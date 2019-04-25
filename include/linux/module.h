@@ -25,6 +25,7 @@
 #include <linux/error-injection.h>
 #include <linux/tracepoint-defs.h>
 #include <linux/srcu.h>
+#include <linux/cfi.h>
 
 #include <linux/percpu.h>
 #include <asm/module.h>
@@ -130,13 +131,17 @@ extern void cleanup_module(void);
 #define module_init(initfn)					\
 	static inline initcall_t __maybe_unused __inittest(void)		\
 	{ return initfn; }					\
-	int init_module(void) __copy(initfn) __attribute__((alias(#initfn)));
+	int init_module(void) __copy(initfn) 			\
+		__attribute__((alias(#initfn)));		\
+	__CFI_ADDRESSABLE(init_module)
 
 /* This is only required if you want to be unloadable. */
 #define module_exit(exitfn)					\
 	static inline exitcall_t __maybe_unused __exittest(void)		\
 	{ return exitfn; }					\
-	void cleanup_module(void) __copy(exitfn) __attribute__((alias(#exitfn)));
+	void cleanup_module(void) __copy(exitfn) 		\
+		__attribute__((alias(#exitfn))); 		\
+	__CFI_ADDRESSABLE(cleanup_module)
 
 #endif
 
@@ -377,6 +382,10 @@ struct module {
 	const struct kernel_symbol *syms;
 	const s32 *crcs;
 	unsigned int num_syms;
+
+#ifdef CONFIG_CFI_CLANG
+	cfi_check_fn cfi_check;
+#endif
 
 	/* Kernel parameters. */
 #ifdef CONFIG_SYSFS
