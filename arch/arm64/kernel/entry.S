@@ -895,11 +895,11 @@ SYM_CODE_START_NOALIGN(tramp_vectors)
 	tramp_ventry	32
 SYM_CODE_END(tramp_vectors)
 
-SYM_CODE_START(tramp_exit_native)
+SYM_CODE_START_LOCAL(tramp_exit_native)
 	tramp_exit
 SYM_CODE_END(tramp_exit_native)
 
-SYM_CODE_START(tramp_exit_compat)
+SYM_CODE_START_LOCAL(tramp_exit_compat)
 	tramp_exit	32
 SYM_CODE_END(tramp_exit_compat)
 
