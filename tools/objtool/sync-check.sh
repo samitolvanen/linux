@@ -21,6 +21,11 @@ arch/x86/include/asm/insn.h     -I '^#include [\"<]\(asm/\)*inat.h[\">]'
 arch/x86/lib/inat.c             -I '^#include [\"<]\(../include/\)*asm/insn.h[\">]'
 arch/x86/lib/insn.c             -I '^#include [\"<]\(../include/\)*asm/in\(at\|sn\).h[\">]' -I '^#include [\"<]\(../include/\)*asm/emulate_prefix.h[\">]'
 "
+elif [ "$SRCARCH" = "arm64" ]; then
+FILES="$FILES
+arch/arm64/include/asm/insn.h
+arch/arm64/lib/insn.c         -I '^#include [\"<]\(asm/\)*kprobes.h[\">]' -I '^#include [\"<]\(asm/\)*debug-monitors.h[\">]'
+"
 fi
 
 check_2 () {
