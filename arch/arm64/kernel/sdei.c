@@ -7,6 +7,7 @@
 #include <linux/hardirq.h>
 #include <linux/irqflags.h>
 #include <linux/sched/task_stack.h>
+#include <linux/scs.h>
 #include <linux/uaccess.h>
 
 #include <asm/alternative.h>
@@ -37,6 +38,14 @@ DEFINE_PER_CPU(unsigned long *, sdei_stack_normal_ptr);
 DEFINE_PER_CPU(unsigned long *, sdei_stack_critical_ptr);
 #endif
 
+DECLARE_PER_CPU(unsigned long *, sdei_shadow_call_stack_normal_ptr);
+DECLARE_PER_CPU(unsigned long *, sdei_shadow_call_stack_critical_ptr);
+
+#ifdef CONFIG_SHADOW_CALL_STACK
+DEFINE_PER_CPU(unsigned long *, sdei_shadow_call_stack_normal_ptr);
+DEFINE_PER_CPU(unsigned long *, sdei_shadow_call_stack_critical_ptr);
+#endif
+
 static void _free_sdei_stack(unsigned long * __percpu *ptr, int cpu)
 {
 	unsigned long *p;
@@ -48,13 +57,31 @@ static void _free_sdei_stack(unsigned long * __percpu *ptr, int cpu)
 	}
 }
 
+static void _free_sdei_scs(unsigned long * __percpu *ptr, int cpu)
+{
+	void *s;
+
+	s = per_cpu(*ptr, cpu);
+	if (s) {
+		per_cpu(*ptr, cpu) = NULL;
+		scs_free(s);
+	}
+}
+
 static void free_sdei_stacks(void)
 {
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
-		_free_sdei_stack(&sdei_stack_normal_ptr, cpu);
-		_free_sdei_stack(&sdei_stack_critical_ptr, cpu);
+		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
+			_free_sdei_stack(&sdei_stack_normal_ptr, cpu);
+			_free_sdei_stack(&sdei_stack_critical_ptr, cpu);
+		}
+
+		if (IS_ENABLED(CONFIG_SHADOW_CALL_STACK)) {
+			_free_sdei_scs(&sdei_shadow_call_stack_normal_ptr, cpu);
+			_free_sdei_scs(&sdei_shadow_call_stack_critical_ptr, cpu);
+		}
 	}
 }
 
@@ -70,18 +97,40 @@ static int _init_sdei_stack(unsigned long * __percpu *ptr, int cpu)
 	return 0;
 }
 
+static int _init_sdei_scs(unsigned long * __percpu *ptr, int cpu)
+{
+	void *s;
+
+	s = scs_alloc(cpu_to_node(cpu));
+	if (!s)
+		return -ENOMEM;
+	per_cpu(*ptr, cpu) = s;
+
+	return 0;
+}
+
 static int init_sdei_stacks(void)
 {
 	int cpu;
 	int err = 0;
 
 	for_each_possible_cpu(cpu) {
-		err = _init_sdei_stack(&sdei_stack_normal_ptr, cpu);
-		if (err)
-			break;
-		err = _init_sdei_stack(&sdei_stack_critical_ptr, cpu);
-		if (err)
-			break;
+		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
+			err = _init_sdei_stack(&sdei_stack_normal_ptr, cpu);
+			if (err)
+				break;
+			err = _init_sdei_stack(&sdei_stack_critical_ptr, cpu);
+			if (err)
+				break;
+		}
+		if (IS_ENABLED(CONFIG_SHADOW_CALL_STACK)) {
+			err = _init_sdei_scs(&sdei_shadow_call_stack_normal_ptr, cpu);
+			if (err)
+				break;
+			err = _init_sdei_scs(&sdei_shadow_call_stack_critical_ptr, cpu);
+			if (err)
+				break;
+		}
 	}
 
 	if (err)
@@ -133,10 +182,8 @@ unsigned long sdei_arch_get_entry_point(int conduit)
 		return 0;
 	}
 
-	if (IS_ENABLED(CONFIG_VMAP_STACK)) {
-		if (init_sdei_stacks())
-			return 0;
-	}
+	if (init_sdei_stacks())
+		return 0;
 
 	sdei_exit_mode = (conduit == SMCCC_CONDUIT_HVC) ? SDEI_EXIT_HVC : SDEI_EXIT_SMC;
 
