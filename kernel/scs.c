@@ -24,7 +24,7 @@ static void __scs_account(void *s, int account)
 #define NR_CACHED_SCS 2
 static DEFINE_PER_CPU(void *, scs_cache[NR_CACHED_SCS]);
 
-static void *scs_alloc(int node)
+void *scs_alloc(int node)
 {
 	int i;
 	void *s;
@@ -63,7 +63,7 @@ out:
 	return s;
 }
 
-static void scs_free(void *s)
+void scs_free(void *s)
 {
 	int i;
 
