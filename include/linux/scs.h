@@ -15,12 +15,7 @@
 
 #ifdef CONFIG_SHADOW_CALL_STACK
 
-/*
- * In testing, 1 KiB shadow stack size (i.e. 128 stack frames on a 64-bit
- * architecture) provided ~40% safety margin on stack usage while keeping
- * memory allocation overhead reasonable.
- */
-#define SCS_SIZE		SZ_1K
+#define SCS_SIZE		PAGE_SIZE
 #define GFP_SCS			(GFP_KERNEL | __GFP_ZERO)
 
 /* An illegal pointer value to mark the end of the shadow stack. */

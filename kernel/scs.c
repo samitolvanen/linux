@@ -5,50 +5,95 @@
  * Copyright (C) 2019 Google LLC
  */
 
+#include <linux/cpuhotplug.h>
 #include <linux/kasan.h>
 #include <linux/mm.h>
 #include <linux/scs.h>
-#include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/vmstat.h>
-
-static struct kmem_cache *scs_cache;
 
 static void __scs_account(void *s, int account)
 {
-	struct page *scs_page = virt_to_page(s);
+	struct page *scs_page = vmalloc_to_page(s);
 
 	mod_node_page_state(page_pgdat(scs_page), NR_KERNEL_SCS_KB,
 			    account * (SCS_SIZE / SZ_1K));
 }
 
+/* Matches NR_CACHED_STACKS for VMAP_STACK */
+#define NR_CACHED_SCS 2
+static DEFINE_PER_CPU(void *, scs_cache[NR_CACHED_SCS]);
+
 static void *scs_alloc(int node)
 {
-	void *s = kmem_cache_alloc_node(scs_cache, GFP_SCS, node);
+	int i;
+	void *s;
+
+	for (i = 0; i < NR_CACHED_SCS; i++) {
+		s = this_cpu_xchg(scs_cache[i], NULL);
+		if (s) {
+			memset(s, 0, SCS_SIZE);
+			goto out;
+		}
+	}
+
+	/*
+	 * We allocate a full page for the shadow stack, which should be
+	 * more than we need. Check the assumption nevertheless.
+	 */
+	BUILD_BUG_ON(SCS_SIZE > PAGE_SIZE);
+
+	s = __vmalloc_node_range(PAGE_SIZE, SCS_SIZE,
+				 VMALLOC_START, VMALLOC_END,
+				 GFP_SCS, PAGE_KERNEL, 0,
+				 node, __builtin_return_address(0));
 
 	if (!s)
 		return NULL;
 
+out:
 	*__scs_magic(s) = SCS_END_MAGIC;
 
 	/*
 	 * Poison the allocation to catch unintentional accesses to
 	 * the shadow stack when KASAN is enabled.
 	 */
-	kasan_poison_object_data(scs_cache, s);
+	kasan_poison_vmalloc(s, SCS_SIZE);
 	__scs_account(s, 1);
 	return s;
 }
 
 static void scs_free(void *s)
 {
+	int i;
+
 	__scs_account(s, -1);
-	kasan_unpoison_object_data(scs_cache, s);
-	kmem_cache_free(scs_cache, s);
+	kasan_unpoison_vmalloc(s, SCS_SIZE);
+
+	for (i = 0; i < NR_CACHED_SCS; i++)
+		if (this_cpu_cmpxchg(scs_cache[i], 0, s) == NULL)
+			return;
+
+	vfree_atomic(s);
+}
+
+static int scs_cleanup(unsigned int cpu)
+{
+	int i;
+	void **cache = per_cpu_ptr(scs_cache, cpu);
+
+	for (i = 0; i < NR_CACHED_SCS; i++) {
+		vfree(cache[i]);
+		cache[i] = NULL;
+	}
+
+	return 0;
 }
 
 void __init scs_init(void)
 {
-	scs_cache = kmem_cache_create("scs_cache", SCS_SIZE, 0, 0, NULL);
+	cpuhp_setup_state(CPUHP_BP_PREPARE_DYN, "scs:scs_cache", NULL,
+			  scs_cleanup);
 }
 
 int scs_prepare(struct task_struct *tsk, int node)
