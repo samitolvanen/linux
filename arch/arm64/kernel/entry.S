@@ -28,6 +28,7 @@
 #include <asm/thread_info.h>
 #include <asm/asm-uaccess.h>
 #include <asm/unistd.h>
+#include <asm/unwind_hints.h>
 
 /*
  * Context tracking and irqflag tracing need to instrument transitions between
@@ -62,6 +63,7 @@
 
 	.macro kernel_ventry, el, label, regsize = 64
 	.align 7
+	UNWIND_HINT_EMPTY
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
 	.if	\el == 0
 alternative_if ARM64_UNMAP_KERNEL_AT_EL0
@@ -839,6 +841,7 @@ alternative_else_nop_endif
 
 	.macro tramp_ventry, regsize = 64
 	.align	7
+	UNWIND_HINT_EMPTY
 1:
 	.if	\regsize == 64
 	msr	tpidrro_el0, x30	// Restored in kernel_ventry
@@ -896,10 +899,12 @@ SYM_CODE_START_NOALIGN(tramp_vectors)
 SYM_CODE_END(tramp_vectors)
 
 SYM_CODE_START_LOCAL(tramp_exit_native)
+	UNWIND_HINT_EMPTY
 	tramp_exit
 SYM_CODE_END(tramp_exit_native)
 
 SYM_CODE_START_LOCAL(tramp_exit_compat)
+	UNWIND_HINT_EMPTY
 	tramp_exit	32
 SYM_CODE_END(tramp_exit_compat)
 
