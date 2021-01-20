@@ -89,6 +89,7 @@ alternative_else_nop_endif
 	tbnz	x0, #THREAD_SHIFT, 0f
 	sub	x0, sp, x0			// x0'' = sp' - x0' = (sp + x0) - sp = x0
 	sub	sp, sp, x0			// sp'' = sp' - x0 = (sp + x0) - x0 = sp
+	UNWIND_HINT_FUNC sp_offset=S_FRAME_SIZE
 	b	el\()\el\()_\label
 
 0:
@@ -121,6 +122,7 @@ alternative_else_nop_endif
 	sub	sp, sp, x0
 	mrs	x0, tpidrro_el0
 #endif
+	UNWIND_HINT_FUNC sp_offset=S_FRAME_SIZE
 	b	el\()\el\()_\label
 	.endm
 
