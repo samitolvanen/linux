@@ -100,4 +100,7 @@ static inline u32 arm64_ras_serror_get_severity(u32 esr)
 
 bool arm64_is_fatal_ras_serror(struct pt_regs *regs, unsigned int esr);
 void __noreturn arm64_serror_panic(struct pt_regs *regs, u32 esr);
+
+typedef bool (pstate_check_t)(unsigned long);
+extern pstate_check_t * const aarch32_opcode_cond_checks[16];
 #endif
