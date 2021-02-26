@@ -17,7 +17,7 @@
 
 #ifndef __ASSEMBLY__
 extern atomic_t modifying_ftrace_code;
-extern void __fentry__(void);
+extern const u8 __fentry__[];
 
 static inline unsigned long ftrace_call_adjust(unsigned long addr)
 {
