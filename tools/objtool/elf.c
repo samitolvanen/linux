@@ -20,6 +20,7 @@
 
 #include <objtool/elf.h>
 #include <objtool/warn.h>
+#include <arch/elf.h>
 
 #define MAX_NAME_LEN 128
 
@@ -290,6 +291,10 @@ static int read_sections(struct elf *elf)
 
 		if (sec->sh.sh_flags & SHF_EXECINSTR)
 			elf->text_size += sec->len;
+
+		/* Detect -fsanitize=cfi jump table sections */
+		if (!strncmp(sec->name, ".text..L.cfi.jumptable", 22))
+			sec->cfi_jt = true;
 
 		list_add_tail(&sec->list, &elf->sections);
 		elf_hash_add(section, &sec->hash, sec->idx);
@@ -576,6 +581,52 @@ static int read_rela_reloc(struct section *sec, int i, struct reloc *reloc, unsi
 	return 0;
 }
 
+/*
+ * CONFIG_CFI_CLANG replaces function relocations to refer to an intermediate
+ * jump table. Undo the conversion so objtool can make sense of things.
+ */
+static int fix_cfi_relocs(const struct elf *elf)
+{
+	struct section *sec;
+	struct reloc *reloc;
+
+	list_for_each_entry(sec, &elf->sections, list) {
+		list_for_each_entry(reloc, &sec->reloc_list, list) {
+			struct reloc *func_reloc;
+			unsigned long offset;
+
+			if (!reloc->sym->sec->cfi_jt)
+				continue;
+
+			if (reloc->sym->type == STT_SECTION) {
+				/* TODO: deal with PC relative relocation types */
+				if (reloc->addend < 0)
+					continue;
+				offset = reloc->addend;
+			} else
+				offset = reloc->sym->offset;
+
+			/*
+			 * The jump table immediately jumps to the actual function,
+			 * so look up the relocation there.
+			 */
+			offset += CFI_JT_RELOC_OFFSET;
+
+			func_reloc = find_reloc_by_dest(elf, reloc->sym->sec, offset);
+			if (!func_reloc || !func_reloc->sym) {
+				WARN("can't find a CFI jump table relocation at %s+0x%lx",
+					reloc->sym->sec->name, offset);
+				continue;
+			}
+
+			reloc->sym = func_reloc->sym;
+			reloc->addend = 0;
+		}
+	}
+
+	return 0;
+}
+
 static int read_relocs(struct elf *elf)
 {
 	struct section *sec;
@@ -638,6 +689,9 @@ static int read_relocs(struct elf *elf)
 		max_reloc = max(max_reloc, nr_reloc);
 		tot_reloc += nr_reloc;
 	}
+
+	if (fix_cfi_relocs(elf))
+		return -1;
 
 	if (stats) {
 		printf("max_reloc: %lu\n", max_reloc);

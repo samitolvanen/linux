@@ -3,4 +3,6 @@
 
 #define R_NONE R_X86_64_NONE
 
+#define CFI_JT_RELOC_OFFSET 1
+
 #endif /* _OBJTOOL_ARCH_ELF */
