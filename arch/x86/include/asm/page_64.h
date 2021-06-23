@@ -6,6 +6,7 @@
 
 #ifndef __ASSEMBLY__
 #include <asm/cpufeatures.h>
+#include <linux/linkage.h>
 #include <asm/alternative.h>
 
 /* duplicated to the one in bootmem.h */
@@ -41,9 +42,9 @@ extern unsigned long __phys_addr_symbol(unsigned long);
 #define pfn_valid(pfn)          ((pfn) < max_pfn)
 #endif
 
-void clear_page_orig(void *page);
-void clear_page_rep(void *page);
-void clear_page_erms(void *page);
+DECLARE_NOT_CALLED_FROM_C(clear_page_orig);
+DECLARE_NOT_CALLED_FROM_C(clear_page_rep);
+DECLARE_NOT_CALLED_FROM_C(clear_page_erms);
 
 static inline void clear_page(void *page)
 {
