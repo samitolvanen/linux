@@ -707,7 +707,7 @@ extern struct paravirt_patch_site __start_parainstructions[],
  * convention such that we can 'call' it from assembly.
  */
 
-extern void int3_magic(unsigned int *ptr); /* defined in asm */
+DECLARE_NOT_CALLED_FROM_C(int3_magic);
 
 asm (
 "	.pushsection	.init.text, \"ax\", @progbits\n"
