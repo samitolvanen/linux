@@ -530,8 +530,6 @@ extern struct paravirt_patch_site __start_parainstructions[],
  * convention such that we can 'call' it from assembly.
  */
 
-extern void int3_magic(unsigned int *ptr); /* defined in asm */
-
 asm (
 "	.pushsection	.init.text, \"ax\", @progbits\n"
 "	.type		int3_magic, @function\n"
@@ -541,6 +539,8 @@ asm (
 "	.size		int3_magic, .-int3_magic\n"
 "	.popsection\n"
 );
+
+DEFINE_ASM_FUNC_SYMBOL(int3_magic);
 
 extern __initdata unsigned long int3_selftest_ip; /* defined in asm below */
 
