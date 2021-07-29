@@ -6,6 +6,7 @@
 
 #ifndef __ASSEMBLY__
 #include <asm/alternative.h>
+#include <asm/proto.h>
 
 /* duplicated to the one in bootmem.h */
 extern unsigned long max_pfn;
@@ -40,9 +41,9 @@ extern unsigned long __phys_addr_symbol(unsigned long);
 #define pfn_valid(pfn)          ((pfn) < max_pfn)
 #endif
 
-void clear_page_orig(void *page);
-void clear_page_rep(void *page);
-void clear_page_erms(void *page);
+DEFINE_ASM_FUNC_SYMBOL(clear_page_orig);
+DEFINE_ASM_FUNC_SYMBOL(clear_page_rep);
+DEFINE_ASM_FUNC_SYMBOL(clear_page_erms);
 
 static inline void clear_page(void *page)
 {
