@@ -49,6 +49,19 @@
 #define __PAGE_ALIGNED_BSS	.section ".bss..page_aligned", "aw"
 
 /*
+ * Declares a function not callable from C using an opaque type. Defined as
+ * an array to allow the address of the symbol to be taken without '&'.
+ */
+#ifndef DECLARE_NOT_CALLED_FROM_C
+#define DECLARE_NOT_CALLED_FROM_C(sym) \
+	extern const u8 sym[]
+#endif
+
+#ifndef __ASSEMBLY__
+typedef const u8 *asm_func_ptr;
+#endif
+
+/*
  * This is used by architectures to keep arguments on the stack
  * untouched by the compiler by keeping them live until the end.
  * The argument stack may be owned by the assembly-language
