@@ -103,6 +103,7 @@ static void tp_stub_func(void)
 {
 	return;
 }
+__CFI_EXCLUDE(tp_stub_func);
 
 static inline void *allocate_probes(int count)
 {
