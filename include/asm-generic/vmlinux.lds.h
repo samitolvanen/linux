@@ -411,6 +411,16 @@
 	KEEP(*(.static_call_tramp_key))					\
 	__stop_static_call_tramp_key = .;
 
+#ifdef CONFIG_CFI_CLANG
+#define CFI_EXCLUDE_DATA						\
+	. = ALIGN(8);							\
+	__start_cfi_exclude = .;					\
+	KEEP(*(.cfiexclude))						\
+	__stop_cfi_exclude = .;
+#else
+#define CFI_EXCLUDE_DATA
+#endif
+
 /*
  * Allow architectures to handle ro_after_init data on their
  * own by defining an empty RO_AFTER_INIT_DATA.
@@ -435,6 +445,7 @@
 		*(.rodata) *(.rodata.*)					\
 		SCHED_DATA						\
 		RO_AFTER_INIT_DATA	/* Read only after init */	\
+		CFI_EXCLUDE_DATA					\
 		. = ALIGN(8);						\
 		__start___tracepoints_ptrs = .;				\
 		KEEP(*(__tracepoints_ptrs)) /* Tracepoints: pointer array */ \

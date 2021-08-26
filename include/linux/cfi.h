@@ -20,6 +20,10 @@ extern void __cfi_check(uint64_t id, void *ptr, void *diag);
 #define __CFI_ADDRESSABLE(fn, __attr) \
 	const void *__cfi_jt_ ## fn __visible __attr = (void *)&fn
 
+#define __CFI_EXCLUDE(fn) \
+	const void *__cfi_excl_ ## fn __visible \
+		__attribute__((__section__(".cfiexclude"))) = (void *)&fn
+
 #ifdef CONFIG_CFI_CLANG_SHADOW
 
 extern void cfi_module_add(struct module *mod, unsigned long base_addr);
@@ -35,6 +39,7 @@ static inline void cfi_module_remove(struct module *mod, unsigned long base_addr
 #else /* !CONFIG_CFI_CLANG */
 
 #define __CFI_ADDRESSABLE(fn, __attr)
+#define __CFI_EXCLUDE(fn)
 
 #endif /* CONFIG_CFI_CLANG */
 
