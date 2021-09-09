@@ -1740,6 +1740,98 @@ static int read_static_call_tramps(struct objtool_file *file)
 	return 0;
 }
 
+static int read_pacsp_instructions(struct objtool_file *file)
+{
+	struct instruction *insn;
+
+	for_each_insn(file, insn)
+		if (insn->type == INSN_PACSP) {
+			/*
+			 * Skip .init.text in vmlinux.o to avoid patching early
+			 * boot code.
+			 */
+			if (!strcmp(insn->sec->name, ".init.text") && !module)
+				continue;
+
+			/* Skip __noscs. */
+			if (!strcmp(insn->sec->name, ".noscs.text"))
+				continue;
+
+			/* Skip KVM nVHE functions. */
+			if (!strncmp(insn->func->name, "__kvm_nvhe_", 11))
+				continue;
+
+			list_add_tail(&insn->pacsp_node, &file->pacsp_list);
+		}
+
+	return 0;
+}
+
+static int create_scs_section(struct objtool_file *file)
+{
+	struct section *sec, *reloc_sec;
+	struct reloc *reloc;
+	s32 *site;
+	struct instruction *insn;
+	int idx;
+
+	sec = find_section_by_name(file->elf, ".scs_sites");
+	if (sec) {
+		INIT_LIST_HEAD(&file->pacsp_list);
+		WARN("file already has .scsp_sites section, skipping");
+		return 0;
+	}
+
+	if (list_empty(&file->pacsp_list))
+		return 0;
+
+	idx = 0;
+	list_for_each_entry(insn, &file->pacsp_list, pacsp_node)
+		idx++;
+
+	sec = elf_create_section(file->elf, ".scs_sites", SHF_WRITE,
+				 sizeof(s32), idx);
+	if (!sec)
+		return -1;
+
+	reloc_sec = elf_create_reloc_section(file->elf, sec, SHT_RELA);
+	if (!reloc_sec)
+		return -1;
+
+	idx = 0;
+	list_for_each_entry(insn, &file->pacsp_list, pacsp_node) {
+
+		site = (s32 *)sec->data->d_buf + idx;
+		*site = 0;
+
+		reloc = malloc(sizeof(*reloc));
+		if (!reloc) {
+			perror("malloc");
+			return -1;
+		}
+		memset(reloc, 0, sizeof(*reloc));
+
+		insn_to_reloc_sym_addend(insn->sec, insn->offset, reloc);
+		if (!reloc->sym) {
+			WARN_FUNC("missing containing symbol",
+				insn->sec, insn->offset);
+			return -1;
+		}
+
+		reloc->type = R_AARCH64_PREL32;
+		reloc->offset = idx * sizeof(s32);
+		reloc->sec = reloc_sec;
+		elf_add_reloc(file->elf, reloc);
+
+		idx++;
+	}
+
+	if (elf_rebuild_reloc_section(file->elf, reloc_sec))
+		return -1;
+
+	return 0;
+}
+
 static void mark_rodata(struct objtool_file *file)
 {
 	struct section *sec;
@@ -1822,6 +1914,12 @@ static int decode_sections(struct objtool_file *file)
 	ret = read_instr_hints(file);
 	if (ret)
 		return ret;
+
+	if (scs) {
+		ret = read_pacsp_instructions(file);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -3150,6 +3248,13 @@ int check(struct objtool_file *file)
 
 	if (mcount) {
 		ret = create_mcount_loc_sections(file);
+		if (ret < 0)
+			goto out;
+		warnings += ret;
+	}
+
+	if (scs) {
+		ret = create_scs_section(file);
 		if (ret < 0)
 			goto out;
 		warnings += ret;

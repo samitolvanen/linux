@@ -372,6 +372,16 @@ static int arm_decode_add_sub_imm(u32 instr, bool set_flags,
 	return 0;
 }
 
+static int insn_is_pacsp(u32 insn)
+{
+	if (!aarch64_insn_is_hint(insn))
+		return 0;
+
+	insn &= 0xFE0;
+	return (insn == AARCH64_INSN_HINT_PACIASP ||
+		insn == AARCH64_INSN_HINT_AUTIASP);
+}
+
 int arch_decode_instruction(const struct elf *elf, const struct section *sec,
 			    unsigned long offset, unsigned int maxlen,
 			    unsigned int *len, enum insn_type *type,
@@ -462,6 +472,8 @@ int arch_decode_instruction(const struct elf *elf, const struct section *sec,
 			*immediate = aarch64_get_branch_offset(insn);
 		} else if (aarch64_insn_is_eret(insn)) {
 			*type = INSN_CONTEXT_SWITCH;
+		} else if (insn_is_pacsp(insn)) {
+			*type = INSN_PACSP;
 		} else if (aarch64_insn_is_steppable_hint(insn)) {
 			*type = INSN_NOP;
 		} else if (aarch64_insn_is_brk(insn)) {
