@@ -201,6 +201,10 @@ enum aarch64_insn_size_type {
 enum aarch64_insn_ldst_type {
 	AARCH64_INSN_LDST_LOAD_REG_OFFSET,
 	AARCH64_INSN_LDST_STORE_REG_OFFSET,
+	AARCH64_INSN_LDST_LOAD_REG_PRE_INDEX,
+	AARCH64_INSN_LDST_LOAD_REG_POST_INDEX,
+	AARCH64_INSN_LDST_STORE_REG_PRE_INDEX,
+	AARCH64_INSN_LDST_STORE_REG_POST_INDEX,
 	AARCH64_INSN_LDST_LOAD_PAIR_PRE_INDEX,
 	AARCH64_INSN_LDST_STORE_PAIR_PRE_INDEX,
 	AARCH64_INSN_LDST_LOAD_PAIR_POST_INDEX,
@@ -460,6 +464,11 @@ u32 aarch64_insn_gen_hint(enum aarch64_insn_hint_cr_op op);
 u32 aarch64_insn_gen_nop(void);
 u32 aarch64_insn_gen_branch_reg(enum aarch64_insn_register reg,
 				enum aarch64_insn_branch_type type);
+u32 aarch64_insn_gen_load_store_imm(enum aarch64_insn_register reg,
+				    enum aarch64_insn_register base,
+				    u64 imm,
+				    enum aarch64_insn_size_type size,
+				    enum aarch64_insn_ldst_type type);
 u32 aarch64_insn_gen_load_store_reg(enum aarch64_insn_register reg,
 				    enum aarch64_insn_register base,
 				    enum aarch64_insn_register offset,

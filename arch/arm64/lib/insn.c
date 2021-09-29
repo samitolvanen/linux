@@ -473,6 +473,42 @@ u32 aarch64_insn_gen_branch_reg(enum aarch64_insn_register reg,
 	return aarch64_insn_encode_register(AARCH64_INSN_REGTYPE_RN, insn, reg);
 }
 
+u32 aarch64_insn_gen_load_store_imm(enum aarch64_insn_register reg,
+				    enum aarch64_insn_register base,
+				    u64 imm,
+				    enum aarch64_insn_size_type size,
+				    enum aarch64_insn_ldst_type type)
+{
+	u32 insn;
+
+	switch (type) {
+	case AARCH64_INSN_LDST_LOAD_REG_PRE_INDEX:
+		insn = aarch64_insn_get_load_pre_value();
+		break;
+	case AARCH64_INSN_LDST_LOAD_REG_POST_INDEX:
+		insn = aarch64_insn_get_load_post_value();
+		break;
+	case AARCH64_INSN_LDST_STORE_REG_PRE_INDEX:
+		insn = aarch64_insn_get_store_pre_value();
+		break;
+	case AARCH64_INSN_LDST_STORE_REG_POST_INDEX:
+		insn = aarch64_insn_get_store_post_value();
+		break;
+	default:
+		pr_err("%s: unknown load/store encoding %d\n", __func__, type);
+		return AARCH64_BREAK_FAULT;
+	}
+
+	insn = aarch64_insn_encode_ldst_size(size, insn);
+
+	insn = aarch64_insn_encode_register(AARCH64_INSN_REGTYPE_RT, insn, reg);
+
+	insn = aarch64_insn_encode_register(AARCH64_INSN_REGTYPE_RN, insn,
+					    base);
+
+	return aarch64_insn_encode_immediate(AARCH64_INSN_IMM_9, insn, imm);
+}
+
 u32 aarch64_insn_gen_load_store_reg(enum aarch64_insn_register reg,
 				    enum aarch64_insn_register base,
 				    enum aarch64_insn_register offset,
