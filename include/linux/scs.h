@@ -25,6 +25,7 @@
 #define task_scs(tsk)		(task_thread_info(tsk)->scs_base)
 #define task_scs_sp(tsk)	(task_thread_info(tsk)->scs_sp)
 
+void __init scs_disable(void);
 void *scs_alloc(int node);
 void scs_free(void *s);
 void scs_init(void);
@@ -50,11 +51,12 @@ static inline bool task_scs_end_corrupted(struct task_struct *tsk)
 	unsigned long *magic = __scs_magic(task_scs(tsk));
 	unsigned long sz = task_scs_sp(tsk) - task_scs(tsk);
 
-	return sz >= SCS_SIZE - 1 || READ_ONCE_NOCHECK(*magic) != SCS_END_MAGIC;
+	return task_scs(tsk) && (sz >= SCS_SIZE - 1 || READ_ONCE_NOCHECK(*magic) != SCS_END_MAGIC);
 }
 
 #else /* CONFIG_SHADOW_CALL_STACK */
 
+static inline void scs_disable(void) {}
 static inline void *scs_alloc(int node) { return NULL; }
 static inline void scs_free(void *s) {}
 static inline void scs_init(void) {}

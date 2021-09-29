@@ -578,19 +578,51 @@ config STACKPROTECTOR_STRONG
 	  about 20% of all kernel functions, which increases the kernel code
 	  size by about 2%.
 
-config ARCH_SUPPORTS_SHADOW_CALL_STACK
+config ARCH_SUPPORTS_SHADOW_CALL_STACK_CLANG
 	bool
 	help
-	  An architecture should select this if it supports Clang's Shadow
-	  Call Stack and implements runtime support for shadow stack
-	  switching.
+	  An architecture should select this if it supports shadow call
+	  stack and implements runtime support for shadow stack switching.
+
+config ARCH_SUPPORTS_SHADOW_CALL_STACK_PATCHING
+	bool
+	help
+	  An architecture should select this if it supports enabling shadow
+	  call stack at boot.
 
 config SHADOW_CALL_STACK
-	bool "Clang Shadow Call Stack"
-	depends on CC_IS_CLANG && ARCH_SUPPORTS_SHADOW_CALL_STACK
-	depends on DYNAMIC_FTRACE_WITH_REGS || !FUNCTION_GRAPH_TRACER
+	bool
 	help
-	  This option enables Clang's Shadow Call Stack, which uses a
+	  Selected if the kernel is built with shadow call stack.
+
+config HAS_SHADOW_CALL_STACK
+	def_bool y
+	depends on ARCH_SUPPORTS_SHADOW_CALL_STACK_CLANG || ARCH_SUPPORTS_SHADOW_CALL_STACK_PATCHING
+	depends on DYNAMIC_FTRACE_WITH_REGS || !FUNCTION_GRAPH_TRACER
+
+choice
+	prompt "Shadow Call Stack"
+	default SHADOW_CALL_STACK_NONE
+	help
+	  This option enables software Shadow Call Stack, which uses a
+	  shadow stack to protect function return addresses from being
+	  overwritten by an attacker.
+
+	  If unsure, select SHADOW_CALL_STACK_NONE.
+
+config SHADOW_CALL_STACK_NONE
+	bool "None"
+	help
+	  Build the kernel without shadow call stack.
+
+config SHADOW_CALL_STACK_CLANG
+	bool "Clang Shadow Call Stack"
+	depends on HAS_SHADOW_CALL_STACK
+	depends on ARCH_SUPPORTS_SHADOW_CALL_STACK_CLANG
+	depends on CC_IS_CLANG
+	select SHADOW_CALL_STACK
+	help
+	  This option enables software Shadow Call Stack, which uses a
 	  shadow stack to protect function return addresses from being
 	  overwritten by an attacker. More information can be found in
 	  Clang's documentation:
@@ -602,6 +634,18 @@ config SHADOW_CALL_STACK
 	  of shadow stacks in memory, which means an attacker capable of
 	  reading and writing arbitrary memory may be able to locate them
 	  and hijack control flow by modifying the stacks.
+
+config SHADOW_CALL_STACK_PATCHING
+	bool "Runtime Shadow Call Stack"
+	depends on HAS_SHADOW_CALL_STACK
+	depends on ARCH_SUPPORTS_SHADOW_CALL_STACK_PATCHING
+	depends on STACK_VALIDATION
+	select SHADOW_CALL_STACK
+	help
+	  This option enables software shadow call stack enabled at boot
+	  time on hardware that lacks alternative native protections.
+
+endchoice
 
 config LTO
 	bool

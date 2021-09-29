@@ -239,7 +239,11 @@ struct ftrace_likely_data {
 #endif
 
 #ifndef __noscs
-# define __noscs
+# ifndef CONFIG_SHADOW_CALL_STACK_PATCHING
+#  define __noscs
+# else
+#  define __noscs __section(".noscs.text")
+# endif
 #endif
 
 #ifndef asm_volatile_goto

@@ -12,6 +12,18 @@
 #include <linux/vmalloc.h>
 #include <linux/vmstat.h>
 
+#ifdef CONFIG_SHADOW_CALL_STACK_PATCHING
+static bool __scs_enabled __ro_after_init = true;
+
+void __init scs_disable(void)
+{
+	__scs_enabled = false;
+}
+#else
+#define __scs_enabled true
+void __init scs_disable(void) {}
+#endif
+
 static void __scs_account(void *s, int account)
 {
 	struct page *scs_page = vmalloc_to_page(s);
@@ -102,6 +114,11 @@ void __init scs_init(void)
 
 int scs_prepare(struct task_struct *tsk, int node)
 {
+	if (!__scs_enabled) {
+		task_scs(tsk) = task_scs_sp(tsk) = NULL;
+		return 0;
+	}
+
 	void *s = scs_alloc(node);
 
 	if (!s)
@@ -117,7 +134,7 @@ static void scs_check_usage(struct task_struct *tsk)
 
 	unsigned long *p, prev, curr = highest, used = 0;
 
-	if (!IS_ENABLED(CONFIG_DEBUG_STACK_USAGE))
+	if (!IS_ENABLED(CONFIG_DEBUG_STACK_USAGE) || !task_scs(tsk))
 		return;
 
 	for (p = task_scs(tsk); p < __scs_magic(tsk); ++p) {

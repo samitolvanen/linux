@@ -224,7 +224,8 @@ objtool_args =								\
 		--no-unreachable,)					\
 	$(if $(CONFIG_RETPOLINE), --retpoline,)				\
 	$(if $(CONFIG_X86_SMAP), --uaccess,)				\
-	$(if $(CONFIG_FTRACE_MCOUNT_USE_OBJTOOL), --mcount,)
+	$(if $(CONFIG_FTRACE_MCOUNT_USE_OBJTOOL), --mcount,)		\
+	$(if $(CONFIG_SHADOW_CALL_STACK_PATCHING), --scs,)
 
 # Useful for describing the dependency of composite objects
 # Usage:

@@ -52,6 +52,8 @@
 #define COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW 1
 #endif
 
+#ifndef CONFIG_SHADOW_CALL_STACK_PATCHING
 #if __has_feature(shadow_call_stack)
 # define __noscs	__attribute__((__no_sanitize__("shadow-call-stack")))
+#endif
 #endif
