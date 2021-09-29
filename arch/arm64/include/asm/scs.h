@@ -24,6 +24,19 @@
 	.endm
 #endif /* CONFIG_SHADOW_CALL_STACK */
 
+#else
+
+#ifdef CONFIG_SHADOW_CALL_STACK_PATCHING
+extern const s32 __scs_sites[];
+extern const s32 __scs_sites_end[];
+
+extern void __init scs_patch_boot(void);
+extern void scs_patch_module(void *start, size_t length);
+#else
+static inline void scs_patch_boot(void) {}
+static inline void scs_patch_module(void *start, size_t length) {}
+#endif
+
 #endif /* __ASSEMBLY __ */
 
 #endif /* _ASM_SCS_H */

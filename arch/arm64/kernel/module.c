@@ -18,6 +18,7 @@
 #include <linux/vmalloc.h>
 #include <asm/alternative.h>
 #include <asm/insn.h>
+#include <asm/scs.h>
 #include <asm/sections.h>
 
 void *module_alloc(unsigned long size)
@@ -525,6 +526,10 @@ int module_finalize(const Elf_Ehdr *hdr,
 	s = find_section(hdr, sechdrs, ".altinstructions");
 	if (s)
 		apply_alternatives_module((void *)s->sh_addr, s->sh_size);
+
+	s = find_section(hdr, sechdrs, ".scs_sites");
+	if (s)
+		scs_patch_module((void *)s->sh_addr, s->sh_size);
 
 	return module_init_ftrace_plt(hdr, sechdrs, me);
 }
