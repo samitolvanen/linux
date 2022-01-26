@@ -3,4 +3,6 @@
 
 #define R_NONE R_X86_64_NONE
 
+#define KCFI_TYPEID_LEN	6
+
 #endif /* _OBJTOOL_ARCH_ELF */

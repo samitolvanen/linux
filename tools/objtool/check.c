@@ -27,6 +27,12 @@ struct alternative {
 	bool skip_orig;
 };
 
+struct kcfi_type {
+	struct section *sec;
+	unsigned long offset;
+	struct hlist_node hash;
+};
+
 static unsigned long nr_cfi, nr_cfi_reused, nr_cfi_cache;
 
 static struct cfi_init_state initial_func_cfi;
@@ -141,6 +147,99 @@ static bool is_sibling_call(struct instruction *insn)
 
 	/* add_jump_destinations() sets insn->call_dest for sibling calls. */
 	return (is_static_jump(insn) && insn->call_dest);
+}
+
+static int kcfi_bits;
+static struct hlist_head *kcfi_hash;
+
+static void *kcfi_alloc_hash(unsigned long size)
+{
+	kcfi_bits = max(10, ilog2(size));
+	kcfi_hash = mmap(NULL, sizeof(struct hlist_head) << kcfi_bits,
+			PROT_READ|PROT_WRITE,
+			MAP_PRIVATE|MAP_ANON, -1, 0);
+	if (kcfi_hash == (void *)-1L) {
+		WARN("mmap fail kcfi_hash");
+		kcfi_hash = NULL;
+	}  else if (stats) {
+		printf("kcfi_bits: %d\n", kcfi_bits);
+	}
+
+	return kcfi_hash;
+}
+
+static void add_kcfi_type(struct kcfi_type *type)
+{
+	hlist_add_head(&type->hash,
+		&kcfi_hash[hash_min(
+			sec_offset_hash(type->sec, type->offset),
+			kcfi_bits)]);
+}
+
+static bool add_kcfi_types(struct section *sec)
+{
+	struct reloc *reloc;
+
+	list_for_each_entry(reloc, &sec->reloc_list, list) {
+		struct kcfi_type *type;
+
+		if (reloc->sym->type != STT_SECTION) {
+			WARN("unexpected relocation symbol type in %s", sec->name);
+			return false;
+		}
+
+		type = malloc(sizeof(*type));
+		if (!type) {
+			perror("malloc");
+			return false;
+		}
+
+		type->sec = reloc->sym->sec;
+		type->offset = reloc->addend;
+
+		add_kcfi_type(type);
+	}
+
+	return true;
+}
+
+static int read_kcfi_types(struct objtool_file *file)
+{
+	if (!kcfi)
+		return 0;
+
+	if (!kcfi_alloc_hash(file->elf->text_size / 16))
+		return -1;
+
+	if (!for_each_section_by_name(file->elf, ".rela.kcfi_types", add_kcfi_types))
+		return -1;
+
+	return 0;
+}
+
+static bool is_kcfi_typeid(struct elf *elf, struct instruction *insn)
+{
+	struct hlist_head *head;
+	struct kcfi_type *type;
+	struct reloc *reloc;
+
+	if (!kcfi)
+		return false;
+
+	/* Compiler-generated annotation in .kcfi_types. */
+	head = &kcfi_hash[hash_min(sec_offset_hash(insn->sec, insn->offset), kcfi_bits)];
+
+	hlist_for_each_entry(type, head, hash)
+		if (type->sec == insn->sec && type->offset == insn->offset)
+			return true;
+
+	/* Manual annotation (in assembly code). */
+	reloc = find_reloc_by_dest(elf, insn->sec, insn->offset);
+
+	if (reloc && !strncmp(reloc->sym->name, "__kcfi_typeid_", 14))
+		return true;
+
+	return false;
 }
 
 /*
@@ -388,13 +487,18 @@ static int decode_instructions(struct objtool_file *file)
 			insn->sec = sec;
 			insn->offset = offset;
 
-			ret = arch_decode_instruction(file, sec, offset,
-						      sec->sh.sh_size - offset,
-						      &insn->len, &insn->type,
-						      &insn->immediate,
-						      &insn->stack_ops);
-			if (ret)
-				goto err;
+			if (is_kcfi_typeid(file->elf, insn)) {
+				insn->type = INSN_KCFI_TYPEID;
+				insn->len = KCFI_TYPEID_LEN;
+			} else {
+				ret = arch_decode_instruction(file, sec, offset,
+							      sec->sh.sh_size - offset,
+							      &insn->len, &insn->type,
+							      &insn->immediate,
+							      &insn->stack_ops);
+				if (ret)
+					goto err;
+			}
 
 			/*
 			 * By default, "ud2" is a dead end unless otherwise
@@ -420,7 +524,8 @@ static int decode_instructions(struct objtool_file *file)
 			}
 
 			sym_for_each_insn(file, func, insn) {
-				insn->func = func;
+				if (insn->type != INSN_KCFI_TYPEID)
+					insn->func = func;
 				if (insn->type == INSN_ENDBR && list_empty(&insn->call_node)) {
 					if (insn->offset == insn->func->offset) {
 						list_add_tail(&insn->call_node, &file->endbr_list);
@@ -2219,6 +2324,10 @@ static int decode_sections(struct objtool_file *file)
 	if (ret)
 		return ret;
 
+	ret = read_kcfi_types(file);
+	if (ret)
+		return ret;
+
 	ret = decode_instructions(file);
 	if (ret)
 		return ret;
@@ -3595,7 +3704,8 @@ static bool ignore_unreachable_insn(struct objtool_file *file, struct instructio
 	int i;
 	struct instruction *prev_insn;
 
-	if (insn->ignore || insn->type == INSN_NOP || insn->type == INSN_TRAP)
+	if (insn->ignore || insn->type == INSN_NOP || insn->type == INSN_TRAP ||
+			insn->type == INSN_KCFI_TYPEID)
 		return true;
 
 	/*

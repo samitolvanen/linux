@@ -120,6 +120,19 @@ struct section *find_section_by_name(const struct elf *elf, const char *name)
 	return NULL;
 }
 
+bool for_each_section_by_name(const struct elf *elf, const char *name,
+			      bool (*callback)(struct section *))
+{
+	struct section *sec;
+
+	elf_hash_for_each_possible(section_name, sec, name_hash, str_hash(name)) {
+		if (!strcmp(sec->name, name) && !callback(sec))
+			return false;
+	}
+
+	return true;
+}
+
 static struct section *find_section_by_index(struct elf *elf,
 					     unsigned int idx)
 {

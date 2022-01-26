@@ -152,6 +152,9 @@ objtool_link()
 		if is_enabled CONFIG_SLS; then
 			objtoolopt="${objtoolopt} --sls"
 		fi
+		if is_enabled CONFIG_CFI_CLANG; then
+			objtoolopt="${objtoolopt} --kcfi"
+		fi
 		info OBJTOOL ${1}
 		tools/objtool/objtool ${objtoolcmd} ${objtoolopt} ${1}
 	fi

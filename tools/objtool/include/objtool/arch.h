@@ -28,6 +28,7 @@ enum insn_type {
 	INSN_CLD,
 	INSN_TRAP,
 	INSN_ENDBR,
+	INSN_KCFI_TYPEID,
 	INSN_OTHER,
 };
 
