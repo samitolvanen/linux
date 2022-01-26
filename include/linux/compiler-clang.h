@@ -66,9 +66,6 @@
 # define __noscs	__attribute__((__no_sanitize__("shadow-call-stack")))
 #endif
 
-#define __nocfi		__attribute__((__no_sanitize__("cfi")))
-#define __cficanonical	__attribute__((__cfi_canonical_jump_table__))
-
 /*
  * Turn individual warnings and errors on and off locally, depending
  * on version.
@@ -93,3 +90,8 @@
 
 #define __diag_ignore_all(option, comment) \
 	__diag_clang(11, ignore, option)
+
+#if CONFIG_CFI_CLANG
+/* Disable CFI checking inside a function. */
+#define __nocfi		__attribute__((__no_sanitize__("kcfi")))
+#endif
