@@ -25,6 +25,13 @@
 #define RET	ret
 #endif
 
+#ifdef CONFIG_CFI_CLANG
+#define __CFI_TYPE(name)			\
+	.fill 10, 1, 0x90 ASM_NL		\
+	.4byte __kcfi_typeid_##name ASM_NL	\
+	.fill 2, 1, 0xcc
+#endif
+
 #else /* __ASSEMBLY__ */
 
 #ifdef CONFIG_SLS

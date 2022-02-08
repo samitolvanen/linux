@@ -40,6 +40,7 @@
 #include <linux/hardirq.h>
 #include <linux/atomic.h>
 #include <linux/ioasid.h>
+#include <linux/cfi.h>
 
 #include <asm/stacktrace.h>
 #include <asm/processor.h>
@@ -295,6 +296,41 @@ static inline void handle_invalid_op(struct pt_regs *regs)
 		      ILL_ILLOPN, error_get_trap_addr(regs));
 }
 
+#ifdef CONFIG_CFI_CLANG
+void *arch_get_cfi_target(unsigned long addr, struct pt_regs *regs)
+{
+	char buffer[MAX_INSN_SIZE];
+	int offset;
+	struct insn insn;
+	unsigned long *target;
+
+	/*
+	 * The expected CFI check instruction sequence:
+	 *   cmpl    <id>, -6(%reg)	; 7 bytes
+	 *   je      .Ltmp1		; 2 bytes
+	 *   ud2			; <- addr
+	 *   .Ltmp1:
+	 *
+	 * Therefore, the target address is in a register that we can
+	 * decode from the cmpl instruction.
+	 */
+	if (copy_from_kernel_nofault(buffer, (void *)addr - 9, MAX_INSN_SIZE))
+		return NULL;
+	if (insn_decode(&insn, buffer, MAX_INSN_SIZE, INSN_MODE_64))
+		return NULL;
+	if (insn.opcode.value != 0x81)
+		return NULL;
+
+	offset = insn_get_modrm_rm_off(&insn, regs);
+	if (offset < 0)
+		return NULL;
+
+	target = (void *)regs + offset;
+
+	return (void *)*target;
+}
+#endif
+
 static noinstr bool handle_bug(struct pt_regs *regs)
 {
 	bool handled = false;
@@ -312,7 +348,8 @@ static noinstr bool handle_bug(struct pt_regs *regs)
 	 */
 	if (regs->flags & X86_EFLAGS_IF)
 		raw_local_irq_enable();
-	if (report_bug(regs->ip, regs) == BUG_TRAP_TYPE_WARN) {
+	if (report_bug(regs->ip, regs) == BUG_TRAP_TYPE_WARN ||
+	    report_cfi(regs->ip, regs) == BUG_TRAP_TYPE_WARN) {
 		regs->ip += LEN_UD2;
 		handled = true;
 	}
