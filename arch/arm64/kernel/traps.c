@@ -26,6 +26,7 @@
 #include <linux/syscalls.h>
 #include <linux/mm_types.h>
 #include <linux/kasan.h>
+#include <linux/cfi.h>
 
 #include <asm/atomic.h>
 #include <asm/bug.h>
@@ -990,6 +991,55 @@ static struct break_hook bug_break_hook = {
 	.imm = BUG_BRK_IMM,
 };
 
+#ifdef CONFIG_CFI_CLANG
+void *arch_get_cfi_target(unsigned long addr, struct pt_regs *regs)
+{
+	/* The expected CFI check instruction sequence:
+	 *   ldur    wA, [xN, #-4]
+	 *   movk    wB, #nnnnn
+	 *   movk    wB, #nnnnn, lsl #16
+	 *   cmp     wA, wB
+	 *   b.eq    .Ltmp1
+	 *   brk     #0x801		; <- addr
+	 *   .Ltmp1:
+	 *
+	 * Therefore, the target address is in the xN register, which we can
+	 * decode from the ldur instruction.
+	 */
+	u32 insn, rn;
+	void *p = (void *)(addr - 5 * AARCH64_INSN_SIZE);
+
+	if (aarch64_insn_read(p, &insn) || !aarch64_insn_is_ldur(insn))
+		return NULL;
+
+	rn = aarch64_insn_decode_register(AARCH64_INSN_REGTYPE_RN, insn);
+	return (void *)regs->regs[rn];
+}
+
+static int cfi_handler(struct pt_regs *regs, unsigned int esr)
+{
+	switch (report_cfi(regs->pc, regs)) {
+	case BUG_TRAP_TYPE_BUG:
+		die("Oops - CFI", regs, 0);
+		break;
+
+	case BUG_TRAP_TYPE_WARN:
+		break;
+
+	default:
+		return DBG_HOOK_ERROR;
+	}
+
+	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
+	return DBG_HOOK_HANDLED;
+}
+
+static struct break_hook cfi_break_hook = {
+	.fn = cfi_handler,
+	.imm = CFI_BRK_IMM,
+};
+#endif /* CONFIG_CFI_CLANG */
+
 static int reserved_fault_handler(struct pt_regs *regs, unsigned int esr)
 {
 	pr_err("%s generated an invalid instruction at %pS!\n",
@@ -1064,12 +1114,19 @@ int __init early_brk64(unsigned long addr, unsigned int esr,
 	if ((comment & ~KASAN_BRK_MASK) == KASAN_BRK_IMM)
 		return kasan_handler(regs, esr) != DBG_HOOK_HANDLED;
 #endif
+#ifdef CONFIG_CFI_CLANG
+	if ((esr & ESR_ELx_BRK64_ISS_COMMENT_MASK) == CFI_BRK_IMM)
+		return cfi_handler(regs, esr) != DBG_HOOK_HANDLED;
+#endif
 	return bug_handler(regs, esr) != DBG_HOOK_HANDLED;
 }
 
 void __init trap_init(void)
 {
 	register_kernel_break_hook(&bug_break_hook);
+#ifdef CONFIG_CFI_CLANG
+	register_kernel_break_hook(&cfi_break_hook);
+#endif
 	register_kernel_break_hook(&fault_break_hook);
 #ifdef CONFIG_KASAN_SW_TAGS
 	register_kernel_break_hook(&kasan_break_hook);
