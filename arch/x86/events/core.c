@@ -695,7 +695,7 @@ void x86_pmu_disable_all(void)
 
 struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr)
 {
-	return static_call(x86_pmu_guest_get_msrs)(nr);
+	return static_call(x86_pmu_guest_get_msrs, nr);
 }
 EXPORT_SYMBOL_GPL(perf_guest_get_msrs);
 
@@ -726,7 +726,7 @@ static void x86_pmu_disable(struct pmu *pmu)
 	cpuc->enabled = 0;
 	barrier();
 
-	static_call(x86_pmu_disable_all)();
+	static_call(x86_pmu_disable_all);
 }
 
 void x86_pmu_enable_all(int added)
@@ -991,7 +991,7 @@ int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
 	if (cpuc->txn_flags & PERF_PMU_TXN_ADD)
 		n0 -= cpuc->n_txn;
 
-	static_call_cond(x86_pmu_start_scheduling)(cpuc);
+	static_call_cond(x86_pmu_start_scheduling, cpuc);
 
 	for (i = 0, wmin = X86_PMC_IDX_MAX, wmax = 0; i < n; i++) {
 		c = cpuc->event_constraint[i];
@@ -1008,7 +1008,7 @@ int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
 		 * change due to external factors (sibling state, allow_tfa).
 		 */
 		if (!c || (c->flags & PERF_X86_EVENT_DYNAMIC)) {
-			c = static_call(x86_pmu_get_event_constraints)(cpuc, i, cpuc->event_list[i]);
+			c = static_call(x86_pmu_get_event_constraints, cpuc, i, cpuc->event_list[i]);
 			cpuc->event_constraint[i] = c;
 		}
 
@@ -1090,7 +1090,7 @@ int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
 	 */
 	if (!unsched && assign) {
 		for (i = 0; i < n; i++)
-			static_call_cond(x86_pmu_commit_scheduling)(cpuc, i, assign[i]);
+			static_call_cond(x86_pmu_commit_scheduling, cpuc, i, assign[i]);
 	} else {
 		for (i = n0; i < n; i++) {
 			e = cpuc->event_list[i];
@@ -1098,13 +1098,13 @@ int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
 			/*
 			 * release events that failed scheduling
 			 */
-			static_call_cond(x86_pmu_put_event_constraints)(cpuc, e);
+			static_call_cond(x86_pmu_put_event_constraints, cpuc, e);
 
 			cpuc->event_constraint[i] = NULL;
 		}
 	}
 
-	static_call_cond(x86_pmu_stop_scheduling)(cpuc);
+	static_call_cond(x86_pmu_stop_scheduling, cpuc);
 
 	return unsched ? -EINVAL : 0;
 }
@@ -1217,7 +1217,7 @@ static inline void x86_assign_hw_event(struct perf_event *event,
 	hwc->last_cpu = smp_processor_id();
 	hwc->last_tag = ++cpuc->tags[i];
 
-	static_call_cond(x86_pmu_assign)(event, idx);
+	static_call_cond(x86_pmu_assign, event, idx);
 
 	switch (hwc->idx) {
 	case INTEL_PMC_IDX_FIXED_BTS:
@@ -1347,7 +1347,7 @@ static void x86_pmu_enable(struct pmu *pmu)
 	cpuc->enabled = 1;
 	barrier();
 
-	static_call(x86_pmu_enable_all)(added);
+	static_call(x86_pmu_enable_all, added);
 }
 
 static DEFINE_PER_CPU(u64 [X86_PMC_IDX_MAX], pmc_prev_left);
@@ -1472,7 +1472,7 @@ static int x86_pmu_add(struct perf_event *event, int flags)
 	if (cpuc->txn_flags & PERF_PMU_TXN_ADD)
 		goto done_collect;
 
-	ret = static_call(x86_pmu_schedule_events)(cpuc, n, assign);
+	ret = static_call(x86_pmu_schedule_events, cpuc, n, assign);
 	if (ret)
 		goto out;
 	/*
@@ -1494,7 +1494,7 @@ done_collect:
 	 * This is before x86_pmu_enable() will call x86_pmu_start(),
 	 * so we enable LBRs before an event needs them etc..
 	 */
-	static_call_cond(x86_pmu_add)(event);
+	static_call_cond(x86_pmu_add, event);
 
 	ret = 0;
 out:
@@ -1521,7 +1521,7 @@ static void x86_pmu_start(struct perf_event *event, int flags)
 
 	cpuc->events[idx] = event;
 	__set_bit(idx, cpuc->active_mask);
-	static_call(x86_pmu_enable)(event);
+	static_call(x86_pmu_enable, event);
 	perf_event_update_userpage(event);
 }
 
@@ -1594,7 +1594,7 @@ void x86_pmu_stop(struct perf_event *event, int flags)
 	struct hw_perf_event *hwc = &event->hw;
 
 	if (test_bit(hwc->idx, cpuc->active_mask)) {
-		static_call(x86_pmu_disable)(event);
+		static_call(x86_pmu_disable, event);
 		__clear_bit(hwc->idx, cpuc->active_mask);
 		cpuc->events[hwc->idx] = NULL;
 		WARN_ON_ONCE(hwc->state & PERF_HES_STOPPED);
@@ -1647,7 +1647,7 @@ static void x86_pmu_del(struct perf_event *event, int flags)
 	if (i >= cpuc->n_events - cpuc->n_added)
 		--cpuc->n_added;
 
-	static_call_cond(x86_pmu_put_event_constraints)(cpuc, event);
+	static_call_cond(x86_pmu_put_event_constraints, cpuc, event);
 
 	/* Delete the array entry. */
 	while (++i < cpuc->n_events) {
@@ -1667,7 +1667,7 @@ do_del:
 	 * This is after x86_pmu_stop(); so we disable LBRs after any
 	 * event can need them etc..
 	 */
-	static_call_cond(x86_pmu_del)(event);
+	static_call_cond(x86_pmu_del, event);
 }
 
 int x86_pmu_handle_irq(struct pt_regs *regs)
@@ -1745,7 +1745,7 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 		return NMI_DONE;
 
 	start_clock = sched_clock();
-	ret = static_call(x86_pmu_handle_irq)(regs);
+	ret = static_call(x86_pmu_handle_irq, regs);
 	finish_clock = sched_clock();
 
 	perf_sample_event_took(finish_clock - start_clock);
@@ -2217,7 +2217,7 @@ early_initcall(init_hw_perf_events);
 
 static void x86_pmu_read(struct perf_event *event)
 {
-	static_call(x86_pmu_read)(event);
+	static_call(x86_pmu_read, event);
 }
 
 /*
@@ -2298,7 +2298,7 @@ static int x86_pmu_commit_txn(struct pmu *pmu)
 	if (!x86_pmu_initialized())
 		return -EAGAIN;
 
-	ret = static_call(x86_pmu_schedule_events)(cpuc, n, assign);
+	ret = static_call(x86_pmu_schedule_events, cpuc, n, assign);
 	if (ret)
 		return ret;
 
@@ -2638,13 +2638,13 @@ static const struct attribute_group *x86_pmu_attr_groups[] = {
 
 static void x86_pmu_sched_task(struct perf_event_context *ctx, bool sched_in)
 {
-	static_call_cond(x86_pmu_sched_task)(ctx, sched_in);
+	static_call_cond(x86_pmu_sched_task, ctx, sched_in);
 }
 
 static void x86_pmu_swap_task_ctx(struct perf_event_context *prev,
 				  struct perf_event_context *next)
 {
-	static_call_cond(x86_pmu_swap_task_ctx)(prev, next);
+	static_call_cond(x86_pmu_swap_task_ctx, prev, next);
 }
 
 void perf_check_microcode(void)

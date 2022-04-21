@@ -131,8 +131,8 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 	if (level > PG_LEVEL_4K)
 		spte |= PT_PAGE_SIZE_MASK;
 	if (tdp_enabled)
-		spte |= static_call(kvm_x86_get_mt_mask)(vcpu, gfn,
-			kvm_is_mmio_pfn(pfn));
+		spte |= static_call(kvm_x86_get_mt_mask, vcpu, gfn,
+				    kvm_is_mmio_pfn(pfn));
 
 	if (host_writable)
 		spte |= shadow_host_writable_mask;

@@ -533,7 +533,7 @@ static int __init test_static_call_init(void)
               if (scd->func)
                       static_call_update(sc_selftest, scd->func);
 
-              WARN_ON(static_call(sc_selftest)(scd->val) != scd->expect);
+              WARN_ON(static_call(sc_selftest, scd->val) != scd->expect);
       }
 
       return 0;

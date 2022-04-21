@@ -507,10 +507,9 @@ static int ctr_crypt(struct skcipher_request *req)
 	while ((nbytes = walk.nbytes) > 0) {
 		kernel_fpu_begin();
 		if (nbytes & AES_BLOCK_MASK)
-			static_call(aesni_ctr_enc_tfm)(ctx, walk.dst.virt.addr,
-						       walk.src.virt.addr,
-						       nbytes & AES_BLOCK_MASK,
-						       walk.iv);
+			static_call(aesni_ctr_enc_tfm, ctx,
+				    walk.dst.virt.addr, walk.src.virt.addr,
+				    nbytes & AES_BLOCK_MASK, walk.iv);
 		nbytes &= ~AES_BLOCK_MASK;
 
 		if (walk.nbytes == walk.total && nbytes > 0) {

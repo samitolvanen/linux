@@ -28,7 +28,7 @@ void paravirt_set_sched_clock(u64 (*func)(void));
 
 static inline u64 paravirt_sched_clock(void)
 {
-	return static_call(pv_sched_clock)();
+	return static_call(pv_sched_clock);
 }
 
 struct static_key;
@@ -42,7 +42,7 @@ bool pv_is_native_vcpu_is_preempted(void);
 
 static inline u64 paravirt_steal_clock(int cpu)
 {
-	return static_call(pv_steal_clock)(cpu);
+	return static_call(pv_steal_clock, cpu);
 }
 
 #ifdef CONFIG_PARAVIRT_SPINLOCKS

@@ -81,13 +81,13 @@ struct static_call_key {
 
 #ifdef MODULE
 #define __STATIC_CALL_MOD_ADDRESSABLE(name)
-#define static_call_mod(name)	__raw_static_call(name)
+#define static_call_mod(name, args...)	__raw_static_call(name)(args)
 #else
 #define __STATIC_CALL_MOD_ADDRESSABLE(name) __STATIC_CALL_ADDRESSABLE(name)
-#define static_call_mod(name)	__static_call(name)
+#define static_call_mod(name, args...)	__static_call(name)(args)
 #endif
 
-#define static_call(name)	__static_call(name)
+#define static_call(name, args...)	__static_call(name)(args)
 
 #else
 
@@ -95,8 +95,8 @@ struct static_call_key {
 	void *func;
 };
 
-#define static_call(name)						\
-	((typeof(STATIC_CALL_TRAMP(name))*)(STATIC_CALL_KEY(name).func))
+#define static_call(name, args...)					\
+	((typeof(STATIC_CALL_TRAMP(name))*)(STATIC_CALL_KEY(name).func))(args)
 
 #endif /* CONFIG_HAVE_STATIC_CALL */
 

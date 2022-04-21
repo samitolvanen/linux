@@ -1096,7 +1096,7 @@ BPF_CALL_3(bpf_get_branch_snapshot, void *, buf, u32, size, u64, flags)
 	static const u32 br_entry_size = sizeof(struct perf_branch_entry);
 	u32 entry_cnt = size / br_entry_size;
 
-	entry_cnt = static_call(perf_snapshot_branch_stack)(buf, entry_cnt);
+	entry_cnt = static_call(perf_snapshot_branch_stack, buf, entry_cnt);
 
 	if (unlikely(flags))
 		return -EINVAL;

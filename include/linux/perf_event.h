@@ -1253,15 +1253,15 @@ DECLARE_STATIC_CALL(__perf_guest_handle_intel_pt_intr, *perf_guest_cbs->handle_i
 
 static inline unsigned int perf_guest_state(void)
 {
-	return static_call(__perf_guest_state)();
+	return static_call(__perf_guest_state);
 }
 static inline unsigned long perf_guest_get_ip(void)
 {
-	return static_call(__perf_guest_get_ip)();
+	return static_call(__perf_guest_get_ip);
 }
 static inline unsigned int perf_guest_handle_intel_pt_intr(void)
 {
-	return static_call(__perf_guest_handle_intel_pt_intr)();
+	return static_call(__perf_guest_handle_intel_pt_intr);
 }
 extern void perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *cbs);
 extern void perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *cbs);

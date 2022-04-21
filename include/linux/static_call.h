@@ -21,8 +21,8 @@
  *
  *   __static_call_return0;
  *
- *   static_call(name)(args...);
- *   static_call_cond(name)(args...);
+ *   static_call(name, args...);
+ *   static_call_cond(name, args...);
  *   static_call_update(name, func);
  *   static_call_query(name);
  *
@@ -38,13 +38,13 @@
  *   DEFINE_STATIC_CALL(my_name, func_a);
  *
  *   # Call func_a()
- *   static_call(my_name)(arg1, arg2);
+ *   static_call(my_name, arg1, arg2);
  *
  *   # Update 'my_name' to point to func_b()
  *   static_call_update(my_name, &func_b);
  *
  *   # Call func_b()
- *   static_call(my_name)(arg1, arg2);
+ *   static_call(my_name, arg1, arg2);
  *
  *
  * Implementation details:
@@ -94,7 +94,7 @@
  *
  *   When calling a static_call that can be NULL, use:
  *
- *     static_call_cond(name)(arg1);
+ *     static_call_cond(name, arg1);
  *
  *   which will include the required value tests to avoid NULL-pointer
  *   dereferences.
@@ -204,7 +204,7 @@ extern long __static_call_return0(void);
 	};								\
 	ARCH_DEFINE_STATIC_CALL_RET0_TRAMP(name)
 
-#define static_call_cond(name)	(void)__static_call(name)
+#define static_call_cond(name, args...)	(void)__static_call(name)(args)
 
 #define EXPORT_STATIC_CALL(name)					\
 	EXPORT_SYMBOL(STATIC_CALL_KEY(name));				\
@@ -246,7 +246,7 @@ static inline int static_call_init(void) { return 0; }
 	};								\
 	ARCH_DEFINE_STATIC_CALL_RET0_TRAMP(name)
 
-#define static_call_cond(name)	(void)__static_call(name)
+#define static_call_cond(name, args...)	(void)__static_call(name)(args)
 
 static inline
 void __static_call_update(struct static_call_key *key, void *tramp, void *func)
@@ -323,7 +323,7 @@ static inline void __static_call_nop(void) { }
 	(typeof(STATIC_CALL_TRAMP(name))*)func;				\
 })
 
-#define static_call_cond(name)	(void)__static_call_cond(name)
+#define static_call_cond(name, args...)	(void)__static_call_cond(name)(args)
 
 static inline
 void __static_call_update(struct static_call_key *key, void *tramp, void *func)

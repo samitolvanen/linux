@@ -170,7 +170,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
 			rcu_dereference_raw((&__tracepoint_##name)->funcs); \
 		if (it_func_ptr) {					\
 			__data = (it_func_ptr)->data;			\
-			static_call(tp_func_##name)(__data, args);	\
+			static_call(tp_func_##name, __data, args);	\
 		}							\
 	} while (0)
 #else

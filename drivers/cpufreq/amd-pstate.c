@@ -146,7 +146,7 @@ DEFINE_STATIC_CALL(amd_pstate_enable, pstate_enable);
 
 static inline int amd_pstate_enable(bool enable)
 {
-	return static_call(amd_pstate_enable)(enable);
+	return static_call(amd_pstate_enable, enable);
 }
 
 static int pstate_init_perf(struct amd_cpudata *cpudata)
@@ -194,7 +194,7 @@ DEFINE_STATIC_CALL(amd_pstate_init_perf, pstate_init_perf);
 
 static inline int amd_pstate_init_perf(struct amd_cpudata *cpudata)
 {
-	return static_call(amd_pstate_init_perf)(cpudata);
+	return static_call(amd_pstate_init_perf, cpudata);
 }
 
 static void pstate_update_perf(struct amd_cpudata *cpudata, u32 min_perf,
@@ -226,8 +226,8 @@ static inline void amd_pstate_update_perf(struct amd_cpudata *cpudata,
 					  u32 min_perf, u32 des_perf,
 					  u32 max_perf, bool fast_switch)
 {
-	static_call(amd_pstate_update_perf)(cpudata, min_perf, des_perf,
-					    max_perf, fast_switch);
+	static_call(amd_pstate_update_perf, cpudata, min_perf, des_perf,
+		    max_perf, fast_switch);
 }
 
 static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)

@@ -170,15 +170,15 @@ static int trusted_instantiate(struct key *key,
 
 	switch (key_cmd) {
 	case Opt_load:
-		ret = static_call(trusted_key_unseal)(payload, datablob);
+		ret = static_call(trusted_key_unseal, payload, datablob);
 		dump_payload(payload);
 		if (ret < 0)
 			pr_info("key_unseal failed (%d)\n", ret);
 		break;
 	case Opt_new:
 		key_len = payload->key_len;
-		ret = static_call(trusted_key_get_random)(payload->key,
-							  key_len);
+		ret = static_call(trusted_key_get_random, payload->key,
+				  key_len);
 		if (ret < 0)
 			goto out;
 
@@ -188,7 +188,7 @@ static int trusted_instantiate(struct key *key,
 			goto out;
 		}
 
-		ret = static_call(trusted_key_seal)(payload, datablob);
+		ret = static_call(trusted_key_seal, payload, datablob);
 		if (ret < 0)
 			pr_info("key_seal failed (%d)\n", ret);
 		break;
@@ -257,7 +257,7 @@ static int trusted_update(struct key *key, struct key_preparsed_payload *prep)
 	dump_payload(p);
 	dump_payload(new_p);
 
-	ret = static_call(trusted_key_seal)(new_p, datablob);
+	ret = static_call(trusted_key_seal, new_p, datablob);
 	if (ret < 0) {
 		pr_info("key_seal failed (%d)\n", ret);
 		kfree_sensitive(new_p);
@@ -334,7 +334,7 @@ static int __init init_trusted(void)
 				   trusted_key_sources[i].ops->exit);
 		migratable = trusted_key_sources[i].ops->migratable;
 
-		ret = static_call(trusted_key_init)();
+		ret = static_call(trusted_key_init);
 		if (!ret)
 			break;
 	}
@@ -351,7 +351,7 @@ static int __init init_trusted(void)
 
 static void __exit cleanup_trusted(void)
 {
-	static_call_cond(trusted_key_exit)();
+	static_call_cond(trusted_key_exit);
 }
 
 late_initcall(init_trusted);

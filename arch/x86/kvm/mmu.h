@@ -113,7 +113,7 @@ static inline void kvm_mmu_load_pgd(struct kvm_vcpu *vcpu)
 	if (!VALID_PAGE(root_hpa))
 		return;
 
-	static_call(kvm_x86_load_mmu_pgd)(vcpu, root_hpa,
+	static_call(kvm_x86_load_mmu_pgd, vcpu, root_hpa,
 					  vcpu->arch.mmu->shadow_root_level);
 }
 
@@ -218,7 +218,7 @@ static inline u8 permission_fault(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
 {
 	/* strip nested paging fault error codes */
 	unsigned int pfec = access;
-	unsigned long rflags = static_call(kvm_x86_get_rflags)(vcpu);
+	unsigned long rflags = static_call(kvm_x86_get_rflags, vcpu);
 
 	/*
 	 * For explicit supervisor accesses, SMAP is disabled if EFLAGS.AC = 1.
