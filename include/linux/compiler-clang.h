@@ -94,4 +94,6 @@
 #if CONFIG_CFI_CLANG
 /* Disable CFI checking inside a function. */
 #define __nocfi		__attribute__((__no_sanitize__("kcfi")))
+/* Disable CFI checking for the indirect call expression. */
+#define cfi_unchecked(expr)	__builtin_kcfi_call_unchecked(expr)
 #endif
