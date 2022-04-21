@@ -81,13 +81,16 @@ struct static_call_key {
 
 #ifdef MODULE
 #define __STATIC_CALL_MOD_ADDRESSABLE(name)
-#define static_call_mod(name, args...)	__raw_static_call(name)(args)
+#define static_call_mod(name, args...) \
+	cfi_unchecked(__raw_static_call(name)(args))
 #else
 #define __STATIC_CALL_MOD_ADDRESSABLE(name) __STATIC_CALL_ADDRESSABLE(name)
-#define static_call_mod(name, args...)	__static_call(name)(args)
+#define static_call_mod(name, args...) \
+	cfi_unchecked(__static_call(name)(args))
 #endif
 
-#define static_call(name, args...)	__static_call(name)(args)
+#define static_call(name, args...) \
+	cfi_unchecked(__static_call(name)(args))
 
 #else
 

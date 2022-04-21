@@ -204,7 +204,8 @@ extern long __static_call_return0(void);
 	};								\
 	ARCH_DEFINE_STATIC_CALL_RET0_TRAMP(name)
 
-#define static_call_cond(name, args...)	(void)__static_call(name)(args)
+#define static_call_cond(name, args...)					\
+	(void)cfi_unchecked(__static_call(name)(args))
 
 #define EXPORT_STATIC_CALL(name)					\
 	EXPORT_SYMBOL(STATIC_CALL_KEY(name));				\
@@ -246,7 +247,8 @@ static inline int static_call_init(void) { return 0; }
 	};								\
 	ARCH_DEFINE_STATIC_CALL_RET0_TRAMP(name)
 
-#define static_call_cond(name, args...)	(void)__static_call(name)(args)
+#define static_call_cond(name, args...)					\
+	(void)cfi_unchecked(__static_call(name)(args))
 
 static inline
 void __static_call_update(struct static_call_key *key, void *tramp, void *func)
