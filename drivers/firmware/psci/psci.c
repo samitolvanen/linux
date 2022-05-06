@@ -521,7 +521,7 @@ static int __init psci_probe(void)
 	return 0;
 }
 
-typedef int (*psci_initcall_t)(const struct device_node *);
+typedef int (*psci_initcall_t)(struct device_node *);
 
 /*
  * PSCI init function for PSCI versions >=0.2
