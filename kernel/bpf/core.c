@@ -1019,6 +1019,33 @@ void __weak bpf_jit_free_exec(void *addr)
 	module_memfree(addr);
 }
 
+#ifdef CONFIG_CFI_CLANG
+static unsigned int __bpf_func_t_instance(const void *ctx, const struct bpf_insn *insni)
+{
+	BUILD_BUG_ON_MSG(!__same_type(&__bpf_func_t_instance, (bpf_func_t)NULL),
+			 "__bpf_func_t_instance must be of type bpf_func_t");
+	return 0;
+}
+__ADDRESSABLE(__bpf_func_t_instance)
+
+unsigned int __weak bpf_jit_cfi_type_size(void)
+{
+	return sizeof(u32);
+}
+
+void __weak bpf_jit_set_cfi_type(u8 *ptr)
+{
+	const unsigned int sz = bpf_jit_cfi_type_size();
+
+	/* Copy the type hash from __bpf_func_t_instance */
+	memcpy(ptr - sz, (void *)__bpf_func_t_instance - sz, sz);
+}
+
+#else
+static inline unsigned int bpf_jit_cfi_type_size(void) { return 0; }
+static inline void bpf_jit_set_cfi_type(u8 *ptr) {}
+#endif
+
 struct bpf_binary_header *
 bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
 		     unsigned int alignment,
@@ -1034,7 +1061,9 @@ bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
 	 * fill a page, allow at least 128 extra bytes to insert a
 	 * random section of illegal instructions.
 	 */
-	size = round_up(proglen + sizeof(*hdr) + 128, PAGE_SIZE);
+	size = round_up(proglen + sizeof(*hdr) +
+			max_t(unsigned int, bpf_jit_cfi_type_size(), 128),
+			PAGE_SIZE);
 
 	if (bpf_jit_charge_modmem(size))
 		return NULL;
@@ -1050,10 +1079,14 @@ bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
 	hdr->size = size;
 	hole = min_t(unsigned int, size - (proglen + sizeof(*hdr)),
 		     PAGE_SIZE - sizeof(*hdr));
-	start = get_random_u32_below(hole) & ~(alignment - 1);
+	start = max_t(unsigned int, bpf_jit_cfi_type_size(),
+			get_random_u32_below(hole)) & ~(alignment - 1);
 
 	/* Leave a random number of instructions before BPF code. */
 	*image_ptr = &hdr->image[start];
+
+	/* Set the CFI type hash for indirect call checking. */
+	bpf_jit_set_cfi_type(*image_ptr);
 
 	return hdr;
 }
@@ -1088,7 +1121,8 @@ bpf_jit_binary_pack_alloc(unsigned int proglen, u8 **image_ptr,
 		     alignment > BPF_IMAGE_ALIGNMENT);
 
 	/* add 16 bytes for a random section of illegal instructions */
-	size = round_up(proglen + sizeof(*ro_header) + 16, BPF_PROG_CHUNK_SIZE);
+	size = round_up(proglen + sizeof(*ro_header) +
+			bpf_jit_cfi_type_size() + 16, BPF_PROG_CHUNK_SIZE);
 
 	if (bpf_jit_charge_modmem(size))
 		return NULL;
@@ -1112,10 +1146,14 @@ bpf_jit_binary_pack_alloc(unsigned int proglen, u8 **image_ptr,
 
 	hole = min_t(unsigned int, size - (proglen + sizeof(*ro_header)),
 		     BPF_PROG_CHUNK_SIZE - sizeof(*ro_header));
-	start = get_random_u32_below(hole) & ~(alignment - 1);
+	start = max_t(unsigned int, bpf_jit_cfi_type_size(),
+			get_random_u32_below(hole)) & ~(alignment - 1);
 
 	*image_ptr = &ro_header->image[start];
 	*rw_image = &(*rw_header)->image[start];
+
+	/* Set the CFI type hash for indirect call checking. */
+	bpf_jit_set_cfi_type(*rw_image);
 
 	return ro_header;
 }
