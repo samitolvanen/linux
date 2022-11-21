@@ -966,6 +966,15 @@ endif
 
 ifdef CONFIG_CFI_CLANG
 CC_FLAGS_CFI	:= -fsanitize=kcfi
+
+ifdef CONFIG_LTO_CLANG_FULL
+CC_FLAGS_CFI_SEAL 	:= $(call cc-option, -fsanitize-kcfi-seal)
+CC_FLAGS_CFI		+= $(CC_FLAGS_CFI_SEAL)
+# Requires -flto, therefore must also be filtered out with CC_FLAGS_LTO
+CC_FLAGS_LTO		+= $(CC_FLAGS_CFI_SEAL)
+export CC_FLAGS_CFI_SEAL
+endif
+
 KBUILD_CFLAGS	+= $(CC_FLAGS_CFI)
 export CC_FLAGS_CFI
 endif
