@@ -14,6 +14,8 @@ CFLAGS_REMOVE_return_address.o = $(CC_FLAGS_FTRACE)
 CFLAGS_REMOVE_syscall.o	 = -fstack-protector -fstack-protector-strong
 CFLAGS_syscall.o	+= -fno-stack-protector
 
+CFLAGS_REMOVE_proton-pack.o = $(CC_FLAGS_LTO)
+
 # When KASAN is enabled, a stack trace is recorded for every alloc/free, which
 # can significantly impact performance. Avoid instrumenting the stack trace
 # collection code to minimize this impact.
