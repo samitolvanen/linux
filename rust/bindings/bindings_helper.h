@@ -37,6 +37,7 @@
 #include <drm/drm_gpuvm.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_syncobj.h>
+#include <drm/gpu_scheduler.h>
 #include <kunit/test.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/blk-mq.h>

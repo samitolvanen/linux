@@ -29,6 +29,7 @@
 #include "irq.c"
 #include "fs.c"
 #include "io.c"
+#include "jiffies.c"
 #include "jump_label.c"
 #include "kunit.c"
 #include "mm.c"
