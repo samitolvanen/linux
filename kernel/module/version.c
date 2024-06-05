@@ -8,7 +8,35 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/printk.h>
+#include <crypto/sha2.h>
 #include "internal.h"
+
+/*
+ * For symbol names longer than MODULE_NAME_LEN, the version table includes
+ * a hash of the symbol name in the following format:
+ *
+ * <hash name>\0<binary hash of the symbol name>
+ */
+#define SYMHASH_PREFIX		"sha256"
+#define SYMHASH_PREFIX_LEN	sizeof(SYMHASH_PREFIX) /* includes \0 */
+#define SYMHASH_LEN		(SYMHASH_PREFIX_LEN + SHA256_DIGEST_SIZE)
+
+static void symhash(const char *name, size_t len, u8 hash[SYMHASH_LEN])
+{
+	memcpy(hash, SYMHASH_PREFIX, SYMHASH_PREFIX_LEN);
+	sha256(name, len, &hash[SYMHASH_PREFIX_LEN]);
+}
+
+static int symcmp(const char *version_name, const char *name, size_t len,
+		  const u8 *hash)
+{
+	BUILD_BUG_ON(SYMHASH_LEN > MODULE_NAME_LEN);
+
+	if (len >= MODULE_NAME_LEN)
+		return memcmp(version_name, hash, SYMHASH_LEN);
+
+	return strcmp(version_name, name);
+}
 
 int check_version(const struct load_info *info,
 		  const char *symname,
@@ -19,6 +47,8 @@ int check_version(const struct load_info *info,
 	unsigned int versindex = info->index.vers;
 	unsigned int i, num_versions;
 	struct modversion_info *versions;
+	u8 hash[SYMHASH_LEN];
+	size_t len;
 
 	/* Exporting module didn't supply crcs?  OK, we're already tainted. */
 	if (!crc)
@@ -32,10 +62,16 @@ int check_version(const struct load_info *info,
 	num_versions = sechdrs[versindex].sh_size
 		/ sizeof(struct modversion_info);
 
+	len = strlen(symname);
+
+	/* For symbols with a long name, use the hash format. */
+	if (len >= MODULE_NAME_LEN)
+		symhash(symname, len, hash);
+
 	for (i = 0; i < num_versions; i++) {
 		u32 crcval;
 
-		if (strcmp(versions[i].name, symname) != 0)
+		if (symcmp(versions[i].name, symname, len, hash) != 0)
 			continue;
 
 		crcval = *crc;
