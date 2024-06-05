@@ -183,6 +183,26 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 			Elf_Sym *sym, const char *symname);
 void add_moddevtable(struct buffer *buf, struct module *mod);
 
+/* symhash.c */
+/*
+ * For symbol names longer than MODULE_NAME_LEN, encode a hash of the
+ * symbol name in version information as follows:
+ *
+ * <hash name>\0<binary hash of the symbol name>
+ *
+ * e.g. as a string in .mod.c files:
+ * "sha256\x00\xNN{32}"
+ *
+ * The string is null terminated after the hash name to avoid breaking
+ * userspace tools that parse the __versions table and don't understand
+ * the format.
+ */
+#define SYMHASH_STR_PREFIX	"sha256\\x00"
+#define SYMHASH_STR_PREFIX_LEN	(sizeof(SYMHASH_STR_PREFIX) - 1)
+#define SYMHASH_STR_LEN		(SYMHASH_STR_PREFIX_LEN + 4*32 + 1)
+
+char *symhash_str(const char *name, size_t len, char hash_str[SYMHASH_STR_LEN]);
+
 /* sumversion.c */
 void get_src_version(const char *modname, char sum[], unsigned sumlen);
 
