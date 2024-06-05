@@ -1838,7 +1838,10 @@ static void add_exported_symbols(struct buffer *buf, struct module *mod)
  **/
 static void add_versions(struct buffer *b, struct module *mod)
 {
+	char hash[SYMHASH_STR_LEN];
 	struct symbol *s;
+	const char *name;
+	size_t len;
 
 	if (!modversions)
 		return;
@@ -1855,13 +1858,20 @@ static void add_versions(struct buffer *b, struct module *mod)
 				s->name, mod->name);
 			continue;
 		}
-		if (strlen(s->name) >= MODULE_NAME_LEN) {
-			error("too long symbol \"%s\" [%s.ko]\n",
-			      s->name, mod->name);
-			break;
+		len = strlen(s->name);
+		/*
+		 * For symbols with a long name, use the hash format, but include
+		 * the full symbol name as a comment to keep the generated files
+		 * human-readable.
+		 */
+		if (len >= MODULE_NAME_LEN) {
+			buf_printf(b, "\t/* %s */\n", s->name);
+			name = symhash_str(s->name, len, hash);
+		} else {
+			name = s->name;
 		}
 		buf_printf(b, "\t{ %#8x, \"%s\" },\n",
-			   s->crc, s->name);
+			   s->crc, name);
 	}
 
 	buf_printf(b, "};\n");
