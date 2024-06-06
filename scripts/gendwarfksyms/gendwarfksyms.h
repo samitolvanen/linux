@@ -76,6 +76,11 @@ static inline u32 name_hash(const char *name)
 	return jhash(name, strlen(name), 0);
 }
 
+static inline u32 addr_hash(uintptr_t addr)
+{
+	return jhash(&addr, sizeof(addr), 0);
+}
+
 struct symbol {
 	const char *name;
 	struct symbol_addr addr;
@@ -89,6 +94,52 @@ extern int symbol_read_symtab(int fd);
 extern struct symbol *symbol_get(const char *name);
 
 /*
+ * die.c
+ */
+
+enum die_state { INCOMPLETE, COMPLETE, LAST = COMPLETE };
+enum die_fragment_type { EMPTY, STRING, DIE };
+
+struct die_fragment {
+	enum die_fragment_type type;
+	union {
+		char *str;
+		uintptr_t addr;
+	} data;
+	struct die_fragment *next;
+};
+
+#define CASE_CONST_TO_STR(name) \
+	case name:              \
+		return #name;
+
+static inline const char *die_state_name(enum die_state state)
+{
+	switch (state) {
+	default:
+	CASE_CONST_TO_STR(INCOMPLETE)
+	CASE_CONST_TO_STR(COMPLETE)
+	}
+}
+
+struct die {
+	enum die_state state;
+	bool mapped;
+	char *fqn;
+	int tag;
+	uintptr_t addr;
+	struct die_fragment *list;
+	struct hlist_node hash;
+};
+
+extern int __die_map_get(uintptr_t addr, enum die_state state,
+			 struct die **res);
+extern int die_map_get(Dwarf_Die *die, enum die_state state, struct die **res);
+extern int die_map_add_string(struct die *pd, const char *str);
+extern int die_map_add_die(struct die *pd, struct die *child);
+extern void die_map_free(void);
+
+/*
  * dwarf.c
  */
 
@@ -99,12 +150,13 @@ struct state {
 	Dwarf_Die die;
 };
 
-typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);
+typedef int (*die_callback_t)(struct state *state, struct die *cache,
+			      Dwarf_Die *die);
 typedef bool (*die_match_callback_t)(Dwarf_Die *die);
 extern bool match_all(Dwarf_Die *die);
 
-extern int process_die_container(struct state *state, Dwarf_Die *die,
-				 die_callback_t func,
+extern int process_die_container(struct state *state, struct die *cache,
+				 Dwarf_Die *die, die_callback_t func,
 				 die_match_callback_t match);
 
 extern int process_module(Dwfl_Module *mod, Dwarf *dbg, Dwarf_Die *cudie);

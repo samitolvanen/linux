@@ -78,6 +78,10 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 	debug("%s", name);
 	dbg = dwfl_module_getdwarf(mod, &dwbias);
 
+	/*
+	 * Look for exported symbols in each CU, follow the DIE tree, and add
+	 * the entries to die_map.
+	 */
 	do {
 		res = dwarf_get_units(dbg, cu, &cu, NULL, NULL, &cudie, NULL);
 		if (res < 0) {
@@ -89,6 +93,8 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 
 		check(process_module(mod, dbg, &cudie));
 	} while (cu);
+
+	die_map_free();
 
 	return DWARF_CB_OK;
 }
