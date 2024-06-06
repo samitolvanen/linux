@@ -16,12 +16,15 @@
 
 /* Print type descriptions and debugging output to stderr */
 bool debug;
+/* Don't use caching */
+bool no_cache;
 
 static const struct {
 	const char *arg;
 	bool *flag;
 } options[] = {
 	{ "--debug", &debug },
+	{ "--no-cache", &no_cache },
 };
 
 static int usage(void)
@@ -131,6 +134,7 @@ int main(int argc, const char **argv)
 
 		dwfl_end(dwfl);
 		close(fd);
+		cache_free();
 	}
 
 	symbol_print_versions();
