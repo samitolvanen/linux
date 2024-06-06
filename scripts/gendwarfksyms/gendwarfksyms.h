@@ -55,6 +55,9 @@ extern bool no_cache;
 /* Error == negative values */
 #define checkp(expr) __check(expr, __res < 0, __res)
 
+/* Consistent aliases (DW_TAG_<type>_type) for DWARF tags */
+#define DW_TAG_typedef_type DW_TAG_typedef
+
 /*
  * symbols.c
  */
