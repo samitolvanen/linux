@@ -18,6 +18,7 @@
  * Options -- in gendwarfksyms.c
  */
 extern bool debug;
+extern bool no_cache;
 
 /*
  * Output helpers
@@ -75,6 +76,35 @@ extern struct symbol *symbol_get_unprocessed(uintptr_t addr, const char *name);
 extern void symbol_print_versions(void);
 
 /*
+ * cache.c
+ */
+enum cached_item_type { EMPTY, STRING, DIE };
+
+struct cached_item {
+	enum cached_item_type type;
+	union {
+		char *str;
+		uintptr_t addr;
+	} data;
+	struct cached_item *next;
+};
+
+enum cached_die_state { INCOMPLETE, COMPLETE };
+
+struct cached_die {
+	enum cached_die_state state;
+	uintptr_t addr;
+	struct cached_item *list;
+	struct hlist_node hash;
+};
+
+extern int cache_get(Dwarf_Die *die, enum cached_die_state state,
+		     struct cached_die **res);
+extern int cache_add_string(struct cached_die *pd, const char *str);
+extern int cache_add_die(struct cached_die *pd, Dwarf_Die *die);
+extern void cache_free(void);
+
+/*
  * types.c
  */
 
@@ -86,12 +116,13 @@ struct state {
 	unsigned long crc;
 };
 
-typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);
+typedef int (*die_callback_t)(struct state *state, struct cached_die *cache,
+			      Dwarf_Die *die);
 typedef bool (*die_match_callback_t)(Dwarf_Die *die);
 extern bool match_all(Dwarf_Die *die);
 
-extern int process_die_container(struct state *state, Dwarf_Die *die,
-				 die_callback_t func,
+extern int process_die_container(struct state *state, struct cached_die *cache,
+				 Dwarf_Die *die, die_callback_t func,
 				 die_match_callback_t match);
 
 extern int process_module(Dwfl_Module *mod, Dwarf *dbg, Dwarf_Die *cudie);
