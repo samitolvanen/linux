@@ -18,7 +18,8 @@ static u32 name_hash(const char *name)
 }
 
 /* symbol_for_each callback -- return true to stop, false to continue */
-typedef bool (*symbol_callback_t)(struct symbol *, void *arg);
+typedef bool (*symbol_callback_t)(struct symbol *, enum symbol_state type,
+				  void *arg);
 
 static bool __for_each_addr(uintptr_t addr, symbol_callback_t func, void *data)
 {
@@ -30,7 +31,7 @@ static bool __for_each_addr(uintptr_t addr, symbol_callback_t func, void *data)
 
 	hash_for_each_possible(symbol_addrs, sym, addr_hash, addr) {
 		if (sym->addr == addr) {
-			if (func(sym, data))
+			if (func(sym, PROCESSED_ADDR, data))
 				return true;
 			found = true;
 		}
@@ -50,7 +51,7 @@ static bool __for_each_name(const char *name, symbol_callback_t func,
 
 	hash_for_each_possible(symbol_names, sym, name_hash, name_hash(name)) {
 		if (!strcmp(sym->name, name)) {
-			if (func(sym, data))
+			if (func(sym, PROCESSED_NAME, data))
 				return true;
 			found = true;
 		}
@@ -70,6 +71,45 @@ static bool for_each(uintptr_t addr, const char *name, symbol_callback_t func,
 		found = true;
 
 	return found;
+}
+
+static bool set_crc(struct symbol *sym, enum symbol_state type, void *data)
+{
+	unsigned long *crc = data;
+
+	/* Prefer an address match if found, otherwise match by name. */
+	if (type == PROCESSED_ADDR) {
+		if (sym->state == PROCESSED_ADDR) {
+			warn("symbol %s (@ %lx) already matched by address (crc %lx vs. %lx)",
+			     sym->name, sym->addr, sym->crc, *crc);
+			return false;
+		}
+		if (sym->state == PROCESSED_NAME && sym->crc != *crc)
+			debug("symbol %s (@ %lx) overriding name match (crc %lx vs. %lx)",
+			      sym->name, sym->addr, sym->crc, *crc);
+	} else if (type == PROCESSED_NAME) {
+		if (sym->state == PROCESSED_ADDR) {
+			if (sym->crc != *crc)
+				debug("symbol %s (@ %lx) ignoring name match (crc %lx vs. %lx)",
+				      sym->name, sym->addr, sym->crc, *crc);
+			return false;
+		}
+		if (sym->state == PROCESSED_NAME) {
+			warn("symbol %s (@ %lx) already matched by name (crc %lx vs. %lx)",
+			     sym->name, sym->addr, sym->crc, *crc);
+			return false;
+		}
+	}
+
+	sym->state = type;
+	sym->crc = *crc;
+
+	return false; /* Continue */
+}
+
+int symbol_set_crc(struct symbol *sym, unsigned long crc)
+{
+	return for_each(sym->addr, sym->name, set_crc, &crc) ? 0 : -1;
 }
 
 int symbol_read_list(FILE *file)
@@ -100,6 +140,8 @@ int symbol_read_list(FILE *file)
 
 		sym->addr = (uintptr_t)addr;
 		sym->name = name;
+		sym->state = UNPROCESSED;
+		sym->crc = 0;
 		name = NULL;
 
 		hash_add(symbol_addrs, &sym->addr_hash, sym->addr);
@@ -112,20 +154,44 @@ int symbol_read_list(FILE *file)
 	return 0;
 }
 
-static bool return_symbol(struct symbol *sym, void *arg)
+static bool return_unprocessed_symbol(struct symbol *sym,
+				      enum symbol_state type, void *arg)
 {
 	struct symbol **res = (struct symbol **)arg;
 
-	*res = sym;
-	return true; /* Stop -- return the first match */
+	if (sym->state == UNPROCESSED) {
+		sym->state = PROCESSING;
+		*res = sym; /* Return the last match */
+	}
+
+	return false; /* Process all matches */
 }
 
-struct symbol *symbol_get(uintptr_t addr, const char *name)
+struct symbol *symbol_get_unprocessed(uintptr_t addr, const char *name)
 {
+	struct symbol *sym = NULL;
+
+	for_each(addr, name, return_unprocessed_symbol, &sym);
+	return sym;
+}
+
+void symbol_print_versions(void)
+{
+	struct hlist_node *tmp;
 	struct symbol *sym;
+	int i;
 
-	if (for_each(addr, name, return_symbol, &sym))
-		return sym;
+	hash_for_each_safe(symbol_addrs, i, tmp, sym, addr_hash) {
+		if (sym->state == UNPROCESSED || sym->state == PROCESSING)
+			warn("no information for symbol %s (@ %lx)", sym->name,
+			     sym->addr);
 
-	return NULL;
+		printf("#SYMVER %s 0x%08lx\n", sym->name, sym->crc);
+
+		free((void *)sym->name);
+		free(sym);
+	}
+
+	hash_init(symbol_addrs);
+	hash_init(symbol_names);
 }

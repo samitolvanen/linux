@@ -57,6 +57,7 @@ extern bool debug;
 /*
  * symbols.c
  */
+enum symbol_state { UNPROCESSED, PROCESSING, PROCESSED_ADDR, PROCESSED_NAME };
 
 /* Exported symbol -- matching either the name or the address */
 struct symbol {
@@ -64,10 +65,14 @@ struct symbol {
 	uintptr_t addr;
 	struct hlist_node addr_hash;
 	struct hlist_node name_hash;
+	enum symbol_state state;
+	unsigned long crc;
 };
 
+extern int symbol_set_crc(struct symbol *sym, unsigned long crc);
 extern int symbol_read_list(FILE *file);
-extern struct symbol *symbol_get(uintptr_t addr, const char *name);
+extern struct symbol *symbol_get_unprocessed(uintptr_t addr, const char *name);
+extern void symbol_print_versions(void);
 
 /*
  * types.c
@@ -78,6 +83,7 @@ struct state {
 	Dwarf *dbg;
 	struct symbol *sym;
 	Dwarf_Die die;
+	unsigned long crc;
 };
 
 typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);

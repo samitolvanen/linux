@@ -125,6 +125,7 @@ int main(int argc, const char **argv)
 	}
 
 	dwfl_end(dwfl);
+	symbol_print_versions();
 
 	return 0;
 }
