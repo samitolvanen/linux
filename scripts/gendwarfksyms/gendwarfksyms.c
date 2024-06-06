@@ -18,6 +18,8 @@
 bool debug;
 /* Don't use caching */
 bool no_cache;
+/* Don't pretty-print (with --debug) */
+bool no_pretty_print;
 
 static const struct {
 	const char *arg;
@@ -25,6 +27,7 @@ static const struct {
 } options[] = {
 	{ "--debug", &debug },
 	{ "--no-cache", &no_cache },
+	{ "--no-pretty-print", &no_pretty_print },
 };
 
 static int usage(void)
