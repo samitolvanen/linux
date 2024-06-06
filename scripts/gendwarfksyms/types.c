@@ -5,6 +5,70 @@
 
 #include "gendwarfksyms.h"
 
+#define DEFINE_GET_ATTR(attr, type)                                    \
+	static bool get_##attr##_attr(Dwarf_Die *die, unsigned int id, \
+				      type *value)                     \
+	{                                                              \
+		Dwarf_Attribute da;                                    \
+		return dwarf_attr(die, id, &da) &&                     \
+		       !dwarf_form##attr(&da, value);                  \
+	}
+
+DEFINE_GET_ATTR(addr, Dwarf_Addr)
+
+static bool get_ref_die_attr(Dwarf_Die *die, unsigned int id, Dwarf_Die *value)
+{
+	Dwarf_Attribute da;
+
+	/* dwarf_formref_die returns a pointer instead of an error value. */
+	return dwarf_attr(die, id, &da) && dwarf_formref_die(&da, value);
+}
+
+static const char *get_name(Dwarf_Die *die)
+{
+	Dwarf_Attribute attr;
+
+	/* rustc uses DW_AT_linkage_name for exported symbols */
+	if (dwarf_attr(die, DW_AT_linkage_name, &attr) ||
+	    dwarf_attr(die, DW_AT_name, &attr)) {
+		return dwarf_formstring(&attr);
+	}
+
+	return NULL;
+}
+
+static bool is_export_symbol(struct state *state, Dwarf_Die *die)
+{
+	Dwarf_Die *source = die;
+	Dwarf_Word addr = UINTPTR_MAX;
+	Dwarf_Die origin;
+
+	state->sym = NULL;
+
+	/* If the DIE has an abstract origin, use it for type information. */
+	if (get_ref_die_attr(die, DW_AT_abstract_origin, &origin))
+		source = &origin;
+
+	/*
+	 * Only one name is emitted for aliased functions, so we must match
+	 * the address too, if available.
+	 */
+	if (get_addr_attr(die, DW_AT_low_pc, &addr) &&
+	    dwfl_module_relocate_address(state->mod, &addr) < 0) {
+		error("dwfl_module_relocate_address failed");
+		return NULL;
+	}
+
+	state->sym = symbol_get(addr, get_name(die));
+
+	/* Look up using the origin name if there are no matches. */
+	if (!state->sym && source != die)
+		state->sym = symbol_get(addr, get_name(source));
+
+	state->die = *source;
+	return !!state->sym;
+}
+
 /*
  * Type string processing
  */
@@ -40,7 +104,7 @@ int process_die_container(struct state *state, Dwarf_Die *die,
 }
 
 /*
- * Symbol processing
+ * Exported symbol processing
  */
 static int process_subprogram(struct state *state, Dwarf_Die *die)
 {
@@ -67,10 +131,15 @@ static int process_exported_symbols(struct state *state, Dwarf_Die *die)
 	/* Possible exported symbols */
 	case DW_TAG_subprogram:
 	case DW_TAG_variable:
+		if (!is_export_symbol(state, die))
+			return 0;
+
+		debug("%s (@ %lx)", state->sym->name, state->sym->addr);
+
 		if (tag == DW_TAG_subprogram)
-			check(process_subprogram(state, die));
+			check(process_subprogram(state, &state->die));
 		else
-			check(process_variable(state, die));
+			check(process_variable(state, &state->die));
 
 		return 0;
 	default:

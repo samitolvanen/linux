@@ -96,6 +96,8 @@ int main(int argc, const char **argv)
 	if (parse_options(argc, argv, &filename) < 0)
 		return usage();
 
+	check(symbol_read_list(stdin));
+
 	fd = open(filename, O_RDONLY);
 	if (fd == -1) {
 		error("open failed for '%s': %s", filename, strerror(errno));

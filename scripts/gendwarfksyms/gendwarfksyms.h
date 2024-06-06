@@ -55,12 +55,29 @@ extern bool debug;
 #define checkp(expr) __check(expr, __res < 0, __res)
 
 /*
+ * symbols.c
+ */
+
+/* Exported symbol -- matching either the name or the address */
+struct symbol {
+	const char *name;
+	uintptr_t addr;
+	struct hlist_node addr_hash;
+	struct hlist_node name_hash;
+};
+
+extern int symbol_read_list(FILE *file);
+extern struct symbol *symbol_get(uintptr_t addr, const char *name);
+
+/*
  * types.c
  */
 
 struct state {
 	Dwfl_Module *mod;
 	Dwarf *dbg;
+	struct symbol *sym;
+	Dwarf_Die die;
 };
 
 typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);
