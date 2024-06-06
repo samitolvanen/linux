@@ -156,6 +156,19 @@ int die_map_add_string(struct die *cd, const char *str)
 	return 0;
 }
 
+int die_map_add_linebreak(struct die *cd, int linebreak)
+{
+	struct die_fragment *df;
+
+	if (!cd)
+		return 0;
+
+	check(append_item(cd, &df));
+	df->data.linebreak = linebreak;
+	df->type = LINEBREAK;
+	return 0;
+}
+
 int die_map_add_die(struct die *cd, struct die *child)
 {
 	struct die_fragment *df;

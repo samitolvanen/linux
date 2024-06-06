@@ -58,6 +58,9 @@ extern bool debug;
 /* Error == negative values */
 #define checkp(expr) __check(expr, __res < 0, __res)
 
+/* Consistent aliases (DW_TAG_<type>_type) for DWARF tags */
+#define DW_TAG_typedef_type DW_TAG_typedef
+
 /*
  * symbols.c
  */
@@ -98,12 +101,13 @@ extern struct symbol *symbol_get(const char *name);
  */
 
 enum die_state { INCOMPLETE, COMPLETE, LAST = COMPLETE };
-enum die_fragment_type { EMPTY, STRING, DIE };
+enum die_fragment_type { EMPTY, STRING, LINEBREAK, DIE };
 
 struct die_fragment {
 	enum die_fragment_type type;
 	union {
 		char *str;
+		int linebreak;
 		uintptr_t addr;
 	} data;
 	struct die_fragment *next;
@@ -136,6 +140,7 @@ extern int __die_map_get(uintptr_t addr, enum die_state state,
 			 struct die **res);
 extern int die_map_get(Dwarf_Die *die, enum die_state state, struct die **res);
 extern int die_map_add_string(struct die *pd, const char *str);
+extern int die_map_add_linebreak(struct die *pd, int linebreak);
 extern int die_map_add_die(struct die *pd, struct die *child);
 extern void die_map_free(void);
 
