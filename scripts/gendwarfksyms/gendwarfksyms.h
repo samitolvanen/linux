@@ -19,6 +19,7 @@
  */
 extern bool debug;
 extern bool no_cache;
+extern bool no_pretty_print;
 
 /*
  * Output helpers
@@ -81,12 +82,13 @@ extern void symbol_print_versions(void);
 /*
  * cache.c
  */
-enum cached_item_type { EMPTY, STRING, DIE };
+enum cached_item_type { EMPTY, STRING, LINEBREAK, DIE };
 
 struct cached_item {
 	enum cached_item_type type;
 	union {
 		char *str;
+		int linebreak;
 		uintptr_t addr;
 	} data;
 	struct cached_item *next;
@@ -104,6 +106,7 @@ struct cached_die {
 extern int cache_get(Dwarf_Die *die, enum cached_die_state state,
 		     struct cached_die **res);
 extern int cache_add_string(struct cached_die *pd, const char *str);
+extern int cache_add_linebreak(struct cached_die *pd, int linebreak);
 extern int cache_add_die(struct cached_die *pd, Dwarf_Die *die);
 extern void cache_free(void);
 

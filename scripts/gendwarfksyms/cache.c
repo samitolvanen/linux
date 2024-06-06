@@ -133,6 +133,19 @@ int cache_add_string(struct cached_die *cd, const char *str)
 	return 0;
 }
 
+int cache_add_linebreak(struct cached_die *cd, int linebreak)
+{
+	struct cached_item *ci;
+
+	if (!cd)
+		return 0;
+
+	check(append_item(cd, &ci));
+	ci->data.linebreak = linebreak;
+	ci->type = LINEBREAK;
+	return 0;
+}
+
 int cache_add_die(struct cached_die *cd, Dwarf_Die *die)
 {
 	struct cached_item *ci;

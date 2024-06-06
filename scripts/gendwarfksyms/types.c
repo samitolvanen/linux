@@ -6,6 +6,17 @@
 #include "gendwarfksyms.h"
 #include "crc32.h"
 
+static bool do_linebreak;
+static int indentation_level;
+
+/* Line breaks and indentation for pretty-printing */
+static int process_linebreak(struct cached_die *cache, int n)
+{
+	indentation_level += n;
+	do_linebreak = true;
+	return check(cache_add_linebreak(cache, n));
+}
+
 #define DEFINE_GET_ATTR(attr, type)                                    \
 	static bool get_##attr##_attr(Dwarf_Die *die, unsigned int id, \
 				      type *value)                     \
@@ -78,6 +89,12 @@ static int process(struct state *state, struct cached_die *cache, const char *s)
 {
 	s = s ?: "<null>";
 
+	if (debug && !no_pretty_print && do_linebreak) {
+		fputs("\n", stderr);
+		for (int i = 0; i < indentation_level; i++)
+			fputs("  ", stderr);
+		do_linebreak = false;
+	}
 	if (debug)
 		fputs(s, stderr);
 
@@ -198,7 +215,9 @@ static int __process_type(struct state *state, struct cached_die *cache,
 	check(process(state, cache, type));
 	check(process_fqn(state, cache, die));
 	check(process(state, cache, " {"));
+	check(process_linebreak(cache, 1));
 	check(process_type_attr(state, cache, die));
+	check(process_linebreak(cache, -1));
 	check(process(state, cache, "}"));
 	check(process_byte_size_attr(state, cache, die));
 	return check(process_alignment_attr(state, cache, die));
@@ -242,6 +261,9 @@ static int process_cached(struct state *state, struct cached_die *cache,
 		switch (ci->type) {
 		case STRING:
 			check(process(state, NULL, ci->data.str));
+			break;
+		case LINEBREAK:
+			check(process_linebreak(NULL, ci->data.linebreak));
 			break;
 		case DIE:
 			if (!dwarf_die_addr_die(state->dbg,
