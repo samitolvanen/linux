@@ -106,7 +106,7 @@ extern struct symbol *symbol_get(const char *name);
  * die.c
  */
 
-enum die_state { INCOMPLETE, COMPLETE, LAST = COMPLETE };
+enum die_state { INCOMPLETE, UNEXPANDED, COMPLETE, LAST = COMPLETE };
 enum die_fragment_type { EMPTY, STRING, LINEBREAK, DIE };
 
 struct die_fragment {
@@ -128,6 +128,7 @@ static inline const char *die_state_name(enum die_state state)
 	switch (state) {
 	default:
 	CASE_CONST_TO_STR(INCOMPLETE)
+	CASE_CONST_TO_STR(UNEXPANDED)
 	CASE_CONST_TO_STR(COMPLETE)
 	}
 }
@@ -151,14 +152,49 @@ extern int die_map_add_die(struct die *pd, struct die *child);
 extern void die_map_free(void);
 
 /*
+ * cache.c
+ */
+
+#define EXPANSION_CACHE_HASH_BITS 11
+
+/* A cache for addresses we've already seen. */
+struct expansion_cache {
+	DECLARE_HASHTABLE(cache, EXPANSION_CACHE_HASH_BITS);
+};
+
+extern int __cache_mark_expanded(struct expansion_cache *ec, uintptr_t addr);
+extern bool __cache_was_expanded(struct expansion_cache *ec, uintptr_t addr);
+
+static inline int cache_mark_expanded(struct expansion_cache *ec, void *addr)
+{
+	return __cache_mark_expanded(ec, (uintptr_t)addr);
+}
+
+static inline bool cache_was_expanded(struct expansion_cache *ec, void *addr)
+{
+	return __cache_was_expanded(ec, (uintptr_t)addr);
+}
+
+extern void cache_clear_expanded(struct expansion_cache *ec);
+
+/*
  * dwarf.c
  */
+struct expansion_state {
+	bool expand;
+	bool in_pointer_type;
+	unsigned int ptr_expansion_depth;
+};
 
 struct state {
 	Dwfl_Module *mod;
 	Dwarf *dbg;
 	struct symbol *sym;
 	Dwarf_Die die;
+
+	/* Structure expansion */
+	struct expansion_state expand;
+	struct expansion_cache expansion_cache;
 };
 
 typedef int (*die_callback_t)(struct state *state, struct die *cache,
