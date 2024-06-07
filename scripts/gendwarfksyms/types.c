@@ -168,8 +168,10 @@ static int process_fqn(struct state *state, struct cached_die *cache,
 		return 0;                                                      \
 	}
 
+DEFINE_PROCESS_UDATA_ATTRIBUTE(accessibility)
 DEFINE_PROCESS_UDATA_ATTRIBUTE(alignment)
 DEFINE_PROCESS_UDATA_ATTRIBUTE(byte_size)
+DEFINE_PROCESS_UDATA_ATTRIBUTE(data_member_location)
 
 /* Match functions -- die_match_callback_t */
 #define DEFINE_MATCH(type)                                     \
@@ -178,8 +180,11 @@ DEFINE_PROCESS_UDATA_ATTRIBUTE(byte_size)
 		return dwarf_tag(die) == DW_TAG_##type##_type; \
 	}
 
+DEFINE_MATCH(enumerator)
 DEFINE_MATCH(formal_parameter)
+DEFINE_MATCH(member)
 DEFINE_MATCH(subrange)
+DEFINE_MATCH(variant)
 
 bool match_all(Dwarf_Die *die)
 {
@@ -224,6 +229,8 @@ static int __process_list_type(struct state *state, struct cached_die *cache,
 {
 	check(process(state, cache, type));
 	check(process_type_attr(state, cache, die));
+	check(process_accessibility_attr(state, cache, die));
+	check(process_data_member_location_attr(state, cache, die));
 	check(process(state, cache, ","));
 	return check(process_linebreak(cache, 0));
 }
@@ -236,6 +243,7 @@ static int __process_list_type(struct state *state, struct cached_die *cache,
 	}
 
 DEFINE_PROCESS_LIST_TYPE(formal_parameter)
+DEFINE_PROCESS_LIST_TYPE(member)
 
 /* Container types with DW_AT_type */
 static int __process_type(struct state *state, struct cached_die *cache,
@@ -268,6 +276,7 @@ DEFINE_PROCESS_TYPE(reference)
 DEFINE_PROCESS_TYPE(restrict)
 DEFINE_PROCESS_TYPE(rvalue_reference)
 DEFINE_PROCESS_TYPE(shared)
+DEFINE_PROCESS_TYPE(template_type_parameter)
 DEFINE_PROCESS_TYPE(volatile)
 DEFINE_PROCESS_TYPE(typedef)
 
@@ -320,6 +329,110 @@ static int process_subroutine_type(struct state *state,
 	return check(__process_subroutine_type(state, cache, die,
 					       "subroutine_type"));
 }
+
+static int process_variant_type(struct state *state, struct cached_die *cache,
+				Dwarf_Die *die)
+{
+	return check(process_die_container(state, cache, die, process_type,
+					   match_member_type));
+}
+
+static int process_variant_part_type(struct state *state,
+				     struct cached_die *cache, Dwarf_Die *die)
+{
+	check(process(state, cache, "variant_part {"));
+	check(process_linebreak(cache, 1));
+	check(process_die_container(state, cache, die, process_type,
+				    match_variant_type));
+	check(process_linebreak(cache, -1));
+	check(process(state, cache, "},"));
+	return check(process_linebreak(cache, 0));
+}
+
+static int ___process_structure_type(struct state *state,
+				     struct cached_die *cache, Dwarf_Die *die)
+{
+	switch (dwarf_tag(die)) {
+	case DW_TAG_member:
+	case DW_TAG_variant_part:
+		return check(process_type(state, cache, die));
+	case DW_TAG_class_type:
+	case DW_TAG_enumeration_type:
+	case DW_TAG_structure_type:
+	case DW_TAG_template_type_parameter:
+	case DW_TAG_union_type:
+		check(process_type(state, cache, die));
+		check(process(state, cache, ","));
+		return check(process_linebreak(cache, 0));
+	case DW_TAG_subprogram:
+		return 0; /* Skip member functions */
+	default:
+		error("unexpected structure_type child: %x", dwarf_tag(die));
+		return -1;
+	}
+}
+
+static int __process_structure_type(struct state *state,
+				    struct cached_die *cache, Dwarf_Die *die,
+				    const char *type,
+				    die_callback_t process_func,
+				    die_match_callback_t match_func)
+{
+	check(process(state, cache, type));
+	check(process_fqn(state, cache, die));
+	check(process(state, cache, " {"));
+	check(process_linebreak(cache, 1));
+
+	check(process_die_container(state, cache, die, process_func,
+				    match_func));
+
+	check(process_linebreak(cache, -1));
+	check(process(state, cache, "}"));
+
+	check(process_byte_size_attr(state, cache, die));
+	check(process_alignment_attr(state, cache, die));
+
+	return 0;
+}
+
+#define DEFINE_PROCESS_STRUCTURE_TYPE(structure)                               \
+	static int process_##structure##_type(                                 \
+		struct state *state, struct cached_die *cache, Dwarf_Die *die) \
+	{                                                                      \
+		return check(__process_structure_type(                         \
+			state, cache, die, #structure "_type ",                \
+			___process_structure_type, match_all));                \
+	}
+
+DEFINE_PROCESS_STRUCTURE_TYPE(class)
+DEFINE_PROCESS_STRUCTURE_TYPE(structure)
+DEFINE_PROCESS_STRUCTURE_TYPE(union)
+
+static int process_enumerator_type(struct state *state,
+				   struct cached_die *cache, Dwarf_Die *die)
+{
+	Dwarf_Word value;
+
+	check(process(state, cache, "enumerator "));
+	check(process_fqn(state, cache, die));
+
+	if (get_udata_attr(die, DW_AT_const_value, &value)) {
+		check(process(state, cache, " = "));
+		check(process_fmt(state, cache, "%" PRIu64, value));
+	}
+
+	check(process(state, cache, ","));
+	return check(process_linebreak(cache, 0));
+}
+
+static int process_enumeration_type(struct state *state,
+				    struct cached_die *cache, Dwarf_Die *die)
+{
+	return check(__process_structure_type(state, cache, die,
+					      "enumeration_type ", process_type,
+					      match_enumerator_type));
+}
+
 static int process_base_type(struct state *state, struct cached_die *cache,
 			     Dwarf_Die *die)
 {
@@ -404,17 +517,27 @@ static int process_type(struct state *state, struct cached_die *parent,
 	PROCESS_TYPE(rvalue_reference)
 	PROCESS_TYPE(shared)
 	PROCESS_TYPE(volatile)
+	/* Container types */
+	PROCESS_TYPE(class)
+	PROCESS_TYPE(structure)
+	PROCESS_TYPE(union)
+	PROCESS_TYPE(enumeration)
 	/* Subtypes */
+	PROCESS_TYPE(enumerator)
 	PROCESS_TYPE(formal_parameter)
+	PROCESS_TYPE(member)
 	PROCESS_TYPE(subrange)
+	PROCESS_TYPE(template_type_parameter)
+	PROCESS_TYPE(variant)
+	PROCESS_TYPE(variant_part)
 	/* Other types */
 	PROCESS_TYPE(array)
 	PROCESS_TYPE(base)
 	PROCESS_TYPE(subroutine)
 	PROCESS_TYPE(typedef)
 	default:
-		debug("unimplemented type: %x", tag);
-		break;
+		error("unexpected type: %x", tag);
+		return -1;
 	}
 
 	if (!no_cache) {
