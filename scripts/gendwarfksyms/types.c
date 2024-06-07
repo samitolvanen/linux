@@ -383,14 +383,21 @@ static int __process_structure_type(struct state *state,
 	check(process(state, cache, " {"));
 	check(process_linebreak(cache, 1));
 
-	check(process_die_container(state, cache, die, process_func,
-				    match_func));
+	if (state->expand.expand) {
+		check(cache_mark_expanded(state, die));
+		check(process_die_container(state, cache, die, process_func,
+					    match_func));
+	} else {
+		check(process(state, cache, "<unexpanded>"));
+	}
 
 	check(process_linebreak(cache, -1));
 	check(process(state, cache, "}"));
 
-	check(process_byte_size_attr(state, cache, die));
-	check(process_alignment_attr(state, cache, die));
+	if (state->expand.expand) {
+		check(process_byte_size_attr(state, cache, die));
+		check(process_alignment_attr(state, cache, die));
+	}
 
 	return 0;
 }
@@ -477,8 +484,38 @@ static int process_cached(struct state *state, struct cached_die *cache,
 
 static void state_init(struct state *state)
 {
+	state->expand.expand = true;
+	state->expand.in_pointer_type = false;
+	state->expand.ptr_expansion_depth = 0;
 	state->crc = 0xffffffff;
 }
+static void expansion_state_restore(struct expansion_state *state,
+				    struct expansion_state *saved)
+{
+	state->ptr_expansion_depth = saved->ptr_expansion_depth;
+	state->in_pointer_type = saved->in_pointer_type;
+	state->expand = saved->expand;
+}
+
+static void expansion_state_save(struct expansion_state *state,
+				 struct expansion_state *saved)
+{
+	expansion_state_restore(saved, state);
+}
+
+static bool is_pointer_type(int tag)
+{
+	return tag == DW_TAG_pointer_type || tag == DW_TAG_reference_type;
+}
+
+static bool is_expanded_type(int tag)
+{
+	return tag == DW_TAG_class_type || tag == DW_TAG_structure_type ||
+	       tag == DW_TAG_union_type || tag == DW_TAG_enumeration_type;
+}
+
+/* The maximum depth for expanding structures in pointers */
+#define MAX_POINTER_EXPANSION_DEPTH 2
 
 #define PROCESS_TYPE(type)                                       \
 	case DW_TAG_##type##_type:                               \
@@ -488,19 +525,55 @@ static void state_init(struct state *state)
 static int process_type(struct state *state, struct cached_die *parent,
 			Dwarf_Die *die)
 {
+	enum cached_die_state want_state = COMPLETE;
 	struct cached_die *cache = NULL;
+	struct expansion_state saved;
 	int tag = dwarf_tag(die);
 
+	expansion_state_save(&state->expand, &saved);
+
 	/*
-	 * If we have the DIE already cached, use it instead of walking
+	 * Structures and enumeration types are expanded only once per
+	 * exported symbol. This is sufficient for detecting ABI changes
+	 * within the structure.
+	 *
+	 * If the exported symbol contains a pointer to a structure,
+	 * at most MAX_POINTER_EXPANSION_DEPTH levels are expanded into
+	 * the referenced structure.
+	 */
+	state->expand.in_pointer_type = saved.in_pointer_type ||
+					is_pointer_type(tag);
+
+	if (state->expand.in_pointer_type &&
+	    state->expand.ptr_expansion_depth >= MAX_POINTER_EXPANSION_DEPTH)
+		state->expand.expand = false;
+	else
+		state->expand.expand = saved.expand &&
+				       !cache_was_expanded(state, die);
+
+	/* Keep track of pointer expansion depth */
+	if (state->expand.expand && state->expand.in_pointer_type &&
+	    is_expanded_type(tag))
+		state->expand.ptr_expansion_depth++;
+
+	/*
+	 * If we have want_state already cached, use it instead of walking
 	 * through DWARF.
 	 */
 	if (!no_cache) {
-		check(cache_get(die, COMPLETE, &cache));
+		if (!state->expand.expand && is_expanded_type(tag))
+			want_state = UNEXPANDED;
 
-		if (cache->state == COMPLETE) {
+		check(cache_get(die, want_state, &cache));
+
+		if (cache->state == want_state) {
+			if (want_state == COMPLETE && is_expanded_type(tag))
+				check(cache_mark_expanded(state, die));
+
 			check(process_cached(state, cache, die));
 			check(cache_add_die(parent, die));
+
+			expansion_state_restore(&state->expand, &saved);
 			return 0;
 		}
 	}
@@ -542,10 +615,11 @@ static int process_type(struct state *state, struct cached_die *parent,
 
 	if (!no_cache) {
 		/* Update cache state and append to the parent (if any) */
-		cache->state = COMPLETE;
+		cache->state = want_state;
 		check(cache_add_die(parent, die));
 	}
 
+	expansion_state_restore(&state->expand, &saved);
 	return 0;
 }
 
@@ -597,6 +671,7 @@ static int process_exported_symbols(struct state *state,
 		else
 			check(process_variable(state, &state->die));
 
+		cache_clear_expanded(state);
 		return check(
 			symbol_set_crc(state->sym, state->crc ^ 0xffffffff));
 	default:

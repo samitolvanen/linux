@@ -6,8 +6,6 @@
 #include <string.h>
 #include "gendwarfksyms.h"
 
-#define DIE_HASH_BITS 10
-
 /* die->addr -> struct cached_die */
 static DEFINE_HASHTABLE(die_cache, DIE_HASH_BITS);
 
@@ -157,4 +155,50 @@ int cache_add_die(struct cached_die *cd, Dwarf_Die *die)
 	ci->data.addr = (uintptr_t)die->addr;
 	ci->type = DIE;
 	return 0;
+}
+
+/* A list of structure types that were already expanded for the current symbol */
+struct expanded {
+	uintptr_t addr;
+	struct hlist_node hash;
+};
+
+int cache_mark_expanded(struct state *state, Dwarf_Die *die)
+{
+	struct expanded *es;
+
+	es = malloc(sizeof(struct expanded));
+	if (!es) {
+		error("malloc failed");
+		return -1;
+	}
+
+	es->addr = (uintptr_t)die->addr;
+	hash_add(state->expansion_cache, &es->hash, es->addr);
+	return 0;
+}
+
+bool cache_was_expanded(struct state *state, Dwarf_Die *die)
+{
+	struct expanded *es;
+	uintptr_t addr = (uintptr_t)die->addr;
+
+	hash_for_each_possible(state->expansion_cache, es, hash, addr) {
+		if (es->addr == addr)
+			return true;
+	}
+
+	return false;
+}
+
+void cache_clear_expanded(struct state *state)
+{
+	struct hlist_node *tmp;
+	struct expanded *es;
+	int i;
+
+	hash_for_each_safe(state->expansion_cache, i, tmp, es, hash) {
+		free(es);
+	}
+	hash_init(state->expansion_cache);
 }
