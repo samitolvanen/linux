@@ -84,15 +84,17 @@ static int process(struct state *state, struct die *cache, const char *s)
 {
 	s = s ?: "<null>";
 
-	if (debug && do_linebreak) {
+	if (dump_dies && do_linebreak) {
 		fputs("\n", stderr);
 		for (int i = 0; i < indentation_level; i++)
 			fputs("  ", stderr);
 		do_linebreak = false;
 	}
-	if (debug)
+	if (dump_dies)
 		fputs(s, stderr);
 
+	if (cache)
+		die_debug_r("cache %p string '%s'", cache, s);
 	return check(die_map_add_string(cache, s));
 }
 
@@ -510,6 +512,8 @@ static int process_cached(struct state *state, struct die *cache,
 	while (df) {
 		switch (df->type) {
 		case STRING:
+			die_debug_b("cache %p STRING '%s'", cache,
+				    df->data.str);
 			check(process(state, NULL, df->data.str));
 			break;
 		case LINEBREAK:
@@ -522,6 +526,8 @@ static int process_cached(struct state *state, struct die *cache,
 				error("dwarf_die_addr_die failed");
 				return -1;
 			}
+			die_debug_b("cache %p DIE addr %" PRIxPTR " tag %d",
+				    cache, df->data.addr, dwarf_tag(&child));
 			check(process_type(state, NULL, &child));
 			break;
 		default:
@@ -619,6 +625,9 @@ static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 	check(die_map_get(die, want_state, &cache));
 
 	if (cache->state == want_state) {
+		die_debug_g("cached addr %p tag %d -- %s", die->addr, tag,
+			    die_state_name(cache->state));
+
 		if (want_state == COMPLETE && is_expanded_type(tag))
 			check(cache_mark_expanded(&state->expansion_cache,
 						  die->addr));
@@ -629,6 +638,9 @@ static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 		expansion_state_restore(&state->expand, &saved);
 		return 0;
 	}
+
+	die_debug_g("addr %p tag %d -- INCOMPLETE -> %s", die->addr, tag,
+		    die_state_name(want_state));
 
 	switch (tag) {
 	/* Type modifiers */
@@ -664,6 +676,9 @@ static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 		error("unexpected type: %x", tag);
 		return -1;
 	}
+
+	die_debug_r("parent %p cache %p die addr %p tag %d", parent, cache,
+		    die->addr, tag);
 
 	/* Update cache state and append to the parent (if any) */
 	cache->tag = tag;

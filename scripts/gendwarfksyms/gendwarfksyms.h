@@ -20,6 +20,8 @@
  * Options -- in gendwarfksyms.c
  */
 extern bool debug;
+extern bool dump_dies;
+extern bool dump_die_map;
 
 #define MAX_INPUT_FILES 128
 
@@ -39,6 +41,18 @@ extern bool debug;
 
 #define warn(format, ...) __println("warning: ", format, ##__VA_ARGS__)
 #define error(format, ...) __println("error: ", format, ##__VA_ARGS__)
+
+#define __die_debug(color, format, ...)                                 \
+	do {                                                            \
+		if (dump_dies && dump_die_map)                          \
+			fprintf(stderr,                                 \
+				"\033[" #color "m<" format ">\033[39m", \
+				__VA_ARGS__);                           \
+	} while (0)
+
+#define die_debug_r(format, ...) __die_debug(91, format, __VA_ARGS__)
+#define die_debug_g(format, ...) __die_debug(92, format, __VA_ARGS__)
+#define die_debug_b(format, ...) __die_debug(94, format, __VA_ARGS__)
 
 /*
  * Error handling helpers

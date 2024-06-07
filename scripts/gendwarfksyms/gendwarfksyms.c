@@ -16,6 +16,10 @@
 
 /* Print out debugging information to stderr */
 bool debug;
+/* Print out die_map contents */
+bool dump_dies;
+/* Print out inline debugging information about die_map changes */
+bool dump_die_map;
 
 static const struct {
 	const char *arg;
@@ -23,6 +27,8 @@ static const struct {
 	const char **param;
 } options[] = {
 	{ "--debug", &debug, NULL },
+	{ "--dump-dies", &dump_dies, NULL },
+	{ "--dump-die-map", &dump_die_map, NULL },
 };
 
 static int usage(void)
@@ -110,6 +116,9 @@ int main(int argc, const char **argv)
 
 	if (parse_options(argc, argv) < 0)
 		return usage();
+
+	if (dump_die_map)
+		dump_dies = true;
 
 	check(symbol_read_exports(stdin));
 
