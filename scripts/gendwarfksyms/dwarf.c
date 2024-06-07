@@ -25,6 +25,7 @@ static int process_linebreak(struct die *cache, int n)
 		       !dwarf_form##attr(&da, value);                  \
 	}
 
+DEFINE_GET_ATTR(flag, bool)
 DEFINE_GET_ATTR(udata, Dwarf_Word)
 
 static bool get_ref_die_attr(Dwarf_Die *die, unsigned int id, Dwarf_Die *value)
@@ -67,6 +68,13 @@ static bool is_export_symbol(struct state *state, Dwarf_Die *die)
 
 	state->die = *source;
 	return !!state->sym;
+}
+
+static bool is_declaration(Dwarf_Die *die)
+{
+	bool value;
+
+	return get_flag_attr(die, DW_AT_declaration, &value) && value;
 }
 
 /*
@@ -421,19 +429,26 @@ static int __process_structure_type(struct state *state, struct die *cache,
 				    die_callback_t process_func,
 				    die_match_callback_t match_func)
 {
+	bool is_decl = is_declaration(die);
+
 	check(process(state, cache, type));
 	check(process_fqn(state, cache, die));
 	check(process(state, cache, " {"));
 	check(process_linebreak(cache, 1));
 
-	check(process_die_container(state, cache, die, process_func,
-				    match_func));
+	if (!is_decl && state->expand.expand) {
+		check(cache_mark_expanded(&state->expansion_cache, die->addr));
+		check(process_die_container(state, cache, die, process_func,
+					    match_func));
+	}
 
 	check(process_linebreak(cache, -1));
 	check(process(state, cache, "}"));
 
-	check(process_byte_size_attr(state, cache, die));
-	check(process_alignment_attr(state, cache, die));
+	if (!is_decl && state->expand.expand) {
+		check(process_byte_size_attr(state, cache, die));
+		check(process_alignment_attr(state, cache, die));
+	}
 
 	return 0;
 }
@@ -519,6 +534,42 @@ static int process_cached(struct state *state, struct die *cache,
 	return 0;
 }
 
+static void state_init(struct state *state)
+{
+	state->expand.expand = true;
+	state->expand.in_pointer_type = false;
+	state->expand.ptr_expansion_depth = 0;
+	hash_init(state->expansion_cache.cache);
+}
+
+static void expansion_state_restore(struct expansion_state *state,
+				    struct expansion_state *saved)
+{
+	state->ptr_expansion_depth = saved->ptr_expansion_depth;
+	state->in_pointer_type = saved->in_pointer_type;
+	state->expand = saved->expand;
+}
+
+static void expansion_state_save(struct expansion_state *state,
+				 struct expansion_state *saved)
+{
+	expansion_state_restore(saved, state);
+}
+
+static bool is_pointer_type(int tag)
+{
+	return tag == DW_TAG_pointer_type || tag == DW_TAG_reference_type;
+}
+
+static bool is_expanded_type(int tag)
+{
+	return tag == DW_TAG_class_type || tag == DW_TAG_structure_type ||
+	       tag == DW_TAG_union_type || tag == DW_TAG_enumeration_type;
+}
+
+/* The maximum depth for expanding structures in pointers */
+#define MAX_POINTER_EXPANSION_DEPTH 2
+
 #define PROCESS_TYPE(type)                                       \
 	case DW_TAG_##type##_type:                               \
 		check(process_##type##_type(state, cache, die)); \
@@ -526,18 +577,56 @@ static int process_cached(struct state *state, struct die *cache,
 
 static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 {
+	enum die_state want_state = COMPLETE;
 	struct die *cache = NULL;
+	struct expansion_state saved;
 	int tag = dwarf_tag(die);
 
+	expansion_state_save(&state->expand, &saved);
+
 	/*
-	 * If we have the DIE already cached, use it instead of walking
+	 * Structures and enumeration types are expanded only once per
+	 * exported symbol. This is sufficient for detecting ABI changes
+	 * within the structure.
+	 *
+	 * If the exported symbol contains a pointer to a structure,
+	 * at most MAX_POINTER_EXPANSION_DEPTH levels are expanded into
+	 * the referenced structure.
+	 */
+	state->expand.in_pointer_type = saved.in_pointer_type ||
+					is_pointer_type(tag);
+
+	if (state->expand.in_pointer_type &&
+	    state->expand.ptr_expansion_depth >= MAX_POINTER_EXPANSION_DEPTH)
+		state->expand.expand = false;
+	else
+		state->expand.expand =
+			saved.expand &&
+			!cache_was_expanded(&state->expansion_cache, die->addr);
+
+	/* Keep track of pointer expansion depth */
+	if (state->expand.expand && state->expand.in_pointer_type &&
+	    is_expanded_type(tag))
+		state->expand.ptr_expansion_depth++;
+
+	/*
+	 * If we have want_state already cached, use it instead of walking
 	 * through DWARF.
 	 */
-	check(die_map_get(die, COMPLETE, &cache));
+	if (!state->expand.expand && is_expanded_type(tag))
+		want_state = UNEXPANDED;
 
-	if (cache->state == COMPLETE) {
+	check(die_map_get(die, want_state, &cache));
+
+	if (cache->state == want_state) {
+		if (want_state == COMPLETE && is_expanded_type(tag))
+			check(cache_mark_expanded(&state->expansion_cache,
+						  die->addr));
+
 		check(process_cached(state, cache, die));
 		check(die_map_add_die(parent, cache));
+
+		expansion_state_restore(&state->expand, &saved);
 		return 0;
 	}
 
@@ -578,9 +667,10 @@ static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 
 	/* Update cache state and append to the parent (if any) */
 	cache->tag = tag;
-	cache->state = COMPLETE;
+	cache->state = want_state;
 	check(die_map_add_die(parent, cache));
 
+	expansion_state_restore(&state->expand, &saved);
 	return 0;
 }
 
@@ -643,6 +733,7 @@ static int process_exported_symbols(struct state *state, struct die *cache,
 			return 0;
 
 		debug("%s", state->sym->name);
+		state_init(state);
 
 		if (is_symbol_ptr(get_name(&state->die)))
 			check(process_symbol_ptr(state, &state->die));
@@ -651,6 +742,7 @@ static int process_exported_symbols(struct state *state, struct die *cache,
 		else
 			check(process_variable(state, &state->die));
 
+		cache_clear_expanded(&state->expansion_cache);
 		return 0;
 	default:
 		return 0;
