@@ -99,6 +99,7 @@ static int process(struct state *state, struct cached_die *cache, const char *s)
 		fputs(s, stderr);
 
 	state->crc = partial_crc32(s, state->crc);
+	inline_debug_r("cache %p string '%s'", cache, s);
 	return cache_add_string(cache, s);
 }
 
@@ -458,6 +459,8 @@ static int process_cached(struct state *state, struct cached_die *cache,
 	while (ci) {
 		switch (ci->type) {
 		case STRING:
+			inline_debug_b("cache %p STRING '%s'", cache,
+				       ci->data.str);
 			check(process(state, NULL, ci->data.str));
 			break;
 		case LINEBREAK:
@@ -470,6 +473,8 @@ static int process_cached(struct state *state, struct cached_die *cache,
 				error("dwarf_die_addr_die failed");
 				return -1;
 			}
+			inline_debug_b("cache %p DIE addr %lx tag %d", cache,
+				       ci->data.addr, dwarf_tag(&child));
 			check(process_type(state, NULL, &child));
 			break;
 		default:
@@ -567,6 +572,9 @@ static int process_type(struct state *state, struct cached_die *parent,
 		check(cache_get(die, want_state, &cache));
 
 		if (cache->state == want_state) {
+			inline_debug_g("cached addr %p tag %d -- %s", die->addr,
+				       tag, cache_state_name(cache->state));
+
 			if (want_state == COMPLETE && is_expanded_type(tag))
 				check(cache_mark_expanded(state, die));
 
@@ -577,6 +585,9 @@ static int process_type(struct state *state, struct cached_die *parent,
 			return 0;
 		}
 	}
+
+	inline_debug_g("addr %p tag %d -- INCOMPLETE -> %s", die->addr, tag,
+		       cache_state_name(want_state));
 
 	switch (tag) {
 	/* Type modifiers */
@@ -614,6 +625,9 @@ static int process_type(struct state *state, struct cached_die *parent,
 	}
 
 	if (!no_cache) {
+		inline_debug_r("parent %p cache %p die addr %p tag %d", parent,
+			       cache, die->addr, tag);
+
 		/* Update cache state and append to the parent (if any) */
 		cache->state = want_state;
 		check(cache_add_die(parent, die));

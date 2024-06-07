@@ -15,6 +15,8 @@
 
 /* Print type descriptions and debugging output to stderr */
 bool debug;
+/* Print inline debugging information to stderr (with --debug) */
+bool inline_debug;
 /* Don't use caching */
 bool no_cache;
 /* Don't pretty-print (with --debug) */
@@ -25,6 +27,7 @@ static const struct {
 	bool *flag;
 } options[] = {
 	{ "--debug", &debug },
+	{ "--inline-debug", &inline_debug },
 	{ "--no-cache", &no_cache },
 	{ "--no-pretty-print", &no_pretty_print },
 };

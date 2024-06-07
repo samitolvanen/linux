@@ -18,6 +18,7 @@
  * Options -- in gendwarfksyms.c
  */
 extern bool debug;
+extern bool inline_debug;
 extern bool no_cache;
 extern bool no_pretty_print;
 
@@ -37,6 +38,18 @@ extern bool no_pretty_print;
 
 #define warn(format, ...) __println("warning: ", format, ##__VA_ARGS__)
 #define error(format, ...) __println("error: ", format, ##__VA_ARGS__)
+
+#define __inline_debug(color, format, ...)                              \
+	do {                                                            \
+		if (debug && inline_debug)                              \
+			fprintf(stderr,                                 \
+				"\033[" #color "m<" format ">\033[39m", \
+				__VA_ARGS__);                           \
+	} while (0)
+
+#define inline_debug_r(format, ...) __inline_debug(91, format, __VA_ARGS__)
+#define inline_debug_g(format, ...) __inline_debug(92, format, __VA_ARGS__)
+#define inline_debug_b(format, ...) __inline_debug(94, format, __VA_ARGS__)
 
 /*
  * Error handling helpers
@@ -103,6 +116,19 @@ struct cached_item {
 };
 
 enum cached_die_state { INCOMPLETE, UNEXPANDED, COMPLETE };
+
+static inline const char *cache_state_name(enum cached_die_state state)
+{
+	switch (state) {
+	default:
+	case INCOMPLETE:
+		return "INCOMPLETE";
+	case UNEXPANDED:
+		return "UNEXPANDED";
+	case COMPLETE:
+		return "COMPLETE";
+	}
+}
 
 struct cached_die {
 	enum cached_die_state state;
