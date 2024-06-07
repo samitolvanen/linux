@@ -103,6 +103,8 @@ extern void symbol_print_versions(void);
 /*
  * cache.c
  */
+#define DIE_HASH_BITS 10
+
 enum cached_item_type { EMPTY, STRING, LINEBREAK, DIE };
 
 struct cached_item {
@@ -115,7 +117,7 @@ struct cached_item {
 	struct cached_item *next;
 };
 
-enum cached_die_state { INCOMPLETE, COMPLETE };
+enum cached_die_state { INCOMPLETE, UNEXPANDED, COMPLETE };
 
 struct cached_die {
 	enum cached_die_state state;
@@ -131,9 +133,20 @@ extern int cache_add_linebreak(struct cached_die *pd, int linebreak);
 extern int cache_add_die(struct cached_die *pd, Dwarf_Die *die);
 extern void cache_free(void);
 
+struct state;
+
+extern int cache_mark_expanded(struct state *state, Dwarf_Die *die);
+extern bool cache_was_expanded(struct state *state, Dwarf_Die *die);
+extern void cache_clear_expanded(struct state *state);
+
 /*
  * types.c
  */
+struct expansion_state {
+	bool expand;
+	bool in_pointer_type;
+	unsigned int ptr_expansion_depth;
+};
 
 struct state {
 	Dwfl_Module *mod;
@@ -141,6 +154,10 @@ struct state {
 	struct symbol *sym;
 	Dwarf_Die die;
 	unsigned long crc;
+
+	/* Structure expansion */
+	struct expansion_state expand;
+	DECLARE_HASHTABLE(expansion_cache, DIE_HASH_BITS);
 };
 
 typedef int (*die_callback_t)(struct state *state, struct cached_die *cache,
