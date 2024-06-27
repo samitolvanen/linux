@@ -168,9 +168,21 @@ config MODVERSIONS
 	  make them incompatible with the kernel you are running.  If
 	  unsure, say N.
 
+config DWARF_MODVERSIONS
+	bool "Use DWARF debugging information for module versioning"
+	depends on MODVERSIONS
+	depends on DEBUG_INFO
+	# Requires full debugging information, split DWARF not supported.
+	depends on !DEBUG_INFO_REDUCED
+	depends on !DEBUG_INFO_SPLIT
+	depends on !LTO
+	help
+	  Use DWARF debugging information for computing symbol versions
+	  instead of genksyms. If unsure, say N.
+
 config ASM_MODVERSIONS
 	bool
-	default HAVE_ASM_MODVERSIONS && MODVERSIONS
+	default HAVE_ASM_MODVERSIONS && MODVERSIONS && !DWARF_MODVERSIONS
 	help
 	  This enables module versioning for exported symbols also from
 	  assembly. This can be enabled only when the target architecture

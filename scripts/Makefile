@@ -54,8 +54,8 @@ targets += module.lds
 
 subdir-$(CONFIG_GCC_PLUGINS) += gcc-plugins
 subdir-$(CONFIG_MODVERSIONS) += genksyms
+subdir-$(CONFIG_DWARF_MODVERSIONS) += gendwarfksyms
 subdir-$(CONFIG_SECURITY_SELINUX) += selinux
-subdir-$(if $(CONFIG_RUST),$(CONFIG_MODVERSIONS)) += gendwarfksyms
 
 # Let clean descend into subdirs
 subdir-	+= basic dtc gdb kconfig mod
