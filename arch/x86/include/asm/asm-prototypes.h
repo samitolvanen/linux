@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <asm/ptrace.h>
 #include <asm/ftrace.h>
 #include <linux/uaccess.h>
 #include <linux/pgtable.h>
