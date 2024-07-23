@@ -274,8 +274,12 @@ int process_die_container(struct state *state, struct die *cache,
 
 	res = checkp(dwarf_child(die, &current));
 	while (!res) {
-		if (match(&current))
-			check(func(state, cache, &current));
+		if (match(&current)) {
+			/* <0 = error, 0 = continue, >0 = stop */
+			res = checkp(func(state, cache, &current));
+			if (res)
+				return res;
+		}
 		res = checkp(dwarf_siblingof(&current, &current));
 	}
 
@@ -490,7 +494,145 @@ static int __process_structure_type(struct state *state, struct die *cache,
 
 DEFINE_PROCESS_STRUCTURE_TYPE(class)
 DEFINE_PROCESS_STRUCTURE_TYPE(structure)
-DEFINE_PROCESS_STRUCTURE_TYPE(union)
+
+static bool is_reserved_member(Dwarf_Die *die)
+{
+	const char *name = get_name(die);
+
+	return name && !strncmp(name, RESERVED_PREFIX, RESERVED_PREFIX_LEN);
+}
+
+static int __process_reserved_struct(struct state *state, struct die *cache,
+				     Dwarf_Die *die)
+{
+	Dwarf_Die type;
+
+	/*
+	 * If the union member is a struct, expect the placeholder type to
+	 * be the first member, i.e.:
+	 *
+	 * union {
+	 * 	type replaced_member;
+	 * 	struct {
+	 * 		type placeholder; // <- type
+	 * 	}
+	 * };
+	 *
+	 * Stop processing if this member isn't reserved.
+	 */
+	if (!is_reserved_member(die))
+		return NOT_RESERVED;
+
+	if (!get_ref_die_attr(die, DW_AT_type, &type)) {
+		error("structure member missing a type?");
+		return -1;
+	}
+
+	check(process_type(state, cache, &type));
+	return RESERVED;
+}
+
+static int __process_reserved_union(struct state *state, struct die *cache,
+				    Dwarf_Die *die)
+{
+	int res = NOT_RESERVED;
+	Dwarf_Die type;
+
+	if (!get_ref_die_attr(die, DW_AT_type, &type)) {
+		error("union member missing a type?");
+		return -1;
+	}
+
+	/*
+	 * We expect a union with two members. Check if either of them
+	 * has the reserved name prefix, i.e.:
+	 *
+	 * union {
+	 * 	...
+	 * 	type memberN; // <- type, N = {0,1}
+	 *	...
+	 * };
+	 *
+	 * The member can also be a structure type, in which case we'll
+	 * check the first structure member.
+	 *
+	 * Stop processing after we've seen two members.
+	 */
+	if (is_reserved_member(die)) {
+		check(process_type(state, cache, &type));
+		return RESERVED;
+	}
+
+	if (dwarf_tag(&type) == DW_TAG_structure_type)
+		res = checkp(process_die_container(state, cache, &type,
+						   __process_reserved_struct,
+						   match_member_type));
+	if (res != RESERVED && ++state->reserved.members < 2)
+		return 0; /* Continue */
+
+	return res;
+}
+
+static int process_reserved(struct state *state, struct die *cache,
+			    Dwarf_Die *die)
+{
+	if (!stable)
+		return NOT_RESERVED;
+
+	/*
+	 * To maintain a stable kABI, distributions may choose to reserve
+	 * space in structs for later use by adding placeholder members,
+	 * for example:
+	 *
+	 * struct s {
+	 * 	u64 a;
+	 *	// placeholder
+	 * 	u64 __kabi_reserved_0;
+	 * };
+	 *
+	 * When the reserved member is taken into use, the type change
+	 * would normally cause the symbol version to change as well, but
+	 * if the replacement uses the following convention, gendwarfksyms
+	 * continues to use the placeholder type for versioning instead,
+	 * thus maintaining the same symbol version:
+	 *
+	 * struct s {
+	 * 	u64 a;
+	 *	union {
+	 * 		// replaced member
+	 * 		struct t b;
+	 * 		struct {
+	 * 			// original placeholder
+	 * 			u64 __kabi_reserved_0;
+	 * 		};
+	 * 	};
+	 * };
+	 *
+	 * I.e., as long as the replaced member is in a union, and the
+	 * placeholder has a __kabi_reserved name prefix, we'll continue
+	 * to use the placeholder type (here u64) for version calculation
+	 * instead of the union type.
+	 *
+	 * Note that the user is responsible for ensuring that the
+	 * replacement type is ABI compatible with the placeholder type.
+	 */
+	state->reserved.members = 0;
+
+	return checkp(process_die_container(state, cache, die,
+					    __process_reserved_union,
+					    match_member_type));
+}
+
+static int process_union_type(struct state *state, struct die *cache,
+			      Dwarf_Die *die)
+{
+	if (checkp(process_reserved(state, cache, die)) == RESERVED)
+		return 0;
+
+	return check(__process_structure_type(state, cache, die, "union_type ",
+					      ___process_structure_type,
+					      match_all));
+}
 
 static int process_enumerator_type(struct state *state, struct die *cache,
 				   Dwarf_Die *die)

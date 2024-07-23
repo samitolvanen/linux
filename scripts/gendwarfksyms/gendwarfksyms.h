@@ -220,10 +220,25 @@ extern void cache_clear_expanded(struct expansion_cache *ec);
 /*
  * dwarf.c
  */
+
+/* See dwarf.c:process_reserved */
+#define RESERVED_PREFIX "__kabi_reserved"
+#define RESERVED_PREFIX_LEN (sizeof(RESERVED_PREFIX) - 1)
+
 struct expansion_state {
 	bool expand;
 	bool in_pointer_type;
 	unsigned int ptr_expansion_depth;
+};
+
+enum reserved_status {
+	/* >0 to stop DIE processing */
+	NOT_RESERVED = 1,
+	RESERVED
+};
+
+struct reserved_state {
+	int members;
 };
 
 struct state {
@@ -235,6 +250,9 @@ struct state {
 	/* Structure expansion */
 	struct expansion_state expand;
 	struct expansion_cache expansion_cache;
+
+	/* Reserved members */
+	struct reserved_state reserved;
 };
 
 typedef int (*die_callback_t)(struct state *state, struct die *cache,
