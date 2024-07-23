@@ -223,11 +223,17 @@ void cache_clear_expanded(struct expansion_cache *ec);
 /*
  * dwarf.c
  */
+
 struct expansion_state {
 	bool expand;
 	unsigned int ptr_depth;
 	unsigned int ptr_expansion_depth;
 	const char *current_fqn;
+};
+
+struct kabi_state {
+	int members;
+	Dwarf_Die placeholder;
 };
 
 struct state {
@@ -240,6 +246,9 @@ struct state {
 	/* Structure expansion */
 	struct expansion_state expand;
 	struct expansion_cache expansion_cache;
+
+	/* Reserved or ignored members */
+	struct kabi_state kabi;
 };
 
 typedef int (*die_callback_t)(struct state *state, struct die *cache,
