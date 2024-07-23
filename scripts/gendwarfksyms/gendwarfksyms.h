@@ -27,6 +27,7 @@ extern int dump_dies;
 extern int dump_die_map;
 extern int dump_types;
 extern int dump_versions;
+extern int stable;
 extern int symtypes;
 
 /*
@@ -226,6 +227,7 @@ struct expansion_state {
 	bool expand;
 	unsigned int ptr_depth;
 	unsigned int ptr_expansion_depth;
+	const char *current_fqn;
 };
 
 struct state {
@@ -256,5 +258,15 @@ void process_cu(Dwarf_Die *cudie);
  */
 
 void generate_symtypes_and_versions(FILE *file);
+
+/*
+ * kabi.c
+ */
+
+bool kabi_is_enumerator_ignored(const char *fqn, const char *field);
+bool kabi_is_struct_declonly(const char *fqn);
+
+void kabi_read_rules(int fd);
+void kabi_free(void);
 
 #endif /* __GENDWARFKSYMS_H */
