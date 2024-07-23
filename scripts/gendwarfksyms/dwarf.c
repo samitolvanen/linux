@@ -74,7 +74,30 @@ static bool is_declaration(Dwarf_Die *die)
 {
 	bool value;
 
-	return get_flag_attr(die, DW_AT_declaration, &value) && value;
+	/*
+	 * If the object file has a __gendwarfksyms_declonly_<structname>
+	 * symbol, we treat structures named "structname" as declarations,
+	 * i.e. they won't be expanded when calculating symbol versions.
+	 * This helps distributions maintain a stable kABI e.g., if extra
+	 * includes change a declaration into a definition.
+	 *
+	 * A simple way to mark a structure declaration-only in the source
+	 * code is to define a discarded symbol:
+	 *
+	 * #define GENDWARFKSYMS_DECLONLY(structname) \
+	 *   static void *__gendwarfksyms_declonly_##structname __used \
+	 *     __section(".discard.gendwarfksyms")
+	 *
+	 *  For example:
+	 *
+	 *  struct struct0 { int a; }
+	 *  GENDWARFKSYMS_DECLONLY(struct0);
+	 *
+	 *  Here, struct0 would be always be considered a declaration even
+	 *  though the definition is visible.
+	 */
+	return (get_flag_attr(die, DW_AT_declaration, &value) && value) ||
+	       is_struct_declonly(get_name(die));
 }
 
 /*

@@ -5,12 +5,20 @@
 
 #include "gendwarfksyms.h"
 
+struct declonly {
+	const char *name;
+	struct hlist_node hash;
+};
+
 #define SYMBOL_HASH_BITS 15
+#define DECLONLY_HASH_BITS 10
 
 /* struct symbol_addr -> struct symbol */
 static DEFINE_HASHTABLE(symbol_addrs, SYMBOL_HASH_BITS);
 /* name -> struct symbol */
 static DEFINE_HASHTABLE(symbol_names, SYMBOL_HASH_BITS);
+/* name -> struct declonly */
+static DEFINE_HASHTABLE(declonly_structs, DECLONLY_HASH_BITS);
 
 static inline u32 symbol_addr_hash(const struct symbol_addr *addr)
 {
@@ -296,11 +304,35 @@ static int process_symbol(const char *name, GElf_Sym *sym, Elf32_Word xndx,
 			  void *arg)
 {
 	struct symbol_addr addr = { .section = xndx, .address = sym->st_value };
+	struct declonly *d;
 
 	/* Set addresses for exported symbols */
 	if (GELF_ST_BIND(sym->st_info) != STB_LOCAL &&
 	    addr.section != SHN_UNDEF)
 		checkp(for_each(name, true, set_symbol_addr, &addr));
+
+	if (!stable)
+		return 0;
+
+	/* Process declonly structs */
+	if (strncmp(name, SYMBOL_DECLONLY_PREFIX, SYMBOL_DECLONLY_PREFIX_LEN))
+		return 0;
+
+	d = malloc(sizeof(struct declonly));
+	if (!d) {
+		error("malloc failed");
+		return -1;
+	}
+
+	name += SYMBOL_DECLONLY_PREFIX_LEN;
+	d->name = strdup(name);
+	if (!d->name) {
+		error("strdup failed");
+		return -1;
+	}
+
+	hash_add(declonly_structs, &d->hash, name_hash(d->name));
+	debug("declaration-only: %s", d->name);
 
 	return 0;
 }
@@ -308,6 +340,35 @@ static int process_symbol(const char *name, GElf_Sym *sym, Elf32_Word xndx,
 int symbol_read_symtab(int fd)
 {
 	return elf_for_each_symbol(fd, process_symbol, NULL);
+}
+
+bool is_struct_declonly(const char *name)
+{
+	struct declonly *d;
+
+	if (!stable || !name)
+		return false;
+
+	hash_for_each_possible(declonly_structs, d, hash, name_hash(name)) {
+		if (!strcmp(name, d->name))
+			return true;
+	}
+
+	return false;
+}
+
+void symbol_free_declonly(void)
+{
+	struct hlist_node *tmp;
+	struct declonly *d;
+	int i;
+
+	hash_for_each_safe(declonly_structs, i, tmp, d, hash) {
+		free((void *)d->name);
+		free(d);
+	}
+
+	hash_init(declonly_structs);
 }
 
 void symbol_print_versions(void)
