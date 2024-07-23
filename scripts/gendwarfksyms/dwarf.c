@@ -80,11 +80,12 @@ static bool match_export_symbol(struct state *state, Dwarf_Die *die)
 	return !!state->sym;
 }
 
-static bool is_declaration(Dwarf_Die *die)
+static bool is_declaration(struct die *cache, Dwarf_Die *die)
 {
 	bool value;
 
-	return get_flag_attr(die, DW_AT_declaration, &value) && value;
+	return (get_flag_attr(die, DW_AT_declaration, &value) && value) ||
+	       kabi_is_struct_declonly(cache->fqn);
 }
 
 /*
@@ -472,7 +473,7 @@ static void __process_structure_type(struct state *state, struct die *cache,
 	process(cache, " {");
 	process_linebreak(cache, 1);
 
-	is_decl = is_declaration(die);
+	is_decl = is_declaration(cache, die);
 
 	if (!is_decl && state->expand.expand) {
 		state->expand.current_fqn = cache->fqn;
@@ -507,6 +508,15 @@ static void process_enumerator_type(struct state *state, struct die *cache,
 				    Dwarf_Die *die)
 {
 	Dwarf_Word value;
+
+	if (stable) {
+		/* Get the fqn before we process anything */
+		update_fqn(cache, die);
+
+		if (kabi_is_enumerator_ignored(state->expand.current_fqn,
+					       cache->fqn))
+			return;
+	}
 
 	process_list_comma(state, cache);
 	process(cache, "enumerator");
@@ -580,6 +590,7 @@ static void state_init(struct state *state)
 	state->expand.expand = true;
 	state->expand.ptr_depth = 0;
 	state->expand.ptr_expansion_depth = 0;
+	state->expand.current_fqn = NULL;
 	hash_init(state->expansion_cache.cache);
 }
 
@@ -589,6 +600,7 @@ static void expansion_state_restore(struct expansion_state *state,
 	state->expand = saved->expand;
 	state->ptr_depth = saved->ptr_depth;
 	state->ptr_expansion_depth = saved->ptr_expansion_depth;
+	state->current_fqn = saved->current_fqn;
 }
 
 static void expansion_state_save(struct expansion_state *state,
