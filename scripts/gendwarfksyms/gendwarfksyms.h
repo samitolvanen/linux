@@ -27,6 +27,7 @@ extern int dump_dies;
 extern int dump_die_map;
 extern int dump_types;
 extern int dump_versions;
+extern int stable;
 extern int symtypes;
 
 /*
@@ -225,6 +226,7 @@ struct expansion_state {
 	bool expand;
 	unsigned int ptr_depth;
 	unsigned int ptr_expansion_depth;
+	const char *current_fqn;
 };
 
 struct state {
@@ -255,5 +257,60 @@ void process_cu(Dwarf_Die *cudie);
  */
 
 void generate_symtypes_and_versions(FILE *file);
+
+/*
+ * kabi.c
+ */
+
+#define KABI_RULE_SECTION ".discard.gendwarfksyms.kabi_rules"
+#define KABI_RULE_VERSION "1"
+
+/*
+ * The rule section consists of four null-terminated strings per
+ * entry:
+ *
+ *   1. version
+ *      Entry format version. Must match KABI_RULE_VERSION.
+ *
+ *   2. type
+ *      Type of the kABI rule. Must be one of the tags defined below.
+ *
+ *   3. target
+ *      Rule-dependent target, typically the fully qualified name of
+ *      the target DIE.
+ *
+ *   4. value
+ *      Rule-dependent value.
+ */
+#define KABI_RULE_MIN_ENTRY_SIZE                                       \
+	(/* version\0 */ 2 + /* type\0 */ 2 + /* target\0" */ 2 + \
+	 /* value\0 */ 2)
+#define KABI_RULE_EMPTY_VALUE ";"
+
+/*
+ * Rule: struct_declonly
+ * - For the struct in the target field, treat it as a declaration
+ *   only even if a definition is available.
+ */
+#define KABI_RULE_TAG_STRUCT_DECLONLY "struct_declonly"
+
+/*
+ * Rule: enumerator_ignore
+ * - For the enum in the target field, ignore the named enumerator
+ *   in the value field.
+ */
+#define KABI_RULE_TAG_ENUMERATOR_IGNORE "enumerator_ignore"
+
+enum kabi_rule_type {
+	KABI_RULE_TYPE_UNKNOWN,
+	KABI_RULE_TYPE_STRUCT_DECLONLY,
+	KABI_RULE_TYPE_ENUMERATOR_IGNORE,
+};
+
+bool kabi_is_enumerator_ignored(const char *fqn, const char *field);
+bool kabi_is_struct_declonly(const char *fqn);
+
+void kabi_read_rules(int fd);
+void kabi_free(void);
 
 #endif /* __GENDWARFKSYMS_H */
