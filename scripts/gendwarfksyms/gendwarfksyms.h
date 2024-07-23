@@ -21,6 +21,7 @@ extern bool debug;
 extern bool inline_debug;
 extern bool no_cache;
 extern bool no_pretty_print;
+extern bool stable;
 
 #define MAX_INPUT_FILES 128
 
@@ -86,6 +87,9 @@ extern bool no_pretty_print;
 #define SYMBOL_PTR_PREFIX "__gendwarfksyms_ptr_"
 #define SYMBOL_PTR_PREFIX_LEN (sizeof(SYMBOL_PTR_PREFIX) - 1)
 
+#define SYMBOL_DECLONLY_PREFIX "__gendwarfksyms_declonly_"
+#define SYMBOL_DECLONLY_PREFIX_LEN (sizeof(SYMBOL_DECLONLY_PREFIX) - 1)
+
 enum symbol_state {
 	UNPROCESSED,
 	PROCESSED,
@@ -111,6 +115,8 @@ extern int symbol_set_crc(struct symbol *sym, unsigned long crc);
 extern int symbol_read_exports(FILE *file);
 extern struct symbol *symbol_get_unprocessed(const char *name);
 extern int symbol_read_symtab(int fd);
+extern bool is_struct_declonly(const char *name);
+extern void symbol_free_declonly(void);
 extern void symbol_print_versions(void);
 
 /*

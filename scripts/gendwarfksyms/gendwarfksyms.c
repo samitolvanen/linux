@@ -22,6 +22,8 @@ bool inline_debug;
 bool no_cache;
 /* Don't pretty-print (with --debug) */
 bool no_pretty_print;
+/* Support kABI stability features */
+bool stable;
 
 static const struct {
 	const char *arg;
@@ -31,6 +33,7 @@ static const struct {
 	{ "--inline-debug", &inline_debug },
 	{ "--no-cache", &no_cache },
 	{ "--no-pretty-print", &no_pretty_print },
+	{ "--stable", &stable },
 };
 
 static int usage(void)
@@ -140,6 +143,7 @@ int main(int argc, const char **argv)
 
 		dwfl_end(dwfl);
 		close(fd);
+		symbol_free_declonly();
 		cache_free();
 	}
 
