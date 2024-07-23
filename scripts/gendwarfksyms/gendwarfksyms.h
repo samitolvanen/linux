@@ -24,6 +24,7 @@ extern bool dump_dies;
 extern bool dump_die_map;
 extern bool dump_types;
 extern bool dump_versions;
+extern bool stable;
 extern bool symtypes;
 
 #define MAX_INPUT_FILES 128
@@ -133,6 +134,9 @@ extern int symbol_set_die(struct symbol *sym, Dwarf_Die *die);
 extern int symbol_set_crc(struct symbol *sym, unsigned long crc);
 extern int symbol_for_each(symbol_callback_t func, void *arg);
 extern void symbol_print_versions(void);
+
+extern bool is_struct_declonly(const char *name);
+extern void symbol_free_declonly(void);
 
 /*
  * die.c

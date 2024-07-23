@@ -24,6 +24,8 @@ bool dump_die_map;
 bool dump_types;
 /* Print out expanded type strings used for version calculations */
 bool dump_versions;
+/* Support kABI stability features */
+bool stable;
 /* Produce a symtypes file */
 bool symtypes;
 static const char *symtypes_file;
@@ -38,6 +40,7 @@ static const struct {
 	{ "--dump-die-map", &dump_die_map, NULL },
 	{ "--dump-types", &dump_types, NULL },
 	{ "--dump-versions", &dump_versions, NULL },
+	{ "--stable", &stable, NULL },
 	{ "--symtypes", &symtypes, &symtypes_file },
 };
 
@@ -186,6 +189,7 @@ int main(int argc, const char **argv)
 
 		dwfl_end(dwfl);
 		close(fd);
+		symbol_free_declonly();
 	}
 
 	if (symfile)
