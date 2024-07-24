@@ -1899,7 +1899,7 @@ config RUST
 	depends on HAVE_RUST
 	depends on RUST_IS_AVAILABLE
 	depends on !CFI_CLANG
-	depends on !MODVERSIONS
+	depends on !MODVERSIONS || GENDWARFKSYMS
 	depends on !GCC_PLUGINS
 	depends on !RANDSTRUCT
 	depends on !SHADOW_CALL_STACK
