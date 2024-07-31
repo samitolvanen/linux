@@ -133,5 +133,7 @@ int main(int argc, const char **argv)
 		close(fd);
 	}
 
+	symbol_print_versions();
+
 	return 0;
 }

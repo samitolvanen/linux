@@ -4,6 +4,7 @@
  */
 
 #include "gendwarfksyms.h"
+#include "crc32.h"
 
 static bool get_ref_die_attr(Dwarf_Die *die, unsigned int id, Dwarf_Die *value)
 {
@@ -26,7 +27,7 @@ static const char *get_name(Dwarf_Die *die)
 	return NULL;
 }
 
-static bool is_export_symbol(struct state *state, Dwarf_Die *die)
+static bool is_unprocessed_export_symbol(struct state *state, Dwarf_Die *die)
 {
 	Dwarf_Die *source = die;
 	Dwarf_Die origin;
@@ -37,18 +38,18 @@ static bool is_export_symbol(struct state *state, Dwarf_Die *die)
 	if (get_ref_die_attr(die, DW_AT_abstract_origin, &origin))
 		source = &origin;
 
-	state->sym = symbol_get(get_name(die));
+	state->sym = symbol_get_unprocessed(get_name(die));
 
 	/* Look up using the origin name if there are no matches. */
 	if (!state->sym && source != die)
-		state->sym = symbol_get(get_name(source));
+		state->sym = symbol_get_unprocessed(get_name(source));
 
 	state->die = *source;
 	return !!state->sym;
 }
 
 /*
- * Type string processing
+ * Type string and CRC processing
  */
 static int process(struct state *state, const char *s)
 {
@@ -57,6 +58,7 @@ static int process(struct state *state, const char *s)
 	if (debug)
 		fputs(s, stderr);
 
+	state->crc = partial_crc32(s, state->crc);
 	return 0;
 }
 
@@ -79,6 +81,11 @@ int process_die_container(struct state *state, Dwarf_Die *die,
 	}
 
 	return 0;
+}
+
+static void state_init(struct state *state)
+{
+	state->crc = 0xffffffff;
 }
 
 /*
@@ -131,10 +138,15 @@ static int process_exported_symbols(struct state *state, Dwarf_Die *die)
 	/* Possible exported symbols */
 	case DW_TAG_subprogram:
 	case DW_TAG_variable:
-		if (!is_export_symbol(state, die))
+		if (!is_unprocessed_export_symbol(state, die))
 			return 0;
 
+		/*
+		 * For each exported symbol, compute a CRC of the expanded type
+		 * description.
+		 */
 		debug("%s", state->sym->name);
+		state_init(state);
 
 		if (is_symbol_ptr(get_name(&state->die)))
 			check(process_symbol_ptr(state, &state->die));
@@ -143,7 +155,8 @@ static int process_exported_symbols(struct state *state, Dwarf_Die *die)
 		else
 			check(process_variable(state, &state->die));
 
-		return 0;
+		return check(
+			symbol_set_crc(state->sym, state->crc ^ 0xffffffff));
 	default:
 		return 0;
 	}

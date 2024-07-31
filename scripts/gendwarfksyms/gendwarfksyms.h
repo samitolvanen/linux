@@ -62,6 +62,11 @@ extern bool debug;
 #define SYMBOL_PTR_PREFIX "__gendwarfksyms_ptr_"
 #define SYMBOL_PTR_PREFIX_LEN (sizeof(SYMBOL_PTR_PREFIX) - 1)
 
+enum symbol_state {
+	UNPROCESSED,
+	PROCESSED,
+};
+
 struct symbol_addr {
 	uint32_t section;
 	Elf64_Addr address;
@@ -73,12 +78,16 @@ struct symbol {
 	struct symbol_addr addr;
 	struct hlist_node addr_hash;
 	struct hlist_node name_hash;
+	enum symbol_state state;
+	unsigned long crc;
 };
 
 extern bool is_symbol_ptr(const char *name);
+extern int symbol_set_crc(struct symbol *sym, unsigned long crc);
 extern int symbol_read_exports(FILE *file);
-extern struct symbol *symbol_get(const char *name);
+extern struct symbol *symbol_get_unprocessed(const char *name);
 extern int symbol_read_symtab(int fd);
+extern void symbol_print_versions(void);
 
 /*
  * types.c
@@ -89,6 +98,7 @@ struct state {
 	Dwarf *dbg;
 	struct symbol *sym;
 	Dwarf_Die die;
+	unsigned long crc;
 };
 
 typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);
