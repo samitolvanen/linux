@@ -57,12 +57,27 @@ extern bool debug;
 #define checkp(expr) __check(expr, __res < 0, __res)
 
 /*
+ * symbols.c
+ */
+
+/* Exported symbol */
+struct symbol {
+	const char *name;
+	struct hlist_node name_hash;
+};
+
+extern int symbol_read_exports(FILE *file);
+extern struct symbol *symbol_get(const char *name);
+
+/*
  * types.c
  */
 
 struct state {
 	Dwfl_Module *mod;
 	Dwarf *dbg;
+	struct symbol *sym;
+	Dwarf_Die die;
 };
 
 typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);
