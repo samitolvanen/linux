@@ -61,6 +61,11 @@ extern bool debug;
 /*
  * symbols.c
  */
+
+/* See symbols.c:is_symbol_ptr */
+#define SYMBOL_PTR_PREFIX "__gendwarfksyms_ptr_"
+#define SYMBOL_PTR_PREFIX_LEN (sizeof(SYMBOL_PTR_PREFIX) - 1)
+
 struct symbol_addr {
 	uint32_t section;
 	Elf64_Addr address;
@@ -78,6 +83,7 @@ struct symbol {
 	struct hlist_node name_hash;
 };
 
+extern bool is_symbol_ptr(const char *name);
 extern int symbol_read_exports(FILE *file);
 extern int symbol_read_symtab(int fd);
 extern struct symbol *symbol_get(const char *name);
