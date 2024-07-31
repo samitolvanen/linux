@@ -59,15 +59,22 @@ extern bool debug;
 /*
  * symbols.c
  */
+struct symbol_addr {
+	uint32_t section;
+	Elf64_Addr address;
+};
 
 /* Exported symbol */
 struct symbol {
 	const char *name;
+	struct symbol_addr addr;
+	struct hlist_node addr_hash;
 	struct hlist_node name_hash;
 };
 
 extern int symbol_read_exports(FILE *file);
 extern struct symbol *symbol_get(const char *name);
+extern int symbol_read_symtab(int fd);
 
 /*
  * types.c
