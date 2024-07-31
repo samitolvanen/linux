@@ -45,6 +45,16 @@ static int __for_each_addr(struct symbol *sym, symbol_callback_t func,
 	return processed;
 }
 
+/*
+ * For symbols without debugging information (e.g. symbols defined in other
+ * TUs), also match __gendwarfksyms_ptr_<symbol-name> pointers for ensuring
+ * type information is present in the processed TU.
+ */
+bool is_symbol_ptr(const char *name)
+{
+	return name && !strncmp(name, SYMBOL_PTR_PREFIX, SYMBOL_PTR_PREFIX_LEN);
+}
+
 static int for_each(const char *name, symbol_callback_t func, void *data)
 {
 	struct hlist_node *tmp;
@@ -52,6 +62,8 @@ static int for_each(const char *name, symbol_callback_t func, void *data)
 
 	if (!name || !*name)
 		return 0;
+	if (is_symbol_ptr(name))
+		name += SYMBOL_PTR_PREFIX_LEN;
 
 	hash_for_each_possible_safe(symbol_names, match, tmp, name_hash,
 				    name_hash(name)) {

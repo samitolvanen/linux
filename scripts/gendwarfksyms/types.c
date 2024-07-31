@@ -94,6 +94,28 @@ static int process_variable(struct state *state, Dwarf_Die *die)
 	return check(process(state, "variable;\n"));
 }
 
+static int process_symbol_ptr(struct state *state, Dwarf_Die *die)
+{
+	Dwarf_Die ptr_type;
+	Dwarf_Die type;
+
+	if (!get_ref_die_attr(die, DW_AT_type, &ptr_type) ||
+	    dwarf_tag(&ptr_type) != DW_TAG_pointer_type) {
+		error("%s must be a pointer type!", get_name(die));
+		return -1;
+	}
+
+	if (!get_ref_die_attr(&ptr_type, DW_AT_type, &type)) {
+		error("%s pointer missing a type attribute?", get_name(die));
+		return -1;
+	}
+
+	if (dwarf_tag(&type) == DW_TAG_subroutine_type)
+		return check(process_subprogram(state, &type));
+	else
+		return check(process_variable(state, &ptr_type));
+}
+
 static int process_exported_symbols(struct state *state, Dwarf_Die *die)
 {
 	int tag = dwarf_tag(die);
@@ -114,7 +136,9 @@ static int process_exported_symbols(struct state *state, Dwarf_Die *die)
 
 		debug("%s", state->sym->name);
 
-		if (tag == DW_TAG_subprogram)
+		if (is_symbol_ptr(get_name(&state->die)))
+			check(process_symbol_ptr(state, &state->die));
+		else if (tag == DW_TAG_subprogram)
 			check(process_subprogram(state, &state->die));
 		else
 			check(process_variable(state, &state->die));
