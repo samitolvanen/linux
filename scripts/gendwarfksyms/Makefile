@@ -4,6 +4,7 @@ gendwarfksyms-objs += gendwarfksyms.o
 gendwarfksyms-objs += cache.o
 gendwarfksyms-objs += crc32.o
 gendwarfksyms-objs += symbols.o
+gendwarfksyms-objs += symtypes.o
 gendwarfksyms-objs += types.o
 
 HOST_EXTRACFLAGS := -I $(srctree)/tools/include

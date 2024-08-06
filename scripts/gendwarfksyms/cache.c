@@ -23,6 +23,8 @@ static int create_die(Dwarf_Die *die, struct cached_die **res)
 	}
 
 	cd->state = INCOMPLETE;
+	cd->name = NULL;
+	cd->tag = -1;
 	cd->addr = (uintptr_t)die->addr;
 	cd->list = NULL;
 
@@ -31,18 +33,27 @@ static int create_die(Dwarf_Die *die, struct cached_die **res)
 	return 0;
 }
 
-int cache_get(Dwarf_Die *die, enum cached_die_state state,
-	      struct cached_die **res)
+int __cache_get(uintptr_t addr, enum cached_die_state state,
+		struct cached_die **res)
 {
 	struct cached_die *cd;
-	uintptr_t addr = (uintptr_t)die->addr;
 
 	hash_for_each_possible(die_cache, cd, hash, addr) {
 		if (cd->addr == addr && cd->state == state) {
 			*res = cd;
-			cache_hits++;
 			return 0;
 		}
+	}
+
+	return -1;
+}
+
+int cache_get(Dwarf_Die *die, enum cached_die_state state,
+	      struct cached_die **res)
+{
+	if (__cache_get((uintptr_t)die->addr, state, res) == 0) {
+		cache_hits++;
+		return 0;
 	}
 
 	cache_misses++;
@@ -144,7 +155,7 @@ int cache_add_linebreak(struct cached_die *cd, int linebreak)
 	return 0;
 }
 
-int cache_add_die(struct cached_die *cd, Dwarf_Die *die)
+int cache_add_die(struct cached_die *cd, struct cached_die *child)
 {
 	struct cached_item *ci;
 
@@ -152,7 +163,7 @@ int cache_add_die(struct cached_die *cd, Dwarf_Die *die)
 		return 0;
 
 	check(append_item(cd, &ci));
-	ci->data.addr = (uintptr_t)die->addr;
+	ci->data.addr = child->addr;
 	ci->type = DIE;
 	return 0;
 }
@@ -163,7 +174,7 @@ struct expanded {
 	struct hlist_node hash;
 };
 
-int cache_mark_expanded(struct state *state, Dwarf_Die *die)
+int __cache_mark_expanded(struct expansion_cache *ec, uintptr_t addr)
 {
 	struct expanded *es;
 
@@ -173,17 +184,16 @@ int cache_mark_expanded(struct state *state, Dwarf_Die *die)
 		return -1;
 	}
 
-	es->addr = (uintptr_t)die->addr;
-	hash_add(state->expansion_cache, &es->hash, es->addr);
+	es->addr = addr;
+	hash_add(ec->cache, &es->hash, es->addr);
 	return 0;
 }
 
-bool cache_was_expanded(struct state *state, Dwarf_Die *die)
+bool __cache_was_expanded(struct expansion_cache *ec, uintptr_t addr)
 {
 	struct expanded *es;
-	uintptr_t addr = (uintptr_t)die->addr;
 
-	hash_for_each_possible(state->expansion_cache, es, hash, addr) {
+	hash_for_each_possible(ec->cache, es, hash, addr) {
 		if (es->addr == addr)
 			return true;
 	}
@@ -191,14 +201,14 @@ bool cache_was_expanded(struct state *state, Dwarf_Die *die)
 	return false;
 }
 
-void cache_clear_expanded(struct state *state)
+void cache_clear_expanded(struct expansion_cache *ec)
 {
 	struct hlist_node *tmp;
 	struct expanded *es;
 	int i;
 
-	hash_for_each_safe(state->expansion_cache, i, tmp, es, hash) {
+	hash_for_each_safe(ec->cache, i, tmp, es, hash) {
 		free(es);
 	}
-	hash_init(state->expansion_cache);
+	hash_init(ec->cache);
 }

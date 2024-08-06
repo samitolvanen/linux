@@ -4,7 +4,6 @@
  */
 
 #include <string.h>
-#include <linux/jhash.h>
 #include "gendwarfksyms.h"
 
 struct declonly {
@@ -12,38 +11,29 @@ struct declonly {
 	struct hlist_node hash;
 };
 
-#define SYMBOL_HASH_BITS 7
+#define SYMBOL_HASH_BITS 15
+/* struct symbol_addr -> struct symbol */
 static DEFINE_HASHTABLE(symbol_addrs, SYMBOL_HASH_BITS);
+/* name -> struct symbol */
 static DEFINE_HASHTABLE(symbol_names, SYMBOL_HASH_BITS);
+/* name -> struct declonly */
 static DEFINE_HASHTABLE(declonly_structs, SYMBOL_HASH_BITS);
-
-static u32 addr_hash(const struct symbol_addr *addr)
-{
-	return jhash(addr, sizeof(struct symbol_addr), 0);
-}
-
-static u32 name_hash(const char *name)
-{
-	return jhash(name, strlen(name), 0);
-}
-
-typedef void (*symbol_callback_t)(struct symbol *, void *arg);
 
 static int __for_each_addr(struct symbol *sym, symbol_callback_t func,
 			   void *data)
 {
 	struct hlist_node *tmp;
-	struct symbol *match;
+	struct symbol *match = NULL;
 	int processed = 0;
 
 	hash_for_each_possible_safe(symbol_addrs, match, tmp, addr_hash,
-				    addr_hash(&sym->addr)) {
+				    symbol_addr_hash(&sym->addr)) {
 		if (match == sym)
 			continue; /* Already processed */
 
 		if (match->addr.section == sym->addr.section &&
 		    match->addr.address == sym->addr.address) {
-			func(match, data);
+			check(func(match, data));
 			++processed;
 		}
 	}
@@ -53,7 +43,7 @@ static int __for_each_addr(struct symbol *sym, symbol_callback_t func,
 
 /*
  * For symbols without debugging information (e.g. symbols defined in other
- * TUs), also match __gendwarfksyms_ptr_<symbol-name> pointers for ensuring
+ * TUs), also match __gendwarfksyms_ptr_<symbol_name> pointers for ensuring
  * type information is present in the processed TU.
  */
 bool is_symbol_ptr(const char *name)
@@ -78,7 +68,7 @@ static int for_each(const char *name, symbol_callback_t func, void *data)
 
 		/* Call func for the match, and all address matches */
 		if (func)
-			func(match, data);
+			check(func(match, data));
 
 		if (match->addr.section != SHN_UNDEF)
 			return checkp(__for_each_addr(match, func, data)) + 1;
@@ -94,7 +84,7 @@ static bool is_exported(const char *name)
 	return checkp(for_each(name, NULL, NULL)) > 0;
 }
 
-static void set_crc(struct symbol *sym, void *data)
+static int set_crc(struct symbol *sym, void *data)
 {
 	unsigned long *crc = data;
 
@@ -104,6 +94,7 @@ static void set_crc(struct symbol *sym, void *data)
 
 	sym->state = PROCESSED;
 	sym->crc = *crc;
+	return 0;
 }
 
 int symbol_set_crc(struct symbol *sym, unsigned long crc)
@@ -111,6 +102,17 @@ int symbol_set_crc(struct symbol *sym, unsigned long crc)
 	if (checkp(for_each(sym->name, set_crc, &crc)) > 0)
 		return 0;
 	return -1;
+}
+
+static int set_die(struct symbol *sym, void *data)
+{
+	sym->die_addr = (uintptr_t)((Dwarf_Die *)data)->addr;
+	return 0;
+}
+
+int symbol_set_die(struct symbol *sym, Dwarf_Die *die)
+{
+	return checkp(for_each(sym->name, set_die, die));
 }
 
 int symbol_read_exports(FILE *file)
@@ -133,17 +135,15 @@ int symbol_read_exports(FILE *file)
 		if (is_exported(name))
 			continue; /* Ignore duplicates */
 
-		sym = malloc(sizeof(struct symbol));
+		sym = calloc(1, sizeof(struct symbol));
 		if (!sym) {
-			error("malloc failed");
+			error("calloc failed");
 			return -1;
 		}
 
 		sym->name = name;
 		sym->addr.section = SHN_UNDEF;
-		sym->addr.address = 0;
 		sym->state = UNPROCESSED;
-		sym->crc = 0;
 		name = NULL;
 
 		hash_add(symbol_names, &sym->name_hash, name_hash(sym->name));
@@ -159,12 +159,14 @@ int symbol_read_exports(FILE *file)
 	return 0;
 }
 
-static void get_unprocessed(struct symbol *sym, void *arg)
+static int get_unprocessed(struct symbol *sym, void *arg)
 {
 	struct symbol **res = arg;
 
 	if (sym->state == UNPROCESSED)
 		*res = sym;
+
+	return 0;
 }
 
 struct symbol *symbol_get_unprocessed(const char *name)
@@ -173,6 +175,20 @@ struct symbol *symbol_get_unprocessed(const char *name)
 
 	for_each(name, get_unprocessed, &sym);
 	return sym;
+}
+
+int symbol_for_each_processed(symbol_callback_t func, void *arg)
+{
+	struct hlist_node *tmp;
+	struct symbol *sym;
+	int i;
+
+	hash_for_each_safe(symbol_names, i, tmp, sym, name_hash) {
+		if (sym->state == PROCESSED)
+			check(func(sym, arg));
+	}
+
+	return 0;
 }
 
 typedef int (*elf_symbol_callback_t)(const char *name, GElf_Sym *sym,
@@ -225,8 +241,8 @@ static int elf_for_each_symbol(int fd, elf_symbol_callback_t func, void *arg)
 			unsigned int n;
 
 			for (n = 0; n < nsyms; ++n) {
-				const char *name;
-				Elf32_Word xndx;
+				const char *name = NULL;
+				Elf32_Word xndx = 0;
 				GElf_Sym sym_mem;
 				GElf_Sym *sym = gelf_getsymshndx(
 					data, xndx_data, n, &sym_mem, &xndx);
@@ -250,17 +266,21 @@ static int elf_for_each_symbol(int fd, elf_symbol_callback_t func, void *arg)
 	return check(elf_end(elf));
 }
 
-static void set_symbol_addr(struct symbol *sym, void *arg)
+static int set_symbol_addr(struct symbol *sym, void *arg)
 {
 	struct symbol_addr *addr = arg;
 
 	if (sym->addr.section == SHN_UNDEF) {
-		sym->addr = *addr;
-		hash_add(symbol_addrs, &sym->addr_hash, addr_hash(&sym->addr));
+		sym->addr.section = addr->section;
+		sym->addr.address = addr->address;
+		hash_add(symbol_addrs, &sym->addr_hash,
+			 symbol_addr_hash(&sym->addr));
 
 		debug("%s -> { %u, %lx }", sym->name, sym->addr.section,
 		      sym->addr.address);
 	}
+
+	return 0;
 }
 
 static int process_symbol(const char *name, GElf_Sym *sym, Elf32_Word xndx,

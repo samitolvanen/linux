@@ -7,9 +7,11 @@
 #include <elfutils/libdw.h>
 #include <elfutils/libdwfl.h>
 #include <linux/hashtable.h>
+#include <linux/jhash.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef __GENDWARFKSYMS_H
 #define __GENDWARFKSYMS_H
@@ -19,9 +21,9 @@
  */
 extern bool debug;
 extern bool inline_debug;
-extern bool no_cache;
 extern bool no_pretty_print;
 extern bool stable;
+extern bool symtypes;
 
 #define MAX_INPUT_FILES 128
 
@@ -81,6 +83,11 @@ extern bool stable;
 #define DW_TAG_variant_part_type DW_TAG_variant_part
 #define DW_TAG_variant_type DW_TAG_variant
 
+static inline u32 name_hash(const char *name)
+{
+	return jhash(name, strlen(name), 0);
+}
+
 /*
  * symbols.c
  */
@@ -100,6 +107,11 @@ struct symbol_addr {
 	Elf64_Addr address;
 };
 
+static inline u32 symbol_addr_hash(const struct symbol_addr *addr)
+{
+	return jhash(addr, sizeof(struct symbol_addr), 0);
+}
+
 /* Exported symbol */
 struct symbol {
 	const char *name;
@@ -107,23 +119,36 @@ struct symbol {
 	struct hlist_node addr_hash;
 	struct hlist_node name_hash;
 	enum symbol_state state;
+	uintptr_t die_addr;
 	unsigned long crc;
 };
 
 extern bool is_symbol_ptr(const char *name);
 extern int symbol_set_crc(struct symbol *sym, unsigned long crc);
+extern int symbol_set_die(struct symbol *sym, Dwarf_Die *die);
 extern int symbol_read_exports(FILE *file);
 extern struct symbol *symbol_get_unprocessed(const char *name);
+
+typedef int (*symbol_callback_t)(struct symbol *, void *arg);
+extern int symbol_for_each_processed(symbol_callback_t func, void *arg);
+
 extern int symbol_read_symtab(int fd);
 extern bool is_struct_declonly(const char *name);
 extern void symbol_free_declonly(void);
 extern void symbol_print_versions(void);
 
 /*
+ * symtypes.c
+ */
+
+extern int symtypes_dump(FILE *file);
+
+/*
  * cache.c
  */
-#define DIE_HASH_BITS 10
+#define DIE_HASH_BITS 18
 
+enum cached_die_state { INCOMPLETE, UNEXPANDED, COMPLETE, SYMBOL };
 enum cached_item_type { EMPTY, STRING, LINEBREAK, DIE };
 
 struct cached_item {
@@ -136,8 +161,6 @@ struct cached_item {
 	struct cached_item *next;
 };
 
-enum cached_die_state { INCOMPLETE, UNEXPANDED, COMPLETE };
-
 static inline const char *cache_state_name(enum cached_die_state state)
 {
 	switch (state) {
@@ -148,28 +171,48 @@ static inline const char *cache_state_name(enum cached_die_state state)
 		return "UNEXPANDED";
 	case COMPLETE:
 		return "COMPLETE";
+	case SYMBOL:
+		return "SYMBOL";
 	}
 }
 
 struct cached_die {
 	enum cached_die_state state;
+	const char *name;
+	int tag;
 	uintptr_t addr;
 	struct cached_item *list;
 	struct hlist_node hash;
 };
 
+extern int __cache_get(uintptr_t addr, enum cached_die_state state,
+		       struct cached_die **res);
 extern int cache_get(Dwarf_Die *die, enum cached_die_state state,
 		     struct cached_die **res);
 extern int cache_add_string(struct cached_die *pd, const char *str);
 extern int cache_add_linebreak(struct cached_die *pd, int linebreak);
-extern int cache_add_die(struct cached_die *pd, Dwarf_Die *die);
+extern int cache_add_die(struct cached_die *pd, struct cached_die *child);
 extern void cache_free(void);
 
-struct state;
+struct expansion_cache {
+	DECLARE_HASHTABLE(cache, DIE_HASH_BITS);
+};
 
-extern int cache_mark_expanded(struct state *state, Dwarf_Die *die);
-extern bool cache_was_expanded(struct state *state, Dwarf_Die *die);
-extern void cache_clear_expanded(struct state *state);
+extern int __cache_mark_expanded(struct expansion_cache *ec, uintptr_t addr);
+extern bool __cache_was_expanded(struct expansion_cache *ec, uintptr_t addr);
+extern void cache_clear_expanded(struct expansion_cache *ec);
+
+static inline int cache_mark_expanded(struct expansion_cache *ec,
+				      Dwarf_Die *die)
+{
+	return __cache_mark_expanded(ec, (uintptr_t)die->addr);
+}
+
+static inline bool cache_was_expanded(struct expansion_cache *ec,
+				      Dwarf_Die *die)
+{
+	return __cache_was_expanded(ec, (uintptr_t)die->addr);
+}
 
 /*
  * types.c
@@ -202,7 +245,7 @@ struct state {
 
 	/* Structure expansion */
 	struct expansion_state expand;
-	DECLARE_HASHTABLE(expansion_cache, DIE_HASH_BITS);
+	struct expansion_cache expansion_cache;
 
 	/* Reserved members */
 	struct reserved_state reserved;

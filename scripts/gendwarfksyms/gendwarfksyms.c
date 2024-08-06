@@ -18,22 +18,24 @@
 bool debug;
 /* Print inline debugging information to stderr (with --debug) */
 bool inline_debug;
-/* Don't use caching */
-bool no_cache;
 /* Don't pretty-print (with --debug) */
 bool no_pretty_print;
 /* Support kABI stability features */
 bool stable;
+/* Produce a symtypes file */
+bool symtypes;
+static const char *symtypes_file;
 
 static const struct {
 	const char *arg;
 	bool *flag;
+	const char **param;
 } options[] = {
-	{ "--debug", &debug },
-	{ "--inline-debug", &inline_debug },
-	{ "--no-cache", &no_cache },
-	{ "--no-pretty-print", &no_pretty_print },
-	{ "--stable", &stable },
+	{ "--debug", &debug, NULL },
+	{ "--inline-debug", &inline_debug, NULL },
+	{ "--no-pretty-print", &no_pretty_print, NULL },
+	{ "--stable", &stable, NULL },
+	{ "--symtypes", &symtypes, &symtypes_file },
 };
 
 static int usage(void)
@@ -51,11 +53,23 @@ static int parse_options(int argc, const char **argv)
 		bool flag = false;
 
 		for (int j = 0; j < ARRAY_SIZE(options); j++) {
-			if (!strcmp(argv[i], options[j].arg)) {
-				*options[j].flag = true;
-				flag = true;
-				break;
+			if (strcmp(argv[i], options[j].arg))
+				continue;
+
+			*options[j].flag = true;
+
+			if (options[j].param) {
+				if (++i >= argc) {
+					error("%s needs an argument",
+					      options[j].arg);
+					return -1;
+				}
+
+				*options[j].param = argv[i];
 			}
+
+			flag = true;
+			break;
 		}
 
 		if (!flag)
@@ -72,6 +86,7 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 	Dwarf_Die cudie;
 	Dwarf_CU *cu = NULL;
 	Dwarf *dbg;
+	FILE *symfile = arg;
 	int res;
 
 	debug("%s", name);
@@ -83,11 +98,14 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 			error("dwarf_get_units failed: no debugging information?");
 			return -1;
 		} else if (res == 1) {
-			return DWARF_CB_OK; /* No more units */
+			break; /* No more units */
 		}
 
 		check(process_module(mod, dbg, &cudie));
 	} while (cu);
+
+	check(symtypes_dump(symfile));
+	cache_free();
 
 	return DWARF_CB_OK;
 }
@@ -99,12 +117,22 @@ static const Dwfl_Callbacks callbacks = {
 
 int main(int argc, const char **argv)
 {
+	FILE *symfile = NULL;
 	unsigned int n;
 
 	if (parse_options(argc, argv) < 0)
 		return usage();
 
 	check(symbol_read_exports(stdin));
+
+	if (symtypes && symtypes_file) {
+		symfile = fopen(symtypes_file, "w+");
+		if (!symfile) {
+			error("fopen failed for '%s': %s", symtypes_file,
+			      strerror(errno));
+			return -1;
+		}
+	}
 
 	for (n = 0; n < object_count; n++) {
 		Dwfl *dwfl;
@@ -135,7 +163,7 @@ int main(int argc, const char **argv)
 
 		dwfl_report_end(dwfl, NULL, NULL);
 
-		if (dwfl_getmodules(dwfl, &process_modules, NULL, 0)) {
+		if (dwfl_getmodules(dwfl, &process_modules, symfile, 0)) {
 			error("dwfl_getmodules failed for '%s'",
 			      object_files[n]);
 			return -1;
@@ -144,10 +172,11 @@ int main(int argc, const char **argv)
 		dwfl_end(dwfl);
 		close(fd);
 		symbol_free_declonly();
-		cache_free();
 	}
 
 	symbol_print_versions();
+	if (symfile)
+		fclose(symfile);
 
 	return 0;
 }

@@ -191,8 +191,10 @@ static int process_fqn(struct state *state, struct cached_die *cache,
 
 DEFINE_PROCESS_UDATA_ATTRIBUTE(accessibility)
 DEFINE_PROCESS_UDATA_ATTRIBUTE(alignment)
+DEFINE_PROCESS_UDATA_ATTRIBUTE(bit_size)
 DEFINE_PROCESS_UDATA_ATTRIBUTE(byte_size)
 DEFINE_PROCESS_UDATA_ATTRIBUTE(encoding)
+DEFINE_PROCESS_UDATA_ATTRIBUTE(data_bit_offset)
 DEFINE_PROCESS_UDATA_ATTRIBUTE(data_member_location)
 
 /* Match functions -- die_match_callback_t */
@@ -256,6 +258,8 @@ static int __process_list_type(struct state *state, struct cached_die *cache,
 	check(process(state, cache, type));
 	check(process_type_attr(state, cache, die));
 	check(process_accessibility_attr(state, cache, die));
+	check(process_bit_size_attr(state, cache, die));
+	check(process_data_bit_offset_attr(state, cache, die));
 	check(process_data_member_location_attr(state, cache, die));
 	check(process(state, cache, ","));
 	return check(process_linebreak(cache, 0));
@@ -314,7 +318,8 @@ static int process_subrange_type(struct state *state, struct cached_die *cache,
 	if (get_udata_attr(die, DW_AT_count, &count))
 		return check(process_fmt(state, cache, "[%" PRIu64 "]", count));
 	if (get_udata_attr(die, DW_AT_upper_bound, &count))
-		return check(process_fmt(state, cache, "[%" PRIu64 "]", count + 1));
+		return check(
+			process_fmt(state, cache, "[%" PRIu64 "]", count + 1));
 
 	return check(process(state, cache, "[]"));
 }
@@ -415,12 +420,12 @@ static int __process_structure_type(struct state *state,
 
 	if (is_decl) {
 		check(process(state, cache, "<declaration>"));
-	} else if (state->expand.expand) {
-		check(cache_mark_expanded(state, die));
+	} else if (!state->expand.expand) {
+		check(process(state, cache, "<unexpanded>"));
+	} else {
+		check(cache_mark_expanded(&state->expansion_cache, die));
 		check(process_die_container(state, cache, die, process_func,
 					    match_func));
-	} else {
-		check(process(state, cache, "<unexpanded>"));
 	}
 
 	check(process_linebreak(cache, -1));
@@ -643,8 +648,8 @@ static int process_cached(struct state *state, struct cached_die *cache,
 				error("dwarf_die_addr_die failed");
 				return -1;
 			}
-			inline_debug_b("cache %p DIE addr %lx tag %d", cache,
-				       ci->data.addr, dwarf_tag(&child));
+			inline_debug_b("cache %p DIE addr %" PRIxPTR " tag %d",
+				       cache, ci->data.addr, dwarf_tag(&child));
 			check(process_type(state, NULL, &child));
 			break;
 		default:
@@ -663,7 +668,7 @@ static void state_init(struct state *state)
 	state->expand.expand = true;
 	state->expand.in_pointer_type = false;
 	state->expand.ptr_expansion_depth = 0;
-	hash_init(state->expansion_cache);
+	hash_init(state->expansion_cache.cache);
 }
 static void expansion_state_restore(struct expansion_state *state,
 				    struct expansion_state *saved)
@@ -724,8 +729,9 @@ static int process_type(struct state *state, struct cached_die *parent,
 	    state->expand.ptr_expansion_depth >= MAX_POINTER_EXPANSION_DEPTH)
 		state->expand.expand = false;
 	else
-		state->expand.expand = saved.expand &&
-				       !cache_was_expanded(state, die);
+		state->expand.expand =
+			saved.expand &&
+			!cache_was_expanded(&state->expansion_cache, die);
 
 	/* Keep track of pointer expansion depth */
 	if (state->expand.expand && state->expand.in_pointer_type &&
@@ -736,25 +742,24 @@ static int process_type(struct state *state, struct cached_die *parent,
 	 * If we have want_state already cached, use it instead of walking
 	 * through DWARF.
 	 */
-	if (!no_cache) {
-		if (!state->expand.expand && is_expanded_type(tag))
-			want_state = UNEXPANDED;
+	if (!state->expand.expand && is_expanded_type(tag))
+		want_state = UNEXPANDED;
 
-		check(cache_get(die, want_state, &cache));
+	check(cache_get(die, want_state, &cache));
 
-		if (cache->state == want_state) {
-			inline_debug_g("cached addr %p tag %d -- %s", die->addr,
-				       tag, cache_state_name(cache->state));
+	if (cache->state == want_state) {
+		inline_debug_g("cached addr %p tag %d -- %s", die->addr, tag,
+			       cache_state_name(cache->state));
 
-			if (want_state == COMPLETE && is_expanded_type(tag))
-				check(cache_mark_expanded(state, die));
+		if (want_state == COMPLETE && is_expanded_type(tag))
+			check(cache_mark_expanded(&state->expansion_cache,
+						  die));
 
-			check(process_cached(state, cache, die));
-			check(cache_add_die(parent, die));
+		check(process_cached(state, cache, die));
+		check(cache_add_die(parent, cache));
 
-			expansion_state_restore(&state->expand, &saved);
-			return 0;
-		}
+		expansion_state_restore(&state->expand, &saved);
+		return 0;
 	}
 
 	inline_debug_g("addr %p tag %d -- INCOMPLETE -> %s", die->addr, tag,
@@ -795,14 +800,14 @@ static int process_type(struct state *state, struct cached_die *parent,
 		return -1;
 	}
 
-	if (!no_cache) {
-		inline_debug_r("parent %p cache %p die addr %p tag %d", parent,
-			       cache, die->addr, tag);
+	inline_debug_r("parent %p cache %p die addr %p tag %d", parent, cache,
+		       die->addr, tag);
 
-		/* Update cache state and append to the parent (if any) */
-		cache->state = want_state;
-		check(cache_add_die(parent, die));
-	}
+	/* Update cache state and append to the parent (if any) */
+	cache->name = get_name(die);
+	cache->tag = tag;
+	cache->state = want_state;
+	check(cache_add_die(parent, cache));
 
 	expansion_state_restore(&state->expand, &saved);
 	return 0;
@@ -811,17 +816,55 @@ static int process_type(struct state *state, struct cached_die *parent,
 /*
  * Exported symbol processing
  */
+static int get_symbol_cache(struct state *state, Dwarf_Die *die,
+			    struct cached_die **cache)
+{
+	/* Store a copy of the DIE we used for symbol versioning */
+	checkp(symbol_set_die(state->sym, die));
+
+	/*
+	 * If symtypes are requested, store a copy of the final symbol output
+	 * in the cache because the type itself may have been used elsewhere,
+	 * and produce a different type string.
+	 */
+	if (symtypes) {
+		check(cache_get(die, SYMBOL, cache));
+
+		if ((*cache)->state == INCOMPLETE) {
+			(*cache)->tag = dwarf_tag(die);
+		} else {
+			*cache = NULL;
+		}
+	}
+
+	return 0;
+}
+
 static int process_subprogram(struct state *state, Dwarf_Die *die)
 {
-	check(__process_subroutine_type(state, NULL, die, "subprogram"));
-	return check(process(state, NULL, ";\n"));
+	struct cached_die *cache = NULL;
+
+	check(get_symbol_cache(state, die, &cache));
+	check(__process_subroutine_type(state, cache, die, "subprogram"));
+
+	if (cache)
+		cache->state = SYMBOL;
+
+	return 0;
 }
 
 static int process_variable(struct state *state, Dwarf_Die *die)
 {
-	check(process(state, NULL, "variable "));
-	check(process_type_attr(state, NULL, die));
-	return check(process(state, NULL, ";\n"));
+	struct cached_die *cache = NULL;
+
+	check(get_symbol_cache(state, die, &cache));
+	check(process(state, cache, "variable "));
+	check(process_type_attr(state, cache, die));
+
+	if (cache)
+		cache->state = SYMBOL;
+
+	return 0;
 }
 
 static int process_symbol_ptr(struct state *state, Dwarf_Die *die)
@@ -880,7 +923,10 @@ static int process_exported_symbols(struct state *state,
 		else
 			check(process_variable(state, &state->die));
 
-		cache_clear_expanded(state);
+		if (debug)
+			fputs("\n", stderr);
+
+		cache_clear_expanded(&state->expansion_cache);
 		return check(
 			symbol_set_crc(state->sym, state->crc ^ 0xffffffff));
 	default:

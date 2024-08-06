@@ -134,7 +134,7 @@ genksyms = scripts/genksyms/genksyms		\
 ifdef CONFIG_GENDWARFKSYMS
 cmd_gensymtypes_c = $(if $(skip_gendwarfksyms),,			\
 	$(call getexportsymbols,$(2:.symtypes=.o),\1) |			\
-	$(gendwarfksyms) $(2:.symtypes=.o) $(if $(1), --debug 2>$(2)))
+	$(gendwarfksyms) $(2:.symtypes=.o) $(if $(1), --symtypes $(2) --debug 2>$(2).debug))
 else
 cmd_gensymtypes_c = $(CPP) -D__GENKSYMS__ $(c_flags) $< | $(genksyms)
 endif # CONFIG_GENDWARFKSYMS
@@ -348,7 +348,7 @@ cmd_gensymtypes_S =						\
 	$(CC) $(c_flags) -c -o $(@:.o=.gendwarfksyms.o) -xc -;	\
 	$(call getexportsymbols,$@,\1) |			\
 	$(gendwarfksyms) $(@:.o=.gendwarfksyms.o)		\
-		$(if $(1), --debug 2>$(2))
+		$(if $(1), --symtypes $(2) --debug 2>$(2).debug)
 else
 cmd_gensymtypes_S =						\
 	$(getasmexports) |					\
