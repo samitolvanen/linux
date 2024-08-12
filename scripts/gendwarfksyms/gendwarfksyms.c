@@ -105,6 +105,8 @@ int main(int argc, char **argv)
 			return -1;
 		}
 
+		symbol_read_symtab(fd);
+
 		dwfl = dwfl_begin(&callbacks);
 		if (!dwfl) {
 			error("dwfl_begin failed for '%s': %s", argv[n],
