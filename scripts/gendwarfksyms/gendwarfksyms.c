@@ -27,7 +27,7 @@ static const struct {
 
 static int usage(void)
 {
-	error("usage: gendwarfksyms [options] elf-object-file ...");
+	error("usage: gendwarfksyms [options] elf-object-file ... < symbol-list");
 	return -1;
 }
 
@@ -104,6 +104,8 @@ int main(int argc, const char **argv)
 
 	if (parse_options(argc, argv) < 0)
 		return usage();
+
+	check(symbol_read_exports(stdin));
 
 	for (n = 0; n < object_count; n++) {
 		Dwfl *dwfl;

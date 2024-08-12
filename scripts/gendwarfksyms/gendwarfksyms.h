@@ -7,9 +7,11 @@
 #include <elfutils/libdw.h>
 #include <elfutils/libdwfl.h>
 #include <linux/hashtable.h>
+#include <linux/jhash.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef __GENDWARFKSYMS_H
 #define __GENDWARFKSYMS_H
@@ -57,12 +59,31 @@ extern bool debug;
 #define checkp(expr) __check(expr, __res < 0, __res)
 
 /*
+ * symbols.c
+ */
+
+static inline u32 name_hash(const char *name)
+{
+	return jhash(name, strlen(name), 0);
+}
+
+struct symbol {
+	const char *name;
+	struct hlist_node name_hash;
+};
+
+extern int symbol_read_exports(FILE *file);
+extern struct symbol *symbol_get(const char *name);
+
+/*
  * dwarf.c
  */
 
 struct state {
 	Dwfl_Module *mod;
 	Dwarf *dbg;
+	struct symbol *sym;
+	Dwarf_Die die;
 };
 
 typedef int (*die_callback_t)(struct state *state, Dwarf_Die *die);
