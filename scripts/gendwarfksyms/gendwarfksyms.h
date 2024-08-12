@@ -61,6 +61,10 @@ extern bool debug;
 /*
  * symbols.c
  */
+struct symbol_addr {
+	uint32_t section;
+	Elf64_Addr address;
+};
 
 static inline u32 name_hash(const char *name)
 {
@@ -69,10 +73,13 @@ static inline u32 name_hash(const char *name)
 
 struct symbol {
 	const char *name;
+	struct symbol_addr addr;
+	struct hlist_node addr_hash;
 	struct hlist_node name_hash;
 };
 
 extern int symbol_read_exports(FILE *file);
+extern int symbol_read_symtab(int fd);
 extern struct symbol *symbol_get(const char *name);
 
 /*

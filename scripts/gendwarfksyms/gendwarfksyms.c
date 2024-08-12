@@ -118,6 +118,8 @@ int main(int argc, const char **argv)
 			return -1;
 		}
 
+		check(symbol_read_symtab(fd));
+
 		dwfl = dwfl_begin(&callbacks);
 		if (!dwfl) {
 			error("dwfl_begin failed for '%s': %s", object_files[n],
