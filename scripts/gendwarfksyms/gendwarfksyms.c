@@ -22,6 +22,8 @@ bool dump_dies;
 bool dump_die_map;
 /* Print out type_map contents */
 bool dump_types;
+/* Print out expanded type strings used for version calculations */
+bool dump_versions;
 /* Produce a symtypes file */
 bool symtypes;
 static const char *symtypes_file;
@@ -35,6 +37,7 @@ static const struct {
 	{ "--dump-dies", &dump_dies, NULL },
 	{ "--dump-die-map", &dump_die_map, NULL },
 	{ "--dump-types", &dump_types, NULL },
+	{ "--dump-versions", &dump_versions, NULL },
 	{ "--symtypes", &symtypes, &symtypes_file },
 };
 
@@ -109,9 +112,10 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 	} while (cu);
 
 	/*
-	 * Use die_map to expand type strings and write them to `symfile`.
+	 * Use die_map to expand type strings, write them to `symfile`, and
+	 * calculate symbol versions.
 	 */
-	check(generate_symtypes(symfile));
+	check(generate_symtypes_and_versions(symfile));
 	die_map_free();
 
 	return DWARF_CB_OK;
@@ -186,6 +190,8 @@ int main(int argc, const char **argv)
 
 	if (symfile)
 		fclose(symfile);
+
+	symbol_print_versions();
 
 	return 0;
 }

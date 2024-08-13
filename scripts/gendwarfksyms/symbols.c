@@ -84,6 +84,38 @@ static int for_each(const char *name, bool name_only, symbol_callback_t func,
 	return 0;
 }
 
+static int set_crc(struct symbol *sym, void *data)
+{
+	unsigned long *crc = data;
+
+	if (sym->state == PROCESSED && sym->crc != *crc)
+		warn("overriding version for symbol %s (crc %lx vs. %lx)",
+		     sym->name, sym->crc, *crc);
+
+	sym->state = PROCESSED;
+	sym->crc = *crc;
+	return 0;
+}
+
+int symbol_set_crc(struct symbol *sym, unsigned long crc)
+{
+	if (checkp(for_each(sym->name, false, set_crc, &crc)) > 0)
+		return 0;
+	return -1;
+}
+
+static int set_die(struct symbol *sym, void *data)
+{
+	sym->die_addr = (uintptr_t)((Dwarf_Die *)data)->addr;
+	sym->state = MAPPED;
+	return 0;
+}
+
+int symbol_set_die(struct symbol *sym, Dwarf_Die *die)
+{
+	return checkp(for_each(sym->name, false, set_die, die));
+}
+
 static bool is_exported(const char *name)
 {
 	return checkp(for_each(name, true, NULL, NULL)) > 0;
@@ -149,6 +181,19 @@ struct symbol *symbol_get_unprocessed(const char *name)
 
 	for_each(name, false, get_unprocessed, &sym);
 	return sym;
+}
+
+int symbol_for_each(symbol_callback_t func, void *arg)
+{
+	struct hlist_node *tmp;
+	struct symbol *sym;
+	int i;
+
+	hash_for_each_safe(symbol_names, i, tmp, sym, name_hash) {
+		check(func(sym, arg));
+	}
+
+	return 0;
 }
 
 typedef int (*elf_symbol_callback_t)(const char *name, GElf_Sym *sym,
@@ -263,4 +308,24 @@ static int process_symbol(const char *name, GElf_Sym *sym, Elf32_Word xndx,
 int symbol_read_symtab(int fd)
 {
 	return elf_for_each_symbol(fd, process_symbol, NULL);
+}
+
+void symbol_print_versions(void)
+{
+	struct hlist_node *tmp;
+	struct symbol *sym;
+	int i;
+
+	hash_for_each_safe(symbol_names, i, tmp, sym, name_hash) {
+		if (sym->state != PROCESSED)
+			warn("no information for symbol %s", sym->name);
+
+		printf("#SYMVER %s 0x%08lx\n", sym->name, sym->crc);
+
+		free((void *)sym->name);
+		free(sym);
+	}
+
+	hash_init(symbol_addrs);
+	hash_init(symbol_names);
 }

@@ -693,18 +693,51 @@ static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 /*
  * Exported symbol processing
  */
+static int get_symbol_cache(struct state *state, Dwarf_Die *die,
+			    struct die **cache)
+{
+	checkp(symbol_set_die(state->sym, die));
+	check(die_map_get(die, SYMBOL, cache));
+
+	if ((*cache)->state != INCOMPLETE)
+		return 1; /* We already processed a symbol for this DIE */
+
+	(*cache)->tag = dwarf_tag(die);
+	return 0;
+}
+
 static int process_subprogram(struct state *state, Dwarf_Die *die)
 {
-	check(__process_subroutine_type(state, NULL, die, "subprogram"));
-	state->sym->state = MAPPED;
+	struct die *cache;
+
+	if (checkp(get_symbol_cache(state, die, &cache)) > 0)
+		return 0;
+
+	debug("%s", state->sym->name);
+	check(__process_subroutine_type(state, cache, die, "subprogram"));
+	cache->state = SYMBOL;
+
+	if (dump_dies)
+		fputs("\n", stderr);
+
 	return 0;
 }
 
 static int process_variable(struct state *state, Dwarf_Die *die)
 {
-	check(process(state, NULL, "variable "));
-	check(process_type_attr(state, NULL, die));
-	state->sym->state = MAPPED;
+	struct die *cache;
+
+	if (checkp(get_symbol_cache(state, die, &cache)) > 0)
+		return 0;
+
+	debug("%s", state->sym->name);
+	check(process(state, cache, "variable "));
+	check(process_type_attr(state, cache, die));
+	cache->state = SYMBOL;
+
+	if (dump_dies)
+		fputs("\n", stderr);
+
 	return 0;
 }
 
@@ -750,7 +783,6 @@ static int process_exported_symbols(struct state *state, struct die *cache,
 		if (!is_export_symbol(state, die))
 			return 0;
 
-		debug("%s", state->sym->name);
 		state_init(state);
 
 		if (is_symbol_ptr(get_name(&state->die)))
@@ -759,9 +791,6 @@ static int process_exported_symbols(struct state *state, struct die *cache,
 			check(process_subprogram(state, &state->die));
 		else
 			check(process_variable(state, &state->die));
-
-		if (dump_dies)
-			fputs("\n", stderr);
 
 		cache_clear_expanded(&state->expansion_cache);
 		return 0;
