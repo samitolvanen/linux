@@ -60,11 +60,11 @@ static bool is_export_symbol(struct state *state, Dwarf_Die *die)
 	if (get_ref_die_attr(die, DW_AT_abstract_origin, &origin))
 		source = &origin;
 
-	state->sym = symbol_get(get_name(die));
+	state->sym = symbol_get_unprocessed(get_name(die));
 
 	/* Look up using the origin name if there are no matches. */
 	if (!state->sym && source != die)
-		state->sym = symbol_get(get_name(source));
+		state->sym = symbol_get_unprocessed(get_name(source));
 
 	state->die = *source;
 	return !!state->sym;
@@ -384,6 +384,7 @@ static int process_subroutine_type(struct state *state, struct die *cache,
 	return check(__process_subroutine_type(state, cache, die,
 					       "subroutine_type"));
 }
+
 static int process_variant_type(struct state *state, struct die *cache,
 				Dwarf_Die *die)
 {
@@ -695,14 +696,16 @@ static int process_type(struct state *state, struct die *parent, Dwarf_Die *die)
 static int process_subprogram(struct state *state, Dwarf_Die *die)
 {
 	check(__process_subroutine_type(state, NULL, die, "subprogram"));
-	return check(process(state, NULL, ";\n"));
+	state->sym->state = MAPPED;
+	return 0;
 }
 
 static int process_variable(struct state *state, Dwarf_Die *die)
 {
 	check(process(state, NULL, "variable "));
 	check(process_type_attr(state, NULL, die));
-	return check(process(state, NULL, ";\n"));
+	state->sym->state = MAPPED;
+	return 0;
 }
 
 static int process_symbol_ptr(struct state *state, Dwarf_Die *die)
@@ -756,6 +759,9 @@ static int process_exported_symbols(struct state *state, struct die *cache,
 			check(process_subprogram(state, &state->die));
 		else
 			check(process_variable(state, &state->die));
+
+		if (dump_dies)
+			fputs("\n", stderr);
 
 		cache_clear_expanded(&state->expansion_cache);
 		return 0;

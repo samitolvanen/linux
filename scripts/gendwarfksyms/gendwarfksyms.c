@@ -20,6 +20,11 @@ bool debug;
 bool dump_dies;
 /* Print out inline debugging information about die_map changes */
 bool dump_die_map;
+/* Print out type_map contents */
+bool dump_types;
+/* Produce a symtypes file */
+bool symtypes;
+static const char *symtypes_file;
 
 static const struct {
 	const char *arg;
@@ -29,6 +34,8 @@ static const struct {
 	{ "--debug", &debug, NULL },
 	{ "--dump-dies", &dump_dies, NULL },
 	{ "--dump-die-map", &dump_die_map, NULL },
+	{ "--dump-types", &dump_types, NULL },
+	{ "--symtypes", &symtypes, &symtypes_file },
 };
 
 static int usage(void)
@@ -79,6 +86,7 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 	Dwarf_Die cudie;
 	Dwarf_CU *cu = NULL;
 	Dwarf *dbg;
+	FILE *symfile = arg;
 	int res;
 
 	debug("%s", name);
@@ -100,6 +108,10 @@ static int process_modules(Dwfl_Module *mod, void **userdata, const char *name,
 		check(process_module(mod, dbg, &cudie));
 	} while (cu);
 
+	/*
+	 * Use die_map to expand type strings and write them to `symfile`.
+	 */
+	check(generate_symtypes(symfile));
 	die_map_free();
 
 	return DWARF_CB_OK;
@@ -112,6 +124,7 @@ static const Dwfl_Callbacks callbacks = {
 
 int main(int argc, const char **argv)
 {
+	FILE *symfile = NULL;
 	unsigned int n;
 
 	if (parse_options(argc, argv) < 0)
@@ -121,6 +134,16 @@ int main(int argc, const char **argv)
 		dump_dies = true;
 
 	check(symbol_read_exports(stdin));
+
+	if (symtypes_file) {
+		symfile = fopen(symtypes_file, "w+");
+
+		if (!symfile) {
+			error("fopen failed for '%s': %s", symtypes_file,
+			      strerror(errno));
+			return -1;
+		}
+	}
 
 	for (n = 0; n < object_count; n++) {
 		Dwfl *dwfl;
@@ -151,7 +174,7 @@ int main(int argc, const char **argv)
 
 		dwfl_report_end(dwfl, NULL, NULL);
 
-		if (dwfl_getmodules(dwfl, &process_modules, NULL, 0)) {
+		if (dwfl_getmodules(dwfl, &process_modules, symfile, 0)) {
 			error("dwfl_getmodules failed for '%s'",
 			      object_files[n]);
 			return -1;
@@ -160,6 +183,9 @@ int main(int argc, const char **argv)
 		dwfl_end(dwfl);
 		close(fd);
 	}
+
+	if (symfile)
+		fclose(symfile);
 
 	return 0;
 }

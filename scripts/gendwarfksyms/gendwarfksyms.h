@@ -22,6 +22,8 @@
 extern bool debug;
 extern bool dump_dies;
 extern bool dump_die_map;
+extern bool dump_types;
+extern bool symtypes;
 
 #define MAX_INPUT_FILES 128
 
@@ -89,6 +91,12 @@ extern bool dump_die_map;
 #define SYMBOL_PTR_PREFIX "__gendwarfksyms_ptr_"
 #define SYMBOL_PTR_PREFIX_LEN (sizeof(SYMBOL_PTR_PREFIX) - 1)
 
+/* See dwarf.c:is_declaration */
+#define SYMBOL_DECLONLY_PREFIX "__gendwarfksyms_declonly_"
+#define SYMBOL_DECLONLY_PREFIX_LEN (sizeof(SYMBOL_DECLONLY_PREFIX) - 1)
+
+enum symbol_state { UNPROCESSED, MAPPED };
+
 struct symbol_addr {
 	uint32_t section;
 	Elf64_Addr address;
@@ -109,12 +117,14 @@ struct symbol {
 	struct symbol_addr addr;
 	struct hlist_node addr_hash;
 	struct hlist_node name_hash;
+	enum symbol_state state;
+	uintptr_t die_addr;
 };
 
 extern bool is_symbol_ptr(const char *name);
 extern int symbol_read_exports(FILE *file);
 extern int symbol_read_symtab(int fd);
-extern struct symbol *symbol_get(const char *name);
+extern struct symbol *symbol_get_unprocessed(const char *name);
 
 /*
  * die.c
@@ -157,12 +167,15 @@ struct die {
 	struct hlist_node hash;
 };
 
+typedef int (*die_map_callback_t)(struct die *, void *arg);
+
 extern int __die_map_get(uintptr_t addr, enum die_state state,
 			 struct die **res);
 extern int die_map_get(Dwarf_Die *die, enum die_state state, struct die **res);
 extern int die_map_add_string(struct die *pd, const char *str);
 extern int die_map_add_linebreak(struct die *pd, int linebreak);
 extern int die_map_add_die(struct die *pd, struct die *child);
+extern int die_map_for_each(die_map_callback_t func, void *arg);
 extern void die_map_free(void);
 
 /*
@@ -221,5 +234,11 @@ extern int process_die_container(struct state *state, struct die *cache,
 				 die_match_callback_t match);
 
 extern int process_module(Dwfl_Module *mod, Dwarf *dbg, Dwarf_Die *cudie);
+
+/*
+ * types.c
+ */
+
+extern int generate_symtypes(FILE *file);
 
 #endif /* __GENDWARFKSYMS_H */
