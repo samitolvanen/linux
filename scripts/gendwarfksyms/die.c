@@ -85,6 +85,19 @@ static void reset_die(struct die *cd)
 	cd->list = NULL;
 }
 
+int die_map_for_each(die_map_callback_t func, void *arg)
+{
+	struct die *cd;
+	struct hlist_node *tmp;
+	int i;
+
+	hash_for_each_safe(die_map, i, tmp, cd, hash) {
+		check(func(cd, arg));
+	}
+
+	return 0;
+}
+
 void die_map_free(void)
 {
 	struct hlist_node *tmp;

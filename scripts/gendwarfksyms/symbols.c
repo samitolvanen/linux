@@ -117,6 +117,7 @@ int symbol_read_exports(FILE *file)
 
 		sym->name = name;
 		sym->addr.section = SHN_UNDEF;
+		sym->state = UNPROCESSED;
 		name = NULL;
 
 		hash_add(symbol_names, &sym->name_hash, name_hash(sym->name));
@@ -132,19 +133,21 @@ int symbol_read_exports(FILE *file)
 	return 0;
 }
 
-static int get_symbol(struct symbol *sym, void *arg)
+static int get_unprocessed(struct symbol *sym, void *arg)
 {
 	struct symbol **res = arg;
 
-	*res = sym;
+	if (sym->state == UNPROCESSED)
+		*res = sym;
+
 	return 0;
 }
 
-struct symbol *symbol_get(const char *name)
+struct symbol *symbol_get_unprocessed(const char *name)
 {
 	struct symbol *sym = NULL;
 
-	for_each(name, false, get_symbol, &sym);
+	for_each(name, false, get_unprocessed, &sym);
 	return sym;
 }
 
