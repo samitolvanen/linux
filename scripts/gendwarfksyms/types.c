@@ -229,6 +229,34 @@ static void type_map_free(void)
 }
 
 /*
+ * CRC for a type, with an optional fully expanded type string for
+ * debugging.
+ */
+struct version {
+	struct type_expansion type;
+	unsigned long crc;
+};
+
+static int version_init(struct version *version)
+{
+	version->crc = 0xffffffff;
+	return check(type_expansion_init(&version->type, dump_versions));
+}
+
+static void version_free(struct version *version)
+{
+	type_expansion_free(&version->type);
+}
+
+static int version_add(struct version *version, const char *s)
+{
+	version->crc = partial_crc32(s, version->crc);
+	if (dump_versions)
+		checkp(type_expansion_append(&version->type, s, NULL));
+	return 0;
+}
+
+/*
  * Type reference format: <prefix>#<name>, where prefix:
  * 	s -> structure
  * 	u -> union
@@ -271,7 +299,7 @@ static char *get_type_name(struct die *cache)
 		warn("found incomplete cache entry: %p", cache);
 		return NULL;
 	}
-	if (!cache->fqn)
+	if (cache->state == SYMBOL || !cache->fqn)
 		return NULL;
 
 	prefix = get_type_prefix(cache->tag);
@@ -303,6 +331,45 @@ static char *get_type_name(struct die *cache)
 	}
 
 	return name;
+}
+
+static int __calculate_version(struct version *version, struct type_list *list)
+{
+	struct type_expansion *e;
+
+	/* Calculate a CRC over an expanded type string */
+	while (list) {
+		if (is_type_prefix(list->str)) {
+			check(type_map_get(list->str, &e));
+
+			/*
+			 * It's sufficient to expand each type reference just
+			 * once to detect changes.
+			 */
+			if (cache_was_expanded(&expansion_cache, e)) {
+				check(version_add(version, list->str));
+			} else {
+				check(cache_mark_expanded(&expansion_cache, e));
+				check(__calculate_version(version,
+							  e->expanded));
+			}
+		} else {
+			check(version_add(version, list->str));
+		}
+
+		list = list->next;
+	}
+
+	return 0;
+}
+
+static int calculate_version(struct version *version, const char *name,
+			     struct type_list *list)
+{
+	check(version_init(version));
+	check(__calculate_version(version, list));
+	cache_clear_expanded(&expansion_cache);
+	return 0;
 }
 
 static int __type_expand(struct die *cache, struct type_expansion *type,
@@ -411,7 +478,51 @@ static int expand_type(struct die *cache, void *arg)
 	return 0;
 }
 
-int generate_symtypes(FILE *file)
+static int expand_symbol(struct symbol *sym, void *arg)
+{
+	struct type_expansion type;
+	struct version version;
+	struct die *cache;
+
+	/*
+	 * No need to expand again unless we want a symtypes file entry
+	 * for the symbol. Note that this means `sym` has the same address
+	 * as another symbol that was already processed.
+	 */
+	if (!symtypes && sym->state == PROCESSED)
+		return 0;
+
+	if (__die_map_get(sym->die_addr, SYMBOL, &cache))
+		return 0; /* We'll warn about missing CRCs later. */
+
+	check(type_expand(cache, &type, false));
+
+	/* If the symbol already has a version, don't calculate it again. */
+	if (sym->state != PROCESSED) {
+		check(calculate_version(&version, sym->name, type.expanded));
+		check(symbol_set_crc(sym, version.crc));
+		debug("%s = %lx", sym->name, version.crc);
+
+		if (dump_versions) {
+			fputs(sym->name, stderr);
+			fputs(" ", stderr);
+			type_list_write(version.type.expanded, stderr);
+			fputs("\n", stderr);
+		}
+
+		version_free(&version);
+	}
+
+	/* These aren't needed in type_map unless we want a symtypes file. */
+	if (symtypes)
+		check(type_map_add(sym->name, &type));
+
+	type_expansion_free(&type);
+
+	return 0;
+}
+
+int generate_symtypes_and_versions(FILE *file)
 {
 	hash_init(expansion_cache.cache);
 
@@ -429,7 +540,14 @@ int generate_symtypes(FILE *file)
 	check(die_map_for_each(expand_type, NULL));
 
 	/*
-	 *   2. If a symtypes file is requested, write type_map contents to
+	 *   2. For each exported symbol, expand the die_cache type, and use
+	 *      type_map expansions to calculate a symbol version from the
+	 *      fully expanded type string.
+	 */
+	check(symbol_for_each(expand_symbol, NULL));
+
+	/*
+	 *   3. If a symtypes file is requested, write type_map contents to
 	 *      the file.
 	 */
 	check(type_map_write(file));

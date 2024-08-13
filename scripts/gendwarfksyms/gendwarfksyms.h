@@ -23,6 +23,7 @@ extern bool debug;
 extern bool dump_dies;
 extern bool dump_die_map;
 extern bool dump_types;
+extern bool dump_versions;
 extern bool symtypes;
 
 #define MAX_INPUT_FILES 128
@@ -95,7 +96,7 @@ extern bool symtypes;
 #define SYMBOL_DECLONLY_PREFIX "__gendwarfksyms_declonly_"
 #define SYMBOL_DECLONLY_PREFIX_LEN (sizeof(SYMBOL_DECLONLY_PREFIX) - 1)
 
-enum symbol_state { UNPROCESSED, MAPPED };
+enum symbol_state { UNPROCESSED, MAPPED, PROCESSED };
 
 struct symbol_addr {
 	uint32_t section;
@@ -119,18 +120,25 @@ struct symbol {
 	struct hlist_node name_hash;
 	enum symbol_state state;
 	uintptr_t die_addr;
+	unsigned long crc;
 };
+
+typedef int (*symbol_callback_t)(struct symbol *, void *arg);
 
 extern bool is_symbol_ptr(const char *name);
 extern int symbol_read_exports(FILE *file);
 extern int symbol_read_symtab(int fd);
 extern struct symbol *symbol_get_unprocessed(const char *name);
+extern int symbol_set_die(struct symbol *sym, Dwarf_Die *die);
+extern int symbol_set_crc(struct symbol *sym, unsigned long crc);
+extern int symbol_for_each(symbol_callback_t func, void *arg);
+extern void symbol_print_versions(void);
 
 /*
  * die.c
  */
 
-enum die_state { INCOMPLETE, UNEXPANDED, COMPLETE, LAST = COMPLETE };
+enum die_state { INCOMPLETE, UNEXPANDED, COMPLETE, SYMBOL, LAST = SYMBOL };
 enum die_fragment_type { EMPTY, STRING, LINEBREAK, DIE };
 
 struct die_fragment {
@@ -154,6 +162,7 @@ static inline const char *die_state_name(enum die_state state)
 	CASE_CONST_TO_STR(INCOMPLETE)
 	CASE_CONST_TO_STR(UNEXPANDED)
 	CASE_CONST_TO_STR(COMPLETE)
+	CASE_CONST_TO_STR(SYMBOL)
 	}
 }
 
@@ -239,6 +248,6 @@ extern int process_module(Dwfl_Module *mod, Dwarf *dbg, Dwarf_Die *cudie);
  * types.c
  */
 
-extern int generate_symtypes(FILE *file);
+extern int generate_symtypes_and_versions(FILE *file);
 
 #endif /* __GENDWARFKSYMS_H */
