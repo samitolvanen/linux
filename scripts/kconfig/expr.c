@@ -21,7 +21,7 @@ HASHTABLE_DEFINE(expr_hashtable, EXPR_HASHSIZE);
 static struct expr *expr_eliminate_yn(struct expr *e);
 
 /**
- * expr_lookup - return the expression for the given type and sub-nodes
+ * expr_lookup - return the expression with the given type and sub-nodes
  * This looks up an expression with the specified type and sub-nodes. If such
  * an expression is found in the hash table, it is returned. Otherwise, a new
  * expression node is allocated and added to the hash table.
@@ -887,16 +887,13 @@ static enum string_value_kind expr_parse_string(const char *str,
 	       ? kind : k_string;
 }
 
-tristate expr_calc_value(struct expr *e)
+static tristate __expr_calc_value(struct expr *e)
 {
 	tristate val1, val2;
 	const char *str1, *str2;
 	enum string_value_kind k1 = k_string, k2 = k_string;
 	union string_value lval = {}, rval = {};
 	int res;
-
-	if (!e)
-		return yes;
 
 	switch (e->type) {
 	case E_SYMBOL:
@@ -959,6 +956,35 @@ tristate expr_calc_value(struct expr *e)
 		printf("expr_calc_value: relation %d?\n", e->type);
 		return no;
 	}
+}
+
+/**
+ * expr_calc_value - return the tristate value of the given expression
+ * @e: expression
+ * return: tristate value of the expression
+ */
+tristate expr_calc_value(struct expr *e)
+{
+	if (!e)
+		return yes;
+
+	if (!e->val_is_valid) {
+		e->val = __expr_calc_value(e);
+		e->val_is_valid = true;
+	}
+
+	return e->val;
+}
+
+/**
+ * expr_invalidate_all - invalidate all cached expression values
+ */
+void expr_invalidate_all(void)
+{
+	struct expr *e;
+
+	hash_for_each(expr_hashtable, e, node)
+		e->val_is_valid = false;
 }
 
 static int expr_compare_type(enum expr_type t1, enum expr_type t2)
