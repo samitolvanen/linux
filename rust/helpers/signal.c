@@ -7,3 +7,4 @@ int rust_helper_signal_pending(struct task_struct *t)
 {
 	return signal_pending(t);
 }
+EXPORT_SYMBOL_GPL(rust_helper_signal_pending);

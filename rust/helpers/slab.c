@@ -7,3 +7,4 @@ rust_helper_krealloc(const void *objp, size_t new_size, gfp_t flags)
 {
 	return krealloc(objp, new_size, flags);
 }
+EXPORT_SYMBOL_GPL(rust_helper_krealloc);
