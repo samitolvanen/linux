@@ -129,6 +129,7 @@ pub mod safety;
 pub mod scatterlist;
 pub mod security;
 pub mod seq_file;
+pub mod shrinker;
 pub mod sizes;
 #[cfg(CONFIG_SOC_BUS)]
 pub mod soc;
