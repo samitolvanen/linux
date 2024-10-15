@@ -208,6 +208,14 @@ config ASM_MODVERSIONS
 	  assembly. This can be enabled only when the target architecture
 	  supports it.
 
+config EXTENDED_MODVERSIONS
+	bool "Extended Module Versioning Support"
+	depends on MODVERSIONS
+	help
+	  This enables extended MODVERSIONs support, allowing long symbol
+	  names to be versioned. The most likely reasons you would enable
+	  this are for Rust usage or aggressive LTO configurations.
+
 config MODULE_SRCVERSION_ALL
 	bool "Source checksum for all modules"
 	help
