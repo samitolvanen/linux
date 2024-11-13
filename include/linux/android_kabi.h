@@ -69,9 +69,9 @@
 
 #endif /* __GENKSYMS__ */
 
-#define _ANDROID_KABI_RESERVE(n)		u64 android_kabi_reserved##n
-#define _ANDROID_BACKPORT_RESERVE(n)		u64 android_backport_reserved##n
-#define _ANDROID_BACKPORT_RESERVE_ARRAY(n, s)	u8 __aligned(8) android_backport_reserved##n[s]
+#define _ANDROID_KABI_RESERVE(n)		u64 __kabi_reserved##n
+#define _ANDROID_BACKPORT_RESERVE(n)		u64 __kabi_reserved_backport##n
+#define _ANDROID_BACKPORT_RESERVE_ARRAY(n, s)	u8 __aligned(8) __kabi_reserved_backport##n[s]
 
 
 /*
@@ -155,5 +155,63 @@
  */
 #define ANDROID_BACKPORT_USE_ARRAY(number, bytes, _new)		\
 	_ANDROID_KABI_REPLACE(_ANDROID_BACKPORT_RESERVE_ARRAY(number, bytes), _new)
+
+#ifdef CONFIG_GENDWARFKSYMS
+
+#define __ANDROID_KABI_RULE(hint, target, value)                     \
+	static const char __PASTE(__gendwarfksyms_rule_,             \
+				  __COUNTER__)[] __used __aligned(1) \
+		__section(".discard.gendwarfksyms.kabi_rules") =     \
+			"1\0" #hint "\0" #target "\0" #value
+
+/*
+ * ANDROID_KABI_IGNORE
+ *   Add a new field that's ignored in versioning.
+ */
+#define ANDROID_KABI_IGNORE(n, _new)             \
+	union {                                  \
+		_new;                            \
+		unsigned char __kabi_ignored##n; \
+	}
+
+/*
+ * ANDROID_KABI_REPLACE
+ *   Replace a field with a compatible new field.
+ */
+#define ANDROID_KABI_REPLACE(_oldtype, _oldname, _new) \
+	_ANDROID_KABI_REPLACE(_oldtype __kabi_renamed##_oldname, struct { _new; })
+
+#else
+
+#define __ANDROID_KABI_RULE(hint, target, value)
+#define ANDROID_KABI_IGNORE(n, _new) _new
+#define ANDROID_KABI_REPLACE(_oldtype, _oldname, _new) _new
+
+#endif /* CONFIG_GENDWARFKSYMS */
+
+/*
+ * ANDROID_KABI_DECLONLY(fqn)
+ *   Treat the struct/union/enum fqn as a declaration, i.e. even if
+ *   a definition is available, don't expand the contents.
+ */
+#define ANDROID_KABI_DECLONLY(fqn) __ANDROID_KABI_RULE(declonly, fqn, )
+
+/*
+ * ANDROID_KABI_ENUMERATOR_IGNORE(fqn, field)
+ *   When expanding enum fqn, skip the provided field. This makes it
+ *   possible to hide added enum fields from versioning.
+ */
+#define ANDROID_KABI_ENUMERATOR_IGNORE(fqn, field) \
+	__ANDROID_KABI_RULE(enumerator_ignore, fqn field, )
+
+/*
+ * ANDROID_KABI_ENUMERATOR_VALUE(fqn, field, value)
+ *   When expanding enum fqn, use the provided value for the
+ *   specified field. This makes it possible to override enumerator
+ *   values when calculating versions.
+ */
+#define ANDROID_KABI_ENUMERATOR_VALUE(fqn, field, value) \
+	__ANDROID_KABI_RULE(enumerator_value, fqn field, value)
+
 
 #endif /* _ANDROID_KABI_H */
