@@ -77,6 +77,8 @@
 #include "binder_trace.h"
 #include <trace/hooks/binder.h>
 
+ANDROID_KABI_BINDER_WORK_TYPE();
+
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 

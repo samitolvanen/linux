@@ -170,6 +170,12 @@ struct binder_work {
 	ANDROID_OEM_DATA(1);
 };
 
+#define ANDROID_KABI_BINDER_WORK_TYPE()				\
+	ANDROID_KABI_ENUMERATOR_IGNORE(binder_work_type,	\
+			BINDER_WORK_FROZEN_BINDER);		\
+	ANDROID_KABI_ENUMERATOR_IGNORE(binder_work_type,	\
+			BINDER_WORK_CLEAR_FREEZE_NOTIFICATION)
+
 struct binder_error {
 	struct binder_work work;
 	uint32_t cmd;
