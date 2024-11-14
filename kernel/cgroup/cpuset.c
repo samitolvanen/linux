@@ -25,6 +25,10 @@
 #include "cgroup-internal.h"
 #endif
 
+ANDROID_KABI_DECLONLY(cgroup_taskset);
+ANDROID_KABI_DECLONLY(fs_context);
+ANDROID_KABI_DECLONLY(fs_parameter_spec);
+
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/cpuset.h>
