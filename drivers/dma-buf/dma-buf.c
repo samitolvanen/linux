@@ -31,6 +31,8 @@
 #include <uapi/linux/dma-buf.h>
 #include <uapi/linux/magic.h>
 
+#include <trace/hooks/dmabuf.h>
+
 #include "dma-buf-sysfs-stats.h"
 
 struct dma_buf_list {
