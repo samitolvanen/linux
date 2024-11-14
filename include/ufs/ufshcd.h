@@ -463,7 +463,7 @@ struct ufs_clk_scaling {
 	bool is_suspended;
 	/* using hole here would not alter the overall size of the structure. */
 #ifndef __GENKSYMS__
-	bool suspend_on_no_request;
+	ANDROID_KABI_IGNORE(0, bool suspend_on_no_request);
 #endif
 
 	ANDROID_KABI_RESERVE(1);
