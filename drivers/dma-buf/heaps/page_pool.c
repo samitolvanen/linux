@@ -17,6 +17,8 @@
 #include <linux/sched/signal.h>
 #include <trace/hooks/dmabuf.h>
 
+ANDROID_KABI_DECLONLY(trace_eval_map);
+
 /* page types we track in the pool */
 enum {
 	POOL_LOWPAGE,      /* Clean lowmem pages */
