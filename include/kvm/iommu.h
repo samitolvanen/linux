@@ -27,7 +27,7 @@
 struct kvm_hyp_iommu {
 	struct kvm_power_domain		power_domain;
 #ifndef __GENKSYMS__
-	u32				lock;   /* lock size verified in kvm_iommu_get_lock.  */
+	ANDROID_KABI_REPLACE(u32, unused, u32 lock);   /* lock size verified in kvm_iommu_get_lock.  */
 #else
 	u32				unused;
 #endif
