@@ -26,6 +26,8 @@
 
 #include "internals.h"
 
+ANDROID_KABI_DECLONLY(trace_eval_map);
+
 #if defined(CONFIG_IRQ_FORCED_THREADING) && !defined(CONFIG_PREEMPT_RT)
 DEFINE_STATIC_KEY_FALSE(force_irqthreads_key);
 
