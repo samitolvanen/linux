@@ -20,6 +20,8 @@
 #include <linux/cma.h>
 #include "../mm/slab.h"
 
+ANDROID_KABI_ANDROID_DEBUG_SYMBOL();
+
 struct ads_entry {
 	char *name;
 	void *addr;

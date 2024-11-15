@@ -29,6 +29,14 @@ enum android_debug_symbol {
 	ADS_END
 };
 
+#define ANDROID_KABI_ANDROID_DEBUG_SYMBOL()			\
+	ANDROID_KABI_ENUMERATOR_IGNORE(android_debug_symbol, 	\
+			ADS_START_RO_AFTER_INIT);		\
+	ANDROID_KABI_ENUMERATOR_IGNORE(android_debug_symbol,	\
+			ADS_END_RO_AFTER_INIT);			\
+	ANDROID_KABI_ENUMERATOR_VALUE(android_debug_symbol,	\
+			ADS_END, 14)
+
 enum android_debug_per_cpu_symbol {
 	ADS_IRQ_STACK_PTR = 0,
 	ADS_DEBUG_PER_CPU_END
