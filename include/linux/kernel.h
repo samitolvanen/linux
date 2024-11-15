@@ -265,6 +265,9 @@ enum ftrace_dump_mode {
 #endif
 };
 
+#define ANDROID_KABI_FTRACE_DUMP_MODE() \
+	ANDROID_KABI_ENUMERATOR_IGNORE(ftrace_dump_mode, DUMP_PARAM)
+
 #ifdef CONFIG_TRACING
 void tracing_on(void);
 void tracing_off(void);

@@ -56,6 +56,8 @@
 #include "trace.h"
 #include "trace_output.h"
 
+ANDROID_KABI_FTRACE_DUMP_MODE();
+
 /*
  * On boot up, the ring buffer is set to the minimum size, so that
  * we do not waste memory on systems that are not using tracing.
