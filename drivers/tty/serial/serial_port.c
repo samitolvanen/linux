@@ -19,6 +19,11 @@
 
 #include "serial_base.h"
 
+ANDROID_KABI_DECLONLY(dev_dma_attr);
+ANDROID_KABI_DECLONLY(acpi_device_id);
+ANDROID_KABI_DECLONLY(device_node);
+ANDROID_KABI_DECLONLY(of_device_id);
+
 #define SERIAL_PORT_AUTOSUSPEND_DELAY_MS	500
 
 /* Only considers pending TX for now. Caller must take care of locking */
