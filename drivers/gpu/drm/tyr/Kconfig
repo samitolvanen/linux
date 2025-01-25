@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0 or MIT
+
+# We should ideally fix this, except that we need these things to be Y (this is
+# a requirement from the Rust infrastructre) even if DRM_TYR=m.
+#
+config TYR_DRM_DEPS
+    bool "Tyr DRM dependencies"
+    select DRM_GPUVM
+    select DRM_GEM_SHMEM_HELPER
+	select DRM_SCHED
+    help
+      Tyr DRM deps (used to force deps to be =y even when the driver is =m)
+
+config DRM_TYR
+	tristate "Tyr (Rust DRM support for ARM Mali CSF-based GPUs)"
+	depends on DRM=y
+	depends on RUST
+	depends on RUST_FW_LOADER_ABSTRACTIONS
+	depends on ARM || ARM64 || COMPILE_TEST
+	depends on !GENERIC_ATOMIC64  # for IOMMU_IO_PGTABLE_LPAE
+	depends on MMU
+	depends on TYR_DRM_DEPS
+	select IOMMU_IO_PGTABLE_LPAE
+	depends on IOMMU_SUPPORT
+	help
+	  Rust DRM driver for ARM Mali CSF-based GPUs.
+
+	  This driver is for Mali (or Immortalis) Valhall Gxxx GPUs.
+
+	  Note that the Mali-G68 and Mali-G78, while Valhall architecture, will
+	  be supported with the panfrost driver as they are not CSF GPUs.
+
+	  if M is selected, the module will be called tyr.

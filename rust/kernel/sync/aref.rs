@@ -125,7 +125,7 @@ impl<T: AlwaysRefCounted> ARef<T> {
     ///
     /// Callers must ensure that they have exclusive access to `T`. This also implies that no other
     /// `ARef`s may be taken out for `T`.
-    pub(crate) unsafe fn as_inner_mut(&mut self) -> &mut T {
+    pub unsafe fn as_inner_mut(&mut self) -> &mut T {
         // SAFETY: Our safety contract guarantees we have exclusive access to `T`
         unsafe { self.ptr.as_mut() }
     }
