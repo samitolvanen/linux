@@ -9,4 +9,4 @@ gendwarfksyms-objs += kabi.o
 gendwarfksyms-objs += symbols.o
 gendwarfksyms-objs += types.o
 
-HOSTLDLIBS_gendwarfksyms := -ldw -lelf -lz
+HOSTLDLIBS_gendwarfksyms := -ldw -lelf -lz $(shell $(HOSTPKG_CONFIG) --libs jemalloc 2> /dev/null)
