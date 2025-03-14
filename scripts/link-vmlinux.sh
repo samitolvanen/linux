@@ -97,6 +97,10 @@ vmlinux_link()
 		ldflags="${ldflags} ${wl}--strip-debug"
 	fi
 
+	if [ -n "${strip_gendwarfksyms}" ] ; then
+		ldflags="${wl}--script=${srctree}/scripts/gendwarfksyms.lds ${ldflags}"
+	fi
+
 	if is_enabled CONFIG_VMLINUX_MAP; then
 		ldflags="${ldflags} ${wl}-Map=${output}.map"
 	fi
@@ -262,6 +266,7 @@ if is_enabled CONFIG_KALLSYMS; then
 
 	# The kallsyms linking does not need debug symbols included.
 	strip_debug=1
+	strip_gendwarfksyms=1
 
 	sysmap_and_kallsyms .tmp_vmlinux1
 	size1=$(${CONFIG_SHELL} "${srctree}/scripts/file-size.sh" ${kallsymso})
@@ -277,6 +282,7 @@ if is_enabled CONFIG_KALLSYMS; then
 fi
 
 strip_debug=
+strip_gendwarfksyms=1
 
 vmlinux_link vmlinux
 

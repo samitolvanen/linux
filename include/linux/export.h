@@ -61,7 +61,7 @@
  */
 #define __GENDWARFKSYMS_EXPORT(sym)				\
 	static typeof(sym) *__gendwarfksyms_ptr_##sym __used	\
-		__section(".discard.gendwarfksyms") = &sym;
+		__section(".data..gendwarfksyms") = &sym;
 #else
 #define __GENDWARFKSYMS_EXPORT(sym)
 #endif

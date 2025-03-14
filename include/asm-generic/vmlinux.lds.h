@@ -539,6 +539,7 @@ defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
 	RO_EXCEPTION_TABLE						\
 	NOTES								\
 	BTF								\
+	GENDWARFKSYMS_PTR						\
 									\
 	. = ALIGN((align));						\
 	__end_rodata = .;
@@ -672,6 +673,18 @@ defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
 	}
 #else
 #define BTF
+#endif
+
+/*
+ * __gendwarfksyms_ptr symbols.
+ */
+#ifdef CONFIG_GENDWARFKSYMS
+#define GENDWARFKSYMS_PTR							\
+	.data..gendwarfksyms : AT(ADDR(.data..gendwarfksyms) - LOAD_OFFSET) {	\
+		*(.data..gendwarfksyms)						\
+	}
+#else
+#define GENDWARFKSYMS_PTR
 #endif
 
 /*
