@@ -8,6 +8,7 @@
  */
 
 #include "auxiliary.c"
+#include "atomic.c"
 #include "blk.c"
 #include "bug.c"
 #include "build_assert.c"
