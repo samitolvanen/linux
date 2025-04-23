@@ -377,3 +377,27 @@ pub(crate) trait SharedSectionEntry {
         Err(ENOTSUPP)
     }
 }
+
+/// Add modinfo to the module file such as firmware files needed
+pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
+
+impl<const N: usize> ModInfoBuilder<N> {
+    /// A list of firmware files + paths needed
+    const FILES: &'static [&'static str] = &[
+        "arm/mali/arch10.8/mali_csffw.bin",
+        // Add more files here as needed in future
+    ];
+
+    /// Create the builder that generated the info at compile-time
+    pub (crate) const fn create(module_name: &'static kernel::str::CStr)
+        -> kernel::firmware::ModInfoBuilder<N> {
+        let mut bld = kernel::firmware::ModInfoBuilder::new(module_name);
+        // Walk over files listed above and add them to modinfo
+        let mut i = 0;
+        while i < Self::FILES.len() {
+            bld = bld.new_entry().push(Self::FILES[i]);
+            i += 1;
+        }
+        bld
+    }
+}
