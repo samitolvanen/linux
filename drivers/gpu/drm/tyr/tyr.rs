@@ -53,3 +53,5 @@ kernel::module_platform_driver! {
     description: "Rust driver for ARM Mali CSF-based GPUs",
     license: "Dual MIT/GPL",
 }
+
+kernel::module_firmware!(fw::ModInfoBuilder);
