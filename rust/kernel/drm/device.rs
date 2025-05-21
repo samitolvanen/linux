@@ -88,7 +88,7 @@ impl<T: drm::Driver> Device<T> {
         name: T::INFO.name.as_char_ptr().cast_mut(),
         desc: T::INFO.desc.as_char_ptr().cast_mut(),
 
-        driver_features: drm::driver::FEAT_GEM,
+        driver_features: drm::driver::FEAT_GEM | drm::driver::FEAT_GEM_GPUVA,
         ioctls: T::IOCTLS.as_ptr(),
         num_ioctls: T::IOCTLS.len() as i32,
         fops: &Self::GEM_FOPS,
