@@ -25,27 +25,23 @@ use crate::regs::*;
 mod as_lock;
 mod faults;
 pub(crate) mod irq;
+mod slot_allocator;
 pub(crate) mod vm;
+
+use self::slot_allocator::SlotAllocator;
 
 pub(crate) struct Mmu {
     /// List containing all VMs.
     vms: KVec<Arc<Mutex<Vm>>>,
     /// Tracks which of the 32 AS slots are free.
-    free_slots: usize,
-    // slot_allocator: Arc<Mutex<SlotAllocator>>,
+    slots: SlotAllocator,
 }
 
 impl Mmu {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             vms: KVec::new(),
-            // slot_allocator: Arc::pin_init(
-            //     new_mutex!(SlotAllocator {
-            //         free_mask: u32::MAX,
-            //     }),
-            //     GFP_KERNEL,
-            // )?,
-            free_slots: usize::MAX & !1,
+            slots: SlotAllocator::new(),
         })
     }
 
@@ -75,16 +71,6 @@ impl Mmu {
         Self::do_as_command(iomem, as_nr, AS_COMMAND_FLUSH_PT, range)
     }
 
-    fn allocate_as(&mut self) -> Result<usize> {
-        let slot = self.free_slots.trailing_zeros();
-        if slot == 32 {
-            return Err(EBUSY);
-        }
-
-        self.free_slots |= 1 << slot;
-        Ok(slot as usize)
-    }
-
     fn wait_ready(iomem: &Devres<IoMem>, as_nr: usize) -> Result {
         let op = || as_status(as_nr)?.read(iomem);
         let cond = |status: &u32| -> bool { *status & AS_STATUS_ACTIVE == 0 };
@@ -96,12 +82,6 @@ impl Mmu {
         )?;
 
         Ok(())
-    }
-
-    /// TODO: The code to manage AS slots is still TODO.
-    #[allow(unused)]
-    fn free_as(&mut self, as_nr: usize) {
-        self.free_slots &= !(1 << as_nr);
     }
 
     fn do_as_command(
@@ -141,11 +121,22 @@ impl Mmu {
             | as_transcfg_ina_bits((55 - va_bits).into());
 
         let memattr = vm.memattr;
-        let as_nr = if vm.for_mcu { 0 } else { self.allocate_as()? };
-
-        Self::enable_as(iomem, as_nr, transtab, transcfg, memattr)?;
-
+        let as_nr = self.slots.find_slot(vm.for_mcu)?;
+        Self::enable_as(iomem, as_nr, transtab, transcfg.into(), memattr)?;
+        self.slots.alloc_slot(as_nr);
         vm.address_space = Some(as_nr);
+        Ok(())
+    }
+
+    pub(crate) fn unbind_vm(&mut self, vm: &Arc<Mutex<Vm>>, iomem: &Devres<IoMem>) -> Result {
+        let mut vm = vm.lock();
+        let as_nr = vm
+            .address_space
+            .ok_or(EINVAL)
+            .inspect_err(|_| pr_warn!("Unbinding vm without AS"))?;
+        Self::disable_as(iomem, as_nr)?;
+        vm.address_space = None;
+        self.slots.free_slot(as_nr);
         Ok(())
     }
 
@@ -181,7 +172,31 @@ impl Mmu {
         as_memattr_lo(as_nr)?.write(iomem, memattr_lo)?;
         as_memattr_hi(as_nr)?.write(iomem, memattr_hi)?;
 
+        let op = || as_status(as_nr)?.read(iomem);
+        let cond = |status: &u32| -> bool { *status & AS_STATUS_ACTIVE == 0 };
+        let _ = io::poll::read_poll_timeout(
+            op,
+            cond,
+            Delta::from_millis(0),
+            Some(Delta::from_micros(200)),
+        )?;
+
         as_command(as_nr)?.write(iomem, AS_COMMAND_UPDATE)?;
+
+        Ok(())
+    }
+
+    fn disable_as(iomem: &Devres<IoMem>, as_nr: usize) -> Result {
+        Self::do_as_command(iomem, as_nr, AS_COMMAND_FLUSH_MEM, 0..u64::MAX)?;
+
+        as_transtab_lo(as_nr)?.write(iomem, 0)?;
+        as_transtab_hi(as_nr)?.write(iomem, 0)?;
+
+        as_memattr_lo(as_nr)?.write(iomem, 0)?;
+        as_memattr_hi(as_nr)?.write(iomem, 0)?;
+
+        as_transcfg_lo(as_nr)?.write(iomem, AS_TRANSCFG_ADRMODE_UNMAPPED as u32)?;
+        as_transcfg_hi(as_nr)?.write(iomem, 0)?;
 
         let op = || as_status(as_nr)?.read(iomem);
         let cond = |status: &u32| -> bool { *status & AS_STATUS_ACTIVE == 0 };
@@ -191,6 +206,8 @@ impl Mmu {
             Delta::from_millis(0),
             Delta::from_micros(200),
         )?;
+
+        as_command(as_nr)?.write(iomem, AS_COMMAND_UPDATE)?;
 
         Ok(())
     }

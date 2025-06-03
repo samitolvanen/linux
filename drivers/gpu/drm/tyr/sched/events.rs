@@ -246,6 +246,7 @@ impl Scheduler {
     }
 
     fn mark_group_idle(&mut self, group: Arc<Group>, data: &TyrData) -> Result {
+        data.with_locked_mmu(|mmu| mmu.unbind_vm(&group.vm, &data.iomem))?;
         self.idle_groups[group.priority as usize].push(group, GFP_KERNEL)?;
         Ok(())
     }
