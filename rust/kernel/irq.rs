@@ -20,4 +20,7 @@ pub mod request;
 pub use flags::Flags;
 
 #[doc(inline)]
-pub use request::{Handler, IrqRequest, IrqReturn, Registration};
+pub use request::{
+    Handler, IrqRequest, IrqReturn, Registration, ThreadedHandler, ThreadedIrqReturn,
+    ThreadedRegistration,
+};
