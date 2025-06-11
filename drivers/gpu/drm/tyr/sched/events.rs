@@ -212,21 +212,23 @@ impl Scheduler {
                 // be in TyrData, or anywhere else we can easily access from
                 // here. It should also be protected by a SpinLock instead,
                 // because we cannot sleep in the signalling path.
-                for job_fence in &queue.in_flight_jobs {
-                    // We have executed everything up until this point.
-                    if sync_obj.seqno < job_fence.seqno() {
-                        break;
+                let mut res = Ok(());
+                queue.in_flight_jobs.retain(|fence| {
+                    if res.is_err() {
+                        return true;
+                    }
+                    if sync_obj.seqno < fence.seqno() {
+                        return true;
                     }
 
                     // Add this debug aid for a while. It will be important
                     // while we develop the driver.
-                    pr_info!("Signalling fence: {}\n", job_fence.seqno());
+                    pr_info!("Signalling fence: {}\n", fence.seqno());
 
-                    job_fence.signal()?;
-                }
-
-                // Ok: this does not allocate, so it is ok to use in the signalling path.
-                queue.in_flight_jobs.retain(|fence| !fence.signaled());
+                    res = fence.signal();
+                    false
+                });
+                res?;
             }
 
             Ok(())
