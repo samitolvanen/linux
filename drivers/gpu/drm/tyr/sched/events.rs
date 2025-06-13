@@ -198,7 +198,9 @@ impl Scheduler {
         }
     }
 
-    fn update_group(&mut self, group: &Group) -> Result {
+    fn update_group(&mut self, group: Arc<Group>, data: &TyrData) -> Result {
+        let mut no_in_flight_jobs = true;
+
         // TODO: we need to annotate this function with the dma signalling token.
         // TODO: we cannot sleep in the signalling path.
         group.with_locked_inner(|inner| {
@@ -229,11 +231,22 @@ impl Scheduler {
                     false
                 });
                 res?;
+
+                no_in_flight_jobs &= queue.in_flight_jobs.is_empty();
             }
 
             Ok(())
         })?;
 
+        if no_in_flight_jobs {
+            self.mark_group_idle(group, data)?;
+        }
+
+        Ok(())
+    }
+
+    fn mark_group_idle(&mut self, group: Arc<Group>, data: &TyrData) -> Result {
+        self.idle_groups[group.priority as usize].push(group, GFP_KERNEL)?;
         Ok(())
     }
 }
@@ -268,7 +281,7 @@ impl WorkItem<3> for TyrData {
     fn run(this: Self::Pointer) {
         let _ = this.with_locked_scheduler(|sched| {
             while let Some(group) = sched.unsynced_groups.pop() {
-                sched.update_group(&group).inspect_err(|e| {
+                sched.update_group(group, &this).inspect_err(|e| {
                     pr_err!("Failed to process firmware events: {}", e.to_errno());
                 })?;
             }
