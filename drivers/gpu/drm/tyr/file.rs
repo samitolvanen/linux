@@ -366,7 +366,7 @@ impl File {
             .ok_or(EINVAL)?;
 
         tdev.with_locked_scheduler(|sched| {
-            sched.bind0(tdev, group.clone())?;
+            sched.bind(tdev, group.clone())?;
             sched.submit(kvec![], out_syncs, group, queue_submits, file.get_client_id())
         })?;
 

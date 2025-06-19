@@ -311,8 +311,8 @@ impl Scheduler {
             let db_req = csg_iface.doobell_request()?;
             db_req.toggle_reqs(queue_mask)?;
 
-            glb_iface.set_csg_state(0, csg::GroupState::Start)?;
-            glb_iface.ring_csg_doorbell(0)
+            glb_iface.set_csg_state(csg_idx, csg::GroupState::Start)?;
+            glb_iface.ring_csg_doorbell(csg_idx)
         })
     }
 
@@ -344,16 +344,17 @@ impl Scheduler {
         cs_iface.set_state(StreamState::Start)
     }
 
-    // TODO: This is here just for debug purposes. Remove this soon.
-    pub(crate) fn bind0(&mut self, tdev: &TyrDevice, group: Arc<Group>) -> Result {
-        self.bind_group(tdev, group, 0)?;
-        self.program_csg_slot(tdev, 0, Priority::Low)
+    pub(crate) fn bind(&mut self, tdev: &TyrDevice, group: Arc<Group>) -> Result {
+        let csg_idx = self.csg_slots.iter().position(|slot| slot.is_none()).ok_or(EBUSY)?;
+        pr_warn!("Using csg slot {csg_idx}\n");
+        self.bind_group(tdev, group, csg_idx)?;
+        self.program_csg_slot(tdev, csg_idx, Priority::Low)
     }
 
     // place a dummy instruction in the first CS for the given group and kick
     // it, just to make sure the ringbuf code is working.
     pub(crate) fn issue_dummy_instr(&mut self, group: Arc<Group>, tdev: &TyrDevice) -> Result {
-        self.bind0(tdev, group.clone())?;
+        self.bind(tdev, group.clone())?;
 
         let iomem = tdev.iomem.clone();
 
