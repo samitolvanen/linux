@@ -92,6 +92,7 @@ pub mod fmt;
 pub mod fs;
 pub mod init;
 pub mod io;
+pub mod io_pgtable;
 pub mod ioctl;
 pub mod irq;
 pub mod jump_label;
