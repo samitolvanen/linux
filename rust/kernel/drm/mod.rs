@@ -9,6 +9,7 @@ pub mod gem;
 #[cfg(CONFIG_DRM_GPUVM = "y")]
 pub mod gpuvm;
 pub mod ioctl;
+pub mod mm;
 
 pub use self::device::Device;
 pub use self::driver::Driver;
