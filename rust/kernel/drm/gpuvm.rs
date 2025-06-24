@@ -36,7 +36,7 @@ use crate::types::Opaque;
 
 /// A convenience type for the driver's GEM object.
 type Object<T> =
-    <<<T as DriverGpuVm>::Driver as driver::Driver>::Object as gem::BaseDriverObject>::Object;
+    <<<T as DriverGpuVm>::Driver as driver::Driver>::Object as gem::DriverObject>::Object;
 
 /// Trait that must be implemented by DRM drivers to represent a DRM [`GpuVm`],
 /// i.e. a GPU address space.
@@ -165,7 +165,7 @@ impl<T: DriverGpuVm> OpMap<T> {
         let gem = unsafe { *self.0.get() }.gem.obj;
 
         // SAFETY: The GEM object has an active reference for the lifetime of this op.
-        unsafe { <Object<T> as IntoGEMObject>::as_ref(gem) }
+        unsafe { <Object<T> as IntoGEMObject>::from_raw(gem) }
     }
 }
 
@@ -210,7 +210,13 @@ impl<T: DriverGpuVm> OpUnMap<T> {
             return None;
         }
         // SAFETY: Container invariant is guaranteed for ops structs created for our types.
-        let p = unsafe { crate::container_of!(self.0.va, GpuVa<T>, gpuva) as *mut GpuVa<T> };
+        let p = unsafe {
+            crate::container_of!(
+                self.0.va.cast::<Opaque<bindings::drm_gpuva>>(),
+                GpuVa<T>,
+                gpuva
+            )
+        };
         // SAFETY: The GpuVa object reference is valid per the op_unmap contract
         Some(unsafe { &*p })
     }
@@ -327,7 +333,13 @@ impl<T: DriverGpuVm> GpuVa<T> {
         unsafe { bindings::drm_gpuvm_bo_get(vm_bo) };
 
         // SAFETY: Container invariant is guaranteed for GpuVmBo<T> objects.
-        let vm_bo = unsafe { crate::container_of!(vm_bo, GpuVmBo<T>, bo) as *mut GpuVmBo<T> };
+        let vm_bo = unsafe {
+            crate::container_of!(
+                vm_bo.cast::<Opaque<bindings::drm_gpuvm_bo>>(),
+                GpuVmBo<T>,
+                bo
+            )
+        };
 
         // SAFETY: We just incremented the reference count above.
         Some(unsafe { ARef::from_raw(NonNull::new_unchecked(vm_bo)) })
@@ -360,7 +372,7 @@ impl<T: DriverGpuVm> GpuVmBo<T> {
         // SAFETY: The GEM object has an active reference for the lifetime of
         // this GpuVmBo and `obj` was set to a pointer to `BaseObject` in
         // `obtain_bo()`.
-        unsafe { <Object<T> as IntoGEMObject>::as_ref(bo) }
+        unsafe { <Object<T> as IntoGEMObject>::from_raw(bo) }
     }
 }
 
@@ -449,7 +461,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
                         // Zero-init required by drm_gpuvm_init.
                         *slot = core::mem::zeroed();
                         bindings::drm_gpuvm_init(
-                            Opaque::raw_get(slot),
+                            Opaque::cast_into(slot),
                             name.as_char_ptr(),
                             0,
                             dev.as_raw(),
@@ -554,7 +566,9 @@ impl<T: DriverGpuVm> GpuVm<T> {
 
         // SAFETY: All the drm_gpuvm_bo objects in this GpuVm are always
         // allocated by us as GpuVmBo<T>.
-        let p = unsafe { crate::container_of!(p, GpuVmBo<T>, bo) as *mut GpuVmBo<T> };
+        let p = unsafe {
+            crate::container_of!(p.cast::<Opaque<bindings::drm_gpuvm_bo>>(), GpuVmBo<T>, bo)
+        };
         // SAFETY: We checked for NULL above, and the types ensure that
         // this object was created by vm_bo_alloc_callback<T>.
         Some(unsafe { ARef::from_raw(NonNull::new_unchecked(p)) })
@@ -574,7 +588,9 @@ impl<T: DriverGpuVm> GpuVm<T> {
         }
 
         // SAFETY: Container invariant is guaranteed for GpuVmBo objects for this GpuVm.
-        let p = unsafe { crate::container_of!(p, GpuVmBo<T>, bo) as *mut GpuVmBo<T> };
+        let p = unsafe {
+            crate::container_of!(p.cast::<Opaque<bindings::drm_gpuvm_bo>>(), GpuVmBo<T>, bo)
+        };
         // SAFETY: We checked for NULL above, and the types ensure that
         // this object was created by vm_bo_alloc_callback<T>.
         Ok(unsafe { ARef::from_raw(NonNull::new_unchecked(p)) })
@@ -662,7 +678,9 @@ impl<T: DriverGpuVm> GpuVm<T> {
             None
         } else {
             // SAFETY: Container invariant is guaranteed for GpuVa<T> objects.
-            let gpuva = unsafe { crate::container_of!(gpuva, GpuVa<T>, gpuva) as *mut GpuVa<T> };
+            let gpuva = unsafe {
+                crate::container_of!(gpuva.cast::<Opaque<bindings::drm_gpuva>>(), GpuVa<T>, gpuva)
+            };
             // SAFETY: Safe as per the type invariant of `GpuVa<T>`. Also it is OK
             // to convert to a reference here.
             Some(ResidentGpuVa(unsafe { &mut *gpuva }))
@@ -688,7 +706,9 @@ impl<T: DriverGpuVm> GpuVm<T> {
             None
         } else {
             // SAFETY: Container invariant is guaranteed for GpuVa<T> objects.
-            let gpuva = unsafe { crate::container_of!(gpuva, GpuVa<T>, gpuva) as *mut GpuVa<T> };
+            let gpuva = unsafe {
+                crate::container_of!(gpuva.cast::<Opaque<bindings::drm_gpuva>>(), GpuVa<T>, gpuva)
+            };
             // SAFETY: Safe as per the type invariant of `GpuVa<T>`. Also it is OK
             // to convert to a reference here.
             Some(ResidentGpuVa(unsafe { &mut *gpuva }))
@@ -744,7 +764,7 @@ unsafe impl<T: DriverGpuVm> AlwaysRefCounted for GpuVm<T> {
 
     unsafe fn dec_ref(obj: NonNull<Self>) {
         // SAFETY: The drm_gpuvm_put function satisfies the requirements for dec_ref().
-        unsafe { bindings::drm_gpuvm_put(Opaque::raw_get(&(*obj.as_ptr()).gpuvm)) };
+        unsafe { bindings::drm_gpuvm_put(Opaque::get(&(*obj.as_ptr()).gpuvm)) };
     }
 }
 
@@ -811,7 +831,13 @@ unsafe impl<T: DriverGpuVm> Send for GpuVmBo<T> {}
 /// This function is only safe to be called from the GPUVM C code.
 unsafe extern "C" fn vm_bo_free_callback<T: DriverGpuVm>(raw_vm_bo: *mut bindings::drm_gpuvm_bo) {
     // SAFETY: Container invariant is guaranteed for objects using this callback.
-    let p = unsafe { crate::container_of!(raw_vm_bo, GpuVmBo<T>, bo) as *mut GpuVmBo<T> };
+    let p = unsafe {
+        crate::container_of!(
+            raw_vm_bo.cast::<Opaque<bindings::drm_gpuvm_bo>>(),
+            GpuVmBo<T>,
+            bo
+        )
+    };
 
     // SAFETY: p is guaranteed to be valid for drm_gpuvm_bo objects using this callback.
     unsafe { drop(KBox::from_raw(p)) };
@@ -868,7 +894,11 @@ unsafe extern "C" fn step_remap_callback<T: DriverGpuVm>(
         // [`AlwaysRefCounted::dec_ref`] is called.
         let vm_bo_ref = unsafe {
             bindings::drm_gpuvm_bo_get(p_vm_bo);
-            &*(crate::container_of!(p_vm_bo, GpuVmBo<T>, bo) as *mut GpuVmBo<T>)
+            &*(crate::container_of!(
+                p_vm_bo.cast::<Opaque<bindings::drm_gpuvm_bo>>(),
+                GpuVmBo<T>,
+                bo
+            ))
         };
 
         from_result(|| {
@@ -917,7 +947,7 @@ unsafe extern "C" fn vm_free_callback<T: DriverGpuVm>(raw_gpuvm: *mut bindings::
             raw_gpuvm as *mut Opaque<bindings::drm_gpuvm>,
             GpuVm<T>,
             gpuvm
-        ) as *mut GpuVm<T>
+        )
     };
 
     // SAFETY: `p` is guaranteed to be valid for [`bindings::drm_gpuvm`] objects
