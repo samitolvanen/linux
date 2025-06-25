@@ -16,3 +16,8 @@ struct drm_gpuvm_bo *rust_helper_drm_gpuvm_bo_get(struct drm_gpuvm_bo *vm_bo)
 {
 	return drm_gpuvm_bo_get(vm_bo);
 }
+
+void rust_helper_drm_gpuvm_exec_unlock(struct drm_gpuvm_exec *vm_exec)
+{
+	return drm_gpuvm_exec_unlock(vm_exec);
+}
