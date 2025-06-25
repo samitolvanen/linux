@@ -738,6 +738,12 @@ impl<T: DriverGpuVm> GpuVm<T> {
         let end = start + self.va_length();
         Range { start, end }
     }
+
+    /// Prepares the objects within the VM, locking their reservations and
+    /// reserving `num_slots` for fences.
+    pub fn prepare(&self, num_slots: u32) -> Result<ExecToken<'_, T>> {
+        ExecToken::prepare(self, num_slots)
+    }
 }
 
 impl<T: DriverGpuVm> Deref for GpuVm<T> {
@@ -977,5 +983,53 @@ unsafe extern "C" fn vm_bo_alloc_callback<T: DriverGpuVm>() -> *mut bindings::dr
         }
 
         Err(_) => core::ptr::null_mut(),
+    }
+}
+
+use bindings::drm_gpuvm_exec;
+
+/// A token that ensures that all the objects within the VM are locked and that
+/// `num_slots` have been reserved for fences.
+pub struct ExecToken<'a, T: DriverGpuVm> {
+    _gpuvm: &'a GpuVm<T>,
+    vm_exec: Pin<KBox<bindings::drm_gpuvm_exec>>,
+    /// The number of slots reserved for fences.
+    pub num_slots: u32,
+}
+
+impl<'a, T: DriverGpuVm> ExecToken<'a, T> {
+    fn prepare(gpuvm: &'a GpuVm<T>, num_slots: u32) -> Result<Self> {
+        // We will probably replace this when the new scheduler debuts anyways,
+        // so just hack it for now.
+        const DRM_EXEC_INTERRUPTIBLE_WAIT: u32 = 0;
+        let mut guard = core::mem::ManuallyDrop::new(Self {
+            _gpuvm: gpuvm,
+            // vm_exec needs to be pinned, so stick it in a Box.
+            vm_exec: KBox::pin_init(
+                init!(drm_gpuvm_exec {
+                    vm: gpuvm.gpuvm.get(),
+                    flags: DRM_EXEC_INTERRUPTIBLE_WAIT,
+                    exec: Default::default(),
+                    extra: Default::default(),
+                    num_fences: num_slots,
+                }),
+                GFP_KERNEL,
+            )?,
+            num_slots,
+        });
+
+        // SAFETY: The object is valid and was initialized above
+        to_result(unsafe { bindings::drm_gpuvm_exec_lock(&mut *guard.vm_exec) })?;
+
+        Ok(core::mem::ManuallyDrop::into_inner(guard))
+    }
+}
+
+impl<'a, T: DriverGpuVm> Drop for ExecToken<'a, T> {
+    fn drop(&mut self) {
+        // SAFETY: We hold the lock, so it's safe to unlock.
+        unsafe {
+            bindings::drm_gpuvm_exec_unlock(&mut *self.vm_exec);
+        }
     }
 }
