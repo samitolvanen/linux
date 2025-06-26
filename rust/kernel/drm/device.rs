@@ -189,7 +189,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         name: crate::str::as_char_ptr_in_const_context(T::INFO.name).cast_mut(),
         desc: crate::str::as_char_ptr_in_const_context(T::INFO.desc).cast_mut(),
 
-        driver_features: drm::driver::FEAT_GEM | drm::driver::FEAT_GEM_GPUVA,
+        driver_features: drm::driver::FEAT_GEM | drm::driver::FEAT_GEM_GPUVA | drm::driver::FEAT_SYNCOBJ,
         ioctls: T::IOCTLS.as_ptr(),
         num_ioctls: T::IOCTLS.len() as i32,
         fops: &Self::GEM_FOPS,
