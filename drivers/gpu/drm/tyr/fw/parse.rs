@@ -27,9 +27,6 @@ use crate::mmu::vm::Vm;
 
 mod cursor;
 
-const FW_BINARY_MAGIC: u32 = 0xc3f13a6e;
-const FW_BINARY_MAJOR_MAX: u8 = 0;
-
 mod flags {
     use kernel::bits::bit_u32;
     use kernel::bits::genmask_u32;
@@ -72,9 +69,12 @@ mod flags {
     pub(crate) const READ: Flag = Flag(bit_u32(0));
     pub(crate) const WRITE: Flag = Flag(bit_u32(1));
     pub(crate) const EXEC: Flag = Flag(bit_u32(2));
+    #[expect(unused)]
     pub(crate) const CACHE_MODE_NONE: Flag = Flag(0 << 3);
     pub(crate) const CACHE_MODE_CACHED: Flag = Flag(1 << 3);
+    #[expect(unused)]
     pub(crate) const CACHE_MODE_UNCACHED_COHERENT: Flag = Flag(2 << 3);
+    #[expect(unused)]
     pub(crate) const CACHE_MODE_CACHED_COHERENT: Flag = Flag(3 << 3);
     pub(crate) const PROT: Flag = Flag(bit_u32(5));
     pub(crate) const SHARED: Flag = Flag(bit_u32(30));
@@ -83,7 +83,27 @@ mod flags {
 
 struct BuildInfoHeader(Range<u32>);
 
+impl BuildInfoHeader {
+    fn new(tdev: &TyrDevice, cursor: &mut Cursor<'_>) -> Result<Self> {
+        let start = cursor.read_u32(tdev)?;
+
+        Ok(Self(Range {
+            start,
+            end: start + cursor.read_u32(tdev)?,
+        }))
+    }
+
+    fn start(&self) -> u32 {
+        self.0.start
+    }
+
+    fn end(&self) -> u32 {
+        self.0.end
+    }
+}
+
 /// A parsed section of the firmware binary.
+#[allow(dead_code)]
 pub(crate) struct Section {
     /// Flags for this section.
     flags: flags::Flags,
@@ -106,7 +126,15 @@ pub(crate) struct Section {
     vm_map_flags: vm::map_flags::Flags,
 }
 
+impl Section {
+    pub(super) fn is_shared(&self) -> bool {
+        self.va.start == CSF_MCU_SHARED_REGION_START
+            && self.flags.contains(flags::SHARED)
+    }
+}
+
 /// The firmware header.
+#[allow(dead_code)]
 struct BinaryHeader {
     /// Magic value to check binary validity.
     magic: u32,
@@ -131,15 +159,30 @@ struct BinaryHeader {
 }
 
 impl BinaryHeader {
+    const FW_BINARY_MAGIC: u32 = 0xc3f13a6e;
+    const FW_BINARY_MAJOR_MAX: u8 = 0;
+
     fn new(tdev: &TyrDevice, cursor: &mut Cursor<'_>) -> Result<Self> {
         let magic = cursor.read_u32(tdev)?;
-        if magic != FW_BINARY_MAGIC {
+        if magic != Self::FW_BINARY_MAGIC {
             dev_err!(tdev.as_ref(), "Invalid firmware magic");
             return Err(EINVAL);
         }
 
         let minor = cursor.read_u8(tdev)?;
         let major = cursor.read_u8(tdev)?;
+
+        if major > Self::FW_BINARY_MAJOR_MAX {
+            dev_err!(
+                tdev.as_ref(),
+                "Unsupported firmware binary header version {}.{} (expected {}.x)\n",
+                major,
+                minor,
+                Self::FW_BINARY_MAJOR_MAX
+            );
+            return Err(EINVAL);
+        }
+
         let padding1 = cursor.read_u16(tdev)?;
         let version_hash = cursor.read_u32(tdev)?;
         let padding2 = cursor.read_u32(tdev)?;
@@ -166,6 +209,7 @@ impl BinaryHeader {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[repr(u8)]
 enum BinaryEntryType {
     /// Host <-> FW interface.
     Iface = 0,
@@ -237,9 +281,14 @@ impl BinarySectionEntryHeader {
 struct BinaryEntryHeader(u32);
 
 impl BinaryEntryHeader {
+    /// Raw, encoded entry type
+    fn entry_type_raw(&self) -> u8 {
+        (self.0 & 0xff) as u8
+    }
+
     /// The entry type.
-    fn entry_ty(&self) -> Result<BinaryEntryType> {
-        let v = (self.0 & 0xff) as u8;
+    fn entry_type(&self) -> Result<BinaryEntryType> {
+        let v = self.entry_type_raw();
         BinaryEntryType::try_from(v)
     }
 
@@ -256,17 +305,15 @@ impl BinaryEntryHeader {
 
 struct BinaryEntrySection {
     hdr: BinaryEntryHeader,
-    inner: Option<Section>,
+    inner: Option<KBox<Section>>,
 }
 
 impl Firmware {
-    /// Parses the firmware sections from the binary.
-    pub(super) fn read_sections(
+    /// Load the firmware
+    fn load(
         tdev: &TyrDevice,
-        iomem: Arc<Devres<IoMem>>,
         gpu_info: &GpuInfo,
-        vm: Arc<Mutex<Vm>>,
-    ) -> Result<(KVec<Section>, Section)> {
+    ) -> Result<kernel::firmware::Firmware> {
         let gpu_id = GpuId::from(gpu_info.gpu_id);
 
         let fw_path = CString::try_from_fmt(fmt!(
@@ -275,72 +322,62 @@ impl Firmware {
             gpu_id.arch_minor
         ))?;
 
-        let fw = kernel::firmware::Firmware::request(&fw_path, tdev.as_ref())?;
+        Ok(kernel::firmware::Firmware::request(
+            &fw_path,
+            tdev.as_ref(),
+        )?)
+    }
+
+    /// Parses the firmware sections from the binary.
+    pub(super) fn read_sections(
+        tdev: &TyrDevice,
+        iomem: Arc<Devres<IoMem>>,
+        gpu_info: &GpuInfo,
+        vm: Arc<Mutex<Vm>>,
+    ) -> Result<KVec<KBox<Section>>> {
+        let fw = Self::load(tdev, gpu_info)?;
 
         let mut cursor = Cursor::new(fw.data());
 
-        dev_err!(
+        dev_dbg!(
             tdev.as_ref(),
             "Requested {} bytes of firmware successfully\n",
             fw.data().len()
         );
+
         let fw_bin_hdr = match BinaryHeader::new(tdev, &mut cursor) {
             Ok(fw_bin_hdr) => fw_bin_hdr,
             Err(e) => {
-                dev_err!(tdev.as_ref(), "Invalid firmware file: {}", e.to_errno());
+                dev_err!(
+                    tdev.as_ref(),
+                    "Invalid firmware file: {}",
+                    e.to_errno()
+                );
                 return Err(e);
             }
         };
-
-        if fw_bin_hdr.magic != FW_BINARY_MAGIC {
-            dev_err!(tdev.as_ref(), "Invalid firmware magic");
-            return Err(EINVAL);
-        }
-
-        if fw_bin_hdr.major > FW_BINARY_MAJOR_MAX {
-            dev_err!(
-                tdev.as_ref(),
-                "Unsupported firmware binary version: {}.{}",
-                fw_bin_hdr.major,
-                fw_bin_hdr.minor
-            );
-            return Err(EINVAL);
-        }
 
         if fw_bin_hdr.size > cursor.len() as u32 {
             dev_err!(tdev.as_ref(), "Firmware image is truncated");
             return Err(EINVAL);
         }
 
-        let mut sections = Vec::new();
-        let mut shared_section = None;
+        let mut sections = KVec::new();
 
         while (cursor.pos() as u32) < fw_bin_hdr.size {
-            match Self::read_entry(&mut cursor, tdev, iomem.clone(), &fw, vm.clone())? {
-                section => {
-                    cursor.advance((section.hdr.size() - 4) as usize)?;
-
-                    match section.inner {
-                        Some(section) => {
-                            // TODO: refactor this.
-                            if section.flags.contains(flags::SHARED) {
-                                shared_section = Some(section);
-                            } else {
-                                sections.push(section, GFP_KERNEL)?
-                            }
-                        }
-                        None => continue,
-                    }
-                }
+            let section = Self::read_entry(
+                &mut cursor,
+                tdev,
+                iomem.clone(),
+                &fw,
+                vm.clone(),
+            )?;
+            if let Some(inner) = section.inner {
+                sections.push(inner, GFP_KERNEL)?;
             }
         }
 
-        let shared_section = shared_section.ok_or_else(|| {
-            dev_err!(tdev.as_ref(), "No shared section found in firmware");
-            EINVAL
-        })?;
-
-        Ok((sections, shared_section))
+        Ok(sections)
     }
 
     fn read_entry(
@@ -355,76 +392,92 @@ impl Firmware {
             inner: None,
         };
 
-        let section_size = section.hdr.size() as usize - core::mem::size_of::<BinaryEntryHeader>();
-
-        let entry_ty = match section.hdr.entry_ty() {
-            Ok(entry_ty) => entry_ty,
-            Err(e) => {
-                if section.hdr.optional() {
-                    dev_info!(
-                        tdev.as_ref(),
-                        "Skipping unknown optional firmware entry type: {}",
-                        e.to_errno()
-                    );
-                    return Ok(section);
-                } else {
-                    dev_err!(
-                        tdev.as_ref(),
-                        "Invalid firmware entry type: {}",
-                        e.to_errno()
-                    );
-                    return Err(EINVAL);
-                }
-            }
-        };
-
-        if cursor.pos() % core::mem::size_of::<u32>() != 0 {
+        if cursor.pos() % size_of::<u32>() != 0
+            || section.hdr.size() as usize % size_of::<u32>() != 0
+        {
             dev_err!(
                 tdev.as_ref(),
-                "Invalid firmware file: entry not aligned to 4 bytes at pos {}\n",
-                cursor.pos()
+                "Firmware entry isn't 32 bit aligned, offset={:#x} size={:#x}\n",
+                cursor.pos() - size_of::<u32>(),
+                section.hdr.size()
             );
             return Err(EINVAL);
         }
 
-        let mut entry_cursor = cursor.view(cursor.pos()..cursor.pos() + section_size)?;
+        let section_size =
+            section.hdr.size() as usize - size_of::<BinaryEntryHeader>();
+        let section = {
+            let mut entry_cursor =
+                cursor.view(cursor.pos()..cursor.pos() + section_size)?;
 
-        match entry_ty {
-            BinaryEntryType::Iface => Ok(BinaryEntrySection {
-                hdr: section.hdr,
-                inner: Self::read_section(tdev, iomem, &mut entry_cursor, fw, vm.clone())?,
-            }),
+            match section.hdr.entry_type() {
+                Ok(BinaryEntryType::Iface) => Ok(BinaryEntrySection {
+                    hdr: section.hdr,
+                    inner: Self::read_section(
+                        tdev,
+                        iomem,
+                        &mut entry_cursor,
+                        fw,
+                        vm,
+                    )?,
+                }),
 
-            BinaryEntryType::BuildInfoMetadata => {
-                // TODO: Read build metadata
-                Ok(section)
-            }
-
-            BinaryEntryType::Config
-            | BinaryEntryType::FutfTest
-            | BinaryEntryType::TraceBuffer
-            | BinaryEntryType::TimelineMetadata => Ok(section),
-
-            _ => {
-                if !section.hdr.optional() {
-                    dev_info!(
-                        tdev.as_ref(),
-                        "Unsupported non-optional entry type: {}",
-                        entry_ty as u32
-                    );
-
-                    Err(EINVAL)
-                } else {
-                    dev_info!(
-                        tdev.as_ref(),
-                        "Skipping unsupported firmware entry type: {}",
-                        entry_ty as u32
-                    );
-
+                Ok(BinaryEntryType::BuildInfoMetadata) => {
+                    let _ = Self::read_build_info(tdev, &mut entry_cursor, fw);
                     Ok(section)
                 }
+
+                Ok(entry_type)
+                    if matches!(
+                        entry_type,
+                        BinaryEntryType::Config
+                            | BinaryEntryType::FutfTest
+                            | BinaryEntryType::TraceBuffer
+                            | BinaryEntryType::TimelineMetadata
+                    ) =>
+                {
+                    Ok(section)
+                }
+
+                entry_type @ _ => {
+                    if entry_type.is_err() || !section.hdr.optional() {
+                        if !section.hdr.optional() {
+                            dev_err!(
+                                tdev.as_ref(),
+                                "Failed to handle firmware entry type: {}\n",
+                                entry_type.map_or(
+                                    section.hdr.entry_type_raw(),
+                                    |e| e as u8
+                                )
+                            );
+                            Err(EINVAL)
+                        } else {
+                            dev_info!(
+                                tdev.as_ref(),
+                                "Unexpected firmware entry type: {}\n",
+                                entry_type.map_or(
+                                    section.hdr.entry_type_raw(),
+                                    |e| e as u8
+                                )
+                            );
+                            Ok(section)
+                        }
+                    } else {
+                        dev_info!(
+                            tdev.as_ref(),
+                            "Skipping unsupported entry type: {}",
+                            entry_type.unwrap() as u8
+                        );
+                        Ok(section)
+                    }
+                }
             }
+        };
+
+        if section.is_ok() {
+            cursor.advance(section_size)?;
         }
+        section
     }
 
     fn read_section(
@@ -433,8 +486,18 @@ impl Firmware {
         cursor: &mut Cursor<'_>,
         fw: &kernel::firmware::Firmware,
         vm: Arc<Mutex<Vm>>,
-    ) -> Result<Option<Section>> {
+    ) -> Result<Option<KBox<Section>>> {
         let hdr = BinarySectionEntryHeader::new(tdev, cursor)?;
+
+        if hdr.data.end as usize > fw.size() {
+            dev_err!(
+                tdev.as_ref(),
+                "Firmware corrupted, file truncated? data_end={:#x} fw size={:#x}\n",
+                hdr.data.end,
+                fw.size()
+            );
+            return Err(EINVAL);
+        }
 
         if hdr.flags.contains(flags::PROT) {
             dev_warn!(
@@ -444,7 +507,9 @@ impl Firmware {
             return Ok(None);
         }
 
-        if hdr.va.start == CSF_MCU_SHARED_REGION_START && !hdr.flags.contains(flags::SHARED) {
+        if hdr.va.start == CSF_MCU_SHARED_REGION_START
+            && !hdr.flags.contains(flags::SHARED)
+        {
             dev_err!(
                 tdev.as_ref(),
                 "Interface at 0x{:x} must be shared",
@@ -512,40 +577,54 @@ impl Firmware {
             vm_map_flags
         );
 
-        Ok(Some(Section {
-            flags: hdr.flags,
-            name,
-            data,
-            mem,
-            va: hdr.va,
-            vm_map_flags,
-        }))
+        Ok(Some(KBox::new(
+            Section {
+                flags: hdr.flags,
+                name,
+                data,
+                mem,
+                va: hdr.va,
+                vm_map_flags,
+            },
+            GFP_KERNEL,
+        )?))
     }
 
-    fn read_build_info(cursor: &mut Cursor<'_>, tdev: &TyrDevice) -> Result<()> {
-        let meta_start = cursor.read_u32(tdev)? as usize;
-        let meta_end = cursor.read_u32(tdev)? as usize;
+    fn read_build_info(
+        tdev: &TyrDevice,
+        cursor: &mut Cursor<'_>,
+        fw: &kernel::firmware::Firmware,
+    ) -> Result<()> {
+        let meta = BuildInfoHeader::new(tdev, cursor)?;
 
-        let expected_hdr = b"git_sha: ";
-        let hdr = cursor.read(tdev, expected_hdr.len())?;
-
-        if hdr != expected_hdr {
-            dev_warn!(tdev.as_ref(), "Firmware's git sha is missing\n");
-            return Ok(());
+        if meta.start() as usize > fw.size() || meta.end() as usize > fw.size()
+        {
+            dev_err!(tdev.as_ref(), "Firmware build info corrupted\n");
+            return Err(EINVAL);
         }
 
-        let sz = meta_end - meta_start - expected_hdr.len();
-        let sha = cursor.read(tdev, sz)?;
-        if sha[sha.len()] != 0 {
-            dev_warn!(tdev.as_ref(), "Firmware's git sha is not NULL terminated\n");
-            return Ok(()); // Don't treat as fatal
+        let header = b"git_sha: ";
+        let range = meta.start() as usize..meta.start() as usize + header.len();
+
+        if header != fw.data().get(range).ok_or(EINVAL)? {
+            return Err(EINVAL);
         }
 
-        let sha = CStr::from_bytes_with_nul(sha).unwrap_or(c_str!(""));
+        let index = meta.end() as usize - 1;
+        if *fw.data().get(index).ok_or(EINVAL)? != b'\0' {
+            dev_warn!(
+                tdev.as_ref(),
+                "Firmware's git sha is not NULL terminated\n"
+            );
+            return Err(EINVAL);
+        }
+
+        let range = meta.start() as usize + header.len()..meta.end() as usize;
         dev_info!(
             tdev.as_ref(),
-            "Firmware git sha: {}\n",
-            sha.to_str().unwrap()
+            "Firmware git sha: {}",
+            CStr::from_bytes_with_nul(fw.data().get(range).ok_or(EINVAL)?)
+                .unwrap_or(c_str!(""))
         );
 
         Ok(())
