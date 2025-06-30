@@ -222,7 +222,7 @@ pub(crate) struct GlobalInterface {
 
     iomem: Arc<Devres<IoMem>>,
 
-    shared_section: Arc<Mutex<Section>>,
+    shared_section: Arc<Mutex<KBox<Section>>>,
 
     event_wait: Arc<Wait>,
 
@@ -232,7 +232,7 @@ pub(crate) struct GlobalInterface {
 
 impl GlobalInterface {
     pub(super) fn new(
-        shared_section: Section,
+        shared_section: KBox<Section>,
         iomem: Arc<Devres<IoMem>>,
         req_wait: Arc<Wait>,
     ) -> Result<Self> {

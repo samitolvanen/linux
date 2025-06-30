@@ -42,7 +42,7 @@ mod parse;
 /// that it can safely be dereferenced by the CPU.
 ///
 pub(crate) struct SharedSectionRange {
-    shared_section: Arc<Mutex<Section>>,
+    shared_section: Arc<Mutex<KBox<Section>>>,
     start: usize,
     end: usize,
 }
@@ -180,7 +180,7 @@ pub(crate) struct Firmware {
     #[pin]
     /// The sections read from the firmware binary. These sections are loaded
     /// into GPU memory via BOs.
-    sections: Mutex<KVec<Section>>,
+    sections: Mutex<KVec<KBox<Section>>>,
 
     /// The global FW interface.
     #[pin]
@@ -230,8 +230,17 @@ impl Firmware {
             vm
         };
 
-        let (sections, shared_section) =
-            Self::read_sections(tdev, iomem.clone(), gpu_info, vm.clone())?;
+        let mut sections = Self::read_sections(tdev, iomem.clone(), gpu_info, vm.clone())?;
+
+        let shared_section = match sections.iter().position(|section| {
+                section.is_shared()
+        }) {
+            Some(index) => sections.remove(index)?,
+            None        => {
+                dev_err!(tdev.as_ref(), "No shared section found in firmware");
+                return Err(EINVAL);
+            }
+        };
 
         let global_iface = GlobalInterface::new(shared_section, iomem.clone(), event_wait.clone())?;
 
