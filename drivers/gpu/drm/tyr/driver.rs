@@ -50,6 +50,7 @@ use crate::mmu::Mmu;
 use crate::regs::*;
 use crate::sched::Scheduler;
 use crate::sched::SchedulerState;
+use crate::new_wait;
 use crate::wait::Wait;
 use crate::wait::WaitResult;
 
@@ -237,7 +238,7 @@ impl platform::Driver for TyrDriver {
         let mmu = KBox::pin_init(new_mutex!(Mmu::new()?), GFP_KERNEL)?;
 
         let fw_event_wait = Wait::new()?;
-        let fw_boot_wait = Wait::new()?;
+        let fw_boot_wait = new_wait!()?;
         let fw = Firmware::init(
             &tdev,
             pdev,

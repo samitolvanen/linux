@@ -9,6 +9,49 @@ use kernel::sync::Arc;
 use kernel::sync::CondVar;
 use kernel::sync::Mutex;
 use kernel::time::msecs_to_jiffies;
+use kernel::sync::lock::Lock;
+use kernel::sync::lock::mutex::MutexBackend;
+
+/// Creates a new `Wait<T>` instance with call-site-specific lockdep class key.
+///
+/// # Usage
+/// - `new_wait!()`                 → creates `Wait<()>`
+/// - `new_wait!(data)`             → creates `Wait<T>` with `data: T`
+/// - `new_wait!(data, "name")`     → creates `Wait<T>` with named lock class
+///
+/// This macro ensures proper per-call-site lock tracking.
+///
+/// The underlying `Wait::new_with_lock()` function should **not** be
+/// used directly; it is only provided to support this macro's expansion.
+///
+/// Always prefer this macro to construct `Wait` object for cases when
+/// the object is expected to have rather unique locking behaviour, that
+/// might otherwise trigger false-positive lockdep warnings.
+/// In other cases, 'Wait::new()' is expected to be used.
+///
+/// ### Example
+/// ```
+/// let wait = new_wait!()?;
+/// let wait = new_wait!(data)?;
+/// let wait = new_wait!(false, "named_lock")?;
+/// ```
+#[macro_export]
+macro_rules! new_wait {
+    () => {{
+        let lock = new_mutex!(());
+        $crate::wait::Wait::new_with_lock(lock)
+    }};
+    ($data:expr) => {{
+        let lock = new_mutex!($data);
+        $crate::wait::Wait::new_with_lock(lock)
+    }};
+    ($data:expr, $name:literal) => {{
+        let lock = new_mutex!($data, $name);
+        $crate::wait::Wait::new_with_lock(lock)
+    }}
+}
+
+pub(crate) use new_wait;
 
 #[pin_data]
 /// A convenience type to wait for GPU responses.
@@ -50,6 +93,22 @@ impl<T> Wait<T> {
             pin_init!(Self {
                 cond <- new_condvar!(),
                 lock <- new_mutex!(data),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    /// A convenience function to initilaize the `Wait` struct
+    /// with provided Lock instance
+    ///
+    /// Use [`new_wait!`] instead.
+    pub(crate) fn new_with_lock(
+        lock: impl PinInit<Lock<T, MutexBackend>>
+    ) -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                cond <- new_condvar!(),
+                lock <- lock,
             }),
             GFP_KERNEL,
         )
