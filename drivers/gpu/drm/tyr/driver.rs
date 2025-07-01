@@ -50,6 +50,7 @@ use crate::mmu::Mmu;
 use crate::regs;
 use crate::sched::Scheduler;
 use crate::sched::SchedulerState;
+use crate::new_wait;
 use crate::wait::Wait;
 use crate::wait::WaitResult;
 
