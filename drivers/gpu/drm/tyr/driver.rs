@@ -354,7 +354,7 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     major: 0,
     minor: 0,
     patchlevel: 0,
-    name: c_str!("tyr"),
+    name: c_str!("panthor"),
     desc: c_str!("ARM Mali CSF-based GPU driver"),
 };
 
