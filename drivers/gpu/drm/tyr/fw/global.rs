@@ -477,7 +477,7 @@ impl GlobalInterface {
     /// Ring the CSG doorbell, thereby instructing CSF to process the requests
     /// made on this CSG.
     pub(crate) fn ring_csg_doorbell(&mut self, csg_idx: usize) -> Result {
-        self.doobell_request()?.toggle_reqs(1 << csg_idx)?;
+        self.doorbell_request()?.toggle_reqs(1 << csg_idx)?;
 
         self.ring_glb_doorbell()?;
 
@@ -577,7 +577,7 @@ impl SharedSectionEntry for GlobalInterface {
         ))
     }
 
-    fn doobell_request(&self) -> Result<RequestField> {
+    fn doorbell_request(&self) -> Result<RequestField> {
         let glb = self.state.enabled()?;
 
         Ok(RequestField::new(

@@ -225,7 +225,7 @@ impl SharedSectionEntry for CommandStreamGroup {
         ))
     }
 
-    fn doobell_request(&self) -> Result<RequestField> {
+    fn doorbell_request(&self) -> Result<RequestField> {
         Ok(RequestField::new(
             &self.input_area,
             core::mem::offset_of!(Input, doorbell_req),
