@@ -104,7 +104,7 @@ impl Scheduler {
         }
 
         if ring_cs_db_mask != 0 {
-            let req = csg.doobell_request()?;
+            let req = csg.doorbell_request()?;
             req.toggle_reqs(ring_cs_db_mask)?;
         }
 

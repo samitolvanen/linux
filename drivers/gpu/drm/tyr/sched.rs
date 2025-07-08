@@ -308,7 +308,7 @@ impl Scheduler {
             let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
             csg_iface.write_input(input)?;
 
-            let db_req = csg_iface.doobell_request()?;
+            let db_req = csg_iface.doorbell_request()?;
             db_req.toggle_reqs(queue_mask)?;
 
             glb_iface.set_csg_state(csg_idx, csg::GroupState::Start)?;

@@ -365,7 +365,7 @@ pub(crate) trait SharedSectionEntry {
 
     fn input_request(&self) -> Result<RequestField>;
 
-    fn doobell_request(&self) -> Result<RequestField> {
+    fn doorbell_request(&self) -> Result<RequestField> {
         pr_err!("Doorbell request not supported for this interface");
         Err(ENOTSUPP)
     }
