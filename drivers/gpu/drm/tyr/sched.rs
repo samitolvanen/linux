@@ -345,7 +345,11 @@ impl Scheduler {
     }
 
     pub(crate) fn bind(&mut self, tdev: &TyrDevice, group: Arc<Group>) -> Result {
-        let csg_idx = self.csg_slots.iter().position(|slot| slot.is_none()).ok_or(EBUSY)?;
+        let csg_idx = self
+            .csg_slots
+            .iter()
+            .position(|slot| slot.is_none())
+            .ok_or(EBUSY)?;
         pr_warn!("Using csg slot {csg_idx}\n");
         self.bind_group(tdev, group, csg_idx)?;
         self.program_csg_slot(tdev, csg_idx, Priority::Low)

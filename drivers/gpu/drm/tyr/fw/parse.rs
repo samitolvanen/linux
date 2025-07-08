@@ -128,8 +128,7 @@ pub(crate) struct Section {
 
 impl Section {
     pub(super) fn is_shared(&self) -> bool {
-        self.va.start == CSF_MCU_SHARED_REGION_START
-            && self.flags.contains(flags::SHARED)
+        self.va.start == CSF_MCU_SHARED_REGION_START && self.flags.contains(flags::SHARED)
     }
 }
 
@@ -310,10 +309,7 @@ struct BinaryEntrySection {
 
 impl Firmware {
     /// Load the firmware
-    fn load(
-        tdev: &TyrDevice,
-        gpu_info: &GpuInfo,
-    ) -> Result<kernel::firmware::Firmware> {
+    fn load(tdev: &TyrDevice, gpu_info: &GpuInfo) -> Result<kernel::firmware::Firmware> {
         let gpu_id = GpuId::from(gpu_info.gpu_id);
 
         let fw_path = CString::try_from_fmt(fmt!(
@@ -348,11 +344,7 @@ impl Firmware {
         let fw_bin_hdr = match BinaryHeader::new(tdev, &mut cursor) {
             Ok(fw_bin_hdr) => fw_bin_hdr,
             Err(e) => {
-                dev_err!(
-                    tdev.as_ref(),
-                    "Invalid firmware file: {}",
-                    e.to_errno()
-                );
+                dev_err!(tdev.as_ref(), "Invalid firmware file: {}", e.to_errno());
                 return Err(e);
             }
         };
@@ -365,13 +357,7 @@ impl Firmware {
         let mut sections = KVec::new();
 
         while (cursor.pos() as u32) < fw_bin_hdr.size {
-            let section = Self::read_entry(
-                &mut cursor,
-                tdev,
-                iomem.clone(),
-                &fw,
-                vm.clone(),
-            )?;
+            let section = Self::read_entry(&mut cursor, tdev, iomem.clone(), &fw, vm.clone())?;
             if let Some(inner) = section.inner {
                 sections.push(inner, GFP_KERNEL)?;
             }
@@ -404,22 +390,14 @@ impl Firmware {
             return Err(EINVAL);
         }
 
-        let section_size =
-            section.hdr.size() as usize - size_of::<BinaryEntryHeader>();
+        let section_size = section.hdr.size() as usize - size_of::<BinaryEntryHeader>();
         let section = {
-            let mut entry_cursor =
-                cursor.view(cursor.pos()..cursor.pos() + section_size)?;
+            let mut entry_cursor = cursor.view(cursor.pos()..cursor.pos() + section_size)?;
 
             match section.hdr.entry_type() {
                 Ok(BinaryEntryType::Iface) => Ok(BinaryEntrySection {
                     hdr: section.hdr,
-                    inner: Self::read_section(
-                        tdev,
-                        iomem,
-                        &mut entry_cursor,
-                        fw,
-                        vm,
-                    )?,
+                    inner: Self::read_section(tdev, iomem, &mut entry_cursor, fw, vm)?,
                 }),
 
                 Ok(BinaryEntryType::BuildInfoMetadata) => {
@@ -445,20 +423,14 @@ impl Firmware {
                             dev_err!(
                                 tdev.as_ref(),
                                 "Failed to handle firmware entry type: {}\n",
-                                entry_type.map_or(
-                                    section.hdr.entry_type_raw(),
-                                    |e| e as u8
-                                )
+                                entry_type.map_or(section.hdr.entry_type_raw(), |e| e as u8)
                             );
                             Err(EINVAL)
                         } else {
                             dev_info!(
                                 tdev.as_ref(),
                                 "Unexpected firmware entry type: {}\n",
-                                entry_type.map_or(
-                                    section.hdr.entry_type_raw(),
-                                    |e| e as u8
-                                )
+                                entry_type.map_or(section.hdr.entry_type_raw(), |e| e as u8)
                             );
                             Ok(section)
                         }
@@ -507,9 +479,7 @@ impl Firmware {
             return Ok(None);
         }
 
-        if hdr.va.start == CSF_MCU_SHARED_REGION_START
-            && !hdr.flags.contains(flags::SHARED)
-        {
+        if hdr.va.start == CSF_MCU_SHARED_REGION_START && !hdr.flags.contains(flags::SHARED) {
             dev_err!(
                 tdev.as_ref(),
                 "Interface at 0x{:x} must be shared",
@@ -597,8 +567,7 @@ impl Firmware {
     ) -> Result<()> {
         let meta = BuildInfoHeader::new(tdev, cursor)?;
 
-        if meta.start() as usize > fw.size() || meta.end() as usize > fw.size()
-        {
+        if meta.start() as usize > fw.size() || meta.end() as usize > fw.size() {
             dev_err!(tdev.as_ref(), "Firmware build info corrupted\n");
             return Err(EINVAL);
         }
@@ -612,10 +581,7 @@ impl Firmware {
 
         let index = meta.end() as usize - 1;
         if *fw.data().get(index).ok_or(EINVAL)? != b'\0' {
-            dev_warn!(
-                tdev.as_ref(),
-                "Firmware's git sha is not NULL terminated\n"
-            );
+            dev_warn!(tdev.as_ref(), "Firmware's git sha is not NULL terminated\n");
             return Err(EINVAL);
         }
 
@@ -623,8 +589,7 @@ impl Firmware {
         dev_info!(
             tdev.as_ref(),
             "Firmware git sha: {}",
-            CStr::from_bytes_with_nul(fw.data().get(range).ok_or(EINVAL)?)
-                .unwrap_or(c_str!(""))
+            CStr::from_bytes_with_nul(fw.data().get(range).ok_or(EINVAL)?).unwrap_or(c_str!(""))
         );
 
         Ok(())

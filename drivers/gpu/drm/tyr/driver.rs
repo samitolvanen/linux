@@ -47,10 +47,10 @@ use crate::gpu::GpuInfo;
 use crate::mmu;
 use crate::mmu::irq::MmuIrq;
 use crate::mmu::Mmu;
+use crate::new_wait;
 use crate::regs::*;
 use crate::sched::Scheduler;
 use crate::sched::SchedulerState;
-use crate::new_wait;
 use crate::wait::Wait;
 use crate::wait::WaitResult;
 

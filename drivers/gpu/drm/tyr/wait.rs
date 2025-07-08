@@ -5,12 +5,12 @@
 use kernel::new_condvar;
 use kernel::new_mutex;
 use kernel::prelude::*;
+use kernel::sync::lock::mutex::MutexBackend;
+use kernel::sync::lock::Lock;
 use kernel::sync::Arc;
 use kernel::sync::CondVar;
 use kernel::sync::Mutex;
 use kernel::time::msecs_to_jiffies;
-use kernel::sync::lock::Lock;
-use kernel::sync::lock::mutex::MutexBackend;
 
 /// Creates a new `Wait<T>` instance with call-site-specific lockdep class key.
 ///
@@ -48,7 +48,7 @@ macro_rules! new_wait {
     ($data:expr, $name:literal) => {{
         let lock = new_mutex!($data, $name);
         $crate::wait::Wait::new_with_lock(lock)
-    }}
+    }};
 }
 
 pub(crate) use new_wait;
@@ -102,9 +102,7 @@ impl<T> Wait<T> {
     /// with provided Lock instance
     ///
     /// Use [`new_wait!`] instead.
-    pub(crate) fn new_with_lock(
-        lock: impl PinInit<Lock<T, MutexBackend>>
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new_with_lock(lock: impl PinInit<Lock<T, MutexBackend>>) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 cond <- new_condvar!(),
