@@ -307,21 +307,20 @@ impl Group {
         let mut fences = KVec::with_capacity(queue_submits.len(), GFP_KERNEL)?;
 
         let vm = self.vm.lock();
-        vm.with_prepared_vm(queue_submits.len() as u32, |locked_vm| {
-            queue_submits.into_iter().try_for_each(|queue_submit| {
-                let fence = self.with_locked_inner(|inner| {
-                    inner.submit(
+        self.with_locked_inner(|inner| {
+            vm.with_prepared_vm(queue_submits.len() as u32, |locked_vm| {
+                queue_submits.into_iter().try_for_each(|queue_submit| {
+                    let fence = inner.submit(
                         &in_syncs,
                         &out_syncs,
                         self.clone(),
                         queue_submit,
                         &locked_vm,
                         client_id,
-                    )
-                })?;
-
-                fences.push(fence, GFP_KERNEL)?;
-                Ok(())
+                    )?;
+                    fences.push(fence, GFP_KERNEL)?;
+                    Ok(())
+                })
             })
         })?;
 
