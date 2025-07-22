@@ -70,8 +70,7 @@ impl Pool {
 
     pub(crate) fn destroy_vm(self: Pin<&Self>, index: usize, iomem: Arc<Devres<IoMem>>) -> Result {
         let xa = self.xa.as_ref();
-        let mut guard = xa.lock();
-        let vm = guard.remove(index).ok_or(EINVAL)?;
+        let vm = xa.lock().remove(index).ok_or(EINVAL)?;
 
         let mut vm = vm.lock();
         vm.destroyed = true;
