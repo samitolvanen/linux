@@ -32,6 +32,11 @@ pub struct MapleTree<T: ForeignOwnable> {
     _p: PhantomData<T>,
 }
 
+// SAFETY: TODO
+unsafe impl<T: Send + Sync + ForeignOwnable> Send for MapleTree<T> {}
+// SAFETY: TODO
+unsafe impl<T: Send + Sync + ForeignOwnable> Sync for MapleTree<T> {}
+
 /// A maple tree with `MT_FLAGS_ALLOC_RANGE` set.
 ///
 /// All methods on [`MapleTree`] are also accessible on this type.
@@ -181,7 +186,7 @@ impl<T: ForeignOwnable> MapleTree<T> {
 
         // SAFETY: The tree is valid, and we are passing a pointer to an owned instance of `T`.
         let res = to_result(unsafe {
-            bindings::mtree_insert_range(self.tree.get(), first, last, ptr, gfp.as_raw())
+            bindings::mtree_insert_range(self.tree.get(), first, last, ptr.cast(), gfp.as_raw())
         });
 
         if let Err(err) = res {
@@ -230,7 +235,7 @@ impl<T: ForeignOwnable> MapleTree<T> {
 
         // SAFETY: If the pointer is not null, then we took ownership of a valid instance of `T`
         // from the tree.
-        unsafe { T::try_from_foreign(ret) }
+        unsafe { T::try_from_foreign(ret.cast()) }
     }
 
     /// Lock the internal spinlock.
@@ -383,7 +388,7 @@ impl<'tree, T: ForeignOwnable> MapleGuard<'tree, T> {
         // SAFETY: If the pointer is not null, then it references a valid instance of `T`. It is
         // safe to borrow the instance mutably because the signature of this function enforces that
         // the mutable borrow is not used after the spinlock is dropped.
-        Some(unsafe { T::borrow_mut(ret) })
+        Some(unsafe { T::borrow_mut(ret.cast()) })
     }
 }
 
@@ -462,7 +467,7 @@ impl<T: ForeignOwnable> MapleTreeAlloc<T> {
             bindings::mtree_alloc_range(
                 self.tree.tree.get(),
                 &mut index,
-                ptr,
+                ptr.cast(),
                 size,
                 min,
                 max,
