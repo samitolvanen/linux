@@ -4,9 +4,15 @@ use core::ops::Range;
 
 use crate::driver::TyrDevice;
 use crate::driver::TyrDriver;
+use crate::file::DrmFile;
+use crate::mmu::vm;
+use crate::mmu::vm::{Vm, LiveRange};
+use kernel::devres::Devres;
 use kernel::drm::gem;
 use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
+use kernel::drm::gem::{self};
+use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use crate::file::DrmFile;
 use crate::mmu::vm;

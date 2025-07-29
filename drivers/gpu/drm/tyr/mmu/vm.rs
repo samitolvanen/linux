@@ -29,7 +29,6 @@ use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::ExecToken;
-use kernel::drm::mm;
 use kernel::io::mem::IoMem;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
@@ -52,6 +51,7 @@ pub(crate) mod map_flags;
 pub(crate) mod pool;
 
 mod range;
+pub(crate) use self::range::{RangeAlloc, LiveRange};
 
 // TODO: we need *all* of these in kernel::bindings.
 const SZ_4G: u64 = 4 * kernel::bindings::SZ_1G as u64;
@@ -74,9 +74,6 @@ pub(crate) struct Vm {
 
     /// Whether this is the MCU VM.
     pub(super) for_mcu: bool,
-
-    /// The range to automatically allocate kernel VAs from, if requested.
-    auto_kernel_va: Range<u64>,
 
     /// Whether this VM was destroyed by userspace.
     ///
@@ -114,11 +111,7 @@ impl Vm {
 
         let va_range = if for_mcu { 0..SZ_4G } else { 0..full_va_range };
 
-        let kernel_mm = mm::Allocator::new(
-            layout.kernel.start,
-            layout.kernel.end - layout.kernel.start,
-            (),
-        )?;
+        let kernel_mm = range::RangeAlloc::new(auto_kernel_va.start, auto_kernel_va.end, GFP_KERNEL)?;
 
         let page_table = ARM64LPAES1::new(
             pdev.as_ref(),
@@ -149,7 +142,6 @@ impl Vm {
             memattr,
             _layout: layout,
             for_mcu,
-            auto_kernel_va,
             destroyed: false,
         })
     }
@@ -158,25 +150,17 @@ impl Vm {
     ///
     /// Kernel VAs are used for the FW, for synchronization objects, ring
     /// buffers and other kernel-only data structures.
-    pub(crate) fn alloc_kernel_range(&mut self, va: KernelVaPlacement) -> Result<mm::Node<(), ()>> {
-        // stack_pin_init!(let local_guard = new_mutex!(()));
-        // let mut locked_vm = self.gpuvm.lock(&mut local_guard.lock());
-
+    pub(crate) fn alloc_kernel_range(&mut self, va: KernelVaPlacement) -> Result<LiveRange> {
         match va {
             KernelVaPlacement::Auto { size } => unsafe { self.gpuvm.as_inner_mut() }
                 .kernel_mm
-                .insert_node_in_range(
-                    (),
-                    size as u64,
-                    4096,
-                    0,
-                    self.auto_kernel_va.start,
-                    self.auto_kernel_va.end,
-                    mm::InsertMode::Best,
+                .allocate(
+                    size,
+                    GFP_KERNEL
                 ),
             KernelVaPlacement::At(va) => unsafe { self.gpuvm.as_inner_mut() }
                 .kernel_mm
-                .reserve_node((), va.start, va.end - va.start, 0),
+                .insert(va.start, va.end, GFP_KERNEL),
         }
     }
 
