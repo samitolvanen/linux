@@ -51,6 +51,8 @@ mod gpuvm;
 pub(crate) mod map_flags;
 pub(crate) mod pool;
 
+mod range;
+
 // TODO: we need *all* of these in kernel::bindings.
 const SZ_4G: u64 = 4 * kernel::bindings::SZ_1G as u64;
 
