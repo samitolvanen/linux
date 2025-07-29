@@ -13,7 +13,6 @@ use core::ops::Range;
 use kernel::devres::Devres;
 use kernel::drm::gpuvm::DriverGpuVa;
 use kernel::drm::gpuvm::{self};
-use kernel::drm::mm;
 use kernel::io::mem::IoMem;
 use kernel::io_pgtable::IoPageTable;
 use kernel::io_pgtable::ARM64LPAES1;
@@ -84,13 +83,13 @@ pub(in crate::mmu) struct LockedVm {
     pub(in crate::mmu) page_table: ARM64LPAES1<Mmu>,
     /// The allocator keeping track of what ranges are in use for the kernel VA
     /// range.
-    pub(super) kernel_mm: mm::Allocator<(), ()>,
+    pub(super) kernel_mm: vm::range::RangeAlloc,
 }
 
 impl LockedVm {
     pub(super) fn new(
         page_table: ARM64LPAES1<Mmu>,
-        kernel_mm: mm::Allocator<(), ()>,
+        kernel_mm: vm::range::RangeAlloc,
     ) -> impl Init<Self> {
         init!(LockedVm {
             page_table,

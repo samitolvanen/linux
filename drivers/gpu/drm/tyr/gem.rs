@@ -6,12 +6,11 @@ use crate::driver::TyrDevice;
 use crate::driver::TyrDriver;
 use crate::file::DrmFile;
 use crate::mmu::vm;
-use crate::mmu::vm::Vm;
+use crate::mmu::vm::{Vm, LiveRange};
 use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
 use kernel::drm::gem::{self};
-use kernel::drm::mm;
 use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -32,7 +31,7 @@ enum ObjectType {
     Kernel {
         // Kernel objects have their VA managed by the MM allocator. This node
         // represents the allocation.
-        node: mm::Node<(), ()>,
+        node: LiveRange,
     },
 
     User,
@@ -101,9 +100,7 @@ impl ObjectRef {
     /// any.
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
         match &self.gem.ty {
-            ObjectType::Kernel { node } => {
-                Some(node.start()..node.start() + node.size())
-            }
+            ObjectType::Kernel { node } => Some(node.range()),
             ObjectType::User => None,
         }
     }
@@ -166,7 +163,7 @@ pub(crate) fn new_kernel_object(
     va.align()?;
     let sz = va.size();
     let node = vm.lock().alloc_kernel_range(va)?;
-    let range = node.start()..node.start() + node.size();
+    let range = node.range();
 
     let gem = Object::new(
         tdev,
