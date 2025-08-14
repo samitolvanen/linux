@@ -556,9 +556,7 @@ pub const fn create_phy_driver<T: Driver>() -> DriverVTable {
         } else {
             None
         },
-        // SAFETY: The rest is zeroed out to initialize `struct phy_driver`,
-        // sets `Option<&F>` to be `None`.
-        ..unsafe { core::mem::MaybeUninit::<bindings::phy_driver>::zeroed().assume_init() }
+        ..pin_init::zeroed()
     }))
 }
 
