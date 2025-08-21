@@ -37,6 +37,7 @@
 #include "pid_namespace.c"
 #include "platform.c"
 #include "poll.c"
+#include "processor.c"
 #include "property.c"
 #include "rbtree.c"
 #include "rcu.c"
