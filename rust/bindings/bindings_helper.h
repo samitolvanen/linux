@@ -51,6 +51,7 @@
 #include <linux/cpumask.h>
 #include <linux/cred.h>
 #include <linux/delay.h>
+#include <linux/dma-direction.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-chain.h>
 #include <linux/device/faux.h>
