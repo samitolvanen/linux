@@ -243,7 +243,6 @@ impl<T: FenceOps> FenceObject<T> {
     const SIZE: usize = core::mem::size_of::<Self>();
 
     const VTABLE: bindings::dma_fence_ops = bindings::dma_fence_ops {
-        use_64bit_seqno: T::USE_64BIT_SEQNO,
         get_driver_name: Some(get_driver_name_cb::<T>),
         get_timeline_name: Some(get_timeline_name_cb::<T>),
         enable_signaling: if T::HAS_ENABLE_SIGNALING {
