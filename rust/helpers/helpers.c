@@ -24,6 +24,7 @@
 #include "drm.c"
 #include "drm_gpuvm.c"
 #include "err.c"
+#include "irq.c"
 #include "fs.c"
 #include "io.c"
 #include "jump_label.c"
