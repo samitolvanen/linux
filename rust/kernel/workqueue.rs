@@ -418,7 +418,7 @@ impl OwnedQueue {
         // * "%s\0" is compatible with passing the name as a c-string.
         // * the flags argument does not include internal flags.
         let ptr = unsafe {
-            bindings::alloc_workqueue(
+            bindings::alloc_workqueue_noprof(
                 b"%s\0".as_ptr(),
                 flags.0,
                 i32::try_from(max_active).unwrap_or(i32::MAX),
@@ -456,7 +456,7 @@ impl OwnedQueue {
         // * "%pA\0" is compatible with passing an `Arguments` pointer.
         // * the flags argument does not include internal flags.
         let ptr = unsafe {
-            bindings::alloc_workqueue(
+            bindings::alloc_workqueue_noprof(
                 b"%pA\0".as_ptr(),
                 flags.0,
                 i32::try_from(max_active).unwrap_or(i32::MAX),
