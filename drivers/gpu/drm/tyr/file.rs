@@ -69,7 +69,7 @@ impl File {
             match devquery.type_ {
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GPU_INFO => {
                     let mut writer =
-                        UserSlice::new(devquery.pointer as usize, devquery.size as usize).writer();
+                        UserSlice::new(UserPtr::from_addr(devquery.pointer as usize), devquery.size as usize).writer();
 
                     writer.write(&tdev.gpu_info)?;
 
@@ -87,7 +87,10 @@ impl File {
     ) -> Result<u32> {
         let id = file.inner().vm_pool().create_vm(
             &ARef::from(tdev),
-            VmLayout::from_user_sz(tdev, VmUserSize::Custom(vmcreate.user_va_range)),
+            VmLayout::from_user_sz(
+                tdev,
+                VmUserSize::Custom(vmcreate.user_va_range),
+            ),
         )?;
 
         vmcreate.id = id as u32;
@@ -112,12 +115,17 @@ impl File {
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &DrmFile,
     ) -> Result<u32> {
-        if vmbind.flags & uapi::drm_panthor_vm_bind_flags_DRM_PANTHOR_VM_BIND_ASYNC != 0 {
+        if vmbind.flags
+            & uapi::drm_panthor_vm_bind_flags_DRM_PANTHOR_VM_BIND_ASYNC
+            != 0
+        {
             dev_info!(tdev.as_ref(), "We do not support async VM_BIND yet");
             return Err(ENOTSUPP);
         }
 
-        if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
+        if vmbind.ops.stride as usize
+            != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>()
+        {
             dev_info!(
                 tdev.as_ref(),
                 "We cannot graciously handle stride mismatches yet"
@@ -128,7 +136,11 @@ impl File {
         let stride = vmbind.ops.stride as usize;
         let count = vmbind.ops.count as usize;
 
-        let mut reader = UserSlice::new(vmbind.ops.array as usize, stride).reader();
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(vmbind.ops.array as usize),
+            stride,
+        )
+        .reader();
         let iomem = tdev.iomem.clone();
 
         for i in 0..count {
@@ -199,7 +211,9 @@ impl File {
         bocreate: &mut uapi::drm_panthor_bo_create,
         file: &DrmFile,
     ) -> Result<u32> {
-        if bocreate.flags & !uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
+        if bocreate.flags & !uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP
+            != 0
+        {
             dev_err!(
                 tdev.as_ref(),
                 "bo_create: invalid flags {}\n",
@@ -250,7 +264,7 @@ impl File {
         }
 
         let mut reader = UserSlice::new(
-            groupcreate.queues.array as usize,
+            UserPtr::from_addr(groupcreate.queues.array as usize),
             groupcreate.queues.stride as usize,
         )
         .reader();
@@ -261,10 +275,12 @@ impl File {
             queue_args.push(queue, GFP_KERNEL)?;
         }
 
-        let handle = file
-            .inner()
-            .group_pool()
-            .create_group(tdev, groupcreate, file, queue_args)?;
+        let handle = file.inner().group_pool().create_group(
+            tdev,
+            groupcreate,
+            file,
+            queue_args,
+        )?;
 
         groupcreate.group_handle = handle as u32;
 
@@ -298,27 +314,31 @@ impl File {
         }
 
         let mut reader = UserSlice::new(
-            groupsubmit.queue_submits.array as usize,
+            UserPtr::from_addr(groupsubmit.queue_submits.array as usize),
             groupsubmit.queue_submits.stride as usize,
         )
         .reader();
 
         let mut queue_submits = kvec![];
         let mut syncs = kvec![];
+
         for _ in 0..groupsubmit.queue_submits.count {
             let queue: QueueSubmit = reader.read()?;
 
-            let mut sync_reader =
-                UserSlice::new(queue.syncs.array as usize, queue.syncs.stride as usize).reader();
+            let mut sync_reader = UserSlice::new(
+                UserPtr::from_addr(queue.syncs.array as usize),
+                queue.syncs.stride as usize,
+            )
+            .reader();
 
             for _ in 0..queue.syncs.count {
                 let sync: SyncOp = sync_reader.read()?;
                 if sync.flags & !uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL as u32
-                    != 0
-                {
-                    pr_err!("We only support DRM_PANTHOR_SYNC_OP_SIGNAL for now");
-                    return Err(ENOTSUPP);
-                }
+                                    != 0
+                                {
+                                    pr_err!("We only support DRM_PANTHOR_SYNC_OP_SIGNAL for now");
+                                    return Err(ENOTSUPP);
+                                }
 
                 syncs.push(sync, GFP_KERNEL)?;
             }
@@ -328,7 +348,10 @@ impl File {
 
         let mut out_syncs = kvec![];
         for sync in syncs.iter().filter(|sync| {
-            sync.flags & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL as u32 != 0
+            sync.flags
+                & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL
+                    as u32
+                != 0
         }) {
             out_syncs.push(
                 drm::syncobj::SyncObj::lookup_handle(file, sync.handle)?,
@@ -344,7 +367,7 @@ impl File {
 
         tdev.with_locked_scheduler(|sched| {
             sched.bind0(tdev, group.clone())?;
-            sched.submit(kvec![], out_syncs, group, queue_submits)
+            sched.submit(kvec![], out_syncs, group, queue_submits, file.get_client_id())
         })?;
 
         Ok(0)

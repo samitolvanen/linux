@@ -62,7 +62,7 @@ impl Job {
             return Err(EINVAL);
         }
 
-        if qsubmit.latest_flush & genmask_u32(30, 24) != 0 {
+        if qsubmit.latest_flush & genmask_u32(24..=30) != 0 {
             pr_err!("job_create: latest_flust[30:24] must be zero\n");
             return Err(EINVAL);
         }
@@ -124,7 +124,7 @@ impl JobImpl for Job {
 
         // Use this default for now. This should work for the rk3588 where it's
         // being tested.
-        let wait_all_mask = genmask_u64(7, 0);
+        let wait_all_mask = genmask_u64(0..=7);
         let wait_all: u64 = opcode << 56 | wait_all_mask << 16;
 
         let opcode = 51; // SYNC_ADD64

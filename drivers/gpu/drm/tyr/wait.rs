@@ -94,7 +94,8 @@ impl<T> Wait<T> {
                     match on_woken(&mut guard)? {
                         WaitResult::Ok => return Ok(()),
                         WaitResult::Retry => {
-                            remaining_time = remaining_time.saturating_sub(jiffies)
+                            remaining_time =
+                                remaining_time.saturating_sub(jiffies)
                         }
                     }
                 }
@@ -105,7 +106,9 @@ impl<T> Wait<T> {
                     }
                     return Err(ETIMEDOUT);
                 }
-                kernel::sync::CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                kernel::sync::CondVarTimeoutResult::Signal { .. } => {
+                    return Err(ERESTARTSYS)
+                }
             }
         }
     }

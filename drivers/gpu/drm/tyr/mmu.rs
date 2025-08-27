@@ -59,14 +59,19 @@ impl Mmu {
         auto_kernel_va: Range<u64>,
         /* coherent: bool, */
     ) -> Result<Arc<Mutex<Vm>>> {
-        let vm = Vm::create(tdev, pdev, for_mcu, gpu_info, layout, auto_kernel_va)?;
+        let vm =
+            Vm::create(tdev, pdev, for_mcu, gpu_info, layout, auto_kernel_va)?;
 
         let vm = Arc::pin_init(new_mutex!(vm), GFP_KERNEL)?;
         self.vms.push(vm.clone(), GFP_KERNEL)?;
         Ok(vm)
     }
 
-    fn flush_range(iomem: &Devres<IoMem>, as_nr: usize, range: Range<u64>) -> Result {
+    fn flush_range(
+        iomem: &Devres<IoMem>,
+        as_nr: usize,
+        range: Range<u64>,
+    ) -> Result {
         Self::do_as_command(iomem, as_nr, AS_COMMAND_FLUSH_PT, range)
     }
 
@@ -87,7 +92,7 @@ impl Mmu {
             op,
             cond,
             Delta::from_millis(0),
-            Some(Delta::from_micros(10000)),
+            Delta::from_micros(10000),
         )?;
 
         Ok(())
@@ -184,7 +189,7 @@ impl Mmu {
             op,
             cond,
             Delta::from_millis(0),
-            Some(Delta::from_micros(200)),
+            Delta::from_micros(200),
         )?;
 
         Ok(())

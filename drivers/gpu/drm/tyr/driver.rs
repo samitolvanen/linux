@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::marker::PhantomPinned;
 use core::pin::Pin;
-use kernel::device;
-use pin_init::pin_init_from_closure;
 
 use kernel::bits::bit_u32;
 use kernel::c_str;
 use kernel::clk::Clk;
+use kernel::device;
 use kernel::device::Core;
 use kernel::devres::Devres;
+use kernel::dma::{Device, DmaMask};
 use kernel::drm;
 use kernel::drm::ioctl;
 use kernel::io;
@@ -33,6 +34,8 @@ use kernel::workqueue::DelayedWork;
 use kernel::workqueue::OwnedQueue;
 use kernel::workqueue::Work;
 use kernel::workqueue::WqFlags;
+
+use pin_init::pin_init_from_closure;
 
 use crate::file::File;
 use crate::fw;
@@ -153,7 +156,7 @@ fn issue_soft_reset(iomem: &Devres<IoMem<0>>) -> Result<()> {
         op,
         cond,
         time::Delta::from_millis(100),
-        Some(time::Delta::from_micros(20000)),
+        time::Delta::from_micros(20000),
     );
 
     if let Err(e) = res {
@@ -192,12 +195,19 @@ impl platform::Driver for TyrDriver {
         stacks_clk.prepare_enable()?;
         coregroup_clk.prepare_enable()?;
 
-        let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("mali"))?;
-        let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("sram"))?;
+        let mali_regulator = Regulator::<regulator::Enabled>::get(
+            pdev.as_ref(),
+            c_str!("mali"),
+        )?;
+        let sram_regulator = Regulator::<regulator::Enabled>::get(
+            pdev.as_ref(),
+            c_str!("sram"),
+        )?;
 
-        let resource = pdev.resource_by_index(0).ok_or(EINVAL)?;
-
-        let iomem = Arc::new(pdev.iomap_resource(resource)?, GFP_KERNEL)?;
+        let iomem = Arc::pin_init(
+            IoMem::new(pdev.io_request_by_index(0).ok_or(EINVAL)?),
+            GFP_KERNEL,
+        )?;
 
         issue_soft_reset(&iomem)?;
         gpu::l2_power_on(&iomem)?;
@@ -205,22 +215,24 @@ impl platform::Driver for TyrDriver {
         let gpu_info = GpuInfo::new(&iomem)?;
         gpu_info.log(pdev);
 
-        pdev.as_ref().dma_set_max_seg_size(u32::MAX);
-        pdev.as_ref()
-            .dma_set_mask_and_coherent(u64::from(gpu_info.pa_bits()))?;
-
+        unsafe {
+            pdev.dma_set_max_seg_size(u32::MAX);
+            pdev.dma_set_mask_and_coherent(DmaMask::try_new(
+                gpu_info.pa_bits(),
+            )?)?;
+        }
         let platform: ARef<platform::Device> = pdev.into();
+
         //TODO: This is very temporary
         // SAFETY: This should be safe as data is not touched by the driver
         // untill it gets fully initialised.
         // Additionally implementation of Drop trait is still pending
         // so no data will be accessed util proper init.
-        let uninit = unsafe {
-            pin_init_from_closure::<TyrData, kernel::error::Error>(|_slot| Ok(core::mem::zeroed()))
-        };
-        let data = Arc::pin_init(uninit, GFP_KERNEL)?;
-
-        let tdev: ARef<TyrDevice> = drm::device::Device::new(pdev.as_ref(), data.clone())?;
+	let uninit = unsafe {
+	    pin_init_from_closure::<TyrData, kernel::error::Error>(|_slot| Ok(()))
+	};
+	let data = Arc::pin_init(uninit, GFP_KERNEL)?;
+	let tdev: ARef<TyrDevice> = drm::device::Device::new(pdev.as_ref(), Ok(data.clone()))?;
 
         let mmu = KBox::pin_init(new_mutex!(Mmu::new()?), GFP_KERNEL)?;
 
@@ -262,7 +274,8 @@ impl platform::Driver for TyrDriver {
         });
 
         unsafe {
-            data_init.__pinned_init(Arc::<TyrData>::as_ptr(&data) as *mut TyrData)?;
+            data_init
+                .__pinned_init(Arc::<TyrData>::as_ptr(&tdev) as *mut TyrData)?;
         }
 
         // We must find a way around this. It's being discussed on Zulip already.
@@ -302,7 +315,7 @@ impl platform::Driver for TyrDriver {
         let core_clk = &tdev.clks.lock().core;
 
         fw_boot_wait.clone().wait_interruptible_timeout(100, |()| {
-            data.fw.with_locked_global_iface(|glb| {
+            tdev.fw.with_locked_global_iface(|glb| {
                 if glb.booted() {
                     glb.enable(&tdev, gpu_info, core_clk)?;
                     Ok(WaitResult::Ok)
@@ -312,8 +325,9 @@ impl platform::Driver for TyrDriver {
             })
         })?;
 
-        data.sched.lock().init(&tdev.clone())?;
+        tdev.sched.lock().init(&tdev.clone())?;
         dev_info!(pdev.as_ref(), "Tyr initialized correctly.\n");
+
         Ok(driver)
     }
 }
@@ -405,9 +419,12 @@ pub(crate) trait TyrIrqTrait: Sync {
     fn handle(&self, tdev: &TyrDevice, status: u32);
 }
 
+#[pin_data]
 pub(crate) struct TyrIrq<T: TyrIrqTrait> {
     tdev: ARef<TyrDevice>,
     irq: T,
+    #[pin]
+    _pin: PhantomPinned,
 }
 
 impl<T: TyrIrqTrait + 'static> TyrIrq<T> {
@@ -417,17 +434,23 @@ impl<T: TyrIrqTrait + 'static> TyrIrq<T> {
         name: &'static CStr,
         irq_type: T,
     ) -> Result<impl PinInit<ThreadedRegistration<Self>, Error> + 'a> {
-        let handler = Self {
+        let handler = try_pin_init!(Self {
             tdev,
             irq: irq_type,
-        };
+            _pin: PhantomPinned,
+        });
 
-        pdev.threaded_irq_by_name(name, kernel::irq::flags::SHARED, handler)
+        pdev.request_threaded_irq_by_name(
+            kernel::irq::Flags::SHARED,
+            name,
+            name,
+            handler,
+        )
     }
 }
 
 impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
-    fn handle_irq(&self) -> kernel::irq::request::ThreadedIrqReturn {
+    fn handle(&self) -> kernel::irq::request::ThreadedIrqReturn {
         let int_stat = self.irq.read_status();
 
         if int_stat == 0 {
@@ -438,7 +461,7 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
         ThreadedIrqReturn::WakeThread
     }
 
-    fn thread_fn(&self) -> kernel::irq::request::IrqReturn {
+    fn handle_threaded(&self) -> kernel::irq::request::IrqReturn {
         let mut ret = IrqReturn::None;
 
         loop {

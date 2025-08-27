@@ -31,6 +31,6 @@ impl WorkItem<1> for TyrData {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
-        let _ = this.with_locked_scheduler(|sched| Ok(()));
+        let _ = this.with_locked_scheduler(|_sched| Ok(()));
     }
 }

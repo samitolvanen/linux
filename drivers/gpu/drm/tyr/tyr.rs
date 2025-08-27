@@ -49,7 +49,7 @@ mod wait;
 kernel::module_platform_driver! {
     type: TyrDriver,
     name: "tyr",
-    author: "The Tyr driver authors",
+    authors: ["The Tyr driver authors"],
     description: "Rust driver for ARM Mali CSF-based GPUs",
     license: "Dual MIT/GPL",
 }

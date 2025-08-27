@@ -41,23 +41,27 @@ enum ObjectType {
 /// Type alias for the GEM object type for this driver.
 pub(crate) type Object = gem::shmem::Object<DriverObject>;
 
-pub struct GemArgs {
+pub(crate) struct GemArgs {
     ty: ObjectType,
     flags: u32,
 }
 
 #[vtable]
-impl gem::BaseDriverObject for DriverObject {
+impl gem::DriverObject for DriverObject {
     type Driver = TyrDriver;
     type Object = gem::shmem::Object<Self>;
     type Args = GemArgs;
 
-    fn new(dev: &TyrDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(
+        dev: &TyrDevice,
+        _size: usize,
+        args: Self::Args,
+    ) -> impl PinInit<Self, Error> {
         dev_dbg!(dev.as_ref(), "DriverObject::new\n");
-        DriverObject {
+        try_pin_init!(DriverObject {
             ty: args.ty,
             flags: args.flags,
-        }
+        })
     }
 }
 
@@ -97,7 +101,9 @@ impl ObjectRef {
     /// any.
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
         match &self.gem.ty {
-            ObjectType::Kernel { node } => Some(node.start()..node.start() + node.size()),
+            ObjectType::Kernel { node } => {
+                Some(node.start()..node.start() + node.size())
+            }
             ObjectType::User => None,
         }
     }
@@ -106,7 +112,11 @@ impl ObjectRef {
 type ObjectConfig<'a> = shmem::ObjectConfig<'a, DriverObject>;
 
 /// Create a new DRM GEM object.
-pub(crate) fn new_object(dev: &TyrDevice, size: usize, flags: u32) -> Result<ObjectRef> {
+pub(crate) fn new_object(
+    dev: &TyrDevice,
+    size: usize,
+    flags: u32,
+) -> Result<ObjectRef> {
     let aligned_size = size.next_multiple_of(1 << 12);
 
     if size == 0 || size > aligned_size {
@@ -129,10 +139,13 @@ pub(crate) fn new_object(dev: &TyrDevice, size: usize, flags: u32) -> Result<Obj
     // TODO: This is really bad but at this point seems to be the only way:
     // to be refactored
     // SAFETY: We are the only owners at this point
-    let mut obj = ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::into_raw(gem);
+    let mut obj =
+        ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::into_raw(gem);
     unsafe { obj.as_mut().flags = flags };
 
-    let gem = unsafe { ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::from_raw(obj) };
+    let gem = unsafe {
+        ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::from_raw(obj)
+    };
 
     Ok(ObjectRef::new(gem))
 }

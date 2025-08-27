@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use group::Group;
-use kernel::bits::bit_u32;
+use kernel::bits::checked_bit_u32;
 use kernel::bits::genmask_u32;
 use kernel::c_str;
 use kernel::dma_fence::UserFence;
@@ -98,7 +98,7 @@ pub(crate) struct Scheduler {
     wq: OwnedQueue,
 
     /// When the next tick should occur.
-    resched_target: Option<Instant>,
+    resched_target: Option<Instant<kernel::time::RealTime>>,
 
     /// Outstanding firmware events.
     events: Option<u32>,
@@ -139,7 +139,7 @@ impl Scheduler {
         let num_groups = core::cmp::min(MAX_CSG_PRIO + 1, num_groups);
 
         // We need at least one AS for the MCU and one for the GPU contexts.
-        let gpu_as_count = tdev.gpu_info.as_present & genmask_u32(31, 1);
+        let gpu_as_count = tdev.gpu_info.as_present & genmask_u32(1..=31);
         let gpu_as_count = gpu_as_count.count_ones();
 
         let csg_slot_count = num_groups;
@@ -148,7 +148,8 @@ impl Scheduler {
         let wq = OwnedQueue::new(c_str!("tyr-csf-sched"), WqFlags::UNBOUND, 0)?;
 
         Ok(Self {
-            runnable_groups: [const { KVec::new() }; Priority::num_priorities()],
+            runnable_groups: [const { KVec::new() };
+                Priority::num_priorities()],
             idle_groups: [const { KVec::new() }; Priority::num_priorities()],
             waiting_groups: [const { KVec::new() }; Priority::num_priorities()],
             unsynced_groups: KVec::new(),
@@ -195,7 +196,9 @@ impl Scheduler {
         let gpu_info = &tdev.gpu_info;
         let iomem = &tdev.iomem;
 
-        tdev.with_locked_mmu(|mmu| mmu.bind_vm(group.vm.clone(), gpu_info, iomem))?;
+        tdev.with_locked_mmu(|mmu| {
+            mmu.bind_vm(group.vm.clone(), gpu_info, iomem)
+        })?;
 
         self.csg_slots[csg_idx] = Some(CommandStreamGroupSlot {
             group: group.clone(),
@@ -265,11 +268,13 @@ impl Scheduler {
                 let mut queue_mask = 0;
 
                 let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
+
                 for (cs_idx, queue) in inner.queues.iter().enumerate() {
                     let cs_iface = csg_iface.cs_mut(cs_idx).ok_or(EINVAL)?;
 
                     self.program_cs_slot(queue, cs_iface)?;
-                    queue_mask |= bit_u32(cs_idx as u32);
+                    queue_mask |=
+                        checked_bit_u32(cs_idx as u32).ok_or(EINVAL)?;
                 }
 
                 Ok(queue_mask)
@@ -294,7 +299,8 @@ impl Scheduler {
         input.csg_config = as_nr;
 
         input.suspend_buf = group.suspend_buf.kernel_va().ok_or(EINVAL)?.start;
-        input.protm_suspend_buf = group.protm_suspend_buf.kernel_va().ok_or(EINVAL)?.start;
+        input.protm_suspend_buf =
+            group.protm_suspend_buf.kernel_va().ok_or(EINVAL)?.start;
 
         input.ack_irq_mask = u32::MAX;
 
@@ -315,7 +321,11 @@ impl Scheduler {
     ///
     /// Queues are alloted slots when their group is itself programmed into a
     /// CSG slot.
-    fn program_cs_slot(&mut self, queue: &Queue, cs_iface: &mut CommandStream) -> Result {
+    fn program_cs_slot(
+        &mut self,
+        queue: &Queue,
+        cs_iface: &mut CommandStream,
+    ) -> Result {
         let doorbell_id = queue.doorbell_id.ok_or(EINVAL)?;
         let mut cs_input = cs_iface.read_input()?;
 
@@ -348,8 +358,8 @@ impl Scheduler {
         let iomem = tdev.iomem.clone();
 
         use crate::mmu::vm::map_flags;
-        let flags =
-            map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED);
+        let flags = map_flags::Flags::from(map_flags::NOEXEC)
+            | map_flags::Flags::from(map_flags::UNCACHED);
 
         let mut debug_gem = gem::new_kernel_object(
             tdev,
@@ -383,8 +393,11 @@ impl Scheduler {
         let src0 = 64; // to the address pointed to by [r64; r65]
         let offset = 0; // and this offset
 
-        let store_multiple: u64 =
-            opcode << 56 | sr << 48 | src0 << 40 | register_bitmap << 16 | offset;
+        let store_multiple: u64 = opcode << 56
+            | sr << 48
+            | src0 << 40
+            | register_bitmap << 16
+            | offset;
 
         instrs.extend_from_slice(&store_multiple.to_le_bytes(), GFP_KERNEL)?;
 
@@ -412,8 +425,9 @@ impl Scheduler {
         out_syncs: KVec<SyncObj<TyrDriver>>,
         group: Arc<Group>,
         queue_submits: KVec<QueueSubmit>,
+        client_id: u64,
     ) -> Result<KVec<UserFence<job::Fence>>> {
-        group.submit(in_syncs, out_syncs, queue_submits)
+        group.submit(in_syncs, out_syncs, queue_submits, client_id)
     }
 }
 

@@ -40,7 +40,7 @@ pub(crate) mod constants {
     use kernel::bits::bit_u32;
     use kernel::bits::genmask_u32;
 
-    pub(crate) const CSG_STATE_MASK: u32 = genmask_u32(2, 0);
+    pub(crate) const CSG_STATE_MASK: u32 = genmask_u32(0..=2);
     const CSG_STATE_TERMINATE: u32 = 0;
     const CSG_STATE_START: u32 = 1;
     const CSG_STATE_SUSPEND: u32 = 2;
@@ -58,25 +58,25 @@ pub(crate) mod constants {
     pub(crate) const CSG_EVT_MASK: u32 = CSG_SYNC_UPDATE | CSG_IDLE | CSG_PROGRESS_TIMER_EVENT;
 
     pub(crate) const fn csg_ep_req_compute(x: u32) -> u32 {
-        x & genmask_u32(7, 0)
+        x & genmask_u32(0..=7)
     }
 
     pub(crate) const fn csg_ep_req_fragment(x: u32) -> u32 {
-        (x << 8) & genmask_u32(15, 8)
+        (x << 8) & genmask_u32(8..=15)
     }
 
     pub(crate) const fn csg_ep_req_tiler(x: u32) -> u32 {
-        (x << 16) & genmask_u32(19, 16)
+        (x << 16) & genmask_u32(16..=19)
     }
 
     pub(crate) const CSG_EP_REQ_EXCL_COMPUTE: u32 = bit_u32(20);
     pub(crate) const CSG_EP_REQ_EXCL_FRAGMENT: u32 = bit_u32(21);
 
     pub(crate) const fn csg_ep_req_priority(x: u32) -> u32 {
-        (x << 28) & genmask_u32(31, 28)
+        (x << 28) & genmask_u32(28..=31)
     }
 
-    pub(crate) const CSG_EP_REQ_PRIORITY_MASK: u32 = genmask_u32(31, 28);
+    pub(crate) const CSG_EP_REQ_PRIORITY_MASK: u32 = genmask_u32(28..=31);
 }
 
 pub(crate) struct CommandStreamGroup {

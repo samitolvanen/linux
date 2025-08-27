@@ -66,9 +66,9 @@ impl StepContext {
 
     pub(super) fn preallocate_vas() -> Result<[Option<PinnedVa>; 3]> {
         Ok([
-            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::zeroed())?),
-            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::zeroed())?),
-            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::zeroed())?),
+            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::init_zeroed())?),
+            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::init_zeroed())?),
+            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::init_zeroed())?),
         ])
     }
 }
@@ -111,12 +111,15 @@ impl LockedVm {
             let pgsize = 4096;
             let pgcount = (size - total_unmapped).div_ceil(pgsize);
 
-            let unmapped_sz =
-                self.page_table
-                    .unmap_pages(iova.start as usize, pgsize as usize, pgcount as usize);
+            let unmapped_sz = self.page_table.unmap_pages(
+                iova.start as usize,
+                pgsize as usize,
+                pgcount as usize,
+            );
 
             if unmapped_sz as u64 != pgsize * pgcount {
-                let range = iova.start..iova.start + total_unmapped + unmapped_sz as u64;
+                let range = iova.start
+                    ..iova.start + total_unmapped + unmapped_sz as u64;
 
                 pr_err!(
                     "AS ({:#?}): failed to unmap range {:#x} - {:#x}, unmapped only {:#x} bytes\n",
@@ -224,7 +227,10 @@ impl gpuvm::DriverGpuVm for LockedVm {
         gpuvm.insert_va(op, gpuva).map_err(|_| EINVAL)?;
         gpuvm.find_va(op.range(), |gpuvm, gpuva| {
             let gpuva = gpuva.ok_or(EINVAL)?;
-            gpuvm.link_va(gpuva, ctx.vm_bo.as_ref().expect("step_map with no BO"))?;
+            gpuvm.link_va(
+                gpuva,
+                ctx.vm_bo.as_ref().expect("step_map with no BO"),
+            )?;
             Ok(())
         })?;
 
@@ -246,7 +252,8 @@ impl gpuvm::DriverGpuVm for LockedVm {
         gpuvm.unmap_pages(&ctx.iomem, ctx.vm_as_nr, iova)?;
 
         gpuvm.find_va(va.range(), |gpuvm, gpuva| {
-            let removed = gpuvm.remove_va(gpuva.unwrap()).map_err(|_| EINVAL)?;
+            let removed =
+                gpuvm.remove_va(gpuva.unwrap()).map_err(|_| EINVAL)?;
             gpuvm.unlink_va(&removed);
             Ok(())
         })?;
@@ -285,7 +292,8 @@ impl gpuvm::DriverGpuVm for LockedVm {
 
         gpuvm.unmap_pages(&ctx.iomem, ctx.vm_as_nr, unmap_range)?;
         gpuvm.find_va(op.unmap().va().unwrap().range(), |gpuvm, gpuva| {
-            let removed_va = gpuvm.remove_va(gpuva.unwrap()).map_err(|_| EINVAL)?;
+            let removed_va =
+                gpuvm.remove_va(gpuva.unwrap()).map_err(|_| EINVAL)?;
             gpuvm.unlink_va(&removed_va);
             Ok(())
         })?;

@@ -7,8 +7,7 @@
 
 use core::ops::Deref;
 
-use kernel::dma_fence::FenceOps;
-use kernel::dma_fence::RawDmaFence;
+use kernel::dma_fence::{FenceOps,RawDmaFence};
 use kernel::impl_has_work;
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -67,7 +66,8 @@ impl Scheduler {
         let mut input = csg.read_input()?;
         let output = csg.read_output()?;
 
-        let csg_events = (input.req ^ output.ack) & csg::constants::CSG_EVT_MASK;
+        let csg_events =
+            (input.req ^ output.ack) & csg::constants::CSG_EVT_MASK;
 
         // // We may have no pending CSG/CS interrupts to process.
         if input.req == output.ack && output.irq_req == input.irq_ack {
@@ -138,8 +138,8 @@ impl Scheduler {
 
         let cs_events = (input.req ^ output.ack) & cs::constants::CS_EVT_MASK;
 
-        let faulty =
-            cs_events & cs::constants::CS_FATAL != 0 || cs_events & cs::constants::CS_FAULT != 0;
+        let faulty = cs_events & cs::constants::CS_FATAL != 0
+            || cs_events & cs::constants::CS_FAULT != 0;
 
         if cs_events & cs::constants::CS_FATAL != 0 {
             cs.decode_fatal()?;
@@ -162,7 +162,9 @@ impl Scheduler {
                 .ok_or(EINVAL)?
                 .group
                 .with_locked_inner(|inner| {
-                    for job_fence in &inner.queues[cs_id as usize].in_flight_jobs {
+                    for job_fence in
+                        &inner.queues[cs_id as usize].in_flight_jobs
+                    {
                         // Just mark everything in flight as failed.
                         //
                         // This is not exactly the right thing to do, but while
@@ -201,8 +203,10 @@ impl Scheduler {
         // TODO: we cannot sleep in the signalling path.
         group.with_locked_inner(|inner| {
             for (queue_idx, queue) in inner.queues.iter_mut().enumerate() {
-                let sync_offset = queue_idx * core::mem::size_of::<syncs::SyncObj64b>();
-                let sync_obj = syncs::SyncObj64b::read(&mut inner.syncobjs, sync_offset)?;
+                let sync_offset =
+                    queue_idx * core::mem::size_of::<syncs::SyncObj64b>();
+                let sync_obj =
+                    syncs::SyncObj64b::read(&mut inner.syncobjs, sync_offset)?;
 
                 // TODO: this has to be moved somewhere else. It should probably
                 // be in TyrData, or anywhere else we can easily access from

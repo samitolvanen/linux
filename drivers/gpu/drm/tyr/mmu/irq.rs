@@ -64,7 +64,7 @@ impl TyrIrqTrait for MmuIrq {
     }
 
     fn handle(&self, _: &TyrDevice, status: u32) {
-        let status = status & kernel::bits::genmask_u32(15, 0);
+        let status = status & kernel::bits::genmask_u32(0..=15);
         let _ = decode_faults(status, &self.iomem);
     }
 }

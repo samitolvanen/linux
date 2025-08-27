@@ -131,11 +131,11 @@ impl GpuInfo {
     }
 
     pub(crate) fn va_bits(&self) -> u32 {
-        self.mmu_features & bits::genmask_u32(7, 0)
+        self.mmu_features & bits::genmask_u32(0..=7)
     }
 
     pub(crate) fn pa_bits(&self) -> u32 {
-        (self.mmu_features >> 8) & bits::genmask_u32(7, 0)
+        (self.mmu_features >> 8) & bits::genmask_u32(0..=7)
     }
 }
 
@@ -172,13 +172,13 @@ pub(crate) struct GpuId {
 impl From<u32> for GpuId {
     fn from(value: u32) -> Self {
         GpuId {
-            arch_major: (value & genmask_u32(31, 28)) >> 28,
-            arch_minor: (value & genmask_u32(27, 24)) >> 24,
-            arch_rev: (value & genmask_u32(23, 20)) >> 20,
-            prod_major: (value & genmask_u32(19, 16)) >> 16,
-            ver_major: (value & genmask_u32(15, 12)) >> 12,
-            ver_minor: (value & genmask_u32(11, 4)) >> 4,
-            ver_status: value & genmask_u32(3, 0),
+            arch_major: (value & genmask_u32(28..=31)) >> 28,
+            arch_minor: (value & genmask_u32(24..=27)) >> 24,
+            arch_rev: (value & genmask_u32(20..=23)) >> 20,
+            prod_major: (value & genmask_u32(16..=19)) >> 16,
+            ver_major: (value & genmask_u32(12..=15)) >> 12,
+            ver_minor: (value & genmask_u32(4..=11)) >> 4,
+            ver_status: value & genmask_u32(0..=3),
         }
     }
 }
@@ -193,7 +193,7 @@ pub(crate) fn l2_power_on(iomem: &Devres<IoMem>) -> Result<()> {
         op,
         cond,
         time::Delta::from_millis(100),
-        Some(time::Delta::from_millis(200)),
+        time::Delta::from_millis(200),
     )?;
 
     L2_PWRON_LO.write(iomem, 1)?;
@@ -205,7 +205,7 @@ pub(crate) fn l2_power_on(iomem: &Devres<IoMem>) -> Result<()> {
         op,
         cond,
         time::Delta::from_millis(100),
-        Some(time::Delta::from_millis(200)),
+        time::Delta::from_millis(200),
     )?;
 
     Ok(())

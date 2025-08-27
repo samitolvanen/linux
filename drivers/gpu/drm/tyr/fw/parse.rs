@@ -9,7 +9,6 @@ use kernel::alloc::KVec;
 use kernel::bits::bit_u32;
 use kernel::c_str;
 use kernel::devres::Devres;
-use kernel::fmt;
 use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::str::CString;
@@ -40,7 +39,7 @@ mod flags {
 
     impl_flags!(Flags, Flag, u32);
 
-    const CACHE_MODE_MASK: Flags = Flags(genmask_u32(4, 3));
+    const CACHE_MODE_MASK: Flags = Flags(genmask_u32(3..=4));
 
     impl Flags {
         pub(crate) fn cache_mode(&self) -> Flags {

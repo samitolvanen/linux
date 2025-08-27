@@ -132,7 +132,7 @@ pub(crate) mod constants {
     /// Note that this is updated when the global doorbell is written.
     pub(crate) const CS_FAULT: u32 = bit_u32(31);
 
-    pub(crate) const CS_STATE_MASK: u32 = genmask_u32(2, 0);
+    pub(crate) const CS_STATE_MASK: u32 = genmask_u32(0..=2);
 
     pub(crate) const CS_REQ_MASK: u32 = CS_STATE_MASK
         | CS_EXTRACT_EVENT
@@ -291,12 +291,12 @@ pub(crate) struct Control {
 impl Control {
     /// Returns the number of work registers available in the command stream.
     pub(crate) fn work_regs(&self) -> u32 {
-        (self.features & genmask_u32(7, 0)) + 1
+        (self.features & genmask_u32(0..=7)) + 1
     }
 
     /// Returns the number of scoreboards available in the command stream.
     pub(crate) fn scoreboards(&self) -> u32 {
-        (self.features & genmask_u32(15, 8)) >> 8
+        (self.features & genmask_u32(8..=15)) >> 8
     }
 
     /// Whether this command stream supports compute workloads.
@@ -341,7 +341,7 @@ impl Input {
             return Err(EINVAL);
         }
 
-        self.config |= u32::from(priority) & genmask_u32(3, 0);
+        self.config |= u32::from(priority) & genmask_u32(0..=3);
         Ok(())
     }
 
@@ -351,7 +351,7 @@ impl Input {
             return Err(EINVAL);
         }
 
-        self.config |= (doorbell_id << 8) & genmask_u32(15, 8);
+        self.config |= (doorbell_id << 8) & genmask_u32(8..=15);
         Ok(())
     }
 }
@@ -383,26 +383,26 @@ pub(crate) struct Output {
 
 impl Output {
     pub(crate) fn cs_fault_exception_type(&self) -> u32 {
-        self.fault & genmask_u32(7, 0)
+        self.fault & genmask_u32(0..=7)
     }
 
     pub(crate) fn cs_fault_exception_data(&self) -> u32 {
-        self.fault >> 8 & genmask_u32(23, 0)
+        self.fault >> 8 & genmask_u32(0..=23)
     }
 
     pub(crate) fn cs_fatal_exception_type(&self) -> u32 {
-        self.fatal & genmask_u32(7, 0)
+        self.fatal & genmask_u32(0..=7)
     }
 
     pub(crate) fn cs_fatal_exception_data(&self) -> u32 {
-        self.fatal >> 8 & genmask_u32(23, 0)
+        self.fatal >> 8 & genmask_u32(0..=23)
     }
 
     pub(crate) fn status_wait(&self) -> Result<StatusWait> {
         let status = self.status_wait;
 
-        let sb_mask = status & genmask_u32(15, 0);
-        let sb_source = (status & genmask_u32(19, 16)) >> 16;
+        let sb_mask = status & genmask_u32(0..=15);
+        let sb_source = (status & genmask_u32(16..=19)) >> 16;
         let gt = (status & bit_u32(24)) != 0;
         let progress_wait = (status & bit_u32(28)) != 0;
         let protm_pend = (status & bit_u32(29)) != 0;
@@ -421,7 +421,7 @@ impl Output {
     }
 
     pub(crate) fn blocked_reason(&self) -> Result<BlockedReason> {
-        let reason = self.status_blocked_reason & genmask_u32(3, 0);
+        let reason = self.status_blocked_reason & genmask_u32(0..=3);
 
         let blocked_reason = match reason {
             0 => BlockedReason::Unblocked,
