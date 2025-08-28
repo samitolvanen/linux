@@ -408,17 +408,6 @@ impl<T> Opaque<T> {
     pub const fn cast_from(this: *const T) -> *const Self {
         this.cast()
     }
-
-    /// Acquire a mutable reference to `T`.
-    ///
-    /// # Safety
-    ///
-    /// Callers must ensure that they have exclusive access to `T`. This also implies that no other
-    /// `ARef`s may be taken out for `T`.
-    pub(crate) unsafe fn as_inner_mut(&mut self) -> &mut T {
-        // SAFETY: Our safety contract guarantees we have exclusive access to `T`
-        unsafe { self.ptr.as_mut() }
-    }
 }
 
 impl<T> Wrapper<T> for Opaque<T> {
