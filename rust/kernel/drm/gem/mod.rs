@@ -6,13 +6,14 @@
 
 use crate::{
     alloc::flags::*,
-    bindings, drm,
+    bindings,
     drm::driver::{AllocImpl, AllocOps},
+    drm::{self, private::Sealed},
     error::{to_result, Result},
     prelude::*,
     types::{ARef, AlwaysRefCounted, Opaque},
 };
-use core::{ops::Deref, ptr::NonNull};
+use core::{marker::PhantomData, ops::Deref, ptr::NonNull};
 
 /// A type alias for retrieving a [`Driver`]s [`DriverFile`] implementation from its
 /// [`DriverObject`] implementation.
@@ -20,6 +21,26 @@ use core::{ops::Deref, ptr::NonNull};
 /// [`Driver`]: drm::Driver
 /// [`DriverFile`]: drm::file::DriverFile
 pub type DriverFile<T> = drm::File<<<T as DriverObject>::Driver as drm::Driver>::File>;
+
+/// A helper macro for implementing AsRef<OpaqueObject<…>>
+macro_rules! impl_as_opaque {
+    ($type:ty where $tparam:ident : $tparam_trait:ident) => {
+        impl<D, $tparam> core::convert::AsRef<kernel::drm::gem::OpaqueObject<D>> for $type
+        where
+            D: kernel::drm::driver::Driver,
+            Self: kernel::drm::gem::DriverObject<Driver = D>,
+            Self: kernel::drm::gem::IntoGEMObject,
+            $tparam: $tparam_trait,
+        {
+            fn as_ref(&self) -> &kernel::drm::gem::OpaqueObject<D> {
+                // SAFETY: This cast is safe via our type invariant.
+                unsafe { &*((self.as_raw().cast_const()).cast()) }
+            }
+        }
+    };
+}
+
+pub(crate) use impl_as_opaque;
 
 /// GEM object functions, which must be implemented by drivers.
 pub trait DriverObject: Sync + Send + Sized {
@@ -29,8 +50,15 @@ pub trait DriverObject: Sync + Send + Sized {
     /// The GEM object type that will be passed to various callbacks.
     type Object: AllocImpl;
 
+    /// The data type to use for passing arguments to [`BaseDriverObject::new`].
+    type Args;
+
     /// Create a new driver data object for a GEM object of a given size.
-    fn new(dev: &drm::Device<Self::Driver>, size: usize) -> impl PinInit<Self, Error>;
+    fn new(
+        dev: &drm::Device<Self::Driver>,
+        size: usize,
+        args: Self::Args,
+    ) -> impl PinInit<Self, Error>;
 
     /// Open a new handle to an existing object, associated with a File.
     fn open(_obj: &Self::Object, _file: &DriverFile<Self>) -> Result {
@@ -42,7 +70,7 @@ pub trait DriverObject: Sync + Send + Sized {
 }
 
 /// Trait that represents a GEM object subtype
-pub trait IntoGEMObject: Sized + super::private::Sealed + AlwaysRefCounted {
+pub trait IntoGEMObject: Sized + Sealed + AlwaysRefCounted {
     /// Returns a reference to the raw `drm_gem_object` structure, which must be valid as long as
     /// this owning object is valid.
     fn as_raw(&self) -> *mut bindings::drm_gem_object;
@@ -233,11 +261,11 @@ impl<T: DriverObject> Object<T> {
     };
 
     /// Create a new GEM object.
-    pub fn new(dev: &drm::Device<T::Driver>, size: usize) -> Result<ARef<Self>> {
+    pub fn new(dev: &drm::Device<T::Driver>, size: usize, args: T::Args) -> Result<ARef<Self>> {
         let obj: Pin<KBox<Self>> = KBox::pin_init(
             try_pin_init!(Self {
                 obj: Opaque::new(bindings::drm_gem_object::default()),
-                data <- T::new(dev, size),
+                data <- T::new(dev, size, args),
                 // INVARIANT: The drm subsystem guarantees that the `struct drm_device` will live
                 // as long as the GEM object lives.
                 dev: dev.into(),
@@ -289,7 +317,7 @@ impl<T: DriverObject> Object<T> {
     }
 }
 
-impl<T: DriverObject> super::private::Sealed for Object<T> {}
+impl<T: DriverObject> Sealed for Object<T> {}
 
 impl<T: DriverObject> Deref for Object<T> {
     type Target = T;
@@ -312,6 +340,39 @@ impl<T: DriverObject> AllocImpl for Object<T> {
         dumb_map_offset: None,
     };
 }
+
+impl_as_opaque!(Object<T> where T: DriverObject);
+
+/// A GEM object whose private-data layout is not known.
+///
+/// Not all GEM objects are created equal, and subsequently drivers may occasionally need to deal
+/// with situations where they are working with a GEM object but have no knowledge of its
+/// private-data layout.
+///
+/// It may be used just like a normal [`Object`], with the exception that it cannot access
+/// driver-private data.
+///
+/// # Invariant
+///
+/// Via `#[repr(transparent)]`, this type is guaranteed to have an identical data layout to
+/// `struct drm_gem_object`.
+#[repr(transparent)]
+pub struct OpaqueObject<T: drm::Driver>(Opaque<bindings::drm_gem_object>, PhantomData<T>);
+
+impl<T: drm::Driver> IntoGEMObject for OpaqueObject<T> {
+    unsafe fn from_raw<'a>(self_ptr: *mut bindings::drm_gem_object) -> &'a Self {
+        // SAFETY:
+        // - This cast is safe via our type invariant.
+        // - `self_ptr` is guaranteed to be a valid pointer to a gem object by our safety contract.
+        unsafe { &*self_ptr.cast::<Self>().cast_const() }
+    }
+
+    fn as_raw(&self) -> *mut bindings::drm_gem_object {
+        self.0.get()
+    }
+}
+
+impl<D: drm::Driver> Sealed for OpaqueObject<D> {}
 
 pub(super) const fn create_fops() -> bindings::file_operations {
     // SAFETY: As by the type invariant, it is safe to initialize `bindings::file_operations`
