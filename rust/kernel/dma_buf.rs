@@ -20,7 +20,6 @@ unsafe impl Send for DmaBuf {}
 // SAFETY: `struct dma_buf` is thread-safe
 unsafe impl Sync for DmaBuf {}
 
-#[expect(unused)]
 impl DmaBuf {
     /// Convert from a `*mut bindings::dma_buf` to a [`DmaBuf`].
     ///
