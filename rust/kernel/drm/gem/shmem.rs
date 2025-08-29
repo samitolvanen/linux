@@ -178,6 +178,22 @@ impl<T: DriverObject> Object<T> {
         Ok(unsafe { scatterlist::SGTable::from_raw(sgt) })
     }
 
+    /// Creates (if necessary) and returns an owned reference to a scatter-gather table of DMA pages
+    /// for this object.
+    ///
+    /// This is the same as [`sg_table`](Self::sg_table), except that it instead returns a
+    /// [`OwnedSGTable`] which holds a reference to the associated gem object.
+    ///
+    /// This will pin the object in memory.
+    pub fn owned_sg_table(&self) -> Result<SGTableRef<T>> {
+        Ok(SGTableRef {
+            sgt: self.sg_table()?.into(),
+            // INVARIANT: We take an owned refcount to `self` here, ensuring that `sgt` remains
+            // valid for as long as this `OwnedSGTable`.
+            _owner: self.into(),
+        })
+    }
+
     /// Creates and returns a virtual kernel memory mapping for this object.
     pub fn vmap(&self) -> Result<VMap<T>> {
         let mut map: MaybeUninit<bindings::iosys_map> = MaybeUninit::uninit();
@@ -309,3 +325,37 @@ impl<T: DriverObject> Drop for VMap<T> {
 unsafe impl<T: DriverObject> Send for VMap<T> {}
 /// SAFETY: `iosys_map` objects are safe to send across threads.
 unsafe impl<T: DriverObject> Sync for VMap<T> {}
+
+/// An owned reference to a scatter-gather table of DMA address spans for a GEM shmem object.
+///
+/// This object holds an owned reference to the underlying GEM shmem object, ensuring that the
+/// [`SGTable`] referenced by `SGTableRef` remains valid for the lifetime of this object.
+///
+/// # Invariants
+///
+/// - `sgt` is kept alive by `_owner`, ensuring it remains valid for as long as `Self`.
+/// - `sgt` corresponds to the owned object in `_owner`.
+/// - This object is only exposed in situations where we know the underlying `SGTable` will not be
+///   modified for the lifetime of this object.
+///
+/// [`SGTable`]: scatterlist::SGTable
+pub struct SGTableRef<T: DriverObject> {
+    sgt: NonNull<scatterlist::SGTable>,
+    _owner: ARef<Object<T>>,
+}
+
+// SAFETY: This object is only exposed in situations where we know the underlying `SGTable` will not
+// be modified for the lifetime of this object.
+unsafe impl<T: DriverObject> Send for SGTableRef<T> {}
+// SAFETY: This object is only exposed in situations where we know the underlying `SGTable` will not
+// be modified for the lifetime of this object.
+unsafe impl<T: DriverObject> Sync for SGTableRef<T> {}
+
+impl<T: DriverObject> Deref for SGTableRef<T> {
+    type Target = scatterlist::SGTable;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: Creating an immutable reference to this is safe via our type invariants.
+        unsafe { self.sgt.as_ref() }
+    }
+}
