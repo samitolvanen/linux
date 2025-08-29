@@ -3,6 +3,8 @@
 //! DRM GEM API
 //!
 //! C header: [`include/linux/drm/drm_gem.h`](srctree/include/linux/drm/drm_gem.h)
+#[cfg(CONFIG_DRM_GEM_SHMEM_HELPER = "y")]
+pub mod shmem;
 
 use crate::{
     alloc::flags::*,
@@ -215,7 +217,6 @@ pub trait BaseObject: IntoGEMObject {
 impl<T: IntoGEMObject> BaseObject for T {}
 
 /// Crate-private base operations shared by all GEM object classes.
-#[expect(unused)]
 pub(crate) trait BaseObjectPrivate: IntoGEMObject {
     /// Return a pointer to this object's dma_resv.
     fn raw_dma_resv(&self) -> *mut bindings::dma_resv {
