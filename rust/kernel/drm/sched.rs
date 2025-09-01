@@ -278,7 +278,7 @@ impl<T: JobImpl> Entity<T> {
     /// after which the scheduler owns it. Since jobs must be submitted in creation order,
     /// this requires a mutable reference to the entity, ensuring that only one new job can be
     /// in flight at once.
-    pub fn new_job(&mut self, credits: u32, inner: T) -> Result<PendingJob<'_, T>> {
+    pub fn new_job(&mut self, credits: u32, client_id: u64, inner: T) -> Result<PendingJob<'_, T>> {
         let mut job: KBox<MaybeUninit<Job<T>>> = Box::new_uninit(GFP_KERNEL | __GFP_ZERO)?;
 
         // SAFETY: We hold a reference to the entity (which is a valid pointer),
@@ -289,6 +289,7 @@ impl<T: JobImpl> Entity<T> {
                 &self.0.as_ref().get_ref().entity as *const _ as *mut _,
                 credits,
                 core::ptr::null_mut(),
+                client_id,
             )
         })?;
 
@@ -328,6 +329,7 @@ impl<T: JobImpl> Scheduler<T> {
         run_job: Some(run_job_cb::<T>),
         timedout_job: Some(timedout_job_cb::<T>),
         free_job: Some(free_job_cb::<T>),
+        cancel_job: None,
     };
     /// Creates a new DRM Scheduler object
     // TODO: Shared timeout workqueues & scores
