@@ -83,6 +83,22 @@ pub trait Device: AsRef<device::Device<Core>> {
             bindings::dma_set_mask_and_coherent(self.as_ref().as_raw(), mask.value())
         })
     }
+    /// Set up the device's DMA max mapping size.
+    ///
+    /// This method is usually called once from `probe()` as soon as the device capabilities are
+    /// known.
+    ///
+    /// # Safety
+    ///
+    /// This method must not be called concurrently with any DMA allocation or mapping primitives,
+    /// such as [`CoherentAllocation::alloc_attrs`].
+    unsafe fn dma_set_max_seg_size(&self, size: u32) {
+        // SAFETY:
+        // - By the type invariant of `device::Device`, `self.as_ref().as_raw()` is valid.
+        // - The safety requirement of this function guarantees that there are no concurrent calls
+        //   to DMA allocation and mapping primitives using this mask.
+        unsafe { bindings::dma_set_max_seg_size(self.as_ref().as_raw(), size) };
+    }
 }
 
 /// A DMA mask that holds a bitmask with the lowest `n` bits set.

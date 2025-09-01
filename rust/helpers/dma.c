@@ -19,3 +19,8 @@ int rust_helper_dma_set_mask_and_coherent(struct device *dev, u64 mask)
 {
 	return dma_set_mask_and_coherent(dev, mask);
 }
+
+void rust_helper_dma_set_max_seg_size(struct device *dev, unsigned int size)
+{
+	dma_set_max_seg_size(dev, size);
+}
