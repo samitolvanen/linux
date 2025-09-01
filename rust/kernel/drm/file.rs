@@ -53,6 +53,12 @@ impl<T: DriverFile> File<T> {
         unsafe { Pin::new_unchecked(&*(self.driver_priv())) }
     }
 
+    /// Return a unique id for fdinfo
+    pub fn get_client_id(&self) -> u64 {
+        // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid.
+        unsafe { (*self.as_raw()).client_id }
+    }
+
     /// The open callback of a `struct drm_file`.
     pub(crate) extern "C" fn open_callback(
         raw_dev: *mut bindings::drm_device,
