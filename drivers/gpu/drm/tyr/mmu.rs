@@ -178,7 +178,7 @@ impl Mmu {
             op,
             cond,
             Delta::from_millis(0),
-            Some(Delta::from_micros(200)),
+            Delta::from_micros(200),
         )?;
 
         as_command(as_nr)?.write(iomem, AS_COMMAND_UPDATE)?;
