@@ -98,24 +98,17 @@ impl RangeAlloc {
     }
 
     pub(crate) fn insert(&self, start: u64, end: u64, gfp: Flags) -> Result<LiveRange> {
-        if end < start {
-            return Err(EINVAL);
-        }
-        if start < self.inner.range.start {
-            return Err(EINVAL);
-        }
-        if end > self.inner.range.end {
+        if end <= start {
             return Err(EINVAL);
         }
 
         #[cfg(target_pointer_width = "32")]
         {
-            let maple_start = (start - self.inner.range.start) as usize;
-            let maple_end = (end - self.inner.range.start) as usize;
-
-            self.inner
-                .maple
-                .insert_range(maple_start..maple_end, (), gfp)?;
+            if let Some(range) = self.inner.maple_range(start, end) {
+                self.inner
+                    .maple
+                    .insert_range(range, (), gfp)?;
+            }
         }
 
         #[cfg(target_pointer_width = "64")]
@@ -130,6 +123,22 @@ impl RangeAlloc {
             offset: start,
             size: (end - start) as usize,
         })
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+impl RangeAllocInner {
+    fn maple_range(&self, start: u64, end: u64) -> Option<Range<usize>> {
+        let range_start = u64::max(start, self.range.start);
+        let range_end = u64::min(end, self.range.end);
+
+        if range_start != range_end {
+            let maple_start = (range_start - self.range.start) as usize;
+            let maple_end = (range_end - self.range.start) as usize;
+            Some(maple_start..maple_end)
+        } else {
+            None
+        }
     }
 }
 
@@ -152,13 +161,15 @@ impl LiveRange {
 }
 
 impl Drop for LiveRange {
+    #[cfg(target_pointer_width = "32")]
     fn drop(&mut self) {
-        #[cfg(target_pointer_width = "32")]
-        self.inner
-            .maple
-            .erase((self.offset - self.inner.range.start) as usize);
+        if let Some(range) = self.inner.maple_range(start, end) {
+            self.inner.maple.erase(range.start);
+        }
+    }
 
-        #[cfg(target_pointer_width = "64")]
+    #[cfg(target_pointer_width = "64")]
+    fn drop(&mut self) {
         self.inner.maple.erase(self.offset as usize);
     }
 }
