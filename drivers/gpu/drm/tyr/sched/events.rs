@@ -240,7 +240,8 @@ impl Scheduler {
     }
 
     pub(crate) fn set_events(&mut self, tdev: &TyrDevice, events: u32) {
-        self.events = Some(events);
+        let old_events = self.events.unwrap_or_default();
+        self.events = Some(events | old_events);
 
         if self.wq.enqueue::<_, 2>(tdev.deref().clone()).is_err() {
             pr_err!("Failed to enqueue firmware events work\n");
