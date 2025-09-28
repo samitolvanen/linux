@@ -248,7 +248,6 @@ impl Vm {
         let range = self.gpuvm.va_range();
 
         self.unmap_range(iomem, range)?;
-        self.address_space = None;
 
         Ok(())
     }

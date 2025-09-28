@@ -117,6 +117,9 @@ impl Mmu {
 
         let memattr = vm.memattr;
         let as_nr = self.slots.find_slot(vm.for_mcu)?;
+        if gpu_info.as_present & (1 << as_nr)  == 0 {
+            return Err(EBUSY);
+        }
         Self::enable_as(iomem, as_nr, transtab, transcfg.into(), memattr)?;
         self.slots.alloc_slot(as_nr);
         vm.address_space = Some(as_nr);
