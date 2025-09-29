@@ -41,10 +41,10 @@ pub(crate) mod constants {
     use kernel::bits::genmask_u32;
 
     pub(crate) const CSG_STATE_MASK: u32 = genmask_u32(0..=2);
-    const CSG_STATE_TERMINATE: u32 = 0;
-    const CSG_STATE_START: u32 = 1;
-    const CSG_STATE_SUSPEND: u32 = 2;
-    const CSG_STATE_RESUME: u32 = 3;
+    pub(crate) const CSG_STATE_TERMINATE: u32 = 0;
+    pub(crate) const CSG_STATE_START: u32 = 1;
+    pub(crate) const CSG_STATE_SUSPEND: u32 = 2;
+    pub(crate) const CSG_STATE_RESUME: u32 = 3;
 
     pub(crate) const CSG_ENDPOINT_CONFIG: u32 = bit_u32(4);
     pub(crate) const CSG_STATUS_UPDATE: u32 = bit_u32(5);
@@ -312,10 +312,24 @@ impl_shared_section_read!(Output);
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum GroupState {
-    Terminate,
-    Start,
-    Suspend,
-    Resume,
+    Terminate = CSG_STATE_TERMINATE as _,
+    Start = CSG_STATE_START as _,
+    Suspend = CSG_STATE_SUSPEND as _,
+    Resume = CSG_STATE_RESUME as _,
+}
+
+impl TryFrom<u32> for GroupState {
+    type Error = Error;
+
+    fn try_from(value: u32) -> Result<Self, Error> {
+        match value & CSG_STATE_MASK {
+            CSG_STATE_TERMINATE => Ok(Self::Terminate),
+            CSG_STATE_START => Ok(Self::Start),
+            CSG_STATE_SUSPEND => Ok(Self::Suspend),
+            CSG_STATE_RESUME => Ok(Self::Resume),
+            _ => Err(EINVAL),
+        }
+    }
 }
 
 /// Represents the priority levels for a Command Stream Group (CSG).
