@@ -252,10 +252,12 @@ impl Scheduler {
 
     fn update_group(&mut self, group: Arc<Group>, data: &Arc<TyrData>) -> Result {
         let mut no_in_flight_jobs = true;
+        let mut csg_id = None;
 
         // TODO: we need to annotate this function with the dma signalling token.
         // TODO: we cannot sleep in the signalling path.
         group.with_locked_inner(|inner| {
+            csg_id = inner.csg_id;
             for (queue_idx, queue) in inner.queues.iter_mut().enumerate() {
                 let sync_offset = queue_idx * core::mem::size_of::<syncs::SyncObj64b>();
                 let sync_obj = syncs::SyncObj64b::read(&mut inner.syncobjs, sync_offset)?;
@@ -289,15 +291,35 @@ impl Scheduler {
         })?;
 
         if no_in_flight_jobs {
-            self.mark_group_idle(group, data)?;
+            self.mark_group_idle(group, data, csg_id)?;
         }
 
         Ok(())
     }
 
-    fn mark_group_idle(&mut self, group: Arc<Group>, data: &TyrData) -> Result {
-        data.with_locked_mmu(|mmu| mmu.unbind_vm(&group.vm, &data.iomem))?;
-        self.idle_groups[group.priority as usize].push(group, GFP_KERNEL)?;
+    fn mark_group_idle(
+        &mut self,
+        group: Arc<Group>,
+        data: &Arc<TyrData>,
+        csg_id: Option<usize>,
+    ) -> Result {
+        // data.with_locked_mmu(|mmu| mmu.unbind_vm(&group.vm, &data.iomem))?;
+        // self.idle_groups[group.priority as usize].push(group, GFP_KERNEL)?;
+        if let Some(csg_idx) = csg_id {
+            if let Some(slot) = &mut self.csg_slots[csg_idx] {
+                slot.idle = true;
+            } else {
+                pr_warn!("Cannot mark empty slot {} idle\n", csg_idx);
+            }
+        }
+
+        if let None = &self.resched_target {
+            self.resched_target = Some(kernel::time::Instant::now());
+            let arc: Arc<TyrData> = data.clone();
+            if self.wq.enqueue::<_, 1>(arc).is_err() {
+                pr_err!("Failed to enqueue tick work\n");
+            }
+        }
         Ok(())
     }
 
