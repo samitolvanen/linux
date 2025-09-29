@@ -16,6 +16,7 @@ use kernel::workqueue::OwnedQueue;
 use kernel::workqueue::WqFlags;
 use queue::Queue;
 
+use crate::driver::TyrData;
 use crate::driver::TyrDevice;
 use crate::file::DrmFile;
 use crate::file::QueueSubmit;
@@ -174,7 +175,7 @@ impl Scheduler {
     /// firmware slots for execution.
     pub(crate) fn bind_group(
         &mut self,
-        tdev: &TyrDevice,
+        data: &TyrData,
         group: Arc<Group>,
         csg_idx: usize,
     ) -> Result {
@@ -196,15 +197,15 @@ impl Scheduler {
             return Err(EINVAL);
         }
 
-        let gpu_info = &tdev.gpu_info;
-        let iomem = &tdev.iomem;
+        let gpu_info = &data.gpu_info;
+        let iomem = &data.iomem;
 
-        tdev.with_locked_mmu(|mmu| mmu.bind_vm(group.vm.clone(), gpu_info, iomem))?;
+        data.with_locked_mmu(|mmu| mmu.bind_vm(group.vm.clone(), gpu_info, iomem))?;
 
         self.csg_slots[csg_idx] = Some(CommandStreamGroupSlot {
             group: group.clone(),
             priority: Priority::Low,
-            idle: true,
+            idle: false,
         });
 
         group.with_locked_inner(|inner| {
@@ -223,12 +224,47 @@ impl Scheduler {
         })
     }
 
+    /// Unbind a group from group slot.
+    pub(crate) fn unbind_group(
+        &mut self,
+        data: &TyrData,
+        csg_idx: usize,
+    ) -> Result<CommandStreamGroupSlot> {
+        if csg_idx >= self.csg_slot_count as usize {
+            pr_err!("unbind_group: invalid group index {}", csg_idx);
+            return Err(EINVAL);
+        }
+        if self.csg_slots[csg_idx].is_none() {
+            pr_err!("unbind_group: group slot already empty");
+            return Err(EINVAL);
+        }
+
+        let slot = self.csg_slots[csg_idx].as_mut().ok_or(EINVAL)?;
+
+        data.with_locked_mmu(|mmu| {
+            mmu.unbind_vm(&slot.group.vm, &data.iomem)?;
+            Ok(())
+        })?;
+
+        slot.group.with_locked_inner(|inner| {
+            inner.csg_id = None;
+
+            for queue in &mut inner.queues {
+                queue.doorbell_id = None;
+            }
+            Ok(())
+        })?;
+
+        let slot = self.csg_slots[csg_idx].take().ok_or(EINVAL)?;
+        return Ok(slot);
+    }
+
     /// Program a group (and its queues) into a firmware slot. This will make
     /// the group eligible for execution from a FW perspective.
     // TODO: this can be private
     pub(crate) fn program_csg_slot(
         &mut self,
-        tdev: &TyrDevice,
+        data: &TyrData,
         csg_idx: usize,
         priority: Priority,
     ) -> Result {
@@ -253,7 +289,7 @@ impl Scheduler {
 
         // let group_inner = group.inner.lock();
 
-        let fw = &tdev.fw;
+        let fw = &data.fw;
 
         // Controls which CSn doorbells will be rung.
         //

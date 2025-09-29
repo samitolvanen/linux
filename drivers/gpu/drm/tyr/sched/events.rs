@@ -21,6 +21,8 @@ use crate::fw::global::csg::CommandStreamGroup;
 use crate::fw::global::GlobalInterface;
 use crate::fw::SharedSectionEntry;
 use crate::regs::JOB_INT_GLOBAL_IF;
+use crate::sched::csg::GroupState;
+use crate::sched::group::State;
 use crate::sched::Scheduler;
 
 use super::group::Group;
@@ -248,7 +250,7 @@ impl Scheduler {
         }
     }
 
-    fn update_group(&mut self, group: Arc<Group>, data: &TyrData) -> Result {
+    fn update_group(&mut self, group: Arc<Group>, data: &Arc<TyrData>) -> Result {
         let mut no_in_flight_jobs = true;
 
         // TODO: we need to annotate this function with the dma signalling token.
@@ -296,6 +298,98 @@ impl Scheduler {
     fn mark_group_idle(&mut self, group: Arc<Group>, data: &TyrData) -> Result {
         data.with_locked_mmu(|mmu| mmu.unbind_vm(&group.vm, &data.iomem))?;
         self.idle_groups[group.priority as usize].push(group, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// update group at `csg_idx` as it changes from `old_state` to `new_state`.
+    fn handle_state_change(
+        &mut self,
+        new_state: State,
+        old_state: State,
+        data: &Arc<TyrData>,
+        glb_iface: &mut GlobalInterface,
+        csg_idx: usize,
+    ) -> Result {
+        self.process_csg_irq(data.clone(), glb_iface, csg_idx as _)?;
+        self.csg_slots[csg_idx]
+            .as_ref()
+            .ok_or(EINVAL)?
+            .group
+            .with_locked_inner(|inner| {
+                if new_state == State::Unknown {
+                    //TODO: schedule reset
+                }
+                if new_state == State::Suspended {
+                    // TODO: handle reg `status_blocked_reason` here
+                }
+                if old_state == State::Active {
+                    let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
+                    for (cs_idx, _) in inner.queues.iter_mut().enumerate() {
+                        let cs_iface = csg_iface.cs_mut(cs_idx).ok_or(EINVAL)?;
+                        cs_iface.set_state(crate::sched::StreamState::Stop)?;
+                    }
+                }
+                Ok(())
+            })
+    }
+
+    /// inform the firmware of the changes of the group at `csg_idx` and update the group
+    /// based on the response.
+    pub(crate) fn sync_group_state(&mut self, data: &Arc<TyrData>, csg_idx: usize) -> Result {
+        if csg_idx >= self.csg_slot_count as usize {
+            pr_err!("sync_group: invalid group index {}", csg_idx);
+            return Err(EINVAL);
+        }
+        if self.csg_slots[csg_idx].is_none() {
+            pr_err!("sync_group: group slot is empty");
+            return Err(EINVAL);
+        }
+
+        let slot = self.csg_slots[csg_idx].as_ref().ok_or(EINVAL)?;
+        let is_idle = self.csg_slots[csg_idx].as_ref().ok_or(EINVAL)?.idle;
+        let (old_state, can_run) = slot.group.with_locked_inner(|inner| {
+            Ok((inner.state, {
+                inner.state != State::Terminated
+                    && inner.state != State::Unknown
+                    && inner.destroyed == false
+                    && inner.fatal_queues == 0
+            }))
+        })?;
+
+        let update = if is_idle {
+            if can_run {
+                GroupState::Suspend
+            } else {
+                GroupState::Terminate
+            }
+        } else {
+            if old_state == State::Suspended {
+                GroupState::Resume
+            } else {
+                GroupState::Start
+            }
+        };
+
+        let fw = &data.fw;
+        fw.with_locked_global_iface(|glb_iface| {
+            glb_iface.set_csg_state(csg_idx, update)?;
+            glb_iface.ring_csg_doorbell(csg_idx)?;
+            let output = glb_iface.read_output()?;
+            let ack = output.ack;
+
+            let new_state = match GroupState::try_from(ack) {
+                Ok(GroupState::Start) => State::Active,
+                Ok(GroupState::Resume) => State::Active,
+                Ok(GroupState::Terminate) => State::Terminated,
+                Ok(GroupState::Suspend) => State::Suspended,
+                _ => State::Unknown,
+            };
+            if old_state == new_state {
+                return Ok(());
+            }
+            self.handle_state_change(new_state, old_state, data, glb_iface, csg_idx)
+        })?;
+
         Ok(())
     }
 }
