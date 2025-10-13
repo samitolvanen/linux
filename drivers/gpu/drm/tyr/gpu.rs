@@ -153,6 +153,11 @@ impl GpuInfo {
     pub(crate) fn pa_bits(&self) -> u32 {
         (self.mmu_features >> 8) & genmask_u32(0..=7)
     }
+
+    pub(crate) fn heap_context_stride(&self) -> u32 {
+        let heap_context_size = 32;
+        crate::regs::l2_feature_line_size(self.l2_features).next_multiple_of(heap_context_size)
+    }
 }
 
 // SAFETY: `GpuInfo`'s invariant guarantees that it is the same type that is

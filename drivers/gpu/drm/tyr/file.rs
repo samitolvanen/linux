@@ -4,6 +4,7 @@ use core::ops::Deref;
 use core::ops::DerefMut;
 
 use kernel::alloc::flags::*;
+use kernel::bits::genmask_u32;
 use kernel::drm;
 use kernel::drm::device::Device as DrmDevice;
 use kernel::drm::gem::BaseObject;
@@ -13,10 +14,13 @@ use kernel::transmute::FromBytes;
 use kernel::types::ARef;
 use kernel::uaccess::UserSlice;
 use kernel::uapi;
+use kernel::xarray;
+use kernel::xarray::XArray;
 
 use crate::driver::TyrDevice;
 use crate::driver::TyrDriver;
 use crate::gem;
+use crate::heap;
 use crate::mmu::vm;
 use crate::mmu::vm::pool::Pool;
 use crate::mmu::vm::VmLayout;
@@ -30,6 +34,12 @@ pub(crate) struct File {
     vm_pool: Pool,
 
     group_pool: group::Pool,
+
+    /// Heap pools, indexed by VM ID.
+    ///
+    /// Each VM can have its own heap pool for tiler heap management.
+    /// The heap pool is created on-demand when the first heap context is created.
+    heap_pools: Pin<KBox<XArray<KBox<heap::Pool>>>>,
 }
 
 /// Convenience type alias for our DRM `File` type
@@ -45,6 +55,7 @@ impl drm::file::DriverFile for File {
             try_pin_init!(Self {
                 vm_pool: Pool::create()?,
                 group_pool: group::Pool::create()?,
+                heap_pools <- KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?,
             }),
             GFP_KERNEL,
         )
@@ -360,6 +371,73 @@ impl File {
                 file.get_client_id(),
             )
         })?;
+
+        Ok(0)
+    }
+
+    pub(crate) fn group_get_state(
+        _tdev: &TyrDevice,
+        _groupgetstate: &mut uapi::drm_panthor_group_get_state,
+        _file: &DrmFile,
+    ) -> Result<u32> {
+        Err(ENOTSUPP)
+    }
+
+    pub(crate) fn heap_create(
+        tdev: &TyrDevice,
+        heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        let vm_id = heapcreate.vm_id as usize;
+        let vm = file.inner().vm_pool().get_vm(vm_id).ok_or(EINVAL)?;
+
+        let args = heap::ContextCreateArgs {
+            initial_chunk_count: heapcreate.initial_chunk_count,
+            chunk_size: heapcreate.chunk_size,
+            max_chunks: heapcreate.max_chunks,
+            target_in_flight: heapcreate.target_in_flight,
+        };
+
+        // Create the heap pool for this VM if it doesn't exist yet
+        let file_inner = file.inner();
+        let xa = file_inner.heap_pools.as_ref();
+
+        {
+            let guard = xa.lock();
+            if guard.get(vm_id).is_none() {
+                drop(guard); // Release lock before creating pool
+                let pool = KBox::new(
+                    heap::Pool::create(tdev, tdev.iomem.clone(), vm.clone())?,
+                    GFP_KERNEL,
+                )?;
+                xa.lock().store(vm_id, pool, GFP_KERNEL)?;
+            }
+        }
+
+        let guard = xa.lock();
+        let pool = guard.get(vm_id).ok_or(EINVAL)?;
+        let created_context = pool.create_heap_context(tdev, args)?;
+
+        heapcreate.handle = heapcreate.vm_id << 16 | created_context.context_id as u32;
+        heapcreate.tiler_heap_ctx_gpu_va = created_context.context_gpu_va;
+        heapcreate.first_heap_chunk_gpu_va = created_context.first_chunk_gpu_va;
+
+        Ok(0)
+    }
+
+    pub(crate) fn heap_destroy(
+        _tdev: &TyrDevice,
+        heapdestroy: &mut uapi::drm_panthor_tiler_heap_destroy,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        let vm_id = (heapdestroy.handle >> 16) as usize;
+        let heap_idx = (heapdestroy.handle & genmask_u32(0..=15)) as usize;
+
+        let file_inner = file.inner();
+        let xa = file_inner.heap_pools.as_ref();
+        let guard = xa.lock();
+        let pool = guard.get(vm_id).ok_or(EINVAL)?;
+        pool.destroy_heap_context(heap_idx).ok_or(EINVAL)?;
 
         Ok(0)
     }
