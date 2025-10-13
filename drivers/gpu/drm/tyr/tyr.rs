@@ -41,6 +41,7 @@ mod flags;
 mod fw;
 mod gem;
 mod gpu;
+mod heap;
 mod mmu;
 mod regs;
 mod sched;

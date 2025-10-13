@@ -44,6 +44,7 @@ use crate::gem;
 use crate::gem::DriverObject;
 use crate::gem::KernelVaPlacement;
 use crate::gpu::GpuInfo;
+use crate::heap;
 use crate::mmu::Mmu;
 use crate::regs;
 

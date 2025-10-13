@@ -27,6 +27,9 @@ impl<const OFFSET: usize> Register<OFFSET> {
 
 pub(crate) const GPU_ID: Register<0x0> = Register;
 pub(crate) const GPU_L2_FEATURES: Register<0x4> = Register;
+pub(crate) const fn l2_feature_line_size(l2_features: u32) -> u32 {
+    1 << (l2_features & kernel::bits::genmask_u32(0..=7))
+}
 pub(crate) const GPU_CORE_FEATURES: Register<0x8> = Register;
 pub(crate) const GPU_CSF_ID: Register<0x1c> = Register;
 pub(crate) const GPU_REVID: Register<0x280> = Register;

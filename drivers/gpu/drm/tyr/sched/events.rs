@@ -27,6 +27,54 @@ use super::group::Group;
 use super::syncs;
 
 impl Scheduler {
+    // TODO: this does not work, we need to get the heap pool from the VM
+    // somehow.
+    fn process_tiler_oom(
+        &mut self,
+        csg: &mut CommandStreamGroup,
+        csg_id: u32,
+        cs_id: u32,
+    ) -> Result {
+        let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
+        let output = cs.read_output()?;
+
+        let heap_address = output.heap_address;
+        let vt_start = output.heap_vt_start;
+        let vt_end = output.heap_vt_end;
+        let frag_end = output.heap_frag_end;
+
+        let _renderpasses_in_flight = vt_start.wrapping_sub(frag_end);
+        let _pending_frag_count = vt_end.wrapping_sub(frag_end);
+
+        pr_info!(
+            "Tiler OOM: heap_addr={:#x}, vt_start={}, vt_end={}, frag_end={}\n",
+            heap_address,
+            vt_start,
+            vt_end,
+            frag_end
+        );
+
+        let slot = self.csg_slots[csg_id as usize].as_ref().ok_or(EINVAL)?;
+        let _vm = slot.group.vm.clone();
+
+        unimplemented!("We can't get the heap pool from the VM yet");
+
+        // let new_chunk_va = 0u64; // <this needs to come from grow_heap_context()
+
+        // let mut input = cs.read_input()?;
+        // input.heap_start = new_chunk_va;
+        // input.heap_end = new_chunk_va;
+        // cs.write_input(input)?;
+
+        // let req = cs.input_request()?;
+        // req.update_reqs(output.ack, cs::constants::CS_TILER_OOM)?;
+
+        // let doorbell = csg.doorbell_request()?;
+        // doorbell.toggle_reqs(1 << cs_id)?;
+
+        Ok(())
+    }
+
     pub(crate) fn process_events(&mut self, data: Arc<TyrData>) -> Result {
         // TODO: we need to annotate this function with the dma signalling token.
 
@@ -152,6 +200,10 @@ impl Scheduler {
 
         if cs_events & cs::constants::CS_FAULT != 0 {
             cs.decode_fault()?;
+        }
+
+        if cs_events & cs::constants::CS_TILER_OOM != 0 {
+            self.process_tiler_oom(csg, csg_id, cs_id)?;
         }
 
         if faulty {
