@@ -48,6 +48,37 @@ impl<T: drm::Driver> SyncObj<T> {
         }
     }
 
+    /// Finds the fence at a specific timeline point for this sync object.
+    pub fn find_fence(
+        file: &drm::File<T::File>,
+        handle: u32,
+        point: u64,
+        flags: u64,
+    ) -> Result<Option<Fence>> {
+        let mut fence = core::ptr::null_mut();
+
+        // SAFETY: All arguments are valid per the type invariants
+        let ret = unsafe {
+            bindings::drm_syncobj_find_fence(
+                file.as_raw() as *mut _,
+                handle,
+                point,
+                flags,
+                &mut fence,
+            )
+        };
+
+        if ret != 0 {
+            Err(Error::from_errno(ret))
+        } else if fence.is_null() {
+            Ok(None)
+        } else {
+            // SAFETY: The pointer is non-NULL and drm_syncobj_find_fence acquired an
+            // additional reference.
+            Ok(Some(unsafe { Fence::from_raw(fence) }))
+        }
+    }
+
     /// Replaces the DMA fence with a new one, or removes it if fence is None.
     pub fn replace_fence(&self, fence: Option<&Fence>) {
         // SAFETY: All arguments should be valid per the respective type invariants.
