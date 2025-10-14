@@ -335,27 +335,31 @@ impl File {
 
             for _ in 0..queue.syncs.count {
                 let sync: SyncOp = sync_reader.read()?;
-                if sync.flags & !uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL as u32
-                    != 0
+
+                let valid_flags = (uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL
+                    | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT
+                    | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK)
+                    as u32;
+
+                if sync.flags & !valid_flags != 0 {
+                    pr_err!("group_submit: invalid sync op flags: 0x{:x}", sync.flags);
+                    return Err(EINVAL);
+                }
+
+                // Validate handle type
+                let handle_type = sync.flags
+                    & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK as u32;
+                if handle_type != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ as u32
+                    && handle_type != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ as u32
                 {
-                    pr_err!("We only support DRM_PANTHOR_SYNC_OP_SIGNAL for now");
-                    return Err(ENOTSUPP);
+                    pr_err!("group_submit: invalid sync handle type: 0x{:x}", handle_type);
+                    return Err(EINVAL);
                 }
 
                 syncs.push(sync, GFP_KERNEL)?;
             }
 
             queue_submits.push(queue, GFP_KERNEL)?;
-        }
-
-        let mut out_syncs = kvec![];
-        for sync in syncs.iter().filter(|sync| {
-            sync.flags & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL as u32 != 0
-        }) {
-            out_syncs.push(
-                drm::syncobj::SyncObj::lookup_handle(file, sync.handle)?,
-                GFP_KERNEL,
-            )?;
         }
 
         let group = file
@@ -366,13 +370,7 @@ impl File {
 
         tdev.with_locked_scheduler(|sched| {
             sched.bind(tdev, group.clone())?;
-            sched.submit(
-                kvec![],
-                out_syncs,
-                group,
-                queue_submits,
-                file.get_client_id(),
-            )
+            sched.submit(syncs, group, queue_submits, file)
         })?;
 
         Ok(0)
@@ -491,6 +489,7 @@ pub(crate) struct QueueCreate(pub uapi::drm_panthor_queue_create);
 unsafe impl FromBytes for QueueCreate {}
 
 #[repr(transparent)]
+#[derive(Copy, Clone)]
 pub(crate) struct QueueSubmit(pub uapi::drm_panthor_queue_submit);
 
 // XXX: we cannot implement this trait for the uapi type directly, hence the
