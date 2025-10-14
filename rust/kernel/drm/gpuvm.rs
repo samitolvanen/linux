@@ -34,6 +34,16 @@ use crate::types::ARef;
 use crate::types::AlwaysRefCounted;
 use crate::types::Opaque;
 
+// DMA reservation usage flags
+/// For in kernel memory management only (e.g. copying, clearing memory).
+pub const DMA_RESV_USAGE_KERNEL: u32 = bindings::dma_resv_usage_DMA_RESV_USAGE_KERNEL;
+/// Implicit write synchronization for userspace submissions.
+pub const DMA_RESV_USAGE_WRITE: u32 = bindings::dma_resv_usage_DMA_RESV_USAGE_WRITE;
+/// Implicit read synchronization for userspace submissions.
+pub const DMA_RESV_USAGE_READ: u32 = bindings::dma_resv_usage_DMA_RESV_USAGE_READ;
+/// No implicit sync (e.g. preemption fences, page table updates, TLB flushes).
+pub const DMA_RESV_USAGE_BOOKKEEP: u32 = bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP;
+
 /// A convenience type for the driver's GEM object.
 type Object<T> =
     <<<T as DriverGpuVm>::Driver as driver::Driver>::Object as gem::DriverObject>::Object;
@@ -1022,6 +1032,25 @@ impl<'a, T: DriverGpuVm> ExecToken<'a, T> {
         to_result(unsafe { bindings::drm_gpuvm_exec_lock(&mut *guard.vm_exec) })?;
 
         Ok(core::mem::ManuallyDrop::into_inner(guard))
+    }
+
+    /// Adds a fence to the private and external buffer object reservations.
+    pub fn resv_add_fence(
+        &mut self,
+        fence: &dyn crate::dma_fence::RawDmaFence,
+        private_usage: u32,
+        extobj_usage: u32,
+    ) {
+        // SAFETY: vm_exec is valid and locked, fence is valid per RawDmaFence contract.
+        unsafe {
+            bindings::drm_gpuvm_resv_add_fence(
+                self.vm_exec.vm,
+                &self.vm_exec.exec as *const _ as *mut _,
+                fence.raw(),
+                private_usage,
+                extobj_usage,
+            )
+        }
     }
 }
 
