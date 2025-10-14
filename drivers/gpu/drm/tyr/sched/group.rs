@@ -16,6 +16,7 @@ use kernel::xarray::XArray;
 use crate::driver::TyrDevice;
 use crate::file::DrmFile;
 use crate::file::QueueSubmit;
+use crate::file::SyncOp;
 use crate::fw::global::csg;
 use crate::fw::global::csg::Priority;
 use crate::fw::SharedSectionEntry;
@@ -24,6 +25,7 @@ use crate::mmu::vm::map_flags;
 use crate::mmu::vm::PreparedVm;
 use crate::mmu::vm::Vm;
 use crate::mmu::vm::WithLockedVm;
+use crate::sched::deps;
 use crate::sched::syncs::SyncObj64b;
 use crate::TyrDriver;
 
@@ -64,38 +66,6 @@ pub(crate) struct GroupInner {
     ///
     /// There is one syncobj per queue.
     pub(super) syncobjs: gem::ObjectRef,
-}
-
-impl GroupInner {
-    pub(crate) fn submit(
-        &mut self,
-        in_syncs: &KVec<SyncObj<TyrDriver>>,
-        out_syncs: &KVec<SyncObj<TyrDriver>>,
-        group: Arc<Group>,
-        queue_submit: QueueSubmit,
-        prepared_vm: &PreparedVm<'_>,
-        client_id: u64,
-    ) -> Result<UserFence<job::Fence>> {
-        let queue = self
-            .queues
-            .get_mut(queue_submit.queue_index as usize)
-            .ok_or(EINVAL)?;
-
-        let sync_addr = self.syncobjs.kernel_va().ok_or(EINVAL)?;
-        let sync_addr = sync_addr.start
-            + u64::from(queue_submit.queue_index)
-                * core::mem::size_of::<syncs::SyncObj64b>() as u64;
-
-        queue.submit(
-            in_syncs,
-            out_syncs,
-            group,
-            sync_addr,
-            queue_submit,
-            prepared_vm,
-            client_id,
-        )
-    }
 }
 
 /// A scheduling group object, usually backing an execution context, e.g.: a
@@ -284,10 +254,9 @@ impl Group {
 
     pub(super) fn submit(
         self: Arc<Self>,
-        in_syncs: KVec<SyncObj<TyrDriver>>,
-        out_syncs: KVec<SyncObj<TyrDriver>>,
+        syncs: KVec<SyncOp>,
         queue_submits: KVec<QueueSubmit>,
-        client_id: u64,
+        file: &DrmFile,
     ) -> Result<KVec<UserFence<job::Fence>>> {
         if self.vm.lock().address_space().is_none() {
             pr_err!("group_submit: invalid address space");
@@ -301,25 +270,61 @@ impl Group {
             return Err(EINVAL);
         }
 
+        // Convert UAPI sync operations to internal representation
+        let internal_syncs = deps::SyncOp::from_uapi_slice(&syncs)?;
+
+        let mut ctx = deps::Context::new(file);
+
         let mut fences = KVec::with_capacity(queue_submits.len(), GFP_KERNEL)?;
 
         let vm = self.vm.lock();
+
+        // Create all jobs and add them to the context
         self.with_locked_inner(|inner| {
             vm.with_prepared_vm(queue_submits.len() as u32, |locked_vm| {
-                queue_submits.into_iter().try_for_each(|queue_submit| {
-                    let fence = inner.submit(
-                        &in_syncs,
-                        &out_syncs,
-                        self.clone(),
-                        queue_submit,
-                        &locked_vm,
-                        client_id,
-                    )?;
+                for queue_submit in queue_submits.iter() {
+                    let queue = inner
+                        .queues
+                        .get_mut(queue_submit.queue_index as usize)
+                        .ok_or(EINVAL)?;
+
+                    let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
+                    let sync_addr = sync_addr.start
+                        + u64::from(queue_submit.queue_index)
+                            * core::mem::size_of::<syncs::SyncObj64b>() as u64;
+
+                    let fence: UserFence<_> = queue
+                        .fence_ctx
+                        .new_fence(0, crate::sched::job::Fence)?
+                        .into();
+
+                    let job =
+                        job::Job::create(*queue_submit, self.clone(), fence.clone(), sync_addr)?;
+
+                    ctx.add_job(job, internal_syncs.clone())?;
+
+                    // Store the fence to return later
                     fences.push(fence, GFP_KERNEL)?;
-                    Ok(())
-                })
+                }
+                Ok(())
             })
         })?;
+
+        ctx.collect_signal_ops(&internal_syncs)?;
+
+        // Now process jobs through their respective queue entities
+        // For now, we assume single queue submit (as enforced in file.rs)
+        // In the future, this will need to be extended to handle multiple queues
+        if !queue_submits.is_empty() {
+            let queue_idx = queue_submits[0].queue_index as usize;
+            self.with_locked_inner(|inner| {
+                let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                ctx.add_deps_and_push_jobs(&mut queue.entity)
+            })?;
+        }
+
+        // Push all signal fences to their syncobjs
+        ctx.push_fences();
 
         Ok(fences)
     }

@@ -4,12 +4,12 @@ use core::ops::Range;
 
 use kernel::c_str;
 use kernel::devres::Devres;
+use kernel::dma_fence::FenceChain;
 use kernel::dma_fence::FenceContexts;
 use kernel::dma_fence::UserFence;
 use kernel::drm::sched;
 use kernel::drm::sched::Entity;
 use kernel::drm::sched::Scheduler;
-use kernel::drm::syncobj::SyncObj;
 use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
@@ -19,12 +19,10 @@ use kernel::sync::Mutex;
 
 use crate::driver::TyrDevice;
 use crate::file::QueueCreate;
-use crate::file::QueueSubmit;
 use crate::fw::global::cs::RingBufferInput;
 use crate::fw::global::cs::RingBufferOutput;
 use crate::gem;
 use crate::mmu::vm::map_flags;
-use crate::mmu::vm::PreparedVm;
 use crate::mmu::vm::Vm;
 use crate::regs::Doorbell;
 use crate::sched::job::Job;
@@ -42,7 +40,7 @@ pub(crate) struct Queue {
     scheduler: Scheduler<Job>,
 
     /// The DRM entity used for this queue.
-    entity: Entity<Job>,
+    pub(super) entity: Entity<Job>,
 
     /// A priority number, between 0 and 15.
     pub(crate) priority: u8,
@@ -188,35 +186,6 @@ impl Queue {
     /// be executed.
     pub(crate) fn kick(&self) -> Result {
         Doorbell::new(self.doorbell_id.ok_or(EINVAL)?).write(&self.iomem, 1)
-    }
-
-    pub(crate) fn submit(
-        &mut self,
-        _in_syncs: &KVec<SyncObj<TyrDriver>>,
-        out_syncs: &KVec<SyncObj<TyrDriver>>,
-        group: Arc<Group>,
-        sync_addr: u64,
-        queue_submit: QueueSubmit,
-        _: &PreparedVm<'_>,
-        client_id: u64,
-    ) -> Result<UserFence<job::Fence>> {
-        let fence: UserFence<_> = self
-            .fence_ctx
-            .new_fence(0, crate::sched::job::Fence)?
-            .into();
-
-        let job = Job::create(queue_submit, group, fence.clone(), sync_addr)?;
-
-        let mut job = self.entity.new_job(1, client_id, job)?.arm();
-        let out_fence = job.fences().finished();
-
-        job.push();
-
-        for sync in out_syncs {
-            sync.replace_fence(Some(&out_fence));
-        }
-
-        Ok(fence)
     }
 }
 

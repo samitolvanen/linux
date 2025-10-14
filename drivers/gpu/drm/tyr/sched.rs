@@ -17,7 +17,9 @@ use kernel::workqueue::WqFlags;
 use queue::Queue;
 
 use crate::driver::TyrDevice;
+use crate::file::DrmFile;
 use crate::file::QueueSubmit;
+use crate::file::SyncOp;
 use crate::fw::global::cs::CommandStream;
 use crate::fw::global::cs::StreamState;
 use crate::fw::global::csg;
@@ -28,6 +30,7 @@ use crate::gem;
 use crate::mmu::vm::WithLockedVm;
 use crate::TyrDriver;
 
+pub(crate) mod deps;
 mod events;
 pub(crate) mod group;
 pub(crate) mod job;
@@ -417,13 +420,12 @@ impl Scheduler {
 
     pub(crate) fn submit(
         &mut self,
-        in_syncs: KVec<SyncObj<TyrDriver>>,
-        out_syncs: KVec<SyncObj<TyrDriver>>,
+        syncs: KVec<SyncOp>,
         group: Arc<Group>,
         queue_submits: KVec<QueueSubmit>,
-        client_id: u64,
+        file: &DrmFile,
     ) -> Result<KVec<UserFence<job::Fence>>> {
-        group.submit(in_syncs, out_syncs, queue_submits, client_id)
+        group.submit(syncs, queue_submits, file)
     }
 }
 
