@@ -17,9 +17,8 @@ pub(crate) mod irq;
 // This can be queried by userspace to get information about the GPU.
 pub(crate) struct GpuInfo {
     pub(crate) gpu_id: u32,
-    pub(crate) csf_id: u32,
     pub(crate) gpu_rev: u32,
-    pub(crate) core_features: u32,
+    pub(crate) csf_id: u32,
     pub(crate) l2_features: u32,
     pub(crate) tiler_features: u32,
     pub(crate) mem_features: u32,
@@ -31,9 +30,12 @@ pub(crate) struct GpuInfo {
     pub(crate) coherency_features: u32,
     pub(crate) texture_features: [u32; 4],
     pub(crate) as_present: u32,
+    pub(crate) pad0: u32,
     pub(crate) shader_present: u64,
-    pub(crate) tiler_present: u64,
     pub(crate) l2_present: u64,
+    pub(crate) tiler_present: u64,
+    pub(crate) core_features: u32,
+    pub(crate) pad: u32,
 }
 
 impl GpuInfo {
@@ -66,24 +68,26 @@ impl GpuInfo {
         let l2_present = l2_present | (GPU_L2_PRESENT_HI.read(iomem)? as u64) << 32;
 
         Ok(Self {
-            gpu_id,
-            csf_id,
-            gpu_rev,
-            core_features,
-            l2_features,
-            tiler_features,
-            mem_features,
-            mmu_features,
-            thread_features,
-            max_threads,
-            thread_max_workgroup_size,
-            thread_max_barrier_size,
-            coherency_features,
+            gpu_id: gpu_id,
+            csf_id: csf_id,
+            gpu_rev: gpu_rev,
+            core_features: core_features,
+            l2_features: l2_features,
+            tiler_features: tiler_features,
+            mem_features: mem_features,
+            mmu_features: mmu_features,
+            thread_features: thread_features,
+            max_threads: max_threads,
+            thread_max_workgroup_size: thread_max_workgroup_size,
+            thread_max_barrier_size: thread_max_barrier_size,
+            coherency_features: coherency_features,
             texture_features: [texture_features, 0, 0, 0],
-            as_present,
-            shader_present,
-            tiler_present,
-            l2_present,
+            as_present: as_present,
+            shader_present: shader_present,
+            tiler_present: tiler_present,
+            l2_present: l2_present,
+            pad0: 0,
+            pad: 0,
         })
     }
 
