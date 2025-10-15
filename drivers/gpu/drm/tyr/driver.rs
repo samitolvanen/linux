@@ -351,7 +351,7 @@ impl PinnedDrop for TyrDriver {
 }
 
 const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
-    major: 0,
+    major: 1,
     minor: 0,
     patchlevel: 0,
     name: c_str!("panthor"),
