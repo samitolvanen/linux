@@ -36,6 +36,7 @@ use kernel::platform;
 use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
+use kernel::sync::Mutex;
 use kernel::types::ARef;
 
 use crate::driver::TyrDevice;
@@ -361,4 +362,24 @@ fn mair_to_memattr(mair: u64) -> u64 {
     }
 
     memattr
+}
+
+/// Extension trait for `Arc<Mutex<Vm>>` to provide convenient locked access.
+pub(crate) trait WithLockedVm {
+    /// Execute a function with the VM locked.
+    ///
+    /// This is implemented as a closure to reduce the scope of the VM lock.
+    fn with_lock_taken<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vm) -> Result<R>;
+}
+
+impl WithLockedVm for Arc<Mutex<Vm>> {
+    fn with_lock_taken<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vm) -> Result<R>,
+    {
+        let mut vm = self.lock();
+        f(&mut vm)
+    }
 }

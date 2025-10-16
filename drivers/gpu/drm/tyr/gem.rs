@@ -145,13 +145,13 @@ pub(crate) fn lookup_handle(file: &DrmFile, handle: u32) -> Result<ObjectRef> {
 pub(crate) fn new_kernel_object(
     tdev: &TyrDevice,
     iomem: Arc<Devres<IoMem>>,
-    vm: Arc<Mutex<Vm>>,
+    vm: &mut Vm,
     mut va: KernelVaPlacement,
     flags: vm::map_flags::Flags,
 ) -> Result<ObjectRef> {
     va.align()?;
     let sz = va.size();
-    let node = vm.lock().alloc_kernel_range(va)?;
+    let node = vm.alloc_kernel_range(va)?;
     let range = node.range();
 
     let gem = Object::new(
@@ -167,7 +167,7 @@ pub(crate) fn new_kernel_object(
         },
     )?;
 
-    vm.lock().bind_gem(iomem, &gem, 0, range, flags)?;
+    vm.bind_gem(iomem, &gem, 0, range, flags)?;
 
     Ok(ObjectRef::new(gem))
 }

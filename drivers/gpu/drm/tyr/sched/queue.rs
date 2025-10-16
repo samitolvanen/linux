@@ -113,15 +113,19 @@ impl Queue {
         let entity = Entity::new(&scheduler, sched::Priority::Kernel)?;
 
         let iomem = tdev.iomem.clone();
-        let ringbuf = gem::new_kernel_object(
-            tdev,
-            iomem.clone(),
-            vm.clone(),
-            gem::KernelVaPlacement::Auto {
-                size: queue_args.ringbuf_size as usize,
-            },
-            map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED),
-        )?;
+        let ringbuf = {
+            let mut vm_guard = vm.lock();
+            gem::new_kernel_object(
+                tdev,
+                iomem.clone(),
+                &mut vm_guard,
+                gem::KernelVaPlacement::Auto {
+                    size: queue_args.ringbuf_size as usize,
+                },
+                map_flags::Flags::from(map_flags::NOEXEC)
+                    | map_flags::Flags::from(map_flags::UNCACHED),
+            )?
+        };
 
         let mem = tdev.fw.alloc_queue_mem(tdev)?;
 

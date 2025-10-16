@@ -23,6 +23,7 @@ use crate::gem;
 use crate::mmu::vm::map_flags;
 use crate::mmu::vm::PreparedVm;
 use crate::mmu::vm::Vm;
+use crate::mmu::vm::WithLockedVm;
 use crate::sched::syncs::SyncObj64b;
 use crate::TyrDriver;
 
@@ -206,13 +207,17 @@ impl Group {
         let protm_suspend_buf = fw.alloc_suspend_buf(tdev, protm_suspend_buf_size as usize)?;
 
         let num_syncs = group_args.queues.count as usize * core::mem::size_of::<SyncObj64b>();
-        let mut syncobjs = gem::new_kernel_object(
-            tdev,
-            tdev.iomem.clone(),
-            vm.clone(),
-            gem::KernelVaPlacement::Auto { size: num_syncs },
-            map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED),
-        )?;
+        let mut syncobjs = {
+            let mut vm_guard = vm.lock();
+            gem::new_kernel_object(
+                tdev,
+                tdev.iomem.clone(),
+                &mut vm_guard,
+                gem::KernelVaPlacement::Auto { size: num_syncs },
+                map_flags::Flags::from(map_flags::NOEXEC)
+                    | map_flags::Flags::from(map_flags::UNCACHED),
+            )?
+        };
 
         let vmap = syncobjs.vmap()?;
         vmap.as_mut_slice().fill(0);
