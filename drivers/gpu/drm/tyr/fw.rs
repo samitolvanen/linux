@@ -21,6 +21,7 @@ use crate::gpu::GpuInfo;
 use crate::mmu::vm::map_flags;
 use crate::mmu::vm::Vm;
 use crate::mmu::vm::VmLayout;
+use crate::mmu::vm::WithLockedVm;
 use crate::mmu::Mmu;
 use crate::wait::Wait;
 use crate::wait::WaitResult;
@@ -255,7 +256,8 @@ impl Firmware {
             map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED);
         let va = KernelVaPlacement::Auto { size: SZ_8K };
 
-        gem::new_kernel_object(tdev, tdev.iomem.clone(), self.vm.clone(), va, flags)
+        self.vm
+            .with_lock_taken(|vm| gem::new_kernel_object(tdev, tdev.iomem.clone(), vm, va, flags))
     }
 
     pub(crate) fn alloc_suspend_buf(
@@ -266,7 +268,8 @@ impl Firmware {
         let flags = map_flags::Flags::from(map_flags::NOEXEC);
         let va = KernelVaPlacement::Auto { size: suspend_size };
 
-        gem::new_kernel_object(tdev, tdev.iomem.clone(), self.vm.clone(), va, flags)
+        self.vm
+            .with_lock_taken(|vm| gem::new_kernel_object(tdev, tdev.iomem.clone(), vm, va, flags))
     }
 
     /// Provide access to the global interface, but as a closure so we can at

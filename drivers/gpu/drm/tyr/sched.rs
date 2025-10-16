@@ -26,6 +26,7 @@ use crate::fw::global::csg::Priority;
 use crate::fw::global::csg::MAX_CSGS;
 use crate::fw::SharedSectionEntry;
 use crate::gem;
+use crate::mmu::vm::WithLockedVm;
 use crate::TyrDriver;
 
 mod events;
@@ -358,13 +359,15 @@ impl Scheduler {
         let flags =
             map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED);
 
-        let mut debug_gem = gem::new_kernel_object(
-            tdev,
-            iomem,
-            group.vm.clone(),
-            gem::KernelVaPlacement::Auto { size: SZ_4K },
-            flags,
-        )?;
+        let mut debug_gem = group.vm.with_lock_taken(|vm| {
+            gem::new_kernel_object(
+                tdev,
+                iomem,
+                vm,
+                gem::KernelVaPlacement::Auto { size: SZ_4K },
+                flags,
+            )
+        })?;
 
         let mut instrs = kvec![];
 

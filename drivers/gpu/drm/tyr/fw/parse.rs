@@ -356,8 +356,9 @@ impl Firmware {
 
         let mut sections = KVec::new();
 
+        let mut vm_guard = vm.lock();
         while (cursor.pos() as u32) < fw_bin_hdr.size {
-            let section = Self::read_entry(&mut cursor, tdev, iomem.clone(), &fw, vm.clone())?;
+            let section = Self::read_entry(&mut cursor, tdev, iomem.clone(), &fw, &mut vm_guard)?;
             if let Some(inner) = section.inner {
                 sections.push(inner, GFP_KERNEL)?;
             }
@@ -371,7 +372,7 @@ impl Firmware {
         tdev: &TyrDevice,
         iomem: Arc<Devres<IoMem>>,
         fw: &kernel::firmware::Firmware,
-        vm: Arc<Mutex<Vm>>,
+        vm: &mut Vm,
     ) -> Result<BinaryEntrySection> {
         let section = BinaryEntrySection {
             hdr: BinaryEntryHeader(cursor.read_u32(tdev)?),
@@ -457,7 +458,7 @@ impl Firmware {
         iomem: Arc<Devres<IoMem>>,
         cursor: &mut Cursor<'_>,
         fw: &kernel::firmware::Firmware,
-        vm: Arc<Mutex<Vm>>,
+        vm: &mut Vm,
     ) -> Result<Option<KBox<Section>>> {
         let hdr = BinarySectionEntryHeader::new(tdev, cursor)?;
 
