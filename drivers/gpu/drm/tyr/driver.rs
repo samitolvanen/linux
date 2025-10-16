@@ -196,14 +196,8 @@ impl platform::Driver for TyrDriver {
         stacks_clk.prepare_enable()?;
         coregroup_clk.prepare_enable()?;
 
-        let mali_regulator = Regulator::<regulator::Enabled>::get(
-            pdev.as_ref(),
-            c_str!("mali"),
-        )?;
-        let sram_regulator = Regulator::<regulator::Enabled>::get(
-            pdev.as_ref(),
-            c_str!("sram"),
-        )?;
+        let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("mali"))?;
+        let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("sram"))?;
 
         let iomem = Arc::pin_init(
             IoMem::new(pdev.io_request_by_index(0).ok_or(EINVAL)?),
@@ -218,9 +212,7 @@ impl platform::Driver for TyrDriver {
 
         unsafe {
             pdev.dma_set_max_seg_size(u32::MAX);
-            pdev.dma_set_mask_and_coherent(DmaMask::try_new(
-                gpu_info.pa_bits(),
-            )?)?;
+            pdev.dma_set_mask_and_coherent(DmaMask::try_new(gpu_info.pa_bits())?)?;
         }
         let platform: ARef<platform::Device> = pdev.into();
 
@@ -229,11 +221,10 @@ impl platform::Driver for TyrDriver {
         // untill it gets fully initialised.
         // Additionally implementation of Drop trait is still pending
         // so no data will be accessed util proper init.
-	let uninit = unsafe {
-	    pin_init_from_closure::<TyrData, kernel::error::Error>(|_slot| Ok(()))
-	};
-	let data = Arc::pin_init(uninit, GFP_KERNEL)?;
-	let tdev: ARef<TyrDevice> = drm::device::Device::new(pdev.as_ref(), Ok(data.clone()))?;
+        let uninit =
+            unsafe { pin_init_from_closure::<TyrData, kernel::error::Error>(|_slot| Ok(())) };
+        let data = Arc::pin_init(uninit, GFP_KERNEL)?;
+        let tdev: ARef<TyrDevice> = drm::device::Device::new(pdev.as_ref(), Ok(data.clone()))?;
 
         let mmu = KBox::pin_init(new_mutex!(Mmu::new()?), GFP_KERNEL)?;
 
@@ -275,8 +266,7 @@ impl platform::Driver for TyrDriver {
         });
 
         unsafe {
-            data_init
-                .__pinned_init(Arc::<TyrData>::as_ptr(&tdev) as *mut TyrData)?;
+            data_init.__pinned_init(Arc::<TyrData>::as_ptr(&tdev) as *mut TyrData)?;
         }
 
         // We must find a way around this. It's being discussed on Zulip already.
@@ -441,12 +431,7 @@ impl<T: TyrIrqTrait + 'static> TyrIrq<T> {
             _pin: PhantomPinned,
         });
 
-        pdev.request_threaded_irq_by_name(
-            kernel::irq::Flags::SHARED,
-            name,
-            name,
-            handler,
-        )
+        pdev.request_threaded_irq_by_name(kernel::irq::Flags::SHARED, name, name, handler)
     }
 }
 

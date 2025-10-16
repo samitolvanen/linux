@@ -105,9 +105,7 @@ impl RangeAlloc {
         #[cfg(target_pointer_width = "32")]
         {
             if let Some(range) = self.inner.maple_range(start, end) {
-                self.inner
-                    .maple
-                    .insert_range(range, (), gfp)?;
+                self.inner.maple.insert_range(range, (), gfp)?;
             }
         }
 

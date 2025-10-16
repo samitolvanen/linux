@@ -81,10 +81,7 @@ impl Queue {
         // ugh..
         let queue_args = &queue_args.0;
 
-        if queue_args.pad[0] != 0
-            || queue_args.pad[1] != 0
-            || queue_args.pad[2] != 0
-        {
+        if queue_args.pad[0] != 0 || queue_args.pad[1] != 0 || queue_args.pad[2] != 0 {
             return Err(EINVAL);
         }
 
@@ -92,10 +89,7 @@ impl Queue {
             || queue_args.ringbuf_size > SZ_64K as u32
             || !queue_args.ringbuf_size.is_power_of_two()
         {
-            pr_err!(
-                "Invalid ring buffer size: {:#x}\n",
-                queue_args.ringbuf_size
-            );
+            pr_err!("Invalid ring buffer size: {:#x}\n", queue_args.ringbuf_size);
             return Err(EINVAL);
         }
 
@@ -105,8 +99,7 @@ impl Queue {
         }
 
         let priority = queue_args.priority;
-        let credit_limit =
-            queue_args.ringbuf_size / core::mem::size_of::<u64>() as u32;
+        let credit_limit = queue_args.ringbuf_size / core::mem::size_of::<u64>() as u32;
 
         let scheduler = Scheduler::new(
             tdev.as_ref(),
@@ -127,8 +120,7 @@ impl Queue {
             gem::KernelVaPlacement::Auto {
                 size: queue_args.ringbuf_size as usize,
             },
-            map_flags::Flags::from(map_flags::NOEXEC)
-                | map_flags::Flags::from(map_flags::UNCACHED),
+            map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED),
         )?;
 
         let mem = tdev.fw.alloc_queue_mem(tdev)?;
@@ -202,7 +194,7 @@ impl Queue {
         sync_addr: u64,
         queue_submit: QueueSubmit,
         _: &PreparedVm<'_>,
-        client_id: u64
+        client_id: u64,
     ) -> Result<UserFence<job::Fence>> {
         let fence: UserFence<_> = self
             .fence_ctx
