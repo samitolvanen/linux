@@ -377,10 +377,38 @@ impl File {
 
     pub(crate) fn group_get_state(
         _tdev: &TyrDevice,
-        _groupgetstate: &mut uapi::drm_panthor_group_get_state,
-        _file: &DrmFile,
+        groupgetstate: &mut uapi::drm_panthor_group_get_state,
+        file: &DrmFile,
     ) -> Result<u32> {
-        Err(ENOTSUPP)
+        if groupgetstate.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let group = file
+            .inner()
+            .group_pool()
+            .group(groupgetstate.group_handle as usize)
+            .ok_or(EINVAL)?;
+
+        // Clear the output fields first
+        groupgetstate.state = 0;
+        groupgetstate.fatal_queues = 0;
+
+        group.with_locked_inner(|inner| {
+            // Check for fatal queues
+            if inner.fatal_queues != 0 {
+                groupgetstate.state |=
+                    uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+                groupgetstate.fatal_queues = inner.fatal_queues;
+            }
+
+            // TODO: Add support for timedout and innocent flags when tyr implements
+            // timeout tracking and reset handling similar to Panthor
+
+            Ok(())
+        })?;
+
+        Ok(0)
     }
 
     pub(crate) fn heap_create(
