@@ -376,6 +376,13 @@ impl Scheduler {
     }
 
     pub(crate) fn bind(&mut self, tdev: &TyrDevice, group: Arc<Group>) -> Result {
+        let already_bound = group.with_locked_inner(|inner| Ok(inner.csg_id.is_some()))?;
+
+        if already_bound {
+            let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id.unwrap()))?;
+            return Ok(());
+        }
+
         let csg_idx = self
             .csg_slots
             .iter()
