@@ -142,8 +142,11 @@ impl File {
         let stride = vmbind.ops.stride as usize;
         let count = vmbind.ops.count as usize;
 
-        let mut reader =
-            UserSlice::new(UserPtr::from_addr(vmbind.ops.array as usize), stride).reader();
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(vmbind.ops.array as usize),
+            stride * count,
+        )
+        .reader();
         let iomem = tdev.iomem.clone();
 
         for i in 0..count {
@@ -266,7 +269,7 @@ impl File {
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(groupcreate.queues.array as usize),
-            groupcreate.queues.stride as usize,
+            groupcreate.queues.stride as usize * groupcreate.queues.count as usize,
         )
         .reader();
 
@@ -314,7 +317,7 @@ impl File {
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(groupsubmit.queue_submits.array as usize),
-            groupsubmit.queue_submits.stride as usize,
+            groupsubmit.queue_submits.stride as usize * groupsubmit.queue_submits.count as usize,
         )
         .reader();
 
@@ -326,7 +329,7 @@ impl File {
 
             let mut sync_reader = UserSlice::new(
                 UserPtr::from_addr(queue.syncs.array as usize),
-                queue.syncs.stride as usize,
+                queue.syncs.stride as usize * queue.syncs.count as usize,
             )
             .reader();
 
