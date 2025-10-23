@@ -7,6 +7,7 @@ pub mod driver;
 pub mod file;
 pub mod gem;
 pub mod ioctl;
+pub mod syncobj;
 
 pub use self::device::Device;
 pub use self::driver::Driver;
