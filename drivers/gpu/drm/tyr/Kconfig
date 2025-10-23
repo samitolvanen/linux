@@ -2,7 +2,9 @@
 
 config DRM_TYR_STATIC_DEPS
 	bool
+	select DRM_GEM_SHMEM_HELPER
 	select DRM_GPUVM
+	select DRM_SCHED
 	help
 	  Ensure required DRM infrastructure is built-in when enabling Tyr
 	  even if Tyr is =m
