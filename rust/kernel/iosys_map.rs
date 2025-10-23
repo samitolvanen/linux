@@ -32,7 +32,7 @@ pub struct RawIoSysMap<T: AsBytes + FromBytes>(bindings::iosys_map, PhantomData<
 
 impl<T: AsBytes + FromBytes> RawIoSysMap<T> {
     /// Convert from a raw `bindings::iosys_map`.
-    #[expect(unused)]
+    #[allow(unused)]
     #[inline]
     pub(crate) fn from_raw(val: bindings::iosys_map) -> Self {
         Self(val, PhantomData)
