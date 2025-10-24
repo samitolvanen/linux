@@ -224,6 +224,7 @@ impl Firmware {
                     kernel: 0..4 * SZ_1G as u64,
                 },
                 auto_kernel_va,
+                iomem.clone(),
             )?;
 
             mmu.bind_vm(vm.clone(), gpu_info, &iomem)?;

@@ -29,6 +29,8 @@ use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::ExecToken;
+use kernel::drm::sched::Entity;
+use kernel::drm::sched::Scheduler;
 use kernel::io::mem::IoMem;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
@@ -37,6 +39,7 @@ use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
+use kernel::time::Delta;
 use kernel::types::ARef;
 
 use crate::driver::TyrDevice;
@@ -48,12 +51,15 @@ use crate::heap;
 use crate::mmu::Mmu;
 use crate::regs;
 
+pub(crate) mod bind_job;
 mod gpuvm;
 pub(crate) mod map_flags;
 pub(crate) mod pool;
 
 mod range;
 pub(crate) use self::range::{LiveRange, RangeAlloc};
+
+pub(crate) use bind_job::{VmBindJob, VmOperation};
 
 // TODO: we need *all* of these in kernel::bindings.
 const SZ_4G: u64 = 4 * kernel::bindings::SZ_1G as u64;
@@ -82,6 +88,20 @@ pub(crate) struct Vm {
     /// Destroyed VMs are unmapped and cannot be the target of map operations
     /// anymore.
     pub(super) destroyed: bool,
+
+    /// Whether this VM is in an unusable state due to failed async operations.
+    ///
+    /// Unusable VMs cannot accept new operations and should be destroyed.
+    pub(crate) unusable: bool,
+
+    /// IoMem reference needed for VM operations.
+    pub(crate) iomem: Arc<Devres<IoMem>>,
+
+    /// DRM scheduler for async VM operations.
+    pub(crate) scheduler: kernel::drm::sched::Scheduler<VmBindJob>,
+
+    /// DRM scheduler entity for submitting jobs.
+    pub(crate) entity: kernel::drm::sched::Entity<VmBindJob>,
 }
 
 impl Vm {
@@ -92,6 +112,7 @@ impl Vm {
         gpu_info: &GpuInfo,
         layout: VmLayout,
         auto_kernel_va: Range<u64>,
+        iomem: Arc<Devres<IoMem>>,
     ) -> Result<Self> {
         // We should ideally not allocate memory for this, but there is no way
         // to create dummy GPUVM GEM objects for now.
@@ -130,6 +151,12 @@ impl Vm {
 
         let memattr = mair_to_memattr(page_table.cfg().mair);
 
+        let scheduler =
+            kernel::drm::sched::Scheduler::new(tdev.as_ref(), 1, 1, 1, 1000, c_str!("tyr_vm"))?;
+
+        let entity =
+            kernel::drm::sched::Entity::new(&scheduler, kernel::drm::sched::Priority::Low)?;
+
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),
             gpuvm: kernel::drm::gpuvm::GpuVm::new(
@@ -146,6 +173,10 @@ impl Vm {
             _layout: layout,
             for_mcu,
             destroyed: false,
+            unusable: false,
+            iomem,
+            scheduler,
+            entity,
         })
     }
 

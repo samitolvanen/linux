@@ -46,6 +46,7 @@ impl Pool {
                     false,
                     layout,
                     auto_kernel_va,
+                    tdev.iomem.clone(),
                 )
             })
         }?;

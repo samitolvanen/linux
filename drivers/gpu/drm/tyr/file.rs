@@ -25,6 +25,9 @@ use crate::mmu::vm;
 use crate::mmu::vm::pool::Pool;
 use crate::mmu::vm::VmLayout;
 use crate::mmu::vm::VmUserSize;
+use crate::mmu::vm::WithLockedVm;
+use crate::mmu::vm::{VmBindJob, VmOperation};
+use crate::sched::deps;
 use crate::sched::group;
 
 #[pin_data]
@@ -121,14 +124,153 @@ impl File {
         Ok(0)
     }
 
+    pub(crate) fn vm_bind_async(
+        tdev: &TyrDevice,
+        vmbind: &mut uapi::drm_panthor_vm_bind,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
+            dev_info!(
+                tdev.as_ref(),
+                "We cannot graciously handle stride mismatches yet"
+            );
+            return Err(ENOTSUPP);
+        }
+
+        let vm = file
+            .inner()
+            .vm_pool()
+            .get_vm(vmbind.vm_id as usize)
+            .ok_or(EINVAL)?;
+
+        if vm.lock().unusable {
+            return Err(EINVAL);
+        }
+
+        let stride = vmbind.ops.stride as usize;
+        let count = vmbind.ops.count as usize;
+
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(vmbind.ops.array as usize),
+            stride * count,
+        )
+        .reader();
+
+        let mut ctx = deps::Context::new(file);
+
+        for i in 0..count {
+            let op: VmBindOp = reader.read()?;
+            let mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+
+            let vm_operation = match op.0.flags as i32 & mask {
+                uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP => {
+                    let bo = gem::lookup_handle(file, op.0.bo_handle)?;
+                    let va_range = op.0.va..op.0.va + op.0.size;
+                    let flags = vm::map_flags::Flags::try_from(op.0.flags & 0b111)?;
+
+                    VmOperation::Map {
+                        va_range,
+                        bo,
+                        bo_offset: op.0.bo_offset,
+                        flags,
+                    }
+                }
+
+                uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP => {
+                    if op.0.bo_handle != 0 || op.0.bo_offset != 0 {
+                        vmbind.ops.count = i as u32;
+                        return Err(EINVAL);
+                    }
+
+                    let va_range = op.0.va..op.0.va + op.0.size;
+                    VmOperation::Unmap { va_range }
+                }
+
+                _ => {
+                    vmbind.ops.count = i as u32;
+                    return Err(ENOTSUPP);
+                }
+            };
+
+            if op.0.syncs.stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
+                dev_info!(
+                    tdev.as_ref(),
+                    "We cannot graciously handle sync stride mismatches yet"
+                );
+                vmbind.ops.count = i as u32;
+                return Err(ENOTSUPP);
+            }
+
+            let sync_count = op.0.syncs.count as usize;
+            let sync_stride = op.0.syncs.stride as usize;
+
+            let mut sync_reader = UserSlice::new(
+                UserPtr::from_addr(op.0.syncs.array as usize),
+                sync_stride * sync_count,
+            )
+            .reader();
+
+            let mut sync_ops = kvec![];
+            for _ in 0..sync_count {
+                let sync_op_uapi: SyncOp = sync_reader.read()?;
+                sync_ops.push(sync_op_uapi, GFP_KERNEL)?;
+            }
+
+            // Convert UAPI sync operations to internal representation
+            let internal_syncs = deps::SyncOp::from_uapi_slice(&sync_ops)?;
+
+            let job = VmBindJob::new(vm.clone(), vm_operation);
+
+            ctx.add_vm_bind_job(job, internal_syncs)?;
+        }
+
+        // Collect all signal operations across all jobs
+        // We need to iterate through all sync ops again to collect signals
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(vmbind.ops.array as usize),
+            stride * count,
+        )
+        .reader();
+
+        for _ in 0..count {
+            let op: VmBindOp = reader.read()?;
+
+            let sync_count = op.0.syncs.count as usize;
+            let sync_stride = op.0.syncs.stride as usize;
+
+            let mut sync_reader = UserSlice::new(
+                UserPtr::from_addr(op.0.syncs.array as usize),
+                sync_stride * sync_count,
+            )
+            .reader();
+
+            let mut sync_ops = kvec![];
+            for _ in 0..sync_count {
+                let sync_op_uapi: SyncOp = sync_reader.read()?;
+                sync_ops.push(sync_op_uapi, GFP_KERNEL)?;
+            }
+
+            let internal_syncs = deps::SyncOp::from_uapi_slice(&sync_ops)?;
+            ctx.collect_signal_ops(&internal_syncs)?;
+        }
+
+        // Push all VM bind jobs with dependencies
+        vm.with_lock_taken(|vm| {
+            ctx.add_deps_and_push_vm_bind_jobs(&mut vm.entity)?;
+
+            // Push all signal fences to their syncobjs
+            ctx.push_fences();
+            Ok(0)
+        })
+    }
+
     pub(crate) fn vm_bind(
         tdev: &TyrDevice,
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &DrmFile,
     ) -> Result<u32> {
         if vmbind.flags & uapi::drm_panthor_vm_bind_flags_DRM_PANTHOR_VM_BIND_ASYNC != 0 {
-            dev_info!(tdev.as_ref(), "We do not support async VM_BIND yet");
-            return Err(ENOTSUPP);
+            return Self::vm_bind_async(tdev, vmbind, file);
         }
 
         if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {

@@ -53,9 +53,10 @@ impl Mmu {
         for_mcu: bool,
         layout: VmLayout,
         auto_kernel_va: Range<u64>,
+        iomem: Arc<Devres<IoMem>>,
         /* coherent: bool, */
     ) -> Result<Arc<Mutex<Vm>>> {
-        let vm = Vm::create(tdev, pdev, for_mcu, gpu_info, layout, auto_kernel_va)?;
+        let vm = Vm::create(tdev, pdev, for_mcu, gpu_info, layout, auto_kernel_va, iomem)?;
 
         let vm = Arc::pin_init(new_mutex!(vm), GFP_KERNEL)?;
         self.vms.push(vm.clone(), GFP_KERNEL)?;
