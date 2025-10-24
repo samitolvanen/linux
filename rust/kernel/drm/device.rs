@@ -160,6 +160,49 @@ impl<T: drm::Driver> Deref for UnregisteredDevice<T> {
 }
 
 impl<T: drm::Driver> UnregisteredDevice<T> {
+    /// Custom mmap handler that calls into Driver::mmap if provided
+    ///
+    /// # Safety:
+    ///
+    /// - Caller must ensure that `filp` and `vma` are valid pointers.
+    /// - `filp->private_data` must point to a valid `drm_file`.
+    unsafe extern "C" fn mmap_callback(
+        filp: *mut bindings::file,
+        vma: *mut bindings::vm_area_struct,
+    ) -> core::ffi::c_int {
+        // SAFETY: Caller ensures filp is valid, and private_data contains drm_file
+        let raw_file = unsafe { (*filp).private_data as *mut bindings::drm_file };
+        if raw_file.is_null() {
+            return bindings::EINVAL as _;
+        }
+
+        // SAFETY: We just checked that raw_file is not null
+        let drm_file = unsafe { drm::file::File::<T::File>::from_raw(raw_file) };
+
+        // SAFETY: raw_file is valid, minor is always set
+        let raw_device = unsafe { (*(*raw_file).minor).dev };
+
+        // SAFETY: Device is valid for the lifetime of the file
+        let device = unsafe { Device::<T>::from_raw(raw_device) };
+
+        // SAFETY: VMA is undergoing initialization in mmap hook
+        let vma_new = unsafe { crate::mm::virt::VmaNew::from_raw(vma) };
+
+        match T::mmap(device, drm_file, vma_new) {
+            Some(Ok(())) => 0,
+            Some(Err(e)) => e.to_errno(),
+            None => {
+                // SAFETY: Called from mmap context with valid parameters
+                unsafe { bindings::drm_gem_mmap(filp, vma) }
+            }
+        }
+    }
+
+    const GEM_FOPS: bindings::file_operations = {
+        let mut fops = drm::gem::create_fops();
+        fops.mmap = Some(Self::mmap_callback);
+        fops
+    };
     const VTABLE: bindings::drm_driver = drm_legacy_fields! {
         load: None,
         open: Some(drm::File::<T::File>::open_callback),
@@ -194,8 +237,6 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         num_ioctls: T::IOCTLS.len() as i32,
         fops: &Self::GEM_FOPS,
     };
-
-    const GEM_FOPS: bindings::file_operations = drm::gem::create_fops();
 
     /// Create a new `UnregisteredDevice` for a `drm::Driver`.
     ///
