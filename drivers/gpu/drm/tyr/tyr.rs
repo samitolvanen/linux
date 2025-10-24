@@ -14,6 +14,7 @@ mod fw;
 mod gem;
 mod gpu;
 mod heap;
+mod mmap;
 mod mmu;
 mod regs;
 mod sched;

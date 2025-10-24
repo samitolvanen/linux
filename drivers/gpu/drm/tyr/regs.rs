@@ -59,6 +59,8 @@ pub(crate) const GPU_IRQ_RAWSTAT_CLEAN_CACHES_COMPLETED: u32 = bit_u32(17);
 pub(crate) const GPU_IRQ_RAWSTAT_DOORBELL_STATUS: u32 = bit_u32(18);
 pub(crate) const GPU_IRQ_RAWSTAT_MCU_STATUS: u32 = bit_u32(19);
 
+pub(crate) const CSF_GPU_LATEST_FLUSH_ID: usize = 0x10000;
+
 pub(crate) const GPU_IRQ_CLEAR: Register<0x24> = Register;
 pub(crate) const GPU_IRQ_MASK: Register<0x28> = Register;
 pub(crate) const GPU_IRQ_STAT: Register<0x2c> = Register;
