@@ -35,6 +35,7 @@
 #include "fs.c"
 #include "io.c"
 #include "iosys_map.c"
+#include "jiffies.c"
 #include "jump_label.c"
 #include "kunit.c"
 #include "maple_tree.c"
