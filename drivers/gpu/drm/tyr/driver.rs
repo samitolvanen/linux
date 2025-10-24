@@ -89,6 +89,11 @@ pub(crate) struct TyrData {
     /// This is mainly queried by userspace, i.e.: Mesa.
     pub(crate) gpu_info: GpuInfo,
 
+    /// CSIF information that gets populated after firmware initialization.
+    /// Kept separate with a mutex since it's populated later.
+    #[pin]
+    pub(crate) csif_info: Mutex<gpu::CsifInfo>,
+
     /// The firmware running on the MCU.
     #[pin]
     pub(crate) fw: Firmware,
@@ -314,6 +319,7 @@ impl platform::Driver for TyrDriver {
                     sram: sram_regulator,
                 }),
                 gpu_info,
+                csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 fw <- fw,
                 coherent: false, // TODO. The GPU is not IO coherent on rk3588, which is what I am testing on.
                 mmu,

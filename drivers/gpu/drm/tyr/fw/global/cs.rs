@@ -19,6 +19,9 @@ use crate::fw::SharedSectionEntry;
 use crate::fw::SharedSectionRange;
 use constants::*;
 
+/// Number of CS registers reserved by the kernel driver to call a userspace command stream.
+pub(crate) const CSF_UNPRESERVED_REG_COUNT: u32 = 4;
+
 /// Used to decode command stream faults.
 pub(crate) const FAULT_EXCEPTION_MAP: &[(u32, &CStr)] = &[
     (0x00, c_str!("OK")),
