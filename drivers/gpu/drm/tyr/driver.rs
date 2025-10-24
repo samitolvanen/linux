@@ -103,6 +103,9 @@ pub(crate) struct TyrData {
     /// The MMIO region.
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
+    /// Physical address of the MMIO region.
+    pub(crate) mmio_phys_addr: u64,
+
     /// The firmware ping work.
     #[pin]
     pub(crate) ping_work: DelayedWork<Self, 0>,
@@ -252,10 +255,10 @@ impl platform::Driver for TyrDriver {
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("mali"))?;
         let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("sram"))?;
 
-        let iomem = Arc::pin_init(
-            IoMem::new(pdev.io_request_by_index(0).ok_or(EINVAL)?),
-            GFP_KERNEL,
-        )?;
+        let io_resource = pdev.io_request_by_index(0).ok_or(EINVAL)?;
+        let mmio_phys_addr = io_resource.start();
+
+        let iomem = Arc::pin_init(IoMem::new(io_resource), GFP_KERNEL)?;
 
         issue_soft_reset(&iomem)?;
         gpu::l2_power_on(&iomem)?;
@@ -316,6 +319,7 @@ impl platform::Driver for TyrDriver {
                 coherent: false, // TODO. The GPU is not IO coherent on rk3588, which is what I am testing on.
                 mmu,
                 iomem: i,
+                mmio_phys_addr,
                 ping_work <- new_delayed_work!("tyr-ping-work"),
                 sched <- new_mutex!(SchedulerState::Disabled),
                 tick_work <- new_work!("tyr_tick"),
@@ -431,6 +435,17 @@ impl drm::driver::Driver for TyrDriver {
         (PANTHOR_GROUP_GET_STATE, drm_panthor_group_get_state, ioctl::RENDER_ALLOW, File::group_get_state),
         (PANTHOR_TILER_HEAP_CREATE, drm_panthor_tiler_heap_create, ioctl::RENDER_ALLOW, File::heap_create),
         (PANTHOR_TILER_HEAP_DESTROY, drm_panthor_tiler_heap_destroy, ioctl::RENDER_ALLOW, File::heap_destroy),
+    }
+
+    fn mmap(
+        device: &TyrDevice,
+        file: &drm::File<File>,
+        vma: &kernel::mm::virt::VmaNew,
+    ) -> Option<Result>
+    where
+        Self: Sized,
+    {
+        crate::mmap::mmap(device, &*file.inner(), vma)
     }
 }
 
