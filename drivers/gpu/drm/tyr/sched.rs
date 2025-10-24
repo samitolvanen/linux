@@ -111,7 +111,7 @@ pub(crate) struct Scheduler {
 
 impl Scheduler {
     pub(crate) fn init(tdev: &TyrDevice) -> Result<Self> {
-        let (group_num, sb_slot_count, cs_slot_count) =
+        let (group_num, sb_slot_count, cs_slot_count, cs_reg_count) =
             tdev.fw.with_locked_global_iface(|glb_iface| {
                 let glb_control = glb_iface.read_control()?;
 
@@ -124,8 +124,9 @@ impl Scheduler {
                 let group_num = glb_control.group_num;
                 let sb_slot_count = cs_control.scoreboards();
                 let cs_slot_count = csg_control.stream_num;
+                let cs_reg_count = cs_control.work_regs();
 
-                Ok((group_num, sb_slot_count, cs_slot_count))
+                Ok((group_num, sb_slot_count, cs_slot_count, cs_reg_count))
             })?;
 
         let num_groups = core::cmp::min(MAX_CSGS, group_num);
@@ -151,6 +152,17 @@ impl Scheduler {
         let as_slot_count = gpu_as_count;
 
         let wq = OwnedQueue::new(c_str!("tyr-csf-sched"), WqFlags::UNBOUND, 0)?;
+
+        // Populate CSIF info in TyrDevice
+        {
+            use crate::fw::global::cs::CSF_UNPRESERVED_REG_COUNT;
+            let mut csif = tdev.csif_info.lock();
+            csif.csg_slot_count = csg_slot_count;
+            csif.cs_slot_count = cs_slot_count;
+            csif.cs_reg_count = cs_reg_count;
+            csif.scoreboard_slot_count = sb_slot_count;
+            csif.unpreserved_cs_reg_count = CSF_UNPRESERVED_REG_COUNT;
+        }
 
         Ok(Self {
             runnable_groups: [const { KVec::new() }; Priority::num_priorities()],

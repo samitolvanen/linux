@@ -8,10 +8,30 @@ use kernel::io;
 use kernel::io::mem::IoMem;
 use kernel::platform;
 use kernel::prelude::*;
+use kernel::sync::Mutex;
 use kernel::time;
 use kernel::transmute::AsBytes;
 
 pub(crate) mod irq;
+
+/// CSIF (Command Stream Interface) information
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CsifInfo {
+    pub(crate) csg_slot_count: u32,
+    pub(crate) cs_slot_count: u32,
+    pub(crate) cs_reg_count: u32,
+    pub(crate) scoreboard_slot_count: u32,
+    pub(crate) unpreserved_cs_reg_count: u32,
+    pub(crate) pad: u32,
+}
+
+// SAFETY:
+//
+// This type matches the drm_panthor_csif_info structure from Panthor's uAPI.
+// As it's declared as #repr(C), we can be sure that the layout is the same.
+// Therefore, it is safe to expose this to userspace.
+unsafe impl AsBytes for CsifInfo {}
 
 #[repr(C)]
 // This can be queried by userspace to get information about the GPU.

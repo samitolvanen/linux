@@ -20,6 +20,7 @@ use kernel::xarray::XArray;
 use crate::driver::TyrDevice;
 use crate::driver::TyrDriver;
 use crate::gem;
+use crate::gpu;
 use crate::heap;
 use crate::mmu::vm;
 use crate::mmu::vm::pool::Pool;
@@ -77,6 +78,10 @@ impl File {
                     devquery.size = core::mem::size_of_val(&tdev.gpu_info) as u32;
                     Ok(0)
                 }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_CSIF_INFO => {
+                    devquery.size = core::mem::size_of::<gpu::CsifInfo>() as u32;
+                    Ok(0)
+                }
                 _ => Err(EINVAL),
             }
         } else {
@@ -89,6 +94,18 @@ impl File {
                     .writer();
 
                     writer.write(&tdev.gpu_info)?;
+
+                    Ok(0)
+                }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_CSIF_INFO => {
+                    let mut writer = UserSlice::new(
+                        UserPtr::from_addr(devquery.pointer as usize),
+                        devquery.size as usize,
+                    )
+                    .writer();
+
+                    let csif = tdev.csif_info.lock();
+                    writer.write(&*csif)?;
 
                     Ok(0)
                 }
