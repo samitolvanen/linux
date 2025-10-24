@@ -13,7 +13,14 @@ use kernel::uapi;
 
 use crate::driver::TyrDriver;
 use crate::file::DrmFile;
+use crate::mmu::vm::VmBindJob;
 use crate::sched::job::Job;
+
+/// Represents either a GPU job or a VM bind job
+pub(crate) enum JobType {
+    Gpu(Job),
+    VmBind(VmBindJob),
+}
 
 pub(crate) enum SyncHandle {
     Binary { handle: u32 },
@@ -134,7 +141,7 @@ impl SyncSignal {
 /// Job state tracking for a job in the submission context
 enum JobState {
     /// Job is ready to be processed
-    Pending(Job),
+    Pending(JobType),
     /// Job has been taken out and is being processed
     Taken,
 }
@@ -197,7 +204,19 @@ impl<'a> Context<'a> {
         self.jobs
             .push(
                 JobContext {
-                    state: JobState::Pending(job),
+                    state: JobState::Pending(JobType::Gpu(job)),
+                    syncops,
+                },
+                GFP_KERNEL,
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn add_vm_bind_job(&mut self, job: VmBindJob, syncops: Arc<KVec<SyncOp>>) -> Result {
+        self.jobs
+            .push(
+                JobContext {
+                    state: JobState::Pending(JobType::VmBind(job)),
                     syncops,
                 },
                 GFP_KERNEL,
@@ -221,12 +240,18 @@ impl<'a> Context<'a> {
     /// immediately to avoid lifetime conflicts.
     pub(crate) fn add_deps_and_push_jobs(&mut self, entity: &mut Entity<Job>) -> Result {
         for job_idx in 0..self.jobs.len() {
+            // Only process GPU jobs with this entity
+            match &self.jobs[job_idx].state {
+                JobState::Pending(JobType::Gpu(_)) => {}
+                JobState::Pending(JobType::VmBind(_)) => continue,
+                JobState::Taken => continue,
+            }
+
             let fences = self.collect_job_deps(job_idx)?;
 
             let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
-                JobState::Pending(job) => job,
-                JobState::Taken => {
-                    // This should never happen - we're processing jobs sequentially
+                JobState::Pending(JobType::Gpu(job)) => job,
+                _ => {
                     return Err(EINVAL);
                 }
             };
@@ -244,6 +269,45 @@ impl<'a> Context<'a> {
 
             // Note: In the C code, there's an `upd_resvs` callback here
             // that updates reservation objects. We're skipping that for now.
+            armed_job.push();
+        }
+
+        Ok(())
+    }
+
+    /// Add VM bind job dependencies, arm jobs, and push them to the scheduler.
+    pub(crate) fn add_deps_and_push_vm_bind_jobs(
+        &mut self,
+        entity: &mut Entity<VmBindJob>,
+    ) -> Result {
+        for job_idx in 0..self.jobs.len() {
+            // Only process VM bind jobs with this entity
+            match &self.jobs[job_idx].state {
+                JobState::Pending(JobType::VmBind(_)) => {}
+                JobState::Pending(JobType::Gpu(_)) => continue,
+                JobState::Taken => continue,
+            }
+
+            let fences = self.collect_job_deps(job_idx)?;
+
+            let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
+                JobState::Pending(JobType::VmBind(job)) => job,
+                _ => {
+                    return Err(EINVAL);
+                }
+            };
+
+            let mut pending_job = entity.new_job(1, 0, job)?;
+
+            for fence in fences {
+                pending_job.add_dependency(fence)?;
+            }
+
+            let mut armed_job = pending_job.arm();
+
+            // Update the sync signal fences with the job's completion fence
+            self.update_job_syncs(job_idx, armed_job.fences().finished())?;
+
             armed_job.push();
         }
 
