@@ -97,6 +97,7 @@ pub mod fs;
 pub mod id_pool;
 pub mod init;
 pub mod io;
+pub mod io_pgtable;
 pub mod ioctl;
 pub mod iosys_map;
 pub mod iov;
