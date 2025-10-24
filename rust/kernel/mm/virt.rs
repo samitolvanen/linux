@@ -92,6 +92,16 @@ impl VmaRef {
         unsafe { (*self.as_ptr()).__bindgen_anon_1.__bindgen_anon_1.vm_end }
     }
 
+    /// Returns the page offset of the virtual memory area.
+    ///
+    /// This is the offset in pages from the start of the file being mapped.
+    #[inline]
+    pub fn pgoff(&self) -> usize {
+        // SAFETY: By the type invariants, the caller holds at least the mmap read lock, so this
+        // access is not a data race.
+        unsafe { (*self.as_ptr()).vm_pgoff }
+    }
+
     /// Zap pages in the given page range.
     ///
     /// This clears page table mappings for the range at the leaf level, leaving all other page
