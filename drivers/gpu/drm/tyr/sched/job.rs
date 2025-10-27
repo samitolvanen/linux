@@ -106,6 +106,9 @@ impl JobImpl for Job {
         let cs_size_regnum = val_reg;
         let mov_cs_size: u64 = opcode << 56 | cs_size_regnum << 48 | u64::from(job.stream_size);
 
+        let opcode = 3;
+        let wait0: u64 = opcode << 56 | (1 << 16); // WAIT(0)
+
         let opcode = 32; // CALL
         let call: u64 = opcode << 56 | cs_start_regnum << 40 | cs_size_regnum << 32;
 
@@ -147,6 +150,7 @@ impl JobImpl for Job {
         instrs.extend_from_slice(&flush_cache.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&mov_cs_start.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&mov_cs_size.to_le_bytes(), GFP_KERNEL)?;
+        instrs.extend_from_slice(&wait0.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&call.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&mov_sync_addr.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&mov_sync_val.to_le_bytes(), GFP_KERNEL)?;
@@ -154,9 +158,9 @@ impl JobImpl for Job {
         instrs.extend_from_slice(&sync_add.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&error_barrier.to_le_bytes(), GFP_KERNEL)?;
 
-        let pad = instrs.len().next_multiple_of(8) - instrs.len();
+        let pad = instrs.len().next_multiple_of(64) - instrs.len();
 
-        // Pad until the next 8-byte boundary with NOPs to please the
+        // Pad until the next 64-byte boundary with NOPs to please the
         // prefetcher.
         for _ in 0..pad {
             instrs.push(0, GFP_KERNEL)?;
