@@ -17,6 +17,7 @@ use kernel::io::mem::IoMem;
 use kernel::io_pgtable::IoPageTable;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::prelude::*;
+use kernel::sizes::{SZ_1G, SZ_2M, SZ_4K};
 use kernel::sync::Arc;
 use kernel::types::ARef;
 
@@ -97,36 +98,74 @@ impl LockedVm {
         })
     }
 
+    fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
+        // io-pgtable only operates on multiple pages within a single table
+        // entry, so we need to split at boundaries of the table size, i.e.
+        // the next block size up. The distance from address A to the next
+        // boundary of block size B is logically B - A % B, but in unsigned
+        // two's complement where B is a power of two we get the equivalence
+        // B - A % B == (B - A) % B == (n * B - A) % B, and choose n = 0 :)
+        let blk_offset_2m = addr.wrapping_neg() % (SZ_2M as u64);
+
+        if blk_offset_2m != 0 || size < SZ_2M as u64 {
+            let count = if blk_offset_2m == 0 {
+                size / SZ_4K as u64
+            } else {
+                blk_offset_2m.min(size) / SZ_4K as u64
+            };
+            return (SZ_4K as u64, count);
+        }
+
+        let blk_offset_1g = addr.wrapping_neg() % (SZ_1G as u64);
+        let blk_offset = if blk_offset_1g == 0 {
+            SZ_1G as u64
+        } else {
+            blk_offset_1g
+        };
+        let count = blk_offset.min(size) / SZ_2M as u64;
+        (SZ_2M as u64, count)
+    }
+
     fn unmap_pages(
         &mut self,
         iomem: &Devres<IoMem>,
         as_nr: Option<usize>,
         iova: Range<u64>,
     ) -> Result {
-        let mut total_unmapped = 0;
+        let start_iova = iova.start;
         let size = iova.end - iova.start;
+        let mut offset = 0u64;
 
-        while total_unmapped < size {
-            let pgsize = 4096;
-            let pgcount = (size - total_unmapped).div_ceil(pgsize);
+        pr_info!(
+            "Unmapping range {:#x} - {:#x}\n",
+            start_iova,
+            start_iova + size
+        );
+
+        while offset < size {
+            let remaining = size - offset;
+            let curr_iova = start_iova + offset;
+
+            let (pgsize, pgcount) = Self::get_pgsize(curr_iova, remaining);
 
             let unmapped_sz =
                 self.page_table
-                    .unmap_pages(iova.start as usize, pgsize as usize, pgcount as usize);
+                    .unmap_pages(curr_iova as usize, pgsize as usize, pgcount as usize);
 
             if unmapped_sz as u64 != pgsize * pgcount {
-                let range = iova.start..iova.start + total_unmapped + unmapped_sz as u64;
-
                 pr_err!(
-                    "AS ({:#?}): failed to unmap range {:#x} - {:#x}, unmapped only {:#x} bytes\n",
+                    "AS ({:#?}): failed to unmap range {:#x}-{:#x} (requested range {:#x}-{:#x}), unmapped only {:#x} bytes\n",
                     as_nr,
-                    iova.start,
-                    iova.start + size,
+                    curr_iova + unmapped_sz as u64,
+                    curr_iova + pgsize * pgcount,
+                    start_iova,
+                    start_iova + size,
                     unmapped_sz,
                 );
 
                 if let Some(as_nr) = as_nr {
-                    Mmu::flush_range(iomem, as_nr, range)?;
+                    let _ =
+                        Mmu::flush_range(iomem, as_nr, start_iova..curr_iova + unmapped_sz as u64);
                 }
 
                 return Err(EINVAL);
@@ -136,17 +175,18 @@ impl LockedVm {
                 "AS ({:#?}): unmapped {} bytes, iova: {:#x}, pgsize: {}, pgcount: {}, len: {}\n",
                 as_nr,
                 unmapped_sz,
-                iova.start,
+                curr_iova,
                 pgsize,
                 pgcount,
-                size
+                remaining
             );
 
-            total_unmapped += unmapped_sz as u64;
+            offset += unmapped_sz as u64;
         }
 
+        // Flush the entire unmapped range
         if let Some(as_nr) = as_nr {
-            Mmu::flush_range(iomem, as_nr, iova)?;
+            Mmu::flush_range(iomem, as_nr, start_iova..start_iova + size)?;
         }
 
         Ok(())
@@ -165,9 +205,8 @@ impl gpuvm::DriverGpuVm for LockedVm {
         op: &mut gpuvm::OpMap<Self>,
         ctx: &mut Self::StepContext,
     ) -> Result {
-        // This is the mapping algorithm from Asahi.
-
-        let mut iova = op.addr();
+        let start_iova = op.addr();
+        let mut iova = start_iova;
         let mut left = op.length();
         let mut offset = op.gem_offset();
         let gpuva = ctx.preallocated_va()?;
@@ -183,7 +222,7 @@ impl gpuvm::DriverGpuVm for LockedVm {
             .expect("SGT should be set before step_map")
             .iter()
         {
-            let mut addr = range.dma_address();
+            let mut paddr = range.dma_address();
             let mut len = u64::from(range.dma_len());
 
             if left == 0 {
@@ -192,7 +231,7 @@ impl gpuvm::DriverGpuVm for LockedVm {
 
             if offset > 0 {
                 let skip = len.min(offset);
-                addr += skip;
+                paddr += skip;
                 len -= skip;
                 offset -= skip;
             }
@@ -205,16 +244,40 @@ impl gpuvm::DriverGpuVm for LockedVm {
 
             len = len.min(left);
 
-            let pgsize = 4096;
-            let pgcount = len.div_ceil(pgsize);
+            let mut segment_mapped = 0u64;
+            while segment_mapped < len {
+                let remaining = len - segment_mapped;
+                let curr_iova = iova + segment_mapped;
+                let curr_paddr = paddr + segment_mapped;
 
-            let _ = gpuvm.page_table.map_pages(
-                iova as usize,
-                addr as usize,
-                pgsize as usize,
-                pgcount as usize,
-                prot,
-            )?;
+                let (pgsize, pgcount) = Self::get_pgsize(curr_iova | curr_paddr, remaining);
+
+                let mapped = gpuvm.page_table.map_pages(
+                    curr_iova as usize,
+                    curr_paddr as usize,
+                    pgsize as usize,
+                    pgcount as usize,
+                    prot,
+                )?;
+
+                if mapped == 0 {
+                    pr_err!(
+                        "map_pages returned 0 bytes mapped (iova: {:#x}, paddr: {:#x}, pgsize: {:#x}, pgcount: {})\n",
+                        curr_iova, curr_paddr, pgsize, pgcount
+                    );
+                    // Unmap what we've mapped so far
+                    if segment_mapped > 0 || iova > start_iova {
+                        let _ = gpuvm.unmap_pages(
+                            &ctx.iomem,
+                            ctx.vm_as_nr,
+                            start_iova..iova + segment_mapped,
+                        );
+                    }
+                    return Err(ENOMEM);
+                }
+
+                segment_mapped += mapped as u64;
+            }
 
             left -= len;
             iova += len;
@@ -226,6 +289,11 @@ impl gpuvm::DriverGpuVm for LockedVm {
             gpuvm.link_va(gpuva, ctx.vm_bo.as_ref().expect("step_map with no BO"))?;
             Ok(())
         })?;
+
+        if let Some(as_nr) = ctx.vm_as_nr {
+            let range = start_iova..iova;
+            Mmu::flush_range(&ctx.iomem, as_nr, range)?;
+        }
 
         Ok(())
     }
@@ -242,6 +310,7 @@ impl gpuvm::DriverGpuVm for LockedVm {
         let va = op.va().expect("This is always set by GPUVM");
         let iova = va.range();
 
+        pr_info!("Unmapping range {:#x} - {:#x}\n", iova.start, iova.end);
         gpuvm.unmap_pages(&ctx.iomem, ctx.vm_as_nr, iova)?;
 
         gpuvm.find_va(va.range(), |gpuvm, gpuva| {
@@ -259,6 +328,11 @@ impl gpuvm::DriverGpuVm for LockedVm {
         _vm_bo: &gpuvm::GpuVmBo<Self>,
         ctx: &mut Self::StepContext,
     ) -> Result {
+        pr_info!(
+            "Remapping range {:#x} - {:#x}\n",
+            op.unmap().va().ok_or(EINVAL)?.addr(),
+            op.unmap().va().ok_or(EINVAL)?.addr() + op.unmap().va().ok_or(EINVAL)?.length()
+        );
         let prev_va = ctx.preallocated_va()?;
         let next_va = ctx.preallocated_va()?;
         let vm_bo = ctx.vm_bo.as_ref().ok_or(EINVAL)?;
