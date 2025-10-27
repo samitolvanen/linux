@@ -301,13 +301,47 @@ impl Vm {
 
         f(prepared_vm)
     }
+
+    /// Prepare the VM and provide access to both the PreparedVm and the entity.
+    ///
+    /// This is needed to avoid borrow checker issues when we need to access
+    /// the entity while the ExecToken is held.
+    pub(crate) fn with_prepared_vm_and_entity<R>(
+        &mut self,
+        num_slots: u32,
+        f: impl FnOnce(PreparedVm<'_>, &mut Entity<VmBindJob>) -> Result<R>,
+    ) -> Result<R> {
+        let exec_token = self.gpuvm.prepare(num_slots)?;
+        let prepared_vm = PreparedVm {
+            exec_token,
+            num_slots,
+        };
+
+        f(prepared_vm, &mut self.entity)
+    }
 }
 
 /// Indicates that all the reservations are locked for the objects in a given
 /// VM, and that `num_slots` have been reserved for fences.
 pub(crate) struct PreparedVm<'a> {
-    exec_token: ExecToken<'a, LockedVm>,
+    pub(crate) exec_token: ExecToken<'a, LockedVm>,
     pub(crate) num_slots: u32,
+}
+
+impl<'a> PreparedVm<'a> {
+    /// Add a fence to the reservation objects.
+    ///
+    /// This is a convenience wrapper around `exec_token.resv_add_fence` that
+    /// avoids exposing the private `LockedVm` type.
+    pub(crate) fn resv_add_fence(
+        &mut self,
+        fence: &impl kernel::dma_fence::RawDmaFence,
+        private_usage: u32,
+        extobj_usage: u32,
+    ) {
+        self.exec_token
+            .resv_add_fence(fence, private_usage, extobj_usage);
+    }
 }
 
 /// 256M of every VM is reserved for kernel objects by default, i.e.: heap

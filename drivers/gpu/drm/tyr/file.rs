@@ -271,14 +271,28 @@ impl File {
             ctx.collect_signal_ops(&internal_syncs)?;
         }
 
-        // Push all VM bind jobs with dependencies
+        // Push all VM bind jobs with dependencies and update reservation objects
         vm.with_lock_taken(|vm| {
-            ctx.add_deps_and_push_vm_bind_jobs(&mut vm.entity)?;
+            vm.with_prepared_vm_and_entity(count as u32, |mut locked_vm, entity| {
+                let finished_fences = ctx.add_deps_and_push_vm_bind_jobs(entity)?;
 
-            // Push all signal fences to their syncobjs
-            ctx.push_fences();
-            Ok(0)
-        })
+                // Add the finished fences to the reservation objects
+                for fence in &finished_fences {
+                    locked_vm.resv_add_fence(
+                        fence,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    );
+                }
+
+                Ok(())
+            })
+        })?;
+
+        // Push all signal fences to their syncobjs
+        ctx.push_fences();
+
+        Ok(0)
     }
 
     pub(crate) fn vm_bind(
