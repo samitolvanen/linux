@@ -279,9 +279,10 @@ impl Group {
 
         let vm = self.vm.lock();
 
-        // Create all jobs and add them to the context
-        self.with_locked_inner(|inner| {
-            vm.with_prepared_vm(queue_submits.len() as u32, |locked_vm| {
+        // Prepare the VM with enough slots for all submissions
+        vm.with_prepared_vm(queue_submits.len() as u32, |mut locked_vm| {
+            // Create all jobs and add them to the context
+            self.with_locked_inner(|inner| {
                 for queue_submit in queue_submits.iter() {
                     let queue = inner
                         .queues
@@ -307,21 +308,33 @@ impl Group {
                     fences.push(fence, GFP_KERNEL)?;
                 }
                 Ok(())
-            })
-        })?;
-
-        ctx.collect_signal_ops(&internal_syncs)?;
-
-        // Now process jobs through their respective queue entities
-        // For now, we assume single queue submit (as enforced in file.rs)
-        // In the future, this will need to be extended to handle multiple queues
-        if !queue_submits.is_empty() {
-            let queue_idx = queue_submits[0].queue_index as usize;
-            self.with_locked_inner(|inner| {
-                let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                ctx.add_deps_and_push_jobs(&mut queue.entity)
             })?;
-        }
+
+            ctx.collect_signal_ops(&internal_syncs)?;
+
+            // Now process jobs through their respective queue entities
+            // For now, we assume single queue submit (as enforced in file.rs)
+            // In the future, this will need to be extended to handle multiple queues
+            if !queue_submits.is_empty() {
+                let queue_idx = queue_submits[0].queue_index as usize;
+
+                let finished_fences = self.with_locked_inner(|inner| {
+                    let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                    ctx.add_deps_and_push_jobs(&mut queue.entity)
+                })?;
+
+                // Add the finished fences to the reservation objects
+                for fence in &finished_fences {
+                    locked_vm.resv_add_fence(
+                        fence,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    );
+                }
+            }
+
+            Ok(())
+        })?;
 
         // Push all signal fences to their syncobjs
         ctx.push_fences();

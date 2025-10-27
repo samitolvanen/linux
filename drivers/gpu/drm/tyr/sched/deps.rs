@@ -238,7 +238,14 @@ impl<'a> Context<'a> {
     ///
     /// This method takes the entity as a parameter, processes all jobs, and pushes them
     /// immediately to avoid lifetime conflicts.
-    pub(crate) fn add_deps_and_push_jobs(&mut self, entity: &mut Entity<Job>) -> Result {
+    ///
+    /// Returns a vector of finished fences that need to be added to reservation objects.
+    pub(crate) fn add_deps_and_push_jobs(
+        &mut self,
+        entity: &mut Entity<Job>,
+    ) -> Result<KVec<Fence>> {
+        let mut finished_fences = KVec::new();
+
         for job_idx in 0..self.jobs.len() {
             // Only process GPU jobs with this entity
             match &self.jobs[job_idx].state {
@@ -264,22 +271,28 @@ impl<'a> Context<'a> {
 
             let mut armed_job = pending_job.arm();
 
-            // Update the sync signal fences with the job's completion fence
-            self.update_job_syncs(job_idx, armed_job.fences().finished())?;
+            let finished_fence = armed_job.fences().finished();
 
-            // Note: In the C code, there's an `upd_resvs` callback here
-            // that updates reservation objects. We're skipping that for now.
+            // Update the sync signal fences with the job's completion fence
+            self.update_job_syncs(job_idx, finished_fence.clone())?;
+
+            finished_fences.push(finished_fence, GFP_KERNEL)?;
+
             armed_job.push();
         }
 
-        Ok(())
+        Ok(finished_fences)
     }
 
     /// Add VM bind job dependencies, arm jobs, and push them to the scheduler.
+    ///
+    /// Returns a vector of finished fences that need to be added to reservation objects.
     pub(crate) fn add_deps_and_push_vm_bind_jobs(
         &mut self,
         entity: &mut Entity<VmBindJob>,
-    ) -> Result {
+    ) -> Result<KVec<Fence>> {
+        let mut finished_fences = KVec::new();
+
         for job_idx in 0..self.jobs.len() {
             // Only process VM bind jobs with this entity
             match &self.jobs[job_idx].state {
@@ -305,13 +318,17 @@ impl<'a> Context<'a> {
 
             let mut armed_job = pending_job.arm();
 
+            let finished_fence = armed_job.fences().finished();
+
             // Update the sync signal fences with the job's completion fence
-            self.update_job_syncs(job_idx, armed_job.fences().finished())?;
+            self.update_job_syncs(job_idx, finished_fence.clone())?;
+
+            finished_fences.push(finished_fence, GFP_KERNEL)?;
 
             armed_job.push();
         }
 
-        Ok(())
+        Ok(finished_fences)
     }
 
     /// Push signal fences to their associated syncobjs
