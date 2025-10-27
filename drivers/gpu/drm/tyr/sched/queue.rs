@@ -141,7 +141,7 @@ impl Queue {
             output_offset: SZ_4K,
         };
 
-        let fence_ctx = FenceContexts::new(1, c_str!("tyr_fence"), None)?;
+        let fence_ctx = FenceContexts::new(1, c_str!("tyr_fence"), None, 1)?;
 
         Ok(Queue {
             scheduler,
