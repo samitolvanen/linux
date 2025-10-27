@@ -21,6 +21,7 @@ use kernel::new_delayed_work;
 use kernel::new_mutex;
 use kernel::new_work;
 use kernel::of;
+use kernel::opp;
 use kernel::platform;
 use kernel::prelude::*;
 use kernel::regulator;
@@ -181,6 +182,53 @@ fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     Ok(())
 }
 
+fn set_maximum_opp(pdev: &ARef<platform::Device>) {
+    match opp::Table::from_of(&pdev.as_ref().into(), 0) {
+        Ok(table) => {
+            match table.opp_from_freq(
+                kernel::clk::Hertz(kernel::ffi::c_ulong::MAX),
+                Some(true), // Only consider available (enabled) OPPs
+                None,       // Use default clock index (0)
+                opp::SearchType::Floor,
+            ) {
+                Ok(max_opp) => {
+                    let freq = max_opp.freq(None);
+                    let voltage = max_opp.voltage();
+
+                    dev_info!(
+                        pdev.as_ref(),
+                        "Setting GPU to max performance: {} Hz @ {} uV\n",
+                        kernel::ffi::c_ulong::from(freq),
+                        kernel::ffi::c_ulong::from(voltage)
+                    );
+
+                    if let Err(e) = table.set_opp(&max_opp) {
+                        dev_warn!(
+                            pdev.as_ref(),
+                            "Failed to set max OPP: {:?}, continuing anyway\n",
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    dev_info!(
+                        pdev.as_ref(),
+                        "Failed to get max OPP: {:?}, using default clocks\n",
+                        e
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            dev_info!(
+                pdev.as_ref(),
+                "No OPP table in device tree: {:?}, using default clocks\n",
+                e
+            );
+        }
+    }
+}
+
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
@@ -224,6 +272,11 @@ impl platform::Driver for TyrDriver {
             pdev.dma_set_mask_and_coherent(DmaMask::try_new(gpu_info.pa_bits())?)?;
         }
         let platform: ARef<platform::Device> = pdev.into();
+
+        // Set GPU to maximum performance operating point
+        // This ensures the GPU runs at the highest frequency for best
+        // performance while we don't have any power management code in place.
+        set_maximum_opp(&platform);
 
         // SAFETY: This should be safe as data is not touched by the driver
         // untill it gets fully initialised.
