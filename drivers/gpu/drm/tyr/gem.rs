@@ -164,6 +164,13 @@ pub(crate) fn new_kernel_object(
         },
     )?;
 
+    pr_info!(
+        "Binding kernel GEM object at VA range {:#x}-{:#x} (size: {:#x}) for VM {}\n",
+        range.start,
+        range.end,
+        sz,
+        vm.address_space().map_or(-1, |as_nr| as_nr as i32)
+    );
     vm.bind_gem(iomem, &gem, 0, range, flags)?;
 
     Ok(ObjectRef::new(gem))
