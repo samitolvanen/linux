@@ -290,9 +290,17 @@ impl Scheduler {
             Ok(())
         })?;
 
-        if no_in_flight_jobs {
-            self.mark_group_idle(group, data, csg_id)?;
-        }
+        // TODO: we need to restore CS_EXTRACT when restarting groups, or else
+        // this will re-execute the whole ringbuffer from the start.
+        //
+        // TODO: We should not remove IDLE groups if there's nothing to
+        // schedule, as it's actually counter-productive to do so.
+        //
+        // For now, just disable this.
+        //
+        // if no_in_flight_jobs {
+        //     self.mark_group_idle(group, data, csg_id)?;
+        // }
 
         Ok(())
     }
