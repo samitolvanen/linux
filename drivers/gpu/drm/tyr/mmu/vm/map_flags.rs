@@ -54,9 +54,12 @@ impl TryFrom<u32> for Flags {
     type Error = Error;
 
     fn try_from(value: u32) -> core::result::Result<Self, Self::Error> {
-        let valid = Flags::from(READONLY) | Flags::from(NOEXEC) | Flags::from(UNCACHED);
+        let valid = (kernel::uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
+            | kernel::uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
+            | kernel::uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
+            as u32;
 
-        if value & !valid.0 != 0 {
+        if value & !valid != 0 {
             pr_err!("Invalid VM map flags: {:#x}\n", value);
             Err(EINVAL)
         } else {
