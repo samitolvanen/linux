@@ -182,6 +182,7 @@ impl Queue {
         ringbuf_input.insert += instrs.len() as u64;
 
         self.interfaces.write_input(ringbuf_input)?;
+        kernel::sync::barrier::smp_wmb();
         Ok(())
     }
 
