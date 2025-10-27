@@ -165,6 +165,15 @@ impl File {
                             .get_vm(vmbind.vm_id as usize)
                             .ok_or(EINVAL)?;
 
+                        pr_info!("binding BO handle {} at offset {:#x} to VA range {:#x}-{:#x} in VM id {} AS {}\n",
+                            op.0.bo_handle,
+                            op.0.bo_offset,
+                            range.start,
+                            range.end,
+                            vmbind.vm_id,
+                            vm.lock().address_space().map_or(-1, |as_nr| as_nr as i32)
+                        );
+
                         vm.lock().bind_gem(
                             iomem.clone(),
                             &bo.gem,
@@ -187,6 +196,12 @@ impl File {
                             .get_vm(vmbind.vm_id as usize)
                             .ok_or(EINVAL)?;
 
+                        pr_info!(
+                            "unbinding VA range {:#x}-{:#x} in VM {}\n",
+                            range.start,
+                            range.end,
+                            vmbind.vm_id
+                        );
                         vm.lock().unmap_range(iomem.clone(), range)?;
                     }
                     _ => return Err(ENOTSUPP),
