@@ -356,6 +356,7 @@ impl Scheduler {
                     let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
                     for (cs_idx, _) in inner.queues.iter_mut().enumerate() {
                         let cs_iface = csg_iface.cs_mut(cs_idx).ok_or(EINVAL)?;
+                        pr_info!("Stopping cs id {}\n", cs_idx);
                         cs_iface.set_state(crate::sched::StreamState::Stop)?;
                     }
                 }
@@ -402,6 +403,12 @@ impl Scheduler {
 
         let fw = &data.fw;
         fw.with_locked_global_iface(|glb_iface| {
+            pr_info!(
+                "Syncing group at csg_idx {}: {:?} -> {:?}\n",
+                csg_idx,
+                old_state,
+                update
+            );
             glb_iface.set_csg_state(csg_idx, update)?;
             glb_iface.ring_csg_doorbell(csg_idx)?;
             let output = glb_iface.read_output()?;
