@@ -421,10 +421,12 @@ impl FenceContexts {
 
         // SAFETY: krealloc is always safe to call like this
         let p = unsafe {
-            bindings::krealloc(
+            bindings::krealloc_node_align_noprof(
                 core::ptr::null_mut(),
                 FenceObject::<T>::SIZE,
+                0,
                 bindings::GFP_KERNEL | bindings::__GFP_ZERO,
+                bindings::NUMA_NO_NODE as i32,
             ) as *mut FenceObject<T>
         };
 
