@@ -23,7 +23,6 @@ use pin_init::pin_init_from_closure;
 use crate::bindings;
 use crate::drm::device;
 use crate::drm::driver;
-use crate::drm::gem;
 use crate::drm::gem::IntoGEMObject;
 use crate::error::code::ENOMEM;
 use crate::error::from_result;
@@ -35,8 +34,7 @@ use crate::types::AlwaysRefCounted;
 use crate::types::Opaque;
 
 /// A convenience type for the driver's GEM object.
-type Object<T> =
-    <<<T as DriverGpuVm>::Driver as driver::Driver>::Object as gem::DriverObject>::Object;
+type Object<T> = <<T as DriverGpuVm>::Driver as driver::Driver>::Object;
 
 /// Trait that must be implemented by DRM drivers to represent a DRM [`GpuVm`],
 /// i.e. a GPU address space.
