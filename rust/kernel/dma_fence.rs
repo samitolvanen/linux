@@ -392,13 +392,14 @@ impl FenceContexts {
         count: u32,
         name: &'static CStr,
         key: Option<Pin<KBox<LockClassKey>>>,
+        initial_seqno: u64,
     ) -> Result<FenceContexts> {
         let mut seqnos: KVec<AtomicU64> = KVec::new();
 
         seqnos.reserve(count as usize, GFP_KERNEL)?;
 
         for _ in 0..count {
-            seqnos.push(Default::default(), GFP_KERNEL)?;
+            seqnos.push(AtomicU64::new(initial_seqno), GFP_KERNEL)?;
         }
 
         // SAFETY: This is always safe to call
