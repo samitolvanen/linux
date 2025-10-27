@@ -328,10 +328,6 @@ pub(crate) enum VmUserSize {
     Custom(u64),
 }
 
-fn as_memattr_aarch64_inner_alloc_expl(inner: bool, outer: bool) -> u8 {
-    ((inner as u8) << 1) | (outer as u8)
-}
-
 fn mair_to_memattr(mair: u64) -> u64 {
     let mut memattr: u64 = 0;
 
@@ -347,15 +343,17 @@ fn mair_to_memattr(mair: u64) -> u64 {
         let out_attr = if (outer & 3 == 0) || (outer & 4 == 0) || (inner & 4 == 0) {
             regs::AS_MEMATTR_AARCH64_INNER_OUTER_NC
                 | regs::AS_MEMATTR_AARCH64_SH_MIDGARD_INNER
-                | as_memattr_aarch64_inner_alloc_expl(false, false) as u32
+                | regs::as_memattr_aarch64_inner_alloc_expl(false, false)
         } else {
             // Use SH_CPU_INNER mode so SH_IS, which is used when
             // IOMMU_CACHE is set, actually maps to the standard
             // definition of inner-shareable and not Mali's
             // internal-shareable mode.
+            //
+            // TODO: this assumes a non-coherent system.
             regs::AS_MEMATTR_AARCH64_INNER_OUTER_WB
-                | regs::AS_MEMATTR_AARCH64_SH_CPU_INNER
-                | as_memattr_aarch64_inner_alloc_expl(inner & 1 != 0, inner & 2 != 0) as u32
+                | regs::AS_MEMATTR_AARCH64_SH_MIDGARD_INNER
+                | regs::as_memattr_aarch64_inner_alloc_expl(inner & 1 != 0, inner & 2 != 0)
         };
 
         memattr |= (out_attr as u64) << (8 * i);
