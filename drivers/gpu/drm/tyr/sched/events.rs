@@ -275,10 +275,6 @@ impl Scheduler {
                         return true;
                     }
 
-                    // Add this debug aid for a while. It will be important
-                    // while we develop the driver.
-                    pr_info!("Signalling fence: {}\n", fence.seqno());
-
                     res = fence.signal();
                     false
                 });
