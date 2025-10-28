@@ -442,17 +442,7 @@ impl GlobalInterface {
     /// made on this CSG.
     pub(crate) fn ring_csg_doorbell(&mut self, csg_idx: usize) -> Result {
         self.doorbell_request()?.toggle_reqs(1 << csg_idx)?;
-
         self.ring_glb_doorbell()?;
-
-        let op = || self.read_output();
-        let cond = |output: &Output| -> bool { output.doorbell_ack == 1 };
-        let _ = io::poll::read_poll_timeout(
-            op,
-            cond,
-            time::Delta::from_millis(0),
-            time::Delta::from_millis(100),
-        );
 
         Ok(())
     }
