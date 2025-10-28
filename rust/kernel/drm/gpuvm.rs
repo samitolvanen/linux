@@ -617,22 +617,25 @@ impl<T: DriverGpuVm> GpuVm<T> {
     ) -> Result {
         let gpuvm = self.gpuvm.get();
         let mut ctx = StepContext { ctx, gpuvm: self };
-        let req_addr = range.start;
-        let req_range = range.end - range.start;
+
+        let req = bindings::drm_gpuvm_map_req {
+            map: bindings::drm_gpuva_op_map {
+                va: bindings::drm_gpuva_op_map__bindgen_ty_1 {
+                    addr: range.start,
+                    range: range.end - range.start,
+                },
+                gem: bindings::drm_gpuva_op_map__bindgen_ty_2 {
+                    offset: gem_offset,
+                    obj: req_obj.as_raw(),
+                },
+            },
+        };
 
         // SAFETY:
         // - `gpuvm` is guaranteed to be valid by the type invariant of `GpuVm<T>`.
         // - `req_obj` is guaranteed to be a valid GEM object by the type invariant of `Object<T>`.
-        to_result(unsafe {
-            bindings::drm_gpuvm_sm_map(
-                gpuvm,
-                &mut ctx as *mut _ as *mut _,
-                req_addr,
-                req_range,
-                req_obj.as_raw(),
-                gem_offset,
-            )
-        })
+        // - `req` is a valid drm_gpuvm_map_req on the stack.
+        to_result(unsafe { bindings::drm_gpuvm_sm_map(gpuvm, &mut ctx as *mut _ as *mut _, &req) })
     }
 
     /// Instructs the [`GpuVm`] instance to build the necessary operations in
