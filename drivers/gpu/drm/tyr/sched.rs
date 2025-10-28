@@ -320,7 +320,7 @@ impl Scheduler {
 
                 let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
 
-                for (cs_idx, queue) in inner.queues.iter().enumerate() {
+                for (cs_idx, queue) in inner.queues.iter_mut().enumerate() {
                     let cs_iface = csg_iface.cs_mut(cs_idx).ok_or(EINVAL)?;
 
                     self.program_cs_slot(queue, cs_iface)?;
@@ -370,9 +370,14 @@ impl Scheduler {
     ///
     /// Queues are alloted slots when their group is itself programmed into a
     /// CSG slot.
-    fn program_cs_slot(&mut self, queue: &Queue, cs_iface: &mut CommandStream) -> Result {
+    fn program_cs_slot(&mut self, queue: &mut Queue, cs_iface: &mut CommandStream) -> Result {
         let doorbell_id = queue.doorbell_id.ok_or(EINVAL)?;
         let mut cs_input = cs_iface.read_input()?;
+
+        let mut ringbuf_input = queue.interfaces.read_input()?;
+        let ringbuf_output = queue.interfaces.read_output()?;
+        ringbuf_input.extract_init = ringbuf_output.extract;
+        queue.interfaces.write_input(ringbuf_input);
 
         cs_input.ringbuf_base = queue.ringbuf.kernel_va().ok_or(EINVAL)?.start;
         cs_input.ringbuf_size = queue.ringbuf.size() as u32;

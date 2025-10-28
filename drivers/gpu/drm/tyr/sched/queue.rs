@@ -179,6 +179,10 @@ impl Queue {
         // Make sure that the ring buffer is updated before the INSERT register.
         kernel::sync::barrier::smp_wmb();
 
+        // We need to always save the latest extract point in case the CS is
+        // stopped and then resumed.
+        let ringbuf_output = self.interfaces.read_output()?;
+        ringbuf_input.extract_init = ringbuf_output.extract;
         ringbuf_input.insert += instrs.len() as u64;
 
         self.interfaces.write_input(ringbuf_input)?;
