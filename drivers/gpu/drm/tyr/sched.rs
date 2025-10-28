@@ -149,7 +149,8 @@ impl Scheduler {
         let gpu_as_count = tdev.gpu_info.as_present & genmask_u32(1..=31);
         let gpu_as_count = gpu_as_count.count_ones();
 
-        let csg_slot_count = num_groups;
+        // Each CSG needs its own AS, so limit CSG count to available AS count
+        let csg_slot_count = core::cmp::min(num_groups, gpu_as_count);
         let as_slot_count = gpu_as_count;
 
         let wq = OwnedQueue::new(c_str!("tyr-csf-sched"), WqFlags::UNBOUND, 0)?;
@@ -396,12 +397,15 @@ impl Scheduler {
             return Ok(());
         }
 
+        // Only search within the valid CSG slots (those initialized in firmware)
         let csg_idx = self
             .csg_slots
             .iter()
+            .take(self.csg_slot_count as usize)
             .position(|slot| slot.is_none())
             .ok_or(EBUSY)?;
-        pr_warn!("Using csg slot {csg_idx}\n");
+
+        pr_info!("Using csg slot {csg_idx}\n");
         self.bind_group(tdev, group, csg_idx)?;
         self.program_csg_slot(tdev, csg_idx, Priority::Low)
     }
