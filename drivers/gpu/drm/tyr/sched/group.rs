@@ -312,15 +312,20 @@ impl Group {
 
             ctx.collect_signal_ops(&internal_syncs)?;
 
-            // Now process jobs through their respective queue entities
-            // For now, we assume single queue submit (as enforced in file.rs)
-            // In the future, this will need to be extended to handle multiple queues
-            if !queue_submits.is_empty() {
-                let queue_idx = queue_submits[0].queue_index as usize;
+            // Collect unique queue indices from all queue submits
+            let mut queue_indices = kvec![];
+            for queue_submit in queue_submits.iter() {
+                let idx = queue_submit.queue_index as usize;
+                if !queue_indices.iter().any(|&qi| qi == idx) {
+                    queue_indices.push(idx, GFP_KERNEL)?;
+                }
+            }
 
+            // Process jobs for each queue
+            for &queue_idx in queue_indices.iter() {
                 let finished_fences = self.with_locked_inner(|inner| {
                     let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                    ctx.add_deps_and_push_jobs(&mut queue.entity)
+                    ctx.add_deps_and_push_jobs(&mut queue.entity, queue_idx)
                 })?;
 
                 // Add the finished fences to the reservation objects

@@ -236,20 +236,25 @@ impl<'a> Context<'a> {
 
     /// Add jobs dependencies, arm jobs, and push them to the scheduler
     ///
-    /// This method takes the entity as a parameter, processes all jobs, and pushes them
-    /// immediately to avoid lifetime conflicts.
+    /// This method takes the entity as a parameter, processes jobs for the specified
+    /// queue_idx, and pushes them immediately to avoid lifetime conflicts.
     ///
     /// Returns a vector of finished fences that need to be added to reservation objects.
     pub(crate) fn add_deps_and_push_jobs(
         &mut self,
         entity: &mut Entity<Job>,
+        queue_idx: usize,
     ) -> Result<KVec<Fence>> {
         let mut finished_fences = KVec::new();
 
         for job_idx in 0..self.jobs.len() {
             // Only process GPU jobs with this entity
             match &self.jobs[job_idx].state {
-                JobState::Pending(JobType::Gpu(_)) => {}
+                JobState::Pending(JobType::Gpu(job)) => {
+                    if job.queue_idx() != queue_idx {
+                        continue;
+                    }
+                }
                 JobState::Pending(JobType::VmBind(_)) => continue,
                 JobState::Taken => continue,
             }
