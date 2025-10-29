@@ -478,13 +478,13 @@ impl File {
     }
 
     pub(crate) fn group_destroy(
-        _tdev: &TyrDevice,
+        tdev: &TyrDevice,
         groupdestroy: &mut uapi::drm_panthor_group_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
         file.inner()
             .group_pool()
-            .destroy_group(groupdestroy.group_handle as usize)?;
+            .destroy_group(tdev, groupdestroy.group_handle as usize)?;
 
         Ok(0)
     }

@@ -426,10 +426,21 @@ impl Pool {
         Some(group.into())
     }
 
-    pub(crate) fn destroy_group(self: Pin<&Self>, index: usize) -> Result {
+    pub(crate) fn destroy_group(self: Pin<&Self>, tdev: &TyrDevice, index: usize) -> Result {
         let xa = self.xa.as_ref();
 
         let group = xa.lock().remove(index).ok_or(EINVAL)?;
+
+        let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id))?;
+
+        if let Some(csg_id) = csg_id {
+            tdev.with_locked_scheduler(|sched| {
+                pr_info!("Unbinding group from CSG slot {}\n", csg_id);
+                sched.set_csg_state(tdev, csg_id, csg::GroupState::Terminate)?;
+                sched.unbind_group(tdev, csg_id)?;
+                Ok(())
+            })?;
+        }
 
         group.with_locked_inner(|inner| {
             inner.destroyed = true;
