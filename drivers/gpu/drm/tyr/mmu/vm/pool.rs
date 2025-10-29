@@ -77,4 +77,22 @@ impl Pool {
         vm.destroyed = true;
         vm.unmap_all(iomem)
     }
+
+    /// Destroy all VMs in the pool.
+    ///
+    /// This is called when the file is being closed to ensure all VMs
+    /// are properly unmapped before being dropped.
+    pub(crate) fn destroy_all(self: Pin<&Self>, iomem: Arc<Devres<IoMem>>) -> Result {
+        let max_index = self.free_index.load(core::sync::atomic::Ordering::Relaxed);
+
+        // Try to destroy all possible VMs from 0 to free_index, as there is no
+        // iterator implementation in xarray.rs.
+        for index in 0..max_index {
+            if let Ok(_) = self.destroy_vm(index, iomem.clone()) {
+                pr_info!("Destroyed VM at index {}\n", index);
+            }
+        }
+
+        Ok(())
+    }
 }

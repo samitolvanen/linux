@@ -447,4 +447,22 @@ impl Pool {
             Ok(())
         })
     }
+
+    /// Destroy all groups in the pool.
+    ///
+    /// This is called when the file is being closed to ensure all groups
+    /// are properly cleaned up (unbound if necessary) before being dropped.
+    pub(crate) fn destroy_all(self: Pin<&Self>, tdev: &TyrDevice) -> Result {
+        let max_index = self.free_index.load(core::sync::atomic::Ordering::Relaxed);
+
+        // Try to destroy all possible groups from 0 to free_index as there's no
+        // iterator implementation in xarray.rs.
+        for index in 0..max_index {
+            if let Ok(_) = self.destroy_group(tdev, index) {
+                pr_info!("Destroyed group at index {}\n", index);
+            }
+        }
+
+        Ok(())
+    }
 }
