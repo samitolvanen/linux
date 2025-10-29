@@ -238,6 +238,24 @@ impl Scheduler {
         })
     }
 
+    pub(crate) fn set_csg_state(
+        &mut self,
+        data: &TyrData,
+        csg_idx: usize,
+        state: csg::GroupState,
+    ) -> Result {
+        if csg_idx >= self.csg_slot_count as usize {
+            return Err(EINVAL);
+        }
+
+        data.fw.with_locked_global_iface(|glb_iface| {
+            glb_iface.set_csg_state(csg_idx, state)?;
+            glb_iface.ring_csg_doorbell(csg_idx)?;
+            glb_iface.wait_csg_acks(csg_idx, csg::constants::CSG_STATE_MASK, 100)?;
+            Ok(())
+        })
+    }
+
     /// Unbind a group from group slot.
     pub(crate) fn unbind_group(
         &mut self,
@@ -353,6 +371,13 @@ impl Scheduler {
 
         input.ack_irq_mask = u32::MAX;
 
+        let group_state = group.with_locked_inner(|inner| Ok(inner.state))?;
+        let csg_state = if group_state == group::State::Suspended {
+            csg::GroupState::Resume
+        } else {
+            csg::GroupState::Start
+        };
+
         fw.with_locked_global_iface(|glb_iface| {
             let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
             csg_iface.write_input(input)?;
@@ -360,8 +385,13 @@ impl Scheduler {
             let db_req = csg_iface.doorbell_request()?;
             db_req.toggle_reqs(queue_mask)?;
 
-            glb_iface.set_csg_state(csg_idx, csg::GroupState::Start)?;
+            glb_iface.set_csg_state(csg_idx, csg_state)?;
             glb_iface.ring_csg_doorbell(csg_idx)
+        })?;
+
+        group.with_locked_inner(|inner| {
+            inner.state = group::State::Active;
+            Ok(())
         })
     }
 
@@ -399,20 +429,76 @@ impl Scheduler {
 
         if already_bound {
             let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id.unwrap()))?;
+            // pr_info!("Group already bound to CSG slot {}\n", csg_id);
             return Ok(());
         }
 
-        // Only search within the valid CSG slots (those initialized in firmware)
+        let csg_idx = self.find_free_slot(tdev)?;
+        pr_info!("Binding group to CSG slot {}\n", csg_idx);
+        self.bind_group(tdev, group, csg_idx)?;
+        self.program_csg_slot(tdev, csg_idx, Priority::Low)
+    }
+
+    /// Find a free slot by either searching within the valid CSG slots (those
+    /// initialized in firmware) or evicting an idle group.
+    fn find_free_slot(&mut self, tdev: &TyrDevice) -> Result<usize> {
         let csg_idx = self
             .csg_slots
             .iter()
             .take(self.csg_slot_count as usize)
-            .position(|slot| slot.is_none())
-            .ok_or(EBUSY)?;
+            .position(|slot| slot.is_none());
 
-        pr_info!("Using csg slot {csg_idx}\n");
-        self.bind_group(tdev, group, csg_idx)?;
-        self.program_csg_slot(tdev, csg_idx, Priority::Low)
+        if let Some(idx) = csg_idx {
+            Ok(idx)
+        } else {
+            self.evict_idle_group(tdev)
+        }
+    }
+
+    fn evict_idle_group(&mut self, tdev: &TyrDevice) -> Result<usize> {
+        let mut idx = None;
+        for (i, slot) in self
+            .csg_slots
+            .iter()
+            .take(self.csg_slot_count as usize)
+            .enumerate()
+        {
+            let Some(s) = slot else { continue };
+
+            let has_idle_queues = s.group.with_locked_inner(|inner| {
+                Ok(inner.queues.iter().all(|q| q.in_flight_jobs.is_empty()))
+            })?;
+
+            if has_idle_queues {
+                idx = Some(i);
+                break;
+            }
+        }
+
+        let idx = idx.ok_or_else(|| {
+            pr_info!("No idle group to evict\n");
+            EBUSY
+        })?;
+
+        if let Some(s) = &mut self.csg_slots[idx] {
+            s.idle = true;
+        }
+
+        self.set_csg_state(tdev, idx, csg::GroupState::Suspend)?;
+
+        if let Some(s) = &self.csg_slots[idx] {
+            s.group.with_locked_inner(|inner| {
+                inner.state = group::State::Suspended;
+                Ok(())
+            })?;
+        }
+
+        let evicted_slot = self.unbind_group(tdev, idx)?;
+        let priority = evicted_slot.priority;
+        self.idle_groups[priority as usize].push(evicted_slot.group.clone(), GFP_KERNEL)?;
+
+        pr_info!("Evicted idle group from CSG slot {}\n", idx);
+        Ok(idx)
     }
 
     // place a dummy instruction in the first CS for the given group and kick
