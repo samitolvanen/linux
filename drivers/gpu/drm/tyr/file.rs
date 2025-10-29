@@ -418,10 +418,23 @@ impl File {
 
     pub(crate) fn vm_get_state(
         _tdev: &TyrDevice,
-        _vmgetstate: &mut uapi::drm_panthor_vm_get_state,
-        _file: &DrmFile,
+        vmgetstate: &mut uapi::drm_panthor_vm_get_state,
+        file: &DrmFile,
     ) -> Result<u32> {
-        Err(ENOTSUPP)
+        let vm = file
+            .inner()
+            .vm_pool()
+            .get_vm(vmgetstate.vm_id as usize)
+            .ok_or(EINVAL)?;
+
+        let vm = vm.lock();
+        vmgetstate.state = if vm.unusable {
+            uapi::drm_panthor_vm_state_DRM_PANTHOR_VM_STATE_UNUSABLE
+        } else {
+            uapi::drm_panthor_vm_state_DRM_PANTHOR_VM_STATE_USABLE
+        };
+
+        Ok(0)
     }
 
     pub(crate) fn bo_create(
