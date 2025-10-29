@@ -16,6 +16,7 @@ use kernel::uaccess::UserSlice;
 use kernel::uapi;
 use kernel::xarray;
 use kernel::xarray::XArray;
+use pin_init::pinned_drop;
 
 use crate::driver::TyrDevice;
 use crate::driver::TyrDriver;
@@ -31,7 +32,7 @@ use crate::mmu::vm::{VmBindJob, VmOperation};
 use crate::sched::deps;
 use crate::sched::group;
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct File {
     /// A pool storing our VMs for this particular context.
     #[pin]
@@ -44,6 +45,9 @@ pub(crate) struct File {
     /// Each VM can have its own heap pool for tiler heap management.
     /// The heap pool is created on-demand when the first heap context is created.
     heap_pools: Pin<KBox<XArray<KBox<heap::Pool>>>>,
+
+    /// Reference to the device for cleanup
+    tdev: ARef<TyrDevice>,
 }
 
 /// Convenience type alias for our DRM `File` type
@@ -55,14 +59,34 @@ impl drm::file::DriverFile for File {
     fn open(dev: &DrmDevice<Self::Driver>) -> Result<Pin<KBox<Self>>> {
         dev_dbg!(dev.as_ref(), "drm::device::Device::open\n");
 
+        let tdev = ARef::from(dev);
+
         KBox::try_pin_init(
             try_pin_init!(Self {
                 vm_pool: Pool::create()?,
                 group_pool: group::Pool::create()?,
                 heap_pools <- KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?,
+                tdev,
             }),
             GFP_KERNEL,
         )
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for File {
+    fn drop(self: Pin<&mut Self>) {
+        pr_info!("Cleaning up DRM file resources\n");
+
+        // Destroy all groups (this unbinds them if necessary)
+        if let Err(e) = self.as_ref().group_pool().destroy_all(&self.tdev) {
+            pr_err!("Failed to destroy all groups: {:?}\n", e);
+        }
+
+        // Destroy all VMs
+        if let Err(e) = self.as_ref().vm_pool().destroy_all(self.tdev.iomem.clone()) {
+            pr_err!("Failed to destroy all VMs: {:?}\n", e);
+        }
     }
 }
 
