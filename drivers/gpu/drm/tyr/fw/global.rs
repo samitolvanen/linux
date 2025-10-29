@@ -452,6 +452,13 @@ impl GlobalInterface {
         shared_section.mem.size()
     }
 
+    pub(crate) fn wait_csg_acks(&self, csg_idx: usize, mask: u32, timeout_ms: u32) -> Result {
+        let glb = self.state.enabled()?;
+        let csg = glb.csgs.get(csg_idx).ok_or(EINVAL)?;
+        let req = csg.input_request()?;
+        req.wait_acks(mask, &self.event_wait, timeout_ms)
+    }
+
     /// Whether the firmware has booted or not.
     pub(crate) fn booted(&self) -> bool {
         self.booted
