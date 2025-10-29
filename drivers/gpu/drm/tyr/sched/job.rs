@@ -77,6 +77,10 @@ impl Job {
             sync_addr,
         })
     }
+
+    pub(crate) fn queue_idx(&self) -> usize {
+        self.queue_idx
+    }
 }
 
 impl JobImpl for Job {

@@ -522,11 +522,6 @@ impl File {
             return Err(EINVAL);
         }
 
-        if groupsubmit.queue_submits.count > 1 {
-            pr_err!("We do not support multiple queue submits yet");
-            return Err(ENOTSUPP);
-        }
-
         let mut reader = UserSlice::new(
             UserPtr::from_addr(groupsubmit.queue_submits.array as usize),
             groupsubmit.queue_submits.stride as usize * groupsubmit.queue_submits.count as usize,
