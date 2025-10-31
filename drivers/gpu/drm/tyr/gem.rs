@@ -3,20 +3,14 @@
 use core::ops::Range;
 
 use crate::driver::TyrDevice;
-use crate::driver::TyrDriver;
-use crate::file::DrmFile;
 use crate::file::DrmFile;
 use crate::mmu::vm;
-use crate::mmu::vm;
 use crate::mmu::vm::{LiveRange, Vm};
-use crate::mmu::vm::{LiveRange, Vm};
-use kernel::devres::Devres;
 use kernel::devres::Devres;
 use kernel::drm::gem;
 use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
 use kernel::drm::gem::{self};
-use kernel::io::mem::IoMem;
 use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -44,7 +38,7 @@ enum ObjectType {
 }
 
 /// Type alias for the GEM object type for this driver.
-pub(crate) type Object = gem::shmem::Object<DriverObject>;
+pub(crate) type Object = gem::shmem::Object<TyrObject>;
 
 pub(crate) struct GemArgs {
     ty: ObjectType,
@@ -63,22 +57,22 @@ impl gem::DriverObject for TyrObject {
     }
 }
 
-// impl gem::shmem::DriverObject for DriverObject {
+// impl gem::shmem::DriverObject for TyrObject {
 //     type Driver = TyrDriver;
 // }
 
 /// A shared reference to a GEM object for this driver.
 pub(crate) struct ObjectRef {
     /// The underlying GEM object reference
-    pub(crate) gem: ARef<shmem::Object<DriverObject>>,
+    pub(crate) gem: ARef<shmem::Object<TyrObject>>,
 
     /// The kernel-side VMap of this object, if any.
-    vmap: Option<shmem::VMap<DriverObject>>,
+    vmap: Option<shmem::VMap<TyrObject>>,
 }
 
 impl ObjectRef {
     /// Create a new wrapper for a raw GEM object reference.
-    pub(crate) fn new(gem: ARef<shmem::Object<DriverObject>>) -> ObjectRef {
+    pub(crate) fn new(gem: ARef<shmem::Object<TyrObject>>) -> ObjectRef {
         ObjectRef { gem, vmap: None }
     }
 
@@ -105,7 +99,7 @@ impl ObjectRef {
     }
 }
 
-type ObjectConfig<'a> = shmem::ObjectConfig<'a, DriverObject>;
+type ObjectConfig<'a> = shmem::ObjectConfig<'a, TyrObject>;
 
 /// Create a new DRM GEM object.
 pub(crate) fn new_object(dev: &TyrDevice, size: usize, flags: u32) -> Result<ObjectRef> {
@@ -131,10 +125,10 @@ pub(crate) fn new_object(dev: &TyrDevice, size: usize, flags: u32) -> Result<Obj
     // TODO: This is really bad but at this point seems to be the only way:
     // to be refactored
     // SAFETY: We are the only owners at this point
-    let mut obj = ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::into_raw(gem);
+    let mut obj = ARef::<kernel::drm::gem::shmem::Object<TyrObject>>::into_raw(gem);
     unsafe { obj.as_mut().flags = flags };
 
-    let gem = unsafe { ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::from_raw(obj) };
+    let gem = unsafe { ARef::<kernel::drm::gem::shmem::Object<TyrObject>>::from_raw(obj) };
 
     Ok(ObjectRef::new(gem))
 }

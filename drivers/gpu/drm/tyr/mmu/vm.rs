@@ -40,8 +40,8 @@ use kernel::types::ARef;
 
 use crate::driver::TyrDevice;
 use crate::gem;
-use crate::gem::DriverObject;
 use crate::gem::KernelVaPlacement;
+use crate::gem::TyrObject;
 use crate::gpu::GpuInfo;
 use crate::mmu::Mmu;
 use crate::regs;
@@ -58,7 +58,7 @@ const SZ_4G: u64 = 4 * kernel::bindings::SZ_1G as u64;
 
 pub(crate) struct Vm {
     /// A dummy object to serve as GPUVM's root. We need ownership of this.
-    _dummy_obj: ARef<shmem::Object<DriverObject>>,
+    _dummy_obj: ARef<shmem::Object<TyrObject>>,
 
     pub(super) gpuvm: ARef<kernel::drm::gpuvm::GpuVm<LockedVm>>,
 
