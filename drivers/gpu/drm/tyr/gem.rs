@@ -4,6 +4,7 @@ use core::ops::Range;
 
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
+use crate::driver::TyrDriver;
 use crate::file::DrmFile;
 use crate::mmu::vm;
 use crate::mmu::vm::{LiveRange, Vm};

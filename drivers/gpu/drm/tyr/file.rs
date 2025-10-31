@@ -15,13 +15,13 @@ use kernel::uaccess::UserSlice;
 use kernel::uapi;
 
 use crate::driver::TyrDevice;
+use crate::driver::TyrDriver;
 use crate::gem;
 use crate::mmu::vm;
 use crate::mmu::vm::pool::Pool;
 use crate::mmu::vm::VmLayout;
 use crate::mmu::vm::VmUserSize;
 use crate::sched::group;
-use crate::TyrDriver;
 
 #[pin_data]
 pub(crate) struct File {
