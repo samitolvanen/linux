@@ -9,9 +9,14 @@ use crate::driver::TyrDriver;
 
 mod driver;
 mod file;
+mod flags;
+mod fw;
 mod gem;
 mod gpu;
+mod mmu;
 mod regs;
+mod sched;
+mod wait;
 
 kernel::module_platform_driver! {
     type: TyrDriver,

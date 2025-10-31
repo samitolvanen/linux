@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
+pub(crate) mod irq;
 
 use kernel::bits::genmask_u32;
 use kernel::device::Bound;

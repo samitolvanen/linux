@@ -1,38 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-// We don't expect that all the registers and fields will be used, even in the
-// future.
-//
-// Nevertheless, it is useful to have most of them defined, like the C driver
-// does.
 #![allow(dead_code)]
 
-use kernel::bits::{bit_u32, bit_u64};
-use kernel::device::Bound;
-use kernel::device::Device;
+use kernel::bits::bit_u64;
 use kernel::devres::Devres;
-use kernel::prelude::*;
-
-use crate::driver::IoMem;
+use kernel::io::mem::IoMem;
+use kernel::{bits::bit_u32, prelude::*};
 
 /// Represents a register in the Register Set
-///
-/// TODO: Replace this with the Nova `register!()` macro when it is available.
-/// In particular, this will automatically give us 64bit register reads and
-/// writes.
 pub(crate) struct Register<const OFFSET: usize>;
 
 impl<const OFFSET: usize> Register<OFFSET> {
     #[inline]
-    pub(crate) fn read(&self, dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result<u32> {
-        let value = (*iomem).access(dev)?.read32(OFFSET);
-        Ok(value)
+    pub(crate) fn read(&self, iomem: &Devres<IoMem>) -> Result<u32> {
+        (*iomem).try_access().ok_or(ENODEV)?.try_read32(OFFSET)
     }
 
     #[inline]
-    pub(crate) fn write(&self, dev: &Device<Bound>, iomem: &Devres<IoMem>, value: u32) -> Result {
-        (*iomem).access(dev)?.write32(value, OFFSET);
-        Ok(())
+    pub(crate) fn write(&self, iomem: &Devres<IoMem>, value: u32) -> Result<()> {
+        (*iomem)
+            .try_access()
+            .ok_or(ENODEV)?
+            .try_write32(value, OFFSET)
     }
 }
 
@@ -45,23 +34,21 @@ pub(crate) const GPU_TILER_FEATURES: Register<0xc> = Register;
 pub(crate) const GPU_MEM_FEATURES: Register<0x10> = Register;
 pub(crate) const GPU_MMU_FEATURES: Register<0x14> = Register;
 pub(crate) const GPU_AS_PRESENT: Register<0x18> = Register;
-pub(crate) const GPU_IRQ_RAWSTAT: Register<0x20> = Register;
+pub(crate) const GPU_INT_RAWSTAT: Register<0x20> = Register;
 
-pub(crate) const GPU_IRQ_RAWSTAT_FAULT: u32 = bit_u32(0);
-pub(crate) const GPU_IRQ_RAWSTAT_PROTECTED_FAULT: u32 = bit_u32(1);
-pub(crate) const GPU_IRQ_RAWSTAT_RESET_COMPLETED: u32 = bit_u32(8);
-pub(crate) const GPU_IRQ_RAWSTAT_POWER_CHANGED_SINGLE: u32 = bit_u32(9);
-pub(crate) const GPU_IRQ_RAWSTAT_POWER_CHANGED_ALL: u32 = bit_u32(10);
-pub(crate) const GPU_IRQ_RAWSTAT_CLEAN_CACHES_COMPLETED: u32 = bit_u32(17);
-pub(crate) const GPU_IRQ_RAWSTAT_DOORBELL_STATUS: u32 = bit_u32(18);
-pub(crate) const GPU_IRQ_RAWSTAT_MCU_STATUS: u32 = bit_u32(19);
+pub(crate) const GPU_INT_RAWSTAT_FAULT: u32 = bit_u32(0);
+pub(crate) const GPU_INT_RAWSTAT_PROTECTED_FAULT: u32 = bit_u32(1);
+pub(crate) const GPU_INT_RAWSTAT_RESET_COMPLETED: u32 = bit_u32(8);
+pub(crate) const GPU_INT_RAWSTAT_POWER_CHANGED_SINGLE: u32 = bit_u32(9);
+pub(crate) const GPU_INT_RAWSTAT_POWER_CHANGED_ALL: u32 = bit_u32(10);
+pub(crate) const GPU_INT_RAWSTAT_CLEAN_CACHES_COMPLETED: u32 = bit_u32(17);
+pub(crate) const GPU_INT_RAWSTAT_DOORBELL_STATUS: u32 = bit_u32(18);
+pub(crate) const GPU_INT_RAWSTAT_MCU_STATUS: u32 = bit_u32(19);
 
-pub(crate) const GPU_IRQ_CLEAR: Register<0x24> = Register;
-pub(crate) const GPU_IRQ_MASK: Register<0x28> = Register;
-pub(crate) const GPU_IRQ_STAT: Register<0x2c> = Register;
+pub(crate) const GPU_INT_CLEAR: Register<0x24> = Register;
+pub(crate) const GPU_INT_MASK: Register<0x28> = Register;
+pub(crate) const GPU_INT_STAT: Register<0x2c> = Register;
 pub(crate) const GPU_CMD: Register<0x30> = Register;
-pub(crate) const GPU_CMD_SOFT_RESET: u32 = 1 | (1 << 8);
-pub(crate) const GPU_CMD_HARD_RESET: u32 = 1 | (2 << 8);
 pub(crate) const GPU_THREAD_FEATURES: Register<0xac> = Register;
 pub(crate) const GPU_THREAD_MAX_THREADS: Register<0xa0> = Register;
 pub(crate) const GPU_THREAD_MAX_WORKGROUP_SIZE: Register<0xa4> = Register;
@@ -95,17 +82,17 @@ pub(crate) const MCU_STATUS_FATAL: u32 = 3;
 
 pub(crate) const GPU_COHERENCY_FEATURES: Register<0x300> = Register;
 
-pub(crate) const JOB_IRQ_RAWSTAT: Register<0x1000> = Register;
-pub(crate) const JOB_IRQ_CLEAR: Register<0x1004> = Register;
-pub(crate) const JOB_IRQ_MASK: Register<0x1008> = Register;
-pub(crate) const JOB_IRQ_STAT: Register<0x100c> = Register;
+pub(crate) const JOB_INT_RAWSTAT: Register<0x1000> = Register;
+pub(crate) const JOB_INT_CLEAR: Register<0x1004> = Register;
+pub(crate) const JOB_INT_MASK: Register<0x1008> = Register;
+pub(crate) const JOB_INT_STAT: Register<0x100c> = Register;
 
-pub(crate) const JOB_IRQ_GLOBAL_IF: u32 = bit_u32(31);
+pub(crate) const JOB_INT_GLOBAL_IF: u32 = bit_u32(31);
 
-pub(crate) const MMU_IRQ_RAWSTAT: Register<0x2000> = Register;
-pub(crate) const MMU_IRQ_CLEAR: Register<0x2004> = Register;
-pub(crate) const MMU_IRQ_MASK: Register<0x2008> = Register;
-pub(crate) const MMU_IRQ_STAT: Register<0x200c> = Register;
+pub(crate) const MMU_INT_RAWSTAT: Register<0x2000> = Register;
+pub(crate) const MMU_INT_CLEAR: Register<0x2004> = Register;
+pub(crate) const MMU_INT_MASK: Register<0x2008> = Register;
+pub(crate) const MMU_INT_STAT: Register<0x200c> = Register;
 
 pub(crate) const AS_TRANSCFG_ADRMODE_UNMAPPED: u64 = bit_u64(0);
 pub(crate) const AS_TRANSCFG_ADRMODE_IDENTITY: u64 = bit_u64(1);

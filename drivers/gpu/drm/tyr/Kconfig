@@ -15,6 +15,7 @@ config DRM_TYR
 	depends on RUST
 	depends on ARM || ARM64 || COMPILE_TEST
 	depends on !GENERIC_ATOMIC64  # for IOMMU_IO_PGTABLE_LPAE
+	depends on RUST_FW_LOADER_ABSTRACTIONS
 	depends on MMU
 	select DRM_TYR_STATIC_DEPS
 	select IOMMU_IO_PGTABLE_LPAE
