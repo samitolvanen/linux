@@ -4,16 +4,6 @@
 
 use core::ops::Range;
 
-use cursor::Cursor;
-use kernel::alloc::KVec;
-use kernel::bits::bit_u32;
-use kernel::c_str;
-use kernel::devres::Devres;
-use kernel::prelude::*;
-use kernel::str::CString;
-use kernel::sync::Arc;
-use kernel::sync::Mutex;
-
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::fw::Firmware;
@@ -24,6 +14,16 @@ use crate::gpu::GpuId;
 use crate::gpu::GpuInfo;
 use crate::mmu::vm;
 use crate::mmu::vm::Vm;
+use cursor::Cursor;
+use kernel::alloc::KVec;
+use kernel::bits::bit_u32;
+use kernel::c_str;
+use kernel::devres::Devres;
+use kernel::drm::gem::BaseObject;
+use kernel::prelude::*;
+use kernel::str::CString;
+use kernel::sync::Arc;
+use kernel::sync::Mutex;
 
 mod cursor;
 
@@ -531,12 +531,14 @@ impl Firmware {
         )?;
 
         let vmap = mem.vmap()?;
-        let vmap = vmap.as_mut_slice();
+        let size = vmap.owner().size();
+        let mut vmap = vmap.get();
+        let bytes = unsafe { vmap.as_mut_slice(0, size)? };
 
-        vmap[0..data.len()].copy_from_slice(&data);
+        bytes[0..data.len()].copy_from_slice(&data);
 
         if hdr.flags.contains(flags::ZERO) {
-            vmap[data.len()..].fill(0);
+            bytes[data.len()..].fill(0);
         }
 
         dev_info!(

@@ -55,12 +55,12 @@ impl SharedSectionRange {
     fn as_mut_ptr(&self) -> Result<*mut core::ffi::c_void> {
         let mut shared_section = self.shared_section.lock();
         let vmap = shared_section.mem.vmap()?;
-        let vmap = vmap.as_mut_ptr();
+        let vmap = vmap.get().as_mut_ptr();
 
         // SAFETY: safe by the type invariant.
         let offset = unsafe { vmap.add(self.start) };
 
-        Ok(offset)
+        Ok(offset as *mut core::ffi::c_void)
     }
 
     fn read<T>(&self) -> Result<T> {

@@ -90,7 +90,7 @@ macro_rules! impl_sync_rw {
                 }
 
                 let vmap = mem.vmap()?;
-                let ptr = unsafe { vmap.as_mut_ptr().add(offset).cast::<Self>() };
+                let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
                 // SAFETY: we know that this pointer is aligned and valid for reads for
                 // at least size_of::<Self>() bytes.
                 Ok(unsafe { core::ptr::read_volatile(ptr) })
@@ -109,7 +109,7 @@ macro_rules! impl_sync_rw {
                 }
 
                 let vmap = mem.vmap()?;
-                let ptr = unsafe { vmap.as_mut_ptr().add(offset).cast::<Self>() };
+                let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
                 // SAFETY: we know that this pointer is aligned and valid for writes for
                 // at least size_of::<Self>() bytes.
                 unsafe { core::ptr::write_volatile(ptr, value) };

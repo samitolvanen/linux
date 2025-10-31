@@ -4,6 +4,7 @@ use core::sync::atomic::AtomicUsize;
 
 use kernel::bits::{genmask_checked_u32, genmask_u32};
 use kernel::dma_fence::UserFence;
+use kernel::drm::gem::BaseObject;
 use kernel::drm::syncobj::SyncObj;
 use kernel::kvec;
 use kernel::new_mutex;
@@ -215,7 +216,8 @@ impl Group {
         )?;
 
         let vmap = syncobjs.vmap()?;
-        vmap.as_mut_slice().fill(0);
+        let size = vmap.owner().size();
+        unsafe { vmap.get().as_mut_slice(0, size)?.fill(0) };
 
         let mut queues = kvec![];
         for i in 0..group_args.queues.count {

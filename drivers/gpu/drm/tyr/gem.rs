@@ -67,7 +67,7 @@ pub(crate) struct ObjectRef {
     pub(crate) gem: ARef<shmem::Object<TyrObject>>,
 
     /// The kernel-side VMap of this object, if any.
-    vmap: Option<shmem::VMap<TyrObject>>,
+    vmap: Option<shmem::VMap<TyrObject, u8>>,
 }
 
 impl ObjectRef {
@@ -77,9 +77,9 @@ impl ObjectRef {
     }
 
     /// Return the `VMap` for this object, creating it if necessary.
-    pub(crate) fn vmap(&mut self) -> Result<&mut shmem::VMap<DriverObject>> {
+    pub(crate) fn vmap(&mut self) -> Result<&mut shmem::VMap<TyrObject, u8>> {
         if self.vmap.is_none() {
-            self.vmap = Some(self.gem.vmap()?);
+            self.vmap = Some(self.gem.vmap()?.into());
         }
         Ok(self.vmap.as_mut().unwrap())
     }

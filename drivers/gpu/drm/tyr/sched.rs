@@ -5,6 +5,7 @@ use kernel::bits::checked_bit_u32;
 use kernel::bits::genmask_u32;
 use kernel::c_str;
 use kernel::dma_fence::UserFence;
+use kernel::drm::gem::BaseObject;
 use kernel::drm::syncobj::SyncObj;
 use kernel::kvec;
 use kernel::prelude::*;
@@ -405,8 +406,11 @@ impl Scheduler {
         kernel::time::delay::fsleep(Delta::from_millis(100));
 
         // Read the address where the GPU is supposed to have written the value.
-        let vmap = debug_gem.vmap()?.as_slice();
-        let value = u32::from_le_bytes(vmap[0..4].try_into().unwrap());
+        let vmap = debug_gem.vmap()?;
+        let size = vmap.owner().size();
+        let vmap = vmap.get();
+        let bytes = unsafe { vmap.as_slice(0, size)? };
+        let value = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
 
         pr_info!("issue_dummy_instr expected 0xdeadbeef, got 0x{:x}\n", value);
         Ok(())

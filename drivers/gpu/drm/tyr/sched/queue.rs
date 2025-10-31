@@ -6,6 +6,7 @@ use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::dma_fence::FenceContexts;
 use kernel::dma_fence::UserFence;
+use kernel::drm::gem::BaseObject;
 use kernel::drm::sched;
 use kernel::drm::sched::Entity;
 use kernel::drm::sched::Scheduler;
@@ -167,9 +168,11 @@ impl Queue {
         let range = cs_insert..cs_insert + instrs.len();
 
         let ringbuf = self.ringbuf.vmap()?;
-        let ringbuf = ringbuf.as_mut_slice();
+        let size = ringbuf.owner().size();
+        let mut ringbuf = ringbuf.get();
+        let bytes = unsafe { ringbuf.as_mut_slice(0, size)? };
 
-        ringbuf[range].copy_from_slice(instrs);
+        bytes[range].copy_from_slice(instrs);
 
         // Make sure that the ring buffer is updated before the INSERT register.
         kernel::sync::barrier::smp_wmb();
@@ -237,7 +240,8 @@ impl Interfaces {
     pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
         let vmap = self.mem.vmap()?;
         let input = unsafe {
-            vmap.as_mut_ptr()
+            vmap.get()
+                .as_mut_ptr()
                 .add(self.input_offset)
                 .cast::<RingBufferInput>()
                 .read_volatile()
@@ -249,7 +253,8 @@ impl Interfaces {
     pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
         let vmap = self.mem.vmap()?;
         unsafe {
-            vmap.as_mut_ptr()
+            vmap.get()
+                .as_mut_ptr()
                 .add(self.input_offset)
                 .cast::<RingBufferInput>()
                 .write_volatile(value)
@@ -261,7 +266,8 @@ impl Interfaces {
     pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
         let vmap = self.mem.vmap()?;
         let output = unsafe {
-            vmap.as_mut_ptr()
+            vmap.get()
+                .as_mut_ptr()
                 .add(self.output_offset)
                 .cast::<RingBufferOutput>()
                 .read_volatile()
