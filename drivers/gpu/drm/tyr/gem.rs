@@ -49,7 +49,7 @@ impl gem::DriverObject for TyrObject {
     type Driver = TyrDriver;
     type Args = GemArgs;
 
-    fn new(_dev: &TyrDevice, _size: usize, _args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &TyrDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         try_pin_init!(TyrObject {
             ty: args.ty,
             flags: args.flags,
