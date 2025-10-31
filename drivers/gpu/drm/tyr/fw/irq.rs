@@ -5,6 +5,7 @@
 //! The Job IRQ controls our interactions with the MCU.
 
 use kernel::c_str;
+use kernel::device::{Bound, Device};
 use kernel::devres::Devres;
 use kernel::irq::ThreadedRegistration;
 use kernel::platform;
@@ -32,7 +33,7 @@ pub(crate) fn job_irq_init<'a>(
     event_wait: Arc<Wait>,
     boot_wait: Arc<Wait>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<JobIrq>>, Error> + 'a> {
-    crate::regs::JOB_INT_MASK.write(&iomem, u32::MAX)?;
+    crate::regs::JOB_IRQ_MASK.write(pdev.as_ref(), &iomem, u32::MAX)?;
 
     let irq_type = JobIrq {
         iomem: iomem.clone(),
@@ -44,24 +45,28 @@ pub(crate) fn job_irq_init<'a>(
 }
 
 impl TyrIrqTrait for JobIrq {
-    fn read_status(&self) -> u32 {
-        regs::JOB_INT_STAT.read(&self.iomem).unwrap_or_default()
+    fn read_status(&self, dev: &Device<Bound>) -> u32 {
+        regs::JOB_IRQ_STAT
+            .read(dev, &self.iomem)
+            .unwrap_or_default()
     }
 
-    fn disable_all(&self) {
-        let _ = regs::JOB_INT_MASK.write(&self.iomem, 0);
+    fn disable_all(&self, dev: &Device<Bound>) {
+        let _ = regs::JOB_IRQ_MASK.write(dev, &self.iomem, 0);
     }
 
-    fn reenable(&self) {
-        let _ = regs::JOB_INT_MASK.write(&self.iomem, self.mask());
+    fn reenable(&self, dev: &Device<Bound>) {
+        let _ = regs::JOB_IRQ_MASK.write(dev, &self.iomem, self.mask());
     }
 
-    fn read_raw_status(&self) -> u32 {
-        regs::JOB_INT_RAWSTAT.read(&self.iomem).unwrap_or_default()
+    fn read_raw_status(&self, dev: &Device<Bound>) -> u32 {
+        regs::JOB_IRQ_RAWSTAT
+            .read(dev, &self.iomem)
+            .unwrap_or_default()
     }
 
-    fn clear_status(&self, status: u32) {
-        let _ = regs::JOB_INT_CLEAR.write(&self.iomem, status);
+    fn clear_status(&self, dev: &Device<Bound>, status: u32) {
+        let _ = regs::JOB_IRQ_CLEAR.write(dev, &self.iomem, status);
     }
 
     fn mask(&self) -> u32 {
@@ -72,7 +77,7 @@ impl TyrIrqTrait for JobIrq {
         self.event_wait.notify_all();
 
         let _ = tdev.fw.with_locked_global_iface(|glb| {
-            if status & regs::JOB_INT_GLOBAL_IF != 0 && !glb.booted {
+            if status & regs::JOB_IRQ_GLOBAL_IF != 0 && !glb.booted {
                 glb.booted = true;
             }
             Ok(())

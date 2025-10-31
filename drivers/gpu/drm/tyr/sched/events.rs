@@ -20,7 +20,7 @@ use crate::fw::global::csg;
 use crate::fw::global::csg::CommandStreamGroup;
 use crate::fw::global::GlobalInterface;
 use crate::fw::SharedSectionEntry;
-use crate::regs::JOB_INT_GLOBAL_IF;
+use crate::regs::JOB_IRQ_GLOBAL_IF;
 use crate::sched::Scheduler;
 
 use super::group::Group;
@@ -33,9 +33,9 @@ impl Scheduler {
         let fw = &data.fw;
         let mut events = self.events.take().unwrap_or_default();
 
-        if events & JOB_INT_GLOBAL_IF != 0 {
+        if events & JOB_IRQ_GLOBAL_IF != 0 {
             // We don't support global events yet.
-            events &= !JOB_INT_GLOBAL_IF;
+            events &= !JOB_IRQ_GLOBAL_IF;
         }
 
         fw.with_locked_global_iface(|glb| {

@@ -490,10 +490,6 @@ impl WorkItem<0> for TyrData {
                 "Ping failed: {}, the firmware probably crashed\n",
                 err.to_errno()
             );
-
-            if let Ok(mcu_status) = crate::regs::MCU_STATUS.read(&this.iomem) {
-                pr_err!("MCU_STATUS is {}\n", mcu_status);
-            }
         }
     }
 }

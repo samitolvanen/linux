@@ -6,6 +6,7 @@
 //! addresses.
 
 use kernel::c_str;
+use kernel::device::{Bound, Device};
 use kernel::devres::Devres;
 use kernel::irq::ThreadedRegistration;
 use kernel::platform;
@@ -29,7 +30,7 @@ pub(crate) fn mmu_irq_init<'a>(
     pdev: &'a platform::Device<kernel::device::Bound>,
     iomem: Arc<Devres<IoMem>>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<MmuIrq>>, Error> + 'a> {
-    crate::regs::MMU_INT_MASK.write(&iomem, u32::MAX)?;
+    crate::regs::MMU_IRQ_MASK.write(pdev.as_ref(), &iomem, u32::MAX)?;
 
     let irq_type = MmuIrq {
         iomem: iomem.clone(),
@@ -39,24 +40,28 @@ pub(crate) fn mmu_irq_init<'a>(
 }
 
 impl TyrIrqTrait for MmuIrq {
-    fn read_status(&self) -> u32 {
-        regs::MMU_INT_STAT.read(&self.iomem).unwrap_or_default()
+    fn read_status(&self, dev: &Device<Bound>) -> u32 {
+        regs::MMU_IRQ_STAT
+            .read(dev, &self.iomem)
+            .unwrap_or_default()
     }
 
-    fn disable_all(&self) {
-        let _ = regs::MMU_INT_MASK.write(&self.iomem, 0);
+    fn disable_all(&self, dev: &Device<Bound>) {
+        let _ = regs::MMU_IRQ_MASK.write(dev, &self.iomem, 0);
     }
 
-    fn reenable(&self) {
-        let _ = regs::MMU_INT_MASK.write(&self.iomem, self.mask());
+    fn reenable(&self, dev: &Device<Bound>) {
+        let _ = regs::MMU_IRQ_MASK.write(dev, &self.iomem, self.mask());
     }
 
-    fn read_raw_status(&self) -> u32 {
-        regs::MMU_INT_RAWSTAT.read(&self.iomem).unwrap_or_default()
+    fn read_raw_status(&self, dev: &Device<Bound>) -> u32 {
+        regs::MMU_IRQ_RAWSTAT
+            .read(dev, &self.iomem)
+            .unwrap_or_default()
     }
 
-    fn clear_status(&self, status: u32) {
-        let _ = regs::MMU_INT_CLEAR.write(&self.iomem, status);
+    fn clear_status(&self, dev: &Device<Bound>, status: u32) {
+        let _ = regs::MMU_IRQ_CLEAR.write(dev, &self.iomem, status);
     }
 
     fn mask(&self) -> u32 {

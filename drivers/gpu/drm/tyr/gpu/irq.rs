@@ -3,6 +3,7 @@
 //! GPU IRQ handler.
 
 use kernel::c_str;
+use kernel::device::{Bound, Device};
 use kernel::devres::Devres;
 use kernel::irq::ThreadedRegistration;
 use kernel::platform;
@@ -28,7 +29,7 @@ pub(crate) fn gpu_irq_init<'a>(
     iomem: Arc<Devres<IoMem>>,
     power_on_wait: Arc<Wait<bool>>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<GpuIrq>>, Error> + 'a> {
-    crate::regs::GPU_INT_MASK.write(&iomem, u32::MAX)?;
+    crate::regs::GPU_IRQ_MASK.write(pdev.as_ref(), &iomem, u32::MAX)?;
 
     let irq_type = GpuIrq {
         iomem: iomem.clone(),
@@ -39,24 +40,28 @@ pub(crate) fn gpu_irq_init<'a>(
 }
 
 impl TyrIrqTrait for GpuIrq {
-    fn read_status(&self) -> u32 {
-        regs::GPU_INT_STAT.read(&self.iomem).unwrap_or_default()
+    fn read_status(&self, dev: &Device<Bound>) -> u32 {
+        regs::GPU_IRQ_STAT
+            .read(dev, &self.iomem)
+            .unwrap_or_default()
     }
 
-    fn disable_all(&self) {
-        let _ = regs::GPU_INT_MASK.write(&self.iomem, 0);
+    fn disable_all(&self, dev: &Device<Bound>) {
+        let _ = regs::GPU_IRQ_MASK.write(dev, &self.iomem, 0);
     }
 
-    fn reenable(&self) {
-        let _ = regs::GPU_INT_MASK.write(&self.iomem, self.mask());
+    fn reenable(&self, dev: &Device<Bound>) {
+        let _ = regs::GPU_IRQ_MASK.write(dev, &self.iomem, self.mask());
     }
 
-    fn read_raw_status(&self) -> u32 {
-        regs::GPU_INT_RAWSTAT.read(&self.iomem).unwrap_or_default()
+    fn read_raw_status(&self, dev: &Device<Bound>) -> u32 {
+        regs::GPU_IRQ_RAWSTAT
+            .read(dev, &self.iomem)
+            .unwrap_or_default()
     }
 
-    fn clear_status(&self, status: u32) {
-        let _ = regs::GPU_INT_CLEAR.write(&self.iomem, status);
+    fn clear_status(&self, dev: &Device<Bound>, status: u32) {
+        let _ = regs::GPU_IRQ_CLEAR.write(dev, &self.iomem, status);
     }
 
     fn mask(&self) -> u32 {
@@ -65,9 +70,9 @@ impl TyrIrqTrait for GpuIrq {
 
     fn handle(&self, _: &TyrDevice, status: u32) {
         if status
-            == regs::GPU_INT_RAWSTAT_RESET_COMPLETED
-                | regs::GPU_INT_RAWSTAT_POWER_CHANGED_SINGLE
-                | regs::GPU_INT_RAWSTAT_POWER_CHANGED_ALL
+            == regs::GPU_IRQ_RAWSTAT_RESET_COMPLETED
+                | regs::GPU_IRQ_RAWSTAT_POWER_CHANGED_SINGLE
+                | regs::GPU_IRQ_RAWSTAT_POWER_CHANGED_ALL
         {
             let _ = self.power_on_wait.with_locked_data(|powered_on| {
                 *powered_on = true;
