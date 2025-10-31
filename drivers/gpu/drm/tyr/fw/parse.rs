@@ -9,12 +9,12 @@ use kernel::alloc::KVec;
 use kernel::bits::bit_u32;
 use kernel::c_str;
 use kernel::devres::Devres;
-use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::str::CString;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::fw::Firmware;
 use crate::fw::CSF_MCU_SHARED_REGION_START;

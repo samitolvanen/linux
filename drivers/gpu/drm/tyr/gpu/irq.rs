@@ -4,13 +4,13 @@
 
 use kernel::c_str;
 use kernel::devres::Devres;
-use kernel::io::mem::IoMem;
 use kernel::irq::ThreadedRegistration;
 use kernel::platform;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::types::ARef;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::driver::TyrIrq;
 use crate::driver::TyrIrqTrait;

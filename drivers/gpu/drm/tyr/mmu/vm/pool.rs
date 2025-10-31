@@ -6,7 +6,6 @@
 use core::sync::atomic::AtomicUsize;
 
 use kernel::devres::Devres;
-use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
@@ -14,6 +13,7 @@ use kernel::types::ARef;
 use kernel::xarray;
 use kernel::xarray::XArray;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::mmu::vm::Vm;
 use crate::mmu::vm::VmLayout;

@@ -10,13 +10,13 @@ use kernel::drm::sched;
 use kernel::drm::sched::Entity;
 use kernel::drm::sched::Scheduler;
 use kernel::drm::syncobj::SyncObj;
-use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sizes::SZ_64K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::file::QueueCreate;
 use crate::file::QueueSubmit;

@@ -13,7 +13,6 @@ use core::ops::Range;
 use kernel::devres::Devres;
 use kernel::drm::gpuvm::DriverGpuVa;
 use kernel::drm::gpuvm::{self};
-use kernel::io::mem::IoMem;
 use kernel::io_pgtable::IoPageTable;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::prelude::*;
@@ -21,6 +20,7 @@ use kernel::sync::Arc;
 use kernel::types::ARef;
 
 use crate::driver;
+use crate::driver::IoMem;
 use crate::mmu::vm;
 use crate::mmu::Mmu;
 

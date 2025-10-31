@@ -6,7 +6,6 @@ use as_lock::AsLockToken;
 use faults::decode_faults;
 use kernel::devres::Devres;
 use kernel::io;
-use kernel::io::mem::IoMem;
 use kernel::io_pgtable;
 use kernel::new_mutex;
 use kernel::platform;
@@ -18,6 +17,7 @@ use kernel::types::ForeignOwnable;
 use vm::Vm;
 use vm::VmLayout;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::gpu::GpuInfo;
 use crate::regs::*;

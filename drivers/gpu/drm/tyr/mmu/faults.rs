@@ -2,10 +2,10 @@
 
 //! Fault reporting.
 
+use crate::driver::IoMem;
 use crate::regs::*;
 use kernel::c_str;
 use kernel::devres::Devres;
-use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::str::CStr;
 

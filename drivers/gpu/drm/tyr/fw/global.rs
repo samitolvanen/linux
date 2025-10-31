@@ -10,7 +10,6 @@ use kernel::clk::Clk;
 use kernel::devres::Devres;
 use kernel::impl_has_delayed_work;
 use kernel::io;
-use kernel::io::mem::IoMem;
 use kernel::kvec;
 use kernel::new_mutex;
 use kernel::prelude::*;
@@ -21,6 +20,7 @@ use kernel::time;
 use kernel::workqueue;
 use kernel::workqueue::WorkItem;
 
+use crate::driver::IoMem;
 use crate::driver::TyrData;
 use crate::driver::TyrDevice;
 use crate::fw::impl_shared_section_read;

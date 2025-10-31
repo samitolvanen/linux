@@ -4,7 +4,6 @@ use global::GlobalInterface;
 use kernel::bindings::SZ_1G;
 use kernel::devres::Devres;
 use kernel::firmware;
-use kernel::io::mem::IoMem;
 use kernel::new_mutex;
 use kernel::platform;
 use kernel::prelude::*;
@@ -13,6 +12,7 @@ use kernel::sync::Arc;
 use kernel::sync::Mutex;
 use parse::Section;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::gem;
 use crate::gem::KernelVaPlacement;

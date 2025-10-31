@@ -2,6 +2,7 @@
 
 use core::ops::Range;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::file::DrmFile;
 use crate::mmu::vm;
@@ -11,7 +12,6 @@ use kernel::drm::gem;
 use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
 use kernel::drm::gem::{self};
-use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;

@@ -6,9 +6,9 @@ use core::ops::Range;
 
 use kernel::bits::{genmask_checked_u64, genmask_u64};
 use kernel::devres::Devres;
-use kernel::io::mem::IoMem;
 use kernel::prelude::*;
 
+use crate::driver::IoMem;
 use crate::mmu::Mmu;
 use crate::regs::*;
 

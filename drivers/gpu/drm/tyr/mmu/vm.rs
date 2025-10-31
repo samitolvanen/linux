@@ -29,7 +29,6 @@ use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::ExecToken;
-use kernel::io::mem::IoMem;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
 use kernel::platform;
@@ -38,6 +37,7 @@ use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::types::ARef;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::gem;
 use crate::gem::KernelVaPlacement;
