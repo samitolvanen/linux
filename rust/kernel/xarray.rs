@@ -84,6 +84,32 @@ pub enum AllocKind {
     Alloc1,
 }
 
+/// Represents a range of valid allocation IDs for XArray allocation functions.
+///
+/// Wraps the C `struct xa_limit`.
+pub struct XaLimit {
+    // This is just two integers. The overhead of wrapping this in Opaque<T> is
+    // not worth it IMHO.
+    inner: bindings::xa_limit,
+}
+
+impl XaLimit {
+    /// The full 32-bit range `[0, u32::MAX]`.
+    pub const LIMIT_32B: Self = Self {
+        inner: bindings::xa_limit {
+            min: 0,
+            max: u32::MAX,
+        },
+    };
+
+    /// Create a custom range.
+    pub const fn new(min: u32, max: u32) -> Self {
+        Self {
+            inner: bindings::xa_limit { min, max },
+        }
+    }
+}
+
 impl<T: ForeignOwnable> XArray<T> {
     /// Creates a new initializer for this type.
     pub fn new(kind: AllocKind) -> impl PinInit<Self> {
@@ -215,6 +241,106 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
         // - `&mut self` guarantees that the lifetimes of [`T::Borrowed`] and [`T::BorrowedMut`]
         // borrowed from `self` have ended.
         unsafe { T::try_from_foreign(ptr) }
+    }
+
+    /// Allocates an unused index and stores the element there.
+    ///
+    /// The index is allocated within the given `limit` range.
+    ///
+    /// On success, returns the allocated index.
+    ///
+    /// On failure, returns the element which was not stored.
+    pub fn alloc(
+        &mut self,
+        value: T,
+        limit: XaLimit,
+        gfp: alloc::Flags,
+    ) -> Result<u32, StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+        let mut id: u32 = 0;
+
+        // SAFETY:
+        // - `self.xa.xa` is always valid by the type invariant.
+        // - The caller holds the lock.
+        //
+        // INVARIANT: `new` came from `T::into_foreign`.
+        let ret = unsafe {
+            bindings::__xa_alloc(
+                self.xa.xa.get(),
+                &mut id,
+                new.cast(),
+                limit.inner,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            // SAFETY: `new` came from `T::into_foreign` and `__xa_alloc` does not take
+            // ownership of the value on error.
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(ret),
+            })
+        } else {
+            Ok(id)
+        }
+    }
+
+    /// Allocates an unused index cyclically and stores the element there.
+    ///
+    /// The index is allocated within the given `limit` range, starting from `*next`.
+    /// On success, `*next` is updated to the value after the allocated index, ready
+    /// for the next call.
+    ///
+    /// Returns the allocated index on success, or the element on failure.
+    ///
+    /// The XArray should be initialized with [`AllocKind::Alloc`].
+    pub fn alloc_cyclic(
+        &mut self,
+        value: T,
+        limit: XaLimit,
+        next: &mut u32,
+        gfp: alloc::Flags,
+    ) -> Result<u32, StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+        let mut id: u32 = 0;
+
+        // SAFETY:
+        // - `self.xa.xa` is always valid by the type invariant.
+        // - The caller holds the lock.
+        //
+        // INVARIANT: `new` came from `T::into_foreign`.
+        let ret = unsafe {
+            bindings::__xa_alloc_cyclic(
+                self.xa.xa.get(),
+                &mut id,
+                new.cast(),
+                limit.inner,
+                next,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            // SAFETY: `new` came from `T::into_foreign` and `__xa_alloc_cyclic` does not take
+            // ownership of the value on error.
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(ret),
+            })
+        } else {
+            Ok(id)
+        }
     }
 
     /// Stores an element at the given index.

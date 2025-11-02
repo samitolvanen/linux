@@ -128,7 +128,6 @@ impl Context {
     fn alloc_chunk(&mut self, tdev: &TyrDevice) -> Result {
         let chunk_bo = {
             let mut chunk_bo = self.vm.with_lock_taken(|vm| {
-                pr_info!("Allocating heap chunk for context\n");
                 gem::new_kernel_object(
                     tdev,
                     tdev.iomem.clone(),

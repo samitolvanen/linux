@@ -32,7 +32,7 @@ use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::GpuVm;
 use kernel::drm::gpuvm::GpuVmCore;
 use kernel::drm::gpuvm::OpMapRequest;
-use kernel::drm::sched::Entity;
+use kernel::drm::job_queue::JobQueue;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
 use kernel::platform;
@@ -40,6 +40,7 @@ use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
+use kernel::time::msecs_to_jiffies;
 use kernel::types::ARef;
 
 use crate::driver::IoMem;
@@ -111,12 +112,8 @@ pub(crate) struct Vm {
     /// IoMem reference needed for VM operations.
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
-    /// DRM scheduler for async VM operations.
-    #[expect(dead_code)]
-    pub(crate) scheduler: kernel::drm::sched::Scheduler<VmBindJob>,
-
-    /// DRM scheduler entity for submitting jobs.
-    pub(crate) entity: kernel::drm::sched::Entity<VmBindJob>,
+    /// Job queue for async VM bind operations.
+    pub(crate) job_queue: JobQueue<bind_job::VmBindJobHandler>,
 }
 
 impl Vm {
@@ -166,11 +163,7 @@ impl Vm {
 
         let memattr = mair_to_memattr(page_table.cfg().mair);
 
-        let scheduler =
-            kernel::drm::sched::Scheduler::new(tdev.as_ref(), 1, 1, 1, 1000, c_str!("tyr_vm"))?;
-
-        let entity =
-            kernel::drm::sched::Entity::new(&scheduler, kernel::drm::sched::Priority::Low)?;
+        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), msecs_to_jiffies(5000))?;
 
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),
@@ -191,8 +184,7 @@ impl Vm {
             destroyed: false,
             unusable: false,
             iomem,
-            scheduler,
-            entity,
+            job_queue,
         })
     }
 
@@ -318,14 +310,14 @@ impl Vm {
         f(prepared_vm)
     }
 
-    /// Prepare the VM and provide access to both the PreparedVm and the entity.
+    /// Prepare the VM and provide access to both the PreparedVm and the job queue.
     ///
     /// This is needed to avoid borrow checker issues when we need to access
-    /// the entity while the ExecToken is held.
-    pub(crate) fn with_prepared_vm_and_entity<R>(
+    /// the job queue while the ExecToken is held.
+    pub(crate) fn with_prepared_vm_and_job_queue<R>(
         &mut self,
         num_slots: u32,
-        f: impl FnOnce(PreparedVm<'_>, &mut Entity<VmBindJob>) -> Result<R>,
+        f: impl FnOnce(PreparedVm<'_>, &JobQueue<bind_job::VmBindJobHandler>) -> Result<R>,
     ) -> Result<R> {
         let exec_token = exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
         let prepared_vm = PreparedVm {
@@ -333,7 +325,7 @@ impl Vm {
             num_slots,
         };
 
-        f(prepared_vm, &mut self.entity)
+        f(prepared_vm, &self.job_queue)
     }
 }
 
@@ -352,7 +344,7 @@ impl<'a> PreparedVm<'a> {
     /// avoids exposing the private `LockedVm` type.
     pub(crate) fn resv_add_fence(
         &mut self,
-        fence: &impl kernel::dma_fence::RawDmaFence,
+        fence: &kernel::dma_fence::PublicDmaFence,
         private_usage: u32,
         extobj_usage: u32,
     ) {

@@ -2,13 +2,15 @@
 
 //! A way to track the internal dependencies of a group submit.
 
+use crate::mmu::vm::bind_job::VmBindJobHandler;
 use kernel::alloc::KVec;
-use kernel::dma_fence::Fence;
 use kernel::dma_fence::FenceChain;
-use kernel::drm::sched::Entity;
+use kernel::dma_fence::PublicDmaFence;
+use kernel::drm::job_queue::JobQueue;
 use kernel::drm::syncobj::SyncObj;
 use kernel::prelude::*;
 use kernel::sync::Arc;
+use kernel::types::ARef;
 use kernel::uapi;
 
 use crate::driver::TyrDriver;
@@ -108,11 +110,11 @@ impl SyncOp {
 /// Fence type for sync signals
 enum SyncFence {
     /// Binary syncobj - just a fence
-    Binary(Option<Fence>),
+    Binary(Option<ARef<PublicDmaFence>>),
     /// Timeline syncobj - uses a fence chain, and stores current fence at this point
     Timeline {
         chain: FenceChain,
-        current_fence: Option<Fence>,
+        current_fence: Option<ARef<PublicDmaFence>>,
     },
 }
 
@@ -130,7 +132,7 @@ struct SyncSignal {
 
 impl SyncSignal {
     /// Get the current fence for this signal (if any)
-    fn current_fence(&self) -> Option<&Fence> {
+    fn current_fence(&self) -> Option<&ARef<PublicDmaFence>> {
         match &self.fence_type {
             SyncFence::Binary(fence) => fence.as_ref(),
             SyncFence::Timeline { current_fence, .. } => current_fence.as_ref(),
@@ -234,21 +236,18 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
-    /// Add jobs dependencies, arm jobs, and push them to the scheduler
-    ///
-    /// This method takes the entity as a parameter, processes jobs for the specified
-    /// queue_idx, and pushes them immediately to avoid lifetime conflicts.
+    /// Add jobs dependencies and submit them to the job queue.
     ///
     /// Returns a vector of finished fences that need to be added to reservation objects.
     pub(crate) fn add_deps_and_push_jobs(
         &mut self,
-        entity: &mut Entity<Job>,
+        job_queue: &JobQueue<super::job::TyrJobHandler>,
         queue_idx: usize,
-    ) -> Result<KVec<Fence>> {
+    ) -> Result<KVec<ARef<PublicDmaFence>>> {
         let mut finished_fences = KVec::new();
 
         for job_idx in 0..self.jobs.len() {
-            // Only process GPU jobs with this entity
+            // Only process GPU jobs for this queue
             match &self.jobs[job_idx].state {
                 JobState::Pending(JobType::Gpu(job)) => {
                     if job.queue_idx() != queue_idx {
@@ -268,38 +267,28 @@ impl<'a> Context<'a> {
                 }
             };
 
-            let mut pending_job = entity.new_job(1, 0, job)?;
-
-            for fence in fences {
-                pending_job.add_dependency(fence)?;
-            }
-
-            let mut armed_job = pending_job.arm();
-
-            let finished_fence = armed_job.fences().finished();
+            let finished_fence = job_queue.submit(job, &fences)?;
 
             // Update the sync signal fences with the job's completion fence
             self.update_job_syncs(job_idx, finished_fence.clone())?;
 
             finished_fences.push(finished_fence, GFP_KERNEL)?;
-
-            armed_job.push();
         }
 
         Ok(finished_fences)
     }
 
-    /// Add VM bind job dependencies, arm jobs, and push them to the scheduler.
+    /// Add VM bind job dependencies and submit them to the job queue.
     ///
     /// Returns a vector of finished fences that need to be added to reservation objects.
     pub(crate) fn add_deps_and_push_vm_bind_jobs(
         &mut self,
-        entity: &mut Entity<VmBindJob>,
-    ) -> Result<KVec<Fence>> {
+        job_queue: &JobQueue<VmBindJobHandler>,
+    ) -> Result<KVec<ARef<PublicDmaFence>>> {
         let mut finished_fences = KVec::new();
 
         for job_idx in 0..self.jobs.len() {
-            // Only process VM bind jobs with this entity
+            // Only process VM bind jobs
             match &self.jobs[job_idx].state {
                 JobState::Pending(JobType::VmBind(_)) => {}
                 JobState::Pending(JobType::Gpu(_)) => continue,
@@ -315,22 +304,12 @@ impl<'a> Context<'a> {
                 }
             };
 
-            let mut pending_job = entity.new_job(1, 0, job)?;
-
-            for fence in fences {
-                pending_job.add_dependency(fence)?;
-            }
-
-            let mut armed_job = pending_job.arm();
-
-            let finished_fence = armed_job.fences().finished();
+            let finished_fence = job_queue.submit(job, &fences)?;
 
             // Update the sync signal fences with the job's completion fence
             self.update_job_syncs(job_idx, finished_fence.clone())?;
 
             finished_fences.push(finished_fence, GFP_KERNEL)?;
-
-            armed_job.push();
         }
 
         Ok(finished_fences)
@@ -347,7 +326,7 @@ impl<'a> Context<'a> {
                 SyncFence::Binary(fence) => {
                     // For binary syncobjs, replace the fence
                     if let Some(fence) = fence {
-                        sig_sync.syncobj.replace_fence(Some(&fence));
+                        sig_sync.syncobj.replace_fence(Some(&*fence));
                     }
                 }
                 SyncFence::Timeline {
@@ -356,7 +335,7 @@ impl<'a> Context<'a> {
                 } => {
                     // For timeline syncobjs, add a point using the fence chain
                     if let Some(fence) = current_fence {
-                        sig_sync.syncobj.add_point(chain, &fence, sig_sync.point);
+                        sig_sync.syncobj.add_point(chain, &*fence, sig_sync.point);
                     }
                 }
             }
@@ -411,7 +390,7 @@ impl<'a> Context<'a> {
         self.add_sync_signal(handle, point)
     }
 
-    fn collect_job_deps(&self, job_idx: usize) -> Result<KVec<Fence>> {
+    fn collect_job_deps(&self, job_idx: usize) -> Result<KVec<ARef<PublicDmaFence>>> {
         let syncops = &self.jobs[job_idx].syncops;
         let mut deps = KVec::new();
 
@@ -443,7 +422,7 @@ impl<'a> Context<'a> {
         Ok(deps)
     }
 
-    fn update_job_syncs(&mut self, job_idx: usize, done_fence: Fence) -> Result {
+    fn update_job_syncs(&mut self, job_idx: usize, done_fence: ARef<PublicDmaFence>) -> Result {
         // Get the sync operations for this job
         let syncops = self.jobs[job_idx].syncops.clone();
 

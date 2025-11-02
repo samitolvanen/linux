@@ -17,9 +17,10 @@ use kernel::irq::IrqReturn;
 use kernel::irq::ThreadedHandler;
 use kernel::irq::ThreadedIrqReturn;
 use kernel::irq::ThreadedRegistration;
+use kernel::dma_fence::DmaFenceWork;
 use kernel::new_delayed_work;
+use kernel::new_dma_fence_work;
 use kernel::new_mutex;
-use kernel::new_work;
 use kernel::of;
 use kernel::opp;
 use kernel::platform;
@@ -33,7 +34,6 @@ use kernel::time;
 use kernel::types::ARef;
 use kernel::workqueue::DelayedWork;
 use kernel::workqueue::OwnedQueue;
-use kernel::workqueue::Work;
 use kernel::workqueue::WqFlags;
 use pin_init::pin_init_from_closure;
 
@@ -119,14 +119,14 @@ pub(crate) struct TyrData {
     sched: Mutex<SchedulerState>,
 
     #[pin]
-    pub(crate) tick_work: Work<Self, 1>,
+    pub(crate) tick_work: DmaFenceWork<Self, 1>,
 
     #[pin]
-    pub(crate) fw_events_work: Work<Self, 2>,
+    pub(crate) fw_events_work: DmaFenceWork<Self, 2>,
 
     /// The work to process group status updates.
     #[pin]
-    pub(crate) group_upd_work: Work<Self, 3>,
+    pub(crate) group_upd_work: DmaFenceWork<Self, 3>,
 
     pub(crate) reset_wq: OwnedQueue,
 }
@@ -332,9 +332,9 @@ impl platform::Driver for TyrDriver {
                 mmio_phys_addr,
                 ping_work <- new_delayed_work!("tyr-ping-work"),
                 sched <- new_mutex!(SchedulerState::Disabled),
-                tick_work <- new_work!("tyr_tick"),
-                fw_events_work <- new_work!("tyr-fw-events"),
-                group_upd_work <- new_work!("tyr-group-upd"),
+                tick_work <- new_dma_fence_work!("tyr_tick"),
+                fw_events_work <- new_dma_fence_work!("tyr-fw-events"),
+                group_upd_work <- new_dma_fence_work!("tyr-group-upd"),
                 reset_wq: OwnedQueue::new(c_str!("tyr-reset"), WqFlags::UNBOUND, 0)? // TODO: add WqFlags::ORDERED once it's available.
         });
 

@@ -1,522 +1,69 @@
 // SPDX-License-Identifier: GPL-2.0
+//
+// Copyright (C) 2025, 2026 Red Hat Inc.:
+//   - Philipp Stanner <pstanner@redhat.com>
 
 //! DMA fence abstraction.
 //!
 //! C header: [`include/linux/dma_fence.h`](../../include/linux/dma_fence.h)
 
-use crate::{
-    bindings,
-    error::{to_result, Result},
-    prelude::*,
-    sync::LockClassKey,
-    types::Opaque,
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::ops::{
+    Deref,
+    DerefMut, //
 };
-use core::fmt::Write;
-use core::ops::{Deref, DerefMut};
-use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{
+    AtomicU64,
+    Ordering, //
+};
 
-/// Any kind of DMA Fence Object
-///
-/// # Invariants
-/// raw() returns a valid pointer to a dma_fence and we own a reference to it.
-pub trait RawDmaFence: crate::private::Sealed {
-    /// Returns the raw `struct dma_fence` pointer.
-    fn raw(&self) -> *mut bindings::dma_fence;
+use pin_init::pin_init_from_closure;
 
-    /// Returns the raw `struct dma_fence` pointer and consumes the object.
-    ///
-    /// The caller is responsible for dropping the reference.
-    fn into_raw(self) -> *mut bindings::dma_fence
-    where
-        Self: Sized,
-    {
-        let ptr = self.raw();
-        core::mem::forget(self);
-        ptr
-    }
-
-    /// Advances this fence to the chain node which will signal this sequence number.
-    /// If no sequence number is provided, this returns `self` again.
-    /// If the seqno has already been signaled, returns None.
-    fn chain_find_seqno(self, seqno: u64) -> Result<Option<Fence>>
-    where
-        Self: Sized,
-    {
-        let mut ptr = self.into_raw();
-
-        // SAFETY: This will safely fail if this DmaFence is not a chain.
-        // `ptr` is valid per the type invariant.
-        let ret = unsafe { bindings::dma_fence_chain_find_seqno(&mut ptr, seqno) };
-
-        if ret != 0 {
-            // SAFETY: This is either an owned reference or NULL, dma_fence_put can handle both.
-            unsafe { bindings::dma_fence_put(ptr) };
-            Err(Error::from_errno(ret))
-        } else if ptr.is_null() {
-            Ok(None)
-        } else {
-            // SAFETY: ptr is valid and non-NULL as checked above.
-            Ok(Some(unsafe { Fence::from_raw(ptr) }))
-        }
-    }
-
-    /// Signal completion of this fence
-    fn signal(&self) -> Result {
-        // SAFETY: Safe to call on any valid dma_fence object
-        to_result(unsafe { bindings::dma_fence_signal(self.raw()) })
-    }
-
-    /// Set the error flag on this fence
-    fn set_error(&self, err: Error) {
-        // SAFETY: Safe to call on any valid dma_fence object
-        unsafe { bindings::dma_fence_set_error(self.raw(), err.to_errno()) };
-    }
-}
-
-/// A generic DMA Fence Object
-///
-/// # Invariants
-/// ptr is a valid pointer to a dma_fence and we own a reference to it.
-pub struct Fence {
-    ptr: *mut bindings::dma_fence,
-}
-
-impl Fence {
-    /// Create a new Fence object from a raw pointer to a dma_fence.
-    ///
-    /// # Safety
-    /// The caller must own a reference to the dma_fence, which is transferred to the new object.
-    pub(crate) unsafe fn from_raw(ptr: *mut bindings::dma_fence) -> Fence {
-        Fence { ptr }
-    }
-
-    /// Create a new Fence object from a raw pointer to a dma_fence.
-    ///
-    /// # Safety
-    /// Takes a borrowed reference to the dma_fence, and increments the reference count.
-    pub(crate) unsafe fn get_raw(ptr: *mut bindings::dma_fence) -> Fence {
-        // SAFETY: Pointer is valid per the safety contract
-        unsafe { bindings::dma_fence_get(ptr) };
-        Fence { ptr }
-    }
-
-    /// Create a new Fence object from a RawDmaFence.
-    pub fn from_fence(fence: &dyn RawDmaFence) -> Fence {
-        // SAFETY: Pointer is valid per the RawDmaFence contract
-        unsafe { Self::get_raw(fence.raw()) }
-    }
-
-    /// Signal the fence.
-    ///
-    /// This marks the fence as signaled, indicating that the operation it represents
-    /// has completed. This will wake up any waiters on this fence.
-    ///
-    /// Returns the previous fence status, or an error if the fence was already signaled.
-    pub fn signal(&self) -> Result<i32> {
-        // SAFETY: The fence pointer is valid and we're calling the C API to signal it
-        let ret = unsafe { bindings::dma_fence_signal(self.ptr) };
-        if ret < 0 {
-            Err(Error::from_errno(ret))
-        } else {
-            Ok(ret)
-        }
-    }
-
-    /// Set an error on the fence.
-    ///
-    /// This sets an error value on the fence, which will be returned to waiters.
-    /// This should be called before signaling the fence if an error occurred.
-    pub fn set_error(&self, error: i32) {
-        // SAFETY: The fence pointer is valid and we're calling the C API to set an error
-        unsafe { bindings::dma_fence_set_error(self.ptr, error) }
-    }
-
-    /// Get the error value from the fence.
-    ///
-    /// Returns the error value that was set on the fence, or 0 if no error occurred.
-    pub fn error(&self) -> i32 {
-        // SAFETY: The fence pointer is valid and we're accessing a simple field
-        unsafe { (*self.ptr).error }
-    }
-
-    /// Check if the fence has been signaled.
-    ///
-    /// Returns `true` if the fence has been signaled, `false` otherwise.
-    pub fn is_signaled(&self) -> bool {
-        // SAFETY: The fence pointer is valid and we're calling the C API.
-        unsafe { bindings::dma_fence_is_signaled(self.ptr) }
-    }
-
-    /// Wait for the fence to be signaled, blocking indefinitely.
-    ///
-    /// Returns an error if the wait was interrupted or another error occurred.
-    pub fn wait(&self) -> Result {
-        // SAFETY: The fence pointer is valid. We pass `0` for non-interruptible
-        // wait and `MAX_SCHEDULE_TIMEOUT` (LONG_MAX) to wait indefinitely.
-        let ret = unsafe {
-            bindings::dma_fence_wait_timeout(self.ptr, false, isize::MAX)
-        };
-        if ret < 0 {
-            Err(Error::from_errno(ret as i32))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl crate::private::Sealed for Fence {}
-
-impl RawDmaFence for Fence {
-    fn raw(&self) -> *mut bindings::dma_fence {
-        self.ptr
-    }
-}
-
-impl Drop for Fence {
-    fn drop(&mut self) {
-        // SAFETY: We own a reference to this syncobj.
-        unsafe { bindings::dma_fence_put(self.ptr) };
-    }
-}
-
-impl Clone for Fence {
-    fn clone(&self) -> Self {
-        // SAFETY: `ptr` is valid per the type invariant and we own a reference to it.
-        unsafe {
-            bindings::dma_fence_get(self.ptr);
-            Self::from_raw(self.ptr)
-        }
-    }
-}
-
-// SAFETY: The API for these objects is thread safe
-unsafe impl Sync for Fence {}
-// SAFETY: The API for these objects is thread safe
-unsafe impl Send for Fence {}
-
-/// Trait which must be implemented by driver-specific fence objects.
-#[vtable]
-pub trait FenceOps: Sized + Send + Sync {
-    /// True if this dma_fence implementation uses 64bit seqno, false otherwise.
-    const USE_64BIT_SEQNO: bool;
-
-    /// Returns the driver name. This is a callback to allow drivers to compute the name at
-    /// runtime, without having it to store permanently for each fence, or build a cache of
-    /// some sort.
-    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr;
-
-    /// Return the name of the context this fence belongs to. This is a callback to allow drivers
-    /// to compute the name at runtime, without having it to store permanently for each fence, or
-    /// build a cache of some sort.
-    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr;
-
-    /// Enable software signaling of fence.
-    fn enable_signaling(self: &FenceObject<Self>) -> bool {
-        false
-    }
-
-    /// Peek whether the fence is signaled, as a fastpath optimization for e.g. dma_fence_wait() or
-    /// dma_fence_add_callback().
-    fn signaled(self: &FenceObject<Self>) -> bool {
-        false
-    }
-
-    /// Callback to fill in free-form debug info specific to this fence, like the sequence number.
-    fn fence_value_str(self: &FenceObject<Self>, _output: &mut dyn Write) {}
-
-    /// Fills in the current value of the timeline as a string, like the sequence number. Note that
-    /// the specific fence passed to this function should not matter, drivers should only use it to
-    /// look up the corresponding timeline structures.
-    fn timeline_value_str(self: &FenceObject<Self>, _output: &mut dyn Write) {}
-}
-
-#[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn get_driver_name_cb<T: FenceOps>(
-    fence: *mut bindings::dma_fence,
-) -> *const crate::ffi::c_char {
-    // SAFETY: All of our fences are FenceObject<T>.
-    let p = unsafe { crate::container_of!(fence, FenceObject<T>, fence) };
-
-    // SAFETY: The caller is responsible for passing a valid dma_fence subtype
-    T::get_driver_name(unsafe { &mut *p }).as_char_ptr()
-}
-
-#[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn get_timeline_name_cb<T: FenceOps>(
-    fence: *mut bindings::dma_fence,
-) -> *const crate::ffi::c_char {
-    // SAFETY: All of our fences are FenceObject<T>.
-    let p = unsafe { crate::container_of!(fence, FenceObject<T>, fence) };
-
-    // SAFETY: The caller is responsible for passing a valid dma_fence subtype
-    T::get_timeline_name(unsafe { &mut *p }).as_char_ptr()
-}
-
-#[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn enable_signaling_cb<T: FenceOps>(fence: *mut bindings::dma_fence) -> bool {
-    // SAFETY: All of our fences are FenceObject<T>.
-    let p = unsafe { crate::container_of!(fence, FenceObject<T>, fence) };
-
-    // SAFETY: The caller is responsible for passing a valid dma_fence subtype
-    T::enable_signaling(unsafe { &mut *p })
-}
-
-#[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn signaled_cb<T: FenceOps>(fence: *mut bindings::dma_fence) -> bool {
-    // SAFETY: All of our fences are FenceObject<T>.
-    let p = unsafe { crate::container_of!(fence, FenceObject<T>, fence) };
-
-    // SAFETY: The caller is responsible for passing a valid dma_fence subtype
-    T::signaled(unsafe { &mut *p })
-}
-
-#[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn release_cb<T: FenceOps>(fence: *mut bindings::dma_fence) {
-    // SAFETY: All of our fences are FenceObject<T>.
-    let p = unsafe { crate::container_of!(fence, FenceObject<T>, fence) };
-
-    // SAFETY: p is never used after this
-    unsafe {
-        core::ptr::drop_in_place(&mut (*p).inner);
-    }
-
-    // SAFETY: All of our fences are allocated using kmalloc, so this is safe.
-    unsafe { bindings::dma_fence_free(fence) };
-}
-
-/// A driver-specific DMA Fence Object
-///
-/// # Invariants
-/// ptr is a valid pointer to a dma_fence and we own a reference to it.
-#[repr(C)]
-pub struct FenceObject<T: FenceOps> {
-    fence: bindings::dma_fence,
-    lock: Opaque<bindings::spinlock>,
-    inner: T,
-}
-
-impl<T: FenceOps> FenceObject<T> {
-    const SIZE: usize = core::mem::size_of::<Self>();
-
-    const VTABLE: bindings::dma_fence_ops = bindings::dma_fence_ops {
-        get_driver_name: Some(get_driver_name_cb::<T>),
-        get_timeline_name: Some(get_timeline_name_cb::<T>),
-        enable_signaling: if T::HAS_ENABLE_SIGNALING {
-            Some(enable_signaling_cb::<T>)
-        } else {
-            None
+use crate::{
+    bindings, c_str,
+    device::{
+        Bound,
+        Device, //
+    },
+    error::{
+        to_result,
+        Result, //
+    },
+    irq::{
+        IrqReturn,
+        ThreadedHandler,
+        ThreadedIrqReturn, //
+    },
+    prelude::*,
+    sync::{
+        aref::{
+            ARef,
+            AlwaysRefCounted, //
         },
-        signaled: if T::HAS_SIGNALED {
-            Some(signaled_cb::<T>)
-        } else {
-            None
-        },
-        wait: None, // Deprecated
-        release: Some(release_cb::<T>),
-        set_deadline: None,
-    };
-
-    /// Returns the fence's sequence number.
-    pub fn seqno(&self) -> u64 {
-        self.fence.seqno
-    }
-}
-
-impl<T: FenceOps> Deref for FenceObject<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.inner
-    }
-}
-
-impl<T: FenceOps> DerefMut for FenceObject<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
-}
-
-impl<T: FenceOps> crate::private::Sealed for FenceObject<T> {}
-impl<T: FenceOps> RawDmaFence for FenceObject<T> {
-    fn raw(&self) -> *mut bindings::dma_fence {
-        &self.fence as *const _ as *mut _
-    }
-}
-
-/// A unique reference to a driver-specific fence object
-pub struct UniqueFence<T: FenceOps>(*mut FenceObject<T>);
-
-impl<T: FenceOps> Deref for UniqueFence<T> {
-    type Target = FenceObject<T>;
-
-    fn deref(&self) -> &FenceObject<T> {
-        // SAFETY: The pointer is always valid for UniqueFence objects
-        unsafe { &*self.0 }
-    }
-}
-
-impl<T: FenceOps> DerefMut for UniqueFence<T> {
-    fn deref_mut(&mut self) -> &mut FenceObject<T> {
-        // SAFETY: The pointer is always valid for UniqueFence objects
-        unsafe { &mut *self.0 }
-    }
-}
-
-impl<T: FenceOps> crate::private::Sealed for UniqueFence<T> {}
-impl<T: FenceOps> RawDmaFence for UniqueFence<T> {
-    fn raw(&self) -> *mut bindings::dma_fence {
-        // SAFETY: The pointer is always valid for UniqueFence objects
-        unsafe { addr_of_mut!((*self.0).fence) }
-    }
-}
-
-impl<T: FenceOps> From<UniqueFence<T>> for UserFence<T> {
-    fn from(value: UniqueFence<T>) -> Self {
-        let ptr = value.0;
-        core::mem::forget(value);
-
-        UserFence(ptr)
-    }
-}
-
-impl<T: FenceOps> Drop for UniqueFence<T> {
-    fn drop(&mut self) {
-        // SAFETY: We own a reference to this fence.
-        unsafe { bindings::dma_fence_put(self.raw()) };
-    }
-}
-
-// SAFETY: The API for these objects is thread safe
-unsafe impl<T: FenceOps> Sync for UniqueFence<T> {}
-// SAFETY: The API for these objects is thread safe
-unsafe impl<T: FenceOps> Send for UniqueFence<T> {}
-
-/// A shared reference to a driver-specific fence object
-pub struct UserFence<T: FenceOps>(*mut FenceObject<T>);
-
-impl<T: FenceOps> Deref for UserFence<T> {
-    type Target = FenceObject<T>;
-
-    fn deref(&self) -> &FenceObject<T> {
-        // SAFETY: The pointer is always valid for UserFence objects
-        unsafe { &*self.0 }
-    }
-}
-
-impl<T: FenceOps> Clone for UserFence<T> {
-    fn clone(&self) -> Self {
-        // SAFETY: `ptr` is valid per the type invariant and we own a reference to it.
-        unsafe {
-            bindings::dma_fence_get(self.raw());
-            Self(self.0)
-        }
-    }
-}
-
-impl<T: FenceOps> crate::private::Sealed for UserFence<T> {}
-impl<T: FenceOps> RawDmaFence for UserFence<T> {
-    fn raw(&self) -> *mut bindings::dma_fence {
-        // SAFETY: The pointer is always valid for UserFence objects
-        unsafe { addr_of_mut!((*self.0).fence) }
-    }
-}
-
-impl<T: FenceOps> Drop for UserFence<T> {
-    fn drop(&mut self) {
-        // SAFETY: We own a reference to this fence.
-        unsafe { bindings::dma_fence_put(self.raw()) };
-    }
-}
-
-// SAFETY: The API for these objects is thread safe
-unsafe impl<T: FenceOps> Sync for UserFence<T> {}
-// SAFETY: The API for these objects is thread safe
-unsafe impl<T: FenceOps> Send for UserFence<T> {}
-
-/// An array of fence contexts, out of which fences can be created.
-pub struct FenceContexts {
-    start: u64,
-    count: u32,
-    seqnos: KVec<AtomicU64>,
-    lock_name: &'static CStr,
-    lock_key: Option<Pin<KBox<LockClassKey>>>,
-}
-
-impl FenceContexts {
-    /// Create a new set of fence contexts.
-    pub fn new(
-        count: u32,
-        name: &'static CStr,
-        key: Option<Pin<KBox<LockClassKey>>>,
-        initial_seqno: u64,
-    ) -> Result<FenceContexts> {
-        let mut seqnos: KVec<AtomicU64> = KVec::new();
-
-        seqnos.reserve(count as usize, GFP_KERNEL)?;
-
-        for _ in 0..count {
-            seqnos.push(AtomicU64::new(initial_seqno), GFP_KERNEL)?;
-        }
-
-        // SAFETY: This is always safe to call
-        let start = unsafe { bindings::dma_fence_context_alloc(count as crate::ffi::c_uint) };
-
-        Ok(FenceContexts {
-            start,
-            count,
-            seqnos,
-            lock_name: name,
-            lock_key: key,
-        })
-    }
-
-    /// Create a new fence in a given context index.
-    pub fn new_fence<T: FenceOps>(&self, context: u32, inner: T) -> Result<UniqueFence<T>> {
-        if context > self.count {
-            return Err(EINVAL);
-        }
-
-        // SAFETY: krealloc is always safe to call like this
-        let p = unsafe {
-            bindings::krealloc_node_align_noprof(
-                core::ptr::null_mut(),
-                FenceObject::<T>::SIZE,
-                0,
-                bindings::GFP_KERNEL | bindings::__GFP_ZERO,
-                bindings::NUMA_NO_NODE as i32,
-            ) as *mut FenceObject<T>
-        };
-
-        if p.is_null() {
-            return Err(ENOMEM);
-        }
-
-        let seqno = self.seqnos[context as usize].fetch_add(1, Ordering::Relaxed);
-
-        // SAFETY: The pointer is valid, so pointers to members are too.
-        // After this, all fields are initialized.
-        unsafe {
-            addr_of_mut!((*p).inner).write(inner);
-            bindings::__spin_lock_init(
-                addr_of_mut!((*p).lock) as *mut _,
-                self.lock_name.as_char_ptr(),
-                self.lock_key
-                    .as_ref()
-                    .map_or_else(|| crate::static_lock_class!().as_ptr(), |key| key.as_ptr()),
-            );
-            bindings::dma_fence_init(
-                addr_of_mut!((*p).fence),
-                &FenceObject::<T>::VTABLE,
-                addr_of_mut!((*p).lock) as *mut _,
-                self.start + context as u64,
-                seqno,
-            );
-        };
-
-        Ok(UniqueFence(p))
-    }
-}
+        Arc,
+        LockClassKey, //
+    },
+    types::{
+        ForeignOwnable,
+        NotThreadSafe,
+        Opaque, //
+    },
+    workqueue::{
+        HasWork,
+        OwnedQueue,
+        RawWorkItem,
+        Work,
+        WorkItem,
+        WorkItemPointer,
+        WqFlags, //
+    },
+    xarray::{
+        AllocKind,
+        XArray, //
+    },
+};
 
 /// Trait for callbacks that can be registered on fences.
 ///
@@ -525,20 +72,21 @@ impl FenceContexts {
 /// # Example
 ///
 /// ```rust
-/// use kernel::dma_fence::{Fence, FenceCallback, FenceCallbackRegistration};
+/// use kernel::dma_fence::{PublicDmaFence, FenceCallback, FenceCallbackRegistration};
+/// use kernel::types::ARef;
 ///
 /// struct MyCallback {
 ///     // Your callback state here
 /// }
 ///
 /// impl FenceCallback for MyCallback {
-///     fn signaled(&self, fence: &Fence) {
+///     fn signaled(&self, fence: &ARef<PublicDmaFence>) {
 ///         pr_info!("Fence signaled!");
 ///         // Handle fence completion
 ///     }
 /// }
 ///
-/// fn register_on_fence(fence: &Fence) -> Result<()> {
+/// fn register_on_fence(fence: &ARef<PublicDmaFence>) -> Result<()> {
 ///     let callback = MyCallback { /* ... */ };
 ///
 ///     match FenceCallbackRegistration::new(fence, callback)? {
@@ -562,7 +110,7 @@ pub trait FenceCallback: Sync {
     ///
     /// Takes `&self` to enforce proper synchronization - if you need to mutate
     /// state, use interior mutability (e.g., `SpinLock`, `AtomicUsize`).
-    fn signaled(&self, fence: &Fence);
+    fn signaled(&self, fence: &ARef<PublicDmaFence>);
 }
 
 /// Error type for fence callback registration.
@@ -608,7 +156,7 @@ pub struct FenceCallbackRegistration<T: FenceCallback> {
     #[pin]
     cb: Opaque<bindings::dma_fence_cb>,
     callback: Option<T>,
-    fence: Fence,
+    fence: ARef<PublicDmaFence>,
 }
 
 impl<T: FenceCallback> FenceCallbackRegistration<T> {
@@ -616,7 +164,10 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
     ///
     /// Returns `Err(CallbackError::AlreadySignaled)` if the fence was already signaled.
     /// Returns `Err(CallbackError::Other(err))` for other errors.
-    pub fn new<'a>(fence: &'a Fence, callback: T) -> impl PinInit<Self, CallbackError> + 'a
+    pub fn new<'a>(
+        fence: &'a ARef<PublicDmaFence>,
+        callback: T,
+    ) -> impl PinInit<Self, CallbackError> + 'a
     where
         T: 'a,
     {
@@ -634,7 +185,7 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
                 // This will initialize the list_head node in the cb structure.
                 to_result(unsafe {
                     bindings::dma_fence_add_callback(
-                        fence.raw(),
+                        fence.inner.get(),
                         slot,
                         Some(Self::dma_fence_callback),
                     )
@@ -661,7 +212,8 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
             let callback = (*reg).callback.take();
 
             if let Some(callback) = callback {
-                // SAFETY: We still have a fence reference in the struct
+                // SAFETY: `(*reg).fence` is an `ARef<PublicDmaFence>` that
+                // keeps the fence alive for the duration of this call.
                 let fence_ref = &(*reg).fence;
                 callback.signaled(fence_ref);
             }
@@ -676,8 +228,9 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
         if self.callback.is_some() {
             // Callback hasn't been invoked yet, try to remove it
             // SAFETY: The fence pointer is valid and the callback is registered
-            let removed =
-                unsafe { bindings::dma_fence_remove_callback(self.fence.raw(), self.cb.get()) };
+            let removed = unsafe {
+                bindings::dma_fence_remove_callback(self.fence.inner.get(), self.cb.get())
+            };
 
             if removed {
                 // Successfully removed, clear our state
@@ -697,7 +250,7 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
     }
 
     /// Returns a reference to the fence this callback is registered on.
-    pub fn fence(self: Pin<&Self>) -> &Fence {
+    pub fn fence(self: Pin<&Self>) -> &ARef<PublicDmaFence> {
         &self.get_ref().fence
     }
 }
@@ -725,7 +278,7 @@ impl<T: FenceCallback> PinnedDrop for FenceCallbackRegistration<T> {
         // SAFETY: The fence pointer is valid and the cb was initialized by
         // dma_fence_add_callback during construction.
         unsafe {
-            bindings::dma_fence_remove_callback(self.fence.raw(), self.cb.get());
+            bindings::dma_fence_remove_callback(self.fence.inner.get(), self.cb.get());
         }
     }
 }
@@ -739,9 +292,10 @@ unsafe impl<T: FenceCallback> Sync for FenceCallbackRegistration<T> where T: Syn
 /// A DMA Fence Chain Object
 ///
 /// # Invariants
-/// ptr is a valid pointer to a dma_fence_chain which we own.
+///
+/// - `ptr` is a valid, non-null pointer to a dma_fence_chain which we own.
 pub struct FenceChain {
-    ptr: *mut bindings::dma_fence_chain,
+    ptr: NonNull<bindings::dma_fence_chain>,
 }
 
 impl FenceChain {
@@ -750,18 +304,15 @@ impl FenceChain {
         // SAFETY: This function is safe to call and takes no arguments.
         let ptr = unsafe { bindings::dma_fence_chain_alloc() };
 
-        if ptr.is_null() {
-            Err(ENOMEM)
-        } else {
-            Ok(FenceChain { ptr })
-        }
+        let ptr = NonNull::new(ptr).ok_or(ENOMEM)?;
+        Ok(FenceChain { ptr })
     }
 
     /// Convert the DmaFenceChain into the underlying raw pointer.
     ///
     /// This assumes the caller will take ownership of the object.
     pub(crate) fn into_raw(self) -> *mut bindings::dma_fence_chain {
-        let ptr = self.ptr;
+        let ptr = self.ptr.as_ptr();
         core::mem::forget(self);
         ptr
     }
@@ -770,6 +321,1054 @@ impl FenceChain {
 impl Drop for FenceChain {
     fn drop(&mut self) {
         // SAFETY: We own this dma_fence_chain.
-        unsafe { bindings::dma_fence_chain_free(self.ptr) };
+        unsafe { bindings::dma_fence_chain_free(self.ptr.as_ptr()) };
+    }
+}
+
+/// A public DMA fence reference.
+///
+/// This is a reference-counted handle to a `dma_fence` that can be shared with
+/// userspace and other kernel subsystems. It provides read-only access to fence
+/// state ([`is_signaled`](Self::is_signaled), [`error`](Self::error),
+/// [`wait`](Self::wait)) but intentionally does not allow signaling or setting
+/// errors.
+///
+/// Only [`DriverDmaFence<T, Published>`] and [`DriverDmaFenceTimeline`] can
+/// signal fences.
+///
+/// # Invariants
+///
+/// The contained `Opaque<bindings::dma_fence>` refers to a valid, initialized
+/// `dma_fence` that is always reference-counted.
+#[repr(transparent)]
+#[pin_data]
+pub struct PublicDmaFence {
+    #[pin]
+    inner: Opaque<bindings::dma_fence>,
+}
+
+// SAFETY: DMA fences are designed to be shared across threads.
+unsafe impl Send for PublicDmaFence {}
+// SAFETY: DMA fences are designed to be shared across threads.
+unsafe impl Sync for PublicDmaFence {}
+
+// SAFETY: We correctly implement inc_ref/dec_ref via dma_fence_get/put, which
+// keep the underlying dma_fence alive as long as any reference exists.
+unsafe impl AlwaysRefCounted for PublicDmaFence {
+    fn inc_ref(&self) {
+        // SAFETY: `self.inner.get()` is a pointer to a valid `struct dma_fence`.
+        unsafe { bindings::dma_fence_get(self.inner.get()) };
+    }
+
+    unsafe fn dec_ref(obj: NonNull<Self>) {
+        // SAFETY: `obj` is never a NULL pointer; and when `dec_ref()` is called
+        // the fence is by definition still valid and has a non-zero refcnt.
+        unsafe {
+            let raw_fence = (*obj.as_ptr()).inner.get();
+            bindings::dma_fence_put(raw_fence);
+        }
+    }
+}
+
+impl From<*mut bindings::dma_fence> for ARef<PublicDmaFence> {
+    fn from(value: *mut bindings::dma_fence) -> Self {
+        // SAFETY: `value` is a pointer to a valid `struct dma_fence` with a
+        // non-zero refcnt. Since `PublicDmaFence` is `repr(transparent)` over
+        // `Opaque<dma_fence>`, the cast is sound.
+        unsafe { ARef::from(&*value.cast_const().cast::<PublicDmaFence>()) }
+    }
+}
+
+impl PublicDmaFence {
+    /// Create an [`ARef<PublicDmaFence>`] from a raw pointer, taking ownership
+    /// of one reference.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a valid, non-null pointer to a `dma_fence` and the caller
+    /// must own a reference that is transferred to the returned [`ARef`].
+    pub unsafe fn from_raw(ptr: *mut bindings::dma_fence) -> ARef<Self> {
+        // SAFETY: ptr is valid and non-null per contract; repr(transparent)
+        // guarantees the cast is sound.
+        unsafe { ARef::from_raw(NonNull::new_unchecked(ptr.cast())) }
+    }
+
+    /// Create an [`ARef<PublicDmaFence>`] from a raw pointer, incrementing the
+    /// refcount.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a valid, non-null pointer to a `dma_fence`.
+    pub unsafe fn get_raw(ptr: *mut bindings::dma_fence) -> ARef<Self> {
+        // SAFETY: The pointer is valid per the safety contract.
+        unsafe { bindings::dma_fence_get(ptr) };
+        // SAFETY: We just incremented the refcount.
+        unsafe { Self::from_raw(ptr) }
+    }
+
+    /// Returns the raw `struct dma_fence` pointer.
+    pub fn raw(&self) -> *mut bindings::dma_fence {
+        self.inner.get()
+    }
+
+    /// Check if the fence has been signaled.
+    pub fn is_signaled(&self) -> bool {
+        // SAFETY: The pointer is valid per the type invariant.
+        unsafe { bindings::dma_fence_is_signaled(self.inner.get()) }
+    }
+
+    /// Get the error from the fence, if any.
+    ///
+    /// Returns `Ok(())` if no error has been set, or the error that was set
+    /// before signaling.
+    pub fn error(&self) -> Result {
+        // SAFETY: The pointer is valid per the type invariant.
+        let err = unsafe { (*self.inner.get()).error };
+        if err == 0 {
+            Ok(())
+        } else {
+            Err(Error::from_errno(err))
+        }
+    }
+
+    /// Wait for the fence to be signaled, blocking indefinitely.
+    ///
+    /// Returns an error if the wait was interrupted or another error occurred.
+    pub fn wait(&self) -> Result {
+        // SAFETY: The pointer is valid. We pass `false` for non-interruptible
+        // wait and `isize::MAX` (MAX_SCHEDULE_TIMEOUT) to wait indefinitely.
+        let ret = unsafe { bindings::dma_fence_wait_timeout(self.inner.get(), false, isize::MAX) };
+        // CAST: `dma_fence_wait_timeout` returns a negative errno on failure, which
+        // always fits in `c_int`. On success it returns the remaining timeout (>= 0).
+        to_result(ret as i32)
+    }
+
+    /// Returns the fence's sequence number.
+    pub fn seqno(&self) -> u64 {
+        // SAFETY: The pointer is valid per the type invariant.
+        unsafe { (*self.inner.get()).seqno }
+    }
+}
+
+/// Trait for driver-specific DMA fence operations.
+#[vtable]
+pub trait DriverDmaFenceOps: Sized + Send + Sync {
+    /// Returns the driver name. This is a callback to allow drivers to
+    /// compute the name at runtime, without having it to store permanently
+    /// for each fence, or build a cache of some sort.
+    fn driver_name(&self) -> &'static CStr;
+
+    /// Return the name of the context this fence belongs to. This is a
+    /// callback to allow drivers to compute the name at runtime, without
+    /// having it to store permanently for each fence, or build a cache of
+    /// some sort.
+    fn timeline_name(&self) -> &'static CStr;
+}
+
+/// The in-memory representation of a driver-specific DMA fence.
+///
+/// Contains the raw `dma_fence`, its per-fence spinlock, and the driver's
+/// private data of type `T`.
+///
+/// # Invariants
+///
+/// The `fence` field is always a valid, initialized `dma_fence` whose `ops`
+/// pointer refers to `Self::OPS`.
+#[repr(C)]
+#[pin_data]
+pub struct DriverDmaFenceInner<T: DriverDmaFenceOps> {
+    #[pin]
+    fence: Opaque<bindings::dma_fence>,
+    #[pin]
+    lock: Opaque<bindings::spinlock>,
+    data: T,
+}
+
+// SAFETY: These implement the C backend's refcounting methods which are proven to work correctly.
+unsafe impl<T: DriverDmaFenceOps> AlwaysRefCounted for DriverDmaFenceInner<T> {
+    fn inc_ref(&self) {
+        // SAFETY: `self.fence.get()` is a pointer to a valid `struct dma_fence`.
+        unsafe { bindings::dma_fence_get(self.fence.get()) };
+    }
+
+    unsafe fn dec_ref(obj: NonNull<Self>) {
+        // SAFETY: `obj` is never a NULL pointer; and when `dec_ref()` is called
+        // the fence is by definition still valid and has a non-zero refcnt.
+        unsafe {
+            let raw_fence = (*obj.as_ptr()).fence.get();
+            bindings::dma_fence_put(raw_fence);
+        }
+    }
+}
+
+impl<T: DriverDmaFenceOps> DriverDmaFenceInner<T> {
+    const OPS: bindings::dma_fence_ops = bindings::dma_fence_ops {
+        get_driver_name: Some(Self::get_driver_name_cb),
+        get_timeline_name: Some(Self::get_timeline_name_cb),
+        enable_signaling: None,
+        signaled: None,
+        wait: None,
+        release: None,
+        set_deadline: None,
+    };
+
+    /// Create a [`PinInit`] that initializes a `DriverDmaFenceInner<T>` with
+    /// the given driver data, context ID, and sequence number.
+    fn new_init(data: T, ctx: u64, seqno: u64) -> impl PinInit<Self> {
+        // SAFETY: All three fields (`lock`, `fence`, `data`) are fully
+        // initialized inside the closure before it returns `Ok(())`.
+        // `dma_fence_init` is called after `__spin_lock_init` so the lock
+        // pointer passed to it is valid. Furthermore, this is infallible, so we
+        // do not need to worry about partially initialized slots, and the slot
+        // is considered pinned throughout initialization.
+        unsafe {
+            pin_init_from_closure(move |slot: *mut Self| {
+                // 1. Initialize driver data (plain field, not pinned).
+                (&raw mut (*slot).data).write(data);
+
+                // 2. Initialize the per-fence spinlock.
+                bindings::__spin_lock_init(
+                    Opaque::cast_into((&raw mut (*slot).lock).cast_const()),
+                    c_str!("drv_dma_fence").as_char_ptr(),
+                    crate::static_lock_class!().as_ptr(),
+                );
+
+                // 3. Initialize the dma_fence itself, referencing the lock.
+                bindings::dma_fence_init(
+                    Opaque::cast_into((&raw mut (*slot).fence).cast_const()),
+                    &Self::OPS,
+                    Opaque::cast_into((&raw mut (*slot).lock).cast_const()),
+                    ctx,
+                    seqno,
+                );
+
+                Ok(())
+            })
+        }
+    }
+
+    /// Allocate and initialize a new `DriverDmaFenceInner<T>`.
+    ///
+    /// Returns an `ARef` owning the initial reference created by `dma_fence_init`.
+    fn new(data: T, ctx: u64, seqno: u64) -> Result<ARef<Self>> {
+        let boxed = KBox::pin_init(Self::new_init(data, ctx, seqno), GFP_KERNEL)?;
+
+        // Leak the KBox — from this point the C dma_fence refcounting owns
+        // the allocation. `release_cb` handles deallocation when the last
+        // reference is dropped.
+        //
+        // SAFETY: The pin guarantee is upheld by the C dma_fence subsystem
+        // which never moves the allocation.
+        let raw = KBox::into_raw(unsafe { Pin::into_inner_unchecked(boxed) });
+
+        // SAFETY: `raw` is valid and we own the one reference from dma_fence_init.
+        // We use `from_raw` (not `ARef::from` which would call `inc_ref`) to take
+        // ownership of the existing reference without bumping the refcount.
+        Ok(unsafe { ARef::from_raw(NonNull::new_unchecked(raw)) })
+    }
+
+    /// Recover a `&DriverDmaFenceInner<T>` from a raw `*mut dma_fence`.
+    ///
+    /// # Safety
+    ///
+    /// `raw_fence` must be a valid pointer to a `dma_fence` that was created as
+    /// part of a `DriverDmaFenceInner<T>`.
+    unsafe fn from_raw<'a>(raw_fence: *mut bindings::dma_fence) -> &'a Self {
+        unsafe {
+            &*crate::container_of!(raw_fence.cast::<Opaque<bindings::dma_fence>>(), Self, fence)
+        }
+    }
+
+    /// Returns a pointer to the raw `dma_fence`.
+    pub fn raw(&self) -> *mut bindings::dma_fence {
+        self.fence.get()
+    }
+
+    /// Returns the fence's sequence number.
+    pub fn seqno(&self) -> u64 {
+        // SAFETY: The fence is initialized per the type invariant.
+        unsafe { (*self.fence.get()).seqno }
+    }
+
+    unsafe extern "C" fn get_driver_name_cb(
+        fence: *mut bindings::dma_fence,
+    ) -> *const crate::ffi::c_char {
+        // SAFETY: The fence was created by `DriverDmaFenceInner::new_init`.
+        let p = unsafe { Self::from_raw(fence) };
+        p.data.driver_name().as_char_ptr()
+    }
+
+    unsafe extern "C" fn get_timeline_name_cb(
+        fence: *mut bindings::dma_fence,
+    ) -> *const crate::ffi::c_char {
+        // SAFETY: The fence was created by `DriverDmaFenceInner::new_init`.
+        let p = unsafe { Self::from_raw(fence) };
+        p.data.timeline_name().as_char_ptr()
+    }
+}
+
+impl<T: DriverDmaFenceOps> Deref for DriverDmaFenceInner<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
+
+impl<T: DriverDmaFenceOps> DerefMut for DriverDmaFenceInner<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+}
+
+/// Trait for DMA fence visibility states.
+///
+/// Implemented by [`Private`] and [`Published`].
+pub trait DriverDmaFenceVisibility {
+    /// Whether fences in this state have been published (shared with the
+    /// outside world).
+    const PUBLISHED: bool;
+}
+
+/// A fence that has not yet been published. It can still be freely mutated
+/// and has not been shared with any external consumer.
+pub struct Private;
+impl DriverDmaFenceVisibility for Private {
+    const PUBLISHED: bool = false;
+}
+
+/// A fence that has been published. An [`ARef<PublicDmaFence>`] has been
+/// handed out and the fence may be waited on by external consumers. The
+/// only remaining operation is to signal it.
+pub struct Published;
+impl DriverDmaFenceVisibility for Published {
+    const PUBLISHED: bool = true;
+}
+
+/// A driver-owned handle to a DMA fence with type-state visibility tracking.
+///
+/// - [`DriverDmaFence<T, Private>`]: a freshly allocated fence that has not
+///   been shared. Can be published via [`publish`](DriverDmaFence::publish).
+/// - [`DriverDmaFence<T, Published>`]: a fence that has been shared with
+///   external consumers. Can be signaled via
+///   [`signal`](DriverDmaFence::signal), which consumes the handle. If
+///   dropped without signaling, the fence is automatically signaled with
+///   `ECANCELED`.
+///
+/// # Invariants
+///
+/// `inner` contains a valid `ARef<DriverDmaFenceInner<T>>`.
+pub struct DriverDmaFence<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility = Private> {
+    inner: ManuallyDrop<ARef<DriverDmaFenceInner<T>>>,
+    visibility: PhantomData<V>,
+}
+
+// SAFETY: The underlying dma_fence is thread-safe.
+unsafe impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Send for DriverDmaFence<T, V> {}
+// SAFETY: The underlying dma_fence is thread-safe.
+unsafe impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Sync for DriverDmaFence<T, V> {}
+
+impl<T: DriverDmaFenceOps> DriverDmaFence<T, Private> {
+    /// Allocate a new private DMA fence.
+    ///
+    /// The fence is initialized with the given context ID and sequence number
+    /// but is not yet visible to any external consumer.
+    pub fn new(data: T, ctx: u64, seqno: u64) -> Result<Self> {
+        let fence = DriverDmaFenceInner::new(data, ctx, seqno)?;
+
+        Ok(Self {
+            inner: ManuallyDrop::new(fence),
+            visibility: PhantomData,
+        })
+    }
+
+    /// Publish the fence, making it visible to external consumers.
+    ///
+    /// Returns the published driver fence handle and an [`ARef<PublicDmaFence>`]
+    /// that can be shared with waiters.
+    pub fn publish(self) -> (DriverDmaFence<T, Published>, ARef<PublicDmaFence>) {
+        let mut fence = self;
+
+        // Create a new public reference by incrementing the refcount.
+        let pub_fence: ARef<PublicDmaFence> = fence.inner.fence.get().into();
+
+        // SAFETY: We are consuming `fence` and transferring the ARef to the
+        // new Published handle. `core::mem::forget` prevents double-drop.
+        let drv_fence = unsafe { ManuallyDrop::take(&mut fence.inner) };
+        core::mem::forget(fence);
+
+        (
+            DriverDmaFence {
+                inner: ManuallyDrop::new(drv_fence),
+                visibility: PhantomData,
+            },
+            pub_fence,
+        )
+    }
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DriverDmaFence<T, V> {
+    /// Access the inner fence object.
+    pub fn inner(&self) -> &DriverDmaFenceInner<T> {
+        &self.inner
+    }
+}
+
+impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {
+    /// Signal the fence with the given result.
+    ///
+    /// Consumes `self`, enforcing at the type level that a fence can only be
+    /// signaled once.
+    ///
+    /// - `Ok(())` signals successful completion.
+    /// - `Err(e)` sets the error on the fence before signaling.
+    pub fn signal(self, result: Result) {
+        let raw_fence = self.inner.fence.get();
+
+        unsafe {
+            if let Err(e) = result {
+                bindings::dma_fence_set_error(raw_fence, e.to_errno());
+            }
+            bindings::dma_fence_signal(raw_fence);
+        }
+
+        // `self` is dropped here. Since the fence is now signaled, Drop
+        // won't signal ECANCELED.
+    }
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Drop for DriverDmaFence<T, V> {
+    fn drop(&mut self) {
+        // SAFETY: Take the ARef — this is only called on drop, so it's the
+        // final use of `self.inner`. Wrap in ManuallyDrop to prevent
+        // ARef::drop from running — we manage the put manually below.
+        let drv_fence = ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut self.inner) });
+        let raw_fence = drv_fence.fence.get();
+
+        if V::PUBLISHED {
+            // Safety net: if a published fence is dropped without being
+            // signaled, signal it with ECANCELED so waiters don't hang.
+            if !unsafe { bindings::dma_fence_is_signaled(raw_fence) } {
+                unsafe { bindings::dma_fence_set_error(raw_fence, ECANCELED.to_errno()) };
+                let _ = unsafe { bindings::dma_fence_signal(raw_fence) };
+            }
+        }
+
+        // SAFETY: We are the sole owner of the DriverDmaFence handle, so no
+        // one else can access T. The pointer is valid — drv_fence is alive
+        // (ManuallyDrop prevents ARef::drop).
+        unsafe { core::ptr::drop_in_place((&raw const drv_fence.data).cast_mut()) };
+
+        // Release our reference. When the refcount reaches 0, C calls
+        // dma_fence_free directly (ops->release is NULL) to free the
+        // allocation. T is already dropped above.
+        //
+        // TODO(dwlsalmeida): consider simply letting the ARef drop here instead
+        // of manually calling put.
+        //
+        // SAFETY: `raw_fence` is valid and has a non-zero refcount since we own
+        // the ARef.
+        unsafe { bindings::dma_fence_put(raw_fence) };
+    }
+}
+
+/// A borrowed reference to a [`DriverDmaFence`].
+///
+/// This is used by the [`ForeignOwnable`] implementation to provide borrowed
+/// access to a `DriverDmaFence`.
+pub struct DriverDmaFenceBorrow<'a, T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> {
+    // We just borrow the DriverDmaFenceInner, so we don't want Drop to be
+    // called on the DriverDmaFence.
+    inner: ManuallyDrop<DriverDmaFence<T, V>>,
+    _p: PhantomData<&'a ()>,
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Deref for DriverDmaFenceBorrow<'_, T, V> {
+    type Target = DriverDmaFence<T, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// A mutably borrowed reference to a [`DriverDmaFence`].
+///
+/// This is used by the [`ForeignOwnable`] implementation to provide mutably borrowed
+/// access to a `DriverDmaFence`.
+pub struct DriverDmaFenceBorrowMut<'a, T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> {
+    // We just borrow the DriverDmaFenceInner, so we don't want Drop to be
+    // called on the DriverDmaFence.
+    inner: ManuallyDrop<DriverDmaFence<T, V>>,
+    _p: PhantomData<&'a mut ()>,
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Deref
+    for DriverDmaFenceBorrowMut<'_, T, V>
+{
+    type Target = DriverDmaFence<T, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DerefMut
+    for DriverDmaFenceBorrowMut<'_, T, V>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+// SAFETY: `DriverDmaFence` wraps a refcounted `ARef<DriverDmaFenceInner<T>>`, so
+// the raw pointer roundtrip through `into_foreign`/`from_foreign` preserves all
+// invariants.
+unsafe impl<T: DriverDmaFenceOps + 'static, V: DriverDmaFenceVisibility> ForeignOwnable
+    for DriverDmaFence<T, V>
+{
+    const FOREIGN_ALIGN: usize = core::mem::align_of::<DriverDmaFenceInner<T>>();
+
+    type Borrowed<'a> = DriverDmaFenceBorrow<'a, T, V>;
+    type BorrowedMut<'a> = DriverDmaFenceBorrowMut<'a, T, V>;
+
+    fn into_foreign(self) -> *mut c_void {
+        let mut fence = self;
+        // SAFETY: We're consuming self, so taking the ARef is safe.
+        let drv_fence = unsafe { ManuallyDrop::take(&mut fence.inner) };
+        core::mem::forget(fence);
+
+        ARef::into_raw(drv_fence).as_ptr().cast()
+    }
+
+    unsafe fn from_foreign(ptr: *mut c_void) -> Self {
+        // SAFETY: The safety requirements of this method ensure that `ptr` is a
+        // valid pointer to a `DriverDmaFenceInner<T>` that was created by a
+        // previous call to `into_foreign`.
+        let inner =
+            unsafe { ARef::from_raw(NonNull::<DriverDmaFenceInner<T>>::new_unchecked(ptr.cast())) };
+
+        Self {
+            inner: ManuallyDrop::new(inner),
+            visibility: PhantomData,
+        }
+    }
+
+    unsafe fn borrow<'a>(ptr: *mut c_void) -> Self::Borrowed<'a> {
+        // SAFETY: The safety requirements of this method ensure that `ptr` is a
+        // valid pointer to a `DriverDmaFenceInner<T>` that was created by a
+        // previous call to `into_foreign`.
+        let inner =
+            unsafe { ARef::from_raw(NonNull::<DriverDmaFenceInner<T>>::new_unchecked(ptr.cast())) };
+
+        DriverDmaFenceBorrow {
+            inner: ManuallyDrop::new(DriverDmaFence {
+                inner: ManuallyDrop::new(inner),
+                visibility: PhantomData,
+            }),
+            _p: PhantomData,
+        }
+    }
+
+    unsafe fn borrow_mut<'a>(ptr: *mut c_void) -> Self::BorrowedMut<'a> {
+        // SAFETY: The safety requirements of this method ensure that `ptr` is a
+        // valid pointer to a `DriverDmaFenceInner<T>` that was created by a
+        // previous call to `into_foreign`.
+        let inner =
+            unsafe { ARef::from_raw(NonNull::<DriverDmaFenceInner<T>>::new_unchecked(ptr.cast())) };
+
+        DriverDmaFenceBorrowMut {
+            inner: ManuallyDrop::new(DriverDmaFence {
+                inner: ManuallyDrop::new(inner),
+                visibility: PhantomData,
+            }),
+            _p: PhantomData,
+        }
+    }
+}
+
+/// Trait implemented by drivers that use timeline-based fence management.
+///
+/// A timeline represents a single ordered stream of fences (one DMA fence
+/// context). The timeline allocates monotonically increasing sequence numbers
+/// and can signal all fences up to a given point in one call.
+pub trait DriverDmaFenceTimelineOps: Send + Sync + Sized + 'static {
+    /// Driver-specific per-fence data stored alongside each timeline fence.
+    type DmaFenceData: Send + Sync + 'static;
+
+    /// Create per-fence data for a new fence with the given sequence number.
+    fn new_fence(&self, seqno: u64) -> Self::DmaFenceData;
+
+    /// Returns the driver name for fences on this timeline.
+    fn driver_name(&self) -> &'static CStr;
+
+    /// Returns the timeline name for this specific timeline instance.
+    fn timeline_name(&self) -> &'static CStr;
+}
+
+/// Internal wrapper that pairs a reference to the shared timeline data with
+/// per-fence data.
+struct TimelineFenceData<T: DriverDmaFenceTimelineOps> {
+    timeline_data: Arc<T>,
+    fence_data: T::DmaFenceData,
+}
+
+#[vtable]
+impl<T: DriverDmaFenceTimelineOps> DriverDmaFenceOps for TimelineFenceData<T> {
+    fn driver_name(&self) -> &'static CStr {
+        self.timeline_data.driver_name()
+    }
+
+    fn timeline_name(&self) -> &'static CStr {
+        self.timeline_data.timeline_name()
+    }
+}
+
+/// A fence produced by a [`DriverDmaFenceTimeline`].
+///
+/// Bundles the public fence reference with the sequence number assigned by
+/// the timeline.
+pub struct TimelineDmaFence {
+    fence: ARef<PublicDmaFence>,
+    seqno: u64,
+}
+
+impl TimelineDmaFence {
+    /// Returns a reference to the public fence.
+    pub fn public_fence(&self) -> ARef<PublicDmaFence> {
+        self.fence.clone()
+    }
+
+    /// Returns the sequence number assigned to this fence.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
+}
+
+/// A DMA fence context with a monotonically increasing sequence number counter.
+///
+/// Wraps a kernel fence context (a globally unique `u64` allocated by
+/// `dma_fence_context_alloc`) together with an atomic seqno counter.
+///
+/// # Invariants
+///
+/// - `ctx` is a valid DMA fence context allocated via `dma_fence_context_alloc`.
+/// - `seqno` is monotonically increasing.
+pub struct DmaFenceContext {
+    ctx: u64,
+    seqno: AtomicU64,
+}
+
+impl DmaFenceContext {
+    /// Allocate a new DMA fence context.
+    pub fn new(initial_seqno: u64) -> Self {
+        // SAFETY: dma_fence_context_alloc is always safe to call.
+        let ctx = unsafe { bindings::dma_fence_context_alloc(1) };
+        Self {
+            ctx,
+            seqno: AtomicU64::new(initial_seqno),
+        }
+    }
+
+    /// Claim the next sequence number.
+    pub fn next_seqno(&self) -> (u64, u64) {
+        let seqno = self.seqno.fetch_add(1, Ordering::Relaxed) + 1;
+        (self.ctx, seqno)
+    }
+
+    /// Return the context ID.
+    pub fn ctx(&self) -> u64 {
+        self.ctx
+    }
+
+    /// Return the last allocated sequence number.
+    pub fn last_seqno(&self) -> u64 {
+        self.seqno.load(Ordering::Relaxed)
+    }
+}
+
+/// Manages an ordered stream of DMA fences sharing a single fence context.
+///
+/// Fences are created with monotonically increasing sequence numbers via
+/// [`new_fence`](Self::new_fence) and signaled in bulk via
+/// [`signal_up_to`](Self::signal_up_to). Published fences are stored in an
+/// [`XArray`] indexed by sequence number for efficient lookup and removal.
+///
+/// # Invariants
+///
+/// - `fence_ctx` holds a valid DMA fence context and the emission seqno counter.
+/// - `signal_seqno` tracks the last signaled sequence number
+///   (`signal_seqno <= fence_ctx.last_seqno()`).
+#[pin_data]
+pub struct DriverDmaFenceTimeline<T: DriverDmaFenceTimelineOps> {
+    fence_ctx: DmaFenceContext,
+    signal_seqno: AtomicU64,
+    /// Shared timeline data that is accessible from all fences on this timeline.
+    data: Arc<T>,
+    #[pin]
+    fences: XArray<DriverDmaFence<TimelineFenceData<T>, Published>>,
+}
+
+impl<T: DriverDmaFenceTimelineOps> DriverDmaFenceTimeline<T> {
+    /// Create a new timeline.
+    pub fn new(data: Arc<T>) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            fence_ctx: DmaFenceContext::new(0),
+            signal_seqno: AtomicU64::new(0),
+            data,
+            fences <- XArray::new(AllocKind::Alloc),
+        })
+    }
+
+    /// Create a new fence on this timeline with the next sequence number.
+    ///
+    /// Returns a [`TimelineDmaFence`] containing the public fence reference
+    /// and the assigned sequence number. The driver must eventually call
+    /// [`signal_up_to`](Self::signal_up_to) to signal this fence.
+    pub fn new_fence(&self) -> Result<TimelineDmaFence> {
+        let (ctx, seqno) = self.fence_ctx.next_seqno();
+
+        let fence_data = TimelineFenceData {
+            timeline_data: self.data.clone(),
+            fence_data: self.data.new_fence(seqno),
+        };
+        let (drv_fence, pub_fence) = DriverDmaFence::new(fence_data, ctx, seqno)?.publish();
+
+        let _old = self
+            .fences
+            .lock()
+            .store(seqno as usize, drv_fence, GFP_KERNEL)?;
+
+        Ok(TimelineDmaFence {
+            fence: pub_fence,
+            seqno,
+        })
+    }
+
+    /// Signal all pending fences with sequence numbers up to and including
+    /// `seqno`.
+    ///
+    /// The fences are removed from the [`XArray`] and signaled with the given
+    /// `result`. Fences are drained into a local [`KVec`] first and signaled
+    /// outside the XArray lock to avoid lock-ordering issues with fence
+    /// callbacks.
+    pub fn signal_up_to(&self, seqno: u64, result: Result) {
+        let target = core::cmp::min(seqno, self.fence_ctx.last_seqno());
+        let start = self.signal_seqno.load(Ordering::Relaxed);
+
+        if target <= start {
+            return;
+        }
+
+        // Drain fences to signal outside the lock.
+        let mut to_signal = KVec::new();
+        {
+            let mut fences = self.fences.lock();
+            for i in (start + 1)..=target {
+                if let Some(fence) = fences.remove(i as usize) {
+                    // Best-effort: if push fails (OOM), the fence is dropped,
+                    // which signals ECANCELED via Drop.
+                    let _ = to_signal.push(fence, GFP_ATOMIC);
+                }
+            }
+        }
+
+        // Signal outside the lock.
+        for fence in to_signal.drain_all() {
+            fence.signal(result);
+        }
+
+        self.signal_seqno.store(target, Ordering::Relaxed);
+    }
+
+    /// Signal all pending fences, regardless of sequence number.
+    ///
+    /// Typically used during teardown or fault recovery.
+    pub fn signal_all(&self, result: Result) {
+        self.signal_up_to(u64::MAX, result);
+    }
+
+    /// Returns the last allocated sequence number.
+    pub fn last_seqno(&self) -> u64 {
+        self.fence_ctx.last_seqno()
+    }
+
+    /// Returns `true` if all timeline fences have been signaled.
+    ///
+    /// This is an approximate check (the atomics are loaded independently);
+    /// it is safe to call from any context.
+    pub fn is_idle(&self) -> bool {
+        self.signal_seqno.load(Ordering::Relaxed) >= self.fence_ctx.last_seqno()
+    }
+
+    /// Returns the DMA fence context ID.
+    pub fn context(&self) -> u64 {
+        self.fence_ctx.ctx()
+    }
+}
+
+/// DMA fence signalling guard used to annotate a section of code responsible
+/// for signaling `dma_fence` objects.
+pub struct DmaFenceSignallingAnnotation {
+    /// The cookie returned by `dma_fence_begin_signalling()`.
+    ///
+    /// This is passed back to `dma_fence_end_signalling()` on drop.
+    cookie: bool,
+
+    /// Used to make sure the object is `!Send`.
+    _not_send: NotThreadSafe,
+}
+
+impl DmaFenceSignallingAnnotation {
+    /// Return a [`DmaFenceSignallingAnnotation`] object.
+    ///
+    /// The DMA-signalling section starts when `DmaFenceSignallingAnnotation::new()`
+    /// is called and stops when this object is dropped.
+    pub fn new() -> Self {
+        Self {
+            // SAFETY: We guarantee that a matching
+            // `dma_fence_end_signalling()` call exists in the drop()
+            // implementation, so that we never keep lockdep in a dangling state.
+            cookie: unsafe { bindings::dma_fence_begin_signalling() },
+            _not_send: NotThreadSafe,
+        }
+    }
+}
+
+impl Drop for DmaFenceSignallingAnnotation {
+    fn drop(&mut self) {
+        // SAFETY: The cookie was returned by `dma_fence_begin_signalling()`.
+        unsafe { bindings::dma_fence_end_signalling(self.cookie) };
+    }
+}
+
+/// DMA-fence constrained work item.
+///
+/// This is a wrapper around [`Work`] allowing us to re-use the existing workqueue
+/// infrastructure while adding constraints on the type of workqueue such work items
+/// can be scheduled on.
+#[pin_data]
+pub struct DmaFenceWork<T: ?Sized, const ID: u64 = 0> {
+    #[pin]
+    pub inner: Work<T, ID>,
+}
+
+impl<T: ?Sized + WorkItem<ID>, const ID: u64> DmaFenceWork<T, ID> {
+    /// Creates an initialiser for a [`DmaFenceWork`] with the given name and lock class.
+    pub fn new(name: &'static CStr, key: Pin<&'static LockClassKey>) -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- Work::new(name, key),
+        })
+    }
+}
+
+/// Used to safely implement the `HasDmaFenceWork` trait.
+///
+/// # Examples
+///
+/// ```ignore
+/// use kernel::sync::Arc;
+/// use kernel::dma_fence::{impl_has_dma_fence_work, DmaFenceWork};
+///
+/// struct MyStruct {
+///     work_field: DmaFenceWork<MyStruct>,
+/// }
+///
+/// impl_has_dma_fence_work! {
+///     impl HasDmaFenceWork<MyStruct>
+///     for MyStruct { self.work_field }
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_has_dma_fence_work {
+    ($(impl$({$($generics:tt)*})?
+       HasDmaFenceWork<$work_type:ty $(, $id:tt)?>
+       for $self:ty
+       { self.$field:ident }
+    )*) => {$(
+        // SAFETY: The implementation of `raw_get_work` only compiles if the field has the right
+        // type.
+        unsafe impl$(<$($generics)+>)? $crate::workqueue::HasWork<$work_type $(, $id)?> for $self {
+            #[inline]
+            unsafe fn raw_get_work(ptr: *mut Self) -> *mut $crate::workqueue::Work<$work_type $(, $id)?> {
+                // SAFETY: The caller promises that the pointer is not dangling.
+                unsafe {
+                    ::core::ptr::addr_of_mut!((*ptr).$field.inner)
+                }
+            }
+
+            #[inline]
+            unsafe fn work_container_of(
+                ptr: *mut $crate::workqueue::Work<$work_type $(, $id)?>,
+            ) -> *mut Self {
+                // SAFETY: The caller promises that the pointer points at a field of the right type
+                // in the right kind of struct.
+                unsafe { $crate::container_of!(ptr, Self, $field.inner) }
+            }
+        }
+
+        impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
+            type Pointer = <Self as $crate::dma_fence::DmaFenceWorkItem<$($id)?>>::Pointer;
+
+            fn run(this: Self::Pointer) {
+                let _annotation = $crate::dma_fence::DmaFenceSignallingAnnotation::new();
+
+                <Self as $crate::dma_fence::DmaFenceWorkItem<$($id)?>>::run(this)
+            }
+        }
+    )*};
+}
+pub use impl_has_dma_fence_work;
+
+/// Creates a [`DmaFenceWork`] initialiser with the given name and a newly-created lock class.
+#[macro_export]
+macro_rules! new_dma_fence_work {
+    ($($name:literal)?) => {
+        $crate::dma_fence::DmaFenceWork::new(
+            $crate::optional_name!($($name)?),
+            $crate::static_lock_class!(),
+        )
+    };
+}
+pub use new_dma_fence_work;
+
+/// Defines the method that should be called when this DMA-fence constrained
+/// work item is executed.
+///
+/// This is similar to [`WorkItem`], except the [`run`] function is called
+/// inside a [`DmaFenceSignallingAnnotation`] section, which allows us to
+/// detect infringements of the DMA-fence signalling rules when lockdep is enabled.
+///
+/// [`run`]: DmaFenceWorkItem::run
+pub trait DmaFenceWorkItem<const ID: u64 = 0> {
+    /// The pointer type that this struct is wrapped in. This will typically be `Arc<Self>` or
+    /// `Pin<KBox<Self>>`.
+    type Pointer: WorkItemPointer<ID>;
+
+    /// The method that should be called when this work item is executed.
+    fn run(this: Self::Pointer);
+}
+
+/// A raw DMA-fence constrained work item.
+///
+/// The only reason we add a new trait is so that a [`DmaFenceWorkqueue`]
+/// can't be used to schedule regular [`RawWorkItem`]s.
+///
+/// # Safety
+///
+/// Implementations must satisfy all the safety requirements of [`RawWorkItem`].
+pub unsafe trait RawDmaFenceWorkItem<const ID: u64>: RawWorkItem<ID> {}
+
+// SAFETY: [`RawWorkItem`] provides all the guarantees we need.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for crate::sync::Arc<T>
+where
+    T: DmaFenceWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+}
+
+// SAFETY: [`RawWorkItem`] provides all the guarantees we need.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for Pin<KBox<T>>
+where
+    T: DmaFenceWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+}
+
+/// Workqueue that can only be used to schedule [`DmaFenceWork`] items.
+///
+/// This ensures that all work scheduled on this workqueue runs inside a
+/// [`DmaFenceSignallingAnnotation`] section, allowing lockdep to detect
+/// violations of the DMA-fence signalling rules.
+pub struct DmaFenceWorkqueue(OwnedQueue);
+
+impl DmaFenceWorkqueue {
+    /// Allocates a new DMA-fence constrained workqueue.
+    ///
+    /// The provided name is used verbatim as the workqueue name.
+    /// `MEM_RECLAIM` is always added to the flags, since DMA-fence workqueues
+    /// participate in memory reclaim.
+    pub fn new(
+        name: &CStr,
+        flags: WqFlags,
+        max_active: usize,
+    ) -> Result<DmaFenceWorkqueue, crate::alloc::AllocError> {
+        let flags = flags | WqFlags::MEM_RECLAIM;
+        let queue = OwnedQueue::new(name, flags, max_active)?;
+        Ok(Self(queue))
+    }
+
+    /// Allocates a new DMA-fence constrained workqueue with a formatted name.
+    #[inline]
+    pub fn new_fmt(
+        name: core::fmt::Arguments<'_>,
+        flags: WqFlags,
+        max_active: usize,
+    ) -> Result<DmaFenceWorkqueue, crate::alloc::AllocError> {
+        let flags = flags | WqFlags::MEM_RECLAIM;
+        let queue = OwnedQueue::new_fmt(name, flags, max_active)?;
+        Ok(Self(queue))
+    }
+
+    /// Enqueues a work item.
+    ///
+    /// This may fail if the work item is already enqueued in a workqueue.
+    ///
+    /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    pub fn enqueue<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
+    where
+        W: RawDmaFenceWorkItem<ID> + Send + 'static,
+    {
+        self.0.enqueue(w)
+    }
+}
+
+/// Trait used for drivers signalling their DMA-fences from a threaded IRQ handler.
+///
+/// This provides an implementation wrapper via [`DmaFenceIrqAdapter`] that
+/// instantiates a [`DmaFenceSignallingAnnotation`] to flag a critical DMA-fence
+/// signalling section. This is only needed for threaded handlers, because raw
+/// handlers are already restrictive enough to cover the DMA-fence signalling
+/// path restrictions.
+pub trait DmaFenceIrqThreadedHandler: Sync {
+    /// The hard IRQ handler.
+    ///
+    /// This is executed in interrupt context, hence all corresponding
+    /// limitations do apply. All work that does not necessarily need to be
+    /// executed from interrupt context, should be deferred to the threaded
+    /// handler, i.e. [`handle_dma_fence_threaded`](Self::handle_dma_fence_threaded).
+    ///
+    /// The default implementation returns [`ThreadedIrqReturn::WakeThread`].
+    #[expect(unused_variables)]
+    fn handle(&self, device: &Device<Bound>) -> ThreadedIrqReturn {
+        ThreadedIrqReturn::WakeThread
+    }
+
+    /// The threaded IRQ handler.
+    ///
+    /// This is executed in process context. The kernel creates a dedicated
+    /// `kthread` for this purpose. This function is called within a
+    /// [`DmaFenceSignallingAnnotation`] section, meaning all the DMA-fence
+    /// signalling path restrictions apply.
+    fn handle_dma_fence_threaded(&self, device: &Device<Bound>) -> IrqReturn;
+}
+
+/// Adapter that wraps a [`DmaFenceIrqThreadedHandler`] to implement
+/// [`ThreadedHandler`].
+///
+/// The threaded handler is automatically called within a
+/// [`DmaFenceSignallingAnnotation`] scope, enabling lockdep checking for
+/// DMA fence signaling correctness.
+pub struct DmaFenceIrqAdapter<T: DmaFenceIrqThreadedHandler>(pub T);
+
+impl<T: DmaFenceIrqThreadedHandler + Send> ThreadedHandler for DmaFenceIrqAdapter<T> {
+    fn handle(&self, device: &Device<Bound>) -> ThreadedIrqReturn {
+        self.0.handle(device)
+    }
+
+    fn handle_threaded(&self, device: &Device<Bound>) -> IrqReturn {
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        self.0.handle_dma_fence_threaded(device)
     }
 }

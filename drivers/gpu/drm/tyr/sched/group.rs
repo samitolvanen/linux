@@ -3,13 +3,14 @@
 use core::sync::atomic::AtomicUsize;
 
 use kernel::bits::genmask_checked_u32;
-use kernel::dma_fence::UserFence;
+use kernel::dma_fence::PublicDmaFence;
 use kernel::drm::gem::BaseObject;
 use kernel::kvec;
 use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
+use kernel::types::ARef;
 use kernel::xarray;
 use kernel::xarray::XArray;
 
@@ -256,9 +257,15 @@ impl Group {
         syncs: KVec<SyncOp>,
         queue_submits: KVec<QueueSubmit>,
         file: &DrmFile,
-    ) -> Result<KVec<UserFence<job::Fence>>> {
-        if self.vm.lock().address_space().is_none() {
-            pr_err!("group_submit: invalid address space");
+    ) -> Result<KVec<ARef<PublicDmaFence>>> {
+        let as_nr = self.vm.lock().address_space();
+        if as_nr.is_none() {
+            let csg_id = self.with_locked_inner(|inner| Ok(inner.csg_id));
+            pr_err!(
+                "group_submit: invalid address space (AS={:?}, csg_id={:?})\n",
+                as_nr,
+                csg_id
+            );
             return Err(EINVAL);
         }
 
@@ -283,28 +290,24 @@ impl Group {
             // Create all jobs and add them to the context
             self.with_locked_inner(|inner| {
                 for queue_submit in queue_submits.iter() {
-                    let queue = inner
+                    // Validate the queue index up-front; submit_to_hw() will
+                    // also check this but bailing early gives a cleaner error.
+                    if inner
                         .queues
-                        .get_mut(queue_submit.queue_index as usize)
-                        .ok_or(EINVAL)?;
+                        .get(queue_submit.queue_index as usize)
+                        .is_none()
+                    {
+                        return Err(EINVAL);
+                    }
 
                     let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
                     let sync_addr = sync_addr.start
                         + u64::from(queue_submit.queue_index)
                             * core::mem::size_of::<syncs::SyncObj64b>() as u64;
 
-                    let fence: UserFence<_> = queue
-                        .fence_ctx
-                        .new_fence(0, crate::sched::job::Fence)?
-                        .into();
-
-                    let job =
-                        job::Job::create(*queue_submit, self.clone(), fence.clone(), sync_addr)?;
+                    let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
 
                     ctx.add_job(job, internal_syncs.clone())?;
-
-                    // Store the fence to return later
-                    fences.push(fence, GFP_KERNEL)?;
                 }
                 Ok(())
             })?;
@@ -324,16 +327,18 @@ impl Group {
             for &queue_idx in queue_indices.iter() {
                 let finished_fences = self.with_locked_inner(|inner| {
                     let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                    ctx.add_deps_and_push_jobs(&mut queue.entity, queue_idx)
+                    ctx.add_deps_and_push_jobs(&queue.job_queue, queue_idx)
                 })?;
 
-                // Add the finished fences to the reservation objects
+                // Add the finished fences to the reservation objects and
+                // collect them to return to the caller (for syncobj signalling).
                 for fence in &finished_fences {
                     locked_vm.resv_add_fence(
-                        fence,
+                        &**fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     );
+                    fences.push(fence.clone(), GFP_KERNEL)?;
                 }
             }
 
@@ -460,9 +465,7 @@ impl Pool {
         // Try to destroy all possible groups from 0 to free_index as there's no
         // iterator implementation in xarray.rs.
         for index in 0..max_index {
-            if let Ok(_) = self.destroy_group(tdev, index) {
-                pr_info!("Destroyed group at index {}\n", index);
-            }
+            let _ = self.destroy_group(tdev, index);
         }
 
         Ok(())

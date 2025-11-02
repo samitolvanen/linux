@@ -4,7 +4,7 @@ use group::Group;
 use kernel::bits::checked_bit_u32;
 use kernel::bits::genmask_u32;
 use kernel::c_str;
-use kernel::dma_fence::UserFence;
+use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::drm::gem::BaseObject;
 use kernel::kvec;
 use kernel::prelude::*;
@@ -12,7 +12,6 @@ use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::time::Delta;
 use kernel::time::Instant;
-use kernel::workqueue::OwnedQueue;
 use kernel::workqueue::WqFlags;
 use queue::Queue;
 
@@ -98,13 +97,12 @@ pub(crate) struct Scheduler {
     #[expect(dead_code)]
     sb_slot_count: u32,
 
-    /// Workqueue used by our internal scheduler logic and by the
-    /// [`drm::Scheduler`].
+    /// Workqueue used by our internal scheduler logic.
     ///
     /// Used for the scheduler tick, group update or other kinds of FW event
     /// processing that cannot be handled in the threaded interrupt path. Also
-    /// passed to the scheduler instances embedded in our queues.
-    wq: OwnedQueue,
+    /// passed to the job queues embedded in our GPU queues.
+    wq: DmaFenceWorkqueue,
 
     /// When the next tick should occur.
     resched_target: Option<Instant<kernel::time::RealTime>>,
@@ -156,7 +154,7 @@ impl Scheduler {
         let csg_slot_count = core::cmp::min(num_groups, gpu_as_count);
         let as_slot_count = gpu_as_count;
 
-        let wq = OwnedQueue::new(c_str!("tyr-csf-sched"), WqFlags::UNBOUND, 0)?;
+        let wq = DmaFenceWorkqueue::new(c_str!("tyr-csf-sched"), WqFlags::UNBOUND, 0)?;
 
         // Populate CSIF info in TyrDevice
         {
@@ -235,6 +233,7 @@ impl Scheduler {
             // on queues belonging to the same group that are rarely updated.
             for queue in &mut inner.queues {
                 queue.doorbell_id = Some(csg_idx + 1);
+                queue.job_queue.unpark();
             }
 
             Ok(())
@@ -276,17 +275,24 @@ impl Scheduler {
 
         let slot = self.csg_slots[csg_idx].as_mut().ok_or(EINVAL)?;
 
-        data.with_locked_mmu(|mmu| {
-            mmu.unbind_vm(&slot.group.vm, &data.iomem)?;
-            Ok(())
-        })?;
-
         slot.group.with_locked_inner(|inner| {
+            // Park all queues first, before releasing any hardware resources.
+            // This ensures tick_exec() cannot attempt to submit jobs after
+            // we've unbound the VM and cleared the doorbells.
+            for queue in &mut inner.queues {
+                queue.job_queue.park();
+            }
+
             inner.csg_id = None;
 
             for queue in &mut inner.queues {
                 queue.doorbell_id = None;
             }
+            Ok(())
+        })?;
+
+        data.with_locked_mmu(|mmu| {
+            mmu.unbind_vm(&slot.group.vm, &data.iomem)?;
             Ok(())
         })?;
 
@@ -431,8 +437,6 @@ impl Scheduler {
         let already_bound = group.with_locked_inner(|inner| Ok(inner.csg_id.is_some()))?;
 
         if already_bound {
-            let _csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id.unwrap()))?;
-            // pr_info!("Group already bound to CSG slot {}\n", csg_id);
             return Ok(());
         }
 
@@ -468,9 +472,9 @@ impl Scheduler {
         {
             let Some(s) = slot else { continue };
 
-            let has_idle_queues = s.group.with_locked_inner(|inner| {
-                Ok(inner.queues.iter().all(|q| q.in_flight_jobs.is_empty()))
-            })?;
+            let has_idle_queues = s
+                .group
+                .with_locked_inner(|inner| Ok(inner.queues.iter().all(|q| q.timeline.is_idle())))?;
 
             if has_idle_queues {
                 idx = Some(i);
@@ -582,8 +586,9 @@ impl Scheduler {
         group: Arc<Group>,
         queue_submits: KVec<QueueSubmit>,
         file: &DrmFile,
-    ) -> Result<KVec<UserFence<job::Fence>>> {
-        group.submit(syncs, queue_submits, file)
+    ) -> Result {
+        group.submit(syncs, queue_submits, file)?;
+        Ok(())
     }
 }
 

@@ -4,7 +4,6 @@
 
 use kernel::bindings;
 use kernel::bindings::drm_gpuvm_exec;
-use kernel::dma_fence::RawDmaFence;
 use kernel::drm::gpuvm::DriverGpuVm;
 use kernel::drm::gpuvm::GpuVm;
 use kernel::error::to_result;
@@ -51,11 +50,12 @@ impl<'a, T: DriverGpuVm> ExecToken<'a, T> {
     /// Adds a fence to the private and external buffer object reservations.
     pub(crate) fn resv_add_fence(
         &mut self,
-        fence: &dyn RawDmaFence,
+        fence: &kernel::dma_fence::PublicDmaFence,
         private_usage: u32,
         extobj_usage: u32,
     ) {
-        // SAFETY: vm_exec is valid and locked, fence is valid per RawDmaFence contract.
+        // SAFETY: vm_exec is valid and locked, fence is valid per the
+        // PublicDmaFence invariants.
         unsafe {
             bindings::drm_gpuvm_resv_add_fence(
                 self.vm_exec.vm,

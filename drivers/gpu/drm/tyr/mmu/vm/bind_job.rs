@@ -4,7 +4,9 @@
 
 use core::ops::Range;
 
-use kernel::drm::sched::JobImpl;
+use kernel::c_str;
+use kernel::dma_fence::{DmaFenceContext, DriverDmaFence, DriverDmaFenceOps};
+use kernel::drm::job_queue::{JobRef, QueueOps, SubmitResult};
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
@@ -40,12 +42,55 @@ impl VmBindJob {
     }
 }
 
-impl JobImpl for VmBindJob {
-    fn run(job: &mut kernel::drm::sched::Job<Self>) -> Result<Option<kernel::dma_fence::Fence>> {
-        let mut vm = job.vm.lock();
+// SAFETY: VmBindJob is used only through the JobQueue, which requires Send +
+// Sync. Arc<Mutex<Vm>> is Send + Sync; gem::ObjectRef follows the same pattern
+// as Job in sched/job.rs.
+unsafe impl Send for VmBindJob {}
+unsafe impl Sync for VmBindJob {}
+
+/// Opaque driver data attached to each VM bind fence.
+struct VmBindFenceData;
+
+#[vtable]
+impl DriverDmaFenceOps for VmBindFenceData {
+    fn driver_name(&self) -> &'static CStr {
+        c_str!("tyr")
+    }
+
+    fn timeline_name(&self) -> &'static CStr {
+        c_str!("tyr_vm_bind")
+    }
+}
+
+/// Handler for VM bind jobs on a [`kernel::drm::job_queue::JobQueue`].
+///
+/// Executes page-table operations synchronously inside `submit()`, then
+/// produces an already-signaled fence so the job queue can immediately retire
+/// the job without waiting for hardware.
+pub(crate) struct VmBindJobHandler {
+    /// Fence context and seqno counter for fences produced by this handler.
+    fence_ctx: DmaFenceContext,
+}
+
+impl VmBindJobHandler {
+    pub(crate) fn new() -> Self {
+        Self {
+            fence_ctx: DmaFenceContext::new(0),
+        }
+    }
+}
+
+impl QueueOps for VmBindJobHandler {
+    type Job = VmBindJob;
+
+    fn submit(&self, job: &JobRef<'_, VmBindJob>) -> Result<SubmitResult> {
+        let (ctx, seqno) = self.fence_ctx.next_seqno();
+        let (drv_fence, pub_fence) = DriverDmaFence::new(VmBindFenceData, ctx, seqno)?.publish();
+
+        let mut vm = job.job.vm.lock();
         let iomem = vm.iomem.clone();
 
-        let result = match &job.operation {
+        let result = match &job.job.operation {
             VmOperation::Map {
                 va_range,
                 bo,
@@ -60,11 +105,17 @@ impl JobImpl for VmBindJob {
             vm.unusable = true;
         }
 
-        result.map(|_| None)
+        drop(vm);
+
+        // Signal the fence immediately — VM bind executes synchronously.
+        // The job queue sees AlreadySignaled when registering its callback and
+        // retires the submit fence right away.
+        drv_fence.signal(result);
+
+        Ok(SubmitResult::Submitted(pub_fence))
     }
 
-    fn timed_out(_job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
-        pr_info!("Async VM bind job timed out\n");
-        kernel::drm::sched::Status::NoDevice
+    fn timed_out(&self, _job: &JobRef<'_, VmBindJob>) {
+        pr_err!("Async VM bind job timed out\n");
     }
 }

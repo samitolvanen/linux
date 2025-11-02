@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use kernel::impl_has_work;
+use kernel::dma_fence::DmaFenceWorkItem;
+use kernel::impl_has_dma_fence_work;
 use kernel::prelude::*;
 use kernel::sync::Arc;
-use kernel::workqueue::WorkItem;
 
 use crate::driver::TyrData;
 use crate::fw::global::csg::Priority;
@@ -26,13 +26,13 @@ impl Tick {
     }
 }
 
-impl_has_work! {
-    impl HasWork<Self, 1> for TyrData {
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<Self, 1> for TyrData {
         self.tick_work
     }
 }
 
-impl WorkItem<1> for TyrData {
+impl DmaFenceWorkItem<1> for TyrData {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {

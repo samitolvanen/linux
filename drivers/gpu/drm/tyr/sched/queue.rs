@@ -2,20 +2,18 @@
 
 use core::ops::Range;
 
-use kernel::c_str;
 use kernel::devres::Devres;
-use kernel::dma_fence::FenceContexts;
-use kernel::dma_fence::UserFence;
+use kernel::dma_fence::DriverDmaFenceTimeline;
 use kernel::drm::gem::BaseObject;
-use kernel::drm::sched;
-use kernel::drm::sched::Entity;
-use kernel::drm::sched::Scheduler;
+use kernel::drm::job_queue::JobQueue;
 use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sizes::SZ_64K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
+use kernel::time::msecs_to_jiffies;
 
+use super::job;
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::file::QueueCreate;
@@ -25,21 +23,15 @@ use crate::gem;
 use crate::mmu::vm::map_flags;
 use crate::mmu::vm::Vm;
 use crate::regs::Doorbell;
-use crate::sched::job::Job;
-
-use super::job;
 
 const JOB_TIMEOUT_MS: usize = 5000;
 pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
 
 /// Represents a hardware executiion queue.
 pub(crate) struct Queue {
-    /// The DRM scheduler used for this queue.
-    #[expect(dead_code)]
-    scheduler: Scheduler<Job>,
-
-    /// The DRM entity used for this queue.
-    pub(super) entity: Entity<Job>,
+    /// The JobQueue used to track dependencies and call us when a job is ready
+    /// to run.
+    pub(super) job_queue: JobQueue<job::TyrJobHandler>,
 
     /// A priority number, between 0 and 15.
     pub(crate) priority: u8,
@@ -63,10 +55,8 @@ pub(crate) struct Queue {
 
     iomem: Arc<Devres<IoMem>>,
 
-    pub(super) fence_ctx: FenceContexts,
-
-    /// The in-flight jobs for this queue.
-    pub(super) in_flight_jobs: KVec<UserFence<job::Fence>>,
+    /// Timeline fence manager for this queue.
+    pub(super) timeline: Arc<DriverDmaFenceTimeline<job::TyrTimelineOps>>,
 }
 
 impl Queue {
@@ -96,18 +86,13 @@ impl Queue {
         }
 
         let priority = queue_args.priority;
-        let credit_limit = queue_args.ringbuf_size / core::mem::size_of::<u64>() as u32;
 
-        let scheduler = Scheduler::new(
-            tdev.as_ref(),
-            1,
-            credit_limit,
-            0,
-            JOB_TIMEOUT_MS,
-            c_str!("tyr-queue"),
+        let job_queue = JobQueue::new(job::TyrJobHandler, msecs_to_jiffies(JOB_TIMEOUT_MS as u32))?;
+
+        let timeline = Arc::pin_init(
+            DriverDmaFenceTimeline::new(Arc::new(job::TyrTimelineOps, GFP_KERNEL)?),
+            GFP_KERNEL,
         )?;
-
-        let entity = Entity::new(&scheduler, sched::Priority::Kernel)?;
 
         let iomem = tdev.iomem.clone();
         let ringbuf = {
@@ -139,18 +124,14 @@ impl Queue {
             output_offset: SZ_4K,
         };
 
-        let fence_ctx = FenceContexts::new(1, c_str!("tyr_fence"), None, 1)?;
-
         Ok(Queue {
-            scheduler,
-            entity,
+            job_queue,
             doorbell_id: None,
             priority,
             ringbuf,
             interfaces,
             iomem,
-            fence_ctx,
-            in_flight_jobs: KVec::new(),
+            timeline,
         })
     }
 

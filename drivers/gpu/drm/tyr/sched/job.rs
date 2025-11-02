@@ -2,15 +2,37 @@
 
 use kernel::bits::genmask_u64;
 use kernel::c_str;
-use kernel::dma_fence;
-use kernel::dma_fence::FenceObject;
-use kernel::dma_fence::FenceOps;
-use kernel::drm::sched::JobImpl;
+use kernel::dma_fence::DriverDmaFenceTimelineOps;
+use kernel::drm::job_queue::{JobRef, QueueOps, SubmitResult};
 use kernel::kvec;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 
 use crate::sched::group::Group;
+
+/// Timeline ops for tyr GPU queues.
+///
+/// Every [`crate::sched::queue::Queue`] owns a
+/// [`dma_fence::DriverDmaFenceTimeline<TyrTimelineOps>`] that tracks the GPU
+/// sync-object counter for that CS slot. Each GPU job claims the next sequence
+/// number in the timeline; when the firmware's SYNC_ADD64 instruction fires
+/// and `update_group()` reads the new sync-object value, it calls
+/// `timeline.signal_up_to(seqno)` to retire all completed fences at once.
+pub(crate) struct TyrTimelineOps;
+
+impl DriverDmaFenceTimelineOps for TyrTimelineOps {
+    type DmaFenceData = ();
+
+    fn new_fence(&self, _seqno: u64) {}
+
+    fn driver_name(&self) -> &'static CStr {
+        c_str!("tyr")
+    }
+
+    fn timeline_name(&self) -> &'static CStr {
+        c_str!("tyr_fence")
+    }
+}
 
 pub(crate) struct Job {
     /// The group whose queue this job will be pushed to.
@@ -27,12 +49,6 @@ pub(crate) struct Job {
 
     latest_flush: u32,
 
-    /// The position of the job in the ringbuffer, if any.
-    ringbuf_pos: Option<RingBufferPosition>,
-
-    /// The fence to signal when the job is done.
-    done_fence: dma_fence::UserFence<Fence>,
-
     /// The address of the sync object for the queue.
     ///
     /// This is here for convenience, so it's ready to be consumed in the run
@@ -44,7 +60,6 @@ impl Job {
     pub(crate) fn create(
         qsubmit: crate::file::QueueSubmit,
         group: Arc<Group>,
-        done_fence: dma_fence::UserFence<Fence>,
         sync_addr: u64,
     ) -> Result<Self> {
         if qsubmit.pad != 0 {
@@ -68,8 +83,6 @@ impl Job {
             stream_addr: qsubmit.stream_addr,
             stream_size: qsubmit.stream_size,
             latest_flush: qsubmit.latest_flush,
-            ringbuf_pos: None,
-            done_fence,
             sync_addr,
         })
     }
@@ -79,9 +92,9 @@ impl Job {
     }
 }
 
-impl JobImpl for Job {
-    // This is in the dma signalling path. Do _not_ allocate here.
-    fn run(job: &mut kernel::drm::sched::Job<Self>) -> Result<Option<kernel::dma_fence::Fence>> {
+impl Job {
+    /// Submit this job to the hardware.
+    fn submit_to_hw(&self) -> Result<SubmitResult> {
         // TODO: use a fixed-size array instead.
         let mut instrs = kvec![];
 
@@ -92,7 +105,7 @@ impl JobImpl for Job {
 
         let opcode = 2; // MOV32
         let latest_flush_regnum = val_reg;
-        let latest_flush: u64 = job.latest_flush.into();
+        let latest_flush: u64 = self.latest_flush.into();
         let mov_latest_flush: u64 = opcode << 56 | latest_flush_regnum << 48 | latest_flush;
 
         let opcode = 36; //FLUSH_CACHE2
@@ -100,11 +113,11 @@ impl JobImpl for Job {
 
         let opcode = 1; // MOV48
         let cs_start_regnum = addr_reg;
-        let mov_cs_start: u64 = opcode << 56 | cs_start_regnum << 48 | job.stream_addr;
+        let mov_cs_start: u64 = opcode << 56 | cs_start_regnum << 48 | self.stream_addr;
 
         let opcode = 2; // MOV32
         let cs_size_regnum = val_reg;
-        let mov_cs_size: u64 = opcode << 56 | cs_size_regnum << 48 | u64::from(job.stream_size);
+        let mov_cs_size: u64 = opcode << 56 | cs_size_regnum << 48 | u64::from(self.stream_size);
 
         let opcode = 3;
         let wait0: u64 = opcode << 56 | (1 << 16); // WAIT(0)
@@ -114,7 +127,7 @@ impl JobImpl for Job {
 
         let opcode = 1; // MOV48
         let sync_addr_regnum = addr_reg;
-        let mov_sync_addr: u64 = opcode << 56 | sync_addr_regnum << 48 | job.sync_addr;
+        let mov_sync_addr: u64 = opcode << 56 | sync_addr_regnum << 48 | self.sync_addr;
 
         // Load the actual "1" constant into a register. SYNC_ADD cannot take
         // this as an immediate.
@@ -166,55 +179,44 @@ impl JobImpl for Job {
             instrs.push(0, GFP_KERNEL)?;
         }
 
-        let ringbuf_pos = job.group.with_locked_inner(|inner| {
-            let queue = inner.queues.get_mut(job.queue_idx).ok_or(EINVAL)?;
-            let input = queue.interfaces.read_input()?;
+        self.group.with_locked_inner(|inner| {
+            let queue = inner.queues.get_mut(self.queue_idx).ok_or(EINVAL)?;
 
-            let ringbuf_pos = RingBufferPosition {
-                start: input.insert,
-                end: input.insert + instrs.len() as u64,
-            };
+            if queue.doorbell_id.is_none() {
+                pr_err!("submit_to_hw: group has no CSG slot assigned, NoResources (queue_idx={}, csg_id={:?})\n",
+                        self.queue_idx, inner.csg_id);
+                return Ok(SubmitResult::NoResources);
+            }
 
             queue.append_instrs(&instrs)?;
 
-            // Push the fence before kicking the queue.
-            queue
-                .in_flight_jobs
-                .push(job.done_fence.clone(), GFP_KERNEL)?;
+            // Claim the next timeline sequence number for this job.
+            // `job_queue`'s `DriverFenceCallback`.
+            let tl_fence = queue.timeline.new_fence()?;
+            let hw_fence = tl_fence.public_fence();
 
             queue.kick()?;
-            Ok(ringbuf_pos)
-        })?;
-
-        job.ringbuf_pos = Some(ringbuf_pos);
-
-        Ok(Some(kernel::dma_fence::Fence::from_fence(&job.done_fence)))
-    }
-
-    fn timed_out(_job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
-        pr_err!("Job timed out\n");
-
-        kernel::drm::sched::Status::NoDevice
+            Ok(SubmitResult::Submitted(hw_fence))
+        })
     }
 }
 
-#[expect(dead_code)]
-struct RingBufferPosition {
-    start: u64,
-    end: u64,
-}
+/// Zero-sized handler that delegates to [`Job::submit_to_hw`].
+pub(crate) struct TyrJobHandler;
 
-pub(crate) struct Fence;
+impl QueueOps for TyrJobHandler {
+    type Job = Job;
 
-#[vtable]
-impl FenceOps for Fence {
-    const USE_64BIT_SEQNO: bool = true;
-
-    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
-        c_str!("tyr")
+    fn submit(&self, job: &JobRef<'_, Job>) -> Result<SubmitResult> {
+        job.job.submit_to_hw()
     }
 
-    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
-        c_str!("tyr_fence")
+    fn timed_out(&self, job: &JobRef<'_, Job>) {
+        pr_err!("Job {} timed out\n", job.counter);
+        // The job_queue pipeline will signal the submit fence with ETIMEDOUT.
+        // Timeline fence retirement is handled by `check_timeouts()` in job_queue.
     }
 }
+
+unsafe impl Send for Job {}
+unsafe impl Sync for Job {}

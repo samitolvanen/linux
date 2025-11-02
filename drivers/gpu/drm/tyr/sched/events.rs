@@ -7,11 +7,11 @@
 
 use core::ops::Deref;
 
-use kernel::dma_fence::RawDmaFence;
-use kernel::impl_has_work;
+use kernel::dma_fence::DmaFenceSignallingAnnotation;
+use kernel::dma_fence::DmaFenceWorkItem;
+use kernel::impl_has_dma_fence_work;
 use kernel::prelude::*;
 use kernel::sync::Arc;
-use kernel::workqueue::WorkItem;
 
 use crate::driver::TyrData;
 use crate::driver::TyrDevice;
@@ -213,18 +213,14 @@ impl Scheduler {
                 .ok_or(EINVAL)?
                 .group
                 .with_locked_inner(|inner| {
-                    for job_fence in &inner.queues[cs_id as usize].in_flight_jobs {
-                        // Just mark everything in flight as failed.
-                        //
-                        // This is not exactly the right thing to do, but while
-                        // the driver is being developed, this will let us at
-                        // least signal all fences, even if we have errored out.
-                        //
-                        // Also, there is no error recovery for now. If we have
-                        // failed, we just want to stop everything and further
-                        // debug the driver code.
-                        job_fence.set_error(EINVAL);
-                        job_fence.signal()?;
+                    let queue = &inner.queues[cs_id as usize];
+
+                    // Signal all in-flight timeline fences as failed so that
+                    // job_queue's DriverFenceCallbacks fire and the submit fences
+                    // are retired with an error.
+                    {
+                        let _ann = DmaFenceSignallingAnnotation::new();
+                        queue.timeline.signal_all(Err(EINVAL));
                     }
 
                     // Let's also mark this group as destroyed just so we don't
@@ -247,49 +243,19 @@ impl Scheduler {
     }
 
     fn update_group(&mut self, group: Arc<Group>, _data: &Arc<TyrData>) -> Result {
-        let mut no_in_flight_jobs = true;
-        let mut csg_id = None;
-
-        // TODO: we need to annotate this function with the dma signalling token.
         // TODO: we cannot sleep in the signalling path.
         group.with_locked_inner(|inner| {
-            csg_id = inner.csg_id;
             for (queue_idx, queue) in inner.queues.iter_mut().enumerate() {
                 let sync_offset = queue_idx * core::mem::size_of::<syncs::SyncObj64b>();
                 let sync_obj = syncs::SyncObj64b::read(&mut inner.syncobjs, sync_offset)?;
 
-                // TODO: this has to be moved somewhere else. It should probably
-                // be in TyrData, or anywhere else we can easily access from
-                // here. It should also be protected by a SpinLock instead,
-                // because we cannot sleep in the signalling path.
-                let mut res = Ok(());
-                queue.in_flight_jobs.retain(|fence| {
-                    if sync_obj.seqno < fence.seqno() {
-                        return true;
-                    }
-
-                    res = fence.signal();
-                    false
-                });
-                res?;
-
-                no_in_flight_jobs &= queue.in_flight_jobs.is_empty();
+                {
+                    let _ann = DmaFenceSignallingAnnotation::new();
+                    queue.timeline.signal_up_to(sync_obj.seqno, Ok(()));
+                }
             }
-
             Ok(())
         })?;
-
-        // TODO: we need to restore CS_EXTRACT when restarting groups, or else
-        // this will re-execute the whole ringbuffer from the start.
-        //
-        // TODO: We should not remove IDLE groups if there's nothing to
-        // schedule, as it's actually counter-productive to do so.
-        //
-        // For now, just disable this.
-        //
-        // if no_in_flight_jobs {
-        //     self.mark_group_idle(group, data, csg_id)?;
-        // }
 
         Ok(())
     }
@@ -419,13 +385,13 @@ impl Scheduler {
     }
 }
 
-impl_has_work! {
-    impl HasWork<Self, 2> for TyrData {
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<Self, 2> for TyrData {
         self.fw_events_work
     }
 }
 
-impl WorkItem<2> for TyrData {
+impl DmaFenceWorkItem<2> for TyrData {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
@@ -437,13 +403,13 @@ impl WorkItem<2> for TyrData {
     }
 }
 
-impl_has_work! {
-    impl HasWork<Self, 3> for TyrData {
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<Self, 3> for TyrData {
         self.group_upd_work
     }
 }
 
-impl WorkItem<3> for TyrData {
+impl DmaFenceWorkItem<3> for TyrData {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {

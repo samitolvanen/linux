@@ -6,7 +6,7 @@
 
 use core::marker::PhantomData;
 
-use crate::{bindings, dma_fence::*, drm, error::Result, prelude::*};
+use crate::{bindings, dma_fence::*, drm, error::Result, prelude::*, types::ARef};
 
 use super::Driver;
 
@@ -36,15 +36,15 @@ impl<T: drm::Driver> SyncObj<T> {
     }
 
     /// Returns the DMA fence associated with this sync object, if any.
-    pub fn fence_get(&self) -> Option<Fence> {
+    pub fn fence_get(&self) -> Option<ARef<PublicDmaFence>> {
         // SAFETY: self.ptr is always valid
         let fence = unsafe { bindings::drm_syncobj_fence_get(self.ptr) };
         if fence.is_null() {
             None
         } else {
             // SAFETY: The pointer is non-NULL and drm_syncobj_fence_get acquired an
-            // additional reference.
-            Some(unsafe { Fence::from_raw(fence) })
+            // additional reference; we transfer ownership into ARef.
+            Some(unsafe { PublicDmaFence::from_raw(fence) })
         }
     }
 
@@ -54,7 +54,7 @@ impl<T: drm::Driver> SyncObj<T> {
         handle: u32,
         point: u64,
         flags: u64,
-    ) -> Result<Option<Fence>> {
+    ) -> Result<Option<ARef<PublicDmaFence>>> {
         let mut fence = core::ptr::null_mut();
 
         // SAFETY: All arguments are valid per the type invariants
@@ -74,13 +74,13 @@ impl<T: drm::Driver> SyncObj<T> {
             Ok(None)
         } else {
             // SAFETY: The pointer is non-NULL and drm_syncobj_find_fence acquired an
-            // additional reference.
-            Ok(Some(unsafe { Fence::from_raw(fence) }))
+            // additional reference; we transfer ownership into ARef.
+            Ok(Some(unsafe { PublicDmaFence::from_raw(fence) }))
         }
     }
 
     /// Replaces the DMA fence with a new one, or removes it if fence is None.
-    pub fn replace_fence(&self, fence: Option<&Fence>) {
+    pub fn replace_fence(&self, fence: Option<&PublicDmaFence>) {
         // SAFETY: All arguments should be valid per the respective type invariants.
         unsafe {
             bindings::drm_syncobj_replace_fence(
@@ -91,7 +91,7 @@ impl<T: drm::Driver> SyncObj<T> {
     }
 
     /// Adds a new timeline point to the syncobj.
-    pub fn add_point(&self, chain: FenceChain, fence: &Fence, point: u64) {
+    pub fn add_point(&self, chain: FenceChain, fence: &PublicDmaFence, point: u64) {
         // SAFETY: All arguments should be valid per the respective type invariants.
         // This takes over the FenceChain ownership.
         unsafe { bindings::drm_syncobj_add_point(self.ptr, chain.into_raw(), fence.raw(), point) };

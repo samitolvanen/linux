@@ -348,13 +348,13 @@ impl File {
 
         // Push all VM bind jobs with dependencies and update reservation objects
         vm.with_lock_taken(|vm| {
-            vm.with_prepared_vm_and_entity(count as u32, |mut locked_vm, entity| {
-                let finished_fences = ctx.add_deps_and_push_vm_bind_jobs(entity)?;
+            vm.with_prepared_vm_and_job_queue(count as u32, |mut locked_vm, job_queue| {
+                let finished_fences = ctx.add_deps_and_push_vm_bind_jobs(job_queue)?;
 
                 // Add the finished fences to the reservation objects
                 for fence in &finished_fences {
                     locked_vm.resv_add_fence(
-                        fence,
+                        &**fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     );

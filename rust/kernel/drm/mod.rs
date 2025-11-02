@@ -9,7 +9,8 @@ pub mod gem;
 #[cfg(CONFIG_DRM_GPUVM = "y")]
 pub mod gpuvm;
 pub mod ioctl;
-pub mod sched;
+#[cfg(CONFIG_DMA_SHARED_BUFFER)]
+pub mod job_queue;
 pub mod syncobj;
 
 pub use self::device::Device;
