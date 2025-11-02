@@ -106,6 +106,39 @@ impl Fence {
         // SAFETY: Pointer is valid per the RawDmaFence contract
         unsafe { Self::get_raw(fence.raw()) }
     }
+
+    /// Signal the fence.
+    ///
+    /// This marks the fence as signaled, indicating that the operation it represents
+    /// has completed. This will wake up any waiters on this fence.
+    ///
+    /// Returns the previous fence status, or an error if the fence was already signaled.
+    pub fn signal(&self) -> Result<i32> {
+        // SAFETY: The fence pointer is valid and we're calling the C API to signal it
+        let ret = unsafe { bindings::dma_fence_signal(self.ptr) };
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(ret)
+        }
+    }
+
+    /// Set an error on the fence.
+    ///
+    /// This sets an error value on the fence, which will be returned to waiters.
+    /// This should be called before signaling the fence if an error occurred.
+    pub fn set_error(&self, error: i32) {
+        // SAFETY: The fence pointer is valid and we're calling the C API to set an error
+        unsafe { bindings::dma_fence_set_error(self.ptr, error) }
+    }
+
+    /// Get the error value from the fence.
+    ///
+    /// Returns the error value that was set on the fence, or 0 if no error occurred.
+    pub fn error(&self) -> i32 {
+        // SAFETY: The fence pointer is valid and we're accessing a simple field
+        unsafe { (*self.ptr).error }
+    }
 }
 
 impl crate::private::Sealed for Fence {}
@@ -496,7 +529,6 @@ impl FenceContexts {
 ///     Ok(())
 /// }
 /// ```
-
 pub trait FenceCallback: Sync {
     /// Called when the fence is signaled.
     ///
