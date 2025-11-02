@@ -30,4 +30,19 @@ void rust_helper_dma_fence_set_error(struct dma_fence *fence, int error)
 	dma_fence_set_error(fence, error);
 }
 
+bool rust_helper_dma_fence_is_signaled(struct dma_fence *fence)
+{
+	return dma_fence_is_signaled(fence);
+}
+
+bool rust_helper_dma_fence_begin_signalling(void)
+{
+	return dma_fence_begin_signalling();
+}
+
+void rust_helper_dma_fence_end_signalling(bool cookie)
+{
+	dma_fence_end_signalling(cookie);
+}
+
 #endif

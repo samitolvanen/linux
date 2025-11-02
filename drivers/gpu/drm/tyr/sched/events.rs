@@ -239,7 +239,7 @@ impl Scheduler {
                         // Also, there is no error recovery for now. If we have
                         // failed, we just want to stop everything and further
                         // debug the driver code.
-                        job_fence.set_error(EINVAL);
+                        job_fence.set_error(EINVAL.to_errno());
                         job_fence.signal()?;
                     }
 

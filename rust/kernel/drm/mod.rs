@@ -8,6 +8,7 @@ pub mod file;
 pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
+pub mod job_queue;
 pub mod sched;
 pub mod syncobj;
 

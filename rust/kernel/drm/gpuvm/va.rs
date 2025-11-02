@@ -121,6 +121,10 @@ impl<T: DriverGpuVm> GpuVaAlloc<T> {
     }
 }
 
+// SAFETY: `GpuVaAlloc` only contains uninitialized memory before it is prepared,
+// so it is safe to send between threads.
+unsafe impl<T: DriverGpuVm> Send for GpuVaAlloc<T> {}
+
 /// A [`GpuVa`] object that has been removed.
 ///
 /// # Invariants

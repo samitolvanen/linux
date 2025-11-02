@@ -309,12 +309,7 @@ impl Group {
                             .new_fence(0, crate::sched::job::Fence)?
                             .into();
 
-                        let job = job::Job::create(
-                            *queue_submit,
-                            self.clone(),
-                            fence.clone(),
-                            sync_addr,
-                        )?;
+                        let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
 
                         ctx.add_job(job, internal_syncs.clone())?;
 
@@ -339,7 +334,7 @@ impl Group {
                 for &queue_idx in queue_indices.iter() {
                     let finished_fences = self.with_locked_inner(|inner| {
                         let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                        ctx.add_deps_and_push_jobs(&mut queue.entity, queue_idx)
+                        ctx.add_deps_and_push_jobs(&queue.job_queue, queue_idx)
                     })?;
 
                     // Add the finished fences to the reservation objects

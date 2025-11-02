@@ -13,6 +13,20 @@ use crate::{
 use core::{iter, marker::PhantomData, pin::Pin, ptr::NonNull};
 use pin_init::{pin_data, pin_init, pinned_drop, PinInit};
 
+/// `XA_ZERO_ENTRY` — the XArray sentinel for reserved-but-empty slots.
+const XA_ZERO_ENTRY: *mut core::ffi::c_void = 1030usize as *mut core::ffi::c_void;
+
+/// An XArray index that has been reserved but not yet populated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedIndex(pub u32);
+
+impl ReservedIndex {
+    /// Returns the raw index value.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// An array which efficiently maps sparse integer indices to owned objects.
 ///
 /// This is similar to a [`crate::alloc::kvec::Vec<Option<T>>`], but more efficient when there are
@@ -82,6 +96,32 @@ pub enum AllocKind {
     Alloc,
     /// Consider the first element to be at index 1.
     Alloc1,
+}
+
+/// Represents a range of valid allocation IDs for XArray allocation functions.
+///
+/// Wraps the C `struct xa_limit`.
+pub struct XaLimit {
+    // This is just two integers. The overhead of wrapping this in Opaque<T> is
+    // not worth it IMHO.
+    inner: bindings::xa_limit,
+}
+
+impl XaLimit {
+    /// The full 32-bit range `[0, u32::MAX]`.
+    pub const LIMIT_32B: Self = Self {
+        inner: bindings::xa_limit {
+            min: 0,
+            max: u32::MAX,
+        },
+    };
+
+    /// Create a custom range.
+    pub const fn new(min: u32, max: u32) -> Self {
+        Self {
+            inner: bindings::xa_limit { min, max },
+        }
+    }
 }
 
 impl<T: ForeignOwnable> XArray<T> {
@@ -264,6 +304,171 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
             // NB: `XA_ZERO_ENTRY` is never returned by functions belonging to the Normal XArray
             // API; such entries present as `NULL`.
             Ok(unsafe { T::try_from_foreign(old) })
+        }
+    }
+
+    /// Allocates an unused index and stores the element there.
+    pub fn alloc(
+        &mut self,
+        value: T,
+        limit: XaLimit,
+        gfp: alloc::Flags,
+    ) -> Result<u32, StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+        let mut id: u32 = 0;
+
+        // SAFETY:
+        // - `self.xa.xa` is always valid by the type invariant.
+        // - The caller holds the lock.
+        let ret = unsafe {
+            bindings::__xa_alloc(
+                self.xa.xa.get(),
+                &mut id,
+                new.cast(),
+                limit.inner,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(ret),
+            })
+        } else {
+            Ok(id)
+        }
+    }
+
+    /// Allocates an unused index cyclically and stores the element there.
+    pub fn alloc_cyclic(
+        &mut self,
+        value: T,
+        limit: XaLimit,
+        next: &mut u32,
+        gfp: alloc::Flags,
+    ) -> Result<u32, StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+        let mut id: u32 = 0;
+
+        // SAFETY:
+        // - `self.xa.xa` is always valid by the type invariant.
+        // - The caller holds the lock.
+        let ret = unsafe {
+            bindings::__xa_alloc_cyclic(
+                self.xa.xa.get(),
+                &mut id,
+                new.cast(),
+                limit.inner,
+                next,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(ret),
+            })
+        } else {
+            Ok(id)
+        }
+    }
+
+    /// Cyclically allocates an index and marks it as reserved (no value stored yet).
+    pub fn alloc_cyclic_reserve(
+        &mut self,
+        limit: XaLimit,
+        next: &mut u32,
+        gfp: alloc::Flags,
+    ) -> Result<ReservedIndex> {
+        build_assert!(
+            core::mem::align_of::<u32>() >= 4,
+            "XArray alloc requires 4-byte aligned entries"
+        );
+        let mut id: u32 = 0;
+
+        // SAFETY: `self.xa.xa` is valid by the type invariant, the caller
+        // holds the lock, and `XA_ZERO_ENTRY` is a valid XArray sentinel.
+        let ret = unsafe {
+            bindings::__xa_alloc_cyclic(
+                self.xa.xa.get(),
+                &mut id,
+                XA_ZERO_ENTRY,
+                limit.inner,
+                next,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(ReservedIndex(id))
+        }
+    }
+
+    /// Populates a slot previously reserved with `alloc_cyclic_reserve`.
+    pub fn store_reserved(
+        &mut self,
+        index: ReservedIndex,
+        value: T,
+        gfp: alloc::Flags,
+    ) -> Result<(), StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+
+        let old = {
+            // SAFETY:
+            // - `self.xa.xa` is always valid by the type invariant.
+            // - The caller holds the lock.
+            // - `new` came from `T::into_foreign`.
+            unsafe {
+                bindings::__xa_store(self.xa.xa.get(), index.index(), new.cast(), gfp.as_raw())
+            }
+        };
+
+        // SAFETY: `__xa_store` returns `xa_err(…)` on error, 0 on success.
+        let errno = unsafe { bindings::xa_err(old) };
+        if errno != 0 {
+            // SAFETY: `new` came from `T::into_foreign`; `__xa_store` does not take
+            // ownership on error.
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(errno),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Releases a slot previously reserved with `alloc_cyclic_reserve` without storing a value.
+    pub fn release(&mut self, index: ReservedIndex) {
+        // SAFETY: `self.xa.xa` is valid by the type invariant, the caller
+        // holds the lock, and both XA_ZERO_ENTRY and NULL are valid cmpxchg
+        // arguments.
+        unsafe {
+            bindings::__xa_cmpxchg(
+                self.xa.xa.get(),
+                index.index(),
+                XA_ZERO_ENTRY,
+                core::ptr::null_mut(),
+                0,
+            );
         }
     }
 }

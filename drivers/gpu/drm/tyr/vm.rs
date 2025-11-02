@@ -16,12 +16,14 @@ use core::{
 };
 
 use kernel::{
+    alloc::Flags,
     c_str,
     device::{
         Bound,
         Device, //
     },
     devres::Devres,
+    dma_fence::DmaFenceWorkqueue,
     drm::{
         gpuvm::{
             DriverGpuVm,
@@ -61,7 +63,8 @@ use kernel::{
         ArcBorrow,
         Mutex, //
     },
-    uapi, //
+    uapi,
+    workqueue, //
 };
 
 use crate::{
@@ -250,7 +253,7 @@ enum VmOpType {
 /// VM operations may require allocating new GPUVA objects to track mappings.
 /// To avoid allocation failures during the operation, preallocate the
 /// maximum number of GPUVAs that might be needed.
-struct VmOpResources {
+pub(crate) struct VmOpResources {
     /// Preallocated GPUVA objects for remap operations.
     ///
     /// Partial unmap requests or map requests overlapping existing mappings
@@ -258,6 +261,30 @@ struct VmOpResources {
     /// objects (one for the new mapping, and two for the previous and next
     /// mappings).
     preallocated_gpuvas: [Option<GpuVaAlloc<GpuVmData>>; 3],
+}
+
+impl VmOpResources {
+    /// Allocate resources for a map operation.
+    pub(crate) fn for_map() -> Result<Self> {
+        Ok(Self {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+            ],
+        })
+    }
+
+    /// Allocate resources for an unmap operation.
+    pub(crate) fn for_unmap() -> Result<Self> {
+        Ok(Self {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                None,
+            ],
+        })
+    }
 }
 
 /// Request to execute a virtual memory operation.
@@ -312,6 +339,9 @@ pub(crate) struct PtUpdateContext<'ctx> {
 
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
+
+    /// GFP flags for page table allocations.
+    gfp: Flags,
 }
 
 impl<'ctx> PtUpdateContext<'ctx> {
@@ -328,6 +358,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
         region: Range<u64>,
         op_type: PtOpType,
         resources: &'ctx mut VmOpResources,
+        gfp: Flags,
     ) -> Result<PtUpdateContext<'ctx>> {
         mmu.start_vm_update(as_data, &region)?;
 
@@ -339,6 +370,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
             region,
             op_type,
             resources,
+            gfp,
         })
     }
 
@@ -373,15 +405,6 @@ impl Drop for PtUpdateContext<'_> {
 /// and associated types for buffer objects, virtual addresses, and contexts.
 pub(crate) struct GpuVmData {}
 
-/// Scheduler context for async VM bind operations.
-struct VmBindCtx {
-    scheduler: sched::Scheduler<VmBindJob>,
-    entity: sched::Entity<VmBindJob>,
-}
-
-/// GPU virtual address space.
-///
-/// Each VM can be mapped into a hardware address space slot.
 #[pin_data]
 pub(crate) struct Vm {
     /// Data referenced by an AS when the VM is active
@@ -407,9 +430,8 @@ pub(crate) struct Vm {
     ///
     /// Once set, the VM cannot accept new operations and should be destroyed.
     unusable: AtomicBool,
-    /// Scheduler context for async VM bind operations.
-    #[pin]
-    bind_ctx: Mutex<VmBindCtx>,
+    /// Job queue for async VM bind operations.
+    pub(crate) job_queue: kernel::drm::job_queue::JobQueue<bind_job::VmBindJobHandler>,
 }
 
 impl Vm {
@@ -456,8 +478,16 @@ impl Vm {
 
         let kernel_va = RangeAlloc::new(kernel_va_range.start, kernel_va_range.end, GFP_KERNEL)?;
 
-        let bind_scheduler = sched::Scheduler::new(ddev.as_ref(), 1, 1, 1, 1000, c_str!("tyr_vm"))?;
-        let bind_entity = sched::Entity::new(&bind_scheduler, sched::Priority::Low)?;
+        let wq = Arc::new(
+            DmaFenceWorkqueue::new(c_str!("vm_bind_wq"), workqueue::WqFlags::HIGHPRI, 0)?,
+            GFP_KERNEL,
+        )?;
+        let job_queue = kernel::drm::job_queue::JobQueue::new(
+            bind_job::VmBindJobHandler::new()?,
+            wq.clone(),
+            wq,
+            kernel::drm::job_queue::PipelineBuilder::new(),
+        )?;
 
         let vm = Arc::pin_init(
             pin_init!(Self{
@@ -470,10 +500,7 @@ impl Vm {
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
                 unusable: AtomicBool::new(false),
-                bind_ctx <- new_mutex!(VmBindCtx {
-                    scheduler: bind_scheduler,
-                    entity: bind_entity,
-                }),
+                job_queue,
             }),
             GFP_KERNEL,
         )?;
@@ -501,30 +528,26 @@ impl Vm {
     }
 
     /// Execute a function with the VM bind entity locked.
-    pub(crate) fn with_bind_entity<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut sched::Entity<VmBindJob>) -> Result<R>,
-    {
-        let mut ctx = self.bind_ctx.lock();
-        f(&mut ctx.entity)
-    }
 
     /// Prepare the VM for execution and lock the bind entity.
     ///
     /// Acquires the GPUVM exec lock (reserving `num_slots` fence slots) and
     /// the bind context mutex, then calls the provided closure with both a
     /// [`PreparedVm`] and the bind [`Entity`].
-    pub(crate) fn with_prepared_vm_and_bind_entity<F, R>(&self, num_slots: u32, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut PreparedVm<'_>, &mut sched::Entity<VmBindJob>) -> Result<R>,
-    {
+    pub(crate) fn with_prepared_vm_and_job_queue<R>(
+        &self,
+        num_slots: u32,
+        f: impl FnOnce(
+            PreparedVm<'_>,
+            &kernel::drm::job_queue::JobQueue<bind_job::VmBindJobHandler>,
+        ) -> Result<R>,
+    ) -> Result<R> {
         let exec_token = exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
-        let mut prepared_vm = PreparedVm {
+        let prepared_vm = PreparedVm {
             exec_token,
             num_slots,
         };
-        let mut ctx = self.bind_ctx.lock();
-        f(&mut prepared_vm, &mut ctx.entity)
+        f(prepared_vm, &self.job_queue)
     }
 
     /// Deactivate the VM by evicting it from its address space slot.
@@ -540,8 +563,22 @@ impl Vm {
         let _ = self.deactivate().inspect_err(|e| {
             pr_err!("Failed to deactivate VM: {:?}\n", e);
         });
+
+        let mut resources = match VmOpResources::for_unmap() {
+            Ok(r) => r,
+            Err(e) => {
+                pr_err!("Failed to allocate resources for kill unmap: {:?}\n", e);
+                return;
+            }
+        };
+
         let _ = self
-            .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
+            .unmap_range(
+                self.va_range.start,
+                self.va_range.end - self.va_range.start,
+                &mut resources,
+                GFP_KERNEL,
+            )
             .inspect_err(|e| {
                 pr_err!("Failed to unmap range during deactivate: {:?}\n", e);
             });
@@ -581,6 +618,7 @@ impl Vm {
         gpuvm_unique: &mut UniqueRefGpuVm<GpuVmData>,
         req: VmOpRequest,
         resources: &mut VmOpResources,
+        gfp: Flags,
     ) -> Result {
         // SAFETY: pdev is a bound device.
         let dev = unsafe { self.pdev.as_ref().as_bound() };
@@ -601,6 +639,7 @@ impl Vm {
                         prot: args.flags.to_prot(),
                     }),
                     resources,
+                    gfp,
                 )?;
 
                 gpuvm_unique.sm_map(OpMapRequest {
@@ -621,6 +660,7 @@ impl Vm {
                     req.region,
                     PtOpType::Unmap,
                     resources,
+                    gfp,
                 )?;
 
                 gpuvm_unique.sm_unmap(
@@ -646,6 +686,8 @@ impl Vm {
         size: u64,
         va: u64,
         flags: VmMapFlags,
+        resources: &mut VmOpResources,
+        gfp: Flags,
     ) -> Result {
         let req = VmOpRequest {
             op_type: VmOpType::Map(VmMapArgs {
@@ -655,16 +697,9 @@ impl Vm {
             }),
             region: va..(va + size),
         };
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-            ],
-        };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
 
-        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)?;
+        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, resources, gfp)?;
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
@@ -677,21 +712,20 @@ impl Vm {
     ///
     /// This removes any existing mappings in the specified range, freeing the
     /// virtual address space for reuse.
-    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+    pub(crate) fn unmap_range(
+        &self,
+        va: u64,
+        size: u64,
+        resources: &mut VmOpResources,
+        gfp: Flags,
+    ) -> Result {
         let req = VmOpRequest {
             op_type: VmOpType::Unmap,
             region: va..(va + size),
         };
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                None,
-            ],
-        };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
 
-        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)?;
+        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, resources, gfp)?;
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
@@ -768,7 +802,7 @@ impl DriverGpuVm for GpuVmData {
             }
             let len = sgt_entry_length.min(bytes_left_to_map);
 
-            let segment_mapped = match pt_map(context.pt, iova, paddr, len, prot) {
+            let segment_mapped = match pt_map(context.pt, iova, paddr, len, prot, context.gfp) {
                 Ok(segment_mapped) => segment_mapped,
                 Err(e) => {
                     // clean up any successful mappings from previous SGT entries.
@@ -903,12 +937,16 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 /// unmapped before returning an error.
 ///
 /// Returns the number of bytes successfully mapped.
+// TODO: Avoiding allocations entirely via page table pre-allocation (as done in `panthor`)
+// is the ideal solution, but requires extending the `IoPageTable` Rust bindings to support
+// custom pools/cookies.
 fn pt_map(
     pt: &IoPageTable<ARM64LPAES1>,
     iova: u64,
     paddr: u64,
     len: u64,
     prot: u32,
+    gfp: Flags,
 ) -> Result<u64> {
     let mut segment_mapped = 0u64;
     while segment_mapped < len {
@@ -929,7 +967,7 @@ fn pt_map(
                 pgsize as usize,
                 pgcount as usize,
                 prot,
-                GFP_KERNEL,
+                gfp,
             )
         };
 

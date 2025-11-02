@@ -11,7 +11,8 @@ use kernel::{
     drm,
     drm::{
         device::Device as DrmDevice,
-        gem::BaseObject, //
+        gem::BaseObject,
+        gpuvm::GpuVaAlloc, //
     },
     io::Io,
     kvec,
@@ -47,8 +48,10 @@ use crate::{
             VmOperation, //
         },
         pool::Pool,
+        GpuVmData,
         VmLayout,
         VmMapFlags,
+        VmOpResources,
         VmUserSize, //
     }, //
 };
@@ -337,7 +340,11 @@ impl TyrDrmFileData {
             }
 
             let internal_syncs = deps::SyncOp::from_uapi_slice(&sync_ops)?;
-            let job = VmBindJob::new(vm.clone(), vm_operation);
+            let resources = match &vm_operation {
+                VmOperation::Map { .. } => VmOpResources::for_map()?,
+                VmOperation::Unmap { .. } => VmOpResources::for_unmap()?,
+            };
+            let job = VmBindJob::new(vm.clone(), vm_operation, resources);
             ctx.add_vm_bind_job(job, internal_syncs)?;
         }
 
@@ -371,8 +378,8 @@ impl TyrDrmFileData {
         }
 
         // Push all VM bind jobs with dependencies and update reservation objects.
-        vm.with_prepared_vm_and_bind_entity(count as u32, |prepared_vm, entity| {
-            let finished_fences = ctx.add_deps_and_push_vm_bind_jobs(entity)?;
+        vm.with_prepared_vm_and_job_queue(count as u32, |mut prepared_vm, job_queue| {
+            let finished_fences = ctx.add_deps_and_push_vm_bind_jobs(job_queue)?;
 
             for fence in &finished_fences {
                 prepared_vm.resv_add_fence(
@@ -434,7 +441,16 @@ impl TyrDrmFileData {
 
                         let flags = VmMapFlags::try_from(op.0.flags & 0b111)?;
 
-                        vm.map_bo_range(&bo, op.0.bo_offset, op.0.size, op.0.va, flags)?;
+                        let mut resources = VmOpResources::for_map()?;
+                        vm.map_bo_range(
+                            &bo,
+                            op.0.bo_offset,
+                            op.0.size,
+                            op.0.va,
+                            flags,
+                            &mut resources,
+                            GFP_KERNEL,
+                        )?;
                     }
 
                     uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP => {
@@ -448,7 +464,8 @@ impl TyrDrmFileData {
                             .get_vm(vmbind.vm_id as usize)
                             .ok_or(EINVAL)?;
 
-                        vm.unmap_range(op.0.va, op.0.size)?;
+                        let mut resources = VmOpResources::for_unmap()?;
+                        vm.unmap_range(op.0.va, op.0.size, &mut resources, GFP_KERNEL)?;
                     }
                     _ => return Err(ENOTSUPP),
                 }

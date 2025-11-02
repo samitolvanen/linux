@@ -250,7 +250,7 @@ impl<'a> Context<'a> {
     /// Returns a vector of finished fences that need to be added to reservation objects.
     pub(crate) fn add_deps_and_push_jobs(
         &mut self,
-        entity: &mut Entity<Job>,
+        job_queue: &kernel::drm::job_queue::JobQueue<crate::sched::job::TyrJobHandler>,
         queue_idx: usize,
     ) -> Result<KVec<Fence>> {
         let mut finished_fences = KVec::new();
@@ -276,22 +276,12 @@ impl<'a> Context<'a> {
                 }
             };
 
-            let mut pending_job = entity.new_job(1, 0, job)?;
-
-            for fence in fences {
-                pending_job.add_dependency(fence)?;
-            }
-
-            let mut armed_job = pending_job.arm();
-
-            let finished_fence = armed_job.fences().finished();
+            let finished_fence = job_queue.submit(job, &fences)?;
 
             // Update the sync signal fences with the job's completion fence
             self.update_job_syncs(job_idx, finished_fence.clone())?;
 
             finished_fences.push(finished_fence, GFP_KERNEL)?;
-
-            armed_job.push();
         }
 
         Ok(finished_fences)
@@ -302,7 +292,7 @@ impl<'a> Context<'a> {
     /// Returns a vector of finished fences that need to be added to reservation objects.
     pub(crate) fn add_deps_and_push_vm_bind_jobs(
         &mut self,
-        entity: &mut Entity<VmBindJob>,
+        job_queue: &kernel::drm::job_queue::JobQueue<crate::vm::bind_job::VmBindJobHandler>,
     ) -> Result<KVec<Fence>> {
         let mut finished_fences = KVec::new();
 
@@ -323,22 +313,12 @@ impl<'a> Context<'a> {
                 }
             };
 
-            let mut pending_job = entity.new_job(1, 0, job)?;
-
-            for fence in fences {
-                pending_job.add_dependency(fence)?;
-            }
-
-            let mut armed_job = pending_job.arm();
-
-            let finished_fence = armed_job.fences().finished();
+            let finished_fence = job_queue.submit(job, &fences)?;
 
             // Update the sync signal fences with the job's completion fence
             self.update_job_syncs(job_idx, finished_fence.clone())?;
 
             finished_fences.push(finished_fence, GFP_KERNEL)?;
-
-            armed_job.push();
         }
 
         Ok(finished_fences)

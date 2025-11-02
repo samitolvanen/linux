@@ -352,6 +352,93 @@ impl Queue {
     }
 }
 
+/// Flags for workqueue creation.
+pub struct WqFlags(bindings::wq_flags);
+
+impl WqFlags {
+    /// Bound workqueue.
+    pub const BOUND: WqFlags = WqFlags(0);
+    /// Bottom half workqueue.
+    pub const BH: WqFlags = WqFlags(bindings::wq_flags_WQ_BH);
+    /// Unbound workqueue.
+    pub const UNBOUND: WqFlags = WqFlags(bindings::wq_flags_WQ_UNBOUND);
+    /// Freezable workqueue.
+    pub const FREEZABLE: WqFlags = WqFlags(bindings::wq_flags_WQ_FREEZABLE);
+    /// Memory reclaim workqueue.
+    pub const MEM_RECLAIM: WqFlags = WqFlags(bindings::wq_flags_WQ_MEM_RECLAIM);
+    /// High priority workqueue.
+    pub const HIGHPRI: WqFlags = WqFlags(bindings::wq_flags_WQ_HIGHPRI);
+    /// CPU intensive workqueue.
+    pub const CPU_INTENSIVE: WqFlags = WqFlags(bindings::wq_flags_WQ_CPU_INTENSIVE);
+    /// Expose in sysfs.
+    pub const SYSFS: WqFlags = WqFlags(bindings::wq_flags_WQ_SYSFS);
+    /// Power efficient workqueue.
+    pub const POWER_EFFICIENT: WqFlags = WqFlags(bindings::wq_flags_WQ_POWER_EFFICIENT);
+}
+
+impl core::ops::BitOr for WqFlags {
+    type Output = WqFlags;
+    fn bitor(self, rhs: WqFlags) -> WqFlags {
+        WqFlags(self.0 | rhs.0)
+    }
+}
+
+/// A workqueue owned by the Rust side (will be destroyed on drop).
+pub struct OwnedQueue {
+    queue: NonNull<Queue>,
+}
+
+impl OwnedQueue {
+    /// Creates a new owned workqueue.
+    pub fn new(name: &CStr, flags: WqFlags, max_active: usize) -> Result<OwnedQueue, AllocError> {
+        let ptr = unsafe {
+            bindings::alloc_workqueue_noprof(
+                b"%s\0".as_ptr(),
+                flags.0,
+                i32::try_from(max_active).unwrap_or(i32::MAX),
+                name.as_char_ptr(),
+            )
+        };
+
+        Ok(OwnedQueue {
+            queue: NonNull::new(ptr).ok_or(AllocError)?.cast(),
+        })
+    }
+
+    /// Creates a new owned workqueue with a formatted name.
+    pub fn new_fmt(
+        name: core::fmt::Arguments<'_>,
+        flags: WqFlags,
+        max_active: usize,
+    ) -> Result<OwnedQueue, AllocError> {
+        let ptr = unsafe {
+            bindings::alloc_workqueue_noprof(
+                b"%pA\0".as_ptr(),
+                flags.0,
+                i32::try_from(max_active).unwrap_or(i32::MAX),
+                (&name) as *const _ as *const crate::ffi::c_void,
+            )
+        };
+
+        Ok(OwnedQueue {
+            queue: NonNull::new(ptr).ok_or(AllocError)?.cast(),
+        })
+    }
+}
+
+impl core::ops::Deref for OwnedQueue {
+    type Target = Queue;
+    fn deref(&self) -> &Queue {
+        unsafe { &*self.queue.as_ptr() }
+    }
+}
+
+impl Drop for OwnedQueue {
+    fn drop(&mut self) {
+        unsafe { bindings::destroy_workqueue(self.queue.as_ptr().cast()) }
+    }
+}
+
 /// A helper type used in [`try_spawn`].
 ///
 /// [`try_spawn`]: Queue::try_spawn

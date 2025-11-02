@@ -11,6 +11,7 @@ use kernel::{
         gem,
         gem::shmem,
         gem::BaseObject,
+        gpuvm::GpuVaAlloc,
         DeviceContext, //
     },
     prelude::*,
@@ -27,10 +28,12 @@ use crate::{
         TyrDrmDriver, //
     },
     file::TyrDrmFile,
-    vm::LiveRange,
     vm::{
+        GpuVmData,
+        LiveRange,
         Vm,
-        VmMapFlags, //
+        VmMapFlags,
+        VmOpResources, //
     },
 };
 
@@ -202,7 +205,16 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
         },
     )?;
 
-    vm.map_bo_range(&gem, 0, aligned_size as u64, va, flags)?;
+    let mut resources = VmOpResources::for_map()?;
+    vm.map_bo_range(
+        &gem,
+        0,
+        aligned_size as u64,
+        va,
+        flags,
+        &mut resources,
+        GFP_KERNEL,
+    )?;
     MappedBo::new(&gem)
 }
 
@@ -280,7 +292,8 @@ impl KernelBo {
             },
         )?;
 
-        vm.map_bo_range(&bo, 0, size, va, flags)?;
+        let mut resources = VmOpResources::for_map()?;
+        vm.map_bo_range(&bo, 0, size, va, flags, &mut resources, GFP_KERNEL)?;
 
         Ok(KernelBo {
             bo,
@@ -295,7 +308,17 @@ impl Drop for KernelBo {
         let va = self.va_range.start;
         let size = self.va_range.end - self.va_range.start;
 
-        if let Err(e) = self.vm.unmap_range(va, size) {
+        let mut resources = match VmOpResources::for_unmap() {
+            Ok(r) => r,
+            Err(e) => {
+                pr_err!(
+                    "Failed to allocate resources for KernelBo drop unmap: {:?}\n",
+                    e
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.vm.unmap_range(va, size, &mut resources, GFP_KERNEL) {
             pr_err!(
                 "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
                 self.va_range.start,

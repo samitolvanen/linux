@@ -2,10 +2,14 @@
 
 //! VM bind jobs for asynchronous VM operations.
 
+use core::cell::UnsafeCell;
 use core::ops::Range;
 
 use kernel::{
-    drm::sched::JobImpl,
+    drm::job_queue::{
+        JobRef,
+        SubmitResult, //
+    },
     prelude::*,
     sync::Arc,
     types::ARef, //
@@ -13,7 +17,8 @@ use kernel::{
 
 use crate::vm::{
     Vm,
-    VmMapFlags, //
+    VmMapFlags,
+    VmOpResources, //
 };
 
 /// VM operation types for asynchronous VM bind.
@@ -36,17 +41,44 @@ pub(crate) struct VmBindJob {
 
     /// The operation to perform.
     pub(crate) operation: VmOperation,
+
+    /// Preallocated resources for the operation.
+    ///
+    /// Not a `Mutex`: `submit()` runs serially per queue, so the cell
+    /// is never aliased.
+    resources: UnsafeCell<VmOpResources>,
 }
 
+// SAFETY: `resources` is only accessed in `submit()`, which the job-queue
+// framework runs serially per queue.
+unsafe impl Sync for VmBindJob {}
+
 impl VmBindJob {
-    pub(crate) fn new(vm: Arc<Vm>, operation: VmOperation) -> Self {
-        Self { vm, operation }
+    pub(crate) fn new(vm: Arc<Vm>, operation: VmOperation, resources: VmOpResources) -> Self {
+        Self {
+            vm,
+            operation,
+            resources: UnsafeCell::new(resources),
+        }
     }
 }
 
-impl JobImpl for VmBindJob {
-    fn run(job: &mut kernel::drm::sched::Job<Self>) -> Result<Option<kernel::dma_fence::Fence>> {
-        let result = match &job.operation {
+pub(crate) struct VmBindJobHandler;
+
+impl VmBindJobHandler {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+impl kernel::drm::job_queue::QueueOps for VmBindJobHandler {
+    type Job = VmBindJob;
+
+    fn submit(&self, job: &JobRef<'_, Self::Job>) -> Result<SubmitResult> {
+        // SAFETY: We are inside `submit()`, which the framework runs
+        // serially per queue, so this is the only reference to `resources`.
+        let resources = unsafe { &mut *job.job.resources.get() };
+        let result = match &job.job.operation {
             VmOperation::Map {
                 va_range,
                 bo,
@@ -54,12 +86,21 @@ impl JobImpl for VmBindJob {
                 flags,
             } => {
                 let size = va_range.end - va_range.start;
-                job.vm
-                    .map_bo_range(&bo, *bo_offset, size, va_range.start, *flags)
+                job.job.vm.map_bo_range(
+                    &bo,
+                    *bo_offset,
+                    size,
+                    va_range.start,
+                    *flags,
+                    resources,
+                    GFP_NOWAIT,
+                )
             }
             VmOperation::Unmap { va_range } => {
                 let size = va_range.end - va_range.start;
-                job.vm.unmap_range(va_range.start, size)
+                job.job
+                    .vm
+                    .unmap_range(va_range.start, size, resources, GFP_NOWAIT)
             }
         };
 
@@ -68,14 +109,11 @@ impl JobImpl for VmBindJob {
                 "Async VM bind operation failed, marking VM as unusable: {:?}\n",
                 e
             );
-            job.vm.mark_unusable();
+            job.job.vm.mark_unusable();
         }
 
-        result.map(|_| None)
-    }
+        let _ = job.submit_fence.signal();
 
-    fn timed_out(_job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
-        pr_info!("Async VM bind job timed out\n");
-        kernel::drm::sched::Status::NoDevice
+        Ok(SubmitResult::Submitted)
     }
 }

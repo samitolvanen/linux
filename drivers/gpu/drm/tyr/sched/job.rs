@@ -31,16 +31,7 @@ pub(crate) struct Job {
 
     latest_flush: u32,
 
-    /// The position of the job in the ringbuffer, if any.
-    ringbuf_pos: Option<RingBufferPosition>,
-
-    /// The fence to signal when the job is done.
-    done_fence: dma_fence::UserFence<Fence>,
-
     /// The address of the sync object for the queue.
-    ///
-    /// This is here for convenience, so it's ready to be consumed in the run
-    /// callback.
     sync_addr: u64,
 }
 
@@ -48,7 +39,6 @@ impl Job {
     pub(crate) fn create(
         qsubmit: crate::file::QueueSubmit,
         group: Arc<Group>,
-        done_fence: dma_fence::UserFence<Fence>,
         sync_addr: u64,
     ) -> Result<Self> {
         if qsubmit.pad != 0 {
@@ -72,8 +62,6 @@ impl Job {
             stream_addr: qsubmit.stream_addr,
             stream_size: qsubmit.stream_size,
             latest_flush: qsubmit.latest_flush,
-            ringbuf_pos: None,
-            done_fence,
             sync_addr,
         })
     }
@@ -81,22 +69,16 @@ impl Job {
     pub(crate) fn queue_idx(&self) -> usize {
         self.queue_idx
     }
-}
 
-impl JobImpl for Job {
-    // This is in the dma signalling path. Do _not_ allocate here.
-    fn run(job: &mut kernel::drm::sched::Job<Self>) -> Result<Option<kernel::dma_fence::Fence>> {
-        // TODO: use a fixed-size array instead.
+    pub(crate) fn submit_to_hw(&self, submit_fence: &kernel::dma_fence::Fence) -> Result {
         let mut instrs = kvec![];
 
-        // We are choosing these registers arbitrarily, but they might be used
-        // by userspace. Down the line, we will have to address this.
         let addr_reg = 92;
         let val_reg = 94;
 
         let opcode = 2; // MOV32
         let latest_flush_regnum = val_reg;
-        let latest_flush: u64 = job.latest_flush.into();
+        let latest_flush: u64 = self.latest_flush.into();
         let mov_latest_flush: u64 = opcode << 56 | latest_flush_regnum << 48 | latest_flush;
 
         let opcode = 36; //FLUSH_CACHE2
@@ -104,11 +86,11 @@ impl JobImpl for Job {
 
         let opcode = 1; // MOV48
         let cs_start_regnum = addr_reg;
-        let mov_cs_start: u64 = opcode << 56 | cs_start_regnum << 48 | job.stream_addr;
+        let mov_cs_start: u64 = opcode << 56 | cs_start_regnum << 48 | self.stream_addr;
 
         let opcode = 2; // MOV32
         let cs_size_regnum = val_reg;
-        let mov_cs_size: u64 = opcode << 56 | cs_size_regnum << 48 | u64::from(job.stream_size);
+        let mov_cs_size: u64 = opcode << 56 | cs_size_regnum << 48 | u64::from(self.stream_size);
 
         let opcode = 3;
         let wait0: u64 = opcode << 56 | (1 << 16); // WAIT(0)
@@ -118,19 +100,13 @@ impl JobImpl for Job {
 
         let opcode = 1; // MOV48
         let sync_addr_regnum = addr_reg;
-        let mov_sync_addr: u64 = opcode << 56 | sync_addr_regnum << 48 | job.sync_addr;
+        let mov_sync_addr: u64 = opcode << 56 | sync_addr_regnum << 48 | self.sync_addr;
 
-        // Load the actual "1" constant into a register. SYNC_ADD cannot take
-        // this as an immediate.
         let opcode = 1; // MOV48
         let sync_val_regnum = val_reg;
         let mov_sync_val: u64 = opcode << 56 | sync_val_regnum << 48 | 1;
 
-        // Wait before _all_ assynchronous work spawned by the user CS is done.
         let opcode = 3; // WAIT(all)
-
-        // Use this default for now. This should work for the rk3588 where it's
-        // being tested.
         let wait_all_mask = genmask_u64(0..=7);
         let wait_all: u64 = opcode << 56 | wait_all_mask << 16;
 
@@ -163,66 +139,41 @@ impl JobImpl for Job {
         instrs.extend_from_slice(&error_barrier.to_le_bytes(), GFP_KERNEL)?;
 
         let pad = instrs.len().next_multiple_of(64) - instrs.len();
-
-        // Pad until the next 64-byte boundary with NOPs to please the
-        // prefetcher.
         for _ in 0..pad {
             instrs.push(0, GFP_KERNEL)?;
         }
 
-        let ringbuf_pos = job.group.with_locked_inner(|inner| {
-            let queue = inner.queues.get_mut(job.queue_idx).ok_or(EINVAL)?;
-            let input = queue.interfaces.read_input()?;
-
-            let ringbuf_pos = RingBufferPosition {
-                start: input.insert,
-                end: input.insert + instrs.len() as u64,
-            };
-
+        self.group.with_locked_inner(|inner| {
+            let queue = inner.queues.get_mut(self.queue_idx).ok_or(EINVAL)?;
             queue.append_instrs(&instrs)?;
 
-            // Push the fence before kicking the queue.
             queue
                 .in_flight_jobs
-                .push(job.done_fence.clone(), GFP_KERNEL)?;
-
+                .push(submit_fence.clone(), GFP_KERNEL)?;
             queue.kick()?;
-            Ok(ringbuf_pos)
+            Ok(())
         })?;
 
-        job.ringbuf_pos = Some(ringbuf_pos);
-
-        Ok(Some(kernel::dma_fence::Fence::from_fence(&job.done_fence)))
-    }
-
-    fn timed_out(job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
-        let as_nr = job.group.vm.address_space();
-        pr_err!("Job timed out: queue={}, stream_addr={:#x}, stream_size={:#x}, AS={:?}, sync_addr={:#x}\n",
-            job.queue_idx, job.stream_addr, job.stream_size, as_nr, job.sync_addr);
-
-        // Dump ring buffer state for timeout diagnosis.
-        let _ = job.group.with_locked_inner(|inner| {
-            if let Some(queue) = inner.queues.get_mut(job.queue_idx) {
-                if let Ok(input) = queue.interfaces.read_input() {
-                    if let Ok(output) = queue.interfaces.read_output() {
-                        pr_err!("  ringbuf: insert={:#x}, extract={:#x}, extract_init={:#x}, active={}\n",
-                            input.insert, output.extract, input.extract_init, output.active);
-                    }
-                }
-                pr_err!("  doorbell_id={:?}\n", queue.doorbell_id);
-            }
-            Ok(())
-        });
-
-        kernel::drm::sched::Status::NoDevice
+        Ok(())
     }
 }
 
-#[expect(dead_code)]
-struct RingBufferPosition {
-    start: u64,
-    end: u64,
+pub(crate) struct TyrJobHandler;
+
+impl kernel::drm::job_queue::QueueOps for TyrJobHandler {
+    type Job = Job;
+
+    fn submit(
+        &self,
+        job: &kernel::drm::job_queue::JobRef<'_, Self::Job>,
+    ) -> Result<kernel::drm::job_queue::SubmitResult> {
+        job.job.submit_to_hw(job.submit_fence)?;
+        Ok(kernel::drm::job_queue::SubmitResult::Submitted)
+    }
 }
+
+unsafe impl Send for Job {}
+unsafe impl Sync for Job {}
 
 pub(crate) struct Fence;
 
@@ -230,11 +181,11 @@ pub(crate) struct Fence;
 impl FenceOps for Fence {
     const USE_64BIT_SEQNO: bool = true;
 
-    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+    fn get_driver_name<'a>(self: &'a kernel::dma_fence::FenceObject<Self>) -> &'a CStr {
         c_str!("tyr")
     }
 
-    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
+    fn get_timeline_name<'a>(self: &'a kernel::dma_fence::FenceObject<Self>) -> &'a CStr {
         c_str!("tyr_fence")
     }
 }

@@ -11,11 +11,7 @@ use kernel::{
     },
     drm::{
         gem::BaseObject,
-        sched,
-        sched::{
-            Entity,
-            Scheduler, //
-        }, //
+        job_queue::JobQueue, //
     },
     io::{
         register::Array,
@@ -56,26 +52,13 @@ pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
 
 /// Represents a hardware executiion queue.
 pub(crate) struct Queue {
-    /// The DRM scheduler used for this queue.
-    #[expect(dead_code)]
-    scheduler: Scheduler<Job>,
-
-    /// The DRM entity used for this queue.
-    pub(super) entity: Entity<Job>,
+    /// The JobQueue used for this queue.
+    pub(super) job_queue: JobQueue<job::TyrJobHandler>,
 
     /// A priority number, between 0 and 15.
     pub(crate) priority: u8,
 
     // Doorbell assigned to this queue, if any.
-    //
-    // Doorbell assignment happens when the group that owns this queue is bound
-    // to a specific hardware slot.
-    //
-    // Right now, all groups share the same doorbell, and the doorbell ID
-    // is assigned to `group_slot + 1` when the group is assigned a slot.
-    // However, we might decide to provide fine-grained doorbell assignment
-    // at some point, so we don't have to wake up all queues in a group
-    // every time one of them is updated.
     pub(crate) doorbell_id: Option<usize>,
 
     /// The ring buffer used to communicate with the firmware.
@@ -85,10 +68,9 @@ pub(crate) struct Queue {
 
     iomem: Arc<Devres<IoMem>>,
 
-    pub(super) fence_ctx: FenceContexts,
+    pub(super) in_flight_jobs: KVec<kernel::dma_fence::Fence>,
 
-    /// The in-flight jobs for this queue.
-    pub(super) in_flight_jobs: KVec<UserFence<job::Fence>>,
+    pub(super) fence_ctx: kernel::dma_fence::FenceContexts,
 }
 
 impl Queue {
@@ -114,19 +96,21 @@ impl Queue {
         }
 
         let priority = queue_args.priority;
-        let credit_limit = queue_args.ringbuf_size / core::mem::size_of::<u64>() as u32;
 
-        let scheduler = Scheduler::new(
-            tdev.as_ref(),
-            1,
-            credit_limit,
-            0,
-            JOB_TIMEOUT_MS,
-            c_str!("tyr-queue"),
+        let wq = Arc::new(
+            kernel::dma_fence::DmaFenceWorkqueue::new(
+                kernel::c_str!("queue_wq"),
+                kernel::workqueue::WqFlags::HIGHPRI,
+                0,
+            )?,
+            GFP_KERNEL,
         )?;
-
-        let entity = Entity::new(&scheduler, sched::Priority::Kernel)?;
-
+        let job_queue = JobQueue::new(
+            job::TyrJobHandler,
+            wq.clone(),
+            wq,
+            kernel::drm::job_queue::PipelineBuilder::new(),
+        )?;
         let iomem = tdev.iomem.clone();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let ringbuf = gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size as usize, flags)?;
@@ -146,18 +130,17 @@ impl Queue {
             output_offset: SZ_4K,
         };
 
-        let fence_ctx = FenceContexts::new(1, c_str!("tyr_fence"), None, 1)?;
+        let fence_ctx = kernel::dma_fence::FenceContexts::new(1, c_str!("tyr_fence"), None, 1)?;
 
         Ok(Queue {
-            scheduler,
-            entity,
+            job_queue,
             doorbell_id: None,
             priority,
             ringbuf,
             interfaces,
             iomem,
-            fence_ctx,
             in_flight_jobs: KVec::new(),
+            fence_ctx,
         })
     }
 

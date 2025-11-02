@@ -4,10 +4,12 @@
 //!
 //! C header: [`include/linux/dma_fence.h`](../../include/linux/dma_fence.h)
 
+use crate::types::AlwaysRefCounted;
 use crate::{
     bindings,
     error::{to_result, Result},
     prelude::*,
+    sync::Arc,
     sync::LockClassKey,
     types::Opaque,
 };
@@ -75,6 +77,15 @@ pub trait RawDmaFence: crate::private::Sealed {
     }
 }
 
+/// The return type of [`Fence::wait_timeout`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum FenceWaitResult {
+    /// The fence was signaled before the timeout elapsed.
+    Signaled,
+    /// The timeout elapsed before the fence was signaled.
+    TimedOut,
+}
+
 /// A generic DMA Fence Object
 ///
 /// # Invariants
@@ -106,6 +117,77 @@ impl Fence {
     pub fn from_fence(fence: &dyn RawDmaFence) -> Fence {
         // SAFETY: Pointer is valid per the RawDmaFence contract
         unsafe { Self::get_raw(fence.raw()) }
+    }
+
+    /// Signal the fence.
+    ///
+    /// This marks the fence as signaled, indicating that the operation it represents
+    /// has completed. This will wake up any waiters on this fence.
+    ///
+    /// Returns the previous fence status, or an error if the fence was already signaled.
+    pub fn signal(&self) -> Result {
+        // SAFETY: The fence pointer is valid and we're calling the C API to signal it
+        unsafe { bindings::dma_fence_signal(self.ptr) };
+        Ok(())
+    }
+
+    /// Set an error on the fence.
+    ///
+    /// This sets an error value on the fence, which will be returned to waiters.
+    /// This should be called before signaling the fence if an error occurred.
+    pub fn set_error(&self, error: i32) {
+        // SAFETY: The fence pointer is valid and we're calling the C API to set an error
+        unsafe { bindings::dma_fence_set_error(self.ptr, error) }
+    }
+
+    /// Get the error value from the fence.
+    ///
+    /// Returns the error value that was set on the fence, or 0 if no error occurred.
+    pub fn error(&self) -> i32 {
+        // SAFETY: The fence pointer is valid and we're accessing a simple field
+        unsafe { (*self.ptr).error }
+    }
+
+    /// Get the sequence number of the fence.
+    pub fn seqno(&self) -> u64 {
+        // SAFETY: The fence pointer is valid.
+        unsafe { (*self.ptr).seqno }
+    }
+
+    /// Check if the fence has been signaled.
+    ///
+    /// Returns `true` if the fence has been signaled, `false` otherwise.
+    pub fn is_signaled(&self) -> bool {
+        // SAFETY: The fence pointer is valid and we're calling the C API.
+        unsafe { bindings::dma_fence_is_signaled(self.ptr) }
+    }
+
+    /// Wait for the fence to be signaled, blocking indefinitely.
+    ///
+    /// Returns an error if the wait was interrupted or another error occurred.
+    pub fn wait(&self) -> Result {
+        // SAFETY: The fence pointer is valid. We pass `0` for non-interruptible
+        // wait and `MAX_SCHEDULE_TIMEOUT` (LONG_MAX) to wait indefinitely.
+        let ret = unsafe { bindings::dma_fence_wait_timeout(self.ptr, false, isize::MAX) };
+        if ret < 0 {
+            Err(Error::from_errno(ret as i32))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Wait for the fence to be signaled, with a timeout.
+    pub fn wait_timeout(&self, timeout: kernel::time::Jiffies) -> Result<FenceWaitResult> {
+        // SAFETY: The pointer is valid. We pass `false` for non-interruptible wait.
+        let ret = unsafe { bindings::dma_fence_wait_timeout(self.ptr, false, timeout as isize) };
+        if ret < 0 {
+            // CAST: negative return is always a valid errno.
+            Err(Error::from_errno(ret as i32))
+        } else if ret > 0 {
+            Ok(FenceWaitResult::Signaled)
+        } else {
+            Ok(FenceWaitResult::TimedOut)
+        }
     }
 }
 
@@ -462,6 +544,217 @@ impl FenceContexts {
     }
 }
 
+/// Trait for callbacks that can be registered on fences.
+///
+/// When the fence signals, the callback will be invoked.
+///
+/// # Example
+///
+/// ```rust
+/// use kernel::dma_fence::{Fence, FenceCallback, FenceCallbackRegistration};
+///
+/// struct MyCallback {
+///     // Your callback state here
+/// }
+///
+/// impl FenceCallback for MyCallback {
+///     fn signaled(&self, fence: &Fence) {
+///         pr_info!("Fence signaled!");
+///         // Handle fence completion
+///     }
+/// }
+///
+/// fn register_on_fence(fence: &Fence) -> Result<()> {
+///     let callback = MyCallback { /* ... */ };
+///
+///     match FenceCallbackRegistration::new(fence, callback)? {
+///         Some(registration) => {
+///             // Callback registered, will be called when fence signals
+///             // Keep `registration` alive or call registration.remove() to cancel
+///         }
+///         None => {
+///             // Fence already signaled. The callback will *not* be invoked.
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+
+pub trait FenceCallback: Sync + Send {
+    /// Called when the fence is signaled.
+    ///
+    /// This is called from the fence signaling path, which may be in interrupt
+    /// context or with locks held. Implementations must not sleep or perform
+    /// long-running operations.
+    ///
+    /// Takes `&self` to enforce proper synchronization - if you need to mutate
+    /// state, use interior mutability (e.g., `SpinLock`, `AtomicUsize`).
+    fn signaled(&self, fence: &Fence);
+}
+
+/// Error type for fence callback registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackError {
+    /// The fence was already signaled when attempting to register the callback.
+    AlreadySignaled,
+    /// Some other error occurred during registration.
+    Other(Error),
+}
+
+impl From<Error> for CallbackError {
+    fn from(err: Error) -> Self {
+        if err.to_errno() == ENOENT.to_errno() {
+            CallbackError::AlreadySignaled
+        } else {
+            CallbackError::Other(err)
+        }
+    }
+}
+
+impl From<CallbackError> for Error {
+    fn from(err: CallbackError) -> Self {
+        match err {
+            CallbackError::AlreadySignaled => ENOENT,
+            CallbackError::Other(e) => e,
+        }
+    }
+}
+
+/// A callback registration on a fence.
+///
+/// When this object is dropped, the callback is automatically removed if it
+/// hasn't been called yet.
+///
+/// # Invariants
+///
+/// If `callback` is `Some`, then `cb` is registered with the fence and the
+/// callback hasn't been invoked yet. If `None`, the callback has been invoked
+/// or the fence was already signaled when we tried to register.
+#[pin_data(PinnedDrop)]
+pub struct FenceCallbackRegistration<T: FenceCallback> {
+    #[pin]
+    cb: Opaque<bindings::dma_fence_cb>,
+    callback: core::cell::UnsafeCell<Option<T>>,
+    fence: Fence,
+}
+
+impl<T: FenceCallback> FenceCallbackRegistration<T> {
+    /// Register a callback on a fence.
+    ///
+    /// Returns `Err(CallbackError::AlreadySignaled)` if the fence was already signaled.
+    /// Returns `Err(CallbackError::Other(err))` for other errors.
+    pub fn new<'a>(fence: &'a Fence, callback: T) -> impl PinInit<Self, CallbackError> + 'a
+    where
+        T: 'a,
+    {
+        try_pin_init!(Self {
+            // IMPORTANT: `callback` and `fence` MUST be initialized before `cb`.
+            // `dma_fence_add_callback` (inside `cb`) makes the callback live —
+            // another CPU can fire `dma_fence_callback` immediately, which reads
+            // `(*reg).callback` and `(*reg).fence`.  If those fields are still
+            // uninitialized, we get a crash.
+            callback: core::cell::UnsafeCell::new(Some(callback)),
+            fence: fence.clone(),
+            cb <- Opaque::try_ffi_init(|slot: *mut bindings::dma_fence_cb| {
+                // SAFETY: We pass a valid callback structure and function pointer.
+                // The fence pointer is valid per the Fence type invariant.
+                // This will initialize the list_head node in the cb structure.
+                to_result(unsafe {
+                    bindings::dma_fence_add_callback(
+                        fence.raw(),
+                        slot,
+                        Some(Self::dma_fence_callback),
+                    )
+                }).map_err(CallbackError::from)
+            }),
+        }? CallbackError)
+    }
+
+    /// Raw dma fence callback that is called by the C code.
+    ///
+    /// # Safety
+    ///
+    /// This is only called by the dma_fence subsystem with valid pointers.
+    unsafe extern "C" fn dma_fence_callback(
+        _fence: *mut bindings::dma_fence,
+        cb: *mut bindings::dma_fence_cb,
+    ) {
+        // SAFETY: The callback pointer is the address of our `cb` field
+        unsafe {
+            let ptr = cb.cast::<Opaque<bindings::dma_fence_cb>>();
+            let reg: *mut Self = crate::container_of!(ptr, Self, cb).cast();
+
+            // SAFETY: We have exclusive access via the callback mechanism
+            let callback = (*(*reg).callback.get()).take();
+
+            if let Some(callback) = callback {
+                // SAFETY: We still have a fence reference in the struct
+                let fence_ref = &(*reg).fence;
+                callback.signaled(fence_ref);
+            }
+        }
+    }
+
+    /// Remove the callback registration.
+    ///
+    /// Returns `true` if the callback was successfully removed (meaning it hasn't
+    /// been called yet), or `false` if the callback was already invoked or removed.
+    pub fn remove(mut self: Pin<&mut Self>) -> bool {
+        // SAFETY: The fence pointer is valid and the callback is registered
+        let removed =
+            unsafe { bindings::dma_fence_remove_callback(self.fence.raw(), self.cb.get()) };
+
+        if removed {
+            // Successfully removed, clear our state
+            // SAFETY: The `callback` field is not structurally pinned.
+            unsafe {
+                *self.as_mut().get_unchecked_mut().callback.get_mut() = None;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Returns a reference to the fence this callback is registered on.
+    pub fn fence(self: Pin<&Self>) -> &Fence {
+        &self.get_ref().fence
+    }
+}
+
+#[pinned_drop]
+impl<T: FenceCallback> PinnedDrop for FenceCallbackRegistration<T> {
+    fn drop(self: Pin<&mut Self>) {
+        // Always call dma_fence_remove_callback, even if `callback` has already
+        // been taken by `dma_fence_callback`.  This is necessary for
+        // synchronization: `dma_fence_remove_callback` acquires `fence->lock`,
+        // which ensures that any in-flight `dma_fence_signal` (which calls our
+        // callback while holding the same lock) has completed before we free
+        // the struct.
+        //
+        // Without this, Drop can race with a concurrent signal:
+        //   CPU0 (signal, lock held): take() -> signaled(fence_ref) (in progress)
+        //   CPU1 (drop): sees is_some()==false -> skips lock -> frees struct
+        //   CPU0: accesses fence_ref -> use-after-free
+        //
+        // When the callback has already fired, the signal path detached the
+        // list node via INIT_LIST_HEAD, so dma_fence_remove_callback just sees
+        // an empty node and returns false — the lock acquisition is the only
+        // thing that matters.
+        //
+        // SAFETY: The fence pointer is valid and the cb was initialized by
+        // dma_fence_add_callback during construction.
+        unsafe {
+            bindings::dma_fence_remove_callback(self.fence.raw(), self.cb.get());
+        }
+    }
+}
+
+// SAFETY: FenceCallbackRegistration can be sent between threads
+unsafe impl<T: FenceCallback> Send for FenceCallbackRegistration<T> {}
+
+// SAFETY: &FenceCallbackRegistration can be shared between threads if &T can.
+unsafe impl<T: FenceCallback> Sync for FenceCallbackRegistration<T> where T: Sync {}
+
 /// A DMA Fence Chain Object
 ///
 /// # Invariants
@@ -499,3 +792,318 @@ impl Drop for FenceChain {
         unsafe { bindings::dma_fence_chain_free(self.ptr) };
     }
 }
+
+/// Annotation for DMA fence signaling sections.
+pub struct DmaFenceSignallingAnnotation {
+    cookie: bool,
+    _not_send: kernel::types::NotThreadSafe,
+}
+
+impl DmaFenceSignallingAnnotation {
+    /// Creates a new annotation section.
+    pub fn new() -> Self {
+        Self {
+            // SAFETY: This is safe to call.
+            cookie: unsafe { bindings::dma_fence_begin_signalling() },
+            _not_send: kernel::types::NotThreadSafe,
+        }
+    }
+}
+
+impl Drop for DmaFenceSignallingAnnotation {
+    fn drop(&mut self) {
+        // SAFETY: This is safe to call, passing the cookie obtained from begin.
+        unsafe { bindings::dma_fence_end_signalling(self.cookie) };
+    }
+}
+
+/// Trait for work items that can be scheduled on a `DmaFenceWorkqueue`.
+pub trait DmaFenceWorkItem<const ID: u64 = 0> {
+    /// The pointer type that this struct is wrapped in. This will typically be `Arc<Self>`.
+    type Pointer: kernel::workqueue::WorkItemPointer<ID>;
+
+    /// The method that should be called when this work item is executed.
+    fn run(this: Self::Pointer);
+}
+
+/// A raw DMA-fence constrained work item.
+pub unsafe trait RawDmaFenceWorkItem<const ID: u64>:
+    kernel::workqueue::RawWorkItem<ID>
+{
+}
+
+// SAFETY: The underlying `RawWorkItem` impl provides all guarantees.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for Arc<T>
+where
+    T: DmaFenceWorkItem<ID, Pointer = Self>,
+    T: kernel::workqueue::WorkItem<ID, Pointer = Self>,
+    T: kernel::workqueue::HasWork<T, ID>,
+{
+}
+
+// SAFETY: The underlying `RawWorkItem` impl provides all guarantees.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for crate::types::ARef<T>
+where
+    T: DmaFenceWorkItem<ID, Pointer = Self> + crate::types::AlwaysRefCounted,
+    T: kernel::workqueue::WorkItem<ID, Pointer = Self>,
+    T: kernel::workqueue::HasWork<T, ID>,
+{
+}
+
+impl<T: crate::drm::Driver, const ID: u64> DmaFenceWorkItem<ID> for crate::drm::Device<T>
+where
+    T::Data: DmaFenceWorkItem<ID, Pointer = crate::types::ARef<crate::drm::Device<T>>>,
+    T::Data: kernel::workqueue::WorkItem<ID, Pointer = crate::types::ARef<crate::drm::Device<T>>>,
+    T::Data: kernel::workqueue::HasWork<crate::drm::Device<T>, ID>,
+{
+    type Pointer = crate::types::ARef<crate::drm::Device<T>>;
+
+    fn run(this: Self::Pointer) {
+        T::Data::run(this);
+    }
+}
+
+/// Workqueue that can only be used to schedule [`DmaFenceWorkItem`]s.
+pub struct DmaFenceWorkqueue(pub kernel::workqueue::OwnedQueue);
+
+impl DmaFenceWorkqueue {
+    /// Create a new dedicated workqueue for DMA fences.
+    pub fn new(name: &CStr, flags: kernel::workqueue::WqFlags, max_active: usize) -> Result<Self> {
+        Ok(Self(
+            kernel::workqueue::OwnedQueue::new(name, flags, max_active).map_err(|_| ENOMEM)?,
+        ))
+    }
+
+    /// Enqueues a work item.
+    pub fn enqueue<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
+    where
+        W: RawDmaFenceWorkItem<ID> + Send + 'static,
+    {
+        self.0.enqueue(w)
+    }
+
+    /// Enqueues a delayed work item.
+    pub fn enqueue_delayed<W, const ID: u64>(
+        &self,
+        w: W,
+        delay: kernel::time::Jiffies,
+    ) -> W::EnqueueOutput
+    where
+        W: RawDmaFenceDelayedWorkItem<ID> + Send + 'static,
+    {
+        self.0.enqueue_delayed(w, delay)
+    }
+}
+
+/// DMA-fence constrained delayed work item.
+#[pin_data]
+pub struct DmaFenceDelayedWork<T: ?Sized, const ID: u64 = 0> {
+    /// The inner delayed work item.
+    #[pin]
+    pub inner: kernel::workqueue::DelayedWork<T, ID>,
+}
+
+impl<T: ?Sized + kernel::workqueue::WorkItem<ID>, const ID: u64> DmaFenceDelayedWork<T, ID> {
+    /// Creates an initialiser for a [`DmaFenceDelayedWork`].
+    pub fn new(
+        work_name: &'static CStr,
+        work_key: Pin<&'static kernel::sync::LockClassKey>,
+        timer_name: &'static CStr,
+        timer_key: Pin<&'static kernel::sync::LockClassKey>,
+    ) -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- kernel::workqueue::DelayedWork::new(work_name, work_key, timer_name, timer_key),
+        })
+    }
+}
+
+/// Trait for delayed work items that can be scheduled on a `DmaFenceWorkqueue`.
+pub trait DmaFenceDelayedWorkItem<const ID: u64 = 0> {
+    /// The pointer type that this struct is wrapped in.
+    type Pointer: kernel::workqueue::WorkItemPointer<ID>;
+
+    /// The method that should be called when this work item is executed.
+    fn run(this: Self::Pointer);
+}
+
+impl<T: crate::drm::Driver, const ID: u64> DmaFenceDelayedWorkItem<ID> for crate::drm::Device<T>
+where
+    T::Data: DmaFenceDelayedWorkItem<ID, Pointer = crate::types::ARef<crate::drm::Device<T>>>,
+    T::Data: kernel::workqueue::WorkItem<ID, Pointer = crate::types::ARef<crate::drm::Device<T>>>,
+    T::Data: kernel::workqueue::HasWork<crate::drm::Device<T>, ID>,
+{
+    type Pointer = crate::types::ARef<crate::drm::Device<T>>;
+
+    fn run(this: Self::Pointer) {
+        T::Data::run(this);
+    }
+}
+
+/// A raw DMA-fence constrained delayed work item.
+pub unsafe trait RawDmaFenceDelayedWorkItem<const ID: u64>:
+    kernel::workqueue::RawDelayedWorkItem<ID>
+{
+}
+
+// SAFETY: The underlying `RawDelayedWorkItem` impl provides all guarantees.
+unsafe impl<T, const ID: u64> RawDmaFenceDelayedWorkItem<ID> for Arc<T>
+where
+    T: DmaFenceDelayedWorkItem<ID, Pointer = Self>,
+    T: kernel::workqueue::WorkItem<ID, Pointer = Self>,
+    T: kernel::workqueue::HasDelayedWork<T, ID>,
+{
+}
+
+// SAFETY: The underlying `RawDelayedWorkItem` impl provides all guarantees.
+unsafe impl<T, const ID: u64> RawDmaFenceDelayedWorkItem<ID> for crate::types::ARef<T>
+where
+    T: DmaFenceDelayedWorkItem<ID, Pointer = Self> + crate::types::AlwaysRefCounted,
+    T: kernel::workqueue::WorkItem<ID, Pointer = Self>,
+    T: kernel::workqueue::HasDelayedWork<T, ID>,
+{
+}
+
+/// Implements `HasDelayedWork` for a struct containing a `DmaFenceDelayedWork`.
+#[macro_export]
+macro_rules! impl_has_dma_fence_delayed_work {
+    ($(impl$({$($generics:tt)*})?
+       HasDmaFenceDelayedWork<$work_type:ty $(, $id:tt)?>
+       for $self:ty
+       { self.$field:ident }
+    )*) => {$(
+        unsafe impl$(<$($generics)+>)?
+            $crate::workqueue::HasDelayedWork<$work_type $(, $id)?> for $self {}
+
+        unsafe impl$(<$($generics)+>)? $crate::workqueue::HasWork<$work_type $(, $id)?> for $self {
+            #[inline]
+            unsafe fn raw_get_work(
+                ptr: *mut Self,
+            ) -> *mut $crate::workqueue::Work<$work_type $(, $id)?> {
+                let ptr: *mut $crate::workqueue::DelayedWork<$work_type $(, $id)?> =
+                    unsafe { &raw mut (*ptr).$field.inner };
+                unsafe { $crate::workqueue::DelayedWork::raw_as_work(ptr) }
+            }
+
+            #[inline]
+            unsafe fn work_container_of(
+                ptr: *mut $crate::workqueue::Work<$work_type $(, $id)?>,
+            ) -> *mut Self {
+                let ptr = unsafe { $crate::workqueue::Work::raw_get(ptr) };
+                let delayed_work = unsafe {
+                    $crate::container_of!(ptr, $crate::bindings::delayed_work, work)
+                };
+                let delayed_work: *mut $crate::workqueue::DelayedWork<$work_type $(, $id)?> =
+                    delayed_work.cast();
+                unsafe { $crate::container_of!(delayed_work, Self, $field.inner) }
+            }
+        }
+
+        impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
+            type Pointer =
+                <Self as $crate::dma_fence::DmaFenceDelayedWorkItem<$($id)?>>::Pointer;
+
+            fn run(this: Self::Pointer) {
+                let _annotation = $crate::dma_fence::DmaFenceSignallingAnnotation::new();
+                <Self as $crate::dma_fence::DmaFenceDelayedWorkItem<$($id)?>>::run(this)
+            }
+        }
+    )*};
+}
+pub use impl_has_dma_fence_delayed_work;
+
+/// Creates a new `DmaFenceDelayedWork` with a name and lock class keys.
+#[macro_export]
+macro_rules! new_dma_fence_delayed_work {
+    () => {
+        $crate::dma_fence::DmaFenceDelayedWork::new(
+            $crate::optional_name!(),
+            $crate::static_lock_class!(),
+            $crate::c_str!(::core::concat!(
+                ::core::file!(),
+                ":",
+                ::core::line!(),
+                "_timer"
+            )),
+            $crate::static_lock_class!(),
+        )
+    };
+    ($name:literal) => {
+        $crate::dma_fence::DmaFenceDelayedWork::new(
+            $crate::c_str!($name),
+            $crate::static_lock_class!(),
+            $crate::c_str!(::core::concat!($name, "_timer")),
+            $crate::static_lock_class!(),
+        )
+    };
+}
+pub use new_dma_fence_delayed_work;
+
+/// DMA-fence constrained work item.
+#[pin_data]
+pub struct DmaFenceWork<T: ?Sized, const ID: u64 = 0> {
+    /// The inner work item.
+    #[pin]
+    pub inner: kernel::workqueue::Work<T, ID>,
+}
+
+impl<T: ?Sized + kernel::workqueue::WorkItem<ID>, const ID: u64> DmaFenceWork<T, ID> {
+    /// Creates an initialiser for a [`DmaFenceWork`].
+    pub fn new(
+        name: &'static CStr,
+        key: Pin<&'static kernel::sync::LockClassKey>,
+    ) -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- kernel::workqueue::Work::new(name, key),
+        })
+    }
+}
+
+/// Implements `HasWork` for a struct containing a `DmaFenceWork`.
+#[macro_export]
+macro_rules! impl_has_dma_fence_work {
+    ($(impl$({$($generics:tt)*})?
+       HasDmaFenceWork<$work_type:ty $(, $id:tt)?>
+       for $self:ty
+       { self.$field:ident }
+    )*) => {$(
+        unsafe impl$(<$($generics)+>)? $crate::workqueue::HasWork<$work_type $(, $id)?> for $self {
+            #[inline]
+            unsafe fn raw_get_work(
+                ptr: *mut Self,
+            ) -> *mut $crate::workqueue::Work<$work_type $(, $id)?> {
+                unsafe { ::core::ptr::addr_of_mut!((*ptr).$field.inner) }
+            }
+
+            #[inline]
+            unsafe fn work_container_of(
+                ptr: *mut $crate::workqueue::Work<$work_type $(, $id)?>,
+            ) -> *mut Self {
+                let ptr: *mut $crate::dma_fence::DmaFenceWork<$work_type $(, $id)?> = ptr.cast();
+                unsafe { $crate::container_of!(ptr, Self, $field) }
+            }
+        }
+
+        impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
+            type Pointer =
+                <Self as $crate::dma_fence::DmaFenceWorkItem<$($id)?>>::Pointer;
+
+            fn run(this: Self::Pointer) {
+                let _annotation = $crate::dma_fence::DmaFenceSignallingAnnotation::new();
+                <Self as $crate::dma_fence::DmaFenceWorkItem<$($id)?>>::run(this)
+            }
+        }
+    )*};
+}
+pub use impl_has_dma_fence_work;
+
+/// Creates a new `DmaFenceWork` with a name and lock class key.
+#[macro_export]
+macro_rules! new_dma_fence_work {
+    () => {
+        $crate::dma_fence::DmaFenceWork::new($crate::optional_name!(), $crate::static_lock_class!())
+    };
+    ($name:literal) => {
+        $crate::dma_fence::DmaFenceWork::new($crate::c_str!($name), $crate::static_lock_class!())
+    };
+}
+pub use new_dma_fence_work;
