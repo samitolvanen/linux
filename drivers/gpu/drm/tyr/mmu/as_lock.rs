@@ -43,8 +43,8 @@ impl<'a> AsLockToken<'a> {
 
         // Mask off the low bits of region.start, which would be ignored by the
         // hardware anyways.
-        let region_start = region.start
-            & genmask_checked_u64(region_width as u32..=63).ok_or(EINVAL)?;
+        let region_start =
+            region.start & genmask_checked_u64(region_width as u32..=63).ok_or(EINVAL)?;
 
         let region = (region_width as u64) | region_start;
 
@@ -69,8 +69,7 @@ impl Drop for AsLockToken<'_> {
                     pr_err!("MMU is busy for AS{}: {:?}\n", self.as_nr, err);
                     return;
                 }
-                if let Err(err) = as_cmd.write(self.iomem, AS_COMMAND_FLUSH_PT)
-                {
+                if let Err(err) = as_cmd.write(self.iomem, AS_COMMAND_FLUSH_PT) {
                     pr_err!(
                         "Failed to flush page tables for AS{}: {:?}\n",
                         self.as_nr,

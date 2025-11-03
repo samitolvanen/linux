@@ -91,8 +91,7 @@ impl TimeoutCycles {
             return Err(EINVAL);
         }
 
-        let mut mod_cycles =
-            (u64::from(timeout_us) * timer_rate).div_ceil(1000000 << 10);
+        let mut mod_cycles = (u64::from(timeout_us) * timer_rate).div_ceil(1000000 << 10);
 
         if mod_cycles > glb_timer_val(u32::MAX).into() {
             pr_err!("Invalid timeout computed\n");
@@ -236,8 +235,7 @@ impl GlobalInterface {
         iomem: Arc<Devres<IoMem>>,
         req_wait: Arc<Wait>,
     ) -> Result<Self> {
-        let shared_section =
-            Arc::pin_init(new_mutex!(shared_section), GFP_KERNEL)?;
+        let shared_section = Arc::pin_init(new_mutex!(shared_section), GFP_KERNEL)?;
 
         Ok(Self {
             state: GlobalInterfaceState::Disabled,
@@ -255,8 +253,7 @@ impl GlobalInterface {
         core_clk: &Clk,
     ) -> Result {
         // This takes a mutex internally in clk_prepare().
-        let poweroff_timer =
-            TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
+        let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
 
         let control_area = SharedSectionRange {
             shared_section: self.shared_section.clone(),
@@ -275,32 +272,24 @@ impl GlobalInterface {
 
         let control = Control::read(&control_area)?;
         if control.version == 0 {
-            pr_err!(
-                "MCU firmware version is 0. Firmware may have failed to boot\n"
-            );
+            pr_err!("MCU firmware version is 0. Firmware may have failed to boot\n");
             return Err(EINVAL);
         }
 
-        let mut input_area = self.shared_range(
-            control.input_va.into(),
-            core::mem::size_of::<Input>(),
-        )?;
+        let mut input_area =
+            self.shared_range(control.input_va.into(), core::mem::size_of::<Input>())?;
 
-        let output_area = self.shared_range(
-            control.output_va.into(),
-            core::mem::size_of::<Output>(),
-        )?;
+        let output_area =
+            self.shared_range(control.output_va.into(), core::mem::size_of::<Output>())?;
 
         /// The start of the CSG control area for the first CSG.
         const CSF_GROUP_CONTROL_OFFSET: u32 = 0x1000;
 
         let mut csgs: KVec<CommandStreamGroup> = kvec![];
         for csg_idx in 0..control.group_num {
-            let iface_offset =
-                CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
+            let iface_offset = CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
 
-            let csg =
-                CommandStreamGroup::init(self, iface_offset, csg_idx as usize)?;
+            let csg = CommandStreamGroup::init(self, iface_offset, csg_idx as usize)?;
 
             if let Some(first) = csgs.first() {
                 if !first.is_identical(&csg)? {
@@ -328,8 +317,7 @@ impl GlobalInterface {
 
         // Setup timers.
         input.poweroff_timer = poweroff_timer;
-        input.progress_timer =
-            PROGRESS_TIMEOUT_CYCLES >> PROGRESS_TIMEOUT_SCALE_SHIFT;
+        input.progress_timer = PROGRESS_TIMEOUT_CYCLES >> PROGRESS_TIMEOUT_SCALE_SHIFT;
         input.idle_timer = IDLE_HYSTERESIS_US;
 
         // Enable the interrupts we care about.
@@ -349,8 +337,7 @@ impl GlobalInterface {
         );
         req.update_reqs(GLB_IDLE_EN, GLB_IDLE_EN)?;
 
-        let reqs =
-            GLB_CFG_ALLOC_EN | GLB_CFG_POWEROFF_TIMER | GLB_CFG_PROGRESS_TIMER;
+        let reqs = GLB_CFG_ALLOC_EN | GLB_CFG_POWEROFF_TIMER | GLB_CFG_PROGRESS_TIMER;
         req.toggle_reqs(reqs)?;
 
         self.ring_glb_doorbell()?;
@@ -374,38 +361,25 @@ impl GlobalInterface {
         Doorbell::new(CSF_GLB_DOORBELL_ID).write(&self.iomem, 1)
     }
 
-    pub(crate) fn csg(
-        &mut self,
-        csg_idx: usize,
-    ) -> Option<&CommandStreamGroup> {
+    pub(crate) fn csg(&mut self, csg_idx: usize) -> Option<&CommandStreamGroup> {
         match &self.state {
             GlobalInterfaceState::Disabled => None,
-            GlobalInterfaceState::Enabled(EnabledGlobalInterface {
-                csgs,
-                ..
-            }) => csgs.get(csg_idx),
+            GlobalInterfaceState::Enabled(EnabledGlobalInterface { csgs, .. }) => csgs.get(csg_idx),
         }
     }
 
-    pub(crate) fn csg_mut(
-        &mut self,
-        csg_idx: usize,
-    ) -> Option<&mut CommandStreamGroup> {
+    pub(crate) fn csg_mut(&mut self, csg_idx: usize) -> Option<&mut CommandStreamGroup> {
         match &mut self.state {
             GlobalInterfaceState::Disabled => None,
-            GlobalInterfaceState::Enabled(EnabledGlobalInterface {
-                csgs,
-                ..
-            }) => csgs.get_mut(csg_idx),
+            GlobalInterfaceState::Enabled(EnabledGlobalInterface { csgs, .. }) => {
+                csgs.get_mut(csg_idx)
+            }
         }
     }
 
     pub(crate) fn arm_watchdog(&self, tdev: &TyrDevice) -> Result {
         tdev.reset_wq
-            .enqueue_delayed::<_, 0>(
-                tdev.deref().clone(),
-                PING_INTERVAL_MS as usize,
-            )
+            .enqueue_delayed::<_, 0>(tdev.deref().clone(), PING_INTERVAL_MS as usize)
             .map_err(|_| EINVAL)
     }
 
@@ -413,9 +387,7 @@ impl GlobalInterface {
         let glb_iface = match self.state {
             GlobalInterfaceState::Enabled(ref enabled) => enabled,
             GlobalInterfaceState::Disabled => {
-                pr_err!(
-                    "Trying to ping CSF but the global interface is down\n"
-                );
+                pr_err!("Trying to ping CSF but the global interface is down\n");
                 return Ok(());
             }
         };
@@ -442,11 +414,7 @@ impl GlobalInterface {
     /// area.
     ///
     /// The result is an offset that can be safely dereferenced by the CPU.
-    pub(super) fn shared_range(
-        &mut self,
-        mcu_va: u64,
-        size: usize,
-    ) -> Result<SharedSectionRange> {
+    pub(super) fn shared_range(&mut self, mcu_va: u64, size: usize) -> Result<SharedSectionRange> {
         let shared_mem_start = u64::from(self.shared_section.lock().va.start);
         let shared_mem_end = u64::from(self.shared_section.lock().va.end);
 
@@ -463,11 +431,7 @@ impl GlobalInterface {
     }
 
     /// Set the CSG state.
-    pub(crate) fn set_csg_state(
-        &mut self,
-        csg_idx: usize,
-        state: csg::GroupState,
-    ) -> Result {
+    pub(crate) fn set_csg_state(&mut self, csg_idx: usize, state: csg::GroupState) -> Result {
         let glb = self.state.enabled_mut()?;
         let csg_iface = glb.csgs.get_mut(csg_idx).ok_or(EINVAL)?;
 
@@ -517,10 +481,7 @@ impl WorkItem<0> for TyrData {
         let res = this.fw.with_locked_global_iface(|glb| {
             glb.ping()?;
             this.reset_wq
-                .enqueue_delayed::<_, 0>(
-                    this.clone(),
-                    PING_INTERVAL_MS as usize,
-                )
+                .enqueue_delayed::<_, 0>(this.clone(), PING_INTERVAL_MS as usize)
                 .map_err(|_| EINVAL)
         });
 

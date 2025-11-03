@@ -51,7 +51,7 @@ pub(crate) mod map_flags;
 pub(crate) mod pool;
 
 mod range;
-pub(crate) use self::range::{RangeAlloc, LiveRange};
+pub(crate) use self::range::{LiveRange, RangeAlloc};
 
 // TODO: we need *all* of these in kernel::bindings.
 const SZ_4G: u64 = 4 * kernel::bindings::SZ_1G as u64;
@@ -111,7 +111,8 @@ impl Vm {
 
         let va_range = if for_mcu { 0..SZ_4G } else { 0..full_va_range };
 
-        let kernel_mm = range::RangeAlloc::new(auto_kernel_va.start, auto_kernel_va.end, GFP_KERNEL)?;
+        let kernel_mm =
+            range::RangeAlloc::new(auto_kernel_va.start, auto_kernel_va.end, GFP_KERNEL)?;
 
         let page_table = ARM64LPAES1::new(
             pdev.as_ref(),
@@ -154,10 +155,7 @@ impl Vm {
         match va {
             KernelVaPlacement::Auto { size } => unsafe { self.gpuvm.as_inner_mut() }
                 .kernel_mm
-                .allocate(
-                    size,
-                    GFP_KERNEL
-                ),
+                .allocate(size, GFP_KERNEL),
             KernelVaPlacement::At(va) => unsafe { self.gpuvm.as_inner_mut() }
                 .kernel_mm
                 .insert(va.start, va.end, GFP_KERNEL),

@@ -5,20 +5,20 @@ use core::ops::Range;
 use crate::driver::TyrDevice;
 use crate::driver::TyrDriver;
 use crate::file::DrmFile;
+use crate::file::DrmFile;
 use crate::mmu::vm;
-use crate::mmu::vm::{Vm, LiveRange};
+use crate::mmu::vm;
+use crate::mmu::vm::{LiveRange, Vm};
+use crate::mmu::vm::{LiveRange, Vm};
+use kernel::devres::Devres;
 use kernel::devres::Devres;
 use kernel::drm::gem;
 use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
 use kernel::drm::gem::{self};
 use kernel::io::mem::IoMem;
-use kernel::prelude::*;
-use crate::file::DrmFile;
-use crate::mmu::vm;
-use crate::mmu::vm::{Vm, LiveRange};
-use kernel::devres::Devres;
 use kernel::io::mem::IoMem;
+use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 use kernel::types::ARef;
@@ -62,7 +62,6 @@ impl gem::DriverObject for TyrObject {
         })
     }
 }
-
 
 // impl gem::shmem::DriverObject for DriverObject {
 //     type Driver = TyrDriver;
@@ -109,11 +108,7 @@ impl ObjectRef {
 type ObjectConfig<'a> = shmem::ObjectConfig<'a, DriverObject>;
 
 /// Create a new DRM GEM object.
-pub(crate) fn new_object(
-    dev: &TyrDevice,
-    size: usize,
-    flags: u32,
-) -> Result<ObjectRef> {
+pub(crate) fn new_object(dev: &TyrDevice, size: usize, flags: u32) -> Result<ObjectRef> {
     let aligned_size = size.next_multiple_of(1 << 12);
 
     if size == 0 || size > aligned_size {
@@ -136,13 +131,10 @@ pub(crate) fn new_object(
     // TODO: This is really bad but at this point seems to be the only way:
     // to be refactored
     // SAFETY: We are the only owners at this point
-    let mut obj =
-        ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::into_raw(gem);
+    let mut obj = ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::into_raw(gem);
     unsafe { obj.as_mut().flags = flags };
 
-    let gem = unsafe {
-        ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::from_raw(obj)
-    };
+    let gem = unsafe { ARef::<kernel::drm::gem::shmem::Object<DriverObject>>::from_raw(obj) };
 
     Ok(ObjectRef::new(gem))
 }

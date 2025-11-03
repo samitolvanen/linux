@@ -232,11 +232,9 @@ impl Firmware {
 
         let mut sections = Self::read_sections(tdev, iomem.clone(), gpu_info, vm.clone())?;
 
-        let shared_section = match sections.iter().position(|section| {
-                section.is_shared()
-        }) {
+        let shared_section = match sections.iter().position(|section| section.is_shared()) {
             Some(index) => sections.remove(index)?,
-            None        => {
+            None => {
                 dev_err!(tdev.as_ref(), "No shared section found in firmware");
                 return Err(EINVAL);
             }
@@ -389,8 +387,9 @@ impl<const N: usize> ModInfoBuilder<N> {
     ];
 
     /// Create the builder that generated the info at compile-time
-    pub (crate) const fn create(module_name: &'static kernel::str::CStr)
-        -> kernel::firmware::ModInfoBuilder<N> {
+    pub(crate) const fn create(
+        module_name: &'static kernel::str::CStr,
+    ) -> kernel::firmware::ModInfoBuilder<N> {
         let mut bld = kernel::firmware::ModInfoBuilder::new(module_name);
         // Walk over files listed above and add them to modinfo
         let mut i = 0;

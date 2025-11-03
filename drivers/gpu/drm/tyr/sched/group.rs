@@ -73,7 +73,7 @@ impl GroupInner {
         group: Arc<Group>,
         queue_submit: QueueSubmit,
         prepared_vm: &PreparedVm<'_>,
-        client_id: u64
+        client_id: u64,
     ) -> Result<UserFence<job::Fence>> {
         let queue = self
             .queues
@@ -180,12 +180,9 @@ impl Group {
             return Err(EINVAL);
         }
 
-        if group_args.compute_core_mask.count_ones()
-            > group_args.max_compute_cores as u32
-            || group_args.fragment_core_mask.count_ones()
-                > group_args.max_fragment_cores as u32
-            || group_args.tiler_core_mask.count_ones()
-                > group_args.max_tiler_cores as u32
+        if group_args.compute_core_mask.count_ones() > group_args.max_compute_cores as u32
+            || group_args.fragment_core_mask.count_ones() > group_args.max_fragment_cores as u32
+            || group_args.tiler_core_mask.count_ones() > group_args.max_tiler_cores as u32
         {
             pr_err!("group_create: asking for more cores than the maximum allowed for the group");
             return Err(EINVAL);
@@ -197,28 +194,24 @@ impl Group {
             .get_vm(group_args.vm_id as usize)
             .ok_or(EINVAL)?;
 
-        let (suspend_buf_size, protm_suspend_buf_size) = fw
-            .with_locked_global_iface(|glb_iface| {
+        let (suspend_buf_size, protm_suspend_buf_size) =
+            fw.with_locked_global_iface(|glb_iface| {
                 let csg = glb_iface.csg(0).ok_or(EINVAL)?;
                 let control = csg.read_control()?;
 
                 Ok((control.suspend_size, control.protm_suspend_size))
             })?;
 
-        let suspend_buf =
-            fw.alloc_suspend_buf(tdev, suspend_buf_size as usize)?;
-        let protm_suspend_buf =
-            fw.alloc_suspend_buf(tdev, protm_suspend_buf_size as usize)?;
+        let suspend_buf = fw.alloc_suspend_buf(tdev, suspend_buf_size as usize)?;
+        let protm_suspend_buf = fw.alloc_suspend_buf(tdev, protm_suspend_buf_size as usize)?;
 
-        let num_syncs = group_args.queues.count as usize
-            * core::mem::size_of::<SyncObj64b>();
+        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<SyncObj64b>();
         let mut syncobjs = gem::new_kernel_object(
             tdev,
             tdev.iomem.clone(),
             vm.clone(),
             gem::KernelVaPlacement::Auto { size: num_syncs },
-            map_flags::Flags::from(map_flags::NOEXEC)
-                | map_flags::Flags::from(map_flags::UNCACHED),
+            map_flags::Flags::from(map_flags::NOEXEC) | map_flags::Flags::from(map_flags::UNCACHED),
         )?;
 
         let vmap = syncobjs.vmap()?;
@@ -230,8 +223,7 @@ impl Group {
             queues.push(queue, GFP_KERNEL)?;
         }
 
-        let idle_queues =
-            genmask_checked_u32(0..=queues.len() as u32 - 1).ok_or(EINVAL)?;
+        let idle_queues = genmask_checked_u32(0..=queues.len() as u32 - 1).ok_or(EINVAL)?;
         let priority = group_args.priority.try_into()?;
 
         Arc::pin_init(
@@ -290,7 +282,7 @@ impl Group {
         in_syncs: KVec<SyncObj<TyrDriver>>,
         out_syncs: KVec<SyncObj<TyrDriver>>,
         queue_submits: KVec<QueueSubmit>,
-        client_id: u64
+        client_id: u64,
     ) -> Result<KVec<UserFence<job::Fence>>> {
         if self.vm.lock().address_space().is_none() {
             pr_err!("group_submit: invalid address space");
@@ -368,8 +360,7 @@ pub(crate) struct Pool {
 
 impl Pool {
     pub(crate) fn create() -> Result<Self> {
-        let xa =
-            KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
+        let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
 
         Ok(Self {
             xa,
