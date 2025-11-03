@@ -11,7 +11,6 @@ use kernel::devres::Devres;
 use kernel::drm::gem;
 use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
-use kernel::drm::gem::{self};
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
