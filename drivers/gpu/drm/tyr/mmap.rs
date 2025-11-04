@@ -56,22 +56,9 @@ pub(crate) fn mmap(device: &TyrDevice, _file: &crate::file::File, vma: &VmaNew) 
 }
 
 static VM_OPS: bindings::vm_operations_struct = bindings::vm_operations_struct {
-    open: None,
-    close: None,
-    may_split: None,
-    mremap: None,
-    mprotect: None,
     fault: Some(vm_fault_handler),
-    huge_fault: None,
-    map_pages: None,
-    pagesize: None,
-    page_mkwrite: None,
-    pfn_mkwrite: None,
-    access: None,
-    name: None,
-    set_policy: None,
-    get_policy: None,
-    find_special_page: None,
+    // SAFETY: All zeros is valid for vm ops.
+    ..unsafe { core::mem::zeroed() }
 };
 
 unsafe extern "C" fn vm_fault_handler(vmf: *mut bindings::vm_fault) -> bindings::vm_fault_t {
