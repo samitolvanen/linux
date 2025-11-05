@@ -13,9 +13,10 @@
 
 use crate::{
     alloc::flags::*,
-    bindings,
+    bindings, container_of,
     error::{to_result, Result},
     new_mutex,
+    prelude::*,
     sync::{Arc, Mutex, UniqueArc},
     types::Opaque,
 };
@@ -25,7 +26,7 @@ use crate::prelude::KBox;
 
 use core::{
     marker::{PhantomData, PhantomPinned},
-    ops::Deref,
+    ops::{ControlFlow, Deref},
     pin::Pin,
 };
 
@@ -53,6 +54,7 @@ struct MmInner<A: AllocInner<T>, T>(Opaque<bindings::drm_mm>, A, PhantomData<T>)
 /// - `node` points to a valid `drm_mm_node` struct, which is initialized when
 ///   the node is inserted in the allocator, and inserting a node is the only way
 ///   to create a `NodeData`, therefore `node` is always valid.
+#[repr(C)]
 pub struct NodeData<A: AllocInner<T>, T> {
     node: Opaque<bindings::drm_mm_node>,
     mm: Arc<Mutex<MmInner<A, T>>>,
@@ -63,6 +65,15 @@ pub struct NodeData<A: AllocInner<T>, T> {
 }
 
 impl<A: AllocInner<T>, T> NodeData<A, T> {
+    /// Resets the raw `drm_mm_node` field to zero from a `Pin`.
+    ///
+    /// This is safe because the `node` field is not structural to the pinning.
+    pub fn reset_node(self: Pin<&mut Self>) {
+        // SAFETY: We are not moving the data out of the `Pin`. The `node` field is not
+        //         structural to the pinning, so mutating it is safe.
+        unsafe { self.get_unchecked_mut().node = core::mem::zeroed() };
+    }
+
     /// Returns the color of the node (an opaque value)
     #[inline]
     pub fn color(&self) -> usize {
@@ -241,17 +252,7 @@ impl<A: AllocInner<T>, T> Allocator<A, T> {
         end: u64,
         mode: InsertMode,
     ) -> Result<Node<A, T>> {
-        let mut mm_node = KBox::new(
-            NodeData {
-                // SAFETY: This C struct should be zero-initialized.
-                node: unsafe { core::mem::zeroed() },
-                valid: false,
-                inner: node,
-                mm: self.mm.clone(),
-                _pin: PhantomPinned,
-            },
-            GFP_KERNEL,
-        )?;
+        let mut mm_node = self.allocate_node_data(node)?;
 
         let guard = self.mm.lock();
         // SAFETY: We hold the lock and all pointers are valid.
@@ -283,7 +284,19 @@ impl<A: AllocInner<T>, T> Allocator<A, T> {
         size: u64,
         color: usize,
     ) -> Result<Node<A, T>> {
-        let mut mm_node = KBox::new(
+        let mm_node = Pin::from(self.allocate_node_data(node)?);
+        self.reserve_node_from_node_data(mm_node, start, size, color)
+            .map_err(|(e, _)| e)
+    }
+
+    /// Allocates the data for a new node, but does not insert it into the allocator.
+    ///
+    /// This is useful when the caller needs to prepare a node but defer its insertion, for example,
+    /// when using `reserve_node_from_node_data`.
+    ///
+    /// `inner` is the user `T` type data to store into the node.
+    pub fn allocate_node_data(&self, node: T) -> Result<KBox<NodeData<A, T>>> {
+        Ok(KBox::new(
             NodeData {
                 // SAFETY: This C struct should be zero-initialized.
                 node: unsafe { core::mem::zeroed() },
@@ -293,23 +306,103 @@ impl<A: AllocInner<T>, T> Allocator<A, T> {
                 _pin: PhantomPinned,
             },
             GFP_KERNEL,
-        )?;
+        )?)
+    }
 
+    /// Insert a pre-allocated node into the allocator at a fixed start address.
+    ///
+    /// `mm_node` is a `Node<A, T>` that has been allocated via `allocate_node_data`.
+    pub fn reserve_node_from_node_data(
+        &self,
+        mut mm_node: Node<A, T>,
+        start: u64,
+        size: u64,
+        color: usize,
+    ) -> Result<Node<A, T>, (Error, Node<A, T>)> {
         {
+            // SAFETY: We don't move the pinned data.
+            let node_ref = unsafe { mm_node.as_mut().get_unchecked_mut() };
+            node_ref.valid = false;
+
             // SAFETY: It is safe to fabricate a &mut reference here.
-            let mm_node = unsafe { &mut *mm_node.node.get() };
-            mm_node.start = start;
-            mm_node.size = size;
-            mm_node.color = color;
+            let drm_node = unsafe { &mut *node_ref.node.get() };
+            drm_node.start = start;
+            drm_node.size = size;
+            drm_node.color = color;
         }
 
         let guard = self.mm.lock();
         // SAFETY: We hold the lock and all pointers are valid.
-        to_result(unsafe { bindings::drm_mm_reserve_node(guard.0.get(), mm_node.node.get()) })?;
+        match to_result(unsafe { bindings::drm_mm_reserve_node(guard.0.get(), mm_node.node.get()) })
+        {
+            Ok(_) => {
+                // SAFETY: We don't move the pinned data.
+                unsafe { mm_node.as_mut().get_unchecked_mut() }.valid = true;
+                Ok(mm_node)
+            }
+            Err(e) => Err((e, mm_node)),
+        }
+    }
 
-        mm_node.valid = true;
+    /// Removes a node from the allocator.
+    ///
+    /// This is equivalent to `NodeData::drop`, but allows the caller to retain ownership of the
+    /// Node<A, T> memory. The node is marked as invalid after this call, so `drop` will become
+    /// a no-op.
+    pub fn remove_node(&self, node: &mut Node<A, T>) {
+        // SAFETY: `remove_node` does not move the pinned data.
+        let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
+        if !node_mut.valid {
+            return;
+        }
 
-        Ok(Pin::from(mm_node))
+        let mut guard = self.mm.lock();
+
+        // Inform the user allocator that a node is being dropped.
+        guard.1.drop_object(
+            node_mut.start(),
+            node_mut.size(),
+            node_mut.color(),
+            &mut node_mut.inner,
+        );
+        // SAFETY: The MM lock is still taken, so we can safely remove the node.
+        unsafe { bindings::drm_mm_remove_node(node_mut.node.get()) };
+
+        node_mut.valid = false;
+    }
+
+    /// Iterate over all nodes that overlap with the given range.
+    ///
+    /// The lock on the allocator is held during the iteration.
+    pub fn for_each_node_in_range<F>(&self, start: u64, end: u64, mut f: F)
+    where
+        F: FnMut(&NodeData<A, T>) -> ControlFlow<()>,
+    {
+        let guard = self.mm.lock();
+        let mm_ptr = guard.0.get();
+
+        // SAFETY: `mm_ptr` is valid and we hold the lock.
+        let mut node_ptr = unsafe { bindings::drm_mm_first_node_in_range(mm_ptr, start, end) };
+
+        while !node_ptr.is_null() {
+            // SAFETY: The pointer is guaranteed to be valid while the allocator lock is held.
+            // We can safely cast it to a `NodeData` reference.
+            let node_data = unsafe {
+                let node_data_ptr = container_of!(
+                    node_ptr as *mut Opaque<bindings::drm_mm_node>,
+                    NodeData<A, T>,
+                    node
+                );
+                &*node_data_ptr
+            };
+
+            if f(node_data).is_break() {
+                break;
+            }
+
+            // SAFETY: `node_ptr` is valid and we hold the lock.
+            node_ptr = unsafe { bindings::drm_mm_next_node_in_range(node_ptr, end) };
+        }
     }
 
     /// Operate on the inner user type `A`, taking the allocator lock

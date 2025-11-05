@@ -66,4 +66,24 @@ int rust_helper_drm_gem_shmem_object_mmap(struct drm_gem_object *obj, struct vm_
 }
 
 #endif /* CONFIG_DRM_GEM_SHMEM_HELPER */
+
+struct drm_mm_node *
+rust_helper_drm_mm_first_node_in_range(struct drm_mm *mm, u64 start, u64 end)
+{
+    struct drm_mm_node *node = __drm_mm_interval_first(mm, start, end - 1);
+
+    if (node == &mm->head_node)
+        return NULL;
+    return node;
+}
+
+struct drm_mm_node *
+rust_helper_drm_mm_next_node_in_range(struct drm_mm_node *node, u64 end)
+{
+    node = list_next_entry(node, node_list);
+    if (node->start < end)
+        return node;
+    return NULL;
+}
+
 #endif /* CONFIG_DRM */
