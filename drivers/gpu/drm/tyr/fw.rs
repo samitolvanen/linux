@@ -38,6 +38,7 @@ const CSF_MCU_SHARED_REGION_SIZE: u32 = 0x04000000;
 pub(crate) mod global;
 pub(crate) mod irq;
 mod parse;
+mod test;
 
 /// The metadata stored in a `drm_mm` node to track a borrow.
 #[derive(Debug)]

@@ -229,6 +229,9 @@ impl GlobalInterface {
     ) -> Result<Self> {
         let shared_section = Arc::pin_init(SharedSection::new(shared_section)?, GFP_KERNEL)?;
 
+        // Run self-tests on the new shared section allocator.
+        super::test::run_all(&shared_section)?;
+
         Ok(Self {
             state: GlobalInterfaceState::Disabled,
             iomem,
