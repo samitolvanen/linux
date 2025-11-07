@@ -21,6 +21,7 @@ use core::sync::atomic::AtomicUsize;
 use kernel::alloc::KVec;
 use kernel::bits::genmask_u64;
 use kernel::devres::Devres;
+use kernel::drm::gem::BaseObject;
 use kernel::kvec;
 use kernel::new_mutex;
 use kernel::prelude::*;
@@ -62,7 +63,7 @@ impl ChunkHeader {
         }
 
         let vmap = mem.vmap()?;
-        let ptr = unsafe { vmap.as_mut_ptr().add(offset).cast::<Self>() };
+        let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
         // SAFETY: we know that this pointer is aligned and valid for reads for
         // at least size_of::<Self>() bytes.
         Ok(unsafe { core::ptr::read_volatile(ptr) })
@@ -81,7 +82,7 @@ impl ChunkHeader {
         }
 
         let vmap = mem.vmap()?;
-        let ptr = unsafe { vmap.as_mut_ptr().add(offset).cast::<Self>() };
+        let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
         // SAFETY: we know that this pointer is aligned and valid for writes for
         // at least size_of::<Self>() bytes.
         unsafe { core::ptr::write_volatile(ptr, value) };
@@ -135,7 +136,9 @@ impl Context {
             })?;
 
             let vmap = chunk_bo.vmap()?;
-            let mem = vmap.as_mut_slice();
+            let size = vmap.owner().size();
+            let mut vmap = vmap.get();
+            let mem = unsafe { vmap.as_mut_slice(0, size)? };
             mem.fill(0);
 
             chunk_bo
