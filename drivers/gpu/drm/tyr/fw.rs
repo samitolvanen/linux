@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::mem::ManuallyDrop;
+use core::ops::ControlFlow;
 use core::ops::Deref;
+use core::sync::atomic::AtomicU32;
 use global::GlobalInterface;
 use kernel::alloc::allocator::Kmalloc;
 use kernel::bindings::SZ_1G;
@@ -40,6 +42,7 @@ mod parse;
 /// The metadata stored in a `drm_mm` node to track a borrow.
 #[derive(Debug)]
 enum BorrowedMode {
+    Shared { refcount: AtomicU32 },
     Exclusive,
 }
 
@@ -100,6 +103,43 @@ impl SharedSectionGuardInner {
     /// Reads a value of type `T` from the start of the borrowed range.
     pub(crate) fn read<T>(&self) -> Result<T> {
         self.read_at(0)
+    }
+}
+
+/// A guard representing a shared (read-only) borrow of a range in the shared section.
+///
+/// This guard ensures that the borrowed range is not concurrently written to by other parts of the
+/// kernel. It is safe to have multiple shared guards for the same range. When the guard is
+/// dropped, the shared borrow is released.
+pub(crate) struct SharedSectionGuard {
+    inner: SharedSectionGuardInner,
+    node: *const BorrowNode,
+}
+
+impl Drop for SharedSectionGuard {
+    fn drop(&mut self) {
+        // SAFETY: The pointer is guaranteed to be valid because it was created from a valid `Pin<KBox>`
+        // that was leaked. The data it points to is `Sync`, so we can safely access the `refcount`.
+        let node_data = unsafe { &*self.node };
+        if let BorrowedMode::Shared { refcount } = &**node_data {
+            if refcount.fetch_sub(1, core::sync::atomic::Ordering::Release) == 1 {
+                // This is the last reference. We can now reconstruct the `Pin<KBox>` and release the
+                // borrow.
+                // SAFETY: This is safe because we are the last owner of the shared borrow, as indicated
+                // by the reference count dropping to zero. We can now take ownership of the `Pin<KBox>`
+                // and release the node.
+                let node = unsafe { Pin::from(KBox::from_raw(self.node as *mut BorrowNode)) };
+                let _ = self.inner.shared_section.release(node);
+            }
+        }
+    }
+}
+
+impl Deref for SharedSectionGuard {
+    type Target = SharedSectionGuardInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -209,6 +249,92 @@ impl SharedSection {
         Ok(mcu_va - shared_mem_start)
     }
 
+    /// Borrows a range of the shared section for shared (read-only) access.
+    ///
+    /// This will attempt to reserve the given range in the `drm_mm` allocator. If the range is
+    /// already borrowed exclusively, this will fail. If the range is already borrowed for shared
+    /// access, the reference count for the existing borrow will be incremented.
+    pub(crate) fn borrow_bytes(
+        self: &Arc<Self>,
+        mcu_va: u64,
+        size: u64,
+    ) -> Result<SharedSectionGuard> {
+        let offset = self.get_offset(mcu_va, size)?;
+        let node = self.get_node(BorrowedMode::Shared { refcount: 1.into() })?;
+        let result = self
+            .allocator
+            .reserve_node_from_node_data(node, offset, size, 0);
+
+        let node_ptr = match result {
+            Ok(node) => {
+                // This is the first shared borrow. We leak the `KBox` and store a raw pointer.
+                // The refcount is already 1.
+                // When the last `SharedSectionGuard` is dropped, it will reconstruct the
+                // `Pin<KBox>` from the raw pointer and drop it, which will free the node.
+
+                // SAFETY: `Pin::into_inner_unchecked` is safe because we are not moving the
+                // `BorrowNode` out of the `KBox`. We are just converting the `KBox` into a raw
+                // pointer, which will be used to reconstruct the `KBox` later. The data
+                // remains pinned at the same memory location.
+                let node_ptr = KBox::into_raw(unsafe { Pin::into_inner_unchecked(node) });
+                Ok(node_ptr as *const _)
+            }
+            Err((e, node)) => {
+                // We failed to reserve the node, so cache it for later use.
+                self.release(node)?;
+
+                if e != ENOSPC {
+                    return Err(e);
+                }
+
+                // The reservation failed because the range is already in use. The request
+                // is for a shared allocation, so check if we can use the existing borrow.
+                let mut found_node = None;
+
+                self.allocator
+                    .for_each_node_in_range(offset, offset + size, |node_data| {
+                        // We don't support partially overlapping borrows, so if the conflicting
+                        // borrow isn't for the exact same memory range, don't tag along.
+                        if node_data.start() == offset && node_data.size() == size {
+                            if let BorrowedMode::Shared { refcount } = &**node_data {
+                                // Increment the reference count for the existing shared borrow and
+                                // return the node.
+                                refcount.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+                                // This pointer remains valid as long as the reference count remains
+                                // non-zero.
+                                found_node = Some(node_data as *const _);
+                            }
+                        }
+
+                        // We only have to look at the first conflicting allocation.
+                        ControlFlow::Break(())
+                    });
+
+                if let Some(node_ptr) = found_node {
+                    Ok(node_ptr)
+                } else {
+                    Err(e)
+                }
+            }
+        }?;
+
+        Ok(SharedSectionGuard {
+            inner: SharedSectionGuardInner {
+                shared_section: self.clone(),
+                start: offset as usize,
+                end: (offset + size) as usize,
+            },
+            node: node_ptr,
+        })
+    }
+
+    /// Borrows a range of the shared section for shared (read-only) access, with the size
+    /// inferred from the generic type `T`.
+    pub(crate) fn borrow<T>(self: &Arc<Self>, mcu_va: u64) -> Result<SharedSectionGuard> {
+        self.borrow_bytes(mcu_va, core::mem::size_of::<T>() as u64)
+    }
+
     /// Borrows a range of the shared section for exclusive (read-write) access.
     ///
     /// This will attempt to reserve the given range in the `drm_mm` allocator. If the range is
@@ -265,7 +391,7 @@ impl SharedSection {
 
     /// Borrows a region, reads a `T` from it, and releases the borrow.
     pub(crate) fn read_once<T: Copy>(self: &Arc<Self>, mcu_va: u64) -> Result<T> {
-        self.borrow_mut::<T>(mcu_va)?.read()
+        self.borrow::<T>(mcu_va)?.read()
     }
 
     /// Borrows a region, writes a `T` to it, and releases the borrow.
