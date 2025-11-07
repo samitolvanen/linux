@@ -232,7 +232,7 @@ impl platform::Driver for TyrDriver {
         let uninit =
             unsafe { pin_init_from_closure::<TyrData, kernel::error::Error>(|_slot| Ok(())) };
         let data = Arc::pin_init(uninit, GFP_KERNEL)?;
-        let tdev: ARef<TyrDevice> = drm::Device::new(pdev.as_ref(), data.clone())?;
+        let tdev: ARef<TyrDevice> = drm::Device::new(pdev.as_ref(), Ok(data.clone()))?;
 
         let mmu = KBox::pin_init(new_mutex!(Mmu::new()?), GFP_KERNEL)?;
 
