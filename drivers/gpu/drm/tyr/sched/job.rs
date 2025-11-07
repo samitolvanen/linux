@@ -200,6 +200,7 @@ impl JobImpl for Job {
     }
 }
 
+#[expect(dead_code)]
 struct RingBufferPosition {
     start: u64,
     end: u64,

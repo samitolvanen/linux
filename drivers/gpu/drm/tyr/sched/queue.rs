@@ -38,6 +38,7 @@ pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
 /// Represents a hardware executiion queue.
 pub(crate) struct Queue {
     /// The DRM scheduler used for this queue.
+    #[expect(dead_code)]
     scheduler: Scheduler<Job>,
 
     /// The DRM entity used for this queue.

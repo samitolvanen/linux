@@ -230,6 +230,7 @@ impl Group {
         )
     }
 
+    #[expect(dead_code)]
     pub(super) fn idle(&self, sched: &Scheduler) -> bool {
         let inner = self.inner.lock();
         if let Some(csg_id) = inner.csg_id {

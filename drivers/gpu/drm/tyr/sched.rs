@@ -72,6 +72,7 @@ pub(crate) struct Scheduler {
     /// to execute, or because they are blocked.
     idle_groups: [KVec<Arc<Group>>; Priority::num_priorities()],
     /// List of groups whose queues are blocked on a sync object.
+    #[expect(dead_code)]
     waiting_groups: [KVec<Arc<Group>>; Priority::num_priorities()],
 
     /// Groups that have been flagged by a STATUS_UPDATE event, but that have
@@ -84,15 +85,19 @@ pub(crate) struct Scheduler {
     csg_slot_count: u32,
 
     /// Number of command stream slots per group slot exposed by the firmware.
+    #[expect(dead_code)]
     cs_slot_count: u32,
 
     /// Number of address space slots supported by the MMU.
+    #[expect(dead_code)]
     as_slot_count: u32,
 
     /// Number of command stream group slots currently in use.
+    #[expect(dead_code)]
     used_csg_slot_count: u32,
 
     /// Number of scoreboard slots.
+    #[expect(dead_code)]
     sb_slot_count: u32,
 
     /// Workqueue used by our internal scheduler logic and by the
@@ -503,6 +508,7 @@ impl Scheduler {
 
     // place a dummy instruction in the first CS for the given group and kick
     // it, just to make sure the ringbuf code is working.
+    #[expect(dead_code)]
     pub(crate) fn issue_dummy_instr(&mut self, group: Arc<Group>, tdev: &TyrDevice) -> Result {
         self.bind(tdev, group.clone())?;
 

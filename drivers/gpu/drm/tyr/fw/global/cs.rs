@@ -291,6 +291,7 @@ pub(crate) struct Control {
     pub(crate) output_va: u32,
 }
 
+#[expect(dead_code)]
 impl Control {
     /// Returns the number of work registers available in the command stream.
     pub(crate) fn work_regs(&self) -> u32 {
@@ -384,6 +385,7 @@ pub(crate) struct Output {
     pub(crate) heap_address: u64,
 }
 
+#[expect(dead_code)]
 impl Output {
     pub(crate) fn cs_fault_exception_type(&self) -> u32 {
         self.fault & genmask_u32(0..=7)
@@ -451,6 +453,7 @@ pub(crate) enum StreamState {
     Start,
 }
 
+#[expect(dead_code)]
 pub(crate) struct StatusWait {
     /// Mask denoting which scoreboard entries are being waited on by this
     /// command stream.

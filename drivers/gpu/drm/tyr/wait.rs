@@ -167,6 +167,7 @@ impl<T> Wait<T> {
         }
     }
 
+    #[expect(dead_code)]
     pub(crate) fn notify_one(&self) {
         let _guard = self.lock.lock();
         self.cond.notify_one();

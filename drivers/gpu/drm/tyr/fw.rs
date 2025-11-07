@@ -318,6 +318,7 @@ macro_rules! impl_shared_section_write {
             ///
             /// Merely taking a reference to it would be UB, as the MCU can change the
             /// underlying memory at any time, as it is a core running its own code.
+            #[allow(dead_code)]
             pub(super) fn write(self, range: &mut SharedSectionRange) -> Result<()> {
                 // Make sure all writes took place before we update the memory.
                 kernel::sync::barrier::smp_mb();
@@ -360,6 +361,7 @@ pub(crate) trait SharedSectionEntry {
     type Output;
 
     fn read_control(&self) -> Result<Self::Control>;
+    #[expect(dead_code)]
     fn write_control(&mut self, control: Self::Control) -> Result;
 
     fn read_input(&self) -> Result<Self::Input>;
@@ -374,6 +376,7 @@ pub(crate) trait SharedSectionEntry {
         Err(ENOTSUPP)
     }
 
+    #[expect(dead_code)]
     fn interrupt_ack(&self) -> Result<RequestField> {
         pr_err!("Interrupt ack not supported for this interface");
         Err(ENOTSUPP)

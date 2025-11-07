@@ -98,6 +98,7 @@ pub(crate) struct Vm {
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
     /// DRM scheduler for async VM operations.
+    #[expect(dead_code)]
     pub(crate) scheduler: kernel::drm::sched::Scheduler<VmBindJob>,
 
     /// DRM scheduler entity for submitting jobs.
@@ -266,6 +267,7 @@ impl Vm {
     }
 
     /// Flush L2 caches for the entirety of a VM's AS.
+    #[expect(dead_code)]
     pub(crate) fn flush(&self, tdev: &ARef<TyrDevice>) -> Result {
         let iomem = &tdev.iomem;
 
@@ -325,6 +327,7 @@ impl Vm {
 /// VM, and that `num_slots` have been reserved for fences.
 pub(crate) struct PreparedVm<'a> {
     pub(crate) exec_token: ExecToken<'a, LockedVm>,
+    #[expect(dead_code)]
     pub(crate) num_slots: u32,
 }
 
@@ -353,6 +356,7 @@ const MIN_KERNEL_VA_SIZE: u64 = 0x10000000;
 
 pub(crate) struct VmLayout {
     /// Section reserved for user objects.
+    #[expect(dead_code)]
     pub(crate) user: Range<u64>,
 
     /// Section reserved for kernel objects.
@@ -387,6 +391,7 @@ impl VmLayout {
 /// Controls the size of the user VA space.
 pub(crate) enum VmUserSize {
     /// Lets the kernel decide the user/kernel split.
+    #[expect(dead_code)]
     Auto,
     /// Sets the user VA space to a custom size. Things will crash if not enough
     /// is left for kernel objects.

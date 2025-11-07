@@ -6,6 +6,8 @@
 //! streams and any other actor (e.g. host CPU, other command streams or other
 //! hardware devices).
 
+#![expect(dead_code)]
+
 use kernel::prelude::*;
 
 use crate::gem;

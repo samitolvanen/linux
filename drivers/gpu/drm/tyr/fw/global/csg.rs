@@ -187,6 +187,7 @@ impl CommandStreamGroup {
         self.streams.get_mut(idx)
     }
 
+    #[expect(dead_code)]
     pub(crate) fn csg_id(&self) -> usize {
         self.csg_id
     }
@@ -301,6 +302,7 @@ pub(crate) struct Output {
 }
 
 impl Output {
+    #[expect(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         self.status_state & bit_u32(0) != 0
     }

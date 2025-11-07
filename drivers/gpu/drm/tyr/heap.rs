@@ -39,6 +39,7 @@ use crate::mmu::vm::Vm;
 use crate::mmu::vm::WithLockedVm;
 
 const MAX_HEAPS_PER_POOL: u32 = 128;
+#[expect(dead_code)]
 const MAX_CONTEXT_SIZE: u32 = 32;
 
 pub(crate) struct ChunkHeader {
@@ -46,6 +47,7 @@ pub(crate) struct ChunkHeader {
     next: u64,
 
     /// Other hardware-specific fields. MBZ.
+    #[expect(dead_code)]
     unknown: [u32; 14],
 }
 
@@ -104,6 +106,7 @@ pub(crate) struct CreatedContext {
     pub(crate) first_chunk_gpu_va: u64,
 }
 
+#[expect(dead_code)]
 pub(crate) struct ContextGrowArgs {
     pub(crate) heap_gpu_va: u64,
     pub(crate) renderpasses_in_flight: u32,
@@ -115,7 +118,9 @@ pub(crate) struct Context {
     vm: Arc<Mutex<Vm>>,
     chunks: KVec<gem::ObjectRef>,
     chunk_size: u32,
+    #[expect(dead_code)]
     max_chunks: u32,
+    #[expect(dead_code)]
     target_in_flight: u32,
 }
 
@@ -162,6 +167,7 @@ pub(crate) struct Pool {
     vm: Arc<Mutex<Vm>>,
 
     gpu_contexts: Pin<KBox<Mutex<gem::ObjectRef>>>,
+    #[expect(dead_code)]
     pool_total_size: AtomicUsize,
 
     xa: Pin<KBox<XArray<KBox<Context>>>>,
@@ -285,6 +291,7 @@ impl Pool {
         guard.remove(context_id)
     }
 
+    #[expect(dead_code)]
     pub(crate) fn grow_heap_context(
         &mut self,
         tdev: &TyrDevice,

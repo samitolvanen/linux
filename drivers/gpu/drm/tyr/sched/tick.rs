@@ -13,11 +13,13 @@ use crate::sched::CommandStreamGroupSlot;
 
 use super::Scheduler;
 
+#[expect(dead_code)]
 pub(super) struct Tick {
     groups: KVec<Arc<Group>>,
     idle_group_count: usize,
 }
 
+#[expect(dead_code)]
 impl Tick {
     fn full(&self, sched: &Scheduler) -> bool {
         self.groups.len() as u32 == sched.csg_slot_count
