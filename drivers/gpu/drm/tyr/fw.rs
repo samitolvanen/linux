@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::mem::ManuallyDrop;
+use core::ops::Deref;
 use global::GlobalInterface;
+use kernel::alloc::allocator::Kmalloc;
 use kernel::bindings::SZ_1G;
 use kernel::devres::Devres;
+use kernel::drm::mm;
 use kernel::firmware;
 use kernel::io::mem::IoMem;
 use kernel::new_mutex;
@@ -32,6 +36,243 @@ const CSF_MCU_SHARED_REGION_SIZE: u32 = 0x04000000;
 pub(crate) mod global;
 pub(crate) mod irq;
 mod parse;
+
+/// The metadata stored in a `drm_mm` node to track a borrow.
+#[derive(Debug)]
+enum BorrowedMode {
+    Exclusive,
+}
+
+/// A type alias for a `drm_mm` node that contains `BorrowedMode` metadata.
+type BorrowNode = mm::NodeData<(), BorrowedMode>;
+
+/// The inner data of a shared section guard, containing common fields.
+///
+/// This struct is not intended to be used directly. It is wrapped by `SharedSectionGuard` and
+/// `SharedSectionGuardMut` to provide safe access to the shared section.
+pub(crate) struct SharedSectionGuardInner {
+    shared_section: Arc<SharedSection>,
+    start: usize,
+    end: usize,
+}
+
+impl SharedSectionGuardInner {
+    /// Returns the length of the borrowed range.
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Returns a mutable pointer to the start of the borrowed range in the shared section.
+    fn as_mut_ptr(&self) -> Result<*mut core::ffi::c_void> {
+        let section_ptr = Arc::as_ptr(&self.shared_section.section) as *mut KBox<Section>;
+        // SAFETY: The `drm_mm` allocator ensures that borrows do not conflict.
+        // A mutable pointer is obtained here to call `vmap()`, which is safe
+        // because it is an idempotent, one-time initialization.
+        let section = unsafe { &mut *section_ptr };
+        let vmap = section.mem.vmap()?;
+        let vmap = vmap.as_mut_ptr();
+
+        // SAFETY: `self.start` is a valid offset into the shared section, as guaranteed by the
+        // `SharedSection` when this guard was created.
+        let offset = unsafe { vmap.add(self.start) };
+
+        Ok(offset)
+    }
+
+    /// Reads a value of type `T` from the given offset within the borrowed range.
+    pub(crate) fn read_at<T>(&self, offset: usize) -> Result<T> {
+        if offset + core::mem::size_of::<T>() > self.len() {
+            return Err(EINVAL);
+        }
+
+        let base_ptr = self.as_mut_ptr()?;
+        // SAFETY: We checked that the read is within the bounds of the borrowed range.
+        let ptr = unsafe { base_ptr.add(offset) };
+
+        // Make sure all writes took place before we read the memory.
+        kernel::sync::barrier::smp_mb();
+
+        // SAFETY: The pointer is guaranteed to be valid for a read of `size_of::<T>()` bytes, as
+        // checked above.
+        Ok(unsafe { core::ptr::read_volatile(ptr as *const T) })
+    }
+
+    /// Reads a value of type `T` from the start of the borrowed range.
+    pub(crate) fn read<T>(&self) -> Result<T> {
+        self.read_at(0)
+    }
+}
+
+/// A guard representing an exclusive (read-write) borrow of a range in the shared section.
+///
+/// This guard ensures that the borrowed range is not concurrently accessed by other parts of the
+/// kernel. Only one exclusive guard can exist for a given range at a time. When the guard is
+/// dropped, the exclusive borrow is released.
+pub(crate) struct SharedSectionGuardMut {
+    inner: SharedSectionGuardInner,
+    node: ManuallyDrop<Pin<KBox<BorrowNode>>>,
+}
+
+impl SharedSectionGuardMut {
+    /// Writes a value of type `T` to the given offset within the borrowed range.
+    pub(crate) fn write_at<T>(&self, offset: usize, value: T) -> Result {
+        if offset + core::mem::size_of::<T>() > self.len() {
+            return Err(EINVAL);
+        }
+
+        let base_ptr = self.as_mut_ptr()?;
+        // SAFETY: We checked that the write is within the bounds of the borrowed range.
+        let ptr = unsafe { base_ptr.add(offset) };
+
+        // Make sure all writes took place before we update the memory.
+        kernel::sync::barrier::smp_mb();
+
+        // SAFETY: The pointer is guaranteed to be valid for a write of `size_of::<T>()` bytes, as
+        // checked above.
+        unsafe {
+            core::ptr::write_volatile(ptr as *mut T, value);
+        }
+
+        Ok(())
+    }
+
+    /// Writes a value of type `T` to the start of the borrowed range.
+    pub(crate) fn write<T>(&self, value: T) -> Result {
+        self.write_at(0, value)
+    }
+}
+
+impl Drop for SharedSectionGuardMut {
+    fn drop(&mut self) {
+        // SAFETY: The `ManuallyDrop` ensures we only drop this once. We are the exclusive owner of
+        // the `Pin<KBox>`, so we can safely take it and release it.
+        let node = unsafe { ManuallyDrop::take(&mut self.node) };
+        let _ = self.inner.shared_section.release(node);
+    }
+}
+
+impl Deref for SharedSectionGuardMut {
+    type Target = SharedSectionGuardInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+/// An allocator for managing borrows of the shared memory section.
+///
+/// This allocator uses a `drm_mm` allocator to track shared and exclusive borrows of ranges within
+/// the shared section. It also maintains a cache of `drm_mm` nodes to reduce allocation overhead.
+#[pin_data]
+pub(crate) struct SharedSection {
+    section: Arc<KBox<Section>>,
+    allocator: mm::Allocator<(), BorrowedMode>,
+    #[pin]
+    node_cache: Mutex<Vec<Pin<KBox<BorrowNode>>, Kmalloc>>,
+}
+
+impl SharedSection {
+    const NODE_CACHE_SIZE: usize = 16;
+
+    /// Creates a new `SharedSection` for the given shared section.
+    fn new(section: KBox<Section>) -> Result<impl PinInit<Self>> {
+        let section = Arc::new(section, GFP_KERNEL)?;
+        let allocator = mm::Allocator::new(0, section.mem.size() as u64, ())?;
+        Ok(pin_init!(Self {
+            section,
+            allocator,
+            node_cache <- new_mutex!(Vec::new()),
+        }))
+    }
+
+    /// Gets a `BorrowNode` from the cache or creates a new one if the cache is empty.
+    fn get_node(self: &Arc<Self>, mode: BorrowedMode) -> Result<Pin<KBox<BorrowNode>>> {
+        let mut cache = self.node_cache.lock();
+        if let Some(mut node) = cache.pop() {
+            // We're reusing a cached node. Initialize it.
+            *node.as_mut().inner_mut() = mode;
+            Ok(node)
+        } else {
+            Ok(Pin::from(self.allocator.allocate_node_data(mode)?))
+        }
+    }
+
+    /// Checks that the given range is within the bounds of the shared section and returns the
+    /// offset from the beginning of the section.
+    fn get_offset(&self, mcu_va: u64, size: u64) -> Result<u64> {
+        let shared_mem_start = u64::from(self.section.va.start);
+        let shared_mem_end = u64::from(self.section.va.end);
+
+        if mcu_va < shared_mem_start || (mcu_va + size) > shared_mem_end {
+            return Err(EINVAL);
+        }
+
+        Ok(mcu_va - shared_mem_start)
+    }
+
+    /// Borrows a range of the shared section for exclusive (read-write) access.
+    ///
+    /// This will attempt to reserve the given range in the `drm_mm` allocator. If the range is
+    /// already borrowed, this will fail.
+    pub(crate) fn borrow_mut_bytes(
+        self: &Arc<Self>,
+        mcu_va: u64,
+        size: u64,
+    ) -> Result<SharedSectionGuardMut> {
+        let offset = self.get_offset(mcu_va, size)?;
+        let node = self.get_node(BorrowedMode::Exclusive)?;
+        let result = self
+            .allocator
+            .reserve_node_from_node_data(node, offset, size, 0);
+
+        let node = match result {
+            Ok(node) => Ok(node),
+            Err((e, node)) => {
+                // We failed to reserve the node, so cache it for later use.
+                self.release(node)?;
+                Err(e)
+            }
+        }?;
+
+        Ok(SharedSectionGuardMut {
+            inner: SharedSectionGuardInner {
+                shared_section: self.clone(),
+                start: offset as usize,
+                end: (offset + size) as usize,
+            },
+            node: ManuallyDrop::new(node),
+        })
+    }
+
+    /// Borrows a range of the shared section for exclusive (read-write) access, with the size
+    /// inferred from the generic type `T`.
+    pub(crate) fn borrow_mut<T>(self: &Arc<Self>, mcu_va: u64) -> Result<SharedSectionGuardMut> {
+        self.borrow_mut_bytes(mcu_va, core::mem::size_of::<T>() as u64)
+    }
+
+    /// Releases a `BorrowNode`, either by returning it to the cache or by freeing it.
+    fn release(&self, mut node: Pin<KBox<BorrowNode>>) -> Result {
+        self.allocator.remove_node(&mut node);
+        let mut guard = self.node_cache.lock();
+
+        if guard.len() < Self::NODE_CACHE_SIZE {
+            // Reset the node so it can be reused and cache it.
+            node.as_mut().reset_node();
+            guard.push(node, GFP_KERNEL)?;
+        }
+
+        Ok(())
+    }
+
+    /// Borrows a region, reads a `T` from it, and releases the borrow.
+    pub(crate) fn read_once<T: Copy>(self: &Arc<Self>, mcu_va: u64) -> Result<T> {
+        self.borrow_mut::<T>(mcu_va)?.read()
+    }
+
+    /// Borrows a region, writes a `T` to it, and releases the borrow.
+    pub(crate) fn write_once<T: Copy>(self: &Arc<Self>, mcu_va: u64, value: T) -> Result {
+        self.borrow_mut::<T>(mcu_va)?.write(value)
+    }
+}
 
 /// A range into the shared section that is known to be valid.
 ///
