@@ -21,7 +21,6 @@ use core::sync::atomic::AtomicUsize;
 use kernel::alloc::KVec;
 use kernel::bits::genmask_u64;
 use kernel::devres::Devres;
-use kernel::io::mem::IoMem;
 use kernel::kvec;
 use kernel::new_mutex;
 use kernel::prelude::*;
@@ -32,6 +31,7 @@ use kernel::uapi::SZ_8M;
 use kernel::xarray;
 use kernel::xarray::XArray;
 
+use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::gem;
 use crate::mmu::vm::Vm;
