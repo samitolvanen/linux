@@ -193,7 +193,7 @@ impl JobImpl for Job {
         Ok(Some(kernel::dma_fence::Fence::from_fence(&job.done_fence)))
     }
 
-    fn timed_out(job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
+    fn timed_out(_job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
         pr_err!("Job timed out\n");
 
         kernel::drm::sched::Status::NoDevice

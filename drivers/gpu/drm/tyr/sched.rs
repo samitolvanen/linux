@@ -412,7 +412,7 @@ impl Scheduler {
         let mut ringbuf_input = queue.interfaces.read_input()?;
         let ringbuf_output = queue.interfaces.read_output()?;
         ringbuf_input.extract_init = ringbuf_output.extract;
-        queue.interfaces.write_input(ringbuf_input);
+        let _ = queue.interfaces.write_input(ringbuf_input);
 
         cs_input.ringbuf_base = queue.ringbuf.kernel_va().ok_or(EINVAL)?.start;
         cs_input.ringbuf_size = queue.ringbuf.size() as u32;
@@ -433,7 +433,7 @@ impl Scheduler {
         let already_bound = group.with_locked_inner(|inner| Ok(inner.csg_id.is_some()))?;
 
         if already_bound {
-            let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id.unwrap()))?;
+            let _csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id.unwrap()))?;
             // pr_info!("Group already bound to CSG slot {}\n", csg_id);
             return Ok(());
         }

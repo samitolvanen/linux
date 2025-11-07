@@ -47,7 +47,7 @@ impl WorkItem<1> for TyrData {
 
             // sync group state for all queued groups
             for i in 0..slot_count {
-                if let Some(slot) = &sched.csg_slots[i] {
+                if let Some(_slot) = &sched.csg_slots[i] {
                     sched.sync_group_state(&this, i)?;
                 }
             }

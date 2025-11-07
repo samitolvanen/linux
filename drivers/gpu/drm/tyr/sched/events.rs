@@ -246,7 +246,7 @@ impl Scheduler {
         let _ = self.wq.enqueue::<_, 2>(tdev.deref().clone());
     }
 
-    fn update_group(&mut self, group: Arc<Group>, data: &Arc<TyrData>) -> Result {
+    fn update_group(&mut self, group: Arc<Group>, _data: &Arc<TyrData>) -> Result {
         let mut no_in_flight_jobs = true;
         let mut csg_id = None;
 
@@ -294,9 +294,10 @@ impl Scheduler {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn mark_group_idle(
         &mut self,
-        group: Arc<Group>,
+        _group: Arc<Group>,
         data: &Arc<TyrData>,
         csg_id: Option<usize>,
     ) -> Result {
