@@ -30,7 +30,7 @@ use crate::mmu::Mmu;
 type PinnedVa = Pin<KBox<gpuvm::GpuVa<LockedVm>>>;
 
 /// A context that is passed throughout the map/unmap/remap steps.
-pub(in crate::mmu) struct StepContext {
+pub(crate) struct StepContext {
     /// The Vm <=> BO connection,
     pub(super) vm_bo: Option<ARef<gpuvm::GpuVmBo<LockedVm>>>,
 
@@ -79,7 +79,7 @@ unsafe impl pin_init::Zeroable for GpuVa {}
 impl DriverGpuVa for GpuVa {}
 
 /// A state that can only be accessed when the GPUVM is locked.
-pub(in crate::mmu) struct LockedVm {
+pub(crate) struct LockedVm {
     /// The page table for this VM.
     pub(in crate::mmu) page_table: ARM64LPAES1<Mmu>,
     /// The allocator keeping track of what ranges are in use for the kernel VA
@@ -387,7 +387,7 @@ impl gpuvm::DriverGpuVm for LockedVm {
 
 /// Data associated with a VM <=> BO pairing
 #[pin_data]
-pub(in crate::mmu) struct VmBo {}
+pub(crate) struct VmBo {}
 
 impl gpuvm::DriverGpuVmBo for VmBo {
     fn new() -> impl PinInit<Self> {

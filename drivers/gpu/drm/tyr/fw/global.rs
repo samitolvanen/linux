@@ -207,7 +207,7 @@ impl GlobalInterfaceState {
     }
 }
 
-struct EnabledGlobalInterface {
+pub(crate) struct EnabledGlobalInterface {
     control_area: SharedSectionRange,
     input_area: SharedSectionRange,
     output_area: SharedSectionRange,
