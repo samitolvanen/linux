@@ -400,91 +400,24 @@ impl SharedSection {
     }
 }
 
-/// A range into the shared section that is known to be valid.
-///
-/// This can be obtained via a call to [`Firmware::to_kmap_range(mcu_va, size)`].
-///
-/// # Invariants
-///
-/// `self.start..self.end` is a valid range into the shared section. This means
-/// that it can safely be dereferenced by the CPU.
-///
-pub(crate) struct SharedSectionRange {
-    shared_section: Arc<Mutex<KBox<Section>>>,
-    start: usize,
-    end: usize,
-}
-
-impl SharedSectionRange {
-    fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    fn as_mut_ptr(&self) -> Result<*mut core::ffi::c_void> {
-        let mut shared_section = self.shared_section.lock();
-        let vmap = shared_section.mem.vmap()?;
-        let vmap = vmap.as_mut_ptr();
-
-        // SAFETY: safe by the type invariant.
-        let offset = unsafe { vmap.add(self.start) };
-
-        Ok(offset)
-    }
-
-    fn read<T>(&self) -> Result<T> {
-        if core::mem::size_of::<T>() > self.len() {
-            return Err(EINVAL);
-        }
-
-        let ptr = self.as_mut_ptr()?;
-
-        // SAFETY: we know that this pointer is aligned and valid for reads for
-        // at least size_of::<Self>() bytes.
-        Ok(unsafe { core::ptr::read_volatile(ptr as *const T) })
-    }
-
-    fn write<T>(&self, value: T) -> Result {
-        if core::mem::size_of::<T>() > self.len() {
-            return Err(EINVAL);
-        }
-
-        let ptr = self.as_mut_ptr()?;
-
-        // SAFETY: we know that this pointer is aligned and valid for writes for
-        // at least size_of::<Self>() bytes.
-        unsafe {
-            core::ptr::write_volatile(ptr as *mut T, value);
-        }
-
-        Ok(())
-    }
-}
-
 /// An offset into the shared section that is known to point to the request field.
 ///
 /// It is more convenient to use this type than reading or writing the memory
 /// areas directly since it implements the XOR logic to handle the communication
 /// of requests and acknowledgements.
 pub(crate) struct RequestField {
-    req: SharedSectionRange,
-    ack: SharedSectionRange,
+    shared_section: Arc<SharedSection>,
+    req_va: u64,
+    ack_va: u64,
 }
 
 impl RequestField {
-    fn new(shared_section: &SharedSectionRange, req_offset: usize, ack_offset: usize) -> Self {
-        let req = SharedSectionRange {
-            shared_section: shared_section.shared_section.clone(),
-            start: shared_section.start + req_offset,
-            end: shared_section.start + req_offset + core::mem::size_of::<u32>(),
-        };
-
-        let ack = SharedSectionRange {
-            shared_section: shared_section.shared_section.clone(),
-            start: shared_section.start + ack_offset,
-            end: shared_section.start + ack_offset + core::mem::size_of::<u32>(),
-        };
-
-        Self { req, ack }
+    fn new(shared_section: Arc<SharedSection>, req_va: u64, ack_va: u64) -> Self {
+        Self {
+            shared_section,
+            req_va,
+            ack_va,
+        }
     }
 
     /// Toggle acknowledge bits to send an event to the FW
@@ -498,11 +431,12 @@ impl RequestField {
     /// ack register managed by the FW. Toggling a specific bit will flag an event. In order
     /// for events to be re-evaluated, the interface doorbell needs to be rung.
     pub(crate) fn toggle_reqs(&self, reqs: u32) -> Result {
-        let cur_req_val = self.req.read::<u32>()?;
-        let ack_val = self.ack.read::<u32>()?;
+        let req = self.shared_section.borrow_mut::<u32>(self.req_va)?;
+        let cur_req_val = req.read::<u32>()?;
+        let ack_val = self.shared_section.read_once::<u32>(self.ack_va)?;
         let new_val = ((ack_val ^ reqs) & reqs) | (cur_req_val & !reqs);
 
-        self.req.write::<u32>(new_val)
+        req.write(new_val)
     }
 
     /// Update bits to reflect a configuration change.
@@ -511,10 +445,11 @@ impl RequestField {
     /// and need to be set to 0 or 1. This function bypasses the toggle logic and
     /// directly sets the bits in the req register.
     pub(crate) fn update_reqs(&self, val: u32, reqs: u32) -> Result {
-        let cur_req_val = self.req.read::<u32>()?;
+        let req = self.shared_section.borrow_mut::<u32>(self.req_va)?;
+        let cur_req_val = req.read::<u32>()?;
         let new_val = (cur_req_val & !reqs) | (val & reqs);
 
-        self.req.write::<u32>(new_val)
+        req.write(new_val)
     }
 
     /// Returns whether any requests are pending for `reqs`.
@@ -522,8 +457,8 @@ impl RequestField {
     /// Requests are pending when the value of the given bit in the req differs
     /// from the one in ack.
     pub(crate) fn pending_reqs(&self, reqs: u32) -> Result<bool> {
-        let cur_req_val = self.req.read::<u32>()? & reqs;
-        let cur_ack_val = self.ack.read::<u32>()? & reqs;
+        let cur_req_val = self.shared_section.read_once::<u32>(self.req_va)? & reqs;
+        let cur_ack_val = self.shared_section.read_once::<u32>(self.ack_va)? & reqs;
 
         Ok((cur_req_val ^ cur_ack_val) != 0)
     }
@@ -650,66 +585,6 @@ impl Firmware {
         f(&mut global_iface)
     }
 }
-
-macro_rules! impl_shared_section_read {
-    ($type:ty) => {
-        impl $type {
-            /// Reads the control interface from the given pointer.
-            ///
-            /// Note that the area pointed to by `ptr` is shared with the MCU, so we
-            /// cannot simply parse it or cast it to &Self.
-            ///
-            /// Merely taking a reference to it would be UB, as the MCU can change the
-            /// underlying memory at any time, as it is a core running its own code.
-            pub(super) fn read(range: &SharedSectionRange) -> Result<Self> {
-                // Make sure all writes took place before we read the memory.
-                kernel::sync::barrier::smp_mb();
-
-                let ptr = range.as_mut_ptr()?;
-                // SAFETY: we know that this pointer is aligned and valid for reads for
-                // at least size_of::<Self>() bytes.
-                Ok(unsafe { core::ptr::read_volatile(ptr as *const Self) })
-            }
-        }
-    };
-}
-pub(crate) use impl_shared_section_read;
-
-macro_rules! impl_shared_section_write {
-    ($type:ty) => {
-        impl $type {
-            /// Writes the control interface to the given pointer.
-            ///
-            /// Note that the area pointed to by `ptr` is shared with the MCU, so we
-            /// cannot simply parse it or cast it to &mut Self.
-            ///
-            /// Merely taking a reference to it would be UB, as the MCU can change the
-            /// underlying memory at any time, as it is a core running its own code.
-            pub(super) fn write(self, range: &mut SharedSectionRange) -> Result<()> {
-                // Make sure all writes took place before we update the memory.
-                kernel::sync::barrier::smp_mb();
-
-                let ptr = range.as_mut_ptr()?;
-                // SAFETY: we know that this pointer is aligned and valid for writes for
-                // at least size_of::<Self>() bytes.
-                unsafe {
-                    core::ptr::write_volatile(ptr as *mut Self, self);
-                }
-
-                Ok(())
-            }
-        }
-    };
-}
-pub(crate) use impl_shared_section_write;
-
-macro_rules! impl_shared_section_rw {
-    ($type:ty) => {
-        crate::fw::impl_shared_section_read!($type);
-        crate::fw::impl_shared_section_write!($type);
-    };
-}
-pub(crate) use impl_shared_section_rw;
 
 /// Standardizes the interface to the shared section entries.
 ///

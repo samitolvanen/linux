@@ -12,10 +12,8 @@ use kernel::impl_has_delayed_work;
 use kernel::io;
 use kernel::io::mem::IoMem;
 use kernel::kvec;
-use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::Arc;
-use kernel::sync::Mutex;
 use kernel::time;
 #[allow(unused)]
 use kernel::workqueue;
@@ -23,8 +21,6 @@ use kernel::workqueue::WorkItem;
 
 use crate::driver::TyrData;
 use crate::driver::TyrDevice;
-use crate::fw::impl_shared_section_read;
-use crate::fw::impl_shared_section_rw;
 use crate::fw::RequestField;
 use crate::fw::SharedSectionEntry;
 use crate::gpu::GpuInfo;
@@ -32,7 +28,7 @@ use crate::regs::Doorbell;
 use crate::regs::CSF_GLB_DOORBELL_ID;
 use crate::wait::Wait;
 
-use super::{Section, SharedSectionRange};
+use super::{Section, SharedSection};
 
 pub(crate) mod cs;
 pub(crate) mod csg;
@@ -113,6 +109,7 @@ impl From<TimeoutCycles> for u32 {
 
 /// The global control interface.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub(crate) struct Control {
     pub(crate) version: u32,
     pub(crate) features: u32,
@@ -142,7 +139,7 @@ impl Control {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 /// The input area for the global interface
 pub(crate) struct Input {
     pub(crate) req: u32,
@@ -170,7 +167,7 @@ pub(crate) struct Input {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 /// The output area for the global interface
 pub(crate) struct Output {
     pub(crate) ack: u32,
@@ -181,10 +178,6 @@ pub(crate) struct Output {
     pub(crate) perfcnt_status: u32,
     pub(crate) perfcnt_insert: u32,
 }
-
-impl_shared_section_rw!(Control);
-impl_shared_section_rw!(Input);
-impl_shared_section_read!(Output);
 
 pub(crate) enum GlobalInterfaceState {
     Disabled,
@@ -207,11 +200,10 @@ impl GlobalInterfaceState {
     }
 }
 
-struct EnabledGlobalInterface {
-    control_area: SharedSectionRange,
-    input_area: SharedSectionRange,
-    output_area: SharedSectionRange,
-
+pub(crate) struct EnabledGlobalInterface {
+    control_va: u64,
+    input_va: u64,
+    output_va: u64,
     csgs: KVec<CommandStreamGroup>,
 }
 
@@ -221,7 +213,7 @@ pub(crate) struct GlobalInterface {
 
     iomem: Arc<Devres<IoMem>>,
 
-    shared_section: Arc<Mutex<KBox<Section>>>,
+    shared_section: Arc<SharedSection>,
 
     event_wait: Arc<Wait>,
 
@@ -235,7 +227,7 @@ impl GlobalInterface {
         iomem: Arc<Devres<IoMem>>,
         req_wait: Arc<Wait>,
     ) -> Result<Self> {
-        let shared_section = Arc::pin_init(new_mutex!(shared_section), GFP_KERNEL)?;
+        let shared_section = Arc::pin_init(SharedSection::new(shared_section)?, GFP_KERNEL)?;
 
         Ok(Self {
             state: GlobalInterfaceState::Disabled,
@@ -255,32 +247,26 @@ impl GlobalInterface {
         // This takes a mutex internally in clk_prepare().
         let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
 
-        let control_area = SharedSectionRange {
-            shared_section: self.shared_section.clone(),
-            start: 0,
-            end: core::mem::size_of::<Control>(),
+        let control_va = u64::from(self.shared_section.section.va.start);
+        let control = {
+            let control_area = self.shared_section.borrow::<Control>(control_va)?;
+
+            let op = || control_area.read();
+            let cond = |control: &Control| -> bool { control.version != 0 };
+            let _ = io::poll::read_poll_timeout(
+                op,
+                cond,
+                time::Delta::from_millis(0),
+                time::Delta::from_millis(200),
+            );
+
+            control_area.read::<Control>()?
         };
 
-        let op = || Control::read(&control_area);
-        let cond = |control: &Control| -> bool { control.version != 0 };
-        let _ = io::poll::read_poll_timeout(
-            op,
-            cond,
-            time::Delta::from_millis(0),
-            time::Delta::from_millis(200),
-        );
-
-        let control = Control::read(&control_area)?;
         if control.version == 0 {
             pr_err!("MCU firmware version is 0. Firmware may have failed to boot\n");
             return Err(EINVAL);
         }
-
-        let mut input_area =
-            self.shared_range(control.input_va.into(), core::mem::size_of::<Input>())?;
-
-        let output_area =
-            self.shared_range(control.output_va.into(), core::mem::size_of::<Output>())?;
 
         /// The start of the CSG control area for the first CSG.
         const CSF_GROUP_CONTROL_OFFSET: u32 = 0x1000;
@@ -289,7 +275,8 @@ impl GlobalInterface {
         for csg_idx in 0..control.group_num {
             let iface_offset = CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
 
-            let csg = CommandStreamGroup::init(self, iface_offset, csg_idx as usize)?;
+            let csg =
+                CommandStreamGroup::init(&self.shared_section, iface_offset, csg_idx as usize)?;
 
             if let Some(first) = csgs.first() {
                 if !first.is_identical(&csg)? {
@@ -310,7 +297,10 @@ impl GlobalInterface {
             control.instr_features
         );
 
-        let mut input = Input::read(&input_area)?;
+        let input_va = u64::from(control.input_va);
+        let input_area = self.shared_section.borrow_mut::<Input>(input_va)?;
+
+        let mut input = input_area.read::<Input>()?;
 
         // Enable all shader cores.
         input.core_en_mask = gpu_info.shader_present as u32;
@@ -328,12 +318,15 @@ impl GlobalInterface {
             | GLB_IDLE_EN
             | GLB_IDLE;
 
-        input.write(&mut input_area)?;
+        input_area.write(input)?;
+        drop(input_area);
+
+        let output_va = u64::from(control.output_va);
 
         let req = RequestField::new(
-            &input_area,
-            core::mem::offset_of!(Input, req),
-            core::mem::offset_of!(Output, ack),
+            self.shared_section.clone(),
+            input_va + core::mem::offset_of!(Input, req) as u64,
+            output_va + core::mem::offset_of!(Output, ack) as u64,
         );
         req.update_reqs(GLB_IDLE_EN, GLB_IDLE_EN)?;
 
@@ -343,9 +336,9 @@ impl GlobalInterface {
         self.ring_glb_doorbell()?;
 
         let enabled = EnabledGlobalInterface {
-            control_area,
-            input_area,
-            output_area,
+            control_va,
+            input_va,
+            output_va,
             csgs,
         };
 
@@ -384,18 +377,12 @@ impl GlobalInterface {
     }
 
     pub(crate) fn ping(&mut self) -> Result {
-        let glb_iface = match self.state {
-            GlobalInterfaceState::Enabled(ref enabled) => enabled,
-            GlobalInterfaceState::Disabled => {
-                pr_err!("Trying to ping CSF but the global interface is down\n");
-                return Ok(());
-            }
-        };
+        let glb_iface = self.state.enabled()?;
 
         let req = RequestField::new(
-            &glb_iface.input_area,
-            core::mem::offset_of!(Input, req),
-            core::mem::offset_of!(Output, ack),
+            self.shared_section.clone(),
+            glb_iface.input_va + core::mem::offset_of!(Input, req) as u64,
+            glb_iface.output_va + core::mem::offset_of!(Output, ack) as u64,
         );
 
         req.toggle_reqs(GLB_PING)?;
@@ -408,26 +395,6 @@ impl GlobalInterface {
         }
 
         Ok(())
-    }
-
-    /// Computes a range into the shared section for a given VA in the shared
-    /// area.
-    ///
-    /// The result is an offset that can be safely dereferenced by the CPU.
-    pub(super) fn shared_range(&mut self, mcu_va: u64, size: usize) -> Result<SharedSectionRange> {
-        let shared_mem_start = u64::from(self.shared_section.lock().va.start);
-        let shared_mem_end = u64::from(self.shared_section.lock().va.end);
-
-        if mcu_va < shared_mem_start || mcu_va >= shared_mem_end {
-            Err(EINVAL)
-        } else {
-            let offset = (mcu_va - shared_mem_start) as usize;
-            Ok(SharedSectionRange {
-                shared_section: self.shared_section.clone(),
-                start: offset,
-                end: offset + size,
-            })
-        }
     }
 
     /// Set the CSG state.
@@ -445,11 +412,6 @@ impl GlobalInterface {
         self.ring_glb_doorbell()?;
 
         Ok(())
-    }
-
-    fn shared_section_size(&self) -> usize {
-        let shared_section = self.shared_section.lock();
-        shared_section.mem.size()
     }
 
     pub(crate) fn wait_csg_acks(&self, csg_idx: usize, mask: u32, timeout_ms: u32) -> Result {
@@ -502,46 +464,44 @@ impl SharedSectionEntry for GlobalInterface {
 
     fn read_control(&self) -> Result<Self::Control> {
         let glb = self.state.enabled()?;
-        Control::read(&glb.control_area)
+        self.shared_section.read_once(glb.control_va)
     }
 
     fn write_control(&mut self, control: Self::Control) -> Result {
         let glb = self.state.enabled_mut()?;
-        control.write(&mut glb.control_area)
+        self.shared_section.write_once(glb.control_va, control)
     }
 
     fn read_input(&self) -> Result<Self::Input> {
         let glb = self.state.enabled()?;
-        Input::read(&glb.input_area)
+        self.shared_section.read_once(glb.input_va)
     }
 
     fn write_input(&mut self, input: Self::Input) -> Result {
         let glb = self.state.enabled_mut()?;
-        input.write(&mut glb.input_area)
+        self.shared_section.write_once(glb.input_va, input)
     }
 
     fn read_output(&self) -> Result<Self::Output> {
         let glb = self.state.enabled()?;
-        Output::read(&glb.output_area)
+        self.shared_section.read_once(glb.output_va)
     }
 
     fn input_request(&self) -> Result<RequestField> {
         let glb = self.state.enabled()?;
-
         Ok(RequestField::new(
-            &glb.input_area,
-            core::mem::offset_of!(Input, req),
-            core::mem::offset_of!(Output, ack),
+            self.shared_section.clone(),
+            glb.input_va + core::mem::offset_of!(Input, req) as u64,
+            glb.output_va + core::mem::offset_of!(Output, ack) as u64,
         ))
     }
 
     fn doorbell_request(&self) -> Result<RequestField> {
         let glb = self.state.enabled()?;
-
         Ok(RequestField::new(
-            &glb.input_area,
-            core::mem::offset_of!(Input, doorbell_req),
-            core::mem::offset_of!(Output, doorbell_ack),
+            self.shared_section.clone(),
+            glb.input_va + core::mem::offset_of!(Input, doorbell_req) as u64,
+            glb.output_va + core::mem::offset_of!(Output, doorbell_ack) as u64,
         ))
     }
 }

@@ -10,13 +10,11 @@ use kernel::bits::bit_u32;
 use kernel::bits::genmask_u32;
 use kernel::c_str;
 use kernel::prelude::*;
+use kernel::sync::Arc;
 
-use crate::fw::global::GlobalInterface;
-use crate::fw::impl_shared_section_read;
-use crate::fw::impl_shared_section_rw;
+use crate::fw::global::SharedSection;
 use crate::fw::RequestField;
 use crate::fw::SharedSectionEntry;
-use crate::fw::SharedSectionRange;
 use constants::*;
 
 /// Number of CS registers reserved by the kernel driver to call a userspace command stream.
@@ -150,48 +148,41 @@ pub(crate) mod constants {
 pub(crate) struct CommandStream {
     cs_id: usize,
     csg_id: usize,
-
-    control_area: SharedSectionRange,
-    input_area: SharedSectionRange,
-    output_area: SharedSectionRange,
-
+    shared_section: Arc<SharedSection>,
+    control_va: u64,
+    input_va: u64,
+    output_va: u64,
     state: StreamState,
 }
 
 impl CommandStream {
     pub(crate) fn init(
-        glb_iface: &mut GlobalInterface,
+        shared_section: &Arc<SharedSection>,
         iface_offset: u32,
         csg_id: usize,
         cs_id: usize,
     ) -> Result<Self> {
-        if iface_offset as usize + core::mem::size_of::<Self>()
-            >= glb_iface.shared_section.lock().mem.size()
+        let base_va = u64::from(shared_section.section.va.start);
+        if iface_offset as usize + core::mem::size_of::<Control>()
+            >= shared_section.section.mem.size()
         {
             pr_err!("CSG interface would overrun the shared section");
             return Err(EINVAL);
         }
 
-        let control_area = SharedSectionRange {
-            shared_section: glb_iface.shared_section.clone(),
-            start: iface_offset as usize,
-            end: core::mem::size_of::<Control>(),
-        };
+        let control_va = base_va + u64::from(iface_offset);
+        let control = shared_section.read_once::<Control>(control_va)?;
 
-        let control = Control::read(&control_area)?;
-
-        let input_area =
-            glb_iface.shared_range(control.input_va.into(), core::mem::size_of::<Input>())?;
-
-        let output_area =
-            glb_iface.shared_range(control.output_va.into(), core::mem::size_of::<Output>())?;
+        let input_va = u64::from(control.input_va);
+        let output_va = u64::from(control.output_va);
 
         Ok(CommandStream {
             cs_id,
             csg_id,
-            control_area,
-            input_area,
-            output_area,
+            shared_section: shared_section.clone(),
+            control_va,
+            input_va,
+            output_va,
             state: StreamState::Stop,
         })
     }
@@ -256,35 +247,36 @@ impl SharedSectionEntry for CommandStream {
     type Output = Output;
 
     fn read_control(&self) -> Result<Self::Control> {
-        Control::read(&self.control_area)
+        self.shared_section.read_once(self.control_va)
     }
 
     fn write_control(&mut self, control: Self::Control) -> Result {
-        control.write(&mut self.control_area)
+        self.shared_section.write_once(self.control_va, control)
     }
 
     fn read_input(&self) -> Result<Self::Input> {
-        Input::read(&self.input_area)
+        self.shared_section.read_once(self.input_va)
     }
 
     fn write_input(&mut self, input: Self::Input) -> Result {
-        input.write(&mut self.input_area)
+        self.shared_section.write_once(self.input_va, input)
     }
 
     fn read_output(&self) -> Result<Self::Output> {
-        Output::read(&self.output_area)
+        self.shared_section.read_once(self.output_va)
     }
 
     fn input_request(&self) -> Result<RequestField> {
         Ok(RequestField::new(
-            &self.input_area,
-            core::mem::offset_of!(Input, req),
-            core::mem::offset_of!(Output, ack),
+            self.shared_section.clone(),
+            self.input_va + core::mem::offset_of!(Input, req) as u64,
+            self.output_va + core::mem::offset_of!(Output, ack) as u64,
         ))
     }
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub(crate) struct Control {
     pub(crate) features: u32,
     pub(crate) input_va: u32,
@@ -319,6 +311,7 @@ impl Control {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub(crate) struct Input {
     pub(crate) req: u32,
     pub(crate) config: u32,
@@ -360,6 +353,7 @@ impl Input {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub(crate) struct Output {
     pub(crate) ack: u32,
     pub(crate) reserved1: [u32; 15],
@@ -497,10 +491,6 @@ pub(crate) enum BlockedReason {
     /// Waiting on the completion of a synchronous FLUSH_CACHE2 instruction.
     Flush = 7,
 }
-
-impl_shared_section_rw!(Control);
-impl_shared_section_rw!(Input);
-impl_shared_section_read!(Output);
 
 /// The input interface for the ring buffer.
 ///
