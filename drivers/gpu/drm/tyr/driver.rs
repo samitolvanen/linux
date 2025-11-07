@@ -374,7 +374,7 @@ const INFO: drm::DriverInfo = drm::DriverInfo {
 
 #[vtable]
 impl drm::Driver for TyrDriver {
-    type Data = TyrData;
+    type Data = Arc<TyrData>;
     type File = File;
     type Object = drm::gem::shmem::Object<TyrObject>;
 
