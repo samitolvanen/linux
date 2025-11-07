@@ -74,7 +74,7 @@ impl Scheduler {
         // let doorbell = csg.doorbell_request()?;
         // doorbell.toggle_reqs(1 << cs_id)?;
 
-        Ok(())
+        // Ok(())
     }
 
     pub(crate) fn process_events(&mut self, data: Arc<TyrData>) -> Result {

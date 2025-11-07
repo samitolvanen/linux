@@ -29,7 +29,7 @@ pub(crate) enum SyncHandle {
 
 impl SyncHandle {
     /// Get the handle for this sync operation
-    pub fn handle(&self) -> u32 {
+    pub(crate) fn handle(&self) -> u32 {
         match self {
             SyncHandle::Binary { handle } => *handle,
             SyncHandle::Timeline { handle, .. } => *handle,
@@ -37,7 +37,7 @@ impl SyncHandle {
     }
 
     /// Get the timeline value, or 0 for binary syncobjs
-    pub fn timeline_value(&self) -> u64 {
+    pub(crate) fn timeline_value(&self) -> u64 {
         match self {
             SyncHandle::Binary { .. } => 0,
             SyncHandle::Timeline { timeline_value, .. } => *timeline_value,
