@@ -110,6 +110,11 @@ impl File {
                     devquery.size = core::mem::size_of::<uapi::drm_panthor_timestamp_info>() as u32;
                     Ok(0)
                 }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GROUP_PRIORITIES_INFO => {
+                    devquery.size =
+                        core::mem::size_of::<uapi::drm_panthor_group_priorities_info>() as u32;
+                    Ok(0)
+                }
                 _ => Err(EINVAL),
             }
         } else {
@@ -149,6 +154,24 @@ impl File {
                     let mut writer = UserSlice::new(
                         UserPtr::from_addr(devquery.pointer as usize),
                         devquery.size as usize,
+                    )
+                    .writer();
+
+                    writer.write(&data)?;
+
+                    Ok(0)
+                }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GROUP_PRIORITIES_INFO => {
+                    // Return group priorities info - allow LOW and MEDIUM
+                    // PANTHOR_GROUP_PRIORITY_HIGH requires CAP_SYS_NICE or DRM_MASTER
+                    // PANTHOR_GROUP_PRIORITY_REALTIME is EINVAL
+                    let mask = (1 << uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_LOW)
+                        | (1 << uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_MEDIUM);
+                    let data: [u8; 4] = [mask as u8, 0, 0, 0];
+
+                    let mut writer = UserSlice::new(
+                        UserPtr::from_addr(devquery.pointer as usize),
+                        devquery.size.min(core::mem::size_of::<[u8; 4]>() as u32) as usize,
                     )
                     .writer();
 
