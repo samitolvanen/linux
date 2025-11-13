@@ -7,7 +7,6 @@ use kernel::device::Device;
 use kernel::devres::Devres;
 use kernel::platform;
 use kernel::prelude::*;
-use kernel::sync::Mutex;
 use kernel::time;
 use kernel::transmute::AsBytes;
 

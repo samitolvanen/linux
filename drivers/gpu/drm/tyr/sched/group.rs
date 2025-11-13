@@ -2,10 +2,9 @@
 
 use core::sync::atomic::AtomicUsize;
 
-use kernel::bits::{genmask_checked_u32, genmask_u32};
+use kernel::bits::genmask_checked_u32;
 use kernel::dma_fence::UserFence;
 use kernel::drm::gem::BaseObject;
-use kernel::drm::syncobj::SyncObj;
 use kernel::kvec;
 use kernel::new_mutex;
 use kernel::prelude::*;
@@ -23,12 +22,9 @@ use crate::fw::global::csg::Priority;
 use crate::fw::SharedSectionEntry;
 use crate::gem;
 use crate::mmu::vm::map_flags;
-use crate::mmu::vm::PreparedVm;
 use crate::mmu::vm::Vm;
-use crate::mmu::vm::WithLockedVm;
 use crate::sched::deps;
 use crate::sched::syncs::SyncObj64b;
-use crate::TyrDriver;
 
 use super::job;
 use super::queue::Queue;

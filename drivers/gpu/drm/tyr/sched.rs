@@ -6,7 +6,6 @@ use kernel::bits::genmask_u32;
 use kernel::c_str;
 use kernel::dma_fence::UserFence;
 use kernel::drm::gem::BaseObject;
-use kernel::drm::syncobj::SyncObj;
 use kernel::kvec;
 use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
@@ -30,7 +29,6 @@ use crate::fw::global::csg::MAX_CSGS;
 use crate::fw::SharedSectionEntry;
 use crate::gem;
 use crate::mmu::vm::WithLockedVm;
-use crate::TyrDriver;
 
 pub(crate) mod deps;
 mod events;

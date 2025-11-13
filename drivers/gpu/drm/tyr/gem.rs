@@ -14,7 +14,6 @@ use kernel::drm::gem::shmem;
 use kernel::drm::gem::BaseObject;
 use kernel::prelude::*;
 use kernel::sync::Arc;
-use kernel::sync::Mutex;
 use kernel::types::ARef;
 
 /// GEM Object inner driver data

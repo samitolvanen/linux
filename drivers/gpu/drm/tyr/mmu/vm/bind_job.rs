@@ -4,18 +4,13 @@
 
 use core::ops::Range;
 
-use kernel::c_str;
-use kernel::dma_fence::FenceObject;
-use kernel::dma_fence::FenceOps;
 use kernel::drm::sched::JobImpl;
 use kernel::prelude::*;
-use kernel::str::CStr;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 
 use super::map_flags;
 use super::Vm;
-use crate::gem;
 
 /// VM operation types for asynchronous VM bind.
 pub(crate) enum VmOperation {

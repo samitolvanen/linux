@@ -4,7 +4,6 @@ use core::ops::Range;
 
 use kernel::c_str;
 use kernel::devres::Devres;
-use kernel::dma_fence::FenceChain;
 use kernel::dma_fence::FenceContexts;
 use kernel::dma_fence::UserFence;
 use kernel::drm::gem::BaseObject;
@@ -27,9 +26,7 @@ use crate::mmu::vm::map_flags;
 use crate::mmu::vm::Vm;
 use crate::regs::Doorbell;
 use crate::sched::job::Job;
-use crate::TyrDriver;
 
-use super::group::Group;
 use super::job;
 
 const JOB_TIMEOUT_MS: usize = 5000;

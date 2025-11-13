@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use kernel::bits::genmask_u32;
 use kernel::bits::genmask_u64;
 use kernel::c_str;
 use kernel::dma_fence;
 use kernel::dma_fence::FenceObject;
 use kernel::dma_fence::FenceOps;
-use kernel::dma_fence::RawDmaFence;
 use kernel::drm::sched::JobImpl;
 use kernel::kvec;
 use kernel::prelude::*;

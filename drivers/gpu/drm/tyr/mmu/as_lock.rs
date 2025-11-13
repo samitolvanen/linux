@@ -4,7 +4,7 @@
 
 use core::ops::Range;
 
-use kernel::bits::{genmask_checked_u64, genmask_u64};
+use kernel::bits::genmask_checked_u64;
 use kernel::devres::Devres;
 use kernel::prelude::*;
 

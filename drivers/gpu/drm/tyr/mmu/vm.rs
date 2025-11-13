@@ -30,7 +30,6 @@ use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::ExecToken;
 use kernel::drm::sched::Entity;
-use kernel::drm::sched::Scheduler;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
 use kernel::platform;
@@ -38,7 +37,6 @@ use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
-use kernel::time::Delta;
 use kernel::types::ARef;
 
 use crate::driver::IoMem;
@@ -47,7 +45,6 @@ use crate::gem;
 use crate::gem::KernelVaPlacement;
 use crate::gem::TyrObject;
 use crate::gpu::GpuInfo;
-use crate::heap;
 use crate::mmu::Mmu;
 use crate::regs;
 
@@ -57,7 +54,7 @@ pub(crate) mod map_flags;
 pub(crate) mod pool;
 
 mod range;
-pub(crate) use self::range::{LiveRange, RangeAlloc};
+pub(crate) use self::range::LiveRange;
 
 pub(crate) use bind_job::{VmBindJob, VmOperation};
 

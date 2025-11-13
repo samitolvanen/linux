@@ -7,7 +7,7 @@
 
 use core::ops::Deref;
 
-use kernel::dma_fence::{FenceOps, RawDmaFence};
+use kernel::dma_fence::RawDmaFence;
 use kernel::impl_has_work;
 use kernel::prelude::*;
 use kernel::sync::Arc;

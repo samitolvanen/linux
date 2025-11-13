@@ -51,8 +51,6 @@ macro_rules! new_wait {
     }};
 }
 
-pub(crate) use new_wait;
-
 #[pin_data]
 /// A convenience type to wait for GPU responses.
 pub(crate) struct Wait<T = ()> {
