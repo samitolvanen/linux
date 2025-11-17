@@ -83,7 +83,7 @@ unsafe extern "C" fn vm_fault_handler(vmf: *mut bindings::vm_fault) -> bindings:
     let phys_addr = tdev.mmio_phys_addr + CSF_GPU_LATEST_FLUSH_ID as u64;
     let pfn = (phys_addr >> PAGE_SHIFT) as usize;
 
-    let pgprot = unsafe { (*vma).vm_page_prot };
+    let pgprot = unsafe { bindings::pgprot_noncached((*vma).vm_page_prot) };
 
     let ret = unsafe { bindings::vmf_insert_pfn_prot(vma, address, pfn, pgprot) };
 
