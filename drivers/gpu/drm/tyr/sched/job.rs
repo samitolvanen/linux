@@ -62,11 +62,6 @@ impl Job {
             return Err(EINVAL);
         }
 
-        if qsubmit.latest_flush & genmask_u32(24..=30) != 0 {
-            pr_err!("job_create: latest_flust[30:24] must be zero\n");
-            return Err(EINVAL);
-        }
-
         Ok(Job {
             group: group.clone(),
             queue_idx: qsubmit.queue_index as usize,
