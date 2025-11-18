@@ -69,6 +69,7 @@ impl JobImpl for VmBindJob {
     }
 
     fn timed_out(_job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
+        pr_info!("Async VM bind job timed out\n");
         kernel::drm::sched::Status::NoDevice
     }
 }
