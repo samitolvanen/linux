@@ -193,9 +193,6 @@ impl JobImpl for Job {
     fn timed_out(job: &mut kernel::drm::sched::Job<Self>) -> kernel::drm::sched::Status {
         pr_err!("Job timed out\n");
 
-        job.done_fence.set_error(ETIMEDOUT);
-        let _ = job.done_fence.signal();
-
         kernel::drm::sched::Status::NoDevice
     }
 }
