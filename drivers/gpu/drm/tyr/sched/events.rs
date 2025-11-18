@@ -268,9 +268,6 @@ impl Scheduler {
                 // because we cannot sleep in the signalling path.
                 let mut res = Ok(());
                 queue.in_flight_jobs.retain(|fence| {
-                    if res.is_err() {
-                        return true;
-                    }
                     if sync_obj.seqno < fence.seqno() {
                         return true;
                     }
