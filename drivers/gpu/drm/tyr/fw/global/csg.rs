@@ -279,7 +279,7 @@ impl Input {
         compute: u32,
         fragment: u32,
         tiler: u32,
-        priority: Priority,
+        priority: usize,
     ) {
         self.csg_ep_req = constants::csg_ep_req_compute(compute)
             | constants::csg_ep_req_fragment(fragment)

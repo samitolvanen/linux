@@ -361,7 +361,7 @@ impl Scheduler {
             group.max_compute_cores.into(),
             group.max_fragment_cores.into(),
             group.max_tiler_cores.into(),
-            priority,
+            csg_idx,
         );
 
         input.csg_config = as_nr;
