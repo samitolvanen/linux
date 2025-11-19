@@ -166,9 +166,7 @@ impl Scheduler {
 
             self.unsynced_groups.push(group, GFP_KERNEL)?;
 
-            if self.wq.enqueue::<_, 3>(data.clone()).is_err() {
-                pr_err!("Failed to enqueue the group update work\n");
-            }
+            let _ = self.wq.enqueue::<_, 3>(data.clone());
         }
 
         glb.ring_csg_doorbell(csg_id as usize)
@@ -245,9 +243,7 @@ impl Scheduler {
         let old_events = self.events.unwrap_or_default();
         self.events = Some(events | old_events);
 
-        if self.wq.enqueue::<_, 2>(tdev.deref().clone()).is_err() {
-            pr_err!("Failed to enqueue firmware events work\n");
-        }
+        let _ = self.wq.enqueue::<_, 2>(tdev.deref().clone());
     }
 
     fn update_group(&mut self, group: Arc<Group>, data: &Arc<TyrData>) -> Result {
@@ -317,9 +313,7 @@ impl Scheduler {
         if let None = &self.resched_target {
             self.resched_target = Some(kernel::time::Instant::now());
             let arc: Arc<TyrData> = data.clone();
-            if self.wq.enqueue::<_, 1>(arc).is_err() {
-                pr_err!("Failed to enqueue tick work\n");
-            }
+            let _ = self.wq.enqueue::<_, 1>(arc);
         }
         Ok(())
     }
