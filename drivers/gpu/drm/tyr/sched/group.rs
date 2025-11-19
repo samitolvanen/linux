@@ -152,11 +152,11 @@ impl Group {
             return Err(EINVAL);
         }
 
-        if group_args.compute_core_mask.count_ones() > group_args.max_compute_cores as u32
-            || group_args.fragment_core_mask.count_ones() > group_args.max_fragment_cores as u32
-            || group_args.tiler_core_mask.count_ones() > group_args.max_tiler_cores as u32
+        if group_args.compute_core_mask.count_ones() < group_args.max_compute_cores as u32
+            || group_args.fragment_core_mask.count_ones() < group_args.max_fragment_cores as u32
+            || group_args.tiler_core_mask.count_ones() < group_args.max_tiler_cores as u32
         {
-            pr_err!("group_create: asking for more cores than the maximum allowed for the group");
+            pr_err!("group_create: core mask must have at least max_cores bits set");
             return Err(EINVAL);
         }
 
