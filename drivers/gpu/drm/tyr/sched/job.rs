@@ -27,6 +27,8 @@ pub(crate) struct Job {
     /// Size of the userspace command stream.
     stream_size: u32,
 
+    latest_flush: u32,
+
     /// The position of the job in the ringbuffer, if any.
     ringbuf_pos: Option<RingBufferPosition>,
 
@@ -67,6 +69,7 @@ impl Job {
             queue_idx: qsubmit.queue_index as usize,
             stream_addr: qsubmit.stream_addr,
             stream_size: qsubmit.stream_size,
+            latest_flush: qsubmit.latest_flush,
             ringbuf_pos: None,
             done_fence,
             sync_addr,
@@ -91,7 +94,7 @@ impl JobImpl for Job {
 
         let opcode = 2; // MOV32
         let latest_flush_regnum = val_reg;
-        let latest_flush = 0;
+        let latest_flush: u64 = job.latest_flush.into();
         let mov_latest_flush: u64 = opcode << 56 | latest_flush_regnum << 48 | latest_flush;
 
         let opcode = 36; //FLUSH_CACHE2
