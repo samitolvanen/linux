@@ -34,6 +34,38 @@ impl<const OFFSET: usize> Register<OFFSET> {
         (*iomem).access(dev)?.write32(value, OFFSET);
         Ok(())
     }
+
+    /// Read a 64-bit value from two consecutive 32-bit registers (lo + hi)
+    /// This is equivalent to panthor's gpu_read64() - simple lo-hi read without tearing protection
+    #[inline]
+    pub(crate) fn read64(&self, iomem: &Devres<IoMem>) -> Result<u64> {
+        let io = (*iomem).try_access().ok_or(ENODEV)?;
+        let lo = io.try_read32(OFFSET)? as u64;
+        let hi = io.try_read32(OFFSET + 4)? as u64;
+        Ok(lo | (hi << 32))
+    }
+
+    /// Read a 64-bit counter with protection against tearing
+    /// This implements the same logic as gpu_read64_counter in panthor
+    #[inline]
+    pub(crate) fn read64_counter(&self, iomem: &Devres<IoMem>) -> Result<u64> {
+        let io = (*iomem).try_access().ok_or(ENODEV)?;
+
+        let hi1 = io.try_read32(OFFSET + 4)? as u64;
+        let lo = io.try_read32(OFFSET)? as u64;
+        let hi2 = io.try_read32(OFFSET + 4)? as u64;
+
+        // If high word changed, use the second read of both parts
+        let (hi, lo) = if hi1 != hi2 {
+            let lo2 = io.try_read32(OFFSET)? as u64;
+            (hi2, lo2)
+        } else {
+            (hi1, lo)
+        };
+
+        let result = lo | (hi << 32);
+        Ok(result)
+    }
 }
 
 pub(crate) const GPU_ID: Register<0x0> = Register;
@@ -67,6 +99,8 @@ pub(crate) const GPU_IRQ_STAT: Register<0x2c> = Register;
 pub(crate) const GPU_CMD: Register<0x30> = Register;
 pub(crate) const GPU_CMD_SOFT_RESET: u32 = 1 | (1 << 8);
 pub(crate) const GPU_CMD_HARD_RESET: u32 = 1 | (2 << 8);
+pub(crate) const GPU_TIMESTAMP_OFFSET: Register<0x88> = Register;
+pub(crate) const GPU_TIMESTAMP: Register<0x98> = Register;
 pub(crate) const GPU_THREAD_FEATURES: Register<0xac> = Register;
 pub(crate) const GPU_THREAD_MAX_THREADS: Register<0xa0> = Register;
 pub(crate) const GPU_THREAD_MAX_WORKGROUP_SIZE: Register<0xa4> = Register;

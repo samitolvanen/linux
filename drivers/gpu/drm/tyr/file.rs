@@ -106,6 +106,10 @@ impl File {
                     devquery.size = core::mem::size_of::<gpu::CsifInfo>() as u32;
                     Ok(0)
                 }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_TIMESTAMP_INFO => {
+                    devquery.size = core::mem::size_of::<uapi::drm_panthor_timestamp_info>() as u32;
+                    Ok(0)
+                }
                 _ => Err(EINVAL),
             }
         } else {
@@ -130,6 +134,25 @@ impl File {
 
                     let csif = tdev.csif_info.lock();
                     writer.write(&*csif)?;
+
+                    Ok(0)
+                }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_TIMESTAMP_INFO => {
+                    use crate::regs;
+
+                    let timestamp_frequency = 0u64;
+                    let current_timestamp = regs::GPU_TIMESTAMP.read64_counter(&tdev.iomem)?;
+                    let timestamp_offset = regs::GPU_TIMESTAMP_OFFSET.read64(&tdev.iomem)?;
+
+                    let data: [u64; 3] = [timestamp_frequency, current_timestamp, timestamp_offset];
+
+                    let mut writer = UserSlice::new(
+                        UserPtr::from_addr(devquery.pointer as usize),
+                        devquery.size as usize,
+                    )
+                    .writer();
+
+                    writer.write(&data)?;
 
                     Ok(0)
                 }
