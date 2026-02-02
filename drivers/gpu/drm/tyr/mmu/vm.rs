@@ -28,7 +28,6 @@ use kernel::bindings::SZ_2M;
 use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
-use kernel::drm::gpuvm::ExecToken;
 use kernel::drm::sched::Entity;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
@@ -49,6 +48,7 @@ use crate::mmu::Mmu;
 use crate::regs;
 
 pub(crate) mod bind_job;
+pub(crate) mod exec;
 mod gpuvm;
 pub(crate) mod map_flags;
 pub(crate) mod pool;
@@ -292,7 +292,7 @@ impl Vm {
         num_slots: u32,
         f: impl FnOnce(PreparedVm<'_>) -> Result,
     ) -> Result {
-        let exec_token = self.gpuvm.prepare(num_slots)?;
+        let exec_token = exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
         let prepared_vm = PreparedVm {
             exec_token,
             num_slots,
@@ -310,7 +310,7 @@ impl Vm {
         num_slots: u32,
         f: impl FnOnce(PreparedVm<'_>, &mut Entity<VmBindJob>) -> Result<R>,
     ) -> Result<R> {
-        let exec_token = self.gpuvm.prepare(num_slots)?;
+        let exec_token = exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
         let prepared_vm = PreparedVm {
             exec_token,
             num_slots,
@@ -323,7 +323,7 @@ impl Vm {
 /// Indicates that all the reservations are locked for the objects in a given
 /// VM, and that `num_slots` have been reserved for fences.
 pub(crate) struct PreparedVm<'a> {
-    pub(crate) exec_token: ExecToken<'a, LockedVm>,
+    pub(crate) exec_token: exec::ExecToken<'a, LockedVm>,
     #[expect(dead_code)]
     pub(crate) num_slots: u32,
 }

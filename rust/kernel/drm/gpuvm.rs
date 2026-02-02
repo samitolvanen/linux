@@ -735,6 +735,12 @@ impl<T: DriverGpuVm> GpuVm<T> {
         unsafe { *self.gpuvm.get() }.mm_start
     }
 
+    /// Returns the raw pointer to the underlying drm_gpuvm structure.
+    #[inline]
+    pub fn as_raw(&self) -> *mut bindings::drm_gpuvm {
+        self.gpuvm.get()
+    }
+
     /// The length of the address space
     #[inline]
     pub fn va_length(&self) -> u64 {
