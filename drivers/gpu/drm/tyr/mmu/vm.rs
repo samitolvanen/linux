@@ -24,10 +24,14 @@ use core::ops::Range;
 
 use gpuvm::LockedVm;
 use gpuvm::StepContext;
+use gpuvm::TyrVmBoData;
 use kernel::bindings::SZ_2M;
 use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::drm::gem::shmem;
+use kernel::drm::gpuvm::GpuVm;
+use kernel::drm::gpuvm::GpuVmCore;
+use kernel::drm::gpuvm::OpMapRequest;
 use kernel::drm::sched::Entity;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
@@ -65,7 +69,7 @@ pub(crate) struct Vm {
     /// A dummy object to serve as GPUVM's root. We need ownership of this.
     _dummy_obj: ARef<shmem::Object<TyrObject>>,
 
-    pub(super) gpuvm: ARef<kernel::drm::gpuvm::GpuVm<LockedVm>>,
+    pub(super) gpuvm: GpuVmCore<LockedVm>,
 
     /// The AS to which this VM is bound, if any.
     pub(super) address_space: Option<usize>,
@@ -157,7 +161,7 @@ impl Vm {
 
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),
-            gpuvm: kernel::drm::gpuvm::GpuVm::new(
+            gpuvm: GpuVm::new::<Error>(
                 c_str!("Tyr::GpuVm"),
                 tdev,
                 &*(dummy_obj.gem),
@@ -184,10 +188,12 @@ impl Vm {
     /// buffers and other kernel-only data structures.
     pub(crate) fn alloc_kernel_range(&mut self, va: KernelVaPlacement) -> Result<LiveRange> {
         match va {
-            KernelVaPlacement::Auto { size } => unsafe { self.gpuvm.as_inner_mut() }
-                .kernel_mm
-                .allocate(size, GFP_KERNEL),
-            KernelVaPlacement::At(va) => unsafe { self.gpuvm.as_inner_mut() }
+            KernelVaPlacement::Auto { size } => {
+                self.gpuvm.data().kernel_mm.allocate(size, GFP_KERNEL)
+            }
+            KernelVaPlacement::At(va) => self
+                .gpuvm
+                .data()
                 .kernel_mm
                 .insert(va.start, va.end, GFP_KERNEL),
         }
@@ -228,23 +234,20 @@ impl Vm {
         // to come before `inner`.
         let mut ctx: StepContext = StepContext {
             iomem,
-            vm_bo: None,
             vm_map_flags: Some(vm_map_flags),
             vm_as_nr: self.address_space,
             preallocated_vas: StepContext::preallocate_vas()?,
         };
 
-        // Things get tricky/nasty here as obtaining the gpuvm inner data requires
-        // a guard. Even though access is already protected by VM lock,
-        // this one cannot be used really, so ... there it is
-        // ... untill smth better pops up
-        // stack_pin_init!(let local_guard = new_mutex!(()));
-        // let mut locked_vm = self.gpuvm.lock(&mut local_guard.lock());
+        let vm_bo = self.gpuvm.obtain(bo, TyrVmBoData::new())?;
 
-        let vm_bo = self.gpuvm.obtain_bo(bo)?;
-
-        ctx.vm_bo = Some(vm_bo);
-        unsafe { self.gpuvm.as_inner_mut() }.map(&mut ctx, bo, va_range, bo_offset)
+        self.gpuvm.sm_map(OpMapRequest {
+            addr: va_range.start,
+            range: va_range.end - va_range.start,
+            offset: bo_offset,
+            vm_bo: vm_bo,
+            context: &mut ctx,
+        })
     }
 
     /// Unmap a given VA range.
@@ -254,13 +257,13 @@ impl Vm {
 
         let mut ctx = StepContext {
             iomem,
-            vm_bo: None,
             vm_map_flags: None,
             vm_as_nr: None,
             preallocated_vas: StepContext::preallocate_vas()?,
         };
 
-        unsafe { self.gpuvm.as_inner_mut() }.unmap(&mut ctx, range)
+        self.gpuvm
+            .sm_unmap(range.start, range.end - range.start, &mut ctx)
     }
 
     /// Flush L2 caches for the entirety of a VM's AS.

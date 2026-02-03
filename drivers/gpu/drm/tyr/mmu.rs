@@ -110,7 +110,7 @@ impl Mmu {
         // stack_pin_init!(let local_guard = new_mutex!(()));
         // let locked_vm = vm.gpuvm.lock(&mut local_guard.lock());
 
-        let transtab = vm.gpuvm.page_table.cfg().ttbr;
+        let transtab = vm.gpuvm.data().page_table.cfg().ttbr;
         let transcfg = AS_TRANSCFG_PTW_MEMATTR_WB
             | AS_TRANSCFG_PTW_RA
             | AS_TRANSCFG_ADRMODE_AARCH64_4K

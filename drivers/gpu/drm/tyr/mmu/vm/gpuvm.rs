@@ -11,29 +11,44 @@
 use core::ops::Range;
 
 use kernel::devres::Devres;
-use kernel::drm::gpuvm::DriverGpuVa;
 use kernel::drm::gpuvm::{self};
 use kernel::io_pgtable::IoPageTable;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::prelude::*;
 use kernel::sizes::{SZ_1G, SZ_2M, SZ_4K};
 use kernel::sync::Arc;
-use kernel::types::ARef;
 
 use crate::driver;
 use crate::driver::IoMem;
 use crate::mmu::vm;
 use crate::mmu::Mmu;
 
+/// Data associated with a VM mapping.
+#[pin_data]
+pub(crate) struct TyrVaData {}
+
+impl TyrVaData {
+    pub(crate) fn new() -> impl PinInit<Self> {
+        pin_init!(Self {})
+    }
+}
+
+/// Data associated with a VM <=> BO pairing.
+#[pin_data]
+pub(crate) struct TyrVmBoData {}
+
+impl TyrVmBoData {
+    pub(crate) fn new() -> impl PinInit<Self> {
+        pin_init!(Self {})
+    }
+}
+
 /// A convenience so that we do not have to spell this whole thing out every
 /// time.
-type PinnedVa = Pin<KBox<gpuvm::GpuVa<LockedVm>>>;
+type PinnedVa = gpuvm::GpuVaAlloc<LockedVm>;
 
 /// A context that is passed throughout the map/unmap/remap steps.
 pub(crate) struct StepContext {
-    /// The Vm <=> BO connection,
-    pub(super) vm_bo: Option<ARef<gpuvm::GpuVmBo<LockedVm>>>,
-
     /// The used when mapping the VM that we are doing the steps on.
     pub(super) vm_map_flags: Option<vm::map_flags::Flags>,
 
@@ -66,17 +81,12 @@ impl StepContext {
 
     pub(super) fn preallocate_vas() -> Result<[Option<PinnedVa>; 3]> {
         Ok([
-            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::init_zeroed())?),
-            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::init_zeroed())?),
-            Some(gpuvm::GpuVa::<LockedVm>::new(pin_init::init_zeroed())?),
+            Some(gpuvm::GpuVaAlloc::<LockedVm>::new(GFP_KERNEL)?),
+            Some(gpuvm::GpuVaAlloc::<LockedVm>::new(GFP_KERNEL)?),
+            Some(gpuvm::GpuVaAlloc::<LockedVm>::new(GFP_KERNEL)?),
         ])
     }
 }
-
-pub(crate) struct GpuVa {/* TODO */}
-unsafe impl pin_init::Zeroable for GpuVa {}
-
-impl DriverGpuVa for GpuVa {}
 
 /// A state that can only be accessed when the GPUVM is locked.
 pub(crate) struct LockedVm {
@@ -88,14 +98,11 @@ pub(crate) struct LockedVm {
 }
 
 impl LockedVm {
-    pub(super) fn new(
-        page_table: ARM64LPAES1<Mmu>,
-        kernel_mm: vm::range::RangeAlloc,
-    ) -> impl Init<Self> {
-        init!(LockedVm {
+    pub(super) fn new(page_table: ARM64LPAES1<Mmu>, kernel_mm: vm::range::RangeAlloc) -> Self {
+        LockedVm {
             page_table,
             kernel_mm,
-        })
+        }
     }
 
     fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
@@ -195,24 +202,24 @@ impl LockedVm {
 
 impl gpuvm::DriverGpuVm for LockedVm {
     type Driver = driver::TyrDriver;
-    type GpuVmBo = VmBo;
-    type StepContext = StepContext;
+    type Object = crate::gem::Object;
+    type VaData = TyrVaData;
+    type VmBoData = TyrVmBoData;
+    type SmContext<'ctx> = StepContext;
 
-    type GpuVa = GpuVa;
-
-    fn step_map(
-        gpuvm: &mut gpuvm::GpuVm<Self>,
-        op: &mut gpuvm::OpMap<Self>,
-        ctx: &mut Self::StepContext,
-    ) -> Result {
+    fn sm_step_map<'op, 'ctx>(
+        &mut self,
+        op: gpuvm::OpMap<'op, Self>,
+        ctx: &mut Self::SmContext<'ctx>,
+    ) -> Result<gpuvm::OpMapped<'op, Self>, Error> {
         let start_iova = op.addr();
         let mut iova = start_iova;
         let mut left = op.length();
         let mut offset = op.gem_offset();
         let gpuva = ctx.preallocated_va()?;
 
-        let vm_bo = ctx.vm_bo.as_ref().ok_or(EINVAL)?;
-        let sgt = vm_bo.gem().sg_table();
+        let vm_bo = op.vm_bo();
+        let sgt = vm_bo.obj().sg_table();
         let prot = ctx.vm_map_flags.ok_or(EINVAL)?.to_prot();
 
         pr_info!("mapping {} bytes, iova: {:#x}, prot {}\n", left, iova, prot);
@@ -252,7 +259,7 @@ impl gpuvm::DriverGpuVm for LockedVm {
 
                 let (pgsize, pgcount) = Self::get_pgsize(curr_iova | curr_paddr, remaining);
 
-                let mapped = gpuvm.page_table.map_pages(
+                let mapped = self.page_table.map_pages(
                     curr_iova as usize,
                     curr_paddr as usize,
                     pgsize as usize,
@@ -267,7 +274,7 @@ impl gpuvm::DriverGpuVm for LockedVm {
                     );
                     // Unmap what we've mapped so far
                     if segment_mapped > 0 || iova > start_iova {
-                        let _ = gpuvm.unmap_pages(
+                        let _ = self.unmap_pages(
                             &ctx.iomem,
                             ctx.vm_as_nr,
                             start_iova..iova + segment_mapped,
@@ -283,72 +290,56 @@ impl gpuvm::DriverGpuVm for LockedVm {
             iova += len;
         }
 
-        gpuvm.insert_va(op, gpuva).map_err(|_| EINVAL)?;
-        gpuvm.find_va(op.range(), |gpuvm, gpuva| {
-            let gpuva = gpuva.ok_or(EINVAL)?;
-            gpuvm.link_va(gpuva, ctx.vm_bo.as_ref().expect("step_map with no BO"))?;
-            Ok(())
-        })?;
+        let op = op.insert(gpuva, TyrVaData::new());
 
         if let Some(as_nr) = ctx.vm_as_nr {
             let range = start_iova..iova;
             Mmu::flush_range(&ctx.iomem, as_nr, range)?;
         }
 
-        Ok(())
+        Ok(op)
     }
 
-    fn step_unmap(
-        gpuvm: &mut gpuvm::GpuVm<Self>,
-        op: &mut gpuvm::OpUnMap<Self>,
-        ctx: &mut Self::StepContext,
-    ) -> Result {
-        // This is always set by drm_gpuvm.c:op_unmap_cb(), not sure why it's an
-        // Option.
-        //
-        // XXX: discuss this with everybody else
-        let va = op.va().expect("This is always set by GPUVM");
+    fn sm_step_unmap<'op, 'ctx>(
+        &mut self,
+        op: gpuvm::OpUnmap<'op, Self>,
+        ctx: &mut Self::SmContext<'ctx>,
+    ) -> Result<gpuvm::OpUnmapped<'op, Self>, Error> {
+        let va = op.va();
         let iova = va.range();
 
         pr_info!("Unmapping range {:#x} - {:#x}\n", iova.start, iova.end);
-        gpuvm.unmap_pages(&ctx.iomem, ctx.vm_as_nr, iova)?;
+        self.unmap_pages(&ctx.iomem, ctx.vm_as_nr, iova)?;
 
-        gpuvm.find_va(va.range(), |gpuvm, gpuva| {
-            let removed = gpuvm.remove_va(gpuva.unwrap()).map_err(|_| EINVAL)?;
-            gpuvm.unlink_va(&removed);
-            Ok(())
-        })?;
-
-        Ok(())
+        let (unmapped, _) = op.remove();
+        Ok(unmapped)
     }
 
-    fn step_remap(
-        gpuvm: &mut gpuvm::GpuVm<Self>,
-        op: &mut gpuvm::OpReMap<Self>,
-        _vm_bo: &gpuvm::GpuVmBo<Self>,
-        ctx: &mut Self::StepContext,
-    ) -> Result {
+    fn sm_step_remap<'op, 'ctx>(
+        &mut self,
+        op: gpuvm::OpRemap<'op, Self>,
+        ctx: &mut Self::SmContext<'ctx>,
+    ) -> Result<gpuvm::OpRemapped<'op, Self>, Error> {
         pr_info!(
             "Remapping range {:#x} - {:#x}\n",
-            op.unmap().va().ok_or(EINVAL)?.addr(),
-            op.unmap().va().ok_or(EINVAL)?.addr() + op.unmap().va().ok_or(EINVAL)?.length()
+            op.va_to_unmap().addr(),
+            op.va_to_unmap().addr() + op.va_to_unmap().length()
         );
         let prev_va = ctx.preallocated_va()?;
         let next_va = ctx.preallocated_va()?;
-        let vm_bo = ctx.vm_bo.as_ref().ok_or(EINVAL)?;
 
-        let va = op.unmap().va().ok_or(EINVAL)?;
+        let va = op.va_to_unmap();
         let orig_addr = va.addr();
         let orig_range: u64 = va.length();
 
         // Only unmap the hole between prev/next, if they exist
-        let unmap_start = if let Some(op) = op.prev_map() {
+        let unmap_start = if let Some(op) = op.prev() {
             op.addr() + op.length()
         } else {
             orig_addr
         };
 
-        let unmap_end = if let Some(op) = op.next_map() {
+        let unmap_end = if let Some(op) = op.next() {
             op.addr()
         } else {
             orig_addr + orig_range
@@ -356,41 +347,9 @@ impl gpuvm::DriverGpuVm for LockedVm {
 
         let unmap_range = unmap_start..unmap_end;
 
-        gpuvm.unmap_pages(&ctx.iomem, ctx.vm_as_nr, unmap_range)?;
-        gpuvm.find_va(op.unmap().va().unwrap().range(), |gpuvm, gpuva| {
-            let removed_va = gpuvm.remove_va(gpuva.unwrap()).map_err(|_| EINVAL)?;
-            gpuvm.unlink_va(&removed_va);
-            Ok(())
-        })?;
+        self.unmap_pages(&ctx.iomem, ctx.vm_as_nr, unmap_range)?;
 
-        if let Some(prev_op) = op.prev_map() {
-            gpuvm.insert_va(prev_op, prev_va).map_err(|_| EINVAL)?;
-            gpuvm.find_va(prev_op.range(), |gpuvm, gpuva| {
-                let gpuva = gpuva.ok_or(EINVAL)?;
-                gpuvm.link_va(gpuva, vm_bo)?;
-                Ok(())
-            })?;
-        }
-
-        if let Some(next_op) = op.next_map() {
-            gpuvm.insert_va(next_op, next_va).map_err(|_| EINVAL)?;
-            gpuvm.find_va(next_op.range(), |gpuvm, gpuva| {
-                let gpuva = gpuva.ok_or(EINVAL)?;
-                gpuvm.link_va(gpuva, vm_bo)?;
-                Ok(())
-            })?;
-        }
-
-        Ok(())
-    }
-}
-
-/// Data associated with a VM <=> BO pairing
-#[pin_data]
-pub(crate) struct VmBo {}
-
-impl gpuvm::DriverGpuVmBo for VmBo {
-    fn new() -> impl PinInit<Self> {
-        pin_init!(VmBo {})
+        let (remapped, _) = op.remap([prev_va, next_va], TyrVaData::new(), TyrVaData::new());
+        Ok(remapped)
     }
 }
