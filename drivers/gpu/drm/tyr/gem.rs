@@ -94,7 +94,6 @@ pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> 
 /// a [`KernelBo`]. An automatic VA allocation strategy will be added in the future.
 pub(crate) enum KernelBoVaAlloc {
     /// Explicit VA address specified by the caller.
-    #[expect(dead_code)]
     Explicit(u64),
 }
 
@@ -107,7 +106,6 @@ pub(crate) enum KernelBoVaAlloc {
 /// When dropped, the buffer is automatically unmapped from the GPU VA space.
 pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
-    #[expect(dead_code)]
     pub(crate) bo: ARef<Bo>,
     /// The GPU VM this buffer is mapped into.
     vm: Arc<Vm>,
@@ -121,7 +119,6 @@ impl KernelBo {
     /// This function allocates a new shmem-backed GEM object and immediately maps
     /// it into the specified GPU virtual memory space. The mapping is automatically
     /// cleaned up when the [`KernelBo`] is dropped.
-    #[expect(dead_code)]
     pub(crate) fn new<Ctx: DeviceContext>(
         ddev: &TyrDrmDevice<Ctx>,
         vm: ArcBorrow<'_, Vm>,

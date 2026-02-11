@@ -18,6 +18,7 @@ config DRM_TYR
 	select DRM_TYR_STATIC_DEPS
 	select IOMMU_IO_PGTABLE_LPAE
 	select RUST_DRM_GEM_SHMEM_HELPER
+	select RUST_FW_LOADER_ABSTRACTIONS
 	depends on IOMMU_SUPPORT
 	default n
 	help
