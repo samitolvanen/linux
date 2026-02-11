@@ -42,6 +42,7 @@ use kernel::{
 
 use crate::{
     file::TyrDrmFileData,
+    fw::Firmware,
     gem::BoData,
     gpu,
     gpu::GpuInfo,
@@ -62,6 +63,8 @@ pub(crate) struct TyrPlatformDriverData;
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
     pub(crate) pdev: ARef<platform::Device>,
+
+    pub(crate) fw: Arc<Firmware>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -142,10 +145,21 @@ impl platform::Driver for TyrPlatformDriverData {
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
         let platform: ARef<platform::Device> = pdev.into();
 
-        let _mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
+        let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
+
+        let firmware = Firmware::new(
+            pdev,
+            iomem.clone(),
+            &uninit_ddev,
+            mmu.as_arc_borrow(),
+            &gpu_info,
+        )?;
+
+        firmware.boot()?;
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
+                fw: firmware,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,

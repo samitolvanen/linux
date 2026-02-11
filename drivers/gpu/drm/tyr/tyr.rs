@@ -9,6 +9,7 @@ use crate::driver::TyrPlatformDriverData;
 
 mod driver;
 mod file;
+mod fw;
 mod gem;
 mod gpu;
 mod mmu;
