@@ -244,7 +244,7 @@ impl Vm {
         self.gpuvm.sm_map(OpMapRequest {
             addr: va_range.start,
             range: va_range.end - va_range.start,
-            offset: bo_offset,
+            gem_offset: bo_offset,
             vm_bo: vm_bo,
             context: &mut ctx,
         })
