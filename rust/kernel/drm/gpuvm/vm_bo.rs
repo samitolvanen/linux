@@ -42,7 +42,6 @@ impl<T: DriverGpuVm> GpuVmBo<T> {
     /// # Safety
     ///
     /// Always safe to call.
-    // Unsafe to match function pointer type in C struct.
     unsafe extern "C" fn vm_bo_alloc() -> *mut bindings::drm_gpuvm_bo {
         KBox::<Self>::new_uninit(GFP_KERNEL | __GFP_ZERO)
             .map(KBox::into_raw)
@@ -153,14 +152,15 @@ impl<T: DriverGpuVm> GpuVmBoAlloc<T> {
 
     /// Look up whether there is an existing [`GpuVmBo`] for this gem object.
     #[inline]
-    pub(super) fn obtain(self) -> GpuVmBoResident<T> {
+    pub(super) fn obtain(self) -> GpuVmBoRegistered<T> {
         let me = ManuallyDrop::new(self);
         // SAFETY: Valid `drm_gpuvm_bo` not already in the lists.
         let ptr = unsafe { bindings::drm_gpuvm_bo_obtain_prealloc(me.as_raw()) };
 
-        // If the vm_bo does not already exist, ensure that it's in the extobj list.
+        // Add the vm_bo to the extobj list if it's an external object, and if the vm_bo does not
+        // already exist. (If we are using an existing vm_bo, it's already in the extobj list.)
         if ptr::eq(ptr, me.as_raw()) && me.gpuvm().is_extobj(me.obj()) {
-            let resv_lock = me.gpuvm().raw_resv_lock();
+            let resv_lock = me.gpuvm().raw_resv();
             // SAFETY: The GPUVM is still alive, so its resv lock is too.
             unsafe { bindings::dma_resv_lock(resv_lock, ptr::null_mut()) };
             // SAFETY: We hold the GPUVMs resv lock.
@@ -171,7 +171,7 @@ impl<T: DriverGpuVm> GpuVmBoAlloc<T> {
 
         // INVARIANTS: Valid `drm_gpuvm_bo` in the GEM list.
         // SAFETY: `drm_gpuvm_bo_obtain_prealloc` always returns a non-null ptr
-        GpuVmBoResident(unsafe { NonNull::new_unchecked(ptr.cast()) })
+        GpuVmBoRegistered(unsafe { NonNull::new_unchecked(ptr.cast()) })
     }
 }
 
@@ -198,9 +198,9 @@ impl<T: DriverGpuVm> Drop for GpuVmBoAlloc<T> {
 /// # Invariants
 ///
 /// Points at a `drm_gpuvm_bo` that contains a valid `T::VmBoData` and is present in the gem list.
-pub struct GpuVmBoResident<T: DriverGpuVm>(NonNull<GpuVmBo<T>>);
+pub struct GpuVmBoRegistered<T: DriverGpuVm>(NonNull<GpuVmBo<T>>);
 
-impl<T: DriverGpuVm> GpuVmBoResident<T> {
+impl<T: DriverGpuVm> GpuVmBoRegistered<T> {
     /// Returns a raw pointer to underlying C value.
     #[inline]
     pub fn as_raw(&self) -> *mut bindings::drm_gpuvm_bo {
@@ -209,7 +209,7 @@ impl<T: DriverGpuVm> GpuVmBoResident<T> {
     }
 }
 
-impl<T: DriverGpuVm> Deref for GpuVmBoResident<T> {
+impl<T: DriverGpuVm> Deref for GpuVmBoRegistered<T> {
     type Target = GpuVmBo<T>;
     #[inline]
     fn deref(&self) -> &GpuVmBo<T> {
@@ -218,7 +218,7 @@ impl<T: DriverGpuVm> Deref for GpuVmBoResident<T> {
     }
 }
 
-impl<T: DriverGpuVm> Drop for GpuVmBoResident<T> {
+impl<T: DriverGpuVm> Drop for GpuVmBoRegistered<T> {
     #[inline]
     fn drop(&mut self) {
         // SAFETY: It's safe to perform a deferred put in any context.

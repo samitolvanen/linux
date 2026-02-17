@@ -194,7 +194,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
         &self,
         obj: &T::Object,
         data: impl PinInit<T::VmBoData>,
-    ) -> Result<GpuVmBoResident<T>, AllocError> {
+    ) -> Result<GpuVmBoRegistered<T>, AllocError> {
         Ok(GpuVmBoAlloc::new(self, obj, data)?.obtain())
     }
 
@@ -225,7 +225,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
     }
 
     #[inline]
-    fn raw_resv_lock(&self) -> *mut bindings::dma_resv {
+    fn raw_resv(&self) -> *mut bindings::dma_resv {
         // SAFETY: `r_obj` is immutable and valid for duration of GPUVM.
         unsafe { (*(*self.as_raw()).r_obj).resv }
     }
@@ -234,7 +234,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
 /// The manager for a GPUVM.
 pub trait DriverGpuVm: Sized {
     /// Parent `Driver` for this object.
-    type Driver: drm::Driver;
+    type Driver: drm::Driver<Object = Self::Object>;
 
     /// The kind of GEM object stored in this GPUVM.
     type Object: IntoGEMObject;

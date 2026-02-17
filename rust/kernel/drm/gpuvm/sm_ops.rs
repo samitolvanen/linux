@@ -11,7 +11,7 @@ struct SmData<'a, 'ctx, T: DriverGpuVm> {
 #[repr(C)]
 struct SmMapData<'a, 'ctx, T: DriverGpuVm> {
     sm_data: SmData<'a, 'ctx, T>,
-    vm_bo: GpuVmBoResident<T>,
+    vm_bo: GpuVmBoRegistered<T>,
 }
 
 /// The argument for [`GpuVmCore::sm_map`].
@@ -21,9 +21,9 @@ pub struct OpMapRequest<'a, 'ctx, T: DriverGpuVm> {
     /// Length of mapping to create.
     pub range: u64,
     /// Offset in GEM object.
-    pub offset: u64,
+    pub gem_offset: u64,
     /// The GEM object to map.
-    pub vm_bo: GpuVmBoResident<T>,
+    pub vm_bo: GpuVmBoRegistered<T>,
     /// The user-provided context type.
     pub context: &'a mut T::SmContext<'ctx>,
 }
@@ -37,7 +37,7 @@ impl<'a, 'ctx, T: DriverGpuVm> OpMapRequest<'a, 'ctx, T> {
                     range: self.range,
                 },
                 gem: bindings::drm_gpuva_op_map__bindgen_ty_2 {
-                    offset: self.offset,
+                    offset: self.gem_offset,
                     obj: self.vm_bo.obj().as_raw(),
                 },
             },
@@ -51,7 +51,10 @@ pub struct OpMap<'op, T: DriverGpuVm> {
     // Since these abstractions are designed for immediate mode, the VM BO needs to be
     // pre-allocated, so we always have it available when we reach this point.
     vm_bo: &'op GpuVmBo<T>,
-    _invariant: PhantomData<*mut &'op mut T>,
+    // This ensures that 'op is invariant, so that `OpMap<'long, T>` does not
+    // coerce to `OpMap<'short, T>`. This ensures that the user can't return
+    // the wrong `OpMapped` value.
+    _invariant: PhantomData<fn(&'op mut T) -> fn(&'op mut T)>,
 }
 
 impl<'op, T: DriverGpuVm> OpMap<'op, T> {
@@ -105,11 +108,14 @@ pub struct OpMapped<'op, T> {
 /// Represents an `sm_step_unmap` operation that has not yet been completed.
 pub struct OpUnmap<'op, T: DriverGpuVm> {
     op: &'op bindings::drm_gpuva_op_unmap,
-    _invariant: PhantomData<*mut &'op mut T>,
+    // This ensures that 'op is invariant, so that `OpUnmap<'long, T>` does not
+    // coerce to `OpUnmap<'short, T>`. This ensures that the user can't return the
+    // wrong`OpUnmapped` value.
+    _invariant: PhantomData<fn(&'op mut T) -> fn(&'op mut T)>,
 }
 
 impl<'op, T: DriverGpuVm> OpUnmap<'op, T> {
-    /// Indicates whether this `drm_gpuva` is physically contiguous with the
+    /// Indicates whether this [`GpuVa`] is physically contiguous with the
     /// original mapping request.
     ///
     /// Optionally, if `keep` is set, drivers may keep the actual page table
@@ -146,13 +152,16 @@ impl<'op, T: DriverGpuVm> OpUnmap<'op, T> {
 
 /// Represents a completed [`OpUnmap`] operation.
 pub struct OpUnmapped<'op, T> {
-    _invariant: PhantomData<*mut &'op mut T>,
+    _invariant: PhantomData<fn(&'op mut T) -> fn(&'op mut T)>,
 }
 
 /// Represents an `sm_step_remap` operation that has not yet been completed.
 pub struct OpRemap<'op, T: DriverGpuVm> {
     op: &'op bindings::drm_gpuva_op_remap,
-    _invariant: PhantomData<*mut &'op mut T>,
+    // This ensures that 'op is invariant, so that `OpRemap<'long, T>` does not
+    // coerce to `OpRemap<'short, T>`. This ensures that the user can't return the
+    // wrong`OpRemapped` value.
+    _invariant: PhantomData<fn(&'op mut T) -> fn(&'op mut T)>,
 }
 
 impl<'op, T: DriverGpuVm> OpRemap<'op, T> {
@@ -295,7 +304,7 @@ pub struct OpRemapRet<T: DriverGpuVm> {
 
 /// Represents a completed [`OpRemap`] operation.
 pub struct OpRemapped<'op, T> {
-    _invariant: PhantomData<*mut &'op mut T>,
+    _invariant: PhantomData<fn(&'op mut T) -> fn(&'op mut T)>,
 }
 
 impl<T: DriverGpuVm> GpuVmCore<T> {
