@@ -139,6 +139,30 @@ impl Fence {
         // SAFETY: The fence pointer is valid and we're accessing a simple field
         unsafe { (*self.ptr).error }
     }
+
+    /// Check if the fence has been signaled.
+    ///
+    /// Returns `true` if the fence has been signaled, `false` otherwise.
+    pub fn is_signaled(&self) -> bool {
+        // SAFETY: The fence pointer is valid and we're calling the C API.
+        unsafe { bindings::dma_fence_is_signaled(self.ptr) }
+    }
+
+    /// Wait for the fence to be signaled, blocking indefinitely.
+    ///
+    /// Returns an error if the wait was interrupted or another error occurred.
+    pub fn wait(&self) -> Result {
+        // SAFETY: The fence pointer is valid. We pass `0` for non-interruptible
+        // wait and `MAX_SCHEDULE_TIMEOUT` (LONG_MAX) to wait indefinitely.
+        let ret = unsafe {
+            bindings::dma_fence_wait_timeout(self.ptr, false, isize::MAX)
+        };
+        if ret < 0 {
+            Err(Error::from_errno(ret as i32))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl crate::private::Sealed for Fence {}
@@ -670,6 +694,11 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
     /// Check if the callback is still active (has not been invoked yet).
     pub fn is_active(self: Pin<&Self>) -> bool {
         self.callback.is_some()
+    }
+
+    /// Returns a reference to the fence this callback is registered on.
+    pub fn fence(self: Pin<&Self>) -> &Fence {
+        &self.get_ref().fence
     }
 }
 
