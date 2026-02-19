@@ -53,6 +53,8 @@
 #include <linux/cred.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/devfreq.h>
+#include <linux/devfreq_cooling.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-chain.h>
 #include <linux/device/faux.h>
