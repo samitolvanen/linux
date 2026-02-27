@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+#ifdef CONFIG_DRM_GPUVM
+
 #include <drm/drm_gpuvm.h>
 
 struct drm_gpuvm *rust_helper_drm_gpuvm_get(struct drm_gpuvm *obj)
@@ -23,7 +25,13 @@ bool rust_helper_drm_gpuvm_is_extobj(struct drm_gpuvm *gpuvm,
 	return drm_gpuvm_is_extobj(gpuvm, obj);
 }
 
+#ifdef CONFIG_DRM_EXEC
+
 void rust_helper_drm_gpuvm_exec_unlock(struct drm_gpuvm_exec *vm_exec)
 {
 	return drm_gpuvm_exec_unlock(vm_exec);
 }
+
+#endif /* CONFIG_DRM_EXEC */
+
+#endif /* CONFIG_DRM_GPUVM */
