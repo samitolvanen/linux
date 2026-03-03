@@ -433,16 +433,16 @@ impl Pool {
 
         let group = xa.lock().remove(index).ok_or(EINVAL)?;
 
-        let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id))?;
+        tdev.with_locked_scheduler(|sched| {
+            let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id))?;
 
-        if let Some(csg_id) = csg_id {
-            tdev.with_locked_scheduler(|sched| {
+            if let Some(csg_id) = csg_id {
                 pr_info!("Unbinding group from CSG slot {}\n", csg_id);
                 sched.set_csg_state(tdev, csg_id, csg::GroupState::Terminate)?;
                 sched.unbind_group(tdev, csg_id)?;
-                Ok(())
-            })?;
-        }
+            }
+            Ok(())
+        })?;
 
         group.with_locked_inner(|inner| {
             inner.destroyed = true;
