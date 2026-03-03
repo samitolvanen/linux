@@ -105,6 +105,16 @@ impl Mmu {
         iomem: &Devres<IoMem>,
     ) -> Result {
         let mut vm = vm.lock();
+
+        // If this VM is already bound to an AS (shared with another group),
+        // just increment the refcount and reuse the existing slot. Without
+        // this, a second bind_vm() would allocate a fresh AS, overwrite
+        // vm.address_space, and silently leak the old slot.
+        if vm.binding_count > 0 {
+            vm.binding_count += 1;
+            return Ok(());
+        }
+
         let va_bits = gpu_info.va_bits();
 
         // stack_pin_init!(let local_guard = new_mutex!(()));
@@ -124,15 +134,28 @@ impl Mmu {
         Self::enable_as(iomem, as_nr, transtab, transcfg.into(), memattr)?;
         self.slots.alloc_slot(as_nr);
         vm.address_space = Some(as_nr);
+        vm.binding_count = 1;
         Ok(())
     }
 
     pub(crate) fn unbind_vm(&mut self, vm: &Arc<Mutex<Vm>>, iomem: &Devres<IoMem>) -> Result {
         let mut vm = vm.lock();
-        let as_nr = vm
-            .address_space
-            .ok_or(EINVAL)
-            .inspect_err(|_| pr_warn!("Unbinding vm without AS"))?;
+
+        if vm.binding_count == 0 {
+            pr_warn!("unbind_vm: called on already-unbound VM, ignoring\n");
+            return Ok(());
+        }
+
+        vm.binding_count -= 1;
+
+        // Still in use by another group sharing this VM.
+        if vm.binding_count > 0 {
+            return Ok(());
+        }
+
+        let as_nr = vm.address_space.ok_or(EINVAL).inspect_err(|_| {
+            pr_warn!("unbind_vm: binding_count reached 0 but address_space is None\n")
+        })?;
         Self::disable_as(iomem, as_nr)?;
         vm.address_space = None;
         self.slots.free_slot(as_nr);

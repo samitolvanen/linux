@@ -74,6 +74,19 @@ pub(crate) struct Vm {
     /// The AS to which this VM is bound, if any.
     pub(super) address_space: Option<usize>,
 
+    /// Number of scheduler groups currently bound to this VM.
+    ///
+    /// Multiple groups can share the same Vm.
+    ///
+    /// To make this work, each call to `Mmu::bind_vm()` increments this
+    /// counter; `unbind_vm()` decrements it and only releases the AS slot when
+    /// the count reaches zero. Without this, a second `bind_vm()` would
+    /// overwrite `address_space` with a fresh slot, silently leaking the old
+    /// one. Additionally, when unbinding, a group that shares its VM with
+    /// others would release the AS slot even if another group was using it.
+    /// This counter is used to prevent this behavior.
+    pub(super) binding_count: usize,
+
     // binding: Option<SlotAllocation>,
     /// The memory attributes for this VM.
     pub(super) memattr: u64,
@@ -171,6 +184,7 @@ impl Vm {
             )?,
             // binding: None,
             address_space: None,
+            binding_count: 0,
             memattr,
             _layout: layout,
             for_mcu,
