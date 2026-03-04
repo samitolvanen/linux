@@ -22,6 +22,7 @@ use core::sync::atomic::{
 use pin_init::pin_init_from_closure;
 
 use crate::{
+    alloc::AllocError,
     bindings, c_str,
     device::{
         Bound,
@@ -80,64 +81,51 @@ use crate::{
 /// }
 ///
 /// impl FenceCallback for MyCallback {
-///     fn signaled(&self, fence: &ARef<PublicDmaFence>) {
+///     fn signaled(self, fence: &ARef<PublicDmaFence>) {
 ///         pr_info!("Fence signaled!");
 ///         // Handle fence completion
 ///     }
 /// }
-///
-/// fn register_on_fence(fence: &ARef<PublicDmaFence>) -> Result<()> {
-///     let callback = MyCallback { /* ... */ };
-///
-///     match FenceCallbackRegistration::new(fence, callback)? {
-///         Some(registration) => {
-///             // Callback registered, will be called when fence signals
-///             // Keep `registration` alive or call registration.remove() to cancel
-///         }
-///         None => {
-///             // Fence already signaled. The callback will *not* be invoked.
-///         }
-///     }
-///     Ok(())
-/// }
 /// ```
-pub trait FenceCallback: Sync {
-    /// Called when the fence is signaled.
+pub trait FenceCallback: Sync + Send {
+    /// Called when the fence is signaled, consuming the callback.
     ///
     /// This is called from the fence signaling path, which may be in interrupt
     /// context or with locks held. Implementations must not sleep or perform
     /// long-running operations.
     ///
-    /// Takes `&self` to enforce proper synchronization - if you need to mutate
-    /// state, use interior mutability (e.g., `SpinLock`, `AtomicUsize`).
-    fn signaled(&self, fence: &ARef<PublicDmaFence>);
+    /// Takes `self` because each callback fires at most once. This allows the
+    /// callback to own resources (e.g., a fence handle) and transfer them out
+    /// without interior mutability or locking.
+    fn signaled(self, fence: &ARef<PublicDmaFence>);
 }
 
 /// Error type for fence callback registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallbackError {
-    /// The fence was already signaled when attempting to register the callback.
-    AlreadySignaled,
+///
+/// Generic over `T` so that `AlreadySignaled` can return the callback to the
+/// caller, allowing it to reclaim any resources owned by the callback (e.g.,
+/// a fence handle that needs to be signaled).
+#[derive(Debug)]
+pub enum CallbackError<T = ()> {
+    /// The fence was already signaled. The callback is returned so the caller
+    /// can extract owned resources without losing them.
+    AlreadySignaled(T),
     /// Some other error occurred during registration.
     Other(Error),
 }
 
-impl From<Error> for CallbackError {
-    fn from(err: Error) -> Self {
-        if err.to_errno() == ENOENT.to_errno() {
-            CallbackError::AlreadySignaled
-        } else {
-            CallbackError::Other(err)
+impl<T> From<CallbackError<T>> for Error {
+    fn from(err: CallbackError<T>) -> Self {
+        match err {
+            CallbackError::AlreadySignaled(_) => ENOENT,
+            CallbackError::Other(e) => e,
         }
     }
 }
 
-impl From<CallbackError> for Error {
-    fn from(err: CallbackError) -> Self {
-        match err {
-            CallbackError::AlreadySignaled => ENOENT,
-            CallbackError::Other(e) => e,
-        }
+impl<T> From<AllocError> for CallbackError<T> {
+    fn from(e: AllocError) -> Self {
+        CallbackError::Other(Error::from(e))
     }
 }
 
@@ -162,36 +150,70 @@ pub struct FenceCallbackRegistration<T: FenceCallback> {
 impl<T: FenceCallback> FenceCallbackRegistration<T> {
     /// Register a callback on a fence.
     ///
-    /// Returns `Err(CallbackError::AlreadySignaled)` if the fence was already signaled.
-    /// Returns `Err(CallbackError::Other(err))` for other errors.
+    /// On success the callback is pinned in place and will fire when the fence
+    /// signals. On `AlreadySignaled` the callback is returned to the caller so
+    /// that owned resources can be reclaimed.
     pub fn new<'a>(
         fence: &'a ARef<PublicDmaFence>,
         callback: T,
-    ) -> impl PinInit<Self, CallbackError> + 'a
+    ) -> impl PinInit<Self, CallbackError<T>> + 'a
     where
         T: 'a,
     {
-        try_pin_init!(Self {
-            // IMPORTANT: `callback` and `fence` MUST be initialized before `cb`.
-            // `dma_fence_add_callback` (inside `cb`) makes the callback live —
-            // another CPU can fire `dma_fence_callback` immediately, which reads
-            // `(*reg).callback` and `(*reg).fence`.  If those fields are still
-            // uninitialized, we get a crash.
-            callback: Some(callback),
-            fence: fence.clone(),
-            cb <- Opaque::try_ffi_init(|slot: *mut bindings::dma_fence_cb| {
-                // SAFETY: We pass a valid callback structure and function pointer.
-                // The fence pointer is valid per the Fence type invariant.
-                // This will initialize the list_head node in the cb structure.
-                to_result(unsafe {
-                    bindings::dma_fence_add_callback(
-                        fence.inner.get(),
-                        slot,
-                        Some(Self::dma_fence_callback),
-                    )
-                }).map_err(CallbackError::from)
-            }),
-        }? CallbackError)
+        // Uses `pin_init_from_closure` instead of `try_pin_init!` so that on
+        // `-ENOENT` (already signaled) the callback can be read back from the
+        // partially-initialized slot and returned through the error.
+        //
+        //
+        // SAFETY: `pin_init_from_closure` requires:
+        // - On `Ok(())`: the slot is fully initialized and valid for `Drop`.
+        // - On `Err(_)`: the slot is clean, i.e.: no partially-initialized fields
+        //   remain, and the slot can be deallocated without dropping.
+        //
+        // We uphold this as follows:
+        // - On success: all three fields are initialized. Ok(()) is returned.
+        // - On ENOENT (already signaled): `callback` and `fence` are read back
+        //   from the slot via `ptr::read`, leaving the slot clean. `cb` was
+        //   initialized by `dma_fence_add_callback` (it calls
+        //   `INIT_LIST_HEAD(&cb->node)` even on error), but `cb` is
+        //   `Opaque<dma_fence_cb>` which has no `Drop`, so not dropping it is
+        //   fine. The callback is returned through `AlreadySignaled(T)`.
+        // - On other errors: same cleanup as ENOENT, error returned as
+        //   `Other(e)`.
+        unsafe {
+            pin_init_from_closure(move |slot: *mut Self| {
+                let slot_callback = &raw mut (*slot).callback;
+                let slot_fence = &raw mut (*slot).fence;
+                let slot_cb = &raw mut (*slot).cb;
+
+                // Write callback and fence first — must be visible before
+                // dma_fence_add_callback makes the registration live.
+                core::ptr::write(slot_callback, Some(callback));
+                core::ptr::write(slot_fence, fence.clone());
+
+                let ret = to_result(bindings::dma_fence_add_callback(
+                    fence.inner.get(),
+                    Opaque::cast_into(slot_cb),
+                    Some(Self::dma_fence_callback),
+                ));
+
+                match ret {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Read back what we wrote to leave the slot clean.
+                        let cb_back = core::ptr::read(slot_callback)
+                            .expect("callback was just written as Some");
+                        let _fence_back = core::ptr::read(slot_fence);
+
+                        if e.to_errno() == ENOENT.to_errno() {
+                            Err(CallbackError::AlreadySignaled(cb_back))
+                        } else {
+                            Err(CallbackError::Other(e))
+                        }
+                    }
+                }
+            })
+        }
     }
 
     /// Raw dma fence callback that is called by the C code.
@@ -203,7 +225,9 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
         _fence: *mut bindings::dma_fence,
         cb: *mut bindings::dma_fence_cb,
     ) {
-        // SAFETY: The callback pointer is the address of our `cb` field
+        // SAFETY: The callback pointer is the address of our `cb` field.
+        // The C subsystem guarantees this is called at most once per
+        // registration, so `.take()` will see `Some` exactly once.
         unsafe {
             let ptr = cb.cast::<Opaque<bindings::dma_fence_cb>>();
             let reg: *mut Self = crate::container_of!(ptr, Self, cb).cast();
@@ -226,15 +250,13 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
     /// been called yet), or `false` if the callback was already invoked or removed.
     pub fn remove(mut self: Pin<&mut Self>) -> bool {
         if self.callback.is_some() {
-            // Callback hasn't been invoked yet, try to remove it
-            // SAFETY: The fence pointer is valid and the callback is registered
+            // SAFETY: The fence pointer is valid and the callback is registered.
             let removed = unsafe {
                 bindings::dma_fence_remove_callback(self.fence.inner.get(), self.cb.get())
             };
 
             if removed {
-                // Successfully removed, clear our state
-                // SAFETY: The `callback` field is not structurally pinned (only `cb` is pinned).
+                // SAFETY: `callback` is not structurally pinned (only `cb` is).
                 unsafe {
                     self.as_mut().get_unchecked_mut().callback = None;
                 }
@@ -242,6 +264,27 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
             }
         }
         false
+    }
+
+    /// Remove the callback and return it if it hasn't fired yet.
+    ///
+    /// Calls `dma_fence_remove_callback`, which acquires `fence->lock` and
+    /// serializes with any in-flight signal. If the callback was removed
+    /// before firing, it is returned as `Some(T)`. If the callback already
+    /// fired (or was previously removed), returns `None`.
+    pub fn take(mut self: Pin<&mut Self>) -> Option<T> {
+        if self.callback.is_some() {
+            // SAFETY: The fence pointer is valid and the callback is registered.
+            let removed = unsafe {
+                bindings::dma_fence_remove_callback(self.fence.inner.get(), self.cb.get())
+            };
+
+            if removed {
+                // SAFETY: The `callback` field is not structurally pinned (only `cb` is pinned).
+                return unsafe { self.as_mut().get_unchecked_mut().callback.take() };
+            }
+        }
+        None
     }
 
     /// Check if the callback is still active (has not been invoked yet).

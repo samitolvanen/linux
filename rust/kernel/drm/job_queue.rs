@@ -63,8 +63,8 @@
 //!
 //!
 //! - Executing: The driver accepted the job and returned a hardware fence.
-//!   When the HW fence signals, the submit fence is signaled and the job moves
-//!   to Done.
+//!   When the HW fence signals, the submit fence is signaled directly from the
+//!   HW fence callback, and the job moves to Done on the next tick.
 //!
 //!
 //! - Done: Cleanup stage. Entries are removed from the XArray in process
@@ -215,25 +215,10 @@ struct JobEntry<T: QueueOps> {
     /// dependency waiters and other observers.
     submit_fence: ARef<PublicDmaFence>,
 
-    /// The driver-side submit fence handle. Held until the job is signaled
-    /// (in `tick_retire`, `tick_exec` error path, `check_timeouts`, or
-    /// `cancel_all`). `None` once the submit fence has been signaled.
-    ///
-    /// With the old non-consuming fence design, this field did not exist.
-    /// `submit_fence` (an `ARef<PublicDmaFence>`) was sufficient: anyone
-    /// holding a clone could call `.signal()` directly, including
-    /// `DriverFenceCallback`, which would signal the submit fence inline
-    /// from the HW fence callback without ever touching the XArray.
-    ///
-    /// With consuming-signal, `.signal()` takes `self`, so ownership of the
-    /// `DriverDmaFence` must live *somewhere* and be transferred to exactly
-    /// one callsite. That place is this field, inside the XArray entry.
-    ///
-    /// Note: the `Option` here does not model presence vs absence, the fence
-    /// is always `Some` from submission until the first (and only) signal.
-    /// `None` simply means "already consumed by `.signal()`". It is a
-    /// once-flag, not an optional value, forced into `Option` shape by the
-    /// need to move out of a field given that signaling consumes the fence.
+    /// The driver-side submit fence handle, kept until the fence is either
+    /// moved into the HW fence callback (on successful submission) or signaled
+    /// directly (on error / timeout / cancel). Once moved into the callback,
+    /// this is `None` and never touched again.
     submit_fence_drv: Option<DriverDmaFence<SubmitFenceData, Published>>,
 
     /// Monotonic job counter for debugging.
@@ -500,12 +485,10 @@ impl<T: QueueOps> JobQueueInner<T> {
                 let callback = DepCallback {
                     inner: self.clone(),
                 };
-                match KBox::pin_init(
+                match KBox::try_pin_init(
                     FenceCallbackRegistration::new(&dep_fence, callback),
                     GFP_KERNEL,
-                )
-                .map_err(CallbackError::from)
-                {
+                ) {
                     Ok(registration) => {
                         let mut guard = self.fifo.lock();
                         if let Some(entry) = guard.get_mut(idx as usize) {
@@ -513,7 +496,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                         }
                         return;
                     }
-                    Err(CallbackError::AlreadySignaled) => {
+                    Err(CallbackError::AlreadySignaled(_)) => {
                         let mut guard = self.fifo.lock();
                         if let Some(entry) = guard.get_mut(idx as usize) {
                             entry.active_dep_cb = None;
@@ -574,90 +557,48 @@ impl<T: QueueOps> JobQueueInner<T> {
             // Notice that the XArray spinlock is not held here.
             match self.handler.submit(&job_ref) {
                 Ok(SubmitResult::Submitted(hw_fence)) => {
+                    // Take the fence from the entry and transfer it to the callback.
+                    let submit_fence_drv = {
+                        let mut guard = self.fifo.lock();
+                        let entry = guard.get_mut(idx as usize).unwrap();
+                        entry.driver_fence = Some(hw_fence.clone());
+                        entry.submit_fence_drv.take().unwrap()
+                    };
+
                     let callback = DriverFenceCallback {
+                        submit_fence: submit_fence_drv,
                         inner: self.clone(),
                     };
 
-                    // Schedule a tick when the hardware fence signals so that
-                    // `tick_retire()` can propagate completion in process context.
-                    let cb_result = KBox::pin_init(
+                    let cb_result = KBox::try_pin_init(
                         FenceCallbackRegistration::new(&hw_fence, callback),
                         GFP_KERNEL,
-                    )
-                    .map_err(CallbackError::from);
+                    );
 
-                    // Collect any fence to signal *after* releasing the XArray
-                    // lock, avoiding lock-ordering issues with fence callbacks.
-                    //
-                    // This is a sad reality that arises from the fact that
-                    // signaling fences now consumes them, which precludes us
-                    // from the simpler pattern where we just signaled the
-                    // submit fence from the HW fence callback. That was simple,
-                    // worked, and removed all this dance below.
-                    //
-                    // Instead, we would revert to this simpler pattern below
-                    // that was present when the new JQ was matched with the old
-                    // fences from Lina:
-                    //
-                    // struct DriverFenceCallback<T: QueueOps> {
-                    //     submit_fence: ARef<PublicDmaFence>,  // cloned at submission time, decoupled from XArray
-                    //     inner: Arc<JobQueueInner<T>>,
-                    // }
-                    //
-                    // impl<T: QueueOps> FenceCallback for DriverFenceCallback<T> {
-                    //     fn signaled(&self, fence: &ARef<PublicDmaFence>) {
-                    //         self.submit_fence.signal(fence.error()); // We don't need to touch the XArray, take its lock, etc.
-                    //         self.inner.maybe_tick();
-                    //     }
-                    // }
-                    let mut deferred: Option<(DriverDmaFence<SubmitFenceData, Published>, Result)> =
-                        None;
-
-                    // Btw: we did not need this boolean before, but now we do:
-                    // if the callback registration failed, we need to fail the
-                    // job by signaling the submit fence with the error, and we
-                    // can only do that after releasing the XArray lock in order
-                    // to avoid the same lock ordering issues described above, so we
-                    // set a flag here and handle it after the XArray's lock scope.
-                    let mut fail_job = false;
-
-                    {
-                        let mut guard = self.fifo.lock();
-                        if let Some(entry) = guard.get_mut(idx as usize) {
-                            entry.driver_fence = Some(hw_fence.clone());
-
-                            match cb_result {
-                                Ok(registration) => {
-                                    entry.driver_fence_cb = Some(registration);
-                                }
-                                Err(CallbackError::AlreadySignaled) => {
-                                    // HW fence already done — signal the submit
-                                    // fence immediately so waiters don't have to
-                                    // wait for a tick_retire() pass.
-                                    let result = hw_fence.error();
-                                    deferred = entry.submit_fence_drv.take().map(|f| (f, result));
-                                }
-                                Err(CallbackError::Other(e)) => {
-                                    pr_err!(
-                                        "JobQueue: tick_exec() cb alloc failed: {:?}, failing job {}\n",
-                                        e,
-                                        counter
-                                    );
-                                    deferred = entry.submit_fence_drv.take().map(|f| (f, Err(e)));
-                                    fail_job = true;
-                                }
+                    match cb_result {
+                        Ok(registration) => {
+                            let mut guard = self.fifo.lock();
+                            if let Some(entry) = guard.get_mut(idx as usize) {
+                                entry.driver_fence_cb = Some(registration);
                             }
                         }
-                    }
-
-                    if let Some((drv_fence, result)) = deferred {
-                        drv_fence.signal(result);
-                    }
-
-                    if fail_job {
-                        state.exec_range.pop_front();
-                        state.done_range.push_back();
-                        continue;
+                        Err(CallbackError::AlreadySignaled(cb)) => {
+                            // HW fence already done — callback returned with
+                            // the submit fence still inside. Signal it.
+                            cb.submit_fence.signal(hw_fence.error());
+                        }
+                        Err(CallbackError::Other(e)) => {
+                            // The callback (owning the fence) was dropped,
+                            // which signals ECANCELED via DriverDmaFence::drop.
+                            pr_err!(
+                                "JobQueue: tick_exec() cb alloc failed: {:?}, job {}\n",
+                                e,
+                                counter
+                            );
+                            state.exec_range.pop_front();
+                            state.done_range.push_back();
+                            continue;
+                        }
                     }
 
                     state.exec_range.pop_front();
@@ -667,16 +608,15 @@ impl<T: QueueOps> JobQueueInner<T> {
                     return;
                 }
                 Err(e) => {
-                    // The driver fatally rejected the job — fail the submit fence.
-                    // Take the fence before releasing the XArray lock.
+                    // handler.submit() failed, so the fence never left the entry.
                     let drv_fence = {
                         let mut guard = self.fifo.lock();
                         guard
                             .get_mut(idx as usize)
                             .and_then(|entry| entry.submit_fence_drv.take())
-                    }; // xa_lock released
-                    if let Some(drv_fence) = drv_fence {
-                        drv_fence.signal(Err(e));
+                    };
+                    if let Some(f) = drv_fence {
+                        f.signal(Err(e));
                     }
                     state.exec_range.pop_front();
                     state.done_range.push_back();
@@ -687,57 +627,31 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// Retire completed HW jobs (in-order from the front).
     ///
-    /// When the hardware fence signals, the job advances to Done and the
-    /// submit fence is signaled with the hardware fence's result.
+    /// The submit fence has already been signaled by the HW fence callback
+    /// (`DriverFenceCallback::signaled`). This function just advances the
+    /// cursor from `hw_range` to `done_range`.
     fn tick_retire(&self, state: &mut PipelineState) {
         while !state.hw_range.is_empty() {
             let idx = state.hw_range.start;
 
-            // Take submit_fence_drv under the XArray lock so we can signal it
-            // afterwards without holding the lock (avoids lock-ordering issues
-            // with fence callbacks that may try to acquire the XArray lock).
-            //
-            // Again, this is a sad consequence of consuming-signal. With the
-            // old non-consuming pattern, tick_retire() would have no signaling
-            // responsibility at all: DriverFenceCallback would have held a
-            // cloned ARef<PublicDmaFence> and signaled it directly when the HW
-            // fence fired. tick_retire() would then be trivial: just a cursor
-            // walk to move signaled jobs to done_range, no take-then-signal
-            // dance required.
-            let (signaled, drv_fence_opt, result) = {
-                let mut guard = self.fifo.lock();
-                let Some(entry) = guard.get_mut(idx as usize) else {
+            let signaled = {
+                let guard = self.fifo.lock();
+                let Some(entry) = guard.get(idx as usize) else {
                     pr_err!(
-                        "JobQueue: tick_hw_retire() BUG: xa_idx={} missing in hw_range, advancing\n",
+                        "JobQueue: tick_retire() BUG: xa_idx={} missing in hw_range, advancing\n",
                         idx
                     );
                     state.hw_range.pop_front();
                     state.done_range.push_back();
                     continue;
                 };
-
-                let signaled = entry
+                entry
                     .driver_fence
                     .as_ref()
-                    .map_or(false, |f| f.is_signaled());
-
-                if signaled {
-                    let result = entry
-                        .driver_fence
-                        .as_ref()
-                        .map(|f| f.error())
-                        .unwrap_or(Ok(()));
-                    let drv_fence_opt = entry.submit_fence_drv.take();
-                    (true, drv_fence_opt, result)
-                } else {
-                    (false, None, Ok(()))
-                }
+                    .map_or(false, |f| f.is_signaled())
             };
 
             if signaled {
-                if let Some(drv_fence) = drv_fence_opt {
-                    drv_fence.signal(result);
-                }
                 state.hw_range.pop_front();
                 state.done_range.push_back();
             } else {
@@ -804,9 +718,21 @@ impl<T: QueueOps> JobQueueInner<T> {
                 counter: entry.counter,
             };
             self.handler.timed_out(&job_ref);
-            // Entry is already removed from the XArray, so no lock is held here.
-            if let Some(drv_fence) = entry.submit_fence_drv.take() {
-                drv_fence.signal(Err(ETIMEDOUT));
+            // Remove the callback. take() calls dma_fence_remove_callback which
+            // serializes with any in-flight signal via fence->lock. If removed
+            // before firing, we get the callback (and the fence inside it)
+            // back.
+            if let Some(mut reg) = entry.driver_fence_cb.take() {
+                if let Some(cb) = reg.as_mut().take() {
+                    cb.submit_fence.signal(Err(ETIMEDOUT));
+                }
+                // else: callback already fired, fence already signaled with
+                // ECANCELED. But honestly, if the fence has timed out...then
+                // this path will never be taken, I guess.
+            }
+            // If no callback was registered, fence is still in submit_fence_drv.
+            if let Some(f) = entry.submit_fence_drv.take() {
+                f.signal(Err(ETIMEDOUT));
             }
 
             // entry dropped here in process context
@@ -865,26 +791,22 @@ struct DepCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for DepCallback<T> {
-    fn signaled(&self, _fence: &ARef<PublicDmaFence>) {
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
         self.inner.maybe_tick();
     }
 }
 
-/// Hardware fence callback. Triggers a pipeline tick so that `tick_retire()`
-/// can propagate the completion result and signal the submit fence in process
-/// context.
+/// Hardware fence callback. Signals the submit fence directly when the HW
+/// fence fires, then triggers a pipeline tick so that `tick_retire()` can
+/// advance the cursor.
 struct DriverFenceCallback<T: QueueOps> {
+    submit_fence: DriverDmaFence<SubmitFenceData, Published>,
     inner: Arc<JobQueueInner<T>>,
 }
 
 impl<T: QueueOps> FenceCallback for DriverFenceCallback<T> {
-    fn signaled(&self, _fence: &ARef<PublicDmaFence>) {
-        // Hey Boris, it would be really great if we could go back to signaling
-        // fences here. Now we have to wait for the worker to get scheduled and
-        // deal with it there :/
-        //
-        // IMHO, the UI was a bit snappier when we signaled from here, and also
-        // the tick code was simpler.
+    fn signaled(self, fence: &ARef<PublicDmaFence>) {
+        self.submit_fence.signal(fence.error());
         self.inner.maybe_tick();
     }
 }
@@ -1126,12 +1048,16 @@ impl<T: QueueOps> JobQueue<T> {
         }
 
         // Signal all submit fences with ECANCELED and drop entries.
-        // Entries are removed from the XArray so no XArray lock is held.
         for mut entry in entries {
-            entry.active_dep_cb = None;
-            entry.driver_fence_cb = None;
-            if let Some(drv_fence) = entry.submit_fence_drv.take() {
-                drv_fence.signal(Err(ECANCELED));
+            // Try to reclaim the fence from the callback registration.
+            if let Some(mut reg) = entry.driver_fence_cb.take() {
+                if let Some(cb) = reg.as_mut().take() {
+                    cb.submit_fence.signal(Err(ECANCELED));
+                }
+            }
+            // If no callback was registered, fence is still in submit_fence_drv.
+            if let Some(f) = entry.submit_fence_drv.take() {
+                f.signal(Err(ECANCELED));
             }
         }
 
