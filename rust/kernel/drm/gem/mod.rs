@@ -96,6 +96,7 @@ pub trait DriverObject: Sync + Send + Sized {
     fn new<Ctx: DeviceContext>(
         dev: &drm::Device<Self::Driver, Ctx>,
         size: usize,
+        args: Self::Args,
     ) -> impl PinInit<Self, Error>;
 
     /// Open a new handle to an existing object, associated with a File.
@@ -280,11 +281,15 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
     };
 
     /// Create a new GEM object.
-    pub fn new(dev: &drm::Device<T::Driver, Ctx>, size: usize) -> Result<ARef<Self>> {
+    pub fn new(
+        dev: &drm::Device<T::Driver, Ctx>,
+        size: usize,
+        args: T::Args,
+    ) -> Result<ARef<Self>> {
         let obj: Pin<KBox<Self>> = KBox::pin_init(
             try_pin_init!(Self {
                 obj: Opaque::new(bindings::drm_gem_object::default()),
-                data <- T::new(dev, size),
+                data <- T::new(dev, size, args),
                 _ctx: PhantomData,
             }),
             GFP_KERNEL,
