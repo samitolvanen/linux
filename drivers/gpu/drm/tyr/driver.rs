@@ -144,11 +144,11 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
         });
 
-        let tdev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref(), data)?;
-        let tdev = Registration::new_foreign_owned(tdev, pdev.as_ref(), 0)?;
+        let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref(), data)?;
+        let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), 0)?;
 
         let driver = TyrPlatformDriverData {
-            _device: tdev.into(),
+            _device: ddev.into(),
         };
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
