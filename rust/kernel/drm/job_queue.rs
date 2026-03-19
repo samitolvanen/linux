@@ -26,45 +26,46 @@
 //!   (which also covers the XArray's internal `xa_lock`) and advances
 //!   `submitted_end`.
 //!
-//!   At the top of each `tick()`, the pipeline drains entries from
+//!   At the top of each `check_progress()`, the pipeline drains entries from
 //!   `submitted_start..submitted_end` into `deps_range`. This allows the queue
 //!   to accept more submissions while the rest of the queue is locked due to a
-//!   tick being in progress. Ignoring this separation may cause a deadlock
+//!   progress check taking place. Ignoring this separation may cause a deadlock
 //!   because the driver's `submit()` path may take driver locks and then wait
-//!   on the `state` mutex held by `tick()`, while `tick()` waits on said locks
-//!   driver locks during `handler.submit()`.
+//!   on the `state` mutex held by `check_progress()`, while `check_progress()`
+//!   waits on said locks driver locks during `handler.submit()`.
 //!
 //!   The current design solves this lock ordering problem by splitting
-//!   `submit()` and `tick()` state into two separate locks: `inbox` for the
-//!   submission path, and `state` for the tick path. The `inbox` mutex is only
-//!   held briefly at the top of `tick()` to drain new submissions, while the
-//!   rest of the tick logic (including calls to the driver's `submit()`)
-//!   happens under the `state` mutex, which is never touched by `submit()`.
-//!   This allows the driver to acquire its own locks and call back into the job
-//!   queue from its `submit()` implementation without risking deadlock with the
-//!   tick logic.
+//!   `submit()` and `check_progress()` state into two separate locks: `inbox`
+//!   for the submission path, and `state` for the progress check path. The
+//!   `inbox` mutex is only held briefly at the top of `check_progress()` to
+//!   drain new submissions, while the rest of the progress check logic
+//!   (including calls to the driver's `submit()`) happens under the `state`
+//!   mutex, which is never touched by `submit()`.  This allows the driver to
+//!   acquire its own locks and call back into the job queue from its `submit()`
+//!   implementation without risking deadlock with the progress check logic.
 //!
 //!
-//! - WaitingForDeps: The job's dependency fences have not all signaled yet.
+//!   - WaitingForDeps: The job's dependency fences have not all signaled yet.
 //!   Dependencies are walked one at a time: a single callback is registered on
-//!   the current dependency, and when it fires, `tick()` fast-forwards through
-//!   any already-signaled deps before registering the next callback. If there
-//!   are no further deps, the job moves to WaitingForExec.
+//!   the current dependency, and when it fires, `check_progress()`
+//!   fast-forwards through any already-signaled deps before registering the
+//!   next callback. If there are no further deps, the job moves to
+//!   WaitingForExec.
 //!
-//!   Dependency callback registration only happens inside `tick()`, never
-//!   inside a fence `signaled()` callback. This avoids the deadlock where
+//!   Dependency callback registration only happens inside `check_progress()`,
+//!   never inside a fence `signaled()` callback. This avoids the deadlock where
 //!   `dma_fence_add_callback` is called while already holding a fence context
 //!   spinlock from a prior `signaled()` invocation.
 //!
 //!
 //! - WaitingForExec: All dependencies are met. The pipeline calls the
 //!   driver's submit function. If the driver returns [`SubmitResult::NoResources`],
-//!   the job stays here and is retried on the next tick.
+//!   the job stays here and is retried on the next progress check.
 //!
 //!
 //! - Executing: The driver accepted the job and returned a hardware fence.
 //!   When the HW fence signals, the submit fence is signaled directly from the
-//!   HW fence callback, and the job moves to Done on the next tick.
+//!   HW fence callback, and the job moves to Done on the next progress check.
 //!
 //!
 //! - Done: Cleanup stage. Entries are removed from the XArray in process
@@ -72,7 +73,7 @@
 //!   XArray to shrink. This ensures that Jobs are dropped in process context.
 //!
 //! The current design allows more stages to be added by introducing new cursor
-//! ranges and adding logic in `tick()`.
+//! ranges and adding logic in `check_progress()`.
 
 use core::sync::atomic::{
     AtomicBool,
@@ -129,8 +130,8 @@ pub enum SubmitResult {
     /// signal when execution completes.
     Submitted(ARef<PublicDmaFence>),
     /// The driver has no resources available (e.g. ring buffer full).
-    /// The pipeline will automatically retry on the next tick, which is
-    /// triggered by job completions or new submissions.
+    /// The pipeline will automatically retry on the next progress check, which
+    /// is triggered by job completions or new submissions.
     NoResources,
 }
 
@@ -158,8 +159,8 @@ pub trait QueueOps: Send + Sync + 'static {
     /// pushed to the HW ring.
     ///
     /// This returns [`SubmitResult::NoResources`] if the ring is full - which
-    /// makes the pipeline retry automatically on the next tick - or `Err(...)`
-    /// if the job failed fatally (the submit fence gets the error).
+    /// makes the pipeline retry automatically on the next progress check - or
+    /// `Err(...)` if the job failed fatally (the submit fence gets the error).
     fn submit(&self, job: &JobRef<'_, Self::Job>) -> Result<SubmitResult>;
 
     /// Called when a job has timed out on the hardware. Called from process
@@ -261,14 +262,14 @@ impl DriverDmaFenceOps for SubmitFenceData {
 }
 
 // State managed by `submit()`. This is separate from `PipelineState` to avoid
-// lock ordering issues between `submit()` and `tick()`. In other words, new
-// jobs can be submitted even if the pipeline itself is locked.
+// lock ordering issues between `submit()` and `check_progress()`. In other
+// words, new jobs can be submitted even if the pipeline itself is locked.
 struct InboxState {
     /// The `next` cursor for `xa_alloc_cyclic`.
     cyclic_next: u32,
 
     /// One past the last XArray index that `submit()` has written.
-    /// `tick()` advances `submitted_start` up to this value to pull
+    /// `check_progress()` advances `submitted_start` up to this value to pull
     /// new entries into `deps_range`.
     submitted_end: u32,
 }
@@ -292,7 +293,7 @@ struct PipelineState {
     /// Completed jobs awaiting XArray cleanup in process context.
     done_range: WrapRange,
 
-    /// When true, `tick_exec()` stops at the exec stage and leaves jobs
+    /// When true, `check_exec()` stops at the exec stage and leaves jobs
     /// parked in `exec_range` until unparked. This is the analogue of
     /// removing a drm_sched entity from its run-queue.
     parked: bool,
@@ -316,8 +317,10 @@ impl PipelineState {
 struct JobQueueInner<T: QueueOps> {
     /// The XArray holding all job entries.
     ///
-    /// Shared between `submit()` (insert) and `tick()` (read/modify/remove).
-    /// Access is serialized by the XArray's internal `xa_lock` spinlock.
+    /// Shared between `submit()` (insert) and `check_progress()`
+    /// (read/modify/remove).
+    ///
+    ///  Access is serialized by the XArray's internal `xa_lock` spinlock.
     #[pin]
     fifo: XArray<KBox<JobEntry<T>>>,
 
@@ -331,7 +334,7 @@ struct JobQueueInner<T: QueueOps> {
 
     handler: T,
 
-    /// Runs `tick()` in process context.
+    /// Runs `check_progress()` in process context.
     #[pin]
     work: Work<JobQueueInner<T>>,
 
@@ -343,7 +346,7 @@ struct JobQueueInner<T: QueueOps> {
     #[pin]
     cleanup_work: Work<JobQueueInner<T>, 3>,
 
-    /// Dedicated high-priority workqueue for tick and cleanup work.
+    /// Dedicated high-priority workqueue for progress check and cleanup work.
     queue: OwnedQueue,
 
     /// DMA fence context ID allocated at creation time.
@@ -383,7 +386,7 @@ impl<T: QueueOps> WorkItem for JobQueueInner<T> {
     type Pointer = Arc<Self>;
 
     fn run(this: Arc<Self>) {
-        this.tick();
+        this.check_progress();
     }
 }
 
@@ -414,20 +417,20 @@ impl<T: QueueOps> JobQueueInner<T> {
     }
 
     /// The main pipeline tick. Runs in process context.
-    fn tick(self: &Arc<Self>) {
+    fn check_progress(self: &Arc<Self>) {
         let mut state = self.state.lock();
 
         // Submitted -> WaitingForDeps.
         self.drain_inbox(&mut state);
 
         //  WaitingForDeps -> WaitingForExec.
-        self.tick_deps(&mut state);
+        self.check_deps(&mut state);
 
         //  WaitingForExec -> Executing.
-        self.tick_exec(&mut state);
+        self.check_exec(&mut state);
 
         //  Executing -> Done.
-        self.tick_retire(&mut state);
+        self.check_retire(&mut state);
 
         //  Schedule deferred work as needed.
         let needs_cleanup = !state.done_range.is_empty();
@@ -447,7 +450,7 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// For each job at the front of `deps_range`, we fast-forward through
     /// already-signaled fences, then register a callback on the next unsignaled
     /// one. If all deps are met, the job advances to `exec_range`.
-    fn tick_deps(self: &Arc<Self>, state: &mut PipelineState) {
+    fn check_deps(self: &Arc<Self>, state: &mut PipelineState) {
         while !state.deps_range.is_empty() {
             let idx = state.deps_range.start;
 
@@ -456,7 +459,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     let guard = self.fifo.lock();
                     let Some(entry) = guard.get(idx as usize) else {
                         pr_err!(
-                            "JobQueue: tick_deps() BUG: xa_idx={} missing in deps_range, advancing\n",
+                            "JobQueue: check_deps() BUG: xa_idx={} missing in deps_range, advancing\n",
                             idx
                         );
                         state.deps_range.pop_front();
@@ -506,7 +509,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     }
                     Err(CallbackError::Other(e)) => {
                         pr_err!(
-                            "JobQueue: tick_deps() dep cb alloc failed: {:?}, skipping dep for job {}",
+                            "JobQueue: check_deps() dep cb alloc failed: {:?}, skipping dep for job {}",
                             e,
                             idx
                         );
@@ -524,7 +527,7 @@ impl<T: QueueOps> JobQueueInner<T> {
     }
 
     /// Process the exec stage: call the driver's submit handler.
-    fn tick_exec(self: &Arc<Self>, state: &mut PipelineState) {
+    fn check_exec(self: &Arc<Self>, state: &mut PipelineState) {
         // If the queue is parked leave jobs in exec_range and wait for unpark()
         // to trigger a new tick.
         if state.parked {
@@ -538,7 +541,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 let guard = self.fifo.lock();
                 let Some(entry) = guard.get(idx as usize) else {
                     pr_err!(
-                        "JobQueue: tick_exec() BUG: xa_idx={} missing in exec_range, advancing\n",
+                        "JobQueue: check_exec() BUG: xa_idx={} missing in exec_range, advancing\n",
                         idx
                     );
                     state.exec_range.pop_front();
@@ -591,7 +594,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                             // The callback (owning the fence) was dropped,
                             // which signals ECANCELED via DriverDmaFence::drop.
                             pr_err!(
-                                "JobQueue: tick_exec() cb alloc failed: {:?}, job {}\n",
+                                "JobQueue: check_exec() cb alloc failed: {:?}, job {}\n",
                                 e,
                                 counter
                             );
@@ -630,7 +633,7 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// The submit fence has already been signaled by the HW fence callback
     /// (`DriverFenceCallback::signaled`). This function just advances the
     /// cursor from `hw_range` to `done_range`.
-    fn tick_retire(&self, state: &mut PipelineState) {
+    fn check_retire(&self, state: &mut PipelineState) {
         while !state.hw_range.is_empty() {
             let idx = state.hw_range.start;
 
@@ -638,7 +641,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 let guard = self.fifo.lock();
                 let Some(entry) = guard.get(idx as usize) else {
                     pr_err!(
-                        "JobQueue: tick_retire() BUG: xa_idx={} missing in hw_range, advancing\n",
+                        "JobQueue: check_retire() BUG: xa_idx={} missing in hw_range, advancing\n",
                         idx
                     );
                     state.hw_range.pop_front();
@@ -760,9 +763,9 @@ impl<T: QueueOps> JobQueueInner<T> {
         Ok(())
     }
 
-    /// Schedule a tick on the system workqueue, unless tick scheduling is
-    /// suppressed by an active [`CoalesceGuard`].
-    fn maybe_tick(self: &Arc<Self>) {
+    /// Schedule a pipeline check on the system workqueue, unless suppressed
+    /// by an active [`CoalesceGuard`].
+    fn maybe_check_progress(self: &Arc<Self>) {
         if !self.coalesce.load(Ordering::Relaxed) {
             let _ = self.queue.enqueue::<Arc<Self>, 0>(self.clone());
         }
@@ -792,12 +795,12 @@ struct DepCallback<T: QueueOps> {
 
 impl<T: QueueOps> FenceCallback for DepCallback<T> {
     fn signaled(self, _fence: &ARef<PublicDmaFence>) {
-        self.inner.maybe_tick();
+        self.inner.maybe_check_progress();
     }
 }
 
 /// Hardware fence callback. Signals the submit fence directly when the HW
-/// fence fires, then triggers a pipeline tick so that `tick_retire()` can
+/// fence fires, then triggers a pipeline check so that `check_retire()` can
 /// advance the cursor.
 struct DriverFenceCallback<T: QueueOps> {
     submit_fence: DriverDmaFence<SubmitFenceData, Published>,
@@ -807,7 +810,7 @@ struct DriverFenceCallback<T: QueueOps> {
 impl<T: QueueOps> FenceCallback for DriverFenceCallback<T> {
     fn signaled(self, fence: &ARef<PublicDmaFence>) {
         self.submit_fence.signal(fence.error());
-        self.inner.maybe_tick();
+        self.inner.maybe_check_progress();
     }
 }
 
@@ -833,9 +836,9 @@ impl<T: QueueOps> Drop for CoalesceGuard<T> {
     fn drop(&mut self) {
         self.inner.coalesce.store(false, Ordering::Relaxed);
         if self.inline {
-            self.inner.tick();
+            self.inner.check_progress();
         } else {
-            self.inner.maybe_tick();
+            self.inner.maybe_check_progress();
         }
     }
 }
@@ -933,7 +936,7 @@ impl<T: QueueOps> JobQueue<T> {
         drop(guard);
         drop(inbox);
 
-        self.inner.maybe_tick();
+        self.inner.maybe_check_progress();
         Ok(submit_fence)
     }
 
@@ -998,11 +1001,12 @@ impl<T: QueueOps> JobQueue<T> {
 
     /// Unpark the queue, allowing jobs to be submitted to the driver again.
     ///
-    /// Immediately schedules a tick so that any jobs that accumulated in
-    /// `WaitingForExec` while the queue was parked are drained without delay.
+    /// Immediately schedules a progress check so that any jobs that accumulated
+    /// in `WaitingForExec` while the queue was parked are drained without
+    /// delay.
     pub fn unpark(&self) {
         self.inner.state.lock().parked = false;
-        self.inner.maybe_tick();
+        self.inner.maybe_check_progress();
     }
 
     /// Cancel all pending and running jobs. Waits for HW jobs to drain.
