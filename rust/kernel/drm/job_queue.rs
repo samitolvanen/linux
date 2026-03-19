@@ -204,6 +204,16 @@ impl WrapRange {
     }
 }
 
+/// Dependency tracking state for a single job.
+struct JobDependencies<T: QueueOps> {
+    /// All dependency fences, set at submit time.
+    fences: KVec<ARef<PublicDmaFence>>,
+    /// Which dependency we're currently waiting on.
+    current_idx: usize,
+    /// The currently active dependency callback (at most one at a time).
+    active_cb: Option<Pin<KBox<FenceCallbackRegistration<DepCallback<T>>>>>,
+}
+
 /// A single per-job allocation stored in the XArray.
 ///
 /// Each job gets exactly one `JobEntry` that lives for its entire lifetime in
@@ -228,14 +238,7 @@ struct JobEntry<T: QueueOps> {
     /// When the job was submitted (for timeout checking).
     submitted_at: Instant<Monotonic>,
 
-    /// All dependency fences, set at submit time.
-    dependencies: KVec<ARef<PublicDmaFence>>,
-
-    /// Which dependency we're currently waiting on.
-    current_dep_idx: usize,
-
-    /// The currently active dependency callback (at most one at a time).
-    active_dep_cb: Option<Pin<KBox<FenceCallbackRegistration<DepCallback<T>>>>>,
+    deps: JobDependencies<T>,
 
     /// The hardware fence returned by the driver's submit callback.
     driver_fence: Option<ARef<PublicDmaFence>>,
@@ -467,10 +470,10 @@ impl<T: QueueOps> JobQueueInner<T> {
                         break;
                     };
 
-                    if entry.current_dep_idx >= entry.dependencies.len() {
+                    if entry.deps.current_idx >= entry.deps.fences.len() {
                         None // All deps satisfied
                     } else {
-                        Some(entry.dependencies[entry.current_dep_idx].clone())
+                        Some(entry.deps.fences[entry.deps.current_idx].clone())
                     }
                 };
 
@@ -478,7 +481,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     let mut guard = self.fifo.lock();
                     if let Some(entry) = guard.get_mut(idx as usize) {
                         // Free this allocation and drop the fences.
-                        entry.dependencies = KVec::new();
+                        entry.deps.fences = KVec::new();
                     }
                     state.deps_range.pop_front();
                     state.exec_range.push_back();
@@ -495,15 +498,15 @@ impl<T: QueueOps> JobQueueInner<T> {
                     Ok(registration) => {
                         let mut guard = self.fifo.lock();
                         if let Some(entry) = guard.get_mut(idx as usize) {
-                            entry.active_dep_cb = Some(registration);
+                            entry.deps.active_cb = Some(registration);
                         }
                         return;
                     }
                     Err(CallbackError::AlreadySignaled(_)) => {
                         let mut guard = self.fifo.lock();
                         if let Some(entry) = guard.get_mut(idx as usize) {
-                            entry.active_dep_cb = None;
-                            entry.current_dep_idx += 1;
+                            entry.deps.active_cb = None;
+                            entry.deps.current_idx += 1;
                         }
                         // Continue inner loop for next dep.
                     }
@@ -516,8 +519,8 @@ impl<T: QueueOps> JobQueueInner<T> {
                         // Skip this dependency and try the next one.
                         let mut guard = self.fifo.lock();
                         if let Some(entry) = guard.get_mut(idx as usize) {
-                            entry.active_dep_cb = None;
-                            entry.current_dep_idx += 1;
+                            entry.deps.active_cb = None;
+                            entry.deps.current_idx += 1;
                         }
                         // Continue inner loop for next dep.
                     }
@@ -904,9 +907,11 @@ impl<T: QueueOps> JobQueue<T> {
                 submit_fence_drv: Some(submit_fence_drv),
                 counter,
                 submitted_at: Instant::<Monotonic>::now(),
-                dependencies: deps,
-                current_dep_idx: 0,
-                active_dep_cb: None,
+                deps: JobDependencies {
+                    fences: deps,
+                    current_idx: 0,
+                    active_cb: None,
+                },
                 driver_fence: None,
                 driver_fence_cb: None,
             },
