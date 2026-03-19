@@ -623,7 +623,7 @@ impl<T: DriverDmaFenceOps> DriverDmaFenceInner<T> {
     }
 
     /// Returns a pointer to the raw `dma_fence`.
-    pub fn raw(&self) -> *mut bindings::dma_fence {
+    pub(crate) fn raw(&self) -> *mut bindings::dma_fence {
         self.fence.get()
     }
 
