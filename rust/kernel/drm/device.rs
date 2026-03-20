@@ -27,12 +27,14 @@ use crate::{
 };
 use core::{
     alloc::Layout,
-    mem,
-    ops::Deref,
-    ptr::{
+    cell::UnsafeCell,
+    mem::{
         self,
-        NonNull, //
+        MaybeUninit, //
     },
+    ops::Deref,
+    ptr::NonNull,
+    sync::atomic::*,
 };
 
 #[cfg(CONFIG_DRM_LEGACY)]
@@ -76,7 +78,14 @@ macro_rules! drm_legacy_fields {
 #[repr(C)]
 pub struct Device<T: drm::Driver> {
     dev: Opaque<bindings::drm_device>,
-    data: T::Data,
+
+    /// Keeps track of whether we've initialized the device data yet.
+    pub(super) data_is_init: AtomicBool,
+
+    /// The Driver's private data.
+    ///
+    /// This must only be written to from [`Device::new`].
+    pub(super) data: UnsafeCell<MaybeUninit<T::Data>>,
 }
 
 impl<T: drm::Driver> Device<T> {
@@ -133,8 +142,13 @@ impl<T: drm::Driver> Device<T> {
         .cast();
         let raw_drm = NonNull::new(from_err_ptr(raw_drm)?).ok_or(ENOMEM)?;
 
+        // Extract *mut MaybeUninit<T::Data> from UnsafeCell<MaybeUninit<T::Data>>
         // SAFETY: `raw_drm` is a valid pointer to `Self`.
-        let raw_data = unsafe { ptr::addr_of_mut!((*raw_drm.as_ptr()).data) };
+        let raw_data = unsafe { (*(raw_drm.as_ptr())).data.get() };
+
+        // Extract *mut T::Data from *mut MaybeUninit<T::Data>
+        // SAFETY: `raw_data` is derived from `raw_drm` which is a valid pointer to `Self`.
+        let raw_data = unsafe { (*raw_data).as_mut_ptr() };
 
         // SAFETY:
         // - `raw_data` is a valid pointer to uninitialized memory.
@@ -148,6 +162,14 @@ impl<T: drm::Driver> Device<T> {
             // refcount must be non-zero.
             unsafe { bindings::drm_dev_put(drm_dev) };
         })?;
+
+        // SAFETY: We just initialized raw_drm above using __drm_dev_alloc(), ensuring it is safe to
+        // dereference
+        unsafe {
+            (*raw_drm.as_ptr())
+                .data_is_init
+                .store(true, Ordering::Relaxed)
+        };
 
         // SAFETY: The reference count is one, and now we take ownership of that reference as a
         // `drm::Device`.
@@ -201,6 +223,22 @@ impl<T: drm::Driver> Device<T> {
         let this = unsafe { Self::from_drm_device(ptr) };
 
         // SAFETY:
+        // - Since we are in release(), we are guaranteed that no one else has access to `this`.
+        // - We confirmed above that `this` is a valid pointer to an initialized `Self`.
+        let is_init = unsafe { &*this }.data_is_init.load(Ordering::Relaxed);
+        if is_init {
+            // SAFETY:
+            // - We confirmed we have unique access to this above.
+            // - We confirmed that `data` is initialized above.
+            let data_ptr = unsafe { &mut (*this).data };
+
+            // SAFETY:
+            // - We checked that the data is initialized above.
+            // - We do not use `data` any point after calling this function.
+            unsafe { data_ptr.get_mut().assume_init_drop() };
+        }
+
+        // SAFETY:
         // - When `release` runs it is guaranteed that there is no further access to `this`.
         // - `this` is valid for dropping.
         unsafe { core::ptr::drop_in_place(this) };
@@ -211,7 +249,8 @@ impl<T: drm::Driver> Deref for Device<T> {
     type Target = T::Data;
 
     fn deref(&self) -> &Self::Target {
-        &self.data
+        // SAFETY: `data` is only written to once in `Device::new()`, so this read will never race.
+        unsafe { (&*self.data.get()).assume_init_ref() }
     }
 }
 
