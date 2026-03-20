@@ -45,7 +45,7 @@ pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
 pub(crate) struct TyrDrmDriver;
 
 /// Convenience type alias for the DRM device type for this driver.
-pub(crate) type TyrDrmDevice = drm::Device<TyrDrmDriver>;
+pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, Ctx>;
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData {
@@ -152,10 +152,12 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
         });
 
-        let ddev: ARef<TyrDrmDevice> = drm::Device::new(pdev.as_ref(), data)?;
-        drm::driver::Registration::new_foreign_owned(&ddev, pdev.as_ref(), 0)?;
+        let tdev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref(), data)?;
+        let tdev = drm::driver::Registration::new_foreign_owned(tdev, pdev.as_ref(), 0)?;
 
-        let driver = TyrPlatformDriverData { _device: ddev };
+        let driver = TyrPlatformDriverData {
+            _device: tdev.into(),
+        };
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
