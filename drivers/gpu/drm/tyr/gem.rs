@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
-    drm::gem,
+    drm::{
+        gem,
+        DeviceContext, //
+    },
     prelude::*, //
 };
 
@@ -18,7 +21,10 @@ impl gem::DriverObject for TyrObject {
     type Driver = TyrDrmDriver;
     type Args = ();
 
-    fn new(_dev: &TyrDrmDevice, _size: usize, _args: ()) -> impl PinInit<Self, Error> {
+    fn new<Ctx: DeviceContext>(
+        _dev: &TyrDrmDevice<Ctx>,
+        _size: usize,
+    ) -> impl PinInit<Self, Error> {
         try_pin_init!(TyrObject {})
     }
 }
