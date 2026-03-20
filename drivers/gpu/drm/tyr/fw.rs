@@ -105,17 +105,22 @@ pub(crate) struct RequestField {
 }
 
 impl RequestField {
-    fn new(shared_section: &SharedSectionRange, req_offset: usize, ack_offset: usize) -> Self {
+    pub(crate) fn new(
+        req_area: &SharedSectionRange,
+        req_offset: usize,
+        ack_area: &SharedSectionRange,
+        ack_offset: usize,
+    ) -> Self {
         let req = SharedSectionRange {
-            shared_section: shared_section.shared_section.clone(),
-            start: shared_section.start + req_offset,
-            end: shared_section.start + req_offset + core::mem::size_of::<u32>(),
+            shared_section: req_area.shared_section.clone(),
+            start: req_area.start + req_offset,
+            end: req_area.start + req_offset + core::mem::size_of::<u32>(),
         };
 
         let ack = SharedSectionRange {
-            shared_section: shared_section.shared_section.clone(),
-            start: shared_section.start + ack_offset,
-            end: shared_section.start + ack_offset + core::mem::size_of::<u32>(),
+            shared_section: ack_area.shared_section.clone(),
+            start: ack_area.start + ack_offset,
+            end: ack_area.start + ack_offset + core::mem::size_of::<u32>(),
         };
 
         Self { req, ack }

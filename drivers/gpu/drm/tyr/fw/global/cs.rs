@@ -279,6 +279,7 @@ impl SharedSectionEntry for CommandStream {
         Ok(RequestField::new(
             &self.input_area,
             core::mem::offset_of!(Input, req),
+            &self.output_area,
             core::mem::offset_of!(Output, ack),
         ))
     }

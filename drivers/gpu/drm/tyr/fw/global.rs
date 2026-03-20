@@ -333,6 +333,7 @@ impl GlobalInterface {
         let req = RequestField::new(
             &input_area,
             core::mem::offset_of!(Input, req),
+            &output_area,
             core::mem::offset_of!(Output, ack),
         );
         req.update_reqs(GLB_IDLE_EN, GLB_IDLE_EN)?;
@@ -395,6 +396,7 @@ impl GlobalInterface {
         let req = RequestField::new(
             &glb_iface.input_area,
             core::mem::offset_of!(Input, req),
+            &glb_iface.output_area,
             core::mem::offset_of!(Output, ack),
         );
 
@@ -527,6 +529,7 @@ impl SharedSectionEntry for GlobalInterface {
         Ok(RequestField::new(
             &glb.input_area,
             core::mem::offset_of!(Input, req),
+            &glb.output_area,
             core::mem::offset_of!(Output, ack),
         ))
     }
@@ -537,6 +540,7 @@ impl SharedSectionEntry for GlobalInterface {
         Ok(RequestField::new(
             &glb.input_area,
             core::mem::offset_of!(Input, doorbell_req),
+            &glb.output_area,
             core::mem::offset_of!(Output, doorbell_ack),
         ))
     }

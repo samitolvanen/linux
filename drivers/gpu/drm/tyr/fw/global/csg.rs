@@ -222,6 +222,7 @@ impl SharedSectionEntry for CommandStreamGroup {
         Ok(RequestField::new(
             &self.input_area,
             core::mem::offset_of!(Input, req),
+            &self.output_area,
             core::mem::offset_of!(Output, ack),
         ))
     }
@@ -230,6 +231,7 @@ impl SharedSectionEntry for CommandStreamGroup {
         Ok(RequestField::new(
             &self.input_area,
             core::mem::offset_of!(Input, doorbell_req),
+            &self.output_area,
             core::mem::offset_of!(Output, doorbell_ack),
         ))
     }
@@ -240,6 +242,7 @@ impl SharedSectionEntry for CommandStreamGroup {
         Ok(RequestField::new(
             &self.input_area,
             core::mem::offset_of!(Input, irq_ack),
+            &self.output_area,
             core::mem::offset_of!(Output, irq_req),
         ))
     }
