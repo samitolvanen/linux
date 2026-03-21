@@ -85,6 +85,9 @@ use crate::{
     c_str,
     dma_fence::{
         CallbackError,
+        DmaFenceWork,
+        DmaFenceWorkItem,
+        DmaFenceWorkqueue,
         DriverDmaFence,
         DriverDmaFenceOps,
         FenceCallback,
@@ -94,8 +97,10 @@ use crate::{
     },
     error::Result,
     impl_has_delayed_work,
+    impl_has_dma_fence_work,
     impl_has_work,
     new_delayed_work,
+    new_dma_fence_work,
     new_mutex,
     new_work,
     prelude::*,
@@ -339,7 +344,7 @@ struct JobQueueInner<T: QueueOps> {
 
     /// Runs `check_progress()` in process context.
     #[pin]
-    work: Work<JobQueueInner<T>>,
+    work: DmaFenceWork<JobQueueInner<T>>,
 
     /// Watchdog timer for timed-out HW jobs.
     #[pin]
@@ -349,8 +354,11 @@ struct JobQueueInner<T: QueueOps> {
     #[pin]
     cleanup_work: Work<JobQueueInner<T>, 3>,
 
-    /// Dedicated high-priority workqueue for progress check and cleanup work.
-    queue: OwnedQueue,
+    /// Workqueue for the main pipeline check (enforces DMA fence signaling rules).
+    wq: Arc<DmaFenceWorkqueue>,
+
+    /// Internal workqueue for timeout and cleanup work.
+    aux_queue: OwnedQueue,
 
     /// DMA fence context ID allocated at creation time.
     fence_ctx_id: u64,
@@ -373,8 +381,8 @@ struct JobQueueInner<T: QueueOps> {
 unsafe impl<T: QueueOps> Send for JobQueueInner<T> {}
 unsafe impl<T: QueueOps> Sync for JobQueueInner<T> {}
 
-impl_has_work! {
-    impl{T: QueueOps} HasWork<JobQueueInner<T>> for JobQueueInner<T> { self.work }
+impl_has_dma_fence_work! {
+    impl{T: QueueOps} HasDmaFenceWork<JobQueueInner<T>> for JobQueueInner<T> { self.work }
 }
 
 impl_has_delayed_work! {
@@ -385,7 +393,7 @@ impl_has_work! {
     impl{T: QueueOps} HasWork<JobQueueInner<T>, 3> for JobQueueInner<T> { self.cleanup_work }
 }
 
-impl<T: QueueOps> WorkItem for JobQueueInner<T> {
+impl<T: QueueOps> DmaFenceWorkItem for JobQueueInner<T> {
     type Pointer = Arc<Self>;
 
     fn run(this: Arc<Self>) {
@@ -770,20 +778,20 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// by an active [`CoalesceGuard`].
     fn maybe_check_progress(self: &Arc<Self>) {
         if !self.coalesce.load(Ordering::Relaxed) {
-            let _ = self.queue.enqueue::<Arc<Self>, 0>(self.clone());
+            let _ = self.wq.enqueue::<Arc<Self>, 0>(self.clone());
         }
     }
 
     /// Schedule the timeout watchdog for hardware jobs.
     fn schedule_timeout(self: &Arc<Self>) {
         let _ = self
-            .queue
+            .aux_queue
             .enqueue_delayed::<Arc<Self>, 1>(self.clone(), self.timeout);
     }
 
     /// Schedule deferred cleanup of completed entries.
     fn schedule_cleanup(self: &Arc<Self>) {
-        let _ = self.queue.enqueue::<Arc<Self>, 3>(self.clone());
+        let _ = self.aux_queue.enqueue::<Arc<Self>, 3>(self.clone());
     }
 }
 
@@ -851,9 +859,10 @@ impl<T: QueueOps> JobQueue<T> {
     ///
     /// `handler` is the driver's submission logic.
     /// `timeout` is the watchdog timeout for jobs on hardware.
-    pub fn new(handler: T, timeout: Jiffies) -> Result<Self> {
-        let queue = OwnedQueue::new(
-            c_str!("job_queue"),
+    /// `wq` is the DMA fence workqueue to schedule pipeline checks on.
+    pub fn new(handler: T, timeout: Jiffies, wq: Arc<DmaFenceWorkqueue>) -> Result<Self> {
+        let aux_queue = OwnedQueue::new(
+            c_str!("job_queue_aux"),
             WqFlags::HIGHPRI | WqFlags::MEM_RECLAIM,
             0,
         )?;
@@ -869,10 +878,11 @@ impl<T: QueueOps> JobQueue<T> {
                 }),
                 state <- new_mutex!(PipelineState::new()),
                 handler,
-                work <- new_work!("JobQueue::work"),
+                work <- new_dma_fence_work!("JobQueue::work"),
                 timeout_work <- new_delayed_work!("JobQueue::timeout_work"),
                 cleanup_work <- new_work!("JobQueue::cleanup_work"),
-                queue,
+                wq,
+                aux_queue,
                 fence_ctx_id,
                 fence_seqno: AtomicU64::new(1),
                 job_counter: AtomicU64::new(0),

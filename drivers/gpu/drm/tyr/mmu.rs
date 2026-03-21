@@ -5,6 +5,7 @@ use core::ops::Range;
 use as_lock::AsLockToken;
 use faults::decode_faults;
 use kernel::devres::Devres;
+use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::io;
 use kernel::io_pgtable;
 use kernel::new_mutex;
@@ -54,9 +55,19 @@ impl Mmu {
         layout: VmLayout,
         auto_kernel_va: Range<u64>,
         iomem: Arc<Devres<IoMem>>,
+        wq: Arc<DmaFenceWorkqueue>,
         /* coherent: bool, */
     ) -> Result<Arc<Mutex<Vm>>> {
-        let vm = Vm::create(tdev, pdev, for_mcu, gpu_info, layout, auto_kernel_va, iomem)?;
+        let vm = Vm::create(
+            tdev,
+            pdev,
+            for_mcu,
+            gpu_info,
+            layout,
+            auto_kernel_va,
+            iomem,
+            wq,
+        )?;
 
         let vm = Arc::pin_init(new_mutex!(vm), GFP_KERNEL)?;
         self.vms.push(vm.clone(), GFP_KERNEL)?;

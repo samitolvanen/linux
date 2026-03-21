@@ -3,7 +3,6 @@
 use group::Group;
 use kernel::bits::checked_bit_u32;
 use kernel::bits::genmask_u32;
-use kernel::c_str;
 use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::drm::gem::BaseObject;
 use kernel::kvec;
@@ -12,7 +11,6 @@ use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::time::Delta;
 use kernel::time::Instant;
-use kernel::workqueue::WqFlags;
 use queue::Queue;
 
 use crate::driver::TyrData;
@@ -102,7 +100,7 @@ pub(crate) struct Scheduler {
     /// Used for the scheduler tick, group update or other kinds of FW event
     /// processing that cannot be handled in the threaded interrupt path. Also
     /// passed to the job queues embedded in our GPU queues.
-    wq: DmaFenceWorkqueue,
+    wq: Arc<DmaFenceWorkqueue>,
 
     /// When the next tick should occur.
     resched_target: Option<Instant<kernel::time::RealTime>>,
@@ -154,7 +152,7 @@ impl Scheduler {
         let csg_slot_count = core::cmp::min(num_groups, gpu_as_count);
         let as_slot_count = gpu_as_count;
 
-        let wq = DmaFenceWorkqueue::new(c_str!("tyr-csf-sched"), WqFlags::UNBOUND, 0)?;
+        let wq = tdev.wq.clone();
 
         // Populate CSIF info in TyrDevice
         {

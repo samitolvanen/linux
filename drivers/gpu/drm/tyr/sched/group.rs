@@ -193,7 +193,7 @@ impl Group {
 
         let mut queues = kvec![];
         for i in 0..group_args.queues.count {
-            let queue = Queue::new(tdev, &queue_args[i as usize], vm.clone())?;
+            let queue = Queue::new(tdev, &queue_args[i as usize], vm.clone(), tdev.wq.clone())?;
             queues.push(queue, GFP_KERNEL)?;
         }
 

@@ -3,6 +3,7 @@
 use global::GlobalInterface;
 use kernel::bindings::SZ_1G;
 use kernel::devres::Devres;
+use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::firmware;
 use kernel::new_mutex;
 use kernel::platform;
@@ -205,6 +206,7 @@ impl Firmware {
         mmu: Pin<&Mutex<Mmu>>,
         iomem: Arc<Devres<IoMem>>,
         event_wait: Arc<Wait>,
+        wq: Arc<DmaFenceWorkqueue>,
     ) -> Result<impl PinInit<Self>> {
         let vm = {
             let auto_kernel_va = CSF_MCU_SHARED_REGION_START as u64
@@ -225,6 +227,7 @@ impl Firmware {
                 },
                 auto_kernel_va,
                 iomem.clone(),
+                wq,
             )?;
 
             mmu.bind_vm(vm.clone(), gpu_info, &iomem)?;

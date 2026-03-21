@@ -3,6 +3,7 @@
 use core::ops::Range;
 
 use kernel::devres::Devres;
+use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::dma_fence::DriverDmaFenceTimeline;
 use kernel::drm::gem::BaseObject;
 use kernel::drm::job_queue::JobQueue;
@@ -64,6 +65,7 @@ impl Queue {
         tdev: &TyrDevice,
         queue_args: &QueueCreate,
         vm: Arc<Mutex<Vm>>,
+        wq: Arc<DmaFenceWorkqueue>,
     ) -> Result<Self> {
         // ugh..
         let queue_args = &queue_args.0;
@@ -87,7 +89,7 @@ impl Queue {
 
         let priority = queue_args.priority;
 
-        let job_queue = JobQueue::new(job::TyrJobHandler, msecs_to_jiffies(JOB_TIMEOUT_MS as u32))?;
+        let job_queue = JobQueue::new(job::TyrJobHandler, msecs_to_jiffies(JOB_TIMEOUT_MS as u32), wq)?;
 
         let timeline = Arc::pin_init(
             DriverDmaFenceTimeline::new(Arc::new(job::TyrTimelineOps, GFP_KERNEL)?),

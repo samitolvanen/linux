@@ -11,13 +11,14 @@ use kernel::device::Core;
 use kernel::device::Device;
 use kernel::devres::Devres;
 use kernel::dma::{Device as DmaDevice, DmaMask};
+use kernel::dma_fence::DmaFenceWork;
+use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::drm;
 use kernel::drm::ioctl;
 use kernel::irq::IrqReturn;
 use kernel::irq::ThreadedHandler;
 use kernel::irq::ThreadedIrqReturn;
 use kernel::irq::ThreadedRegistration;
-use kernel::dma_fence::DmaFenceWork;
 use kernel::new_delayed_work;
 use kernel::new_dma_fence_work;
 use kernel::new_mutex;
@@ -127,6 +128,9 @@ pub(crate) struct TyrData {
     /// The work to process group status updates.
     #[pin]
     pub(crate) group_upd_work: DmaFenceWork<Self, 3>,
+
+    /// Workqueue shared by all job queues in this device.
+    pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
     pub(crate) reset_wq: OwnedQueue,
 }
@@ -301,6 +305,14 @@ impl platform::Driver for TyrDriver {
 
         let fw_event_wait = Wait::new()?;
         let fw_boot_wait = new_wait!()?;
+        let job_wq = Arc::new(
+            DmaFenceWorkqueue::new(
+                c_str!("tyr-job-queue"),
+                WqFlags::UNBOUND | WqFlags::MEM_RECLAIM,
+                0,
+            )?,
+            GFP_KERNEL,
+        )?;
         let fw = Firmware::init(
             &tdev,
             pdev,
@@ -308,10 +320,12 @@ impl platform::Driver for TyrDriver {
             mmu.as_ref(),
             iomem.clone(),
             fw_event_wait.clone(),
+            job_wq.clone(),
         )?;
 
         // Ideally we'd find a way around this useless clone too...
         let i = iomem.clone();
+        let reset_wq = OwnedQueue::new(c_str!("tyr-reset"), WqFlags::UNBOUND, 0)?; // TODO: add WqFlags::ORDERED once it's available.
         let data_init = try_pin_init!(TyrData {
                 pdev: platform.clone(),
                 clks <- new_mutex!(Clocks {
@@ -335,7 +349,8 @@ impl platform::Driver for TyrDriver {
                 tick_work <- new_dma_fence_work!("tyr_tick"),
                 fw_events_work <- new_dma_fence_work!("tyr-fw-events"),
                 group_upd_work <- new_dma_fence_work!("tyr-group-upd"),
-                reset_wq: OwnedQueue::new(c_str!("tyr-reset"), WqFlags::UNBOUND, 0)? // TODO: add WqFlags::ORDERED once it's available.
+                wq: job_wq,
+                reset_wq,
         });
 
         unsafe {

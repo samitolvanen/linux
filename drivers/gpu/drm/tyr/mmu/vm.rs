@@ -28,6 +28,7 @@ use gpuvm::TyrVmBoData;
 use kernel::bindings::SZ_2M;
 use kernel::c_str;
 use kernel::devres::Devres;
+use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::GpuVm;
 use kernel::drm::gpuvm::GpuVmCore;
@@ -125,6 +126,7 @@ impl Vm {
         layout: VmLayout,
         auto_kernel_va: Range<u64>,
         iomem: Arc<Devres<IoMem>>,
+        wq: Arc<DmaFenceWorkqueue>,
     ) -> Result<Self> {
         // We should ideally not allocate memory for this, but there is no way
         // to create dummy GPUVM GEM objects for now.
@@ -163,7 +165,11 @@ impl Vm {
 
         let memattr = mair_to_memattr(page_table.cfg().mair);
 
-        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), msecs_to_jiffies(5000))?;
+        let job_queue = JobQueue::new(
+            bind_job::VmBindJobHandler::new(),
+            msecs_to_jiffies(5000),
+            wq,
+        )?;
 
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),
