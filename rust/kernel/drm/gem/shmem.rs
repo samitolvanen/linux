@@ -690,8 +690,8 @@ mod tests {
         type Driver = KunitDriver;
         type Args = ();
 
-        fn new(
-            _dev: &drm::Device<KunitDriver>,
+        fn new<Ctx: drm::DeviceContext>(
+            _dev: &drm::Device<KunitDriver, Ctx>,
             _size: usize,
             _args: Self::Args,
         ) -> impl PinInit<Self, Error> {
@@ -703,31 +703,38 @@ mod tests {
     impl drm::Driver for KunitDriver {
         type Data = KunitData;
         type File = KunitFile;
-        type Object = Object<KunitObject>;
+        type Object<Ctx: drm::DeviceContext> = Object<KunitObject>;
 
         const INFO: drm::DriverInfo = INFO;
         const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor] = &[];
     }
 
-    fn create_drm_dev() -> Result<(faux::Registration, ARef<drm::Device<KunitDriver>>)> {
+    fn create_drm_dev<'a>(dev: &'a faux::Registration) -> Result<&'a drm::Device<KunitDriver>> {
         // Create a faux DRM device so we can test gem object creation.
         let data = try_pin_init!(KunitData {});
-        let dev = faux::Registration::new(c"Kunit", None)?;
-        let drm = drm::Device::<KunitDriver>::new(dev.as_ref(), data)?;
+        let drm_unregistered = drm::device::UnregisteredDevice::<KunitDriver>::new(dev.as_ref())?;
 
-        Ok((dev, drm))
+        // SAFETY: The faux device is created and registered, so it's safe to treat as bound for the
+        // lifetime of the test.
+        let dev_bound = unsafe { dev.as_ref().as_bound() };
+
+        let drm =
+            drm::driver::Registration::new_foreign_owned(drm_unregistered, dev_bound, data, 0)?;
+
+        Ok(drm)
     }
 
     #[test]
     fn compile_time_vmap_sizes() -> Result {
-        let (_dev, drm) = create_drm_dev()?;
+        let dev = faux::Registration::new(c"Kunit", None)?;
+        let drm = create_drm_dev(&dev)?;
 
         // Create a gem object to test with
         let cfg_ = ObjectConfig::<KunitObject> {
             map_wc: false,
             parent_resv_obj: None,
         };
-        let obj = Object::<KunitObject>::new(&drm, PAGE_SIZE, cfg_, ())?;
+        let obj = Object::<KunitObject>::new(drm, PAGE_SIZE, cfg_, ())?;
 
         // Try creating a normal vmap
         obj.vmap::<PAGE_SIZE>()?;
@@ -743,14 +750,15 @@ mod tests {
 
     #[test]
     fn vmap_io() -> Result {
-        let (_dev, drm) = create_drm_dev()?;
+        let dev = faux::Registration::new(c"Kunit", None)?;
+        let drm = create_drm_dev(&dev)?;
 
         // Create a gem object to test with
         let cfg_ = ObjectConfig::<KunitObject> {
             map_wc: false,
             parent_resv_obj: None,
         };
-        let obj = Object::<KunitObject>::new(&drm, PAGE_SIZE, cfg_, ())?;
+        let obj = Object::<KunitObject>::new(drm, PAGE_SIZE, cfg_, ())?;
 
         let vmap = obj.vmap::<PAGE_SIZE>()?;
 
