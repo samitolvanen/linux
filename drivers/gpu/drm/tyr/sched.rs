@@ -472,7 +472,7 @@ impl Scheduler {
 
             let has_idle_queues = s
                 .group
-                .with_locked_inner(|inner| Ok(inner.queues.iter().all(|q| q.timeline.is_idle())))?;
+                .with_locked_inner(|inner| Ok(inner.queues.iter().all(|q| q.pending_submit_fences.is_empty())))?;
 
             if has_idle_queues {
                 idx = Some(i);

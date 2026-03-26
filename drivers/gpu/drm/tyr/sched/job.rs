@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::sync::atomic::Ordering;
 use kernel::bits::genmask_u64;
 use kernel::c_str;
-use kernel::dma_fence::DriverDmaFenceTimelineOps;
+use kernel::dma_fence::{
+    DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, Published,
+};
 use kernel::drm::job_queue::{JobRef, QueueOps, SubmitResult};
 use kernel::kvec;
 use kernel::prelude::*;
@@ -10,27 +13,18 @@ use kernel::sync::Arc;
 
 use crate::sched::group::Group;
 
-/// Timeline ops for tyr GPU queues.
-///
-/// Every [`crate::sched::queue::Queue`] owns a
-/// [`dma_fence::DriverDmaFenceTimeline<TyrTimelineOps>`] that tracks the GPU
-/// sync-object counter for that CS slot. Each GPU job claims the next sequence
-/// number in the timeline; when the firmware's SYNC_ADD64 instruction fires
-/// and `update_group()` reads the new sync-object value, it calls
-/// `timeline.signal_up_to(seqno)` to retire all completed fences at once.
-pub(crate) struct TyrTimelineOps;
+/// Driver data for GPU job submit fences.
+#[derive(Default)]
+pub(crate) struct TyrJobFenceData;
 
-impl DriverDmaFenceTimelineOps for TyrTimelineOps {
-    type DmaFenceData = ();
-
-    fn new_fence(&self, _seqno: u64) {}
-
+#[vtable]
+impl DriverDmaFenceOps for TyrJobFenceData {
     fn driver_name(&self) -> &'static CStr {
         c_str!("tyr")
     }
 
     fn timeline_name(&self) -> &'static CStr {
-        c_str!("tyr_fence")
+        c_str!("tyr_sched")
     }
 }
 
@@ -93,8 +87,14 @@ impl Job {
 }
 
 impl Job {
-    /// Submit this job to the hardware.
-    fn submit_to_hw(&self) -> Result<SubmitResult> {
+    /// Submit this job to the hardware, taking ownership of the submit fence.
+    ///
+    /// The fence is stored on the queue and signaled when the firmware's
+    /// SYNC_ADD64 instruction fires for this job's seqno.
+    fn submit_to_hw_with_fence(
+        &self,
+        fence: DriverDmaFence<TyrJobFenceData, Published>,
+    ) -> Result<SubmitResult<TyrJobFenceData>> {
         // TODO: use a fixed-size array instead.
         let mut instrs = kvec![];
 
@@ -185,36 +185,45 @@ impl Job {
             if queue.doorbell_id.is_none() {
                 pr_err!("submit_to_hw: group has no CSG slot assigned, NoResources (queue_idx={}, csg_id={:?})\n",
                         self.queue_idx, inner.csg_id);
-                return Ok(SubmitResult::NoResources);
+                return Ok(SubmitResult::NoResources(fence));
             }
 
             queue.append_instrs(&instrs)?;
 
-            // Claim the next timeline sequence number for this job.
-            // `job_queue`'s `DriverFenceCallback`.
-            let tl_fence = queue.timeline.new_fence()?;
-            let hw_fence = tl_fence.public_fence();
+            // Claim the next sequence number for this job.
+            let seqno = queue.next_seqno.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Store the submit fence so it can be signaled when
+            // signal_submit_fences_up_to fires for this seqno in events.rs.
+            queue.add_pending_submit_fence(seqno, fence)?;
 
             queue.kick()?;
-            Ok(SubmitResult::Submitted(hw_fence))
+            Ok(SubmitResult::Submitted)
         })
     }
 }
 
-/// Zero-sized handler that delegates to [`Job::submit_to_hw`].
+/// Zero-sized handler that delegates to [`Job::submit_to_hw_with_fence`].
 pub(crate) struct TyrJobHandler;
 
 impl QueueOps for TyrJobHandler {
     type Job = Job;
+    type FenceData = TyrJobFenceData;
 
-    fn submit(&self, job: &JobRef<'_, Job>) -> Result<SubmitResult> {
-        job.job.submit_to_hw()
+    fn submit(
+        &self,
+        job: &JobRef<'_, Job>,
+        fence: DriverDmaFence<TyrJobFenceData, Published>,
+        _wq: &DmaFenceWorkqueue,
+    ) -> Result<SubmitResult<TyrJobFenceData>> {
+        job.job.submit_to_hw_with_fence(fence)
     }
 
     fn timed_out(&self, job: &JobRef<'_, Job>) {
         pr_err!("Job {} timed out\n", job.counter);
-        // The job_queue pipeline will signal the submit fence with ETIMEDOUT.
-        // Timeline fence retirement is handled by `check_timeouts()` in job_queue.
+        // The driver should initiate a GPU reset here, which will cause
+        // events.rs to call signal_submit_fences_up_to with ETIMEDOUT,
+        // signaling the submit fence held by the queue.
     }
 }
 

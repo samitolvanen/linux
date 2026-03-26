@@ -2,7 +2,8 @@
 
 //! A way to track the internal dependencies of a group submit.
 
-use crate::mmu::vm::bind_job::VmBindJobHandler;
+use crate::mmu::vm::bind_job::{VmBindFenceData, VmBindJobHandler};
+use crate::sched::job::TyrJobFenceData;
 use kernel::alloc::KVec;
 use kernel::dma_fence::FenceChain;
 use kernel::dma_fence::PublicDmaFence;
@@ -267,7 +268,7 @@ impl<'a> Context<'a> {
                 }
             };
 
-            let finished_fence = job_queue.submit(job, &fences)?;
+            let finished_fence = job_queue.submit(job, TyrJobFenceData, &fences)?;
 
             // Update the sync signal fences with the job's completion fence
             self.update_job_syncs(job_idx, finished_fence.clone())?;
@@ -304,7 +305,7 @@ impl<'a> Context<'a> {
                 }
             };
 
-            let finished_fence = job_queue.submit(job, &fences)?;
+            let finished_fence = job_queue.submit(job, VmBindFenceData, &fences)?;
 
             // Update the sync signal fences with the job's completion fence
             self.update_job_syncs(job_idx, finished_fence.clone())?;

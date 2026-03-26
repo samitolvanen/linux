@@ -130,14 +130,15 @@ use crate::{
 };
 
 /// The result of a driver's submit call.
-pub enum SubmitResult {
-    /// The driver accepted the job and returned a hardware fence that will
-    /// signal when execution completes.
-    Submitted(ARef<PublicDmaFence>),
+pub enum SubmitResult<FD: DriverDmaFenceOps> {
+    /// The driver accepted the job and took ownership of the submit fence.
+    /// The driver must eventually call [`DriverDmaFence::signal`] when the
+    /// job completes or fails (directly or via a registered callback).
+    Submitted,
     /// The driver has no resources available (e.g. ring buffer full).
-    /// The pipeline will automatically retry on the next progress check, which
-    /// is triggered by job completions or new submissions.
-    NoResources,
+    /// The fence is returned so the pipeline can retry on the next progress
+    /// check, which is triggered by job completions or new submissions.
+    NoResources(DriverDmaFence<FD, Published>),
 }
 
 /// A read-only reference to a submitted job, provided to the driver's submit
@@ -146,8 +147,6 @@ pub struct JobRef<'a, J: Send + Sync + 'static> {
     /// The driver's job data.
     pub job: &'a J,
     /// The public fence that will be signaled when this job completes.
-    /// The driver must not signal or set errors on this fence directly;
-    /// that is handled by the pipeline in process context.
     pub submit_fence: &'a ARef<PublicDmaFence>,
     /// Monotonic job counter, useful for debug/logging.
     pub counter: u64,
@@ -158,19 +157,29 @@ pub trait QueueOps: Send + Sync + 'static {
     /// The type of job this handler processes.
     type Job: Send + Sync + 'static;
 
+    /// The driver data type embedded in submit fences.
+    ///
+    /// Use a zero-sized type to avoid per-job allocation overhead.
+    type FenceData: DriverDmaFenceOps + Send + 'static;
+
     /// Submit a job to the hardware. Called from process context.
     ///
-    /// Return [`SubmitResult::Submitted`] with a hardware fence if the job was
-    /// pushed to the HW ring.
-    ///
-    /// This returns [`SubmitResult::NoResources`] if the ring is full - which
-    /// makes the pipeline retry automatically on the next progress check - or
-    /// `Err(...)` if the job failed fatally (the submit fence gets the error).
-    fn submit(&self, job: &JobRef<'_, Self::Job>) -> Result<SubmitResult>;
+    /// `fence` is owned by the call. On [`SubmitResult::Submitted`] the driver
+    /// takes ownership and must eventually call [`DriverDmaFence::signal`]
+    /// (directly or via a callback) when the job completes or fails. On
+    /// [`SubmitResult::NoResources`] the fence is returned to the queue for
+    /// the next retry. On `Err(..)` the driver must signal `fence` with the
+    /// error before returning.
+    fn submit(
+        &self,
+        job: &JobRef<'_, Self::Job>,
+        fence: DriverDmaFence<Self::FenceData, Published>,
+        wq: &DmaFenceWorkqueue,
+    ) -> Result<SubmitResult<Self::FenceData>>;
 
     /// Called when a job has timed out on the hardware. Called from process
-    /// context. The implementation should abort the job and trigger a GPU reset
-    /// if necessary.
+    /// context. The implementation should initiate a GPU reset so that the
+    /// submit fence (held by the driver) is eventually signaled.
     fn timed_out(&self, job: &JobRef<'_, Self::Job>);
 }
 /// A wrapping range over `u32` indices.
@@ -231,11 +240,11 @@ struct JobEntry<T: QueueOps> {
     /// dependency waiters and other observers.
     submit_fence: ARef<PublicDmaFence>,
 
-    /// The driver-side submit fence handle, kept until the fence is either
-    /// moved into the HW fence callback (on successful submission) or signaled
-    /// directly (on error / timeout / cancel). Once moved into the callback,
-    /// this is `None` and never touched again.
-    submit_fence_drv: Option<DriverDmaFence<SubmitFenceData, Published>>,
+    /// The driver-side submit fence handle. Present from job creation until
+    /// the job is passed to [`QueueOps::submit`]; `None` thereafter (the
+    /// driver owns it and will signal it when done, or on drop signals
+    /// `ECANCELED`).
+    submit_fence_drv: Option<DriverDmaFence<T::FenceData, Published>>,
 
     /// Monotonic job counter for debugging.
     counter: u64,
@@ -245,28 +254,9 @@ struct JobEntry<T: QueueOps> {
 
     deps: JobDependencies<T>,
 
-    /// The hardware fence returned by the driver's submit callback.
-    driver_fence: Option<ARef<PublicDmaFence>>,
-
-    /// Callback registered on the driver fence.
-    driver_fence_cb: Option<Pin<KBox<FenceCallbackRegistration<DriverFenceCallback<T>>>>>,
-}
-
-/// Zero-sized driver data for submit fences.
-///
-/// Submit fences have no per-fence driver state; all metadata is managed by
-/// [`JobQueueInner`] (context ID, sequence number).
-struct SubmitFenceData;
-
-#[vtable]
-impl DriverDmaFenceOps for SubmitFenceData {
-    fn driver_name(&self) -> &'static CStr {
-        c_str!("job_queue")
-    }
-
-    fn timeline_name(&self) -> &'static CStr {
-        c_str!("job_queue_finished")
-    }
+    /// Callback registered on the submit fence to trigger a pipeline check
+    /// promptly when the driver signals it.
+    progress_cb: Option<Pin<KBox<FenceCallbackRegistration<ProgressCallback<T>>>>>,
 }
 
 // State managed by `submit()`. This is separate from `PipelineState` to avoid
@@ -562,6 +552,21 @@ impl<T: QueueOps> JobQueueInner<T> {
                 (entry.job.clone(), entry.submit_fence.clone(), entry.counter)
             };
 
+            // Take the submit fence out of the entry *before* calling the
+            // driver so the driver can take immediate ownership on Submitted.
+            let fence = {
+                let mut guard = self.fifo.lock();
+                guard
+                    .get_mut(idx as usize)
+                    .and_then(|e| e.submit_fence_drv.take())
+            };
+            let Some(fence) = fence else {
+                // Already submitted — shouldn't happen.
+                state.exec_range.pop_front();
+                state.hw_range.push_back();
+                continue;
+            };
+
             let job_ref = JobRef {
                 job: &*job,
                 submit_fence: &submit_fence,
@@ -569,23 +574,18 @@ impl<T: QueueOps> JobQueueInner<T> {
             };
 
             // Notice that the XArray spinlock is not held here.
-            match self.handler.submit(&job_ref) {
-                Ok(SubmitResult::Submitted(hw_fence)) => {
-                    // Take the fence from the entry and transfer it to the callback.
-                    let submit_fence_drv = {
-                        let mut guard = self.fifo.lock();
-                        let entry = guard.get_mut(idx as usize).unwrap();
-                        entry.driver_fence = Some(hw_fence.clone());
-                        entry.submit_fence_drv.take().unwrap()
-                    };
-
-                    let callback = DriverFenceCallback {
-                        submit_fence: submit_fence_drv,
-                        inner: self.clone(),
-                    };
-
+            match self.handler.submit(&job_ref, fence, &self.wq) {
+                Ok(SubmitResult::Submitted) => {
+                    // Register a callback on the public submit fence so that
+                    // check_retire() is triggered promptly when the driver
+                    // signals it.
                     let cb_result = KBox::try_pin_init(
-                        FenceCallbackRegistration::new(&hw_fence, callback),
+                        FenceCallbackRegistration::new(
+                            &submit_fence,
+                            ProgressCallback {
+                                inner: self.clone(),
+                            },
+                        ),
                         GFP_KERNEL,
                     );
 
@@ -593,45 +593,42 @@ impl<T: QueueOps> JobQueueInner<T> {
                         Ok(registration) => {
                             let mut guard = self.fifo.lock();
                             if let Some(entry) = guard.get_mut(idx as usize) {
-                                entry.driver_fence_cb = Some(registration);
+                                entry.progress_cb = Some(registration);
                             }
                         }
                         Err(CallbackError::AlreadySignaled(cb)) => {
-                            // HW fence already done — callback returned with
-                            // the submit fence still inside. Signal it.
-                            cb.submit_fence.signal(hw_fence.error());
+                            // Fence already signaled — trigger check immediately.
+                            cb.inner.maybe_check_progress();
                         }
                         Err(CallbackError::Other(e)) => {
-                            // The callback (owning the fence) was dropped,
-                            // which signals ECANCELED via DriverDmaFence::drop.
                             pr_err!(
-                                "JobQueue: check_exec() cb alloc failed: {:?}, job {}\n",
+                                "JobQueue: check_exec() progress cb alloc failed: {:?}, job {}\n",
                                 e,
                                 counter
                             );
-                            state.exec_range.pop_front();
-                            state.done_range.push_back();
-                            continue;
                         }
                     }
 
                     state.exec_range.pop_front();
                     state.hw_range.push_back();
                 }
-                Ok(SubmitResult::NoResources) => {
+                Ok(SubmitResult::NoResources(fence)) => {
+                    // Put the fence back and retry on the next tick.
+                    let mut guard = self.fifo.lock();
+                    if let Some(entry) = guard.get_mut(idx as usize) {
+                        entry.submit_fence_drv = Some(fence);
+                    }
                     return;
                 }
                 Err(e) => {
-                    // handler.submit() failed, so the fence never left the entry.
-                    let drv_fence = {
-                        let mut guard = self.fifo.lock();
-                        guard
-                            .get_mut(idx as usize)
-                            .and_then(|entry| entry.submit_fence_drv.take())
-                    };
-                    if let Some(f) = drv_fence {
-                        f.signal(Err(e));
-                    }
+                    // The driver must have signaled `fence` with `e` before
+                    // returning Err. If it did not, the fence will be signaled
+                    // ECANCELED when the driver drops it.
+                    pr_err!(
+                        "JobQueue: check_exec() submit failed: {:?}, job {}\n",
+                        e,
+                        counter
+                    );
                     state.exec_range.pop_front();
                     state.done_range.push_back();
                 }
@@ -641,9 +638,8 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// Retire completed HW jobs (in-order from the front).
     ///
-    /// The submit fence has already been signaled by the HW fence callback
-    /// (`DriverFenceCallback::signaled`). This function just advances the
-    /// cursor from `hw_range` to `done_range`.
+    /// Advances jobs whose submit fences have been signaled from `hw_range`
+    /// to `done_range`.
     fn check_retire(&self, state: &mut PipelineState) {
         while !state.hw_range.is_empty() {
             let idx = state.hw_range.start;
@@ -659,10 +655,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     state.done_range.push_back();
                     continue;
                 };
-                entry
-                    .driver_fence
-                    .as_ref()
-                    .map_or(false, |f| f.is_signaled())
+                entry.submit_fence.is_signaled()
             };
 
             if signaled {
@@ -736,18 +729,11 @@ impl<T: QueueOps> JobQueueInner<T> {
             // serializes with any in-flight signal via fence->lock. If removed
             // before firing, we get the callback (and the fence inside it)
             // back.
-            if let Some(mut reg) = entry.driver_fence_cb.take() {
-                if let Some(cb) = reg.as_mut().take() {
-                    cb.submit_fence.signal(Err(ETIMEDOUT));
-                }
-                // else: callback already fired, fence already signaled with
-                // ECANCELED. But honestly, if the fence has timed out...then
-                // this path will never be taken, I guess.
-            }
-            // If no callback was registered, fence is still in submit_fence_drv.
-            if let Some(f) = entry.submit_fence_drv.take() {
-                f.signal(Err(ETIMEDOUT));
-            }
+            // The submit fence was passed to the driver; it must signal it
+            // when the GPU reset triggered by timed_out() completes.
+            // Cancel the progress callback so it does not fire after the
+            // entry is dropped.
+            drop(entry.progress_cb.take());
 
             // entry dropped here in process context
             drop(entry);
@@ -810,17 +796,14 @@ impl<T: QueueOps> FenceCallback for DepCallback<T> {
     }
 }
 
-/// Hardware fence callback. Signals the submit fence directly when the HW
-/// fence fires, then triggers a pipeline check so that `check_retire()` can
-/// advance the cursor.
-struct DriverFenceCallback<T: QueueOps> {
-    submit_fence: DriverDmaFence<SubmitFenceData, Published>,
+/// Callback registered on the public submit fence. Triggers a pipeline check
+/// when the driver signals the fence so that `check_retire()` runs promptly.
+struct ProgressCallback<T: QueueOps> {
     inner: Arc<JobQueueInner<T>>,
 }
 
-impl<T: QueueOps> FenceCallback for DriverFenceCallback<T> {
-    fn signaled(self, fence: &ARef<PublicDmaFence>) {
-        self.submit_fence.signal(fence.error());
+impl<T: QueueOps> FenceCallback for ProgressCallback<T> {
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
         self.inner.maybe_check_progress();
     }
 }
@@ -901,9 +884,13 @@ impl<T: QueueOps> JobQueue<T> {
     pub fn submit(
         &self,
         job: T::Job,
+        fence_data: T::FenceData,
         dependencies: &[ARef<PublicDmaFence>],
     ) -> Result<ARef<PublicDmaFence>> {
-        let (submit_fence_drv, submit_fence) = self.create_submit_fence()?;
+        let seqno = self.inner.fence_seqno.fetch_add(1, Ordering::Relaxed);
+        let (submit_fence_drv, submit_fence) =
+            DriverDmaFence::new(fence_data, self.inner.fence_ctx_id, seqno)?
+                .publish();
         let counter = self.inner.job_counter.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(job, GFP_KERNEL)?;
 
@@ -922,8 +909,7 @@ impl<T: QueueOps> JobQueue<T> {
                     current_idx: 0,
                     active_cb: None,
                 },
-                driver_fence: None,
-                driver_fence_cb: None,
+                progress_cb: None,
             },
             GFP_KERNEL,
         )?;
@@ -1043,13 +1029,13 @@ impl<T: QueueOps> JobQueue<T> {
             self.inner
                 .drain_range_into(&mut state.exec_range, &mut entries)?;
 
-            // hw_range needs special handling: collect driver fences for waiting.
+            // hw_range needs special handling: wait for HW jobs to drain.
+            // The driver owns the DriverDmaFence for these jobs and will
+            // signal the public submit fence when done.
             while let Some(idx) = state.hw_range.pop_front() {
                 let mut guard = self.inner.fifo.lock();
                 if let Some(entry) = guard.remove(idx as usize) {
-                    if let Some(ref df) = entry.driver_fence {
-                        hw_fences.push(df.clone(), GFP_KERNEL)?;
-                    }
+                    hw_fences.push(entry.submit_fence.clone(), GFP_KERNEL)?;
                     entries.push(entry, GFP_KERNEL)?;
                 }
             }
@@ -1066,31 +1052,20 @@ impl<T: QueueOps> JobQueue<T> {
             let _ = fence.wait();
         }
 
-        // Signal all submit fences with ECANCELED and drop entries.
+        // Signal remaining submit fences (those not yet passed to the
+        // driver) with ECANCELED, and drop all entries.
         for mut entry in entries {
-            // Try to reclaim the fence from the callback registration.
-            if let Some(mut reg) = entry.driver_fence_cb.take() {
-                if let Some(cb) = reg.as_mut().take() {
-                    cb.submit_fence.signal(Err(ECANCELED));
-                }
-            }
-            // If no callback was registered, fence is still in submit_fence_drv.
+            // Cancel the progress callback to avoid stale triggers.
+            drop(entry.progress_cb.take());
+            // If the fence was not yet passed to the driver, signal it now.
             if let Some(f) = entry.submit_fence_drv.take() {
                 f.signal(Err(ECANCELED));
             }
+            // For hw_range entries the fence is held by the driver; we
+            // already waited above for the public submit_fence to signal.
         }
 
         Ok(())
-    }
-
-    fn create_submit_fence(
-        &self,
-    ) -> Result<(
-        DriverDmaFence<SubmitFenceData, Published>,
-        ARef<PublicDmaFence>,
-    )> {
-        let seqno = self.inner.fence_seqno.fetch_add(1, Ordering::Relaxed);
-        Ok(DriverDmaFence::new(SubmitFenceData, self.inner.fence_ctx_id, seqno)?.publish())
     }
 }
 

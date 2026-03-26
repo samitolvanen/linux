@@ -213,14 +213,12 @@ impl Scheduler {
                 .ok_or(EINVAL)?
                 .group
                 .with_locked_inner(|inner| {
-                    let queue = &inner.queues[cs_id as usize];
+                    let queue = &mut inner.queues[cs_id as usize];
 
-                    // Signal all in-flight timeline fences as failed so that
-                    // job_queue's DriverFenceCallbacks fire and the submit fences
-                    // are retired with an error.
+                    // Signal all in-flight submit fences as failed.
                     {
                         let _ann = DmaFenceSignallingAnnotation::new();
-                        queue.timeline.signal_all(Err(EINVAL));
+                        queue.signal_submit_fences_up_to(u64::MAX, Err(EINVAL));
                     }
 
                     // Let's also mark this group as destroyed just so we don't
@@ -251,7 +249,7 @@ impl Scheduler {
 
                 {
                     let _ann = DmaFenceSignallingAnnotation::new();
-                    queue.timeline.signal_up_to(sync_obj.seqno, Ok(()));
+                    queue.signal_submit_fences_up_to(sync_obj.seqno, Ok(()));
                 }
             }
             Ok(())

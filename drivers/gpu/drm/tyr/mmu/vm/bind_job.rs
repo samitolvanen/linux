@@ -5,7 +5,7 @@
 use core::ops::Range;
 
 use kernel::c_str;
-use kernel::dma_fence::{DmaFenceContext, DriverDmaFence, DriverDmaFenceOps};
+use kernel::dma_fence::{DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, Published};
 use kernel::drm::job_queue::{JobRef, QueueOps, SubmitResult};
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -49,7 +49,8 @@ unsafe impl Send for VmBindJob {}
 unsafe impl Sync for VmBindJob {}
 
 /// Opaque driver data attached to each VM bind fence.
-struct VmBindFenceData;
+#[derive(Default)]
+pub(crate) struct VmBindFenceData;
 
 #[vtable]
 impl DriverDmaFenceOps for VmBindFenceData {
@@ -65,28 +66,26 @@ impl DriverDmaFenceOps for VmBindFenceData {
 /// Handler for VM bind jobs on a [`kernel::drm::job_queue::JobQueue`].
 ///
 /// Executes page-table operations synchronously inside `submit()`, then
-/// produces an already-signaled fence so the job queue can immediately retire
-/// the job without waiting for hardware.
-pub(crate) struct VmBindJobHandler {
-    /// Fence context and seqno counter for fences produced by this handler.
-    fence_ctx: DmaFenceContext,
-}
+/// signals the provided fence immediately so the job queue can retire the
+/// job without waiting for hardware.
+pub(crate) struct VmBindJobHandler;
 
 impl VmBindJobHandler {
     pub(crate) fn new() -> Self {
-        Self {
-            fence_ctx: DmaFenceContext::new(0),
-        }
+        Self
     }
 }
 
 impl QueueOps for VmBindJobHandler {
     type Job = VmBindJob;
+    type FenceData = VmBindFenceData;
 
-    fn submit(&self, job: &JobRef<'_, VmBindJob>) -> Result<SubmitResult> {
-        let (ctx, seqno) = self.fence_ctx.next_seqno();
-        let (drv_fence, pub_fence) = DriverDmaFence::new(VmBindFenceData, ctx, seqno)?.publish();
-
+    fn submit(
+        &self,
+        job: &JobRef<'_, VmBindJob>,
+        fence: DriverDmaFence<VmBindFenceData, Published>,
+        _wq: &DmaFenceWorkqueue,
+    ) -> Result<SubmitResult<VmBindFenceData>> {
         let mut vm = job.job.vm.lock();
         let iomem = vm.iomem.clone();
 
@@ -108,11 +107,9 @@ impl QueueOps for VmBindJobHandler {
         drop(vm);
 
         // Signal the fence immediately — VM bind executes synchronously.
-        // The job queue sees AlreadySignaled when registering its callback and
-        // retires the submit fence right away.
-        drv_fence.signal(result);
+        fence.signal(result);
 
-        Ok(SubmitResult::Submitted(pub_fence))
+        Ok(SubmitResult::Submitted)
     }
 
     fn timed_out(&self, _job: &JobRef<'_, VmBindJob>) {

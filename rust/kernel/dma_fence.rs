@@ -380,7 +380,7 @@ impl Drop for FenceChain {
 /// [`wait`](Self::wait)) but intentionally does not allow signaling or setting
 /// errors.
 ///
-/// Only [`DriverDmaFence<T, Published>`] and [`DriverDmaFenceTimeline`] can
+/// Only [`DriverDmaFence<T, Published>`] can
 /// signal fences.
 ///
 /// # Invariants
@@ -933,64 +933,6 @@ unsafe impl<T: DriverDmaFenceOps + 'static, V: DriverDmaFenceVisibility> Foreign
     }
 }
 
-/// Trait implemented by drivers that use timeline-based fence management.
-///
-/// A timeline represents a single ordered stream of fences (one DMA fence
-/// context). The timeline allocates monotonically increasing sequence numbers
-/// and can signal all fences up to a given point in one call.
-pub trait DriverDmaFenceTimelineOps: Send + Sync + Sized + 'static {
-    /// Driver-specific per-fence data stored alongside each timeline fence.
-    type DmaFenceData: Send + Sync + 'static;
-
-    /// Create per-fence data for a new fence with the given sequence number.
-    fn new_fence(&self, seqno: u64) -> Self::DmaFenceData;
-
-    /// Returns the driver name for fences on this timeline.
-    fn driver_name(&self) -> &'static CStr;
-
-    /// Returns the timeline name for this specific timeline instance.
-    fn timeline_name(&self) -> &'static CStr;
-}
-
-/// Internal wrapper that pairs a reference to the shared timeline data with
-/// per-fence data.
-struct TimelineFenceData<T: DriverDmaFenceTimelineOps> {
-    timeline_data: Arc<T>,
-    fence_data: T::DmaFenceData,
-}
-
-#[vtable]
-impl<T: DriverDmaFenceTimelineOps> DriverDmaFenceOps for TimelineFenceData<T> {
-    fn driver_name(&self) -> &'static CStr {
-        self.timeline_data.driver_name()
-    }
-
-    fn timeline_name(&self) -> &'static CStr {
-        self.timeline_data.timeline_name()
-    }
-}
-
-/// A fence produced by a [`DriverDmaFenceTimeline`].
-///
-/// Bundles the public fence reference with the sequence number assigned by
-/// the timeline.
-pub struct TimelineDmaFence {
-    fence: ARef<PublicDmaFence>,
-    seqno: u64,
-}
-
-impl TimelineDmaFence {
-    /// Returns a reference to the public fence.
-    pub fn public_fence(&self) -> ARef<PublicDmaFence> {
-        self.fence.clone()
-    }
-
-    /// Returns the sequence number assigned to this fence.
-    pub fn seqno(&self) -> u64 {
-        self.seqno
-    }
-}
-
 /// A DMA fence context with a monotonically increasing sequence number counter.
 ///
 /// Wraps a kernel fence context (a globally unique `u64` allocated by
@@ -1030,126 +972,6 @@ impl DmaFenceContext {
     /// Return the last allocated sequence number.
     pub fn last_seqno(&self) -> u64 {
         self.seqno.load(Ordering::Relaxed)
-    }
-}
-
-/// Manages an ordered stream of DMA fences sharing a single fence context.
-///
-/// Fences are created with monotonically increasing sequence numbers via
-/// [`new_fence`](Self::new_fence) and signaled in bulk via
-/// [`signal_up_to`](Self::signal_up_to). Published fences are stored in an
-/// [`XArray`] indexed by sequence number for efficient lookup and removal.
-///
-/// # Invariants
-///
-/// - `fence_ctx` holds a valid DMA fence context and the emission seqno counter.
-/// - `signal_seqno` tracks the last signaled sequence number
-///   (`signal_seqno <= fence_ctx.last_seqno()`).
-#[pin_data]
-pub struct DriverDmaFenceTimeline<T: DriverDmaFenceTimelineOps> {
-    fence_ctx: DmaFenceContext,
-    signal_seqno: AtomicU64,
-    /// Shared timeline data that is accessible from all fences on this timeline.
-    data: Arc<T>,
-    #[pin]
-    fences: XArray<DriverDmaFence<TimelineFenceData<T>, Published>>,
-}
-
-impl<T: DriverDmaFenceTimelineOps> DriverDmaFenceTimeline<T> {
-    /// Create a new timeline.
-    pub fn new(data: Arc<T>) -> impl PinInit<Self, Error> {
-        try_pin_init!(Self {
-            fence_ctx: DmaFenceContext::new(0),
-            signal_seqno: AtomicU64::new(0),
-            data,
-            fences <- XArray::new(AllocKind::Alloc),
-        })
-    }
-
-    /// Create a new fence on this timeline with the next sequence number.
-    ///
-    /// Returns a [`TimelineDmaFence`] containing the public fence reference
-    /// and the assigned sequence number. The driver must eventually call
-    /// [`signal_up_to`](Self::signal_up_to) to signal this fence.
-    pub fn new_fence(&self) -> Result<TimelineDmaFence> {
-        let (ctx, seqno) = self.fence_ctx.next_seqno();
-
-        let fence_data = TimelineFenceData {
-            timeline_data: self.data.clone(),
-            fence_data: self.data.new_fence(seqno),
-        };
-        let (drv_fence, pub_fence) = DriverDmaFence::new(fence_data, ctx, seqno)?.publish();
-
-        let _old = self
-            .fences
-            .lock()
-            .store(seqno as usize, drv_fence, GFP_KERNEL)?;
-
-        Ok(TimelineDmaFence {
-            fence: pub_fence,
-            seqno,
-        })
-    }
-
-    /// Signal all pending fences with sequence numbers up to and including
-    /// `seqno`.
-    ///
-    /// The fences are removed from the [`XArray`] and signaled with the given
-    /// `result`. Fences are drained into a local [`KVec`] first and signaled
-    /// outside the XArray lock to avoid lock-ordering issues with fence
-    /// callbacks.
-    pub fn signal_up_to(&self, seqno: u64, result: Result) {
-        let target = core::cmp::min(seqno, self.fence_ctx.last_seqno());
-        let start = self.signal_seqno.load(Ordering::Relaxed);
-
-        if target <= start {
-            return;
-        }
-
-        // Drain fences to signal outside the lock.
-        let mut to_signal = KVec::new();
-        {
-            let mut fences = self.fences.lock();
-            for i in (start + 1)..=target {
-                if let Some(fence) = fences.remove(i as usize) {
-                    // Best-effort: if push fails (OOM), the fence is dropped,
-                    // which signals ECANCELED via Drop.
-                    let _ = to_signal.push(fence, GFP_ATOMIC);
-                }
-            }
-        }
-
-        // Signal outside the lock.
-        for fence in to_signal.drain_all() {
-            fence.signal(result);
-        }
-
-        self.signal_seqno.store(target, Ordering::Relaxed);
-    }
-
-    /// Signal all pending fences, regardless of sequence number.
-    ///
-    /// Typically used during teardown or fault recovery.
-    pub fn signal_all(&self, result: Result) {
-        self.signal_up_to(u64::MAX, result);
-    }
-
-    /// Returns the last allocated sequence number.
-    pub fn last_seqno(&self) -> u64 {
-        self.fence_ctx.last_seqno()
-    }
-
-    /// Returns `true` if all timeline fences have been signaled.
-    ///
-    /// This is an approximate check (the atomics are loaded independently);
-    /// it is safe to call from any context.
-    pub fn is_idle(&self) -> bool {
-        self.signal_seqno.load(Ordering::Relaxed) >= self.fence_ctx.last_seqno()
-    }
-
-    /// Returns the DMA fence context ID.
-    pub fn context(&self) -> u64 {
-        self.fence_ctx.ctx()
     }
 }
 

@@ -2,18 +2,6 @@
 
 use core::ops::Range;
 
-use kernel::devres::Devres;
-use kernel::dma_fence::DmaFenceWorkqueue;
-use kernel::dma_fence::DriverDmaFenceTimeline;
-use kernel::drm::gem::BaseObject;
-use kernel::drm::job_queue::JobQueue;
-use kernel::prelude::*;
-use kernel::sizes::SZ_4K;
-use kernel::sizes::SZ_64K;
-use kernel::sync::Arc;
-use kernel::sync::Mutex;
-use kernel::time::msecs_to_jiffies;
-
 use super::job;
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
@@ -24,6 +12,19 @@ use crate::gem;
 use crate::mmu::vm::map_flags;
 use crate::mmu::vm::Vm;
 use crate::regs::Doorbell;
+use kernel::devres::Devres;
+use core::sync::atomic::AtomicU64;
+use kernel::dma_fence::DmaFenceWorkqueue;
+use kernel::dma_fence::DriverDmaFence;
+use kernel::dma_fence::Published;
+use kernel::drm::gem::BaseObject;
+use kernel::drm::job_queue::JobQueue;
+use kernel::prelude::*;
+use kernel::sizes::SZ_4K;
+use kernel::sizes::SZ_64K;
+use kernel::sync::Arc;
+use kernel::sync::Mutex;
+use kernel::time::msecs_to_jiffies;
 
 const JOB_TIMEOUT_MS: usize = 5000;
 pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
@@ -56,8 +57,15 @@ pub(crate) struct Queue {
 
     iomem: Arc<Devres<IoMem>>,
 
-    /// Timeline fence manager for this queue.
-    pub(super) timeline: Arc<DriverDmaFenceTimeline<job::TyrTimelineOps>>,
+    /// Monotonically increasing sequence number counter. Each submitted job
+    /// claims the next value; `signal_submit_fences_up_to` uses it to match
+    /// completions reported by the firmware sync object.
+    pub(super) next_seqno: AtomicU64,
+
+    /// Submit fences waiting to be signaled when the corresponding sequence
+    /// number is reached.  Entries are appended in seqno order and consumed
+    /// (signaled) by `signal_submit_fences_up_to`.
+    pub(super) pending_submit_fences: KVec<(u64, DriverDmaFence<job::TyrJobFenceData, Published>)>,
 }
 
 impl Queue {
@@ -90,11 +98,6 @@ impl Queue {
         let priority = queue_args.priority;
 
         let job_queue = JobQueue::new(job::TyrJobHandler, msecs_to_jiffies(JOB_TIMEOUT_MS as u32), wq)?;
-
-        let timeline = Arc::pin_init(
-            DriverDmaFenceTimeline::new(Arc::new(job::TyrTimelineOps, GFP_KERNEL)?),
-            GFP_KERNEL,
-        )?;
 
         let iomem = tdev.iomem.clone();
         let ringbuf = {
@@ -133,8 +136,31 @@ impl Queue {
             ringbuf,
             interfaces,
             iomem,
-            timeline,
+            next_seqno: AtomicU64::new(0),
+            pending_submit_fences: KVec::new(),
         })
+    }
+
+    /// Store a submit fence to be signaled when `seqno` is reached.
+    pub(super) fn add_pending_submit_fence(
+        &mut self,
+        seqno: u64,
+        fence: DriverDmaFence<job::TyrJobFenceData, Published>,
+    ) -> Result {
+        self.pending_submit_fences
+            .push((seqno, fence), GFP_KERNEL)
+            .map_err(|_| ENOMEM)
+    }
+
+    /// Signal and drain all pending submit fences with seqno <= `seqno`.
+    pub(super) fn signal_submit_fences_up_to(&mut self, seqno: u64, result: Result) {
+        while let Some(&(s, _)) = self.pending_submit_fences.first() {
+            if s > seqno {
+                break;
+            }
+            let (_, fence) = self.pending_submit_fences.remove(0).unwrap();
+            fence.signal(result);
+        }
     }
 
     /// Append instructions to this queue for execution.
