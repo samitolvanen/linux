@@ -34,6 +34,10 @@ use kernel::drm::gpuvm::GpuVm;
 use kernel::drm::gpuvm::GpuVmCore;
 use kernel::drm::gpuvm::OpMapRequest;
 use kernel::drm::job_queue::JobQueue;
+use kernel::drm::job_queue::PipelineBuilder;
+use kernel::drm::job_queue::StageAdvance;
+use kernel::drm::job_queue::StageContext;
+use kernel::drm::job_queue::StageOps;
 use kernel::io_pgtable::ARM64LPAES1;
 use kernel::io_pgtable::{self};
 use kernel::platform;
@@ -42,6 +46,8 @@ use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 use kernel::types::ARef;
+use kernel::time::msecs_to_jiffies;
+use kernel::time::Jiffies;
 
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
@@ -57,6 +63,26 @@ pub(crate) mod exec;
 mod gpuvm;
 pub(crate) mod map_flags;
 pub(crate) mod pool;
+
+/// Pipeline stage that waits for a VM bind operation to complete on hardware,
+/// retiring the job if it takes longer than `timeout` jiffies.
+struct VmBindTimeoutStage {
+    timeout: Jiffies,
+}
+
+impl StageOps<bind_job::VmBindJobHandler> for VmBindTimeoutStage {
+    fn process(&self, ctx: &StageContext<'_, bind_job::VmBindJobHandler>) -> StageAdvance {
+        if ctx.submit_fence.is_signaled() {
+            return StageAdvance::Advance;
+        }
+        let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+        if elapsed >= self.timeout {
+            pr_err!("Async VM bind job {} timed out\n", ctx.counter);
+            return StageAdvance::TimedOut(ETIMEDOUT);
+        }
+        StageAdvance::WaitFor(self.timeout - elapsed)
+    }
+}
 
 mod range;
 pub(crate) use self::range::LiveRange;
@@ -164,7 +190,10 @@ impl Vm {
 
         let memattr = mair_to_memattr(page_table.cfg().mair);
 
-        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), wq)?;
+        let pipeline = PipelineBuilder::new().add_stage(VmBindTimeoutStage {
+            timeout: msecs_to_jiffies(5000u32),
+        })?;
+        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), wq, pipeline)?;
 
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),

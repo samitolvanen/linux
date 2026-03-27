@@ -19,13 +19,40 @@ use kernel::dma_fence::DriverDmaFence;
 use kernel::dma_fence::Published;
 use kernel::drm::gem::BaseObject;
 use kernel::drm::job_queue::JobQueue;
+use kernel::drm::job_queue::PipelineBuilder;
+use kernel::drm::job_queue::StageAdvance;
+use kernel::drm::job_queue::StageContext;
+use kernel::drm::job_queue::StageOps;
 use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sizes::SZ_64K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
+use kernel::time::msecs_to_jiffies;
+use kernel::time::Jiffies;
 
+const JOB_TIMEOUT_MS: usize = 5000;
 pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
+
+/// Pipeline stage that waits for hardware completion and retires the job if
+/// it takes longer than `timeout` jiffies.
+struct HwTimeoutStage {
+    timeout: Jiffies,
+}
+
+impl StageOps<job::TyrJobHandler> for HwTimeoutStage {
+    fn process(&self, ctx: &StageContext<'_, job::TyrJobHandler>) -> StageAdvance {
+        if ctx.submit_fence.is_signaled() {
+            return StageAdvance::Advance;
+        }
+        let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+        if elapsed >= self.timeout {
+            pr_err!("Job {} timed out\n", ctx.counter);
+            return StageAdvance::TimedOut(ETIMEDOUT);
+        }
+        StageAdvance::WaitFor(self.timeout - elapsed)
+    }
+}
 
 /// Represents a hardware executiion queue.
 pub(crate) struct Queue {
@@ -95,7 +122,10 @@ impl Queue {
 
         let priority = queue_args.priority;
 
-        let job_queue = JobQueue::new(job::TyrJobHandler, wq)?;
+        let pipeline = PipelineBuilder::new().add_stage(HwTimeoutStage {
+            timeout: msecs_to_jiffies(JOB_TIMEOUT_MS as u32),
+        })?;
+        let job_queue = JobQueue::new(job::TyrJobHandler, wq, pipeline)?;
 
         let iomem = tdev.iomem.clone();
         let ringbuf = {
