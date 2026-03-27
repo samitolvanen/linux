@@ -219,12 +219,6 @@ impl QueueOps for TyrJobHandler {
         job.job.submit_to_hw_with_fence(fence)
     }
 
-    fn timed_out(&self, job: &JobRef<'_, Job>) {
-        pr_err!("Job {} timed out\n", job.counter);
-        // The driver should initiate a GPU reset here, which will cause
-        // events.rs to call signal_submit_fences_up_to with ETIMEDOUT,
-        // signaling the submit fence held by the queue.
-    }
 }
 
 unsafe impl Send for Job {}

@@ -96,10 +96,8 @@ use crate::{
         Published,
     },
     error::Result,
-    impl_has_delayed_work,
     impl_has_dma_fence_work,
     impl_has_work,
-    new_delayed_work,
     new_dma_fence_work,
     new_mutex,
     new_work,
@@ -107,12 +105,6 @@ use crate::{
     sync::{
         Arc,
         Mutex, //
-    },
-    time::{
-        msecs_to_jiffies,
-        Instant,
-        Jiffies,
-        Monotonic, //
     },
     types::ARef, //
     workqueue::{
@@ -176,11 +168,6 @@ pub trait QueueOps: Send + Sync + 'static {
         fence: DriverDmaFence<Self::FenceData, Published>,
         wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>>;
-
-    /// Called when a job has timed out on the hardware. Called from process
-    /// context. The implementation should initiate a GPU reset so that the
-    /// submit fence (held by the driver) is eventually signaled.
-    fn timed_out(&self, job: &JobRef<'_, Self::Job>);
 }
 /// A wrapping range over `u32` indices.
 ///
@@ -248,9 +235,6 @@ struct JobEntry<T: QueueOps> {
 
     /// Monotonic job counter for debugging.
     counter: u64,
-
-    /// When the job was submitted (for timeout checking).
-    submitted_at: Instant<Monotonic>,
 
     deps: JobDependencies<T>,
 
@@ -336,10 +320,6 @@ struct JobQueueInner<T: QueueOps> {
     #[pin]
     work: DmaFenceWork<JobQueueInner<T>>,
 
-    /// Watchdog timer for timed-out HW jobs.
-    #[pin]
-    timeout_work: DelayedWork<JobQueueInner<T>, 1>,
-
     /// Deferred drop of JobEntry in process context.
     #[pin]
     cleanup_work: Work<JobQueueInner<T>, 3>,
@@ -347,7 +327,7 @@ struct JobQueueInner<T: QueueOps> {
     /// Workqueue for the main pipeline check (enforces DMA fence signaling rules).
     wq: Arc<DmaFenceWorkqueue>,
 
-    /// Internal workqueue for timeout and cleanup work.
+    /// Internal workqueue for cleanup work.
     aux_queue: OwnedQueue,
 
     /// DMA fence context ID allocated at creation time.
@@ -358,9 +338,6 @@ struct JobQueueInner<T: QueueOps> {
 
     /// Monotonic job counter.
     job_counter: AtomicU64,
-
-    /// Configurable timeout for watchdog.
-    timeout: Jiffies,
 
     /// When true, fence callbacks skip scheduling ticks via the workqueue, and
     /// ticks have to be manually triggered. This allows batching multiple fence
@@ -375,10 +352,6 @@ impl_has_dma_fence_work! {
     impl{T: QueueOps} HasDmaFenceWork<JobQueueInner<T>> for JobQueueInner<T> { self.work }
 }
 
-impl_has_delayed_work! {
-    impl{T: QueueOps} HasDelayedWork<JobQueueInner<T>, 1> for JobQueueInner<T> { self.timeout_work }
-}
-
 impl_has_work! {
     impl{T: QueueOps} HasWork<JobQueueInner<T>, 3> for JobQueueInner<T> { self.cleanup_work }
 }
@@ -388,14 +361,6 @@ impl<T: QueueOps> DmaFenceWorkItem for JobQueueInner<T> {
 
     fn run(this: Arc<Self>) {
         this.check_progress();
-    }
-}
-
-impl<T: QueueOps> WorkItem<1> for JobQueueInner<T> {
-    type Pointer = Arc<Self>;
-
-    fn run(this: Arc<Self>) {
-        this.check_timeouts();
     }
 }
 
@@ -435,14 +400,10 @@ impl<T: QueueOps> JobQueueInner<T> {
 
         //  Schedule deferred work as needed.
         let needs_cleanup = !state.done_range.is_empty();
-        let has_hw = !state.hw_range.is_empty();
         drop(state);
 
         if needs_cleanup {
             self.schedule_cleanup();
-        }
-        if has_hw {
-            self.schedule_timeout();
         }
     }
 
@@ -684,68 +645,8 @@ impl<T: QueueOps> JobQueueInner<T> {
         drop(entries_to_drop);
     }
 
-    /// Check the oldest HW job for timeout.
-    fn check_timeouts(self: &Arc<Self>) {
-        let (timed_out_entry, has_hw) = {
-            let mut state = self.state.lock();
-            if state.hw_range.is_empty() {
-                return;
-            }
-
-            let idx = state.hw_range.start;
-
-            let should_timeout = {
-                let guard = self.fifo.lock();
-                if let Some(entry) = guard.get(idx as usize) {
-                    let elapsed = entry.submitted_at.elapsed();
-                    let elapsed_jiffies = msecs_to_jiffies(elapsed.as_millis() as u32);
-                    elapsed_jiffies >= self.timeout
-                } else {
-                    false
-                }
-            };
-
-            let entry = if should_timeout {
-                state.hw_range.pop_front();
-                state.done_range.push_back();
-                let mut guard = self.fifo.lock();
-                guard.remove(idx as usize)
-            } else {
-                None
-            };
-
-            (entry, !state.hw_range.is_empty())
-        };
-
-        if let Some(mut entry) = timed_out_entry {
-            pr_err!("JobQueue: Job {} timed out\n", entry.counter);
-            let job_ref = JobRef {
-                job: &*entry.job,
-                submit_fence: &entry.submit_fence,
-                counter: entry.counter,
-            };
-            self.handler.timed_out(&job_ref);
-            // Remove the callback. take() calls dma_fence_remove_callback which
-            // serializes with any in-flight signal via fence->lock. If removed
-            // before firing, we get the callback (and the fence inside it)
-            // back.
-            // The submit fence was passed to the driver; it must signal it
-            // when the GPU reset triggered by timed_out() completes.
-            // Cancel the progress callback so it does not fire after the
-            // entry is dropped.
-            drop(entry.progress_cb.take());
-
-            // entry dropped here in process context
-            drop(entry);
-        }
-
-        if has_hw {
-            self.schedule_timeout();
-        }
-    }
-
-    /// Drain all entries from `range`, removing them from the XArray and
-    /// appending them to `entries`.
+    /// Schedule a pipeline check on the system workqueue, unless suppressed
+    /// by an active [`CoalesceGuard`].
     fn drain_range_into(
         &self,
         range: &mut WrapRange,
@@ -766,13 +667,6 @@ impl<T: QueueOps> JobQueueInner<T> {
         if !self.coalesce.load(Ordering::Relaxed) {
             let _ = self.wq.enqueue::<Arc<Self>, 0>(self.clone());
         }
-    }
-
-    /// Schedule the timeout watchdog for hardware jobs.
-    fn schedule_timeout(self: &Arc<Self>) {
-        let _ = self
-            .aux_queue
-            .enqueue_delayed::<Arc<Self>, 1>(self.clone(), self.timeout);
     }
 
     /// Schedule deferred cleanup of completed entries.
@@ -841,9 +735,8 @@ impl<T: QueueOps> JobQueue<T> {
     /// Create a new job queue.
     ///
     /// `handler` is the driver's submission logic.
-    /// `timeout` is the watchdog timeout for jobs on hardware.
     /// `wq` is the DMA fence workqueue to schedule pipeline checks on.
-    pub fn new(handler: T, timeout: Jiffies, wq: Arc<DmaFenceWorkqueue>) -> Result<Self> {
+    pub fn new(handler: T, wq: Arc<DmaFenceWorkqueue>) -> Result<Self> {
         let aux_queue = OwnedQueue::new(
             c_str!("job_queue_aux"),
             WqFlags::HIGHPRI | WqFlags::MEM_RECLAIM,
@@ -862,14 +755,12 @@ impl<T: QueueOps> JobQueue<T> {
                 state <- new_mutex!(PipelineState::new()),
                 handler,
                 work <- new_dma_fence_work!("JobQueue::work"),
-                timeout_work <- new_delayed_work!("JobQueue::timeout_work"),
                 cleanup_work <- new_work!("JobQueue::cleanup_work"),
                 wq,
                 aux_queue,
                 fence_ctx_id,
                 fence_seqno: AtomicU64::new(1),
                 job_counter: AtomicU64::new(0),
-                timeout,
                 coalesce: AtomicBool::new(false),
             }),
             GFP_KERNEL,
@@ -903,7 +794,6 @@ impl<T: QueueOps> JobQueue<T> {
                 submit_fence: submit_fence.clone(),
                 submit_fence_drv: Some(submit_fence_drv),
                 counter,
-                submitted_at: Instant::<Monotonic>::now(),
                 deps: JobDependencies {
                     fences: deps,
                     current_idx: 0,

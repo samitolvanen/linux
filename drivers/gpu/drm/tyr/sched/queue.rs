@@ -24,9 +24,7 @@ use kernel::sizes::SZ_4K;
 use kernel::sizes::SZ_64K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
-use kernel::time::msecs_to_jiffies;
 
-const JOB_TIMEOUT_MS: usize = 5000;
 pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
 
 /// Represents a hardware executiion queue.
@@ -97,7 +95,7 @@ impl Queue {
 
         let priority = queue_args.priority;
 
-        let job_queue = JobQueue::new(job::TyrJobHandler, msecs_to_jiffies(JOB_TIMEOUT_MS as u32), wq)?;
+        let job_queue = JobQueue::new(job::TyrJobHandler, wq)?;
 
         let iomem = tdev.iomem.clone();
         let ringbuf = {

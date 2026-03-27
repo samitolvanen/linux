@@ -112,7 +112,4 @@ impl QueueOps for VmBindJobHandler {
         Ok(SubmitResult::Submitted)
     }
 
-    fn timed_out(&self, _job: &JobRef<'_, VmBindJob>) {
-        pr_err!("Async VM bind job timed out\n");
-    }
 }

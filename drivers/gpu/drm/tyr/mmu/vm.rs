@@ -41,7 +41,6 @@ use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
-use kernel::time::msecs_to_jiffies;
 use kernel::types::ARef;
 
 use crate::driver::IoMem;
@@ -165,11 +164,7 @@ impl Vm {
 
         let memattr = mair_to_memattr(page_table.cfg().mair);
 
-        let job_queue = JobQueue::new(
-            bind_job::VmBindJobHandler::new(),
-            msecs_to_jiffies(5000),
-            wq,
-        )?;
+        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), wq)?;
 
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),
