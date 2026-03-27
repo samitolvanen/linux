@@ -614,6 +614,52 @@ impl<T: DriverDmaFenceOps> DriverDmaFenceInner<T> {
         Ok(unsafe { ARef::from_raw(NonNull::new_unchecked(raw)) })
     }
 
+    /// Allocate a `DriverDmaFenceInner<T>` and initialize `data` and `lock` but
+    /// not `fence` (i.e., `dma_fence_init` is not called and no seqno is
+    /// assigned, so no signal obligation is created).
+    ///
+    /// Returns an [`UninitDriverDmaFenceInner<T>`] that owns the allocation.
+    /// The caller must eventually either call [`UninitDmaFence::init`] (which
+    /// calls `dma_fence_init`) or drop the [`UninitDmaFence`] (which drops
+    /// `data` and frees the allocation).
+    fn new_uninit(data: T) -> Result<UninitDriverDmaFenceInner<T>> {
+        // SAFETY: All three fields are correctly handled:
+        // - `data` is written via raw pointer (plain move, no drop issue).
+        // - `lock` is initialized by `__spin_lock_init`.
+        // - `fence` is intentionally left uninitialized; its type
+        // `Opaque<dma_fence>` contains a `MaybeUninit` and has a no-op Drop, so
+        // this is safe.
+        let boxed = KBox::pin_init(
+            unsafe {
+                pin_init_from_closure(
+                    move |slot: *mut Self|
+                          -> ::core::result::Result<(), ::core::convert::Infallible> {
+                        (&raw mut (*slot).data).write(data);
+
+                        bindings::__spin_lock_init(
+                            Opaque::cast_into(
+                                (&raw mut (*slot).lock).cast_const(),
+                            ),
+                            c_str!("drv_dma_fence").as_char_ptr(),
+                            crate::static_lock_class!().as_ptr(),
+                        );
+                        // (*slot).fence intentionally not initialized.
+                        Ok(())
+                    },
+                )
+            },
+            GFP_KERNEL,
+        )?;
+
+        // SAFETY: This wraps a pointer on the heap, we do not move it in the
+        // kernel crate and driver code cannot access it directly.
+        let raw = KBox::into_raw(unsafe { Pin::into_inner_unchecked(boxed) });
+        // SAFETY: `KBox::into_raw` always returns a non-null pointer.
+        Ok(UninitDriverDmaFenceInner(unsafe {
+            NonNull::new_unchecked(raw)
+        }))
+    }
+
     /// Recover a `&DriverDmaFenceInner<T>` from a raw `*mut dma_fence`.
     ///
     /// # Safety
@@ -816,6 +862,138 @@ impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Drop for DriverDmaFence<
         // SAFETY: `raw_fence` is valid and has a non-zero refcount since we own
         // the ARef.
         unsafe { bindings::dma_fence_put(raw_fence) };
+    }
+}
+
+/// Owns a heap-allocated [`DriverDmaFenceInner<T>`] whose `data` and `lock`
+/// are initialized but whose `fence` field is not (i.e., `dma_fence_init` has
+/// not been called).  Private to this module; exposed to callers only through
+/// [`UninitDmaFence`].
+struct UninitDriverDmaFenceInner<T: DriverDmaFenceOps>(NonNull<DriverDmaFenceInner<T>>);
+
+// SAFETY: The underlying allocation is heap memory; no thread-local state.
+unsafe impl<T: DriverDmaFenceOps> Send for UninitDriverDmaFenceInner<T> {}
+// SAFETY: No interior mutability through a shared reference.
+unsafe impl<T: DriverDmaFenceOps> Sync for UninitDriverDmaFenceInner<T> {}
+
+/// A fence allocation whose `data` and spinlock are initialized but for which
+/// [`dma_fence_init`] has not been called yet.
+///
+/// This is the pre-commit form of a driver DMA fence.  Because no seqno has
+/// been assigned yet, dropping an `UninitDmaFence` is a simple `kfree` plus
+/// a call to `T::drop` — no [`ECANCELED`] signal, no hole in the seqno
+/// sequence, as if the fence never existed.
+///
+/// Obtain one via [`UninitDmaFence::new`] and convert it into a live, published
+/// fence via [`UninitDmaFence::init`].
+///
+/// # Invariants
+///
+/// `inner` wraps a heap-allocated `DriverDmaFenceInner<T>` whose `data` and
+/// `lock` fields are fully initialized and whose `fence` field has NOT been
+/// initialized (i.e., `dma_fence_init` has not been called).
+pub struct UninitDmaFence<T: DriverDmaFenceOps> {
+    inner: UninitDriverDmaFenceInner<T>,
+}
+
+// SAFETY: The underlying allocation is heap memory; no thread-local state.
+unsafe impl<T: DriverDmaFenceOps> Send for UninitDmaFence<T> {}
+// SAFETY: `&UninitDmaFence` provides no interior mutability.
+unsafe impl<T: DriverDmaFenceOps> Sync for UninitDmaFence<T> {}
+
+impl<T: DriverDmaFenceOps> UninitDmaFence<T> {
+    /// Allocate and partially initialize a new fence.
+    ///
+    /// Initializes the driver `data` and the per-fence spinlock, but does
+    /// not call `dma_fence_init`.
+    pub fn new(data: T) -> Result<Self> {
+        let inner = DriverDmaFenceInner::new_uninit(data)?;
+        Ok(Self { inner })
+    }
+
+    /// Assign a seqno and publish the fence.
+    ///
+    /// Calls `dma_fence_init` with the given `ctx` and `seqno`, which assigns
+    /// the seqno and establishes the signal obligation.  From this point on the
+    /// fence **must** be signaled (either by the caller via
+    /// [`DriverDmaFence::signal`] or automatically with `ECANCELED` on drop).
+    ///
+    /// Returns the driver-owned handle and a public reference that can be
+    /// shared with waiters.
+    ///
+    /// Consumes `self` to make clear that the allocation is now owned by the
+    /// `dma_fence` refcounting machinery.
+    pub fn init(
+        self,
+        ctx: u64,
+        seqno: u64,
+    ) -> (DriverDmaFence<T, Published>, ARef<PublicDmaFence>) {
+        let ptr = self.inner.0.as_ptr();
+        // Prevent our Drop from running — ownership is transferred to the
+        // dma_fence refcount established by dma_fence_init below.
+        core::mem::forget(self);
+
+        // SAFETY: `ptr` is valid and exclusively owned (we just forgot `self`).
+        // `fence` and `lock` are at valid locations within the allocation.
+        // `lock` was initialized by `new_uninit`.
+        unsafe {
+            bindings::dma_fence_init(
+                Opaque::cast_into((&raw mut (*ptr).fence).cast_const()),
+                &DriverDmaFenceInner::<T>::OPS,
+                Opaque::cast_into((&raw mut (*ptr).lock).cast_const()),
+                ctx,
+                seqno,
+            );
+        }
+
+        // After dma_fence_init the refcount is 1.  Create the public ARef by
+        // calling dma_fence_get (refcount = 2), then own the original count
+        // (refcount stays at 2: one for drv_fence, one for pub_fence).
+        //
+        // SAFETY: `dma_fence_init` initialized the fence; the fence field is
+        // valid and lives at the correct offset within the allocation.
+        let raw_fence: *mut bindings::dma_fence = unsafe { (*ptr).fence.get() };
+        let pub_fence: ARef<PublicDmaFence> = raw_fence.into();
+
+        // SAFETY: refcount is now 2; take ownership of one count for drv_fence.
+        let aref: ARef<DriverDmaFenceInner<T>> =
+            unsafe { ARef::from_raw(NonNull::new_unchecked(ptr)) };
+
+        (
+            DriverDmaFence {
+                inner: ManuallyDrop::new(aref),
+                visibility: PhantomData::<Published>,
+            },
+            pub_fence,
+        )
+    }
+}
+
+impl<T: DriverDmaFenceOps> Drop for UninitDmaFence<T> {
+    fn drop(&mut self) {
+        let ptr = self.inner.0.as_ptr();
+
+        // Drop `data: T` (it was fully initialized by `new_without_init`).
+        // SAFETY: `data` is at a valid, initialized location in the allocation.
+        unsafe { core::ptr::drop_in_place(&raw mut (*ptr).data) };
+
+        // Free the allocation without re-running T's destructor.
+        // We cast to `ManuallyDrop<DriverDmaFenceInner<T>>` so that the KBox
+        // drop glue is a no-op for the inner type (ManuallyDrop prevents it),
+        // and only the allocator `dealloc` runs.
+        //
+        // SAFETY:
+        // - `ptr` was obtained from `KBox::into_raw` in `new_without_init`
+        //   using the same kernel allocator.
+        // - `ManuallyDrop<X>` is `repr(transparent)`, so size and alignment
+        //   match; the allocation is valid for this type.
+        // - `data: T` has already been dropped above; the ManuallyDrop cast
+        //   ensures it is not dropped again by KBox.
+        drop(unsafe {
+            KBox::<core::mem::ManuallyDrop<DriverDmaFenceInner<T>>>::from_raw(
+                ptr.cast::<core::mem::ManuallyDrop<DriverDmaFenceInner<T>>>(),
+            )
+        });
     }
 }
 

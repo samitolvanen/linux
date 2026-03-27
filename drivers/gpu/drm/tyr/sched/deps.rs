@@ -7,7 +7,7 @@ use crate::sched::job::TyrJobFenceData;
 use kernel::alloc::KVec;
 use kernel::dma_fence::FenceChain;
 use kernel::dma_fence::PublicDmaFence;
-use kernel::drm::job_queue::JobQueue;
+use kernel::drm::job_queue::{JobQueue, PreparedJob};
 use kernel::drm::syncobj::SyncObj;
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -237,18 +237,30 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
+    /// Count the number of Wait sync operations for a job.  Used to
+    /// pre-size the dependency `KVec` in `prepare()` so no reallocation
+    /// is needed during the commit phase.
+    fn count_wait_ops(&self, job_idx: usize) -> usize {
+        self.jobs[job_idx]
+            .syncops
+            .iter()
+            .filter(|op| matches!(op.ty, SyncOpType::Wait))
+            .count()
+    }
+
     /// Add jobs dependencies and submit them to the job queue.
     ///
-    /// Returns a vector of finished fences that need to be added to reservation objects.
+    ///
+    /// Returns a vector of finished fences that need to be added to
+    /// reservation objects.
     pub(crate) fn add_deps_and_push_jobs(
         &mut self,
         job_queue: &JobQueue<super::job::TyrJobHandler>,
         queue_idx: usize,
     ) -> Result<KVec<ARef<PublicDmaFence>>> {
-        let mut finished_fences = KVec::new();
+        let mut prepared_jobs: KVec<(usize, PreparedJob<super::job::TyrJobHandler>)> = KVec::new();
 
         for job_idx in 0..self.jobs.len() {
-            // Only process GPU jobs for this queue
             match &self.jobs[job_idx].state {
                 JobState::Pending(JobType::Gpu(job)) => {
                     if job.queue_idx() != queue_idx {
@@ -259,20 +271,22 @@ impl<'a> Context<'a> {
                 JobState::Taken => continue,
             }
 
-            let fences = self.collect_job_deps(job_idx)?;
-
+            let num_deps = self.count_wait_ops(job_idx);
             let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
                 JobState::Pending(JobType::Gpu(job)) => job,
-                _ => {
-                    return Err(EINVAL);
-                }
+                _ => return Err(EINVAL),
             };
 
-            let finished_fence = job_queue.submit(job, TyrJobFenceData, &fences)?;
+            let prepared = job_queue.prepare(job, num_deps, TyrJobFenceData)?;
+            prepared_jobs.push((job_idx, prepared), GFP_KERNEL)?;
+        }
 
-            // Update the sync signal fences with the job's completion fence
+        let mut finished_fences = KVec::new();
+
+        for (job_idx, prepared) in prepared_jobs {
+            let fences = self.collect_job_deps(job_idx)?;
+            let finished_fence = job_queue.commit(prepared, &fences)?;
             self.update_job_syncs(job_idx, finished_fence.clone())?;
-
             finished_fences.push(finished_fence, GFP_KERNEL)?;
         }
 
@@ -281,35 +295,37 @@ impl<'a> Context<'a> {
 
     /// Add VM bind job dependencies and submit them to the job queue.
     ///
-    /// Returns a vector of finished fences that need to be added to reservation objects.
+    /// Same two-phase pattern as `add_deps_and_push_jobs`; see that function
+    /// for a full explanation.
     pub(crate) fn add_deps_and_push_vm_bind_jobs(
         &mut self,
         job_queue: &JobQueue<VmBindJobHandler>,
     ) -> Result<KVec<ARef<PublicDmaFence>>> {
-        let mut finished_fences = KVec::new();
+        let mut prepared_jobs: KVec<(usize, PreparedJob<VmBindJobHandler>)> = KVec::new();
 
         for job_idx in 0..self.jobs.len() {
-            // Only process VM bind jobs
             match &self.jobs[job_idx].state {
                 JobState::Pending(JobType::VmBind(_)) => {}
                 JobState::Pending(JobType::Gpu(_)) => continue,
                 JobState::Taken => continue,
             }
 
-            let fences = self.collect_job_deps(job_idx)?;
-
+            let num_deps = self.count_wait_ops(job_idx);
             let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
                 JobState::Pending(JobType::VmBind(job)) => job,
-                _ => {
-                    return Err(EINVAL);
-                }
+                _ => return Err(EINVAL),
             };
 
-            let finished_fence = job_queue.submit(job, VmBindFenceData, &fences)?;
+            let prepared = job_queue.prepare(job, num_deps, VmBindFenceData)?;
+            prepared_jobs.push((job_idx, prepared), GFP_KERNEL)?;
+        }
 
-            // Update the sync signal fences with the job's completion fence
+        let mut finished_fences = KVec::new();
+
+        for (job_idx, prepared) in prepared_jobs {
+            let fences = self.collect_job_deps(job_idx)?;
+            let finished_fence = job_queue.commit(prepared, &fences)?;
             self.update_job_syncs(job_idx, finished_fence.clone())?;
-
             finished_fences.push(finished_fence, GFP_KERNEL)?;
         }
 

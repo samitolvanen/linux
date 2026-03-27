@@ -94,6 +94,7 @@ use crate::{
         FenceCallbackRegistration,
         PublicDmaFence, //
         Published,
+        UninitDmaFence,
     },
     error::Result,
     impl_has_dma_fence_work,
@@ -116,6 +117,7 @@ use crate::{
     },
     xarray::{
         AllocKind,
+        ReservedIndex,
         XArray,
         XaLimit, //
     },
@@ -731,6 +733,41 @@ impl<T: QueueOps> Drop for CoalesceGuard<T> {
     }
 }
 
+/// A job that has been fully prepared (all major resources allocated) but not
+/// yet committed to the pipeline.
+///
+/// Produced by [`JobQueue::prepare`] and consumed by [`JobQueue::commit`].
+///
+/// If dropped before [`commit`](JobQueue::commit) is called, the reserved
+/// XArray slot is released and the [`UninitDmaFence`] is freed via `kfree`.
+/// Because [`dma_fence_init`](crate::dma_fence) was never called, no seqno
+/// was assigned and no fence ever existed — rollback is a pure `kfree` with
+/// no `ECANCELED` signal and no hole in the seqno sequence.
+pub struct PreparedJob<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+    job: Arc<T::Job>,
+    /// Partially-initialized fence allocation.  `None` once consumed by
+    /// `commit()`, which calls `dma_fence_init` to assign the seqno.
+    uninit_fence: Option<UninitDmaFence<T::FenceData>>,
+    /// Reserved XArray slot. `None` once consumed by `commit()`.
+    xa_index: Option<ReservedIndex>,
+    /// Pre-allocated dependency vector (empty on creation, capacity reserved).
+    deps: KVec<ARef<PublicDmaFence>>,
+    counter: u64,
+}
+
+impl<T: QueueOps> Drop for PreparedJob<T> {
+    fn drop(&mut self) {
+        // Release the reserved XArray slot if commit() didn't consume it.
+        if let Some(idx) = self.xa_index.take() {
+            self.inner.fifo.lock().release(idx);
+        }
+        // uninit_fence: if Some (not yet committed), UninitDmaFence::drop
+        // drops T::data and kfrees the allocation.  dma_fence_init was never
+        // called, so no seqno was assigned and no ECANCELED is signaled.
+    }
+}
+
 impl<T: QueueOps> JobQueue<T> {
     /// Create a new job queue.
     ///
@@ -769,62 +806,113 @@ impl<T: QueueOps> JobQueue<T> {
         Ok(Self { inner })
     }
 
-    /// Submit a job to the queue.
+    /// Prepare a job for submission, allocating all resources upfront.
     ///
-    /// Returns a fence that signals when the job completes (or fails/times out).
-    pub fn submit(
+    /// Call [`commit`](Self::commit) to assign the seqno, insert the job into
+    /// the pipeline, and receive the public fence.
+    pub fn prepare(
         &self,
         job: T::Job,
+        num_deps: usize,
         fence_data: T::FenceData,
-        dependencies: &[ARef<PublicDmaFence>],
-    ) -> Result<ARef<PublicDmaFence>> {
-        let seqno = self.inner.fence_seqno.fetch_add(1, Ordering::Relaxed);
-        let (submit_fence_drv, submit_fence) =
-            DriverDmaFence::new(fence_data, self.inner.fence_ctx_id, seqno)?
-                .publish();
+    ) -> Result<PreparedJob<T>> {
+        let uninit_fence = UninitDmaFence::new(fence_data)?;
         let counter = self.inner.job_counter.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(job, GFP_KERNEL)?;
+        let deps = KVec::with_capacity(num_deps, GFP_KERNEL)?;
 
-        let mut deps = KVec::with_capacity(dependencies.len(), GFP_KERNEL)?;
-        let _ = deps.extend_from_slice(dependencies, GFP_KERNEL);
+        let xa_index = {
+            let mut inbox = self.inner.inbox.lock();
+            let mut guard = self.inner.fifo.lock();
+            guard.alloc_cyclic_reserve(XaLimit::LIMIT_32B, &mut inbox.cyclic_next, GFP_KERNEL)?
+        };
 
-        let entry = KBox::new(
+        Ok(PreparedJob {
+            inner: self.inner.clone(),
+            job,
+            uninit_fence: Some(uninit_fence),
+            xa_index: Some(xa_index),
+            deps,
+            counter,
+        })
+    }
+
+    /// Commit a prepared job to the pipeline.
+    ///
+    /// Returns the public submit fence.
+    pub fn commit(
+        &self,
+        mut prepared: PreparedJob<T>,
+        deps: &[ARef<PublicDmaFence>],
+    ) -> Result<ARef<PublicDmaFence>> {
+        // Consume xa_index and uninit_fence from `prepared`.
+        // On any failure below we release xa_index manually; PreparedJob::drop
+        // is a no-op for these fields once they are taken.
+        let xa_index = prepared
+            .xa_index
+            .take()
+            .expect("JobQueue::commit: xa_index already consumed");
+        let uninit_fence = prepared
+            .uninit_fence
+            .take()
+            .expect("JobQueue::commit: uninit_fence already consumed");
+
+        let seqno = self.inner.fence_seqno.fetch_add(1, Ordering::Relaxed);
+        let (submit_fence_drv, submit_fence) = uninit_fence.init(self.inner.fence_ctx_id, seqno);
+
+        // Copy deps into the pre-allocated vector.
+        let mut dep_vec = core::mem::replace(&mut prepared.deps, KVec::new());
+        let _ = dep_vec.extend_from_slice(deps, GFP_KERNEL);
+
+        // Allocate the JobEntry box.  On OOM the struct constructor is
+        // evaluated first, so `submit_fence_drv` is moved in and then dropped
+        // when the aborted `KBox` drops the value — signaling ECANCELED.
+        let entry = match KBox::new(
             JobEntry {
-                job,
+                job: prepared.job.clone(),
                 submit_fence: submit_fence.clone(),
                 submit_fence_drv: Some(submit_fence_drv),
-                counter,
+                counter: prepared.counter,
                 deps: JobDependencies {
-                    fences: deps,
+                    fences: dep_vec,
                     current_idx: 0,
                     active_cb: None,
                 },
                 progress_cb: None,
             },
             GFP_KERNEL,
-        )?;
+        ) {
+            Ok(e) => e,
+            Err(_) => {
+                self.inner.fifo.lock().release(xa_index);
+                return Err(ENOMEM);
+            }
+        };
 
+        // Store entry in the reserved slot.
         let mut inbox = self.inner.inbox.lock();
-
-        let mut guard = self.inner.fifo.lock();
-        let idx = guard.alloc_cyclic(
-            entry,
-            XaLimit::LIMIT_32B,
-            &mut inbox.cyclic_next,
-            GFP_KERNEL,
-        )?;
+        {
+            let mut guard = self.inner.fifo.lock();
+            if let Err(store_err) = guard.store_reserved(xa_index, entry, GFP_KERNEL) {
+                // Slot still holds XA_ZERO_ENTRY..release it.
+                // store_err.value (the KBox<JobEntry>) is dropped here, leading to ECANCELED.
+                drop(store_err);
+                guard.release(xa_index);
+                drop(inbox);
+                return Err(ENOMEM);
+            }
+        }
 
         let expected = inbox.submitted_end;
-        if idx as u32 != expected {
+        if xa_index.index() as u32 != expected {
             pr_err!(
-                "JobQueue: submit() BUG: xa_idx={} != submitted_end={} (job={})\n",
-                idx,
+                "JobQueue: commit() BUG: xa_idx={} != submitted_end={} (job={})\n",
+                xa_index.index(),
                 expected,
-                counter
+                prepared.counter
             );
         }
         inbox.submitted_end = inbox.submitted_end.wrapping_add(1);
-        drop(guard);
         drop(inbox);
 
         self.inner.maybe_check_progress();
