@@ -13,6 +13,27 @@ use crate::{
 use core::{iter, marker::PhantomData, pin::Pin, ptr::NonNull};
 use pin_init::{pin_data, pin_init, pinned_drop, PinInit};
 
+/// `XA_ZERO_ENTRY` — the XArray sentinel for reserved-but-empty slots.
+///
+/// Defined in C as `xa_mk_internal(257)` which expands to `(257 << 2) | 2`.
+const XA_ZERO_ENTRY: *mut c_void = 1030usize as *mut c_void;
+
+/// An XArray index that has been reserved but not yet populated.
+///
+/// Returned by [`Guard::alloc_cyclic_reserve`]. Must be passed to either
+/// [`Guard::store_reserved`] (to commit a value) or [`Guard::release`] (to
+/// undo the reservation). Carries no Drop impl intentionally, i.e.: callers are
+/// responsible for not leaking reserved slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedIndex(pub u32);
+
+impl ReservedIndex {
+    /// Returns the raw index value.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// An array which efficiently maps sparse integer indices to owned objects.
 ///
 /// This is similar to a [`crate::alloc::kvec::Vec<Option<T>>`], but more efficient when there are
@@ -340,6 +361,111 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
             })
         } else {
             Ok(id)
+        }
+    }
+
+    /// Cyclically allocates an index and marks it as reserved (no value stored yet).
+    ///
+    /// Works like [`alloc_cyclic`](Guard::alloc_cyclic) but stores `XA_ZERO_ENTRY`
+    /// instead of a real value. The slot is invisible to normal lookups but prevents
+    /// the cyclic allocator from reusing the index until it is either filled with
+    /// [`store_reserved`](Guard::store_reserved) or freed with
+    /// [`release`](Guard::release).
+    pub fn alloc_cyclic_reserve(
+        &mut self,
+        limit: XaLimit,
+        next: &mut u32,
+        gfp: alloc::Flags,
+    ) -> Result<ReservedIndex> {
+        build_assert!(
+            core::mem::align_of::<u32>() >= 4,
+            "XArray alloc requires 4-byte aligned entries"
+        );
+        let mut id: u32 = 0;
+
+        // SAFETY: `self.xa.xa` is valid by the type invariant, the caller
+        // holds the lock, and `XA_ZERO_ENTRY` is a valid XArray sentinel.
+        let ret = unsafe {
+            bindings::__xa_alloc_cyclic(
+                self.xa.xa.get(),
+                &mut id,
+                XA_ZERO_ENTRY,
+                limit.inner,
+                next,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(ReservedIndex(id))
+        }
+    }
+    /// [`alloc_cyclic_reserve`](Guard::alloc_cyclic_reserve).
+    ///
+    /// The `XA_ZERO_ENTRY` sentinel left by the reservation is silently discarded
+    /// (it is not a `T`). Use the ordinary [`store`](Guard::store) when replacing
+    /// an existing `T` value.
+    ///
+    /// On failure the element is returned inside [`StoreError`].
+    pub fn store_reserved(
+        &mut self,
+        index: ReservedIndex,
+        value: T,
+        gfp: alloc::Flags,
+    ) -> Result<(), StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+
+        let old = {
+            // SAFETY:
+            // - `self.xa.xa` is always valid by the type invariant.
+            // - The caller holds the lock.
+            // - `new` came from `T::into_foreign`.
+            unsafe {
+                bindings::__xa_store(self.xa.xa.get(), index.index(), new.cast(), gfp.as_raw())
+            }
+        };
+
+        // SAFETY: `__xa_store` returns `xa_err(…)` on error, 0 on success.
+        let errno = unsafe { bindings::xa_err(old) };
+        if errno != 0 {
+            // SAFETY: `new` came from `T::into_foreign`; `__xa_store` does not take
+            // ownership on error.
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(errno),
+            })
+        } else {
+            // `old` is XA_ZERO_ENTRY — an internal marker, not a `T`. Discard it.
+            Ok(())
+        }
+    }
+
+    /// Releases a slot previously reserved with
+    /// [`alloc_cyclic_reserve`](Guard::alloc_cyclic_reserve) without storing a value.
+    ///
+    /// Uses `__xa_cmpxchg` to atomically replace `XA_ZERO_ENTRY` with `NULL`, making
+    /// the slot available for future allocations. If the slot no longer contains
+    /// `XA_ZERO_ENTRY` (e.g. it was already committed or concurrently modified) this
+    /// is a no-op.
+    pub fn release(&mut self, index: ReservedIndex) {
+        // SAFETY: `self.xa.xa` is valid by the type invariant, the caller
+        // holds the lock, and both XA_ZERO_ENTRY and NULL are valid cmpxchg
+        // arguments.
+        unsafe {
+            bindings::__xa_cmpxchg(
+                self.xa.xa.get(),
+                index.index(),
+                XA_ZERO_ENTRY,
+                core::ptr::null_mut(),
+                0,
+            );
         }
     }
 
