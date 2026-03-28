@@ -980,19 +980,10 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// Remove and drop completed entries. Runs in process context.
     fn do_cleanup(self: &Arc<Self>) {
-        let mut entries_to_drop: KVec<KBox<JobEntry<T>>> = KVec::new();
-
-        {
-            let mut state = self.state.lock();
-            while let Some(idx) = state.done_range.pop_front() {
-                let mut guard = self.fifo.lock();
-                if let Some(entry) = guard.remove(idx as usize) {
-                    let _ = entries_to_drop.push(entry, GFP_KERNEL);
-                }
-            }
+        let mut state = self.state.lock();
+        while let Some(idx) = state.done_range.pop_front() {
+            drop(self.fifo.lock().remove(idx as usize));
         }
-
-        drop(entries_to_drop);
     }
 
     /// Schedule a pipeline check on the system workqueue, unless suppressed
