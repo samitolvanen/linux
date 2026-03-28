@@ -1352,80 +1352,50 @@ impl<T: QueueOps> JobQueue<T> {
     ///
     /// Must be called from process context (it may sleep while waiting for
     /// hardware fences).
-    pub fn cancel_all(&self) -> Result {
+    pub fn cancel_all(&self) {
         // WaitingForExec is always at index 1; stages beyond it have been
         // handed to hardware and need their fences waited on before cancel.
         const EXEC_STAGE_IDX: usize = 1;
-        let mut entries: KVec<KBox<JobEntry<T>>> = KVec::new();
-        let mut hw_fences: KVec<ARef<PublicDmaFence>> = KVec::new();
 
-        {
-            let mut state = self.inner.state.lock();
+        let mut state = self.inner.state.lock();
 
-            // First, drain inbox so all submitted jobs become visible.
-            self.inner.drain_inbox(&mut state);
+        // First, drain inbox so all submitted jobs become visible.
+        self.inner.drain_inbox(&mut state);
 
-            // Drain all stage ranges. Stages beyond EXEC_STAGE_IDX contain
-            // jobs that have been handed to the driver; collect their fences
-            // for waiting.
-            for stage_i in 0..state.stage_ranges.len() {
-                while let Some(idx) = state.stage_ranges[stage_i].pop_front() {
-                    let mut guard = self.inner.fifo.lock();
-                    if let Some(entry) = guard.remove(idx as usize) {
-                        if stage_i > EXEC_STAGE_IDX {
-                            // Driver owns the DriverDmaFence; wait for the
-                            // public submit fence to signal after recovery.
-                            hw_fences.push(entry.submit_fence.clone(), GFP_KERNEL)?;
-                        }
-                        entries.push(entry, GFP_KERNEL)?;
+        for stage_i in 0..state.stage_ranges.len() {
+            while let Some(idx) = state.stage_ranges[stage_i].pop_front() {
+                let Some(mut entry) = self.inner.fifo.lock().remove(idx as usize) else {
+                    continue;
+                };
+                // For entries already handed to hardware, wait for the
+                // firmware fence before cancelling. state.lock() is a mutex
+                // so sleeping here is fine; check_progress() will unblock
+                // once we release it.
+                if stage_i > EXEC_STAGE_IDX {
+                    let _ = entry.submit_fence.wait();
+                }
+                drop(entry.deps.active_cb.take());
+                drop(entry.progress_cb.take());
+                drop(entry.stage_wake_cb.take());
+                for stage in &self.inner.stages {
+                    if let StageKind::Driver(s) = stage {
+                        s.cancel(&*entry.job, entry.counter);
                     }
                 }
-            }
-
-            while let Some(idx) = state.done_range.pop_front() {
-                let mut guard = self.inner.fifo.lock();
-                if let Some(entry) = guard.remove(idx as usize) {
-                    entries.push(entry, GFP_KERNEL)?;
+                if let Some(f) = entry.submit_fence_drv.take() {
+                    f.signal(Err(ECANCELED));
                 }
             }
         }
 
-        for fence in &hw_fences {
-            // TODO: I wonder whether we should take a "cancel: bool" argument
-            // and just signal with ECANCELED instead of waiting in this case.
-            //
-            // Boris: WDYT?
-            let _ = fence.wait();
+        while let Some(idx) = state.done_range.pop_front() {
+            drop(self.inner.fifo.lock().remove(idx as usize));
         }
-
-        // Signal remaining submit fences (those not yet passed to the
-        // driver) with ECANCELED, and drop all entries.
-        for mut entry in entries {
-            // Cancel the progress and stage-wake callbacks to avoid stale triggers.
-            drop(entry.progress_cb.take());
-            drop(entry.stage_wake_cb.take());
-            // Notify driver-defined stages of cancellation.
-            for stage in &self.inner.stages {
-                if let StageKind::Driver(s) = stage {
-                    s.cancel(&*entry.job, entry.counter);
-                }
-            }
-            // If the fence was not yet passed to the driver, signal it now.
-            if let Some(f) = entry.submit_fence_drv.take() {
-                f.signal(Err(ECANCELED));
-            }
-            // For HW-stage entries the fence is held by the driver; we
-            // already waited above for the public submit_fence to signal.
-        }
-
-        Ok(())
     }
 }
 
 impl<T: QueueOps> Drop for JobQueue<T> {
     fn drop(&mut self) {
-        if let Err(e) = self.cancel_all() {
-            pr_err!("JobQueue::drop: cancel_all() failed: {:?}\n", e);
-        }
+        self.cancel_all();
     }
 }
