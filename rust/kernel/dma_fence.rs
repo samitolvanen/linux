@@ -104,6 +104,15 @@ pub trait FenceCallback: Sync + Send {
     fn signaled(self, fence: &ARef<PublicDmaFence>);
 }
 
+/// The return type of [`DmaFence::wait_timeout`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum FenceWaitResult {
+    /// The fence was signaled before the timeout elapsed.
+    Signaled,
+    /// The timeout elapsed before the fence was signaled.
+    TimedOut,
+}
+
 /// Error type for fence callback registration.
 ///
 /// Generic over `T` so that `AlreadySignaled` can return the callback to the
@@ -488,6 +497,25 @@ impl PublicDmaFence {
         // CAST: `dma_fence_wait_timeout` returns a negative errno on failure, which
         // always fits in `c_int`. On success it returns the remaining timeout (>= 0).
         to_result(ret as i32)
+    }
+
+    /// Wait for the fence to be signaled, with a timeout.
+    ///
+    /// Returns `Ok(FenceWaitResult::Signaled)` if the fence was signaled before
+    /// the timeout elapsed, `Ok(FenceWaitResult::TimedOut)` if the timeout
+    /// elapsed first, or an error if the wait was interrupted.
+    pub fn wait_timeout(&self, timeout: Jiffies) -> Result<FenceWaitResult> {
+        // SAFETY: The pointer is valid. We pass `false` for non-interruptible wait.
+        let ret =
+            unsafe { bindings::dma_fence_wait_timeout(self.inner.get(), false, timeout as isize) };
+        if ret < 0 {
+            // CAST: negative return is always a valid errno.
+            Err(Error::from_errno(ret as i32))
+        } else if ret > 0 {
+            Ok(FenceWaitResult::Signaled)
+        } else {
+            Ok(FenceWaitResult::TimedOut)
+        }
     }
 
     /// Returns the fence's sequence number.
