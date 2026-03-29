@@ -59,6 +59,15 @@
 //! - `WaitFor`   — schedule a delayed work item; re-run after the delay
 //! - `TimedOut`  — retire the job to Done with an error
 //!
+//! ## Stage iteration order
+//!
+//! `check_progress()` walks the pipeline in two passes per tick:
+//!
+//! 1. Backward — later stages first, so completed jobs free resources
+//!    (e.g. ring-buffer slots) before earlier stages try to consume them.
+//! 2. Forward — picks up jobs that became eligible during the backward
+//!    pass and advances them in the same tick.
+//!
 //! ## Lock topology
 //!
 //! Two mutexes prevent deadlocks between `submit()` and `check_progress()`:
@@ -395,6 +404,12 @@ impl<T: QueueOps> PipelineBuilder<T> {
     }
 }
 
+/// Iteration direction for [`JobQueueInner::check_stages`].
+enum Direction {
+    Backward,
+    Forward,
+}
+
 /// Internal representation of a pipeline stage stored in
 /// [`JobQueueInner::stages`]. Built-in stages carry no data; driver stages
 /// wrap an [`Arc`]-ed [`StageOps`] implementation.
@@ -709,95 +724,128 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// The main pipeline tick. Runs in process context.
     ///
-    /// Iterates over every stage in `self.stages` in order. For each stage,
-    /// loops over the jobs queued there (front first) calling the appropriate
-    /// per-stage helper until the stage returns anything other than `Advance`.
-    /// Stage transitions are managed here; helpers only return a [`StageAdvance`]
-    /// without touching `PipelineState` themselves.
+    /// Drains the inbox, then walks the pipeline in two passes:
+    ///
+    /// 1. Backward — later stages first, so completed jobs free resources
+    ///    (e.g. ring-buffer slots) before earlier stages try to consume them.
+    /// 2. Forward — picks up jobs that became eligible during the backward
+    ///    pass and advances them immediately, avoiding an extra tick of latency.
+    ///
+    /// For each stage, loops over the jobs queued there (front first) calling
+    /// the appropriate per-stage helper until the stage returns anything other
+    /// than `Advance`. Stage transitions are managed in [`process_stage`](Self::process_stage);
+    /// helpers only return a [`StageAdvance`] without touching `PipelineState`
+    /// themselves.
     fn check_progress(self: &Arc<Self>) {
         let mut state = self.state.lock();
 
         // Drain newly submitted jobs into stage_ranges[0] (DepsStage).
         self.drain_inbox(&mut state);
 
-        for stage_i in 0..self.stages.len() {
-            if state.parked_at == Some(stage_i) {
-                break;
-            }
-
-            'stage_loop: loop {
-                if state.stage_ranges[stage_i].is_empty() {
-                    break 'stage_loop;
-                }
-                let entry_idx = state.stage_ranges[stage_i].start;
-
-                let advance = match &self.stages[stage_i] {
-                    StageKind::WaitingForDeps => self.process_deps(entry_idx),
-                    StageKind::WaitingForExec => self.process_exec(entry_idx),
-                    StageKind::Executing => self.process_default_hw_wait(entry_idx),
-                    StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
-                };
-
-                match advance {
-                    StageAdvance::Advance => {
-                        state.stage_ranges[stage_i].pop_front();
-                        if stage_i + 1 < self.stages.len() {
-                            state.stage_ranges[stage_i + 1].push_back();
-                            // Reset the elapsed timer when entering a new stage.
-                            let mut guard = self.fifo.lock();
-                            if let Some(entry) = guard.get_mut(entry_idx as usize) {
-                                entry.stage_entered_at = Instant::now();
-                            }
-                        } else {
-                            state.done_range.push_back();
-                        }
-                        // Continue inner loop: process the new front of this stage.
-                    }
-                    StageAdvance::TimedOut(_) => {
-                        state.stage_ranges[stage_i].pop_front();
-                        state.done_range.push_back();
-                        break 'stage_loop;
-                    }
-                    StageAdvance::WaitOn(fence) => {
-                        let cb = FenceCallbackRegistration::new(
-                            &fence,
-                            StageWakeCallback {
-                                inner: self.clone(),
-                            },
-                        );
-                        match KBox::try_pin_init(cb, GFP_KERNEL) {
-                            Ok(registration) => {
-                                let mut guard = self.fifo.lock();
-                                if let Some(entry) = guard.get_mut(entry_idx as usize) {
-                                    entry.stage_wake_cb = Some(registration);
-                                }
-                            }
-                            Err(CallbackError::AlreadySignaled(cb)) => {
-                                cb.inner.maybe_check_progress();
-                            }
-                            Err(CallbackError::Other(e)) => {
-                                pr_err!(
-                                    "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
-                                    e,
-                                    entry_idx
-                                );
-                            }
-                        }
-                        break 'stage_loop;
-                    }
-                    StageAdvance::WaitFor(delay) => {
-                        let _ = self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay);
-                        break 'stage_loop;
-                    }
-                    StageAdvance::Wait => break 'stage_loop,
-                }
-            }
-        }
+        self.check_stages(&mut state, Direction::Backward);
+        self.check_stages(&mut state, Direction::Forward);
 
         let needs_cleanup = !state.done_range.is_empty();
         drop(state);
         if needs_cleanup {
             self.schedule_cleanup();
+        }
+    }
+
+    /// Walk every stage in the given [`Direction`], processing the front job at
+    /// each stage until it blocks or the stage empties.
+    fn check_stages(self: &Arc<Self>, state: &mut PipelineState, direction: Direction) {
+        let park = state.parked_at.unwrap_or(usize::MAX);
+
+        match direction {
+            Direction::Forward => {
+                for stage_i in 0..self.stages.len() {
+                    if stage_i >= park {
+                        continue;
+                    }
+                    self.process_stage(state, stage_i);
+                }
+            }
+            Direction::Backward => {
+                for stage_i in (0..self.stages.len()).rev() {
+                    if stage_i >= park {
+                        continue;
+                    }
+                    self.process_stage(state, stage_i);
+                }
+            }
+        }
+    }
+
+    /// Process the front job at `stage_i` in a loop until the stage empties
+    /// or the job blocks.
+    fn process_stage(self: &Arc<Self>, state: &mut PipelineState, stage_i: usize) {
+        loop {
+            if state.stage_ranges[stage_i].is_empty() {
+                return;
+            }
+            let entry_idx = state.stage_ranges[stage_i].start;
+
+            let advance = match &self.stages[stage_i] {
+                StageKind::WaitingForDeps => self.process_deps(entry_idx),
+                StageKind::WaitingForExec => self.process_exec(entry_idx),
+                StageKind::Executing => self.process_default_hw_wait(entry_idx),
+                StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
+            };
+
+            match advance {
+                StageAdvance::Advance => {
+                    state.stage_ranges[stage_i].pop_front();
+                    if stage_i + 1 < self.stages.len() {
+                        state.stage_ranges[stage_i + 1].push_back();
+                        // Reset the elapsed timer when entering a new stage.
+                        let mut guard = self.fifo.lock();
+                        if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                            entry.stage_entered_at = Instant::now();
+                        }
+                    } else {
+                        state.done_range.push_back();
+                    }
+                    // Continue loop: process the new front of this stage.
+                }
+                StageAdvance::TimedOut(_) => {
+                    state.stage_ranges[stage_i].pop_front();
+                    state.done_range.push_back();
+                    return;
+                }
+                StageAdvance::WaitOn(fence) => {
+                    let cb = FenceCallbackRegistration::new(
+                        &fence,
+                        StageWakeCallback {
+                            inner: self.clone(),
+                        },
+                    );
+                    match KBox::try_pin_init(cb, GFP_KERNEL) {
+                        Ok(registration) => {
+                            let mut guard = self.fifo.lock();
+                            if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                                entry.stage_wake_cb = Some(registration);
+                            }
+                        }
+                        Err(CallbackError::AlreadySignaled(cb)) => {
+                            cb.inner.maybe_check_progress();
+                        }
+                        Err(CallbackError::Other(e)) => {
+                            pr_err!(
+                                "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
+                                e,
+                                entry_idx
+                            );
+                        }
+                    }
+                    return;
+                }
+                StageAdvance::WaitFor(delay) => {
+                    let _ = self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay);
+                    return;
+                }
+                StageAdvance::Wait => return,
+            }
         }
     }
 
