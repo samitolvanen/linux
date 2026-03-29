@@ -102,11 +102,9 @@ use crate::{
     error::Result,
     impl_has_dma_fence_delayed_work,
     impl_has_dma_fence_work,
-    impl_has_work,
     new_dma_fence_delayed_work,
     new_dma_fence_work,
     new_mutex,
-    new_work,
     prelude::*,
     sync::{
         Arc,
@@ -115,10 +113,6 @@ use crate::{
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
     types::ARef, //
     workqueue::{
-        DelayedWork,
-        OwnedQueue,
-        Work,
-        WorkItem,
         WqFlags, //
     },
     xarray::{
@@ -562,13 +556,13 @@ struct JobQueueInner<T: QueueOps> {
 
     /// Deferred drop of JobEntry in process context.
     #[pin]
-    cleanup_work: Work<JobQueueInner<T>, 3>,
+    cleanup_work: DmaFenceWork<JobQueueInner<T>, 3>,
 
     /// Workqueue for the main pipeline check (enforces DMA fence signaling rules).
     wq: Arc<DmaFenceWorkqueue>,
 
     /// Internal workqueue for cleanup work.
-    aux_queue: OwnedQueue,
+    aux_wq: DmaFenceWorkqueue,
 
     /// DMA fence context ID allocated at creation time.
     fence_ctx_id: u64,
@@ -606,8 +600,8 @@ impl_has_dma_fence_work! {
     impl{T: QueueOps} HasDmaFenceWork<JobQueueInner<T>> for JobQueueInner<T> { self.work }
 }
 
-impl_has_work! {
-    impl{T: QueueOps} HasWork<JobQueueInner<T>, 3> for JobQueueInner<T> { self.cleanup_work }
+impl_has_dma_fence_work! {
+    impl{T: QueueOps} HasDmaFenceWork<JobQueueInner<T>, 3> for JobQueueInner<T> { self.cleanup_work }
 }
 
 impl<T: QueueOps> DmaFenceWorkItem for JobQueueInner<T> {
@@ -618,7 +612,7 @@ impl<T: QueueOps> DmaFenceWorkItem for JobQueueInner<T> {
     }
 }
 
-impl<T: QueueOps> WorkItem<3> for JobQueueInner<T> {
+impl<T: QueueOps> DmaFenceWorkItem<3> for JobQueueInner<T> {
     type Pointer = Arc<Self>;
 
     fn run(this: Arc<Self>) {
@@ -1015,7 +1009,7 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// Schedule deferred cleanup of completed entries.
     fn schedule_cleanup(self: &Arc<Self>) {
-        let _ = self.aux_queue.enqueue::<Arc<Self>, 3>(self.clone());
+        let _ = self.aux_wq.enqueue::<Arc<Self>, 3>(self.clone());
     }
 }
 
@@ -1134,9 +1128,9 @@ impl<T: QueueOps> JobQueue<T> {
         wq: Arc<DmaFenceWorkqueue>,
         mut pipeline: PipelineBuilder<T>,
     ) -> Result<Self> {
-        let aux_queue = OwnedQueue::new(
+        let aux_wq = DmaFenceWorkqueue::new(
             c_str!("job_queue_aux"),
-            WqFlags::HIGHPRI | WqFlags::MEM_RECLAIM,
+            WqFlags::HIGHPRI,
             0,
         )?;
         // SAFETY: dma_fence_context_alloc is always safe to call.
@@ -1167,9 +1161,9 @@ impl<T: QueueOps> JobQueue<T> {
                 state <- new_mutex!(pipeline_state),
                 handler,
                 work <- new_dma_fence_work!("JobQueue::work"),
-                cleanup_work <- new_work!("JobQueue::cleanup_work"),
+                cleanup_work <- new_dma_fence_work!("JobQueue::cleanup_work"),
                 wq,
-                aux_queue,
+                aux_wq,
                 fence_ctx_id,
                 fence_seqno: AtomicU64::new(1),
                 job_counter: AtomicU64::new(0),
