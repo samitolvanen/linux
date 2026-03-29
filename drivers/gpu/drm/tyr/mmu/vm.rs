@@ -45,9 +45,9 @@ use kernel::prelude::*;
 use kernel::sizes::SZ_4K;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
-use kernel::types::ARef;
 use kernel::time::msecs_to_jiffies;
 use kernel::time::Jiffies;
+use kernel::types::ARef;
 
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
@@ -193,7 +193,7 @@ impl Vm {
         let pipeline = PipelineBuilder::new().add_stage(VmBindTimeoutStage {
             timeout: msecs_to_jiffies(5000u32),
         })?;
-        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), wq, pipeline)?;
+        let job_queue = JobQueue::new(bind_job::VmBindJobHandler::new(), wq.clone(), wq, pipeline)?;
 
         Ok(Vm {
             _dummy_obj: dummy_obj.gem.clone(),

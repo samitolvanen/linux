@@ -125,7 +125,7 @@ impl Queue {
         let pipeline = PipelineBuilder::new().add_stage(HwTimeoutStage {
             timeout: msecs_to_jiffies(JOB_TIMEOUT_MS as u32),
         })?;
-        let job_queue = JobQueue::new(job::TyrJobHandler, wq, pipeline)?;
+        let job_queue = JobQueue::new(job::TyrJobHandler, wq.clone(), wq, pipeline)?;
 
         let iomem = tdev.iomem.clone();
         let ringbuf = {

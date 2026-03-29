@@ -83,7 +83,6 @@ use core::sync::atomic::{
 };
 
 use crate::{
-    c_str,
     dma_fence::{
         CallbackError,
         DmaFenceDelayedWork,
@@ -112,9 +111,6 @@ use crate::{
     },
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
     types::ARef, //
-    workqueue::{
-        WqFlags, //
-    },
     xarray::{
         AllocKind,
         ReservedIndex,
@@ -286,7 +282,7 @@ pub trait StageOps<T: QueueOps>: Send + Sync + 'static {
 /// ```ignore
 /// let pipeline = PipelineBuilder::new()
 ///     .add_stage(HwStage { timeout: msecs_to_jiffies(5000) })?;
-/// let queue = JobQueue::new(handler, wq, pipeline)?;
+/// let queue = JobQueue::new(handler, wq, aux_wq, pipeline)?;
 /// ```
 ///
 /// A queue with a 10-second total pipeline deadline:
@@ -295,7 +291,7 @@ pub trait StageOps<T: QueueOps>: Send + Sync + 'static {
 /// let pipeline = PipelineBuilder::new()
 ///     .set_pipeline_timeout(msecs_to_jiffies(10000))
 ///     .add_stage(HwStage { timeout: msecs_to_jiffies(5000) })?;
-/// let queue = JobQueue::new(handler, wq, pipeline)?;
+/// let queue = JobQueue::new(handler, wq, aux_wq, pipeline)?;
 /// ```
 pub struct PipelineBuilder<T: QueueOps> {
     stages: KVec<Arc<dyn StageOps<T>>>,
@@ -562,7 +558,7 @@ struct JobQueueInner<T: QueueOps> {
     wq: Arc<DmaFenceWorkqueue>,
 
     /// Internal workqueue for cleanup work.
-    aux_wq: DmaFenceWorkqueue,
+    aux_wq: Arc<DmaFenceWorkqueue>,
 
     /// DMA fence context ID allocated at creation time.
     fence_ctx_id: u64,
@@ -1121,18 +1117,16 @@ impl<T: QueueOps> JobQueue<T> {
     ///
     /// `handler` is the driver's submission logic.
     /// `wq` is the DMA fence workqueue to schedule pipeline checks on.
+    /// `aux_wq` is the workqueue for deferred cleanup; the driver may pass the
+    /// same workqueue as `wq` if no separation is needed.
     /// `pipeline` is the set of driver-defined stages jobs pass through after
     /// HW submission (use [`PipelineBuilder::new()`] for no custom stages).
     pub fn new(
         handler: T,
         wq: Arc<DmaFenceWorkqueue>,
+        aux_wq: Arc<DmaFenceWorkqueue>,
         mut pipeline: PipelineBuilder<T>,
     ) -> Result<Self> {
-        let aux_wq = DmaFenceWorkqueue::new(
-            c_str!("job_queue_aux"),
-            WqFlags::HIGHPRI,
-            0,
-        )?;
         // SAFETY: dma_fence_context_alloc is always safe to call.
         let fence_ctx_id = unsafe { bindings::dma_fence_context_alloc(1) };
 
