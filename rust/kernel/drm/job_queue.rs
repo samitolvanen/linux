@@ -94,6 +94,7 @@ use crate::{
         DriverDmaFenceOps,
         FenceCallback,
         FenceCallbackRegistration,
+        FenceWaitResult,
         PublicDmaFence, //
         Published,
         UninitDmaFence,
@@ -296,6 +297,7 @@ pub trait StageOps<T: QueueOps>: Send + Sync + 'static {
 pub struct PipelineBuilder<T: QueueOps> {
     stages: KVec<Arc<dyn StageOps<T>>>,
     pipeline_timeout: Option<Jiffies>,
+    cancel_timeout: Option<Jiffies>,
 }
 
 impl<T: QueueOps> PipelineBuilder<T> {
@@ -304,6 +306,7 @@ impl<T: QueueOps> PipelineBuilder<T> {
         Self {
             stages: KVec::new(),
             pipeline_timeout: None,
+            cancel_timeout: None,
         }
     }
 
@@ -325,6 +328,17 @@ impl<T: QueueOps> PipelineBuilder<T> {
     /// [`StageContext::pipeline_elapsed`].
     pub fn set_pipeline_timeout(mut self, timeout: Jiffies) -> Self {
         self.pipeline_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the per-entry timeout used in [`JobQueue::cancel_all`] when waiting
+    /// for hardware fences to signal.
+    ///
+    /// If not set, teardown waits indefinitely. Drivers that interact with
+    /// firmware should set this to a value slightly longer than their longest
+    /// expected firmware round-trip.
+    pub fn set_cancel_timeout(mut self, timeout: Jiffies) -> Self {
+        self.cancel_timeout = Some(timeout);
         self
     }
 }
@@ -583,6 +597,8 @@ struct JobQueueInner<T: QueueOps> {
     /// stages enforce it automatically; driver stages can observe the elapsed
     /// time via [`StageContext::pipeline_elapsed`].
     pipeline_timeout: Option<Jiffies>,
+
+    cancel_timeout: Option<Jiffies>,
 
     /// Delayed work for stage-timer wakeups.
     #[pin]
@@ -1127,6 +1143,7 @@ impl<T: QueueOps> JobQueue<T> {
         all_stages.push(StageKind::WaitingForDeps, GFP_KERNEL)?;
         all_stages.push(StageKind::WaitingForExec, GFP_KERNEL)?;
         let pipeline_timeout = pipeline.pipeline_timeout;
+        let cancel_timeout = pipeline.cancel_timeout;
         if pipeline.stages.is_empty() {
             all_stages.push(StageKind::Executing, GFP_KERNEL)?;
         } else {
@@ -1155,6 +1172,7 @@ impl<T: QueueOps> JobQueue<T> {
                 coalesce: AtomicBool::new(false),
                 stages: all_stages,
                 pipeline_timeout,
+                cancel_timeout,
                 stage_timer <- new_dma_fence_delayed_work!("JobQueue::stage_timer"),
             }),
             GFP_KERNEL,
@@ -1372,7 +1390,20 @@ impl<T: QueueOps> JobQueue<T> {
                 // so sleeping here is fine; check_progress() will unblock
                 // once we release it.
                 if stage_i > EXEC_STAGE_IDX {
-                    let _ = entry.submit_fence.wait();
+                    match self.inner.cancel_timeout {
+                        None => {
+                            let _ = entry.submit_fence.wait();
+                        }
+                        Some(t) => {
+                            if let Ok(FenceWaitResult::TimedOut) =
+                                entry.submit_fence.wait_timeout(t)
+                            {
+                                pr_warn!(
+                                    "JobQueue: timed out waiting for HW fence during teardown\n"
+                                );
+                            }
+                        }
+                    }
                 }
                 drop(entry.deps.active_cb.take());
                 drop(entry.progress_cb.take());
