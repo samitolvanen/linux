@@ -75,6 +75,58 @@
 //! - **Done** — Entries are removed from the XArray and dropped in process
 //!   context via `cleanup_work` so that `JobEntry` is never freed in IRQ or
 //!   atomic context.
+//!
+//! ## Teardown
+//!
+//! Dropping a [`JobQueue`] calls [`JobQueue::cancel_all`], which synchronously
+//! drains the entire pipeline:
+//!
+//! - All dependency, progress, and stage-wake callbacks are unregistered before
+//!   any entry is freed, so no stale callbacks fire after drop returns.
+//! - Every fence that passed through [`JobQueue::commit`] is guaranteed to
+//!   signal, either normally or with `ECANCELED`, before drop returns.
+//! - Jobs at stages beyond `WaitingForExec` — those already handed to hardware —
+//!   are waited on before cancellation. Use
+//!   [`PipelineBuilder::set_cancel_timeout`] to bound this wait.
+//! - The driver's [`QueueOps`] methods are never called again after drop returns.
+//!
+//! Together these guarantees make teardown straightforward to reason about: no
+//! fence callback or scheduled work item can fire against hardware or firmware
+//! state that has already been freed. In the common synchronous case this
+//! holds directly — the queue is fully quiesced before the surrounding driver
+//! struct's destructor can free any of that state. For async teardown the same
+//! invariant must be maintained by the driver; see below.
+//!
+//! ### Async teardown
+//!
+//! Drivers that need firmware round-trips before the queue is torn down (e.g.
+//! to deregister a context with the firmware) can wrap [`JobQueue`] in a driver
+//! type and defer the drop:
+//!
+//! ```ignore
+//! struct ExecQueue<T: QueueOps> {
+//!     job_queue: JobQueue<T>,
+//!     // ... firmware handles, etc.
+//! }
+//!
+//! impl<T: QueueOps> ExecQueue<T> {
+//!     fn destroy(self) {
+//!         // Park first: prevents check_progress() from calling StageOps
+//!         // callbacks while firmware state is being torn down.
+//!         self.job_queue.park();
+//!         // Move into async work on a device-level workqueue.
+//!         // When the firmware round-trips finish, drop(self) runs
+//!         // cancel_all() as usual.
+//!     }
+//! }
+//! ```
+//!
+//! Parking before starting async teardown is important: without it, fence
+//! callbacks could fire [`check_progress`](JobQueue::check_progress) during
+//! the firmware teardown window, invoking driver stage callbacks against
+//! partially-torn-down state. All resources held by the queue (the job data,
+//! the [`QueueOps`] handler, any `Arc`s inside it) stay alive until drop
+//! completes normally.
 
 use core::sync::atomic::{
     AtomicBool,
