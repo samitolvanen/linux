@@ -416,9 +416,9 @@ where
 {
     unsafe fn raw_get_work(ptr: *mut Self) -> *mut Work<Device<T>, ID> {
         // SAFETY: The caller promises that `ptr` points to a valid `Device<T>`.
-        let data_ptr = unsafe { &raw mut (*ptr).data };
+        let data_ptr = unsafe { (*ptr).data.get().cast::<T::Data>() };
 
-        // SAFETY: `data_ptr` is a valid pointer to `T::Data`.
+        // SAFETY: `data_ptr` is a valid pointer to initialized `T::Data`.
         unsafe { T::Data::raw_get_work(data_ptr) }
     }
 
@@ -427,8 +427,11 @@ where
         // `T::Data`.
         let data_ptr = unsafe { T::Data::work_container_of(ptr) };
 
+        // Cast back to the field type for `container_of!`.
+        let field_ptr = data_ptr.cast::<UnsafeCell<MaybeUninit<T::Data>>>();
+
         // SAFETY: `T::Data` is stored as the `data` field in `Device<T>`.
-        unsafe { crate::container_of!(data_ptr, Self, data) }
+        unsafe { crate::container_of!(field_ptr, Self, data) }
     }
 }
 
