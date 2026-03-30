@@ -146,6 +146,7 @@ use core::sync::atomic::{
 use crate::{
     dma_fence::{
         CallbackError,
+        DmaFenceContext,
         DmaFenceDelayedWork,
         DmaFenceDelayedWorkItem,
         DmaFenceWork,
@@ -641,11 +642,8 @@ struct JobQueueInner<T: QueueOps> {
     /// Internal workqueue for cleanup work.
     aux_wq: Arc<DmaFenceWorkqueue>,
 
-    /// DMA fence context ID allocated at creation time.
-    fence_ctx_id: u64,
-
-    /// Monotonically increasing sequence number for submit fences.
-    fence_seqno: AtomicU64,
+    /// DMA fence context and sequence number counter for submit fences.
+    fence_ctx: DmaFenceContext,
 
     /// Monotonic job counter.
     job_counter: AtomicU64,
@@ -1234,9 +1232,6 @@ impl<T: QueueOps> JobQueue<T> {
         aux_wq: Arc<DmaFenceWorkqueue>,
         mut pipeline: PipelineBuilder<T>,
     ) -> Result<Self> {
-        // SAFETY: dma_fence_context_alloc is always safe to call.
-        let fence_ctx_id = unsafe { bindings::dma_fence_context_alloc(1) };
-
         // Build the unified stages vec:
         //   [WaitingForDeps, WaitingForExec, <driver stages or Executing>]
         let mut all_stages: KVec<StageKind<T>> = KVec::new();
@@ -1266,8 +1261,7 @@ impl<T: QueueOps> JobQueue<T> {
                 cleanup_work <- new_dma_fence_work!("JobQueue::cleanup_work"),
                 wq,
                 aux_wq,
-                fence_ctx_id,
-                fence_seqno: AtomicU64::new(1),
+                fence_ctx: DmaFenceContext::new(0),
                 job_counter: AtomicU64::new(0),
                 coalesce: AtomicBool::new(false),
                 stages: all_stages,
@@ -1332,8 +1326,8 @@ impl<T: QueueOps> JobQueue<T> {
             .take()
             .expect("JobQueue::commit: uninit_fence already consumed");
 
-        let seqno = self.inner.fence_seqno.fetch_add(1, Ordering::Relaxed);
-        let (submit_fence_drv, submit_fence) = uninit_fence.init(self.inner.fence_ctx_id, seqno);
+        let (ctx, seqno) = self.inner.fence_ctx.next_seqno();
+        let (submit_fence_drv, submit_fence) = uninit_fence.init(ctx, seqno);
 
         // Copy deps into the pre-allocated vector.
         let mut dep_vec = core::mem::replace(&mut prepared.deps, KVec::new());
