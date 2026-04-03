@@ -794,11 +794,23 @@ impl<T: QueueOps> JobQueueInner<T> {
             }
             let entry_idx = state.stage_ranges[stage_i].start;
 
-            let advance = match &self.stages[stage_i] {
-                StageKind::WaitingForDeps => self.process_deps(entry_idx),
-                StageKind::WaitingForExec => self.process_exec(entry_idx),
-                StageKind::Executing => self.process_default_hw_wait(entry_idx),
-                StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
+            let is_failed = {
+                let guard = self.fifo.lock();
+                guard
+                    .get(entry_idx as usize)
+                    .map(|e| e.submit_fence.is_signaled() && e.submit_fence.error().is_err())
+                    .unwrap_or(false)
+            };
+
+            let advance = if is_failed {
+                StageAdvance::Advance
+            } else {
+                match &self.stages[stage_i] {
+                    StageKind::WaitingForDeps => self.process_deps(entry_idx),
+                    StageKind::WaitingForExec => self.process_exec(entry_idx),
+                    StageKind::Executing => self.process_default_hw_wait(entry_idx),
+                    StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
+                }
             };
 
             match advance {
@@ -816,10 +828,34 @@ impl<T: QueueOps> JobQueueInner<T> {
                     }
                     // Continue loop: process the new front of this stage.
                 }
-                StageAdvance::TimedOut(_) => {
+                StageAdvance::TimedOut(e) => {
+                    pr_err!(
+                        "JobQueue: stage {} timed out with error {:?}, entry {}\n",
+                        stage_i,
+                        e,
+                        entry_idx
+                    );
+                    let mut fence_to_signal = None;
+                    {
+                        let mut guard = self.fifo.lock();
+                        if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                            fence_to_signal = entry.submit_fence_drv.take();
+                        }
+                    }
+                    if let Some(drv_fence) = fence_to_signal {
+                        drv_fence.signal(Err(e));
+                    }
                     state.stage_ranges[stage_i].pop_front();
-                    state.done_range.push_back();
-                    return;
+                    if stage_i + 1 < self.stages.len() {
+                        state.stage_ranges[stage_i + 1].push_back();
+                        let mut guard = self.fifo.lock();
+                        if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                            entry.stage_entered_at = Instant::now();
+                        }
+                    } else {
+                        state.done_range.push_back();
+                    }
+                    // Continue loop: process the new front of this stage.
                 }
                 StageAdvance::WaitOn(fence) => {
                     let uninit_box = {
