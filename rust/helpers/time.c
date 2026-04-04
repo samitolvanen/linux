@@ -4,6 +4,10 @@
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
 
+#ifdef CONFIG_ARM_ARCH_TIMER
+#include <asm/arch_timer.h>
+#endif
+
 void rust_helper_fsleep(unsigned long usecs)
 {
 	fsleep(usecs);
@@ -33,3 +37,10 @@ s64 rust_helper_ktime_to_ms(const ktime_t kt)
 {
 	return ktime_to_ms(kt);
 }
+
+#ifdef CONFIG_ARM_ARCH_TIMER
+u32 rust_helper_arch_timer_get_cntfrq(void)
+{
+	return arch_timer_get_cntfrq();
+}
+#endif
