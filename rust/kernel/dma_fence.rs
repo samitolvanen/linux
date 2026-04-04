@@ -839,6 +839,15 @@ impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DriverDmaFence<T, V> {
     pub fn inner(&self) -> &DriverDmaFenceInner<T> {
         &self.inner
     }
+
+    /// Set the error code on the fence.
+    pub fn set_error(&self, err: Error) {
+        // SAFETY: The fence pointer is valid because it's managed by `self.inner`.
+        // The error code is a standard negative errno value.
+        unsafe {
+            bindings::dma_fence_set_error(self.inner.fence.get(), err.to_errno());
+        }
+    }
 }
 
 impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {
