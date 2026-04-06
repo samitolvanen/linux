@@ -426,7 +426,8 @@ impl platform::Driver for TyrDriver {
             )
         })?;
 
-        tdev.sched.lock().init(&tdev.clone())?;
+        let scheduler = Scheduler::init(&tdev.clone())?;
+        *tdev.sched.lock() = SchedulerState::Enabled(scheduler);
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
