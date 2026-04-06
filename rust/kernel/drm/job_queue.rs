@@ -518,6 +518,8 @@ struct JobDependencies<T: QueueOps> {
     current_idx: usize,
     /// The currently active dependency callback (at most one at a time).
     active_cb: Option<Pin<KBox<FenceCallbackRegistration<DepCallback<T>>>>>,
+    /// Pre-allocated uninitialized memory for dependency callbacks.
+    prealloc_cbs: KVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
 }
 
 /// A single per-job allocation stored in the XArray.
@@ -556,6 +558,14 @@ struct JobEntry<T: QueueOps> {
 
     /// Optional callback registered when a stage returns [`StageAdvance::WaitOn`].
     stage_wake_cb: Option<Pin<KBox<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
+
+    /// Pre-allocated uninitialized memory for the progress callback.
+    prealloc_progress_cb:
+        Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<ProgressCallback<T>>>>>,
+
+    /// Pre-allocated uninitialized memory for the stage wake callback.
+    prealloc_stage_cb:
+        Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
 }
 
 // State managed by `submit()`. This is separate from `PipelineState` to avoid
@@ -812,28 +822,57 @@ impl<T: QueueOps> JobQueueInner<T> {
                     return;
                 }
                 StageAdvance::WaitOn(fence) => {
+                    let uninit_box = {
+                        let mut guard = self.fifo.lock();
+                        guard
+                            .get_mut(entry_idx as usize)
+                            .and_then(|e| e.prealloc_stage_cb.take())
+                    };
+
                     let cb = FenceCallbackRegistration::new(
                         &fence,
                         StageWakeCallback {
                             inner: self.clone(),
                         },
                     );
-                    match KBox::try_pin_init(cb, GFP_KERNEL) {
-                        Ok(registration) => {
-                            let mut guard = self.fifo.lock();
-                            if let Some(entry) = guard.get_mut(entry_idx as usize) {
-                                entry.stage_wake_cb = Some(registration);
+
+                    if let Some(uninit_box) = uninit_box {
+                        match uninit_box.write_pin_init(cb) {
+                            Ok(registration) => {
+                                let mut guard = self.fifo.lock();
+                                if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                                    entry.stage_wake_cb = Some(registration);
+                                }
+                            }
+                            Err(CallbackError::AlreadySignaled(cb)) => {
+                                cb.inner.maybe_check_progress();
+                            }
+                            Err(CallbackError::Other(e)) => {
+                                pr_err!(
+                                    "JobQueue: stage WaitOn prealloc failed: {:?}, entry {}\n",
+                                    e,
+                                    entry_idx
+                                );
                             }
                         }
-                        Err(CallbackError::AlreadySignaled(cb)) => {
-                            cb.inner.maybe_check_progress();
-                        }
-                        Err(CallbackError::Other(e)) => {
-                            pr_err!(
-                                "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
-                                e,
-                                entry_idx
-                            );
+                    } else {
+                        match KBox::try_pin_init(cb, GFP_NOWAIT) {
+                            Ok(registration) => {
+                                let mut guard = self.fifo.lock();
+                                if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                                    entry.stage_wake_cb = Some(registration);
+                                }
+                            }
+                            Err(CallbackError::AlreadySignaled(cb)) => {
+                                cb.inner.maybe_check_progress();
+                            }
+                            Err(CallbackError::Other(e)) => {
+                                pr_err!(
+                                    "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
+                                    e,
+                                    entry_idx
+                                );
+                            }
                         }
                     }
                     return;
@@ -879,13 +918,43 @@ impl<T: QueueOps> JobQueueInner<T> {
                 return StageAdvance::Advance;
             };
 
+            if dep_fence.is_signaled() {
+                let mut guard = self.fifo.lock();
+                if let Some(entry) = guard.get_mut(entry_idx as usize) {
+                    entry.deps.active_cb = None;
+                    entry.deps.current_idx += 1;
+                }
+                continue;
+            }
+
+            // If we've already registered a callback for this dependency, wait.
+            let is_waiting = {
+                let guard = self.fifo.lock();
+                if let Some(entry) = guard.get(entry_idx as usize) {
+                    entry.deps.active_cb.is_some()
+                } else {
+                    false
+                }
+            };
+
+            if is_waiting {
+                return self.pipeline_wait_or_timeout(entry_idx);
+            }
+
             let callback = DepCallback {
                 inner: self.clone(),
             };
-            match KBox::try_pin_init(
-                FenceCallbackRegistration::new(&dep_fence, callback),
-                GFP_KERNEL,
-            ) {
+            let uninit_box = {
+                let mut guard = self.fifo.lock();
+                guard
+                    .get_mut(entry_idx as usize)
+                    .unwrap()
+                    .deps
+                    .prealloc_cbs
+                    .pop()
+                    .unwrap()
+            };
+            match uninit_box.write_pin_init(FenceCallbackRegistration::new(&dep_fence, callback)) {
                 Ok(registration) => {
                     {
                         let mut guard = self.fifo.lock();
@@ -960,15 +1029,21 @@ impl<T: QueueOps> JobQueueInner<T> {
             Ok(SubmitResult::Submitted) => {
                 // Register a callback on the public submit fence so that the
                 // HW-wait stage wakes up promptly when the driver signals it.
-                let cb_result = KBox::try_pin_init(
-                    FenceCallbackRegistration::new(
-                        &submit_fence,
-                        ProgressCallback {
-                            inner: self.clone(),
-                        },
-                    ),
-                    GFP_KERNEL,
-                );
+                let uninit_box = {
+                    let mut guard = self.fifo.lock();
+                    guard
+                        .get_mut(entry_idx as usize)
+                        .unwrap()
+                        .prealloc_progress_cb
+                        .take()
+                        .unwrap()
+                };
+                let cb_result = uninit_box.write_pin_init(FenceCallbackRegistration::new(
+                    &submit_fence,
+                    ProgressCallback {
+                        inner: self.clone(),
+                    },
+                ));
                 match cb_result {
                     Ok(registration) => {
                         let mut guard = self.fifo.lock();
@@ -1202,6 +1277,12 @@ pub struct PreparedJob<T: QueueOps> {
     xa_index: Option<ReservedIndex>,
     /// Pre-allocated dependency vector (empty on creation, capacity reserved).
     deps: KVec<ARef<PublicDmaFence>>,
+    prealloc_cbs: KVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
+    prealloc_progress_cb:
+        Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<ProgressCallback<T>>>>>,
+    prealloc_stage_cb:
+        Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
+    entry_box: Option<KBox<core::mem::MaybeUninit<JobEntry<T>>>>,
     counter: u64,
 }
 
@@ -1218,6 +1299,21 @@ impl<T: QueueOps> Drop for PreparedJob<T> {
 }
 
 impl<T: QueueOps> JobQueue<T> {
+    /// Returns true if the job queue is completely idle (no jobs in any stage).
+    pub fn is_idle(&self) -> bool {
+        let state = self.inner.state.lock();
+        let inbox = self.inner.inbox.lock();
+        if state.submitted_start != inbox.submitted_end {
+            return false;
+        }
+        for i in 0..state.stage_ranges.len() {
+            if !state.stage_ranges[i].is_empty() {
+                return false;
+            }
+        }
+        state.done_range.is_empty()
+    }
+
     /// Create a new job queue.
     ///
     /// `handler` is the driver's submission logic.
@@ -1290,6 +1386,16 @@ impl<T: QueueOps> JobQueue<T> {
         let job = Arc::new(job, GFP_KERNEL)?;
         let deps = KVec::with_capacity(num_deps, GFP_KERNEL)?;
 
+        let mut prealloc_cbs = KVec::with_capacity(num_deps, GFP_KERNEL)?;
+        for _ in 0..num_deps {
+            prealloc_cbs.push(KBox::new_uninit(GFP_KERNEL)?, GFP_KERNEL)?;
+        }
+
+        let prealloc_progress_cb = Some(KBox::new_uninit(GFP_KERNEL)?);
+        let prealloc_stage_cb = Some(KBox::new_uninit(GFP_KERNEL)?);
+
+        let entry_box = Some(KBox::new_uninit(GFP_KERNEL)?);
+
         let xa_index = {
             let mut inbox = self.inner.inbox.lock();
             let mut guard = self.inner.fifo.lock();
@@ -1302,6 +1408,10 @@ impl<T: QueueOps> JobQueue<T> {
             uninit_fence: Some(uninit_fence),
             xa_index: Some(xa_index),
             deps,
+            prealloc_cbs,
+            prealloc_progress_cb,
+            prealloc_stage_cb,
+            entry_box,
             counter,
         })
     }
@@ -1331,41 +1441,35 @@ impl<T: QueueOps> JobQueue<T> {
 
         // Copy deps into the pre-allocated vector.
         let mut dep_vec = core::mem::replace(&mut prepared.deps, KVec::new());
-        let _ = dep_vec.extend_from_slice(deps, GFP_KERNEL);
+        for dep in deps {
+            let _ = dep_vec.push(dep.clone(), GFP_NOWAIT);
+        }
 
-        // Allocate the JobEntry box.  On OOM the struct constructor is
-        // evaluated first, so `submit_fence_drv` is moved in and then dropped
-        // when the aborted `KBox` drops the value — signaling ECANCELED.
-        let entry = match KBox::new(
-            JobEntry {
-                job: prepared.job.clone(),
-                submit_fence: submit_fence.clone(),
-                submit_fence_drv: Some(submit_fence_drv),
-                counter: prepared.counter,
-                deps: JobDependencies {
-                    fences: dep_vec,
-                    current_idx: 0,
-                    active_cb: None,
-                },
-                progress_cb: None,
-                stage_entered_at: Instant::now(),
-                pipeline_entered_at: Instant::now(),
-                stage_wake_cb: None,
+        let entry_box = prepared.entry_box.take().unwrap();
+        let entry = entry_box.write(JobEntry {
+            job: prepared.job.clone(),
+            submit_fence: submit_fence.clone(),
+            submit_fence_drv: Some(submit_fence_drv),
+            counter: prepared.counter,
+            deps: JobDependencies {
+                fences: dep_vec,
+                current_idx: 0,
+                active_cb: None,
+                prealloc_cbs: core::mem::replace(&mut prepared.prealloc_cbs, KVec::new()),
             },
-            GFP_KERNEL,
-        ) {
-            Ok(e) => e,
-            Err(_) => {
-                self.inner.fifo.lock().release(xa_index);
-                return Err(ENOMEM);
-            }
-        };
+            progress_cb: None,
+            stage_entered_at: Instant::now(),
+            pipeline_entered_at: Instant::now(),
+            stage_wake_cb: None,
+            prealloc_progress_cb: prepared.prealloc_progress_cb.take(),
+            prealloc_stage_cb: prepared.prealloc_stage_cb.take(),
+        });
 
         // Store entry in the reserved slot.
         let mut inbox = self.inner.inbox.lock();
         {
             let mut guard = self.inner.fifo.lock();
-            if let Err(store_err) = guard.store_reserved(xa_index, entry, GFP_KERNEL) {
+            if let Err(store_err) = guard.store_reserved(xa_index, entry, GFP_NOWAIT) {
                 // Slot still holds XA_ZERO_ENTRY..release it.
                 // store_err.value (the KBox<JobEntry>) is dropped here, leading to ECANCELED.
                 drop(store_err);
@@ -1499,6 +1603,7 @@ impl<T: QueueOps> JobQueue<T> {
                         }
                     }
                 }
+                let _ann = kernel::dma_fence::DmaFenceSignallingAnnotation::new();
                 drop(entry.deps.active_cb.take());
                 drop(entry.progress_cb.take());
                 drop(entry.stage_wake_cb.take());
