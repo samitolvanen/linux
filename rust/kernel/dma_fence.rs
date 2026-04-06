@@ -523,6 +523,12 @@ impl PublicDmaFence {
         // SAFETY: The pointer is valid per the type invariant.
         unsafe { (*self.inner.get()).seqno }
     }
+
+    /// Returns the fence's context ID.
+    pub fn context(&self) -> u64 {
+        // SAFETY: The pointer is valid per the type invariant.
+        unsafe { (*self.inner.get()).context }
+    }
 }
 
 /// Trait for driver-specific DMA fence operations.
