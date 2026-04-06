@@ -168,27 +168,38 @@ impl RequestField {
         Ok((cur_req_val ^ cur_ack_val) != 0)
     }
 
+    /// Returns the subset of `reqs` that have been acknowledged by the firmware.
+    pub(crate) fn acked_reqs(&self, reqs: u32) -> Result<u32> {
+        let cur_req_val = self.req.read::<u32>()?;
+        let cur_ack_val = self.ack.read::<u32>()?;
+
+        // Bits that are the same in req and ack are considered acked.
+        Ok(!(cur_req_val ^ cur_ack_val) & reqs)
+    }
+
     /// Waits for the given requests to be acknowledged.
     ///
     /// This will sleep for at most `timeout_ms` milliseconds.
-    pub(crate) fn wait_acks(&self, reqs: u32, events_wait: &Wait, timeout_ms: u32) -> Result {
+    pub(crate) fn wait_acks(&self, reqs: u32, events_wait: &Wait, timeout_ms: u32) -> Result<u32> {
         // Busy wait for a few microseconds to avoid the overhead of context
         // switching if the firmware responds quickly (which it usually does).
         // This matches read_poll_timeout_atomic usage in Panthor.
         for _ in 0..10_000 {
             if !self.pending_reqs(reqs)? {
-                return Ok(());
+                return self.acked_reqs(reqs);
             }
             cpu_relax();
         }
 
-        events_wait.wait_interruptible_timeout(timeout_ms, |()| {
+        let _ = events_wait.wait_interruptible_timeout(timeout_ms, |()| {
             if !self.pending_reqs(reqs)? {
                 Ok(WaitResult::Ok)
             } else {
                 Ok(WaitResult::Retry)
             }
-        })
+        });
+
+        self.acked_reqs(reqs)
     }
 }
 

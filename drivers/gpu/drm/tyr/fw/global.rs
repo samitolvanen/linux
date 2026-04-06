@@ -404,7 +404,8 @@ impl GlobalInterface {
 
         self.ring_glb_doorbell()?;
 
-        if let Err(ETIMEDOUT) = req.wait_acks(GLB_PING, &self.event_wait, 100) {
+        let acked = req.wait_acks(GLB_PING, &self.event_wait, 100)?;
+        if acked != GLB_PING {
             pr_err!("CSF has not responded to a ping request\n");
             pr_err!("The firmware probably crashed\n");
         }
@@ -458,7 +459,8 @@ impl GlobalInterface {
         let glb = self.state.enabled()?;
         let csg = glb.csgs.get(csg_idx).ok_or(EINVAL)?;
         let req = csg.input_request()?;
-        req.wait_acks(mask, &self.event_wait, timeout_ms)
+        req.wait_acks(mask, &self.event_wait, timeout_ms)?;
+        Ok(())
     }
 
     /// Whether the firmware has booted or not.
