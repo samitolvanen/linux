@@ -111,5 +111,4 @@ impl QueueOps for VmBindJobHandler {
 
         Ok(SubmitResult::Submitted)
     }
-
 }

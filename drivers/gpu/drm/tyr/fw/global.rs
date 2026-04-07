@@ -4,13 +4,13 @@
 
 use core::ops::Deref;
 
+use cs::CommandStream;
 use csg::CommandStreamGroup;
 use kernel::bits::genmask_u32;
 use kernel::clk::Clk;
 use kernel::devres::Devres;
 use kernel::impl_has_delayed_work;
 use kernel::io;
-use kernel::kvec;
 use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -38,8 +38,10 @@ pub(crate) mod cs;
 pub(crate) mod csg;
 
 #[allow(dead_code)]
-mod constants {
+pub(crate) mod constants {
     use kernel::bits::{bit_u32, genmask_u32};
+
+    pub(crate) const CSF_GROUP_CONTROL_OFFSET: u32 = 0x1000;
 
     pub(super) const GLB_TIMER_SOURCE_GPU_COUNTER: u32 = bit_u32(31);
     pub(super) const PROGRESS_TIMEOUT_CYCLES: u32 = 5 * 500 * 1024 * 1024;
@@ -246,11 +248,45 @@ impl GlobalInterface {
         })
     }
 
+    pub(crate) fn read_topology(&self) -> Result<(u32, u32)> {
+        let control_area = SharedSectionRange {
+            shared_section: self.shared_section.clone(),
+            start: 0,
+            end: core::mem::size_of::<Control>(),
+        };
+
+        let op = || Control::read(&control_area);
+        let cond = |control: &Control| -> bool { control.version != 0 };
+        let _ = io::poll::read_poll_timeout(
+            op,
+            cond,
+            time::Delta::from_millis(0),
+            time::Delta::from_millis(200),
+        );
+
+        let control = Control::read(&control_area)?;
+        if control.version == 0 {
+            pr_err!("MCU firmware version is 0. Firmware may have failed to boot\n");
+            return Err(EINVAL);
+        }
+
+        let csg_control_area = SharedSectionRange {
+            shared_section: self.shared_section.clone(),
+            start: constants::CSF_GROUP_CONTROL_OFFSET as usize,
+            end: core::mem::size_of::<csg::Control>(),
+        };
+        let csg_control = csg::Control::read(&csg_control_area)?;
+
+        Ok((control.group_num, csg_control.stream_num))
+    }
+
     pub(crate) fn enable(
         &mut self,
         tdev: &TyrDevice,
         gpu_info: &GpuInfo,
         core_clk: &Clk,
+        mut csgs: KVec<CommandStreamGroup>,
+        mut streams_per_csg: KVec<KVec<CommandStream>>,
     ) -> Result {
         // This takes a mutex internally in clk_prepare().
         let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
@@ -282,14 +318,14 @@ impl GlobalInterface {
         let output_area =
             self.shared_range(control.output_va.into(), core::mem::size_of::<Output>())?;
 
-        /// The start of the CSG control area for the first CSG.
-        const CSF_GROUP_CONTROL_OFFSET: u32 = 0x1000;
-
-        let mut csgs: KVec<CommandStreamGroup> = kvec![];
         for csg_idx in 0..control.group_num {
-            let iface_offset = CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
+            let iface_offset =
+                constants::CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
 
-            let csg = CommandStreamGroup::init(self, iface_offset, csg_idx as usize)?;
+            let prealloc_streams = streams_per_csg.pop().ok_or(EINVAL)?;
+
+            let csg =
+                CommandStreamGroup::init(self, iface_offset, csg_idx as usize, prealloc_streams)?;
 
             if let Some(first) = csgs.first() {
                 if !first.is_identical(&csg)? {
@@ -298,7 +334,7 @@ impl GlobalInterface {
                 }
             }
 
-            csgs.push(csg, GFP_KERNEL)?;
+            csgs.push(csg, GFP_NOWAIT)?;
         }
 
         pr_info!(

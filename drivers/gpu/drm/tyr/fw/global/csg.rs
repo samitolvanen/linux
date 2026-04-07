@@ -20,7 +20,6 @@
 //! area.
 
 use kernel::bits::bit_u32;
-use kernel::kvec;
 use kernel::prelude::*;
 
 use crate::fw::global::cs::CommandStream;
@@ -39,6 +38,8 @@ pub(crate) mod constants {
     #![allow(dead_code)]
     use kernel::bits::bit_u32;
     use kernel::bits::genmask_u32;
+
+    pub(crate) const CSF_STREAM_CONTROL_OFFSET: u32 = 0x40;
 
     pub(crate) const CSG_STATE_MASK: u32 = genmask_u32(0..=2);
     pub(crate) const CSG_STATE_TERMINATE: u32 = 0;
@@ -95,6 +96,7 @@ impl CommandStreamGroup {
         glb_iface: &mut GlobalInterface,
         iface_offset: u32,
         csg_id: usize,
+        mut streams: KVec<CommandStream>,
     ) -> Result<Self> {
         if iface_offset as usize + core::mem::size_of::<Self>() >= glb_iface.shared_section_size() {
             pr_err!("CSG interface would overrun the shared section");
@@ -115,9 +117,6 @@ impl CommandStreamGroup {
         let output_area =
             glb_iface.shared_range(control.output_va.into(), core::mem::size_of::<Output>())?;
 
-        const CSF_STREAM_CONTROL_OFFSET: u32 = 0x40;
-        let mut streams: KVec<CommandStream> = kvec![];
-
         for cs_idx in 0..control.stream_num {
             let iface_offset = iface_offset + CSF_STREAM_CONTROL_OFFSET + (cs_idx * control.stride);
             let cs = CommandStream::init(glb_iface, iface_offset, csg_id, cs_idx as usize)?;
@@ -132,7 +131,7 @@ impl CommandStreamGroup {
                 }
             }
 
-            streams.push(cs, GFP_KERNEL)?;
+            streams.push(cs, GFP_NOWAIT)?;
         }
 
         Ok(CommandStreamGroup {

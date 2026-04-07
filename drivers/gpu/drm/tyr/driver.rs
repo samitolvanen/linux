@@ -396,12 +396,28 @@ impl platform::Driver for TyrDriver {
         fw_boot_wait.clone().wait_interruptible_timeout(100, |()| {
             tdev.fw.with_locked_global_iface(|glb| {
                 if glb.booted() {
-                    glb.enable(&tdev, gpu_info, core_clk)?;
                     Ok(WaitResult::Ok)
                 } else {
                     Ok(WaitResult::Retry)
                 }
             })
+        })?;
+
+        let (group_num, stream_num) = tdev
+            .fw
+            .with_locked_global_iface(|glb| glb.read_topology())?;
+
+        let prealloc_csgs = KVec::with_capacity(group_num as usize, GFP_KERNEL)?;
+        let mut prealloc_streams = KVec::with_capacity(group_num as usize, GFP_KERNEL)?;
+        for _ in 0..group_num {
+            prealloc_streams.push(
+                KVec::with_capacity(stream_num as usize, GFP_KERNEL)?,
+                GFP_KERNEL,
+            )?;
+        }
+
+        tdev.fw.with_locked_global_iface(|glb| {
+            glb.enable(&tdev, gpu_info, core_clk, prealloc_csgs, prealloc_streams)
         })?;
 
         tdev.sched.lock().init(&tdev.clone())?;
