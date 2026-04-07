@@ -7,7 +7,6 @@ use core::ops::Deref;
 use cs::CommandStream;
 use csg::CommandStreamGroup;
 use kernel::bits::genmask_u32;
-use kernel::clk::Clk;
 use kernel::devres::Devres;
 use kernel::impl_has_delayed_work;
 use kernel::io;
@@ -86,8 +85,24 @@ fn glb_timer_val(val: u32) -> u32 {
 struct TimeoutCycles(u32);
 
 impl TimeoutCycles {
-    fn from_micro(core_clk: &Clk, timeout_us: u32) -> Result<Self> {
-        let timer_rate = core_clk.rate().as_hz() as u64;
+    fn from_micro(core_clk_rate: u64, timeout_us: u32) -> Result<Self> {
+        let mut use_cycle_counter = false;
+        let mut timer_rate = {
+            #[cfg(CONFIG_ARM_ARCH_TIMER)]
+            {
+                // SAFETY: It is safe to call `arch_timer_get_cntfrq` because it only reads a system register.
+                (unsafe { kernel::bindings::arch_timer_get_cntfrq() }) as u64
+            }
+            #[cfg(not(CONFIG_ARM_ARCH_TIMER))]
+            {
+                0
+            }
+        };
+
+        if timer_rate == 0 {
+            timer_rate = core_clk_rate;
+            use_cycle_counter = true;
+        }
 
         if timer_rate == 0 {
             return Err(EINVAL);
@@ -101,9 +116,11 @@ impl TimeoutCycles {
         }
 
         let mod_cycles = u32::try_from(mod_cycles)?;
-        Ok(Self(
-            glb_timer_val(mod_cycles) | GLB_TIMER_SOURCE_GPU_COUNTER,
-        ))
+        let mut val = glb_timer_val(mod_cycles);
+        if use_cycle_counter {
+            val |= GLB_TIMER_SOURCE_GPU_COUNTER;
+        }
+        Ok(Self(val))
     }
 }
 
@@ -284,12 +301,12 @@ impl GlobalInterface {
         &mut self,
         tdev: &TyrDevice,
         gpu_info: &GpuInfo,
-        core_clk: &Clk,
+        core_clk_rate: u64,
         mut csgs: KVec<CommandStreamGroup>,
         mut streams_per_csg: KVec<KVec<CommandStream>>,
     ) -> Result {
         // This takes a mutex internally in clk_prepare().
-        let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
+        let poweroff_timer = TimeoutCycles::from_micro(core_clk_rate, PWROFF_HYSTERESIS_US)?.into();
 
         let control_area = SharedSectionRange {
             shared_section: self.shared_section.clone(),

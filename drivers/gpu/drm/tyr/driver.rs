@@ -391,7 +391,7 @@ impl platform::Driver for TyrDriver {
         regs::MCU_CONTROL.write(pdev.as_ref(), &tdev.iomem, regs::MCU_CONTROL_AUTO)?;
 
         let gpu_info = &tdev.gpu_info;
-        let core_clk = &tdev.clks.lock().core;
+        let core_clk_rate = tdev.clks.lock().core.rate().as_hz() as u64;
 
         fw_boot_wait.clone().wait_interruptible_timeout(100, |()| {
             tdev.fw.with_locked_global_iface(|glb| {
@@ -417,7 +417,13 @@ impl platform::Driver for TyrDriver {
         }
 
         tdev.fw.with_locked_global_iface(|glb| {
-            glb.enable(&tdev, gpu_info, core_clk, prealloc_csgs, prealloc_streams)
+            glb.enable(
+                &tdev,
+                gpu_info,
+                core_clk_rate,
+                prealloc_csgs,
+                prealloc_streams,
+            )
         })?;
 
         tdev.sched.lock().init(&tdev.clone())?;
