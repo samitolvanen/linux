@@ -52,9 +52,7 @@ pub(crate) struct TyrDrmDriver;
 pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, Ctx>;
 
 #[pin_data(PinnedDrop)]
-pub(crate) struct TyrPlatformDriverData {
-    _device: ARef<TyrDrmDevice>,
-}
+pub(crate) struct TyrPlatformDriverData;
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrDrmDeviceData {
@@ -157,15 +155,12 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
         });
 
-        let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
-        let driver = TyrPlatformDriverData {
-            _device: ddev.into(),
-        };
+        Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
-        Ok(driver)
+        Ok(TyrPlatformDriverData)
     }
 }
 
