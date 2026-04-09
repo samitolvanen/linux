@@ -190,18 +190,24 @@ impl<T: DriverObject> Object<T> {
         // - DRM always passes a valid gem object here
         // - We used drm_gem_shmem_create() in our create_gem_object callback, so we know that
         //   `obj` is contained within a drm_gem_shmem_object
-        let this = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
+        let shmem_obj = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
+
+        // SAFETY:
+        // - We verified above that `obj` is valid, which makes `shmem_obj` valid
+        // - This function is set in AllocOps, so we know that `shmem_obj` is contained within a
+        //   `Object<T>`
+        let this = unsafe { container_of!(Opaque::cast_from(shmem_obj), Self, obj) }.cast_mut();
+
+        // Clear sgt_res before calling drm_gem_shmem_release(), since drm_gem_shmem_release()
+        // will free the sgt, and we don't want SGTableMap::drop to try to free it again.
+        // SAFETY: We have exclusive access to this object in free_callback.
+        unsafe { (*this).sgt_res.get_mut().take() };
 
         // SAFETY:
         // - We're in free_callback - so this function is safe to call.
         // - We won't be using the gem resources on `this` after this call.
-        unsafe { bindings::drm_gem_shmem_release(this) };
+        unsafe { bindings::drm_gem_shmem_release(shmem_obj) };
 
-        // SAFETY:
-        // - We verified above that `obj` is valid, which makes `this` valid
-        // - This function is set in AllocOps, so we know that `this` is contained within a
-        //   `Object<T>`
-        let this = unsafe { container_of!(Opaque::cast_from(this), Self, obj) }.cast_mut();
 
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(this) };
