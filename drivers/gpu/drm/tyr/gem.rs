@@ -24,6 +24,7 @@ impl gem::DriverObject for TyrObject {
     fn new<Ctx: DeviceContext>(
         _dev: &TyrDrmDevice<Ctx>,
         _size: usize,
+        _args: Self::Args,
     ) -> impl PinInit<Self, Error> {
         try_pin_init!(TyrObject {})
     }
