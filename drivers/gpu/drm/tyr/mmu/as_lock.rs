@@ -50,15 +50,13 @@ impl<'a> AsLockToken<'a> {
         let region_start =
             region.start & genmask_checked_u64(region_width as u32..=63).ok_or(EINVAL)?;
 
-        let region = (region_width as u64) | region_start;
-
-        let region_lo = (region & 0xffffffff) as u32;
-        let region_hi = (region >> 32) as u32;
+        let region_val = (region_width as u64) | region_start;
 
         // Lock the region that needs to be updated.
-        as_lockaddr_lo(as_nr)?.write(iomem, region_lo)?;
-        as_lockaddr_hi(as_nr)?.write(iomem, region_hi)?;
-        as_command(as_nr)?.write(iomem, AS_COMMAND_LOCK)?;
+        as_lockaddr_lo(as_nr)?.write(iomem, (region_val & 0xffffffff) as u32)?;
+        as_lockaddr_hi(as_nr)?.write(iomem, (region_val >> 32) as u32)?;
+
+        Mmu::write_cmd(iomem, as_nr, AS_COMMAND_LOCK)?;
 
         Ok(Self { iomem, as_nr })
     }
@@ -66,29 +64,12 @@ impl<'a> AsLockToken<'a> {
 
 impl Drop for AsLockToken<'_> {
     fn drop(&mut self) {
-        let as_cmd = as_command(self.as_nr);
-        match as_cmd {
-            Ok(as_cmd) => {
-                if let Err(err) = Mmu::wait_ready(self.iomem, self.as_nr) {
-                    pr_err!("MMU is busy for AS{}: {:?}\n", self.as_nr, err);
-                    return;
-                }
-                if let Err(err) = as_cmd.write(self.iomem, AS_COMMAND_FLUSH_PT) {
-                    pr_err!(
-                        "Failed to flush page tables for AS{}: {:?}\n",
-                        self.as_nr,
-                        err
-                    );
-                    return;
-                }
-                if let Err(err) = Mmu::wait_ready(self.iomem, self.as_nr) {
-                    pr_err!("MMU is busy for AS{}: {:?}\n", self.as_nr, err);
-                }
-            }
-
-            Err(err) => {
-                pr_err!("Failed to unlock AS{}: {:?}\n", self.as_nr, err);
-            }
+        if let Err(err) = Mmu::write_cmd(self.iomem, self.as_nr, AS_COMMAND_UNLOCK) {
+            pr_err!("Failed to unlock AS{}: {:?}\n", self.as_nr, err);
+            return;
+        }
+        if let Err(err) = Mmu::wait_ready(self.iomem, self.as_nr) {
+            pr_err!("MMU is busy for AS{}: {:?}\n", self.as_nr, err);
         }
     }
 }

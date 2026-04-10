@@ -35,6 +35,19 @@ impl<const OFFSET: usize> Register<OFFSET> {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) fn try_read(&self, iomem: &Devres<IoMem>) -> Result<u32> {
+        (*iomem).try_access().ok_or(ENODEV)?.try_read32(OFFSET)
+    }
+
+    #[inline]
+    pub(crate) fn try_write(&self, iomem: &Devres<IoMem>, value: u32) -> Result<()> {
+        (*iomem)
+            .try_access()
+            .ok_or(ENODEV)?
+            .try_write32(value, OFFSET)
+    }
+
     /// Read a 64-bit value from two consecutive 32-bit registers (lo + hi)
     /// This is equivalent to panthor's gpu_read64() - simple lo-hi read without tearing protection
     #[inline]
@@ -97,8 +110,23 @@ pub(crate) const GPU_IRQ_CLEAR: Register<0x24> = Register;
 pub(crate) const GPU_IRQ_MASK: Register<0x28> = Register;
 pub(crate) const GPU_IRQ_STAT: Register<0x2c> = Register;
 pub(crate) const GPU_CMD: Register<0x30> = Register;
-pub(crate) const GPU_CMD_SOFT_RESET: u32 = 1 | (1 << 8);
-pub(crate) const GPU_CMD_HARD_RESET: u32 = 1 | (2 << 8);
+
+#[inline]
+pub(crate) const fn gpu_cmd_def(cmd_type: u32, payload: u32) -> u32 {
+    cmd_type | (payload << 8)
+}
+
+pub(crate) const GPU_CMD_SOFT_RESET: u32 = gpu_cmd_def(1, 1);
+pub(crate) const GPU_CMD_HARD_RESET: u32 = gpu_cmd_def(1, 2);
+
+pub(crate) const CACHE_CLEAN: u32 = bit_u32(0);
+pub(crate) const CACHE_INV: u32 = bit_u32(1);
+
+#[inline]
+pub(crate) const fn gpu_flush_caches(l2: u32, lsc: u32, oth: u32) -> u32 {
+    gpu_cmd_def(4, (l2 << 0) | (lsc << 4) | (oth << 8))
+}
+
 pub(crate) const GPU_TIMESTAMP_OFFSET: Register<0x88> = Register;
 pub(crate) const GPU_TIMESTAMP: Register<0x98> = Register;
 pub(crate) const GPU_THREAD_FEATURES: Register<0xac> = Register;

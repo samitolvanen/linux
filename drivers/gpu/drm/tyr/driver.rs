@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::marker::PhantomPinned;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel::c_str;
 use kernel::clk::Clk;
@@ -259,6 +260,12 @@ impl platform::Driver for TyrDriver {
         pdev: &platform::Device<Core>,
         _info: Option<&Self::IdInfo>,
     ) -> Result<Pin<KBox<Self>>> {
+        static INIT_ONCE: AtomicBool = AtomicBool::new(false);
+        if !INIT_ONCE.swap(true, Ordering::Relaxed) {
+            // SAFETY: Initialized exactly once before first use.
+            unsafe { crate::mmu::CACHE_FLUSH_LOCK.init() };
+        }
+
         let core_clk = Clk::get(pdev.as_ref(), Some(c_str!("core")))?;
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c_str!("stacks")))?;
         let coregroup_clk = OptionalClk::get(pdev.as_ref(), Some(c_str!("coregroup")))?;

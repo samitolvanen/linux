@@ -22,19 +22,18 @@ pub(crate) struct GpuIrq {
     iomem: Arc<Devres<IoMem>>,
     power_on_wait: Arc<Wait<bool>>,
 }
-
 pub(crate) fn gpu_irq_init<'a>(
     tdev: ARef<TyrDevice>,
     pdev: &'a platform::Device<kernel::device::Bound>,
     iomem: Arc<Devres<IoMem>>,
     power_on_wait: Arc<Wait<bool>>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<GpuIrq>>, Error> + 'a> {
-    crate::regs::GPU_IRQ_MASK.write(pdev.as_ref(), &iomem, u32::MAX)?;
-
     let irq_type = GpuIrq {
         iomem: iomem.clone(),
         power_on_wait,
     };
+
+    crate::regs::GPU_IRQ_MASK.write(pdev.as_ref(), &iomem, irq_type.mask())?;
 
     TyrIrq::request(pdev, tdev, c_str!("gpu"), irq_type)
 }
@@ -65,7 +64,7 @@ impl TyrIrqTrait for GpuIrq {
     }
 
     fn mask(&self) -> u32 {
-        u32::MAX
+        u32::MAX & !regs::GPU_IRQ_RAWSTAT_CLEAN_CACHES_COMPLETED
     }
 
     fn handle(&self, _: &TyrDevice, status: u32) {

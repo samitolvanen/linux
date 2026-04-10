@@ -21,7 +21,12 @@ use vm::VmLayout;
 use crate::driver::IoMem;
 use crate::driver::TyrDevice;
 use crate::gpu::GpuInfo;
-use crate::regs::*;
+use crate::regs::{self, *};
+
+kernel::sync::global_lock! {
+    // SAFETY: Initialized in the `probe` function of the module before first use.
+    pub(crate) unsafe(uninit) static CACHE_FLUSH_LOCK: Mutex<()> = ();
+}
 
 mod as_lock;
 mod faults;
@@ -75,7 +80,7 @@ impl Mmu {
     }
 
     fn flush_range(iomem: &Devres<IoMem>, as_nr: usize, range: Range<u64>) -> Result {
-        Self::do_as_command(iomem, as_nr, AS_COMMAND_FLUSH_PT, range)
+        Self::hw_do_operation(iomem, as_nr, AS_COMMAND_FLUSH_PT, range)
     }
 
     fn wait_ready(iomem: &Devres<IoMem>, as_nr: usize) -> Result {
@@ -91,20 +96,50 @@ impl Mmu {
         Ok(())
     }
 
-    fn do_as_command(
+    pub(crate) fn write_cmd(iomem: &Devres<IoMem>, as_nr: usize, command: u32) -> Result {
+        Self::wait_ready(iomem, as_nr)?;
+        as_command(as_nr)?.write(iomem, command)?;
+        Ok(())
+    }
+
+    fn hw_do_operation(
         iomem: &Devres<IoMem>,
         as_nr: usize,
         command: u32,
         region: Range<u64>,
     ) -> Result {
-        if command == AS_COMMAND_UNLOCK {
-            as_command(as_nr)?.write(iomem, command)?;
-        } else {
-            let _lock = AsLockToken::lock_region(iomem, as_nr, region)?;
-            Self::wait_ready(iomem, as_nr)?;
-            as_command(as_nr)?.write(iomem, command)?;
-            Self::wait_ready(iomem, as_nr)?;
-        }
+        let (l2_flush_op, lsc_flush_op) = match command {
+            AS_COMMAND_FLUSH_MEM => (
+                regs::CACHE_CLEAN | regs::CACHE_INV,
+                regs::CACHE_CLEAN | regs::CACHE_INV,
+            ),
+            AS_COMMAND_FLUSH_PT => (regs::CACHE_CLEAN | regs::CACHE_INV, 0),
+            _ => return Err(EINVAL),
+        };
+
+        let gpu_cmd_val = regs::gpu_flush_caches(l2_flush_op, lsc_flush_op, 0);
+
+        let _lock = AsLockToken::lock_region(iomem, as_nr, region)?;
+        Self::wait_ready(iomem, as_nr)?;
+
+        let _cache_flush_lock = CACHE_FLUSH_LOCK.lock();
+
+        // Clear any old CLEAN_CACHES_COMPLETED
+        regs::GPU_IRQ_CLEAR.try_write(iomem, regs::GPU_IRQ_RAWSTAT_CLEAN_CACHES_COMPLETED)?;
+
+        regs::GPU_CMD.try_write(iomem, gpu_cmd_val)?;
+
+        let op = || regs::GPU_IRQ_RAWSTAT.try_read(iomem);
+        let cond =
+            |status: &u32| -> bool { *status & regs::GPU_IRQ_RAWSTAT_CLEAN_CACHES_COMPLETED != 0 };
+
+        let res =
+            io::poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
+
+        // Clear it once we are done (or timed out)
+        regs::GPU_IRQ_CLEAR.try_write(iomem, regs::GPU_IRQ_RAWSTAT_CLEAN_CACHES_COMPLETED)?;
+
+        res?;
 
         Ok(())
     }
@@ -185,7 +220,7 @@ impl Mmu {
             return Err(EBUSY);
         }
 
-        Self::do_as_command(iomem, as_nr, AS_COMMAND_FLUSH_MEM, 0..u64::MAX)?;
+        Self::hw_do_operation(iomem, as_nr, AS_COMMAND_FLUSH_MEM, 0..u64::MAX)?;
 
         let transtab_lo = (transtab & 0xffffffff) as u32;
         let transtab_hi = (transtab >> 32) as u32;
@@ -205,18 +240,11 @@ impl Mmu {
         as_memattr_lo(as_nr)?.write(iomem, memattr_lo)?;
         as_memattr_hi(as_nr)?.write(iomem, memattr_hi)?;
 
-        let op = || as_status(as_nr)?.read(iomem);
-        let cond = |status: &u32| -> bool { *status & AS_STATUS_ACTIVE == 0 };
-        let _ =
-            io::poll::read_poll_timeout(op, cond, Delta::from_millis(0), Delta::from_micros(200))?;
-
-        as_command(as_nr)?.write(iomem, AS_COMMAND_UPDATE)?;
-
-        Ok(())
+        Self::write_cmd(iomem, as_nr, AS_COMMAND_UPDATE)
     }
 
     fn disable_as(iomem: &Devres<IoMem>, as_nr: usize) -> Result {
-        Self::do_as_command(iomem, as_nr, AS_COMMAND_FLUSH_MEM, 0..u64::MAX)?;
+        Self::hw_do_operation(iomem, as_nr, AS_COMMAND_FLUSH_MEM, 0..u64::MAX)?;
 
         as_transtab_lo(as_nr)?.write(iomem, 0)?;
         as_transtab_hi(as_nr)?.write(iomem, 0)?;
@@ -227,14 +255,7 @@ impl Mmu {
         as_transcfg_lo(as_nr)?.write(iomem, AS_TRANSCFG_ADRMODE_UNMAPPED as u32)?;
         as_transcfg_hi(as_nr)?.write(iomem, 0)?;
 
-        let op = || as_status(as_nr)?.read(iomem);
-        let cond = |status: &u32| -> bool { *status & AS_STATUS_ACTIVE == 0 };
-        let _ =
-            io::poll::read_poll_timeout(op, cond, Delta::from_millis(0), Delta::from_micros(200))?;
-
-        as_command(as_nr)?.write(iomem, AS_COMMAND_UPDATE)?;
-
-        Ok(())
+        Self::write_cmd(iomem, as_nr, AS_COMMAND_UPDATE)
     }
 }
 
