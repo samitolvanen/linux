@@ -171,7 +171,7 @@ const INFO: drm::DriverInfo = drm::DriverInfo {
 impl drm::Driver for TyrDrmDriver {
     type Data = TyrDrmDeviceData;
     type File = TyrDrmFileData;
-    type Object<R: drm::DeviceContext> = drm::gem::Object<BoData, R>;
+    type Object<R: drm::DeviceContext> = drm::gem::shmem::Object<BoData>;
 
     const INFO: drm::DriverInfo = INFO;
 
