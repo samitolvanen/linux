@@ -36,10 +36,14 @@ impl<'a> AsLockToken<'a> {
         // differs. The smallest naturally aligned block must include this bit
         // change, the desired region starts with this bit (and subsequent bits)
         // zeroed and ends with the bit (and subsequent bits) set to one.
-        let region_width = core::cmp::max(
-            (region.start ^ (region.end - 1)).leading_zeros() as u8,
-            64 - AS_LOCK_REGION_MIN_SIZE.trailing_zeros() as u8,
-        ) - 1;
+        let diff = region.start ^ (region.end - 1);
+        let fls = if diff == 0 {
+            0
+        } else {
+            64 - diff.leading_zeros() as u8
+        };
+
+        let region_width = core::cmp::max(fls, AS_LOCK_REGION_MIN_SIZE.trailing_zeros() as u8) - 1;
 
         // Mask off the low bits of region.start, which would be ignored by the
         // hardware anyways.
