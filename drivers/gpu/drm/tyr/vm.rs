@@ -7,7 +7,13 @@
 //! Each virtual memory (VM) area is backed by ARM64 LPAE Stage 1 page tables and can be
 //! mapped into hardware address space (AS) slots for GPU execution.
 
-use core::ops::Range;
+use core::{
+    ops::Range,
+    sync::atomic::{
+        AtomicBool,
+        Ordering, //
+    },
+};
 
 use kernel::{
     c_str,
@@ -31,6 +37,7 @@ use kernel::{
             OpUnmapped,
             UniqueRefGpuVm, //
         },
+        sched,
         DeviceContext, //
     },
     impl_flags,
@@ -71,6 +78,15 @@ use crate::{
     },
     regs::gpu_control::MMU_FEATURES,
 };
+
+pub(crate) mod bind_job;
+pub(crate) mod exec;
+pub(crate) mod pool;
+pub(crate) mod range;
+
+pub(crate) use self::bind_job::VmBindJob;
+pub(crate) use self::range::LiveRange;
+use self::range::RangeAlloc;
 
 impl_flags!(
     /// Flags controlling virtual memory mapping behavior.
@@ -157,6 +173,58 @@ impl TryFrom<u32> for VmMapFlags {
         }
         Ok(Self(value))
     }
+}
+
+/// 256M of every VM is reserved for kernel objects by default, i.e.: heap
+/// chunks, heapcontext, ring buffers, kernel synchronization objects and etc.
+///
+/// The user VA space always start at 0x0, and the kernel VA space is always
+/// placed after the user VA range.
+const MIN_KERNEL_VA_SIZE: u64 = 0x10000000;
+
+/// Layout of a VM's virtual address space, split into user and kernel regions.
+pub(crate) struct VmLayout {
+    /// Section reserved for user objects.
+    #[expect(dead_code)]
+    pub(crate) user: Range<u64>,
+
+    /// Section reserved for kernel objects.
+    pub(crate) kernel: Range<u64>,
+}
+
+impl VmLayout {
+    /// Automatically manages a layout given the a `VmUserSize`
+    pub(crate) fn from_user_sz(tdev: &TyrDrmDevice, user_sz: VmUserSize) -> Self {
+        let va_bits = tdev.gpu_info.va_bits();
+        let max_va_range = 1u64 << va_bits;
+
+        let user;
+        let kernel;
+
+        match user_sz {
+            VmUserSize::Auto | VmUserSize::Custom(0) => {
+                user = 0..max_va_range - MIN_KERNEL_VA_SIZE;
+                kernel = user.end..user.end + MIN_KERNEL_VA_SIZE;
+            }
+            VmUserSize::Custom(user_sz) => {
+                let user_sz = core::cmp::min(user_sz, max_va_range - MIN_KERNEL_VA_SIZE);
+                user = 0..user_sz;
+                kernel = user_sz..user_sz + MIN_KERNEL_VA_SIZE;
+            }
+        }
+
+        Self { user, kernel }
+    }
+}
+
+/// Controls the size of the user VA space.
+pub(crate) enum VmUserSize {
+    /// Lets the kernel decide the user/kernel split.
+    #[expect(dead_code)]
+    Auto,
+    /// Sets the user VA space to a custom size. Things will crash if not enough
+    /// is left for kernel objects.
+    Custom(u64),
 }
 
 /// Arguments for a virtual memory map operation.
@@ -305,6 +373,12 @@ impl Drop for PtUpdateContext<'_> {
 /// and associated types for buffer objects, virtual addresses, and contexts.
 pub(crate) struct GpuVmData {}
 
+/// Scheduler context for async VM bind operations.
+struct VmBindCtx {
+    scheduler: sched::Scheduler<VmBindJob>,
+    entity: sched::Entity<VmBindJob>,
+}
+
 /// GPU virtual address space.
 ///
 /// Each VM can be mapped into a hardware address space slot.
@@ -324,6 +398,18 @@ pub(crate) struct Vm {
     gpuvm: ARef<GpuVm<GpuVmData>>,
     /// VA range for this VM.
     va_range: Range<u64>,
+    /// Kernel VA allocator for auto-placement of kernel buffer objects.
+    kernel_va: RangeAlloc,
+    /// Kernel VA reservations that must live as long as the VM.
+    #[pin]
+    kernel_reservations: Mutex<KVec<LiveRange>>,
+    /// Whether this VM is in an unusable state due to failed async operations.
+    ///
+    /// Once set, the VM cannot accept new operations and should be destroyed.
+    unusable: AtomicBool,
+    /// Scheduler context for async VM bind operations.
+    #[pin]
+    bind_ctx: Mutex<VmBindCtx>,
 }
 
 impl Vm {
@@ -336,6 +422,7 @@ impl Vm {
         ddev: &TyrDrmDevice<Ctx>,
         mmu: ArcBorrow<'_, Mmu>,
         iomem: ArcBorrow<'_, Devres<IoMem>>,
+        kernel_va_range: Range<u64>,
     ) -> Result<Arc<Vm>> {
         // SAFETY: pdev is a bound device.
         let dev = unsafe { pdev.as_ref().as_bound() };
@@ -367,6 +454,23 @@ impl Vm {
 
         let as_data = Arc::pin_init(VmAsData::new(&mmu, pdev, va_bits, pa_bits), GFP_KERNEL)?;
 
+        let kernel_va = RangeAlloc::new(
+            kernel_va_range.start,
+            kernel_va_range.end,
+            GFP_KERNEL,
+        )?;
+
+        let bind_scheduler = sched::Scheduler::new(
+            ddev.as_ref(),
+            1,
+            1,
+            1,
+            1000,
+            c_str!("tyr_vm"),
+        )?;
+        let bind_entity =
+            sched::Entity::new(&bind_scheduler, sched::Priority::Low)?;
+
         let vm = Arc::pin_init(
             pin_init!(Self{
                 as_data,
@@ -375,6 +479,13 @@ impl Vm {
                 gpuvm,
                 gpuvm_unique <- new_mutex!(gpuvm_core),
                 va_range: range,
+                kernel_va,
+                kernel_reservations <- new_mutex!(KVec::new()),
+                unusable: AtomicBool::new(false),
+                bind_ctx <- new_mutex!(VmBindCtx {
+                    scheduler: bind_scheduler,
+                    entity: bind_entity,
+                }),
             }),
             GFP_KERNEL,
         )?;
@@ -391,8 +502,49 @@ impl Vm {
             })
     }
 
+    /// Returns whether this VM is in an unusable state.
+    pub(crate) fn is_unusable(&self) -> bool {
+        self.unusable.load(Ordering::Relaxed)
+    }
+
+    /// Marks this VM as unusable due to a failed operation.
+    pub(crate) fn mark_unusable(&self) {
+        self.unusable.store(true, Ordering::Relaxed);
+    }
+
+    /// Execute a function with the VM bind entity locked.
+    pub(crate) fn with_bind_entity<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut sched::Entity<VmBindJob>) -> Result<R>,
+    {
+        let mut ctx = self.bind_ctx.lock();
+        f(&mut ctx.entity)
+    }
+
+    /// Prepare the VM for execution and lock the bind entity.
+    ///
+    /// Acquires the GPUVM exec lock (reserving `num_slots` fence slots) and
+    /// the bind context mutex, then calls the provided closure with both a
+    /// [`PreparedVm`] and the bind [`Entity`].
+    pub(crate) fn with_prepared_vm_and_bind_entity<F, R>(
+        &self,
+        num_slots: u32,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut PreparedVm<'_>, &mut sched::Entity<VmBindJob>) -> Result<R>,
+    {
+        let exec_token = exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
+        let mut prepared_vm = PreparedVm {
+            exec_token,
+            num_slots,
+        };
+        let mut ctx = self.bind_ctx.lock();
+        f(&mut prepared_vm, &mut ctx.entity)
+    }
+
     /// Deactivate the VM by evicting it from its address space slot.
-    fn deactivate(&self) -> Result {
+    pub(crate) fn deactivate(&self) -> Result {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
             pr_err!("Failed to deactivate VM: {:?}\n", e);
         })
@@ -409,6 +561,32 @@ impl Vm {
             .inspect_err(|e| {
                 pr_err!("Failed to unmap range during deactivate: {:?}\n", e);
             });
+    }
+
+    /// Returns the hardware address space slot number if the VM is active.
+    pub(crate) fn address_space(&self) -> Option<usize> {
+        let mgr = self.mmu.as_manager.lock();
+        self.as_data.slot(&*mgr).map(|s| s as usize)
+    }
+
+    /// Prepare the VM for execution, reserving `num_slots` fence slots.
+    ///
+    /// Locks all reservation objects within the VM and reserves fence slots,
+    /// then calls the provided closure with a [`PreparedVm`] that can be used
+    /// to add fences to the reservation objects.
+    pub(crate) fn with_prepared_vm(
+        &self,
+        num_slots: u32,
+        f: impl FnOnce(PreparedVm<'_>) -> Result,
+    ) -> Result {
+        let exec_token =
+            exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
+        let prepared_vm = PreparedVm {
+            exec_token,
+            num_slots,
+        };
+
+        f(prepared_vm)
     }
 
     /// Executes a virtual memory operation.
@@ -536,6 +714,23 @@ impl Vm {
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
         self.gpuvm.deferred_cleanup();
+        Ok(())
+    }
+
+    /// Allocate a kernel VA range from the VM's kernel VA allocator.
+    pub(crate) fn alloc_kernel_range(
+        &self,
+        size: usize,
+    ) -> Result<range::LiveRange> {
+        self.kernel_va.allocate(size, GFP_KERNEL)
+    }
+
+    /// Reserve an explicitly-mapped range in the kernel VA allocator so
+    /// that future auto-allocations cannot collide with it.  The returned
+    /// `LiveRange` is stored for the lifetime of the VM.
+    pub(crate) fn reserve_kernel_range(&self, start: u64, end: u64) -> Result {
+        let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
+        self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
         Ok(())
     }
 }
@@ -807,4 +1002,25 @@ fn pt_unmap(pt: &IoPageTable<ARM64LPAES1>, range: Range<u64>) -> Result {
     }
 
     Ok(())
+}
+
+/// Indicates that all the reservations are locked for the objects in a given
+/// VM, and that `num_slots` have been reserved for fences.
+pub(crate) struct PreparedVm<'a> {
+    exec_token: exec::ExecToken<'a, GpuVmData>,
+    #[expect(dead_code)]
+    num_slots: u32,
+}
+
+impl<'a> PreparedVm<'a> {
+    /// Add a fence to the private and external buffer object reservations.
+    pub(crate) fn resv_add_fence(
+        &mut self,
+        fence: &impl kernel::dma_fence::RawDmaFence,
+        private_usage: u32,
+        extobj_usage: u32,
+    ) {
+        self.exec_token
+            .resv_add_fence(fence, private_usage, extobj_usage);
+    }
 }

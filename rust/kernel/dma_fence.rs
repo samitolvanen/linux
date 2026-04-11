@@ -64,7 +64,8 @@ pub trait RawDmaFence: crate::private::Sealed {
     /// Signal completion of this fence
     fn signal(&self) -> Result {
         // SAFETY: Safe to call on any valid dma_fence object
-        to_result(unsafe { bindings::dma_fence_signal(self.raw()) })
+        unsafe { bindings::dma_fence_signal(self.raw()) };
+        Ok(())
     }
 
     /// Set the error flag on this fence

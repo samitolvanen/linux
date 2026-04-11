@@ -25,7 +25,8 @@ use kernel::{
         Arc,
         ArcBorrow,
         Mutex, //
-    }, //
+    },
+    types::ForeignOwnable, //
 };
 
 use crate::{
@@ -42,6 +43,10 @@ use crate::{
 };
 
 pub(crate) mod address_space;
+mod faults;
+pub(crate) mod irq;
+
+pub(crate) use faults::decode_faults;
 
 pub(crate) type AsSlotManager = SlotManager<AddressSpaceManager, MAX_AS>;
 
@@ -127,3 +132,6 @@ impl Mmu {
         self.as_manager.lock().end_vm_update(vm)
     }
 }
+
+// We use no-op flush ops in iommu::pgtable.
+// The real TLB flush happens through AddressSpaceManager::as_flush / as_end_update.

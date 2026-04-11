@@ -47,6 +47,20 @@ pub(crate) fn read_u64_no_tearing(lo_read: impl Fn() -> u32, hi_read: impl Fn() 
 
 pub(crate) use mmu_control::mmu_as_control::MAX_AS;
 
+/// Offset of the CSF GPU_LATEST_FLUSH_ID register from the base of the MMIO region.
+///
+/// This register is memory-mapped to userspace so that the userspace driver can read
+/// the latest cache flush ID without a syscall.
+pub(crate) const CSF_GPU_LATEST_FLUSH_ID: usize = 0x10000;
+
+/// The doorbell index used for the CSF global interface.
+pub(crate) const CSF_GLB_DOORBELL_ID: usize = 0;
+
+/// Bit mask for the GLB (global interface) request in JOB_IRQ registers.
+///
+/// This corresponds to bit 31 of JOB_IRQ_RAWSTAT/JOB_IRQ_STATUS.
+pub(crate) const JOB_IRQ_GLOBAL_IF: u32 = 1u32 << 31;
+
 /// These registers correspond to the GPU_CONTROL register page.
 /// They are involved in GPU configuration and control.
 pub(crate) mod gpu_control {

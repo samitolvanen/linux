@@ -43,6 +43,8 @@ pub(super) struct ParsedSection {
     pub(super) va: Range<u32>,
     /// Memory protection and caching flags for the mapping.
     pub(super) vm_map_flags: VmMapFlags,
+    /// Raw section flags from the firmware binary.
+    pub(super) section_flags: SectionFlags,
 }
 
 /// A bare-bones `std::io::Cursor<[u8]>` clone to keep track of the current position in the firmware binary.
@@ -321,6 +323,7 @@ impl<'a> FwParser<'a> {
             data_range: section_hdr.data.clone(),
             va: section_hdr.va,
             vm_map_flags,
+            section_flags: section_hdr.section_flags,
         }))
     }
 }

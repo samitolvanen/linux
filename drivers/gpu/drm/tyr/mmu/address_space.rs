@@ -144,6 +144,13 @@ impl VmAsData {
         }? Error)
     }
 
+    /// Returns the hardware address space slot number if the VM is currently active.
+    ///
+    /// The caller must hold the `AsSlotManager` lock.
+    pub(crate) fn slot(&self, mgr: &AsSlotManager) -> Option<u8> {
+        self.as_seat.access(mgr).slot()
+    }
+
     /// Computes the hardware configuration for this address space.
     ///
     /// The caller must ensure that the address space is evicted and cleaned up

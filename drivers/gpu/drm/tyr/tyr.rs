@@ -12,10 +12,14 @@ mod file;
 mod fw;
 mod gem;
 mod gpu;
+mod heap;
+mod mmap;
 mod mmu;
 mod regs;
+mod sched;
 mod slot;
 mod vm;
+mod wait;
 
 kernel::module_platform_driver! {
     type: TyrPlatformDriverData,
@@ -24,3 +28,5 @@ kernel::module_platform_driver! {
     description: "Arm Mali Tyr DRM driver",
     license: "Dual MIT/GPL",
 }
+
+kernel::module_firmware!(fw::ModInfoBuilder);

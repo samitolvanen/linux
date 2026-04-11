@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+pub(crate) mod irq;
+
 use core::ops::{
     Deref,
     DerefMut, //
@@ -28,6 +30,21 @@ use crate::{
         join_u64, //
     }, //
 };
+
+/// CSIF (Command Stream Interface) information
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CsifInfo {
+    pub(crate) csg_slot_count: u32,
+    pub(crate) cs_slot_count: u32,
+    pub(crate) cs_reg_count: u32,
+    pub(crate) scoreboard_slot_count: u32,
+    pub(crate) unpreserved_cs_reg_count: u32,
+    pub(crate) pad: u32,
+}
+
+// SAFETY: Same layout as drm_panthor_csif_info, repr(C) with no padding.
+unsafe impl AsBytes for CsifInfo {}
 
 /// Struct containing information that can be queried by userspace. This is read from
 /// the GPU's registers.
@@ -122,6 +139,20 @@ impl GpuInfo {
             self.l2_present,
             self.tiler_present,
         );
+    }
+
+    pub(crate) fn va_bits(&self) -> u32 {
+        MMU_FEATURES::from_raw(self.mmu_features).va_bits().get()
+    }
+
+    pub(crate) fn pa_bits(&self) -> u32 {
+        MMU_FEATURES::from_raw(self.mmu_features).pa_bits().get()
+    }
+
+    pub(crate) fn heap_context_stride(&self) -> u32 {
+        let line_size = 1u32 << L2_FEATURES::from_raw(self.l2_features).line_size().get();
+        let heap_context_size = 32u32;
+        line_size.next_multiple_of(heap_context_size)
     }
 }
 

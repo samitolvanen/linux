@@ -10,6 +10,7 @@ use kernel::{
     drm::{
         gem,
         gem::shmem,
+        gem::BaseObject,
         DeviceContext, //
     },
     prelude::*,
@@ -25,6 +26,8 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDriver, //
     },
+    file::TyrDrmFile,
+    vm::LiveRange,
     vm::{
         Vm,
         VmMapFlags, //
@@ -38,8 +41,27 @@ use crate::{
 /// buffer object creation and management.
 #[pin_data]
 pub(crate) struct BoData {
-    /// Buffer object creation flags (currently unused).
-    flags: u32,
+    /// Whether this is a kernel or user BO.
+    ty: ObjectType,
+    /// The flags received at BO creation time.
+    pub(crate) flags: u32,
+}
+
+impl BoData {
+    /// Returns the kernel VA range for kernel-owned BOs.
+    pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
+        match &self.ty {
+            ObjectType::Kernel { node } => Some(node.range()),
+            ObjectType::User => None,
+        }
+    }
+}
+
+enum ObjectType {
+    // Kernel objects have their VA managed by the range allocator.
+    // This node represents the allocation.
+    Kernel { node: LiveRange },
+    User,
 }
 
 /// Arguments for creating a [`BoData`] instance.
@@ -47,7 +69,7 @@ pub(crate) struct BoData {
 /// This structure is used to pass creation parameters when instantiating
 /// a new buffer object, as required by the [`gem::DriverObject`] trait.
 pub(crate) struct BoCreateArgs {
-    /// Buffer object creation flags (currently unused).
+    ty: ObjectType,
     flags: u32,
 }
 
@@ -66,26 +88,121 @@ impl gem::DriverObject for BoData {
         _size: usize,
         args: BoCreateArgs,
     ) -> impl PinInit<Self, Error> {
-        try_pin_init!(Self { flags: args.flags })
+        try_pin_init!(Self {
+            ty: args.ty,
+            flags: args.flags,
+        })
     }
 }
 
 /// Type alias for Tyr GEM buffer objects.
 pub(crate) type Bo = gem::shmem::Object<BoData>;
 
+/// A mapped GEM buffer object with an always-valid kernel mapping.
+///
+/// This wraps a [`shmem::VMap`] that holds both the kernel mapping and a
+/// reference to the underlying [`Bo`]. Use [`Deref`] to access the `Bo`
+/// (via [`VMap::owner()`]).
+pub(crate) struct MappedBo {
+    vmap: shmem::VMap<BoData>,
+}
+
+impl MappedBo {
+    /// Creates a new `MappedBo` by vmapping the given BO.
+    pub(crate) fn new(bo: &Bo) -> Result<Arc<Self>> {
+        let vmap = bo.vmap()?;
+        Ok(Arc::new(MappedBo { vmap: vmap.into() }, GFP_KERNEL)?)
+    }
+
+    /// Returns a reference to the underlying VMap.
+    pub(crate) fn vmap(&self) -> &shmem::VMap<BoData> {
+        &self.vmap
+    }
+}
+
+impl core::ops::Deref for MappedBo {
+    type Target = Bo;
+
+    fn deref(&self) -> &Bo {
+        self.vmap.owner()
+    }
+}
+
+pub(crate) fn new_bo<Ctx: DeviceContext>(
+    dev: &TyrDrmDevice<Ctx>,
+    size: usize,
+    flags: u32,
+) -> Result<ARef<Bo>> {
+    let aligned_size = size.next_multiple_of(1 << 12);
+
+    if size == 0 || size > aligned_size {
+        return Err(EINVAL);
+    }
+
+    Bo::new(
+        dev,
+        aligned_size,
+        shmem::ObjectConfig {
+            map_wc: true,
+            parent_resv_obj: None,
+        },
+        BoCreateArgs {
+            ty: ObjectType::User,
+            flags,
+        },
+    )
+}
+
+pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
+    shmem::Object::lookup_handle(file, handle)
+}
+
+/// Creates a kernel-owned GEM object mapped into the VM.
+///
+/// Allocates a virtual address range from the VM's kernel VA allocator,
+/// creates a GEM buffer object, maps it into the VM, and vmaps it for
+/// CPU access. The returned `MappedBo` always has a valid kernel mapping.
+pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
+    dev: &TyrDrmDevice<Ctx>,
+    vm: &Vm,
+    size: usize,
+    flags: VmMapFlags,
+) -> Result<Arc<MappedBo>> {
+    let aligned_size = size.next_multiple_of(1 << 12);
+    let node = vm.alloc_kernel_range(aligned_size)?;
+    let va = node.start();
+
+    let gem = Bo::new(
+        dev,
+        aligned_size,
+        shmem::ObjectConfig {
+            map_wc: true,
+            parent_resv_obj: None,
+        },
+        BoCreateArgs {
+            ty: ObjectType::Kernel { node },
+            flags: 0,
+        },
+    )?;
+
+    vm.map_bo_range(&gem, 0, aligned_size as u64, va, flags)?;
+    MappedBo::new(&gem)
+}
+
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
 pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> Result<ARef<Bo>> {
-    let bo = gem::shmem::Object::<BoData>::new(
+    Bo::new(
         ddev,
         4096,
         shmem::ObjectConfig {
             map_wc: true,
             parent_resv_obj: None,
         },
-        BoCreateArgs { flags: 0 },
-    )?;
-
-    Ok(bo)
+        BoCreateArgs {
+            ty: ObjectType::User,
+            flags: 0,
+        },
+    )
 }
 
 /// VA allocation strategy for kernel buffer objects.
@@ -133,14 +250,17 @@ impl KernelBo {
 
         let KernelBoVaAlloc::Explicit(va) = va_alloc;
 
-        let bo = gem::shmem::Object::<BoData>::new(
+        let bo = Bo::new(
             ddev,
             size as usize,
             shmem::ObjectConfig {
                 map_wc: true,
                 parent_resv_obj: None,
             },
-            BoCreateArgs { flags: 0 },
+            BoCreateArgs {
+                ty: ObjectType::User,
+                flags: 0,
+            },
         )?;
 
         vm.map_bo_range(&bo, 0, size, va, flags)?;
