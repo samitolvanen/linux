@@ -151,6 +151,11 @@ impl KernelBo {
             va_range: va..(va + size),
         })
     }
+
+    /// Returns the GPU virtual address range occupied by this buffer.
+    pub(crate) fn va_range(&self) -> Range<u64> {
+        self.va_range.clone()
+    }
 }
 
 impl Drop for KernelBo {

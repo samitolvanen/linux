@@ -177,10 +177,10 @@ impl platform::Driver for TyrPlatformDriverData {
         devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
 
         firmware.boot()?;
-
         firmware
             .wait_ready(1000)
             .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
+        firmware.enable_global_interface()?;
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
