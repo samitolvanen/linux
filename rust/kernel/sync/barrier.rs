@@ -59,3 +59,10 @@ pub fn smp_rmb() {
         barrier();
     }
 }
+
+/// A write-write memory barrier for device I/O.
+#[inline(always)]
+pub fn wmb() {
+    // SAFETY: `wmb()` is safe to call.
+    unsafe { bindings::wmb() };
+}

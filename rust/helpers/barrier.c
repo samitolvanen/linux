@@ -16,3 +16,8 @@ void rust_helper_smp_rmb(void)
 {
 	smp_rmb();
 }
+
+void rust_helper_wmb(void)
+{
+	wmb();
+}
