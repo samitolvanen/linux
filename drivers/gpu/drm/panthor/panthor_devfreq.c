@@ -11,6 +11,7 @@
 
 #include "panthor_devfreq.h"
 #include "panthor_device.h"
+#include <trace/events/panthor.h>
 
 /**
  * struct panthor_devfreq - Device frequency management
@@ -72,8 +73,11 @@ static int panthor_devfreq_target(struct device *dev, unsigned long *freq,
 	dev_pm_opp_put(opp);
 
 	err = dev_pm_opp_set_rate(dev, *freq);
-	if (!err)
+	if (!err) {
+		if (ptdev->current_frequency != *freq)
+			trace_panthor_devfreq_target(ptdev->current_frequency, *freq);
 		ptdev->current_frequency = *freq;
+	}
 
 	return err;
 }

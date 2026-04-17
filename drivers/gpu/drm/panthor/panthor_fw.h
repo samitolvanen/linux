@@ -310,6 +310,9 @@ struct panthor_fw_cs_iface {
 	 * This interface is read-only.
 	 */
 	const struct panthor_fw_cs_output_iface *output;
+
+	u32 csg_id;
+	u32 cs_id;
 };
 
 /**
@@ -354,6 +357,9 @@ struct panthor_fw_csg_iface {
 	 * This interface is read-only.
 	 */
 	const struct panthor_fw_csg_output_iface *output;
+
+	u32 csg_id;
+	u32 cs_id;
 };
 
 /**
@@ -398,6 +404,9 @@ struct panthor_fw_global_iface {
 	 * This interface is read-only.
 	 */
 	const struct panthor_fw_global_output_iface *output;
+
+	u32 csg_id;
+	u32 cs_id;
 };
 
 /**
@@ -427,7 +436,10 @@ struct panthor_fw_global_iface {
 		spin_lock(&(__iface)->lock); \
 		__cur_val = READ_ONCE((__iface)->input->__in_reg); \
 		__out_val = READ_ONCE((__iface)->output->__out_reg); \
-		__new_val = ((__out_val ^ (__mask)) & (__mask)) | (__cur_val & ~(__mask)); \
+		__new_val = (__cur_val & ~(__mask)) | (~__out_val & (__mask)); \
+		_Generic((__iface), \
+			struct panthor_fw_global_iface *: trace_panthor_fw_glb_doorbell_req(#__in_reg, __new_val, 0, __mask), \
+			struct panthor_fw_csg_iface *: trace_panthor_fw_csg_doorbell_req((__iface)->csg_id, #__in_reg, __new_val, 0, __mask)); \
 		WRITE_ONCE((__iface)->input->__in_reg, __new_val); \
 		spin_unlock(&(__iface)->lock); \
 	} while (0)
@@ -453,10 +465,13 @@ struct panthor_fw_global_iface {
 		spin_lock(&(__iface)->lock); \
 		__cur_val = READ_ONCE((__iface)->input->__in_reg); \
 		__new_val = (__cur_val & ~(__mask)) | ((__val) & (__mask)); \
+		_Generic(__iface, \
+			struct panthor_fw_global_iface *: trace_panthor_fw_glb_req(#__in_reg, __new_val, __mask, 0), \
+			struct panthor_fw_csg_iface *: trace_panthor_fw_csg_req((__iface)->csg_id, 0, #__in_reg, __new_val, __mask, 0), \
+			struct panthor_fw_cs_iface *: trace_panthor_fw_cs_req((__iface)->csg_id, (__iface)->cs_id, 0, #__in_reg, __new_val, __mask, 0)); \
 		WRITE_ONCE((__iface)->input->__in_reg, __new_val); \
 		spin_unlock(&(__iface)->lock); \
 	} while (0)
-
 struct panthor_fw_global_iface *
 panthor_fw_get_glb_iface(struct panthor_device *ptdev);
 

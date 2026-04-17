@@ -24,6 +24,8 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+#include "panthor_trace.h"
+#include <trace/events/panthor.h>
 
 #define CSF_FW_NAME "mali_csffw.bin"
 
@@ -832,10 +834,12 @@ static int panthor_init_cs_iface(struct panthor_device *ptdev,
 	struct panthor_fw_cs_iface *first_cs_iface =
 		panthor_fw_get_cs_iface(ptdev, 0, 0);
 
-	if (iface_offset + sizeof(*cs_iface) >= shared_section_sz)
+	if (iface_offset + sizeof(*cs_iface->control) >= shared_section_sz)
 		return -EINVAL;
 
 	spin_lock_init(&cs_iface->lock);
+	cs_iface->csg_id = csg_idx;
+	cs_iface->cs_id = cs_idx;
 	cs_iface->control = ptdev->fw->shared_section->mem->kmap + iface_offset;
 	cs_iface->input = iface_fw_to_cpu_addr(ptdev, cs_iface->control->input_va);
 	cs_iface->output = iface_fw_to_cpu_addr(ptdev, cs_iface->control->output_va);
@@ -887,6 +891,7 @@ static int panthor_init_csg_iface(struct panthor_device *ptdev,
 		return -EINVAL;
 
 	spin_lock_init(&csg_iface->lock);
+	csg_iface->csg_id = csg_idx;
 	csg_iface->control = ptdev->fw->shared_section->mem->kmap + iface_offset;
 	csg_iface->input = iface_fw_to_cpu_addr(ptdev, csg_iface->control->input_va);
 	csg_iface->output = iface_fw_to_cpu_addr(ptdev, csg_iface->control->output_va);
@@ -1010,6 +1015,8 @@ static void panthor_fw_init_global_iface(struct panthor_device *ptdev)
 
 static void panthor_job_irq_handler(struct panthor_device *ptdev, u32 status)
 {
+	trace_panthor_job_irq_clear(status);
+	trace_panthor_fw_irq(status);
 	gpu_write(ptdev, JOB_INT_CLEAR, status);
 
 	if (!ptdev->fw->booted && (status & JOB_INT_GLOBAL_IF))

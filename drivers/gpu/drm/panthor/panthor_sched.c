@@ -32,6 +32,8 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+#include "panthor_trace.h"
+#include <trace/events/panthor.h>
 
 /**
  * DOC: Scheduler
@@ -999,6 +1001,8 @@ group_bind_locked(struct panthor_group *group, u32 csg_id)
 
 	csg_slot->group = group;
 
+	trace_panthor_group_bind((u64)group, csg_id);
+
 	return 0;
 }
 
@@ -1024,6 +1028,7 @@ group_unbind_locked(struct panthor_group *group)
 
 	slot = &ptdev->scheduler->csg_slots[group->csg_id];
 	panthor_vm_idle(group->vm);
+	trace_panthor_group_unbind((u64)group, group->csg_id);
 	group->csg_id = -1;
 
 	/* Tiler OOM events will be re-issued next time the group is scheduled. */
@@ -1078,8 +1083,10 @@ cs_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 			       CS_STATE_MASK |
 			       CS_EXTRACT_EVENT);
 	if (queue->iface.input->insert != queue->iface.input->extract && queue->timeout_suspended) {
+		struct panthor_group *group = ptdev->scheduler->csg_slots[csg_id].group;
 		drm_sched_resume_timeout(&queue->scheduler, queue->remaining_time);
 		queue->timeout_suspended = false;
+		trace_panthor_queue_timeout_state((u64)group, cs_id, false);
 	}
 }
 
@@ -1113,6 +1120,7 @@ cs_slot_reset_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 	if (!(group->blocked_queues & BIT(cs_id)) && !queue->timeout_suspended) {
 		queue->remaining_time = drm_sched_suspend_timeout(&queue->scheduler);
 		queue->timeout_suspended = true;
+		trace_panthor_queue_timeout_state((u64)group, cs_id, true);
 		WARN_ON(queue->remaining_time > msecs_to_jiffies(JOB_TIMEOUT_MS));
 	}
 
@@ -1140,6 +1148,20 @@ csg_slot_sync_priority_locked(struct panthor_device *ptdev, u32 csg_id)
 	csg_slot->priority = (csg_iface->input->endpoint_req & CSG_EP_REQ_PRIORITY_MASK) >> 28;
 }
 
+static u64 panthor_queue_active_job_id(struct panthor_queue *queue)
+{
+	struct panthor_job *job;
+	u64 job_id = 0;
+
+	spin_lock(&queue->fence_ctx.lock);
+	job = list_first_entry_or_null(&queue->fence_ctx.in_flight_jobs, struct panthor_job, node);
+	if (job)
+		job_id = (u64)job;
+	spin_unlock(&queue->fence_ctx.lock);
+
+	return job_id;
+}
+
 /**
  * cs_slot_sync_queue_state_locked() - Synchronize the queue slot priority
  * @ptdev: Device.
@@ -1158,15 +1180,26 @@ cs_slot_sync_queue_state_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs
 
 	u32 status_wait_cond;
 
+	trace_panthor_fw_cs_status_update(csg_id, cs_id, group ? (u64)group : 0,
+					  cs_iface->output->status_wait,
+					  cs_iface->output->status_blocked_reason,
+					  cs_iface->output->status_req_resource);
+
 	switch (cs_iface->output->status_blocked_reason) {
 	case CS_STATUS_BLOCKED_REASON_UNBLOCKED:
 		if (queue->iface.input->insert == queue->iface.output->extract &&
 		    cs_iface->output->status_scoreboards == 0)
 			group->idle_queues |= BIT(cs_id);
+
+		if (group->blocked_queues & BIT(cs_id)) {
+			group->blocked_queues &= ~BIT(cs_id);
+			trace_panthor_queue_state((u64)group, cs_id, false);
+		}
 		break;
 
 	case CS_STATUS_BLOCKED_REASON_SYNC_WAIT:
 		if (list_empty(&group->wait_node)) {
+			trace_panthor_group_wait((u64)group, true);
 			list_move_tail(&group->wait_node,
 				       &group->ptdev->scheduler->groups.waiting);
 		}
@@ -1174,8 +1207,14 @@ cs_slot_sync_queue_state_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs
 		/* The queue is only blocked if there's no deferred operation
 		 * pending, which can be checked through the scoreboard status.
 		 */
-		if (!cs_iface->output->status_scoreboards)
-			group->blocked_queues |= BIT(cs_id);
+		if (!cs_iface->output->status_scoreboards) {
+			if (!(group->blocked_queues & BIT(cs_id))) {
+				group->blocked_queues |= BIT(cs_id);
+				trace_panthor_queue_state((u64)group, cs_id, true);
+			}
+			trace_panthor_job_status(panthor_queue_active_job_id(queue),
+						 (u64)group, cs_id, "blocked");
+		}
 
 		queue->syncwait.gpu_va = cs_iface->output->status_wait_sync_ptr;
 		queue->syncwait.ref = cs_iface->output->status_wait_sync_value;
@@ -1204,16 +1243,33 @@ csg_slot_sync_queues_state_locked(struct panthor_device *ptdev, u32 csg_id)
 {
 	struct panthor_csg_slot *csg_slot = &ptdev->scheduler->csg_slots[csg_id];
 	struct panthor_group *group = csg_slot->group;
+	u32 prev_idle, prev_blocked;
 	u32 i;
 
 	lockdep_assert_held(&ptdev->scheduler->lock);
+
+	prev_idle = group->idle_queues;
+	prev_blocked = group->blocked_queues;
 
 	group->idle_queues = 0;
 	group->blocked_queues = 0;
 
 	for (i = 0; i < group->queue_count; i++) {
-		if (group->queues[i])
+		if (group->queues[i]) {
+			bool is_idle, was_idle, is_blocked, was_blocked;
+
 			cs_slot_sync_queue_state_locked(ptdev, csg_id, i);
+
+			is_idle = !!(group->idle_queues & BIT(i));
+			was_idle = !!(prev_idle & BIT(i));
+			if (is_idle != was_idle)
+				trace_panthor_queue_idle_state((u64)group, i, is_idle);
+
+			is_blocked = !!(group->blocked_queues & BIT(i));
+			was_blocked = !!(prev_blocked & BIT(i));
+			if (is_blocked != was_blocked)
+				trace_panthor_queue_state((u64)group, i, is_blocked);
+		}
 	}
 }
 
@@ -1583,6 +1639,8 @@ static bool cs_slot_process_irq_locked(struct panthor_device *ptdev,
 	ack = cs_iface->output->ack;
 	events = (req ^ ack) & CS_EVT_MASK;
 
+	trace_panthor_cs_irq(csg_id, cs_id, req, ack);
+
 	if (events & CS_FATAL)
 		cs_slot_process_fatal_event_locked(ptdev, csg_id, cs_id);
 
@@ -1667,11 +1725,15 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 	u32 req, ack, cs_irq_req, cs_irq_ack, cs_irqs, csg_events;
 	struct panthor_fw_csg_iface *csg_iface;
 	u32 ring_cs_db_mask = 0;
+	u64 group_id = 0;
 
 	lockdep_assert_held(&ptdev->scheduler->lock);
 
 	if (drm_WARN_ON(&ptdev->base, csg_id >= ptdev->scheduler->csg_slot_count))
 		return;
+
+	if (ptdev->scheduler->csg_slots[csg_id].group)
+		group_id = (u64)ptdev->scheduler->csg_slots[csg_id].group;
 
 	csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 	req = READ_ONCE(csg_iface->input->req);
@@ -1681,8 +1743,11 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 	csg_events = (req ^ ack) & CSG_EVT_MASK;
 
 	/* There may not be any pending CSG/CS interrupts to process */
-	if (req == ack && cs_irq_req == cs_irq_ack)
+	if (req == ack && cs_irq_req == cs_irq_ack) {
 		return;
+	}
+
+	trace_panthor_csg_irq(csg_id, group_id, req, ack, cs_irq_req, cs_irq_ack);
 
 	/* Immediately set IRQ_ACK bits to be same as the IRQ_REQ bits before
 	 * examining the CS_ACK & CS_REQ bits. This would ensure that Host
@@ -1748,6 +1813,9 @@ static void sched_process_global_irq_locked(struct panthor_device *ptdev)
 	ack = READ_ONCE(glb_iface->output->ack);
 	evts = (req ^ ack) & GLB_EVT_MASK;
 
+	if (evts)
+		trace_panthor_glb_irq(req, ack);
+
 	if (evts & GLB_IDLE)
 		sched_process_idle_event_locked(ptdev);
 }
@@ -1758,6 +1826,8 @@ static void process_fw_events_work(struct work_struct *work)
 						      fw_events_work);
 	u32 events = atomic_xchg(&sched->fw_events, 0);
 	struct panthor_device *ptdev = sched->ptdev;
+
+	trace_panthor_work_run("fw_events");
 
 	mutex_lock(&sched->lock);
 
@@ -1873,6 +1943,7 @@ static int csgs_upd_ctx_apply_locked(struct panthor_device *ptdev,
 			csg_slot_sync_state_locked(ptdev, csg_id);
 
 		if (acked & CSG_STATUS_UPDATE) {
+			trace_panthor_fw_csg_status_update(csg_id, ptdev->scheduler->csg_slots[csg_id].group ? (u64)ptdev->scheduler->csg_slots[csg_id].group : 0, csg_iface->output->status_endpoint_current, csg_iface->output->status_endpoint_req, csg_iface->output->status_state, csg_iface->output->resource_dep);
 			csg_slot_sync_queues_state_locked(ptdev, csg_id);
 			csg_slot_sync_idle_state_locked(ptdev, csg_id);
 		}
@@ -1964,6 +2035,7 @@ tick_ctx_pick_groups_from_list(const struct panthor_scheduler *sched,
 			group_get(group);
 
 		list_move_tail(&group->run_node, &ctx->groups[group->priority]);
+				trace_panthor_group_list((u64)group, 2);
 		ctx->group_count++;
 		if (group_is_idle(group))
 			ctx->idle_group_count++;
@@ -2144,10 +2216,15 @@ tick_ctx_cleanup(struct panthor_scheduler *sched,
 
 			if (!group_can_run(group)) {
 				list_del_init(&group->run_node);
+				trace_panthor_group_list((u64)group, 0);
+				if (!list_empty(&group->wait_node)) {
+				trace_panthor_group_wait((u64)group, false);
 				list_del_init(&group->wait_node);
+			}
 				group_queue_work(group, term);
 			} else if (group->csg_id >= 0) {
 				list_del_init(&group->run_node);
+				trace_panthor_group_list((u64)group, 0);
 			} else {
 				list_move(&group->run_node,
 					  group_is_idle(group) ?
@@ -2168,6 +2245,7 @@ tick_ctx_cleanup(struct panthor_scheduler *sched,
 		list_for_each_entry_safe(group, tmp, &ctx->groups[i], run_node) {
 			if (group->csg_id >= 0) {
 				list_del_init(&group->run_node);
+				trace_panthor_group_list((u64)group, 0);
 			} else {
 				list_move(&group->run_node,
 					  group_is_idle(group) ?
@@ -2217,6 +2295,8 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 				continue;
 			}
 
+			trace_panthor_sched_keep(csg_id, (u64)group, prio, new_csg_prio);
+
 			csg_slot = &sched->csg_slots[csg_id];
 			csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 			if (csg_slot->priority == new_csg_prio) {
@@ -2248,8 +2328,10 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			 * any pending interrupts before we start the new
 			 * group.
 			 */
-			if (group->csg_id >= 0)
+			if (group->csg_id >= 0) {
+				trace_panthor_sched_evict(group->csg_id, (u64)group, prio);
 				sched_process_csg_irq_locked(ptdev, group->csg_id);
+			}
 
 			group_unbind_locked(group);
 		}
@@ -2278,6 +2360,8 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			if (drm_WARN_ON(&ptdev->base, csg_id < 0))
 				break;
 
+			trace_panthor_sched_bind(csg_id, (u64)group, prio, new_csg_prio);
+
 			csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 			csg_slot = &sched->csg_slots[csg_id];
 			group_bind_locked(group, csg_id);
@@ -2303,6 +2387,7 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 	for (prio = PANTHOR_CSG_PRIORITY_COUNT - 1; prio >= 0; prio--) {
 		list_for_each_entry_safe(group, tmp, &ctx->groups[prio], run_node) {
 			list_del_init(&group->run_node);
+				trace_panthor_group_list((u64)group, 0);
 
 			/* If the group has been destroyed while we were
 			 * scheduling, ask for an immediate tick to
@@ -2323,15 +2408,19 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			if (!group_can_run(group))
 				continue;
 
-			if (group_is_idle(group))
+			if (group_is_idle(group)) {
 				list_move_tail(&group->run_node, &sched->groups.idle[prio]);
-			else
+				trace_panthor_group_list((u64)group, 1);
+			} else {
 				list_move_tail(&group->run_node, &sched->groups.runnable[prio]);
+				trace_panthor_group_list((u64)group, 2);
+			}
 			group_put(group);
 		}
 	}
 
 	sched->used_csg_slot_count = ctx->group_count;
+	trace_panthor_csg_slots_status(sched->used_csg_slot_count, sched->csg_slot_count);
 	sched->might_have_idle_groups = ctx->idle_group_count > 0;
 }
 
@@ -2400,6 +2489,8 @@ static void tick_work(struct work_struct *work)
 		goto out_cleanup_ctx;
 
 	if (remaining_jiffies) {
+		trace_panthor_work_run("tick");
+
 		/* Scheduling forced in the middle of a tick. Only RT groups
 		 * can preempt non-RT ones. Currently running RT groups can't be
 		 * preempted.
@@ -2415,6 +2506,8 @@ static void tick_work(struct work_struct *work)
 							       true, false);
 			}
 		}
+	} else {
+		trace_panthor_work_run("full tick");
 	}
 
 	/* First pick non-idle groups */
@@ -2511,6 +2604,8 @@ static void sync_upd_work(struct work_struct *work)
 	struct panthor_group *group, *tmp;
 	bool immediate_tick = false;
 
+	trace_panthor_work_run("sync_upd");
+
 	mutex_lock(&sched->lock);
 	list_for_each_entry_safe(group, tmp, &sched->groups.waiting, wait_node) {
 		u32 tested_queues = group->blocked_queues;
@@ -2529,18 +2624,32 @@ static void sync_upd_work(struct work_struct *work)
 		}
 
 		if (unblocked_queues) {
+			u32 i;
+
 			group->blocked_queues &= ~unblocked_queues;
 
+			for (i = 0; i < group->queue_count; i++) {
+				if (unblocked_queues & BIT(i)) {
+					struct panthor_queue *queue = group->queues[i];
+					if (queue)
+						trace_panthor_job_status(panthor_queue_active_job_id(queue),
+									 (u64)group, i, "unblocked");
+				}
+			}
+
 			if (group->csg_id < 0) {
-				list_move(&group->run_node,
-					  &sched->groups.runnable[group->priority]);
+				list_move(&group->run_node, &sched->groups.runnable[group->priority]);
+				trace_panthor_group_list((u64)group, 2);
 				if (group->priority == PANTHOR_CSG_PRIORITY_RT)
 					immediate_tick = true;
 			}
 		}
 
 		if (!group->blocked_queues)
-			list_del_init(&group->wait_node);
+			if (!list_empty(&group->wait_node)) {
+				trace_panthor_group_wait((u64)group, false);
+				list_del_init(&group->wait_node);
+			}
 	}
 	mutex_unlock(&sched->lock);
 
@@ -2571,8 +2680,10 @@ static void group_schedule_locked(struct panthor_group *group, u32 queue_mask)
 	if (atomic_read(&sched->reset.in_progress))
 		return;
 
-	if (was_idle && !group_is_idle(group))
+	if (was_idle && !group_is_idle(group)) {
 		list_move_tail(&group->run_node, queue);
+		trace_panthor_group_list((u64)group, 2);
+	}
 
 	/* RT groups are preemptive. */
 	if (group->priority == PANTHOR_CSG_PRIORITY_RT) {
@@ -2637,6 +2748,7 @@ static void panthor_group_stop(struct panthor_group *group)
 
 	group_get(group);
 	list_move_tail(&group->run_node, &sched->reset.stopped_groups);
+	trace_panthor_group_list((u64)group, 0);
 }
 
 static void panthor_group_start(struct panthor_group *group)
@@ -2655,7 +2767,11 @@ static void panthor_group_start(struct panthor_group *group)
 			       &sched->groups.runnable[group->priority]);
 	} else {
 		list_del_init(&group->run_node);
-		list_del_init(&group->wait_node);
+				trace_panthor_group_list((u64)group, 0);
+		if (!list_empty(&group->wait_node)) {
+			trace_panthor_group_wait((u64)group, false);
+			list_del_init(&group->wait_node);
+		}
 		group_queue_work(group, term);
 	}
 
@@ -2748,8 +2864,10 @@ void panthor_sched_suspend(struct panthor_device *ptdev)
 			 * automatically terminate all active groups, so let's
 			 * force the state to halted here.
 			 */
-			if (csg_slot->group->state != PANTHOR_CS_GROUP_TERMINATED)
+			if (csg_slot->group->state != PANTHOR_CS_GROUP_TERMINATED) {
 				csg_slot->group->state = PANTHOR_CS_GROUP_TERMINATED;
+				trace_panthor_group_update((u64)csg_slot->group, PANTHOR_CS_GROUP_TERMINATED);
+			}
 			slot_mask &= ~BIT(csg_id);
 		}
 	}
@@ -2794,13 +2912,16 @@ void panthor_sched_suspend(struct panthor_device *ptdev)
 		drm_WARN_ON(&group->ptdev->base, !list_empty(&group->run_node));
 
 		if (group_can_run(group)) {
-			list_add(&group->run_node,
-				 &sched->groups.idle[group->priority]);
+			list_add(&group->run_node, &sched->groups.idle[group->priority]);
+				trace_panthor_group_list((u64)group, 1);
 		} else {
 			/* We don't bother stopping the scheduler if the group is
 			 * faulty, the group termination work will finish the job.
 			 */
-			list_del_init(&group->wait_node);
+			if (!list_empty(&group->wait_node)) {
+				trace_panthor_group_wait((u64)group, false);
+				list_del_init(&group->wait_node);
+			}
 			group_queue_work(group, term);
 		}
 		group_put(group);
@@ -2854,8 +2975,10 @@ void panthor_sched_post_reset(struct panthor_device *ptdev, bool reset_failed)
 		/* Consider all previously running group as terminated if the
 		 * reset failed.
 		 */
-		if (reset_failed)
+		if (reset_failed) {
 			group->state = PANTHOR_CS_GROUP_TERMINATED;
+			trace_panthor_group_update((u64)group, PANTHOR_CS_GROUP_TERMINATED);
+		}
 
 		panthor_group_start(group);
 	}
@@ -2918,6 +3041,8 @@ static void group_sync_upd_work(struct work_struct *work)
 	u32 queue_idx;
 	bool cookie;
 
+	trace_panthor_work_run("group_sync_upd");
+
 	cookie = dma_fence_begin_signalling();
 	for (queue_idx = 0; queue_idx < group->queue_count; queue_idx++) {
 		struct panthor_queue *queue = group->queues[queue_idx];
@@ -2934,6 +3059,7 @@ static void group_sync_upd_work(struct work_struct *work)
 				break;
 
 			list_move_tail(&job->node, &done_jobs);
+			trace_panthor_job_done((u64)job, (u64)group, queue->doorbell_id, job->done_fence->error);
 			dma_fence_signal_locked(job->done_fence);
 		}
 		spin_unlock(&queue->fence_ctx.lock);
@@ -3174,6 +3300,8 @@ queue_run_job(struct drm_sched_job *sched_job)
 
 	job->ringbuf.start = queue->iface.input->insert;
 
+	trace_panthor_job_submit((u64)job, (u64)group, queue->doorbell_id, job->call_info.size);
+
 	get_job_cs_params(job, &cs_params);
 	prepare_job_instrs(&cs_params, &instrs);
 	copy_instrs_to_ringbuf(queue, job, &instrs);
@@ -3193,7 +3321,12 @@ queue_run_job(struct drm_sched_job *sched_job)
 	queue->iface.input->extract = queue->iface.output->extract;
 	queue->iface.input->insert = job->ringbuf.end;
 
+	trace_panthor_cs_ring_ptrs((u64)group, job->queue_idx,
+				   queue->iface.input->insert,
+				   queue->iface.input->extract);
+
 	if (group->csg_id < 0) {
+		trace_panthor_job_status((u64)job, (u64)group, job->queue_idx, "not bound");
 		/* If the queue is blocked, we want to keep the timeout running, so we
 		 * can detect unbounded waits and kill the group when that happens.
 		 * Otherwise, we suspend the timeout so the time we spend waiting for
@@ -3203,10 +3336,12 @@ queue_run_job(struct drm_sched_job *sched_job)
 		    !queue->timeout_suspended) {
 			queue->remaining_time = drm_sched_suspend_timeout(&queue->scheduler);
 			queue->timeout_suspended = true;
+			trace_panthor_queue_timeout_state((u64)group, job->queue_idx, true);
 		}
 
 		group_schedule_locked(group, BIT(job->queue_idx));
 	} else {
+		trace_panthor_queue_doorbell((u64)group, job->queue_idx, queue->doorbell_id);
 		gpu_write(ptdev, CSF_DOORBELL(queue->doorbell_id), 1);
 		if (!sched->pm.has_ref &&
 		    !(group->blocked_queues & BIT(job->queue_idx))) {
@@ -3239,6 +3374,8 @@ queue_timedout_job(struct drm_sched_job *sched_job)
 	struct panthor_scheduler *sched = ptdev->scheduler;
 	struct panthor_queue *queue = group->queues[job->queue_idx];
 
+	trace_panthor_job_status((u64)job, (u64)group, job->queue_idx, "hw_timeout");
+
 	drm_warn(&ptdev->base, "job timeout: pid=%d, comm=%s, seqno=%llu\n",
 		 group->task_info.pid, group->task_info.comm, job->done_fence->seqno);
 
@@ -3248,6 +3385,7 @@ queue_timedout_job(struct drm_sched_job *sched_job)
 
 	mutex_lock(&sched->lock);
 	group->timedout = true;
+	trace_panthor_group_timedout((u64)group);
 	if (group->csg_id >= 0) {
 		sched_queue_delayed_work(ptdev->scheduler, tick, 0);
 	} else {
@@ -3255,7 +3393,11 @@ queue_timedout_job(struct drm_sched_job *sched_job)
 		 * pick the group on the next tick.
 		 */
 		list_del_init(&group->run_node);
-		list_del_init(&group->wait_node);
+				trace_panthor_group_list((u64)group, 0);
+		if (!list_empty(&group->wait_node)) {
+			trace_panthor_group_wait((u64)group, false);
+			list_del_init(&group->wait_node);
+		}
 
 		group_queue_work(group, term);
 	}
@@ -3479,6 +3621,7 @@ int panthor_group_create(struct panthor_file *pfile,
 	spin_lock_init(&group->fatal_lock);
 	kref_init(&group->refcount);
 	group->state = PANTHOR_CS_GROUP_CREATED;
+	trace_panthor_group_update((u64)group, PANTHOR_CS_GROUP_CREATED);
 	group->csg_id = -1;
 
 	group->ptdev = ptdev;
@@ -3561,8 +3704,8 @@ int panthor_group_create(struct panthor_file *pfile,
 		panthor_group_stop(group);
 	} else {
 		mutex_lock(&sched->lock);
-		list_add_tail(&group->run_node,
-			      &sched->groups.idle[group->priority]);
+		list_add_tail(&group->run_node, &sched->groups.idle[group->priority]);
+				trace_panthor_group_list((u64)group, 1);
 		mutex_unlock(&sched->lock);
 	}
 	mutex_unlock(&sched->reset.lock);
@@ -3600,7 +3743,11 @@ int panthor_group_destroy(struct panthor_file *pfile, u32 group_handle)
 		 * pick the group on the next tick.
 		 */
 		list_del_init(&group->run_node);
-		list_del_init(&group->wait_node);
+				trace_panthor_group_list((u64)group, 0);
+		if (!list_empty(&group->wait_node)) {
+			trace_panthor_group_wait((u64)group, false);
+			list_del_init(&group->wait_node);
+		}
 		group_queue_work(group, term);
 	}
 	mutex_unlock(&sched->lock);

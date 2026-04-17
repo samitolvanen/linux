@@ -33,6 +33,7 @@
 #include "panthor_heap.h"
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
+#include <trace/events/panthor.h>
 #include "panthor_sched.h"
 
 #define MAX_AS_SLOTS			32
@@ -1997,9 +1998,11 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 
 	panthor_vma_init(vma, op_ctx->flags & PANTHOR_VM_MAP_FLAGS);
 
+	trace_panthor_mmu_bind_start((u64)vm, op->map.va.addr, op->map.va.range);
 	ret = panthor_vm_map_pages(vm, op->map.va.addr, flags_to_prot(vma->flags),
 				   op_ctx->map.sgt, op->map.gem.offset,
 				   op->map.va.range);
+	trace_panthor_mmu_bind_done((u64)vm, op->map.va.addr, op->map.va.range, ret);
 	if (ret)
 		return ret;
 
