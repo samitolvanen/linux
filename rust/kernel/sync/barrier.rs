@@ -59,3 +59,16 @@ pub fn smp_rmb() {
         barrier();
     }
 }
+
+/// A write-write memory barrier suitable for ordering device-visible stores.
+///
+/// Unlike [`smp_wmb`], `wmb` orders prior CPU stores ahead of subsequent
+/// stores to memory observed by external agents, including device DMA and
+/// non-coherent regions, regardless of `CONFIG_SMP`. Use it when publishing
+/// data into a shared buffer (for example, a GPU command-stream ringbuffer)
+/// before signalling the device.
+#[inline(always)]
+pub fn wmb() {
+    // SAFETY: `wmb()` is safe to call.
+    unsafe { bindings::wmb() };
+}
