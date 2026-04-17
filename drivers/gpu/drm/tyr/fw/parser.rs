@@ -175,6 +175,19 @@ impl<'a> FwParser<'a> {
             }
         }
 
+        // Validate that the firmware contains the required shared memory section.
+        let has_shared_section = parsed_sections
+            .iter()
+            .any(|section| section.va.start == super::CSF_MCU_SHARED_REGION_START);
+
+        if !has_shared_section {
+            pr_err!(
+                "No shared section found at 0x{:08x} in firmware\n",
+                super::CSF_MCU_SHARED_REGION_START
+            );
+            return Err(EINVAL);
+        }
+
         Ok(parsed_sections)
     }
 
