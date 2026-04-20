@@ -125,6 +125,8 @@ pub(crate) struct TyrData {
     sched: Mutex<SchedulerState>,
 
     #[pin]
+    pub(crate) tick_work: DmaFenceWork<Self, 1>,
+
     #[pin]
     pub(crate) fw_events_work: DmaFenceWork<Self, 2>,
 
@@ -136,6 +138,7 @@ pub(crate) struct TyrData {
     pub(crate) sync_upd_work: DmaFenceWork<Self, 3>,
 
     #[pin]
+    pub(crate) periodic_tick_work: DmaFenceDelayedWork<Self, 4>,
 
     /// Workqueue used by our internal scheduler logic.
     pub(crate) sched_wq: DmaFenceWorkqueue,
@@ -147,6 +150,14 @@ pub(crate) struct TyrData {
 }
 
 impl TyrData {
+    pub(crate) fn schedule_tick(self: &Arc<Self>) {
+        let _ = self.sched_wq.enqueue::<_, 1>(self.clone());
+    }
+
+    pub(crate) fn schedule_periodic_tick(self: &Arc<Self>, delay: Jiffies) {
+        let _ = self.sched_wq.enqueue_delayed::<_, 4>(self.clone(), delay);
+    }
+
     pub(crate) fn schedule_fw_events(self: &Arc<Self>) {
         let _ = self.sched_wq.enqueue::<_, 2>(self.clone());
     }
@@ -380,12 +391,14 @@ impl platform::Driver for TyrDriver {
                 mmio_phys_addr,
                 ping_work <- new_delayed_work!("tyr-ping-work"),
                 sched <- new_mutex!(SchedulerState::Disabled),
+                tick_work <- new_dma_fence_work!("tyr_tick"),
                 fw_events_work <- new_dma_fence_work!("tyr-fw-events"),
                 fw_events: AtomicU32::new(0),
                 sync_upd_work <- new_dma_fence_work!("tyr-sync-upd"),
                 sched_wq,
                 wq: job_wq,
                 reset_wq,
+                periodic_tick_work <- new_dma_fence_delayed_work!("tyr_periodic_tick"),
         });
 
         unsafe {

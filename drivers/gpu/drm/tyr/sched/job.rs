@@ -184,6 +184,7 @@ impl Job {
         }
 
         let mut needs_runnable = false;
+        let mut needs_tick = false;
 
         let submit_result = self.group.with_locked_inner(|inner| {
             if !inner.can_run() {
@@ -252,6 +253,7 @@ impl Job {
                     if was_idle && !inner.is_idle() {
                         needs_runnable = true;
                     }
+                    needs_tick = true;
                 }
             } else {
                 let _ = queue.kick(&self.group.tdev);
@@ -259,9 +261,15 @@ impl Job {
 
             Ok(SubmitResult::Submitted)
         })?;
-        if needs_runnable {
+
+        if needs_runnable || needs_tick {
             self.group.tdev.with_locked_scheduler(|sched| {
-                sched.mark_group_runnable(&self.group);
+                if needs_runnable {
+                    sched.mark_group_runnable(&self.group);
+                }
+                if needs_tick {
+                    sched.schedule_group(&self.group.tdev, Some(self.group.priority));
+                }
                 Ok(())
             })?;
         }

@@ -22,6 +22,9 @@ mod events;
 pub(crate) mod group;
 pub(crate) mod job;
 pub(crate) mod queue;
+mod tick;
+
+pub(crate) const TICK_PERIOD_MS: u32 = 10;
 
 pub(crate) const MAX_CSG_PRIO: u32 = 0xf;
 
@@ -126,6 +129,9 @@ pub(crate) struct Scheduler {
 
     /// When the next tick should occur.
     resched_target: Option<Instant<Monotonic>>,
+
+    /// When the last tick occurred.
+    pub(crate) last_tick: Instant<Monotonic>,
 }
 
 impl Scheduler {
@@ -295,6 +301,7 @@ impl Scheduler {
             might_have_idle_groups: false,
             sb_slot_count,
             resched_target: None,
+            last_tick: Instant::<Monotonic>::now(),
         })
     }
 

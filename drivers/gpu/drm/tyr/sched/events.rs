@@ -115,6 +115,7 @@ impl Scheduler {
         if evts & GLB_IDLE != 0 {
             let req = glb.input_request()?;
             req.update_reqs(output.ack, GLB_IDLE)?;
+            data.schedule_tick();
         }
 
         Ok(())
@@ -152,8 +153,11 @@ impl Scheduler {
             CSG_SYNC_UPDATE | CSG_IDLE | CSG_PROGRESS_TIMER_EVENT,
         )?;
 
+        let mut needs_tick = false;
+
         if csg_events & CSG_IDLE != 0 {
             self.might_have_idle_groups = true;
+            needs_tick = true;
         }
 
         if csg_events & CSG_PROGRESS_TIMER_EVENT != 0 {
@@ -165,6 +169,12 @@ impl Scheduler {
                     Ok(())
                 });
             }
+
+            needs_tick = true;
+        }
+
+        if needs_tick {
+            data.schedule_tick();
         }
 
         let mut ring_cs_db_mask = 0;
@@ -225,6 +235,7 @@ impl Scheduler {
                 // sure we stop scheduling groups until the reset has happened.
                 // TODO: schedule a reset and cancel tick work.
             } else {
+                data.schedule_tick();
             }
         }
 
@@ -272,7 +283,36 @@ impl Scheduler {
         Ok(ring_db)
     }
 
-    pub(crate) fn schedule_group(&mut self, _data: &Arc<TyrData>, _priority: Option<Priority>) {}
+    pub(crate) fn schedule_group(&mut self, data: &Arc<TyrData>, priority: Option<Priority>) {
+        if priority == Some(Priority::RealTime) || self.might_have_idle_groups {
+            data.schedule_tick();
+            return;
+        }
+
+        if self.resched_target.is_some() {
+            if self.used_csg_slot_count < self.csg_slot_count {
+                data.schedule_tick();
+            }
+            return;
+        }
+
+        let now = Instant::<Monotonic>::now();
+        let target = self.last_tick + Delta::from_millis(super::TICK_PERIOD_MS as i64);
+        self.resched_target = Some(target);
+
+        let delay_jiffies =
+            if self.used_csg_slot_count == self.csg_slot_count && (target - now).as_nanos() > 0 {
+                msecs_to_jiffies((target - now).as_millis() as _)
+            } else {
+                0
+            };
+
+        if delay_jiffies > 0 {
+            data.schedule_periodic_tick(delay_jiffies as _);
+        } else {
+            data.schedule_tick();
+        }
+    }
 
     pub(crate) fn sync_csg_slot_priority(
         &mut self,
@@ -493,6 +533,8 @@ impl DmaFenceWorkItem<3> for TyrData {
 
     fn run(this: Self::Pointer) {
         let _ = this.with_locked_scheduler(|sched| {
+            let mut immediate_tick = false;
+
             for prio in 0..Priority::num_priorities() {
                 // Collect groups that need to be made runnable to avoid borrowing `sched`
                 // mutably while iterating over `sched.waiting_groups`.
@@ -551,7 +593,9 @@ impl DmaFenceWorkItem<3> for TyrData {
                                 if move_to_runnable {
                                     make_runnable.push_back(list_arc);
 
-                                    if prio == Priority::RealTime as usize {}
+                                    if prio == Priority::RealTime as usize {
+                                        immediate_tick = true;
+                                    }
                                 }
                             } else {
                                 cursor.move_next();
@@ -567,6 +611,10 @@ impl DmaFenceWorkItem<3> for TyrData {
                     let group = list_arc.into_arc();
                     sched.mark_group_runnable(&group);
                 }
+            }
+
+            if immediate_tick {
+                this.schedule_tick();
             }
 
             Ok(())

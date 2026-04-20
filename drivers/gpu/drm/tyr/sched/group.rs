@@ -708,6 +708,7 @@ impl Pool {
         })?;
 
         if is_bound {
+            tdev.schedule_tick();
         } else {
             group.schedule_term();
         }

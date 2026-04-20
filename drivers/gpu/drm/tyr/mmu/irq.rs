@@ -73,6 +73,8 @@ impl TyrIrqTrait for MmuIrq {
         let status = status & kernel::bits::genmask_u32(0..=15);
         let _ = decode_faults(tdev, status, &self.iomem);
 
-        if status != 0 {}
+        if status != 0 {
+            tdev.schedule_tick();
+        }
     }
 }
