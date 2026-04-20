@@ -415,6 +415,28 @@ impl Output {
         self.fatal >> 8 & genmask_u32(0..=23)
     }
 
+    pub(crate) fn status_wait(&self) -> Result<StatusWait> {
+        let status = self.status_wait;
+
+        let sb_mask = status & genmask_u32(0..=15);
+        let sb_source = (status & genmask_u32(16..=19)) >> 16;
+        let gt = (status & bit_u32(24)) != 0;
+        let progress_wait = (status & bit_u32(28)) != 0;
+        let protm_pend = (status & bit_u32(29)) != 0;
+        let sync64 = (status & bit_u32(30)) != 0;
+        let sync_wait = (status & bit_u32(31)) != 0;
+
+        Ok(StatusWait {
+            _sb_mask: sb_mask,
+            _sb_source: sb_source,
+            gt,
+            _progress_wait: progress_wait,
+            _protm_pend: protm_pend,
+            sync64,
+            _sync_wait: sync_wait,
+        })
+    }
+
     pub(crate) fn blocked_reason(&self) -> Result<BlockedReason> {
         let reason = self.status_blocked_reason & genmask_u32(0..=3);
 
@@ -441,6 +463,30 @@ pub(crate) enum StreamState {
     Stop,
     /// Initialize the command stream and start execution.
     Start,
+}
+
+pub(crate) struct StatusWait {
+    /// Mask denoting which scoreboard entries are being waited on by this
+    /// command stream.
+    _sb_mask: u32,
+
+    /// Source of the scoreboard wait status, if any.
+    _sb_source: u32,
+
+    /// Whether the condition is a greater-than comparison.
+    pub(crate) gt: bool,
+
+    /// Whether the command stream is waiting for a PROGRESS_WAIT instruction.
+    _progress_wait: bool,
+
+    /// Whether the command stream is waiting for protected mode execution.
+    _protm_pend: bool,
+
+    /// Whether the sync object is 32 or 64 bits wide.
+    pub(crate) sync64: bool,
+
+    /// Whether the command stream is waiting for a SYNC_WAIT instruction.
+    _sync_wait: bool,
 }
 
 #[derive(Clone, Copy)]

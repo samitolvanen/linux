@@ -18,10 +18,12 @@ use crate::fw::global::csg::Priority;
 use crate::fw::global::csg::MAX_CSGS;
 use crate::fw::SharedSectionEntry;
 
+pub(crate) mod deps;
 mod events;
 pub(crate) mod group;
 pub(crate) mod job;
 pub(crate) mod queue;
+mod syncs;
 mod tick;
 
 pub(crate) const TICK_PERIOD_MS: u32 = 10;

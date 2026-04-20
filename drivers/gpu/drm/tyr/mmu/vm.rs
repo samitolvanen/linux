@@ -25,14 +25,14 @@ use core::ops::Range;
 use gpuvm::LockedVm;
 use gpuvm::StepContext;
 use gpuvm::TyrVmBoData;
-use kernel::bindings::SZ_2M;
+use kernel::bindings::{drm_gpuva_find_first, SZ_2M};
 use kernel::c_str;
 use kernel::devres::Devres;
 use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::drm::gem::shmem;
 use kernel::drm::gpuvm::GpuVm;
-use kernel::drm::gpuvm::GpuVmCore;
 use kernel::drm::gpuvm::OpMapRequest;
+use kernel::drm::gpuvm::{GpuVa, GpuVmCore};
 use kernel::drm::job_queue::JobQueue;
 use kernel::drm::job_queue::PipelineBuilder;
 use kernel::drm::job_queue::StageAdvance;
@@ -323,6 +323,21 @@ impl Vm {
         self.unmap_range(iomem, range)?;
 
         Ok(())
+    }
+
+    pub(crate) fn get_bo_for_va(&self, va: u64, bo_offset: &mut u64) -> Option<gem::ObjectRef> {
+        let raw_vm = self.gpuvm.as_raw();
+        let gpuva_ptr = unsafe { drm_gpuva_find_first(raw_vm, va, 1) };
+        if gpuva_ptr.is_null() {
+            return None;
+        }
+
+        let gpuva = unsafe { GpuVa::<gpuvm::LockedVm>::from_raw(gpuva_ptr) };
+        let bo = gpuva.obj();
+
+        *bo_offset = gpuva.gem_offset() + (va - gpuva.addr());
+
+        Some(gem::ObjectRef::new(bo.into()))
     }
 
     pub(crate) fn address_space(&self) -> Option<usize> {

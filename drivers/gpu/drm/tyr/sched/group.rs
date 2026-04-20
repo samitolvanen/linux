@@ -6,6 +6,7 @@ use kernel::bits::genmask_checked_u32;
 use kernel::dma_fence::DmaFenceSignallingAnnotation;
 use kernel::dma_fence::DmaFenceWork;
 use kernel::dma_fence::DmaFenceWorkItem;
+use kernel::dma_fence::PublicDmaFence;
 use kernel::drm::gem::BaseObject;
 use kernel::impl_has_dma_fence_work;
 use kernel::kvec;
@@ -17,6 +18,7 @@ use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
+use kernel::types::ARef;
 use kernel::xarray;
 use kernel::xarray::XArray;
 
@@ -24,43 +26,19 @@ use crate::driver::TyrDevice;
 use crate::file::DrmFile;
 use crate::file::QueueCreate;
 use crate::file::QueueSubmit;
+use crate::file::SyncOp;
 use crate::fw::global::csg;
 use crate::fw::global::csg::Priority;
 use crate::fw::SharedSectionEntry;
 use crate::gem;
 use crate::mmu::vm::map_flags;
 use crate::mmu::vm::Vm;
+use crate::sched::deps;
+use crate::sched::syncs::SyncObj64b;
 
 use super::job;
 use super::queue::Queue;
-
-#[repr(C)]
-pub(crate) struct QueueSyncObj {
-    pub(crate) seqno: u64,
-    pub(crate) status: u32,
-    pub(crate) pad: u32,
-}
-
-impl QueueSyncObj {
-    pub(super) fn read(mem: &mut crate::gem::ObjectRef, offset: usize) -> Result<Self> {
-        if offset > mem.size() {
-            return Err(EINVAL);
-        }
-        let vmap = mem.vmap()?;
-        let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
-        Ok(unsafe { core::ptr::read_volatile(ptr) })
-    }
-
-    pub(super) fn write(mem: &mut crate::gem::ObjectRef, offset: usize, val: Self) -> Result<()> {
-        if offset > mem.size() {
-            return Err(EINVAL);
-        }
-        let vmap = mem.vmap()?;
-        let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
-        unsafe { core::ptr::write_volatile(ptr, val) };
-        Ok(())
-    }
-}
+use super::syncs;
 
 /// The part of the state protected under the group lock.
 #[pin_data]
@@ -279,7 +257,7 @@ impl Group {
         let suspend_buf = fw.alloc_suspend_buf(tdev, suspend_buf_size as usize)?;
         let protm_suspend_buf = fw.alloc_suspend_buf(tdev, protm_suspend_buf_size as usize)?;
 
-        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<QueueSyncObj>();
+        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<SyncObj64b>();
         let mut syncobjs = {
             let mut vm_guard = vm.lock();
             gem::new_kernel_object(
@@ -515,14 +493,15 @@ impl Group {
                     .with_locked_inner(|inner| {
                         let queue = &mut inner.queues[i];
                         let seqno = queue.next_seqno.load(Ordering::Relaxed);
-                        let sync_offset = i * core::mem::size_of::<QueueSyncObj>();
+                        let sync_offset = i * core::mem::size_of::<syncs::SyncObj64b>();
 
-                        let sync_obj = QueueSyncObj {
+                        let sync_obj = syncs::SyncObj64b {
                             seqno,
                             status: !0,
                             pad: 0,
                         };
-                        let _ = QueueSyncObj::write(&mut inner.syncobjs, sync_offset, sync_obj);
+                        let _ =
+                            syncs::SyncObj64b::write(&mut inner.syncobjs, sync_offset, sync_obj);
 
                         Ok(queue.take_all_fences())
                     })
@@ -541,8 +520,60 @@ impl Group {
 }
 
 impl Group {
-    pub(crate) fn eval_syncwait(&self, _queue_idx: usize) -> Result<bool> {
-        Ok(false)
+    pub(crate) fn eval_syncwait(&self, queue_idx: usize) -> Result<bool> {
+        let (syncwait, syncobjs_va) = self.with_locked_inner(|inner| {
+            let syncobjs_va = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
+            let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+            Ok((queue.syncwait.clone(), syncobjs_va))
+        })?;
+
+        if syncwait.gpu_va == 0 {
+            return Ok(false);
+        }
+
+        let value = if syncwait.gpu_va >= syncobjs_va.start && syncwait.gpu_va < syncobjs_va.end {
+            let offset = (syncwait.gpu_va - syncobjs_va.start) as usize;
+            self.with_locked_inner(|inner| {
+                if syncwait.sync64 {
+                    let sync_obj = syncs::SyncObj64b::read(&mut inner.syncobjs, offset)?;
+                    Ok(sync_obj.seqno)
+                } else {
+                    let sync_obj = syncs::SyncObj32b::read(&mut inner.syncobjs, offset)?;
+                    Ok(sync_obj.seqno as u64)
+                }
+            })?
+        } else {
+            let vm_guard = self.vm.lock();
+            let mut bo_offset = 0;
+            let mut bo = vm_guard
+                .get_bo_for_va(syncwait.gpu_va, &mut bo_offset)
+                .ok_or(EINVAL)?;
+
+            if syncwait.sync64 {
+                let sync_obj = syncs::SyncObj64b::read(&mut bo, bo_offset as usize)?;
+                sync_obj.seqno
+            } else {
+                let sync_obj = syncs::SyncObj32b::read(&mut bo, bo_offset as usize)?;
+                sync_obj.seqno as u64
+            }
+        };
+
+        let result = if syncwait.gt {
+            value > syncwait.ref_val
+        } else {
+            value <= syncwait.ref_val
+        };
+
+        if result {
+            self.with_locked_inner(|inner| {
+                if let Some(queue) = inner.queues.get_mut(queue_idx) {
+                    queue.syncwait.gpu_va = 0;
+                }
+                Ok(())
+            })?;
+        }
+
+        Ok(result)
     }
 
     /// Provide access to the part of the group we may want to mutate.
@@ -558,20 +589,25 @@ impl Group {
 
     pub(crate) fn submit(
         self: Arc<Self>,
+        all_syncs: KVec<KVec<SyncOp>>,
         queue_submits: KVec<QueueSubmit>,
-        _file: &DrmFile,
-    ) -> Result<()> {
+        file: &DrmFile,
+    ) -> Result<KVec<ARef<PublicDmaFence>>> {
         if !self.can_run() {
             pr_err!("group_submit: invalid group: group is terminated");
             return Err(EINVAL);
         }
 
+        let mut ctx = deps::Context::new(file);
+
+        let mut fences = KVec::with_capacity(queue_submits.len(), GFP_KERNEL)?;
+
         let vm = self.vm.lock();
 
         // Prepare the VM with enough slots for all submissions
-        vm.with_prepared_vm(queue_submits.len() as u32, |mut _locked_vm| {
-            let mut jobs = kvec![];
-            for queue_submit in queue_submits.iter() {
+        vm.with_prepared_vm(queue_submits.len() as u32, |mut locked_vm| {
+            // Create all jobs and add them to the context
+            for (queue_submit, syncs) in core::iter::zip(queue_submits.iter(), all_syncs.iter()) {
                 let sync_addr = self.with_locked_inner(|inner| {
                     // Validate the queue index up-front; submit_to_hw() will
                     // also check this but bailing early gives a cleaner error.
@@ -586,35 +622,57 @@ impl Group {
                     let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
                     Ok(sync_addr.start
                         + u64::from(queue_submit.queue_index)
-                            * core::mem::size_of::<QueueSyncObj>() as u64)
+                            * core::mem::size_of::<syncs::SyncObj64b>() as u64)
                 })?;
 
                 let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
-                jobs.push((job, queue_submit.queue_index as usize), GFP_KERNEL)?;
+                let internal_syncs = deps::SyncOp::from_uapi_slice(syncs)?;
+
+                ctx.add_job(job, internal_syncs)?;
             }
 
-            let mut prepared_jobs = kvec![];
-            for (job, queue_idx) in jobs.into_iter() {
+            ctx.collect_signal_ops()?;
+
+            // Prepare all jobs and resolve dependencies (Pass 1)
+            for (job_idx, queue_submit) in queue_submits.iter().enumerate() {
+                let queue_idx = queue_submit.queue_index as usize;
+
                 let job_queue = self.with_locked_inner(|inner| {
-                    Ok(inner
-                        .queues
-                        .get_mut(queue_idx)
-                        .ok_or(EINVAL)?
-                        .job_queue
-                        .clone())
+                    let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                    Ok(queue.job_queue.clone())
                 })?;
-                let prepared_job = job_queue.prepare(job, 0, crate::sched::job::TyrJobFenceData)?;
-                prepared_jobs.push((prepared_job, job_queue), GFP_KERNEL)?;
+
+                ctx.prepare(job_idx, &job_queue)?;
             }
 
-            for (prepared_job, job_queue) in prepared_jobs {
-                job_queue.commit(prepared_job, &[])?;
+            // Process jobs in the order they were submitted (Pass 2)
+            for (job_idx, queue_submit) in queue_submits.iter().enumerate() {
+                let queue_idx = queue_submit.queue_index as usize;
+
+                let job_queue = self.with_locked_inner(|inner| {
+                    let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                    Ok(queue.job_queue.clone())
+                })?;
+
+                let fence = ctx.commit(job_idx, &job_queue)?;
+
+                // Add the finished fence to the reservation objects and
+                // collect them to return to the caller (for syncobj signalling).
+                locked_vm.resv_add_fence(
+                    &*fence,
+                    kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                );
+                fences.push(fence, GFP_KERNEL)?;
             }
 
             Ok(())
         })?;
 
-        Ok(())
+        // Push all signal fences to their syncobjs
+        ctx.push_fences();
+
+        Ok(fences)
     }
 }
 
@@ -751,8 +809,8 @@ impl DmaFenceWorkItem<0> for Group {
             loop {
                 let fence_to_signal = this
                     .with_locked_inner(|inner| {
-                        let sync_offset = queue_idx * core::mem::size_of::<QueueSyncObj>();
-                        let sync_obj = QueueSyncObj::read(&mut inner.syncobjs, sync_offset)?;
+                        let sync_offset = queue_idx * core::mem::size_of::<syncs::SyncObj64b>();
+                        let sync_obj = syncs::SyncObj64b::read(&mut inner.syncobjs, sync_offset)?;
                         let queue = &mut inner.queues[queue_idx];
 
                         Ok(queue.pop_pending_fence_up_to(sync_obj.seqno))

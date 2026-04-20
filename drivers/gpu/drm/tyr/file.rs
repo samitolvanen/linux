@@ -30,6 +30,7 @@ use crate::mmu::vm::VmLayout;
 use crate::mmu::vm::VmUserSize;
 use crate::mmu::vm::WithLockedVm;
 use crate::mmu::vm::{VmBindJob, VmOperation};
+use crate::sched::deps;
 use crate::sched::group;
 
 #[pin_data(PinnedDrop)]
@@ -220,17 +221,22 @@ impl File {
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &DrmFile,
     ) -> Result<u32> {
-        let vm = match file.inner().vm_pool().get_vm(vmbind.vm_id as usize) {
-            Some(vm) => vm,
-            None => return Err(EINVAL),
-        };
-
         if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
             dev_info!(
                 tdev.as_ref(),
-                "We cannot graciously handle vm_bind_op stride mismatches yet"
+                "We cannot graciously handle stride mismatches yet"
             );
             return Err(ENOTSUPP);
+        }
+
+        let vm = file
+            .inner()
+            .vm_pool()
+            .get_vm(vmbind.vm_id as usize)
+            .ok_or(EINVAL)?;
+
+        if vm.lock().unusable {
+            return Err(EINVAL);
         }
 
         let stride = vmbind.ops.stride as usize;
@@ -242,7 +248,7 @@ impl File {
         )
         .reader();
 
-        let mut jobs = kvec![];
+        let mut ctx = deps::Context::new(file);
 
         for i in 0..count {
             let op: VmBindOp = reader.read()?;
@@ -278,21 +284,54 @@ impl File {
                 }
             };
 
+            if op.0.syncs.stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
+                dev_info!(
+                    tdev.as_ref(),
+                    "We cannot graciously handle sync stride mismatches yet"
+                );
+                vmbind.ops.count = i as u32;
+                return Err(ENOTSUPP);
+            }
+
+            let sync_count = op.0.syncs.count as usize;
+            let sync_stride = op.0.syncs.stride as usize;
+
+            let mut sync_reader = UserSlice::new(
+                UserPtr::from_addr(op.0.syncs.array as usize),
+                sync_stride * sync_count,
+            )
+            .reader();
+
+            let mut sync_ops = kvec![];
+            for _ in 0..sync_count {
+                let sync_op_uapi: SyncOp = sync_reader.read()?;
+                sync_ops.push(sync_op_uapi, GFP_KERNEL)?;
+            }
+
+            // Convert UAPI sync operations to internal representation
+            let internal_syncs = deps::SyncOp::from_uapi_slice(&sync_ops)?;
+
             let job = VmBindJob::new(vm.clone(), vm_operation);
-            jobs.push(job, GFP_KERNEL)?;
+
+            ctx.add_vm_bind_job(job, internal_syncs)?;
         }
 
+        // Collect all signal operations across all jobs
+        ctx.collect_signal_ops()?;
+
+        // Push all VM bind jobs with dependencies and update reservation objects
         vm.with_lock_taken(|vm| {
             vm.with_prepared_vm_and_job_queue(count as u32, |mut locked_vm, job_queue| {
-                let mut prepared_jobs = kvec![];
-                for job in jobs.into_iter() {
-                    let prepared_job =
-                        job_queue.prepare(job, 0, crate::mmu::vm::bind_job::VmBindFenceData)?;
-                    prepared_jobs.push(prepared_job, GFP_KERNEL)?;
+                // Prepare all jobs and resolve dependencies (Pass 1)
+                for job_idx in 0..count {
+                    ctx.prepare_vm_bind_job(job_idx, job_queue)?;
                 }
 
-                for prepared_job in prepared_jobs {
-                    let fence = job_queue.commit(prepared_job, &[])?;
+                // Process jobs in the order they were submitted (Pass 2)
+                for job_idx in 0..count {
+                    let fence = ctx.commit_vm_bind_job(job_idx, job_queue)?;
+
+                    // Add the finished fences to the reservation objects
                     locked_vm.resv_add_fence(
                         &*fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
@@ -303,6 +342,9 @@ impl File {
                 Ok(())
             })
         })?;
+
+        // Push all signal fences to their syncobjs
+        ctx.push_fences();
 
         Ok(0)
     }
@@ -579,7 +621,7 @@ impl File {
             .group(groupsubmit.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        group.clone().submit(queue_submits, file)?;
+        group.clone().submit(all_syncs, queue_submits, file)?;
         Ok(0)
     }
 

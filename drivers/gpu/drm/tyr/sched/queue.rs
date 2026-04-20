@@ -33,6 +33,19 @@ pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
 /// the firmware blocks the queue and reports the wait parameters. The driver must
 /// manually evaluate this condition when the sync object is updated to determine
 /// when the queue can be unblocked and rescheduled.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct SyncWait {
+    /// The GPU virtual address of the sync object being evaluated.
+    pub(crate) gpu_va: u64,
+    /// The reference value to compare the sync object against.
+    pub(crate) ref_val: u64,
+    /// If `true`, the sync object is 64-bit; if `false`, it is 32-bit.
+    pub(crate) sync64: bool,
+    /// The comparison operator: `true` means wait until `sync_val > ref_val`,
+    /// `false` means wait until `sync_val <= ref_val`.
+    pub(crate) gt: bool,
+}
+
 pub(crate) struct PendingSubmitFence {
     pub(crate) seqno: u64,
     pub(crate) ringbuf_start: u64,
@@ -141,6 +154,8 @@ pub(crate) struct Queue {
     pub(crate) pending_submit_fences: KVec<PendingSubmitFence>,
     pub(crate) pending_submit_fences_head: usize,
 
+    pub(crate) syncwait: SyncWait,
+
     pub(crate) timeout_suspended: core::sync::atomic::AtomicBool,
     pub(crate) parked: bool,
     pub(crate) suspend_start_nanos: core::sync::atomic::AtomicI64,
@@ -237,6 +252,7 @@ impl Queue {
             next_seqno: AtomicU64::new(0),
             pending_submit_fences: KVec::with_capacity(max_jobs, GFP_KERNEL)?,
             pending_submit_fences_head: 0,
+            syncwait: Default::default(),
             timeout_suspended: core::sync::atomic::AtomicBool::new(false),
             parked: false,
             suspend_start_nanos: core::sync::atomic::AtomicI64::new(0),

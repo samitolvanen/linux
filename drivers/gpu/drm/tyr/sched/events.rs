@@ -23,6 +23,7 @@ use crate::regs::JOB_IRQ_GLOBAL_IF;
 use crate::sched::csg::CommandStreamGroup;
 use crate::sched::csg::GroupState;
 use crate::sched::group::State;
+use crate::sched::queue;
 use crate::sched::CsgUpdateContext;
 use crate::sched::Priority;
 use crate::sched::Scheduler;
@@ -474,7 +475,28 @@ impl Scheduler {
                         }
                         BlockedReason::SyncWait => {
                             has_sync_wait = true;
-                            blocked = true;
+                            let status_wait = cs_out.status_wait()?;
+
+                            let mut ref_val = cs_out.status_wait_sync_value as u64;
+                            if status_wait.sync64 {
+                                ref_val |= (cs_out.status_wait_sync_value_hi as u64) << 32;
+                            }
+
+                            let syncwait = queue::SyncWait {
+                                gpu_va: cs_out.status_wait_sync_ptr,
+                                ref_val,
+                                sync64: status_wait.sync64,
+                                gt: status_wait.gt,
+                            };
+
+                            if let Some(queue) = inner.queues.get_mut(cs_id) {
+                                queue.syncwait = syncwait;
+                            }
+
+                            // Only blocked if there's no deferred operation pending
+                            if cs_out.status_scoreboards == 0 {
+                                blocked = true;
+                            }
                         }
                         _ => {
                             // Other reasons are not blocking. Consider the queue as
