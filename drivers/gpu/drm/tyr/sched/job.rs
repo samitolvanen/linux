@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use crate::devfreq;
 use core::sync::atomic::Ordering;
 use kernel::c_str;
 use kernel::dma_fence::{DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, Published};
@@ -257,6 +258,7 @@ impl Job {
                 }
             } else {
                 let _ = queue.kick(&self.group.tdev);
+                devfreq::record_busy(&self.group.tdev);
             }
 
             Ok(SubmitResult::Submitted)

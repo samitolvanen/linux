@@ -5,7 +5,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel::c_str;
 use kernel::clk::Clk;
+use kernel::clk::Hertz;
 use kernel::clk::OptionalClk;
+use kernel::devfreq;
 use kernel::device;
 use kernel::device::Bound;
 use kernel::device::Core;
@@ -42,6 +44,8 @@ use kernel::workqueue::OwnedQueue;
 use kernel::workqueue::WqFlags;
 use pin_init::pin_init_from_closure;
 
+use crate::devfreq::DevfreqState;
+use crate::devfreq::TyrDevfreqCallbacks;
 use crate::file::File;
 use crate::fw;
 use crate::fw::irq::JobIrq;
@@ -59,7 +63,7 @@ use crate::sched::Scheduler;
 use crate::sched::SchedulerState;
 use crate::wait::Wait;
 use crate::wait::WaitResult;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicUsize};
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
 
@@ -84,8 +88,11 @@ pub(crate) struct TyrDriver {
 pub(crate) struct TyrData {
     pub(crate) pdev: ARef<platform::Device>,
 
+    /// Maximum operating frequency of the GPU core, used for fdinfo reporting.
+    pub(crate) max_freq: u64,
+
     #[pin]
-    clks: Mutex<Clocks>,
+    pub(crate) clks: Mutex<Clocks>,
 
     #[pin]
     regulators: Mutex<Regulators>,
@@ -147,6 +154,20 @@ pub(crate) struct TyrData {
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
     pub(crate) reset_wq: OwnedQueue,
+
+    #[pin]
+    pub(crate) devfreq_registration: Mutex<Option<devfreq::Registration<TyrDevfreqCallbacks>>>,
+
+    #[pin]
+    pub(crate) devfreq_state: Mutex<DevfreqState>,
+
+    #[pin]
+    pub(crate) opp_table: Mutex<Option<opp::Table>>,
+
+    #[pin]
+    pub(crate) opp_config: Mutex<Option<opp::ConfigToken>>,
+
+    pub(crate) current_frequency: AtomicUsize,
 }
 
 impl TyrData {
@@ -228,49 +249,43 @@ fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     Ok(())
 }
 
-fn set_maximum_opp(pdev: &ARef<platform::Device>) {
+fn get_max_freq(pdev: &platform::Device<Core>, core_clk: &kernel::clk::Clk) -> Result<u64> {
     match opp::Table::from_of(&pdev.as_ref().into(), 0) {
-        Ok(table) => {
-            match table.opp_from_freq(
-                kernel::clk::Hertz(kernel::ffi::c_ulong::MAX),
-                Some(true), // Only consider available (enabled) OPPs
-                None,       // Use default clock index (0)
-                opp::SearchType::Floor,
-            ) {
-                Ok(max_opp) => {
-                    let freq = max_opp.freq(None);
-                    let voltage = max_opp.voltage();
+        Ok(table) => match table.opp_from_freq(
+            Hertz(kernel::ffi::c_ulong::MAX),
+            Some(true), // Only consider available (enabled) OPPs
+            None,       // Use default clock index (0)
+            opp::SearchType::Floor,
+        ) {
+            Ok(opp) => {
+                let freq = opp.freq(None);
+                let voltage = opp.voltage();
 
-                    dev_info!(
-                        pdev.as_ref(),
-                        "Setting GPU to max performance: {} Hz @ {} uV\n",
-                        kernel::ffi::c_ulong::from(freq),
-                        kernel::ffi::c_ulong::from(voltage)
-                    );
+                dev_info!(
+                    pdev.as_ref(),
+                    "Max performance: {} Hz @ {} uV\n",
+                    kernel::ffi::c_ulong::from(freq),
+                    kernel::ffi::c_ulong::from(voltage)
+                );
 
-                    if let Err(e) = table.set_opp(&max_opp) {
-                        dev_warn!(
-                            pdev.as_ref(),
-                            "Failed to set max OPP: {:?}, continuing anyway\n",
-                            e
-                        );
-                    }
-                }
-                Err(e) => {
-                    dev_info!(
-                        pdev.as_ref(),
-                        "Failed to get max OPP: {:?}, using default clocks\n",
-                        e
-                    );
-                }
+                Ok(freq.as_hz() as u64)
             }
-        }
+            Err(e) => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "Failed to get max OPP: {:?}, using current clock\n",
+                    e
+                );
+                Ok(core_clk.rate().as_hz() as u64)
+            }
+        },
         Err(e) => {
             dev_info!(
                 pdev.as_ref(),
-                "No OPP table in device tree: {:?}, using default clocks\n",
+                "No OPP table in device tree: {:?}, using current clock\n",
                 e
             );
+            Ok(core_clk.rate().as_hz() as u64)
         }
     }
 }
@@ -308,7 +323,7 @@ impl platform::Driver for TyrDriver {
         coregroup_clk.prepare_enable()?;
 
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("mali"))?;
-        let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c_str!("sram"))?;
+        let max_freq = get_max_freq(pdev, &core_clk)?;
 
         let io_resource = pdev.io_request_by_index(0).ok_or(EINVAL)?;
         let mmio_phys_addr = io_resource.start();
@@ -326,11 +341,6 @@ impl platform::Driver for TyrDriver {
             pdev.dma_set_mask_and_coherent(DmaMask::try_new(gpu_info.pa_bits())?)?;
         }
         let platform: ARef<platform::Device> = pdev.into();
-
-        // Set GPU to maximum performance operating point
-        // This ensures the GPU runs at the highest frequency for best
-        // performance while we don't have any power management code in place.
-        set_maximum_opp(&platform);
 
         // SAFETY: This should be safe as data is not touched by the driver
         // untill it gets fully initialised.
@@ -373,6 +383,7 @@ impl platform::Driver for TyrDriver {
         )?;
         let data_init = try_pin_init!(TyrData {
                 pdev: platform.clone(),
+                max_freq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
@@ -380,7 +391,6 @@ impl platform::Driver for TyrDriver {
                 }),
                 regulators <- new_mutex!(Regulators {
                     mali: mali_regulator,
-                    sram: sram_regulator,
                 }),
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
@@ -399,6 +409,13 @@ impl platform::Driver for TyrDriver {
                 wq: job_wq,
                 reset_wq,
                 periodic_tick_work <- new_dma_fence_delayed_work!("tyr_periodic_tick"),
+                devfreq_registration <- new_mutex!(None),
+                devfreq_state <- new_mutex!(
+                    DevfreqState::new()
+                ),
+                opp_table <- new_mutex!(None),
+                opp_config <- new_mutex!(None),
+                current_frequency: AtomicUsize::new(0),
         });
 
         unsafe {
@@ -477,6 +494,19 @@ impl platform::Driver for TyrDriver {
         let scheduler = Scheduler::init(&tdev.clone())?;
         *tdev.sched.lock() = SchedulerState::Enabled(scheduler);
 
+        // devfreq requires drvdata to be set before init, but platform driver
+        // framework only sets it after probe returns. Set it manually here.
+        // SAFETY: The `driver` pointer is valid and will be identical to what
+        // the platform driver core sets after `probe` returns.
+        unsafe {
+            kernel::bindings::dev_set_drvdata(
+                core::ptr::from_ref(pdev.as_ref()).cast_mut().cast(),
+                core::ptr::from_ref(&*driver).cast_mut().cast(),
+            );
+        }
+
+        crate::devfreq::init(&tdev, pdev.as_ref())?;
+
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev.as_ref(), "Tyr initialized correctly.\n");
@@ -488,6 +518,11 @@ impl platform::Driver for TyrDriver {
 #[pinned_drop]
 impl PinnedDrop for TyrDriver {
     fn drop(self: Pin<&mut Self>) {
+        // Unregister devfreq before TyrDriver is freed. The devfreq subsystem
+        // invokes callbacks with the parent device, relying on the parent's
+        // driver data (which is TyrDriver). Thus, devfreq must not outlive TyrDriver.
+        *self.device.devfreq_registration.lock() = None;
+
         // XXX: we will not have the `data` field here if we failed the
         // initialization, i.e.: if probe failed.
         //
@@ -505,6 +540,10 @@ impl PinnedDrop for TyrDriver {
 #[pinned_drop]
 impl PinnedDrop for TyrData {
     fn drop(self: Pin<&mut Self>) {
+        // Drop devfreq components in reverse initialization order.
+        let _ = self.opp_table.lock().take();
+        let _ = self.opp_config.lock().take();
+
         // TODO: the type-state pattern for Clks will fix this.
         let clks = self.clks.lock();
         clks.core.disable_unprepare();
@@ -560,8 +599,8 @@ impl drm::Driver for TyrDriver {
 }
 
 #[pin_data]
-struct Clocks {
-    core: Clk,
+pub(crate) struct Clocks {
+    pub(crate) core: Clk,
     stacks: OptionalClk,
     coregroup: OptionalClk,
 }
@@ -569,7 +608,6 @@ struct Clocks {
 #[pin_data]
 struct Regulators {
     mali: Regulator<regulator::Enabled>,
-    sram: Regulator<regulator::Enabled>,
 }
 
 pub(crate) trait TyrIrqTrait: Sync {

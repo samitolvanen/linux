@@ -18,6 +18,8 @@ config DRM_TYR
 	depends on MMU
 	select DRM_TYR_STATIC_DEPS
 	select IOMMU_IO_PGTABLE_LPAE
+	select PM_DEVFREQ
+	select DEVFREQ_GOV_SIMPLE_ONDEMAND
 	depends on IOMMU_SUPPORT
 	default n
 	help

@@ -9,6 +9,7 @@ use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::time::{msecs_to_jiffies, Delta, Instant, Monotonic};
 
+use crate::devfreq;
 use crate::driver::TyrData;
 use crate::fw::global::csg::{GroupState, Priority, MAX_CSGS};
 use crate::sched::group::Group;
@@ -552,6 +553,12 @@ impl<'a> Tick<'a> {
         self.halt_and_unbind_evicted_groups(data, decision)?;
         self.apply_priorities_and_bind(data, decision)?;
         self.sched.prune_destroyed_groups();
+
+        if decision.all_idle {
+            devfreq::record_idle(data);
+        } else {
+            devfreq::record_busy(data);
+        }
 
         self.update_status_and_resched(data, decision);
         Ok(())

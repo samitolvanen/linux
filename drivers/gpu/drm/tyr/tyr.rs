@@ -8,6 +8,7 @@
 
 use crate::driver::TyrDriver;
 
+mod devfreq;
 mod driver;
 mod file;
 mod flags;
