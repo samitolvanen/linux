@@ -41,6 +41,8 @@ pub(crate) struct Mmu {
     vms: KVec<Arc<Mutex<Vm>>>,
     /// Tracks which of the 32 AS slots are free.
     slots: SlotAllocator,
+    /// Bitmask of faulty AS slots.
+    pub(crate) faulty_mask: u32,
 }
 
 impl Mmu {
@@ -48,7 +50,17 @@ impl Mmu {
         Ok(Self {
             vms: KVec::new(),
             slots: SlotAllocator::new(),
+            faulty_mask: 0,
         })
+    }
+
+    pub(crate) fn get_vm_by_as(&self, as_index: usize) -> Option<Arc<Mutex<Vm>>> {
+        for vm in &self.vms {
+            if vm.lock().address_space == Some(as_index) {
+                return Some(vm.clone());
+            }
+        }
+        None
     }
 
     pub(crate) fn create_vm(
@@ -177,6 +189,9 @@ impl Mmu {
         if gpu_info.as_present & (1 << as_nr) == 0 {
             return Err(EBUSY);
         }
+
+        vm.unhandled_fault = false;
+
         Self::enable_as(iomem, as_nr, transtab, transcfg.into(), memattr)?;
         self.slots.alloc_slot(as_nr);
         vm.address_space = Some(as_nr);

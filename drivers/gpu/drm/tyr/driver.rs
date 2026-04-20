@@ -12,6 +12,7 @@ use kernel::device::Core;
 use kernel::device::Device;
 use kernel::devres::Devres;
 use kernel::dma::{Device as DmaDevice, DmaMask};
+use kernel::dma_fence::DmaFenceDelayedWork;
 use kernel::dma_fence::DmaFenceWork;
 use kernel::dma_fence::DmaFenceWorkqueue;
 use kernel::drm;
@@ -21,6 +22,7 @@ use kernel::irq::ThreadedHandler;
 use kernel::irq::ThreadedIrqReturn;
 use kernel::irq::ThreadedRegistration;
 use kernel::new_delayed_work;
+use kernel::new_dma_fence_delayed_work;
 use kernel::new_dma_fence_work;
 use kernel::new_mutex;
 use kernel::of;
@@ -33,6 +35,7 @@ use kernel::sizes::SZ_2M;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 use kernel::time;
+use kernel::time::Jiffies;
 use kernel::types::ARef;
 use kernel::workqueue::DelayedWork;
 use kernel::workqueue::OwnedQueue;
@@ -56,6 +59,7 @@ use crate::sched::Scheduler;
 use crate::sched::SchedulerState;
 use crate::wait::Wait;
 use crate::wait::WaitResult;
+use core::sync::atomic::AtomicU32;
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
 
@@ -64,7 +68,7 @@ pub(crate) type TyrDevice = drm::Device<TyrDriver>;
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrDriver {
-    device: ARef<TyrDevice>,
+    pub(crate) device: ARef<TyrDevice>,
 
     #[pin]
     gpu_irq: ThreadedRegistration<TyrIrq<GpuIrq>>,
@@ -121,14 +125,9 @@ pub(crate) struct TyrData {
     sched: Mutex<SchedulerState>,
 
     #[pin]
-    pub(crate) tick_work: DmaFenceWork<Self, 1>,
 
-    #[pin]
-    pub(crate) fw_events_work: DmaFenceWork<Self, 2>,
-
-    /// The work to process group status updates.
-    #[pin]
-    pub(crate) group_upd_work: DmaFenceWork<Self, 3>,
+    /// Workqueue used by our internal scheduler logic.
+    pub(crate) sched_wq: DmaFenceWorkqueue,
 
     /// Workqueue shared by all job queues in this device.
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
@@ -137,6 +136,10 @@ pub(crate) struct TyrData {
 }
 
 impl TyrData {
+    pub(crate) fn schedule_ping(self: &Arc<Self>, delay: Jiffies) {
+        let _ = self.reset_wq.enqueue_delayed::<_, 0>(self.clone(), delay);
+    }
+
     /// Execute a function with the scheduler locked.
     ///
     /// This is implemented as a closure to reduce the scope of the scheduler
@@ -333,6 +336,11 @@ impl platform::Driver for TyrDriver {
         // Ideally we'd find a way around this useless clone too...
         let i = iomem.clone();
         let reset_wq = OwnedQueue::new(c_str!("tyr-reset"), WqFlags::UNBOUND, 0)?; // TODO: add WqFlags::ORDERED once it's available.
+        let sched_wq = DmaFenceWorkqueue::new(
+            c_str!("tyr-sched"),
+            WqFlags::UNBOUND | WqFlags::MEM_RECLAIM,
+            0,
+        )?;
         let data_init = try_pin_init!(TyrData {
                 pdev: platform.clone(),
                 clks <- new_mutex!(Clocks {
@@ -353,9 +361,7 @@ impl platform::Driver for TyrDriver {
                 mmio_phys_addr,
                 ping_work <- new_delayed_work!("tyr-ping-work"),
                 sched <- new_mutex!(SchedulerState::Disabled),
-                tick_work <- new_dma_fence_work!("tyr_tick"),
-                fw_events_work <- new_dma_fence_work!("tyr-fw-events"),
-                group_upd_work <- new_dma_fence_work!("tyr-group-upd"),
+                sched_wq,
                 wq: job_wq,
                 reset_wq,
         });
@@ -541,7 +547,7 @@ pub(crate) trait TyrIrqTrait: Sync {
     fn disable_all(&self, dev: &Device<Bound>);
 
     /// Reenable the interrupts after the threaded handler has run.
-    fn reenable(&self, dev: &Device<Bound>);
+    fn reenable(&self, dev: &Device<Bound>, tdev: &TyrDevice);
 
     /// Reads the raw interrupt status register.
     fn read_raw_status(&self, dev: &Device<Bound>) -> u32;
@@ -608,7 +614,7 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
             ret = IrqReturn::Handled;
         }
 
-        self.irq.reenable(_dev);
+        self.irq.reenable(_dev, &self.tdev);
         ret
     }
 }

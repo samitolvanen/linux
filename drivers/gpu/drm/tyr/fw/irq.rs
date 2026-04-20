@@ -55,7 +55,7 @@ impl TyrIrqTrait for JobIrq {
         let _ = regs::JOB_IRQ_MASK.write(dev, &self.iomem, 0);
     }
 
-    fn reenable(&self, dev: &Device<Bound>) {
+    fn reenable(&self, dev: &Device<Bound>, _tdev: &TyrDevice) {
         let _ = regs::JOB_IRQ_MASK.write(dev, &self.iomem, self.mask());
     }
 
@@ -76,18 +76,15 @@ impl TyrIrqTrait for JobIrq {
     fn handle(&self, tdev: &TyrDevice, status: u32) {
         self.event_wait.notify_all();
 
-        let _ = tdev.fw.with_locked_global_iface(|glb| {
-            if status & regs::JOB_IRQ_GLOBAL_IF != 0 && !glb.booted {
-                glb.booted = true;
-            }
-            Ok(())
-        });
+        if status & regs::JOB_IRQ_GLOBAL_IF != 0 {
+            let _ = tdev.fw.with_locked_global_iface(|glb| {
+                if !glb.booted {
+                    glb.booted = true;
+                }
+                Ok(())
+            });
+        }
 
         self.boot_wait.notify_all();
-
-        let _ = tdev.with_locked_scheduler(|sched| {
-            sched.set_events(tdev, status);
-            Ok(())
-        });
     }
 }

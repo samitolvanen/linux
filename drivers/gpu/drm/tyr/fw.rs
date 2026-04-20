@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use global::csg::constants::CSG_STATE_MASK;
 use global::GlobalInterface;
 use kernel::bindings::SZ_1G;
 use kernel::devres::Devres;
@@ -127,6 +128,10 @@ impl RequestField {
         Self { req, ack }
     }
 
+    pub(crate) fn write_req(&self, val: u32) -> Result {
+        self.req.write::<u32>(val)
+    }
+
     /// Toggle acknowledge bits to send an event to the FW
     ///
     /// The Host -> FW event/message passing was designed to be lockless, with each side of
@@ -137,11 +142,10 @@ impl RequestField {
     /// This helper allows one to update the req register based on the current value of the
     /// ack register managed by the FW. Toggling a specific bit will flag an event. In order
     /// for events to be re-evaluated, the interface doorbell needs to be rung.
-    pub(crate) fn toggle_reqs(&self, reqs: u32) -> Result {
+    pub(crate) fn toggle_reqs(&self, mask: u32) -> Result {
         let cur_req_val = self.req.read::<u32>()?;
         let ack_val = self.ack.read::<u32>()?;
-        let new_val = ((ack_val ^ reqs) & reqs) | (cur_req_val & !reqs);
-
+        let new_val = (cur_req_val & !mask) | (!ack_val & mask);
         self.req.write::<u32>(new_val)
     }
 
@@ -150,10 +154,29 @@ impl RequestField {
     /// Not all bits work in a toggle fashion. Some bits are used to configure the FW
     /// and need to be set to 0 or 1. This function bypasses the toggle logic and
     /// directly sets the bits in the req register.
-    pub(crate) fn update_reqs(&self, val: u32, reqs: u32) -> Result {
+    pub(crate) fn update_reqs(&self, val: u32, mask: u32) -> Result {
         let cur_req_val = self.req.read::<u32>()?;
-        let new_val = (cur_req_val & !reqs) | (val & reqs);
+        let new_val = (cur_req_val & !mask) | (val & mask);
+        self.req.write::<u32>(new_val)
+    }
 
+    /// Update bits and toggle bits simultaneously to avoid multiple FW writes.
+    pub(crate) fn update_and_toggle_reqs(
+        &self,
+        val: u32,
+        update_mask: u32,
+        toggle_mask: u32,
+    ) -> Result {
+        let cur_req_val = self.req.read::<u32>()?;
+        let ack_val = self.ack.read::<u32>()?;
+
+        let mut new_val = cur_req_val;
+        if update_mask != 0 {
+            new_val = (new_val & !update_mask) | (val & update_mask);
+        }
+        if toggle_mask != 0 {
+            new_val = (new_val & !toggle_mask) | (!ack_val & toggle_mask);
+        }
         self.req.write::<u32>(new_val)
     }
 
@@ -312,6 +335,23 @@ impl Firmware {
         let mut global_iface = self.global_iface.lock();
         f(&mut global_iface)
     }
+
+    pub(crate) fn wait_csg_acks(&self, csg_idx: usize, mask: u32, timeout_ms: u32) -> Result<u32> {
+        let req = self.with_locked_global_iface(|glb| {
+            let csg = glb.csg(csg_idx).ok_or(EINVAL)?;
+            csg.input_request()
+        })?;
+        let mut acked = req.wait_acks(mask, &self.event_wait, timeout_ms)?;
+
+        // Check that all bits in the state field were updated, if any mismatch
+        // then clear all bits in the state field. This allows code to do
+        // (acked & CSG_STATE_MASK) and get the right value.
+        if (acked & CSG_STATE_MASK) != CSG_STATE_MASK {
+            acked &= !CSG_STATE_MASK;
+        }
+
+        Ok(acked)
+    }
 }
 
 macro_rules! impl_shared_section_read {
@@ -406,7 +446,6 @@ pub(crate) trait SharedSectionEntry {
         Err(ENOTSUPP)
     }
 
-    #[expect(dead_code)]
     fn interrupt_ack(&self) -> Result<RequestField> {
         pr_err!("Interrupt ack not supported for this interface");
         Err(ENOTSUPP)

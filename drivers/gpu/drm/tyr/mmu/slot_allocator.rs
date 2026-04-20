@@ -4,10 +4,10 @@
 //! implements an allocator to track which slots are active, and later to evict
 //! the least recently used one if needed.
 
-use kernel::{bits::bit_u32, prelude::*};
+use kernel::prelude::*;
 
 fn as_nr_mask(as_nr: usize) -> u32 {
-    bit_u32(as_nr as u32)
+    1u32 << as_nr
 }
 
 /// Alocates HW AS slots, which represent a physical slot where a VM can be

@@ -73,11 +73,12 @@ pub(crate) mod constants {
     pub(crate) const CSG_EP_REQ_EXCL_COMPUTE: u32 = bit_u32(20);
     pub(crate) const CSG_EP_REQ_EXCL_FRAGMENT: u32 = bit_u32(21);
 
-    pub(crate) const fn csg_ep_req_priority(x: u32) -> u32 {
-        (x << 28) & genmask_u32(28..=31)
-    }
-
+    pub(crate) const CSG_EP_REQ_PRIORITY_SHIFT: u32 = 28;
     pub(crate) const CSG_EP_REQ_PRIORITY_MASK: u32 = genmask_u32(28..=31);
+
+    pub(crate) const fn csg_ep_req_priority(x: u32) -> u32 {
+        (x << CSG_EP_REQ_PRIORITY_SHIFT) & CSG_EP_REQ_PRIORITY_MASK
+    }
 }
 
 pub(crate) struct CommandStreamGroup {
@@ -88,7 +89,6 @@ pub(crate) struct CommandStreamGroup {
     output_area: SharedSectionRange,
 
     streams: KVec<CommandStream>,
-    state: GroupState,
 }
 
 impl CommandStreamGroup {
@@ -140,20 +140,7 @@ impl CommandStreamGroup {
             input_area,
             output_area,
             streams,
-            state: GroupState::Terminate,
         })
-    }
-
-    pub(super) fn set_group_state(&mut self, state: GroupState) -> Result<()> {
-        let req = self.input_request()?;
-        req.update_reqs(state as u32, CSG_STATE_MASK)?;
-
-        if let GroupState::Start = state {
-            req.toggle_reqs(constants::CSG_ENDPOINT_CONFIG)?;
-        }
-
-        self.state = state;
-        Ok(())
     }
 
     pub(super) fn is_identical(&self, other: &CommandStreamGroup) -> Result<bool> {
@@ -304,7 +291,6 @@ pub(crate) struct Output {
 }
 
 impl Output {
-    #[expect(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         self.status_state & bit_u32(0) != 0
     }

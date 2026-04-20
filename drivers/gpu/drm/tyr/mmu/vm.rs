@@ -130,6 +130,9 @@ pub(crate) struct Vm {
     /// anymore.
     pub(super) destroyed: bool,
 
+    /// Whether this VM has unhandled faults.
+    pub(crate) unhandled_fault: bool,
+
     /// Whether this VM is in an unusable state due to failed async operations.
     ///
     /// Unusable VMs cannot accept new operations and should be destroyed.
@@ -212,6 +215,7 @@ impl Vm {
             _layout: layout,
             for_mcu,
             destroyed: false,
+            unhandled_fault: false,
             unusable: false,
             iomem,
             job_queue,

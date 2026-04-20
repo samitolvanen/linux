@@ -106,7 +106,15 @@ macro_rules! impl_sync_rw {
             /// Merely taking a reference to it would be UB, as the GPU can change the
             /// underlying memory at any time, as it is a core running on its own.
             pub(super) fn write(mem: &mut gem::ObjectRef, offset: usize, value: Self) -> Result {
-                if offset > mem.size() {
+                if offset
+                    .checked_add(core::mem::size_of::<Self>())
+                    .ok_or(EINVAL)?
+                    > mem.size()
+                {
+                    return Err(EINVAL);
+                }
+
+                if offset % core::mem::align_of::<Self>() != 0 {
                     return Err(EINVAL);
                 }
 

@@ -145,6 +145,9 @@ pub(crate) mod constants {
         | CS_IDLE_RESOURCE_REQ;
 
     pub(crate) const CS_EVT_MASK: u32 = CS_TILER_OOM | CS_PROTM_PENDING | CS_FATAL | CS_FAULT;
+
+    pub(crate) const CS_INHERIT_FAULT: u32 = 0x4b;
+    pub(crate) const CS_UNRECOVERABLE: u32 = 0x41;
 }
 
 pub(crate) struct CommandStream {
@@ -197,8 +200,15 @@ impl CommandStream {
     }
 
     pub(crate) fn set_state(&mut self, state: StreamState) -> Result {
-        self.input_request()?
-            .update_reqs(state as u32, CS_STATE_MASK)?;
+        let mut req_val = state as u32;
+        let mut req_mask = CS_STATE_MASK;
+
+        if state == StreamState::Start {
+            req_val |= CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_EXTRACT_EVENT;
+            req_mask |= CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_EXTRACT_EVENT;
+        }
+
+        self.input_request()?.update_reqs(req_val, req_mask)?;
 
         self.state = state;
         Ok(())
@@ -346,7 +356,8 @@ impl Input {
             return Err(EINVAL);
         }
 
-        self.config |= u32::from(priority) & genmask_u32(0..=3);
+        self.config =
+            (self.config & !genmask_u32(0..=3)) | (u32::from(priority) & genmask_u32(0..=3));
         Ok(())
     }
 
@@ -356,7 +367,8 @@ impl Input {
             return Err(EINVAL);
         }
 
-        self.config |= (doorbell_id << 8) & genmask_u32(8..=15);
+        self.config =
+            (self.config & !genmask_u32(8..=15)) | ((doorbell_id << 8) & genmask_u32(8..=15));
         Ok(())
     }
 }
@@ -386,7 +398,6 @@ pub(crate) struct Output {
     pub(crate) heap_address: u64,
 }
 
-#[expect(dead_code)]
 impl Output {
     pub(crate) fn cs_fault_exception_type(&self) -> u32 {
         self.fault & genmask_u32(0..=7)
@@ -402,28 +413,6 @@ impl Output {
 
     pub(crate) fn cs_fatal_exception_data(&self) -> u32 {
         self.fatal >> 8 & genmask_u32(0..=23)
-    }
-
-    pub(crate) fn status_wait(&self) -> Result<StatusWait> {
-        let status = self.status_wait;
-
-        let sb_mask = status & genmask_u32(0..=15);
-        let sb_source = (status & genmask_u32(16..=19)) >> 16;
-        let gt = (status & bit_u32(24)) != 0;
-        let progress_wait = (status & bit_u32(28)) != 0;
-        let protm_pend = (status & bit_u32(29)) != 0;
-        let sync64 = (status & bit_u32(30)) != 0;
-        let sync_wait = (status & bit_u32(31)) != 0;
-
-        Ok(StatusWait {
-            sb_mask,
-            sb_source,
-            gt,
-            progress_wait,
-            protm_pend,
-            sync64,
-            sync_wait,
-        })
     }
 
     pub(crate) fn blocked_reason(&self) -> Result<BlockedReason> {
@@ -454,31 +443,7 @@ pub(crate) enum StreamState {
     Start,
 }
 
-#[expect(dead_code)]
-pub(crate) struct StatusWait {
-    /// Mask denoting which scoreboard entries are being waited on by this
-    /// command stream.
-    sb_mask: u32,
-
-    /// Source of the scoreboard wait status, if any.
-    sb_source: u32,
-
-    /// Whether the condition is a greater-than comparison.
-    gt: bool,
-
-    /// Whether the command stream is waiting for a PROGRESS_WAIT instruction.
-    progress_wait: bool,
-
-    /// Whether the command stream is waiting for protected mode execution.
-    protm_pend: bool,
-
-    /// Whether the sync object is 32 or 64 bits wide.
-    sync64: bool,
-
-    /// Whether the command stream is waiting for a SYNC_WAIT instruction.
-    sync_wait: bool,
-}
-
+#[derive(Clone, Copy)]
 pub(crate) enum BlockedReason {
     /// The command stream is not blocked.
     Unblocked = 0,

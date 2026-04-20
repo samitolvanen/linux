@@ -2,7 +2,8 @@
 
 //! Fault reporting.
 
-use crate::driver::IoMem;
+use crate::driver::{IoMem, TyrDevice};
+use crate::mmu::Mmu;
 use crate::regs::*;
 use kernel::c_str;
 use kernel::devres::Devres;
@@ -81,7 +82,7 @@ pub(crate) fn access_type_name(fault_status: u32) -> &'static str {
 }
 
 /// Decodes a MMU fault, printing a message to the kernel log.
-pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
+pub(super) fn decode_faults(tdev: &TyrDevice, mut status: u32, iomem: &Devres<IoMem>) -> Result {
     while status != 0 {
         let as_index = (status | (status >> 16)).trailing_zeros();
         let mask = kernel::bits::bit_u32(as_index);
@@ -117,6 +118,18 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
             access_type_name(fault_status),
             source_id
         );
+
+        let _ = tdev.with_locked_mmu(|mmu| {
+            mmu.faulty_mask |= mask;
+
+            let _ = Mmu::disable_as(iomem, as_index as usize);
+
+            if let Some(vm) = mmu.get_vm_by_as(as_index as usize) {
+                vm.lock().unhandled_fault = true;
+            }
+
+            Ok(())
+        });
 
         // Update status to process the next fault
         status &= !mask;

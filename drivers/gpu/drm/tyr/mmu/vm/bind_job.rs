@@ -89,6 +89,11 @@ impl QueueOps for VmBindJobHandler {
         let mut vm = job.job.vm.lock();
         let iomem = vm.iomem.clone();
 
+        if vm.destroyed || vm.unusable {
+            fence.signal(Err(EINVAL));
+            return Ok(SubmitResult::Submitted);
+        }
+
         let result = match &job.job.operation {
             VmOperation::Map {
                 va_range,

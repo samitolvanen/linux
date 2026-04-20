@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
+#![recursion_limit = "256"]
 
 //! Arm Mali Tyr DRM driver.
 //!

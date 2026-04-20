@@ -49,7 +49,7 @@ impl TyrIrqTrait for GpuIrq {
         let _ = regs::GPU_IRQ_MASK.write(dev, &self.iomem, 0);
     }
 
-    fn reenable(&self, dev: &Device<Bound>) {
+    fn reenable(&self, dev: &Device<Bound>, _tdev: &TyrDevice) {
         let _ = regs::GPU_IRQ_MASK.write(dev, &self.iomem, self.mask());
     }
 

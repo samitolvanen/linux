@@ -50,8 +50,9 @@ impl TyrIrqTrait for MmuIrq {
         let _ = regs::MMU_IRQ_MASK.write(dev, &self.iomem, 0);
     }
 
-    fn reenable(&self, dev: &Device<Bound>) {
-        let _ = regs::MMU_IRQ_MASK.write(dev, &self.iomem, self.mask());
+    fn reenable(&self, dev: &Device<Bound>, tdev: &TyrDevice) {
+        let faulty_mask = tdev.with_locked_mmu(|mmu| Ok(mmu.faulty_mask)).unwrap_or(0);
+        let _ = regs::MMU_IRQ_MASK.write(dev, &self.iomem, self.mask() & !faulty_mask);
     }
 
     fn read_raw_status(&self, dev: &Device<Bound>) -> u32 {
@@ -68,8 +69,10 @@ impl TyrIrqTrait for MmuIrq {
         u32::MAX // for now.
     }
 
-    fn handle(&self, _: &TyrDevice, status: u32) {
+    fn handle(&self, tdev: &TyrDevice, status: u32) {
         let status = status & kernel::bits::genmask_u32(0..=15);
-        let _ = decode_faults(status, &self.iomem);
+        let _ = decode_faults(tdev, status, &self.iomem);
+
+        if status != 0 {}
     }
 }

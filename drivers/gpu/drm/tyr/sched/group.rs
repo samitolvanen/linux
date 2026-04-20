@@ -1,42 +1,74 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel::bits::genmask_checked_u32;
-use kernel::dma_fence::PublicDmaFence;
+use kernel::dma_fence::DmaFenceSignallingAnnotation;
+use kernel::dma_fence::DmaFenceWork;
+use kernel::dma_fence::DmaFenceWorkItem;
 use kernel::drm::gem::BaseObject;
+use kernel::impl_has_dma_fence_work;
 use kernel::kvec;
+use kernel::list::{
+    impl_list_arc_safe, impl_list_item, AtomicTracker, ListArc, ListLinks, TryNewListArc,
+};
+use kernel::new_dma_fence_work;
 use kernel::new_mutex;
 use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
-use kernel::types::ARef;
 use kernel::xarray;
 use kernel::xarray::XArray;
 
 use crate::driver::TyrDevice;
 use crate::file::DrmFile;
+use crate::file::QueueCreate;
 use crate::file::QueueSubmit;
-use crate::file::SyncOp;
 use crate::fw::global::csg;
 use crate::fw::global::csg::Priority;
 use crate::fw::SharedSectionEntry;
 use crate::gem;
 use crate::mmu::vm::map_flags;
 use crate::mmu::vm::Vm;
-use crate::sched::deps;
-use crate::sched::syncs::SyncObj64b;
 
 use super::job;
 use super::queue::Queue;
-use super::syncs;
-use super::Scheduler;
+
+#[repr(C)]
+pub(crate) struct QueueSyncObj {
+    pub(crate) seqno: u64,
+    pub(crate) status: u32,
+    pub(crate) pad: u32,
+}
+
+impl QueueSyncObj {
+    pub(super) fn read(mem: &mut crate::gem::ObjectRef, offset: usize) -> Result<Self> {
+        if offset > mem.size() {
+            return Err(EINVAL);
+        }
+        let vmap = mem.vmap()?;
+        let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
+        Ok(unsafe { core::ptr::read_volatile(ptr) })
+    }
+
+    pub(super) fn write(mem: &mut crate::gem::ObjectRef, offset: usize, val: Self) -> Result<()> {
+        if offset > mem.size() {
+            return Err(EINVAL);
+        }
+        let vmap = mem.vmap()?;
+        let ptr = unsafe { vmap.get().as_mut_ptr().add(offset).cast::<Self>() };
+        unsafe { core::ptr::write_volatile(ptr, val) };
+        Ok(())
+    }
+}
 
 /// The part of the state protected under the group lock.
 #[pin_data]
 pub(crate) struct GroupInner {
     /// The group state.
     pub(crate) state: State,
+
+    pub(crate) list_state: GroupListState,
 
     /// The group's queues.
     pub(crate) queues: KVec<Queue>,
@@ -45,26 +77,45 @@ pub(crate) struct GroupInner {
     pub(crate) csg_id: Option<usize>,
 
     /// Bitmask reflecting the blocked queues.
-    pub(crate) blocked_queues: u32,
+    blocked_queues: u32,
 
     /// Bitmask reflecting the idle queues.
-    pub(crate) idle_queues: u32,
+    idle_queues: u32,
 
     /// Bitmask reflecting the fatal queues.
-    pub(crate) fatal_queues: u32,
+    fatal_queues: u32,
 
-    /// True when the group has been destroyed.
-    ///
-    /// If a group is destroyed it becomes useless: no further jobs can be
-    /// submitted to its queues. We simply wait for all references to be
-    /// dropped.
-    pub(crate) destroyed: bool,
+    /// Whether the group is idle.
+    pub(crate) idle: bool,
+
+    /// The error that caused this group to terminate, if any.
+    pub(crate) fatal_error: Option<kernel::error::Error>,
 
     /// The buffer with all the KMD synchronization objects for the group.
     ///
     /// There is one syncobj per queue.
     pub(super) syncobjs: gem::ObjectRef,
 }
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum GroupListState {
+    None,
+    Idle,
+    Runnable,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct GroupStatus {
+    pub(crate) can_run: bool,
+    pub(crate) is_idle: bool,
+    pub(crate) csg_id: Option<usize>,
+}
+
+// SAFETY: Group instances can be safely sent and shared across threads. The
+// inner state is protected by a Mutex, and all fields are thread-safe or
+// safely shared through Arc.
+unsafe impl Send for Group {}
+unsafe impl Sync for Group {}
 
 /// A scheduling group object, usually backing an execution context, e.g.: a
 /// VkQueue or similar.
@@ -119,14 +170,68 @@ pub(crate) struct Group {
 
     /// The group's priority.
     pub(super) priority: Priority,
+
+    pub(crate) tdev: Arc<crate::driver::TyrData>,
+
+    #[pin]
+    pub(crate) links: ListLinks,
+
+    #[pin]
+    pub(crate) tracker: AtomicTracker<0>,
+
+    #[pin]
+    pub(crate) wait_links: ListLinks<1>,
+
+    #[pin]
+    pub(crate) wait_tracker: AtomicTracker<1>,
+
+    /// Work to update group sync status.
+    #[pin]
+    pub(crate) sync_upd_work: DmaFenceWork<Self, 0>,
+
+    /// Work to finish the group termination procedure asynchronously.
+    #[pin]
+    pub(crate) term_work: DmaFenceWork<Self, 1>,
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<0> for Group {
+        tracked_by tracker: AtomicTracker<0>;
+    }
+}
+
+impl_list_item! {
+    impl ListItem<0> for Group {
+        using ListLinks { self.links };
+    }
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<1> for Group {
+        tracked_by wait_tracker: AtomicTracker<1>;
+    }
+}
+
+impl_list_item! {
+    impl ListItem<1> for Group {
+        using ListLinks { self.wait_links };
+    }
 }
 
 impl Group {
+    pub(crate) fn schedule_sync_upd(self: &Arc<Self>) {
+        let _ = self.tdev.wq.enqueue::<_, 0>(self.clone());
+    }
+
+    pub(crate) fn schedule_term(self: &Arc<Self>) {
+        let _ = self.tdev.wq.enqueue::<_, 1>(self.clone());
+    }
+
     pub(super) fn create(
         tdev: &TyrDevice,
         file: &DrmFile,
         group_args: &kernel::uapi::drm_panthor_group_create,
-        queue_args: KVec<crate::file::QueueCreate>,
+        queue_args: KVec<QueueCreate>,
     ) -> Result<Arc<Self>> {
         let gpu_info = &tdev.gpu_info;
         let fw = &tdev.fw;
@@ -174,7 +279,7 @@ impl Group {
         let suspend_buf = fw.alloc_suspend_buf(tdev, suspend_buf_size as usize)?;
         let protm_suspend_buf = fw.alloc_suspend_buf(tdev, protm_suspend_buf_size as usize)?;
 
-        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<SyncObj64b>();
+        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<QueueSyncObj>();
         let mut syncobjs = {
             let mut vm_guard = vm.lock();
             gem::new_kernel_object(
@@ -193,7 +298,7 @@ impl Group {
 
         let mut queues = kvec![];
         for i in 0..group_args.queues.count {
-            let queue = Queue::new(tdev, &queue_args[i as usize], vm.clone(), tdev.wq.clone())?;
+            let queue = Queue::new(tdev, &queue_args[i as usize], vm.clone())?;
             queues.push(queue, GFP_KERNEL)?;
         }
 
@@ -204,12 +309,14 @@ impl Group {
             pin_init!(Group {
                 inner <- new_mutex!(GroupInner {
                     state: State::Created,
+                    list_state: GroupListState::Idle,
                     queues,
                     csg_id: None,
                     blocked_queues: 0,
                     idle_queues,
-                    fatal_queues:0,
-                    destroyed: false,
+                    fatal_queues: 0,
+                    idle: false,
+                    fatal_error: None,
                     syncobjs,
                 }),
                 vm,
@@ -222,23 +329,219 @@ impl Group {
                 suspend_buf,
                 protm_suspend_buf,
                 priority,
+                tdev: (*tdev).clone(),
+                links <- ListLinks::new(),
+                tracker <- AtomicTracker::new(),
+                wait_links <- ListLinks::new(),
+                wait_tracker <- AtomicTracker::new(),
+                sync_upd_work <- new_dma_fence_work!("tyr-group-sync"),
+                term_work <- new_dma_fence_work!("tyr-group-term"),
             }),
             GFP_KERNEL,
         )
     }
+}
 
-    #[expect(dead_code)]
-    pub(super) fn idle(&self, sched: &Scheduler) -> bool {
-        let inner = self.inner.lock();
-        if let Some(csg_id) = inner.csg_id {
-            match &sched.csg_slots[csg_id] {
-                Some(csg) => csg.idle,
-                None => true,
-            }
+impl GroupInner {
+    /// Returns the bitmask of currently blocked queues.
+    pub(crate) fn blocked_queues(&self) -> u32 {
+        self.blocked_queues
+    }
+
+    /// Returns true if there are any blocked queues in the group.
+    pub(crate) fn has_blocked_queues(&self) -> bool {
+        self.blocked_queues != 0
+    }
+
+    /// Returns true if the specific queue is blocked.
+    pub(crate) fn is_queue_blocked(&self, queue_idx: usize) -> bool {
+        (self.blocked_queues & (1 << queue_idx)) != 0
+    }
+
+    /// Returns true if there are any fatal queues in the group.
+    pub(crate) fn has_fatal_queues(&self) -> bool {
+        self.fatal_queues != 0
+    }
+
+    /// Returns the bitmask of currently fatal queues.
+    pub(crate) fn fatal_queues(&self) -> u32 {
+        self.fatal_queues
+    }
+
+    pub(crate) fn can_run(&self) -> bool {
+        self.state != State::Terminated
+            && self.state != State::Unknown
+            && self.fatal_error.is_none()
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        if self.csg_id.is_some() {
+            self.idle
         } else {
-            let inactive_queues = inner.blocked_queues | inner.idle_queues;
-            inactive_queues.count_ones() == inner.queues.len() as u32
+            let inactive_queues = self.blocked_queues | self.idle_queues;
+            inactive_queues.count_ones() == self.queues.len() as u32
         }
+    }
+
+    /// Evaluates the current state of a queue and applies the correct
+    /// park and timeout suspend states to the underlying `JobQueue`.
+    pub(crate) fn sync_queue_state(&mut self, queue_idx: usize) {
+        let is_blocked = (self.blocked_queues & (1 << queue_idx)) != 0;
+
+        // A queue should have its timeout suspended if the group is
+        // unbound/evicted and not blocked on a syncobj.
+        // A queue should be parked if it has encountered a terminal error.
+        let should_park = match self.state {
+            State::Terminated | State::Unknown => true,
+            _ => false,
+        };
+
+        let should_suspend = if self.csg_id.is_some() {
+            should_park
+        } else {
+            match self.state {
+                State::Suspended => !is_blocked,
+                _ => true,
+            }
+        };
+
+        let queue = &mut self.queues[queue_idx];
+        let currently_suspended = queue
+            .timeout_suspended
+            .load(core::sync::atomic::Ordering::Relaxed);
+
+        if should_suspend != currently_suspended {
+            if should_suspend {
+                queue.suspend_timeout();
+            } else {
+                queue.resume_timeout();
+            }
+        }
+
+        // We track park state to avoid redundant calls to JobQueue::park()
+        // and avoid spamming the trace log.
+        if should_park != queue.parked {
+            queue.parked = should_park;
+            if should_park {
+                queue.job_queue.park();
+            } else {
+                queue.job_queue.unpark();
+            }
+        }
+    }
+
+    /// Helper to update the blocked state of a queue.
+    pub(crate) fn set_queue_blocked(&mut self, queue_idx: usize, blocked: bool) {
+        let mask = 1 << queue_idx;
+
+        if blocked {
+            self.blocked_queues |= mask;
+        } else {
+            self.blocked_queues &= !mask;
+        }
+    }
+
+    /// Helper to update the idle state of a queue.
+    pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
+        let mask = 1 << queue_idx;
+        let was_idle = (self.idle_queues & mask) != 0;
+
+        if idle {
+            self.idle_queues |= mask;
+        } else {
+            self.idle_queues &= !mask;
+        }
+
+        was_idle
+    }
+
+    /// Helper to update the fatal state of a queue.
+    pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
+        if (self.fatal_queues & (1 << queue_idx)) == 0 {
+            self.fatal_queues |= 1 << queue_idx;
+            self.fatal_error = Some(kernel::error::code::EFAULT);
+        }
+    }
+}
+
+impl Group {
+    /// Return the group's current status, evaluating whether it can be run and if it's idle.
+    pub(crate) fn status(&self) -> GroupStatus {
+        let inner = self.inner.lock();
+
+        GroupStatus {
+            can_run: inner.can_run(),
+            is_idle: inner.is_idle(),
+            csg_id: inner.csg_id,
+        }
+    }
+
+    /// Return true if the group can be run.
+    pub(crate) fn can_run(&self) -> bool {
+        self.inner.lock().can_run()
+    }
+
+    /// Return true if the group is idle.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.inner.lock().is_idle()
+    }
+
+    /// Return the group's current state.
+    pub(crate) fn state(&self) -> State {
+        self.inner.lock().state
+    }
+
+    pub(crate) fn set_state(&self, new_state: State) {
+        let _ = self.with_locked_inner(|inner| {
+            inner.state = new_state;
+            Ok(())
+        });
+    }
+
+    /// Cancel all queues in the group, signaling pending fences with the provided error.
+    ///
+    /// This also updates the hardware sync objects to indicate failure, ensuring that
+    /// userspace or other software waiters polling the sync object memory are unblocked.
+    pub(crate) fn cancel_queues(self: &Arc<Self>, err: Error) {
+        let num_queues = self
+            .with_locked_inner(|inner| Ok(inner.queues.len()))
+            .unwrap_or(0);
+        for i in 0..num_queues {
+            if let Ok(job_queue) =
+                self.with_locked_inner(|inner| Ok(inner.queues[i].job_queue.clone()))
+            {
+                job_queue.cancel_all();
+                let fences_to_signal = self
+                    .with_locked_inner(|inner| {
+                        let queue = &mut inner.queues[i];
+                        let seqno = queue.next_seqno.load(Ordering::Relaxed);
+                        let sync_offset = i * core::mem::size_of::<QueueSyncObj>();
+
+                        let sync_obj = QueueSyncObj {
+                            seqno,
+                            status: !0,
+                            pad: 0,
+                        };
+                        let _ = QueueSyncObj::write(&mut inner.syncobjs, sync_offset, sync_obj);
+
+                        Ok(queue.take_all_fences())
+                    })
+                    .unwrap_or_else(|_| KVec::new());
+
+                let _ann = DmaFenceSignallingAnnotation::new();
+                for pending in fences_to_signal {
+                    if let Some(fence) = pending.fence {
+                        fence.signal(Err(err));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Group {
+    pub(crate) fn eval_syncwait(&self, _queue_idx: usize) -> Result<bool> {
+        Ok(false)
     }
 
     /// Provide access to the part of the group we may want to mutate.
@@ -252,44 +555,23 @@ impl Group {
         f(&mut inner)
     }
 
-    pub(super) fn submit(
+    pub(crate) fn submit(
         self: Arc<Self>,
-        syncs: KVec<SyncOp>,
         queue_submits: KVec<QueueSubmit>,
-        file: &DrmFile,
-    ) -> Result<KVec<ARef<PublicDmaFence>>> {
-        let as_nr = self.vm.lock().address_space();
-        if as_nr.is_none() {
-            let csg_id = self.with_locked_inner(|inner| Ok(inner.csg_id));
-            pr_err!(
-                "group_submit: invalid address space (AS={:?}, csg_id={:?})\n",
-                as_nr,
-                csg_id
-            );
+        _file: &DrmFile,
+    ) -> Result<()> {
+        if !self.can_run() {
+            pr_err!("group_submit: invalid group: group is terminated");
             return Err(EINVAL);
         }
-
-        let destroyed = self.with_locked_inner(|inner| Ok(inner.destroyed))?;
-
-        if destroyed {
-            pr_err!("group_submit: invalid group: group is destroyed");
-            return Err(EINVAL);
-        }
-
-        // Convert UAPI sync operations to internal representation
-        let internal_syncs = deps::SyncOp::from_uapi_slice(&syncs)?;
-
-        let mut ctx = deps::Context::new(file);
-
-        let mut fences = KVec::with_capacity(queue_submits.len(), GFP_KERNEL)?;
 
         let vm = self.vm.lock();
 
         // Prepare the VM with enough slots for all submissions
-        vm.with_prepared_vm(queue_submits.len() as u32, |mut locked_vm| {
-            // Create all jobs and add them to the context
-            self.with_locked_inner(|inner| {
-                for queue_submit in queue_submits.iter() {
+        vm.with_prepared_vm(queue_submits.len() as u32, |mut _locked_vm| {
+            let mut jobs = kvec![];
+            for queue_submit in queue_submits.iter() {
+                let sync_addr = self.with_locked_inner(|inner| {
                     // Validate the queue index up-front; submit_to_hw() will
                     // also check this but bailing early gives a cleaner error.
                     if inner
@@ -301,54 +583,37 @@ impl Group {
                     }
 
                     let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
-                    let sync_addr = sync_addr.start
+                    Ok(sync_addr.start
                         + u64::from(queue_submit.queue_index)
-                            * core::mem::size_of::<syncs::SyncObj64b>() as u64;
-
-                    let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
-
-                    ctx.add_job(job, internal_syncs.clone())?;
-                }
-                Ok(())
-            })?;
-
-            ctx.collect_signal_ops(&internal_syncs)?;
-
-            // Collect unique queue indices from all queue submits
-            let mut queue_indices = kvec![];
-            for queue_submit in queue_submits.iter() {
-                let idx = queue_submit.queue_index as usize;
-                if !queue_indices.iter().any(|&qi| qi == idx) {
-                    queue_indices.push(idx, GFP_KERNEL)?;
-                }
-            }
-
-            // Process jobs for each queue
-            for &queue_idx in queue_indices.iter() {
-                let finished_fences = self.with_locked_inner(|inner| {
-                    let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                    ctx.add_deps_and_push_jobs(&queue.job_queue, queue_idx)
+                            * core::mem::size_of::<QueueSyncObj>() as u64)
                 })?;
 
-                // Add the finished fences to the reservation objects and
-                // collect them to return to the caller (for syncobj signalling).
-                for fence in &finished_fences {
-                    locked_vm.resv_add_fence(
-                        &**fence,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    );
-                    fences.push(fence.clone(), GFP_KERNEL)?;
-                }
+                let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
+                jobs.push((job, queue_submit.queue_index as usize), GFP_KERNEL)?;
+            }
+
+            let mut prepared_jobs = kvec![];
+            for (job, queue_idx) in jobs.into_iter() {
+                let job_queue = self.with_locked_inner(|inner| {
+                    Ok(inner
+                        .queues
+                        .get_mut(queue_idx)
+                        .ok_or(EINVAL)?
+                        .job_queue
+                        .clone())
+                })?;
+                let prepared_job = job_queue.prepare(job, 0, crate::sched::job::TyrJobFenceData)?;
+                prepared_jobs.push((prepared_job, job_queue), GFP_KERNEL)?;
+            }
+
+            for (prepared_job, job_queue) in prepared_jobs {
+                job_queue.commit(prepared_job, &[])?;
             }
 
             Ok(())
         })?;
 
-        // Push all signal fences to their syncobjs
-        ctx.push_fences();
-
-        Ok(fences)
+        Ok(())
     }
 }
 
@@ -405,19 +670,17 @@ impl Pool {
         tdev: &TyrDevice,
         groupcreate: &mut kernel::uapi::drm_panthor_group_create,
         file: &DrmFile,
-        queue_args: KVec<crate::file::QueueCreate>,
+        queue_args: KVec<QueueCreate>,
     ) -> Result<usize> {
         let group = Group::create(tdev, file, groupcreate, queue_args)?;
 
         tdev.with_locked_scheduler(|sched| {
-            sched.idle_groups[group.priority as usize]
-                .push(group.clone(), GFP_KERNEL)
-                .map_err(|_| ENOMEM)
+            let list_arc = ListArc::try_from_arc(group.clone()).map_err(|_| EINVAL)?;
+            sched.requeue_group(list_arc);
+            Ok(())
         })?;
 
-        let index = self
-            .free_index
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let index = self.free_index.fetch_add(1, Ordering::Relaxed);
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
@@ -438,21 +701,17 @@ impl Pool {
 
         let group = xa.lock().remove(index).ok_or(EINVAL)?;
 
-        tdev.with_locked_scheduler(|sched| {
-            let csg_id = group.with_locked_inner(|inner| Ok(inner.csg_id))?;
-
-            if let Some(csg_id) = csg_id {
-                pr_info!("Unbinding group from CSG slot {}\n", csg_id);
-                sched.set_csg_state(tdev, csg_id, csg::GroupState::Terminate)?;
-                sched.unbind_group(tdev, csg_id)?;
-            }
-            Ok(())
+        let is_bound = group.with_locked_inner(|inner| {
+            inner.fatal_error = Some(ECANCELED);
+            Ok(inner.csg_id.is_some())
         })?;
 
-        group.with_locked_inner(|inner| {
-            inner.destroyed = true;
-            Ok(())
-        })
+        if is_bound {
+        } else {
+            group.schedule_term();
+        }
+
+        Ok(())
     }
 
     /// Destroy all groups in the pool.
@@ -460,7 +719,7 @@ impl Pool {
     /// This is called when the file is being closed to ensure all groups
     /// are properly cleaned up (unbound if necessary) before being dropped.
     pub(crate) fn destroy_all(self: Pin<&Self>, tdev: &TyrDevice) -> Result {
-        let max_index = self.free_index.load(core::sync::atomic::Ordering::Relaxed);
+        let max_index = self.free_index.load(Ordering::Relaxed);
 
         // Try to destroy all possible groups from 0 to free_index as there's no
         // iterator implementation in xarray.rs.
@@ -469,5 +728,62 @@ impl Pool {
         }
 
         Ok(())
+    }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<Self, 0> for Group {
+        self.sync_upd_work
+    }
+}
+
+impl DmaFenceWorkItem<0> for Group {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Self::Pointer) {
+        let num_queues = this
+            .with_locked_inner(|inner| Ok(inner.queues.len()))
+            .unwrap_or(0);
+
+        for queue_idx in 0..num_queues {
+            loop {
+                let fence_to_signal = this
+                    .with_locked_inner(|inner| {
+                        let sync_offset = queue_idx * core::mem::size_of::<QueueSyncObj>();
+                        let sync_obj = QueueSyncObj::read(&mut inner.syncobjs, sync_offset)?;
+                        let queue = &mut inner.queues[queue_idx];
+
+                        Ok(queue.pop_pending_fence_up_to(sync_obj.seqno))
+                    })
+                    .unwrap_or(None);
+
+                match fence_to_signal {
+                    Some(fence) => {
+                        fence.signal(Ok(()));
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<Self, 1> for Group {
+        self.term_work
+    }
+}
+
+impl DmaFenceWorkItem<1> for Group {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Self::Pointer) {
+        let err = this
+            .with_locked_inner(|inner| Ok(inner.fatal_error))
+            .unwrap_or(Some(kernel::error::code::ECANCELED));
+
+        if let Some(e) = err {
+            this.cancel_queues(e);
+        }
     }
 }

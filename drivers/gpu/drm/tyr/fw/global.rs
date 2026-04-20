@@ -2,8 +2,6 @@
 
 //! Code to control the global interface of the CSF firmware.
 
-use core::ops::Deref;
-
 use cs::CommandStream;
 use csg::CommandStreamGroup;
 use kernel::bits::genmask_u32;
@@ -15,6 +13,7 @@ use kernel::prelude::*;
 use kernel::sync::Arc;
 use kernel::sync::Mutex;
 use kernel::time;
+use kernel::time::msecs_to_jiffies;
 #[allow(unused)]
 use kernel::workqueue;
 use kernel::workqueue::WorkItem;
@@ -65,11 +64,11 @@ pub(crate) mod constants {
     pub(super) const GLB_PROTM_EXIT: u32 = bit_u32(23);
     pub(super) const GLB_PERFCNT_THRESHOLD: u32 = bit_u32(24);
     pub(super) const GLB_PERFCNT_OVERFLOW: u32 = bit_u32(25);
-    pub(super) const GLB_IDLE: u32 = bit_u32(26);
+    pub(crate) const GLB_IDLE: u32 = bit_u32(26);
     pub(super) const GLB_DBG_CSF: u32 = bit_u32(30);
     pub(super) const GLB_DBG_HOST: u32 = bit_u32(31);
     pub(super) const GLB_REQ_MASK: u32 = genmask_u32(0..=10);
-    pub(super) const GLB_EVT_MASK: u32 = genmask_u32(20..=26);
+    pub(crate) const GLB_EVT_MASK: u32 = genmask_u32(20..=26);
 
     pub(super) const PING_INTERVAL_MS: i64 = 12000;
 }
@@ -307,6 +306,7 @@ impl GlobalInterface {
     ) -> Result {
         // This takes a mutex internally in clk_prepare().
         let poweroff_timer = TimeoutCycles::from_micro(core_clk_rate, PWROFF_HYSTERESIS_US)?.into();
+        let idle_timer = TimeoutCycles::from_micro(core_clk_rate, IDLE_HYSTERESIS_US)?.into();
 
         let control_area = SharedSectionRange {
             shared_section: self.shared_section.clone(),
@@ -371,12 +371,12 @@ impl GlobalInterface {
         // Setup timers.
         input.poweroff_timer = poweroff_timer;
         input.progress_timer = PROGRESS_TIMEOUT_CYCLES >> PROGRESS_TIMEOUT_SCALE_SHIFT;
-        input.idle_timer = IDLE_HYSTERESIS_US;
+        input.idle_timer = idle_timer;
 
         // Enable the interrupts we care about.
         input.ack_irq_mask = GLB_CFG_ALLOC_EN
             | GLB_PING
-            | GLB_CFG_POWEROFF_TIMER
+            | GLB_CFG_PROGRESS_TIMER
             | GLB_CFG_POWEROFF_TIMER
             | GLB_IDLE_EN
             | GLB_IDLE;
@@ -415,6 +415,13 @@ impl GlobalInterface {
         Doorbell::new(CSF_GLB_DOORBELL_ID).write(&self.iomem, 1)
     }
 
+    pub(crate) fn ring_csg_doorbells(&mut self, mask: u32) -> Result {
+        self.doorbell_request()?.toggle_reqs(mask)?;
+        self.ring_glb_doorbell()?;
+
+        Ok(())
+    }
+
     pub(crate) fn csg(&mut self, csg_idx: usize) -> Option<&CommandStreamGroup> {
         match &self.state {
             GlobalInterfaceState::Disabled => None,
@@ -432,9 +439,8 @@ impl GlobalInterface {
     }
 
     pub(crate) fn arm_watchdog(&self, tdev: &TyrDevice) -> Result {
-        tdev.reset_wq
-            .enqueue_delayed::<_, 0>(tdev.deref().clone(), PING_INTERVAL_MS as usize)
-            .map_err(|_| EINVAL)
+        tdev.schedule_ping(msecs_to_jiffies(PING_INTERVAL_MS as u32));
+        Ok(())
     }
 
     pub(crate) fn ping(&mut self) -> Result {
@@ -486,14 +492,6 @@ impl GlobalInterface {
         }
     }
 
-    /// Set the CSG state.
-    pub(crate) fn set_csg_state(&mut self, csg_idx: usize, state: csg::GroupState) -> Result {
-        let glb = self.state.enabled_mut()?;
-        let csg_iface = glb.csgs.get_mut(csg_idx).ok_or(EINVAL)?;
-
-        csg_iface.set_group_state(state)
-    }
-
     /// Ring the CSG doorbell, thereby instructing CSF to process the requests
     /// made on this CSG.
     pub(crate) fn ring_csg_doorbell(&mut self, csg_idx: usize) -> Result {
@@ -506,14 +504,6 @@ impl GlobalInterface {
     fn shared_section_size(&self) -> usize {
         let shared_section = self.shared_section.lock();
         shared_section.mem.size()
-    }
-
-    pub(crate) fn wait_csg_acks(&self, csg_idx: usize, mask: u32, timeout_ms: u32) -> Result {
-        let glb = self.state.enabled()?;
-        let csg = glb.csgs.get(csg_idx).ok_or(EINVAL)?;
-        let req = csg.input_request()?;
-        req.wait_acks(mask, &self.event_wait, timeout_ms)?;
-        Ok(())
     }
 
     /// Whether the firmware has booted or not.
@@ -534,9 +524,8 @@ impl WorkItem<0> for TyrData {
     fn run(this: Self::Pointer) {
         let res = this.fw.with_locked_global_iface(|glb| {
             glb.ping()?;
-            this.reset_wq
-                .enqueue_delayed::<_, 0>(this.clone(), PING_INTERVAL_MS as usize)
-                .map_err(|_| EINVAL)
+            this.schedule_ping(msecs_to_jiffies(PING_INTERVAL_MS as u32));
+            Ok(())
         });
 
         if let Err(err) = res {
