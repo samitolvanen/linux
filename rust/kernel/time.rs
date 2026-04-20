@@ -373,6 +373,35 @@ impl ops::Div for Delta {
     }
 }
 
+/// Returns the ARM architecture timer frequency in Hz, if available.
+///
+/// This function queries the system-wide ARM architecture timer frequency.
+/// The architecture timer provides a consistent time source across all CPU cores.
+///
+/// Returns `None` if:
+/// - The ARM architecture timer is not available (`CONFIG_ARM_ARCH_TIMER` not enabled)
+/// - The timer rate is zero (not initialized)
+///
+/// # Examples
+///
+/// ```
+/// use kernel::time::arch_timer_get_rate;
+///
+/// if let Some(rate) = arch_timer_get_rate() {
+///     // Use `rate`.
+/// }
+/// ```
+pub fn arch_timer_get_rate() -> Option<u32> {
+    // SAFETY: The C API is available in all configs; when CONFIG_ARM_ARCH_TIMER
+    // is disabled, the header provides a stub returning 0.
+    let rate = unsafe { bindings::arch_timer_get_rate() };
+    if rate == 0 {
+        None
+    } else {
+        Some(rate)
+    }
+}
+
 impl Delta {
     /// A span of time equal to zero.
     pub const ZERO: Self = Self { nanos: 0 };
