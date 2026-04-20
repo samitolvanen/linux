@@ -434,9 +434,9 @@ impl Output {
             1 => BlockedReason::SbWait,
             2 => BlockedReason::ProgressWait,
             3 => BlockedReason::SyncWait,
-            5 => BlockedReason::Deferred,
-            6 => BlockedReason::Resource,
-            7 => BlockedReason::Flush,
+            4 => BlockedReason::Deferred,
+            5 => BlockedReason::Resource,
+            6 => BlockedReason::Flush,
             _ => return Err(EINVAL),
         };
 
@@ -493,13 +493,13 @@ pub(crate) enum BlockedReason {
     SyncWait = 3,
 
     /// Awaiting storage for a deferred instruction.
-    Deferred = 5,
+    Deferred = 4,
 
     /// Waiting for resource allocation.
-    Resource = 6,
+    Resource = 5,
 
     /// Waiting on the completion of a synchronous FLUSH_CACHE2 instruction.
-    Flush = 7,
+    Flush = 6,
 }
 
 impl_shared_section_rw!(Control);
