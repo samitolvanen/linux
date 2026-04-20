@@ -151,11 +151,11 @@ pub(crate) struct Input {
     pub(crate) reserved1: u32,
     pub(crate) progress_timer: u32,
     pub(crate) poweroff_timer: u32,
-    pub(crate) core_en_mask: u32,
+    pub(crate) core_en_mask: u64,
     pub(crate) reserved2: u32,
     pub(crate) perfcnt_as: u32,
     pub(crate) perfcnt_base: u64,
-    pub(crate) perfcnt_extratct: u32,
+    pub(crate) perfcnt_extract: u32,
     pub(crate) reserved3: [u32; 3],
     pub(crate) percnt_config: u32,
     pub(crate) percnt_csg_select: u32,
@@ -313,7 +313,7 @@ impl GlobalInterface {
         let mut input = Input::read(&input_area)?;
 
         // Enable all shader cores.
-        input.core_en_mask = gpu_info.shader_present as u32;
+        input.core_en_mask = gpu_info.shader_present;
 
         // Setup timers.
         input.poweroff_timer = poweroff_timer;
