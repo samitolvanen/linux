@@ -17,6 +17,8 @@ use crate::fw::global::csg::constants::*;
 use crate::fw::global::csg::Priority;
 use crate::fw::global::csg::MAX_CSGS;
 use crate::fw::SharedSectionEntry;
+
+mod events;
 pub(crate) mod group;
 pub(crate) mod job;
 pub(crate) mod queue;
@@ -417,16 +419,21 @@ impl Scheduler {
             if context.update_mask & (1 << csg_idx) != 0 {
                 let acked_reqs = context.acked_reqs[csg_idx];
 
-                if acked_reqs & CSG_ENDPOINT_CONFIG != 0 {}
+                if acked_reqs & CSG_ENDPOINT_CONFIG != 0 {
+                    data.fw.with_locked_global_iface(|glb_iface| {
+                        self.sync_csg_slot_priority(glb_iface, csg_idx)
+                    })?;
+                }
 
-                if acked_reqs & CSG_STATE_MASK != 0 {}
+                if acked_reqs & CSG_STATE_MASK != 0 {
+                    data.fw.with_locked_global_iface(|glb_iface| {
+                        self.sync_csg_slot_state(glb_iface, csg_idx)
+                    })?;
+                }
 
                 if acked_reqs & CSG_STATUS_UPDATE != 0 {
                     data.fw.with_locked_global_iface(|glb_iface| {
-                        if let Some(csg) = glb_iface.csg(csg_idx) {
-                            let _ = csg.read_output();
-                        }
-                        Ok(())
+                        self.sync_csg_slot_queues_state(glb_iface, csg_idx)
                     })?;
                 }
             }

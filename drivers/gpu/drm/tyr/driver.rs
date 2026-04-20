@@ -125,6 +125,17 @@ pub(crate) struct TyrData {
     sched: Mutex<SchedulerState>,
 
     #[pin]
+    #[pin]
+    pub(crate) fw_events_work: DmaFenceWork<Self, 2>,
+
+    /// Outstanding firmware events.
+    pub(crate) fw_events: AtomicU32,
+
+    /// The work to process group status updates.
+    #[pin]
+    pub(crate) sync_upd_work: DmaFenceWork<Self, 3>,
+
+    #[pin]
 
     /// Workqueue used by our internal scheduler logic.
     pub(crate) sched_wq: DmaFenceWorkqueue,
@@ -136,6 +147,14 @@ pub(crate) struct TyrData {
 }
 
 impl TyrData {
+    pub(crate) fn schedule_fw_events(self: &Arc<Self>) {
+        let _ = self.sched_wq.enqueue::<_, 2>(self.clone());
+    }
+
+    pub(crate) fn schedule_sync_upd(self: &Arc<Self>) {
+        let _ = self.sched_wq.enqueue::<_, 3>(self.clone());
+    }
+
     pub(crate) fn schedule_ping(self: &Arc<Self>, delay: Jiffies) {
         let _ = self.reset_wq.enqueue_delayed::<_, 0>(self.clone(), delay);
     }
@@ -361,6 +380,9 @@ impl platform::Driver for TyrDriver {
                 mmio_phys_addr,
                 ping_work <- new_delayed_work!("tyr-ping-work"),
                 sched <- new_mutex!(SchedulerState::Disabled),
+                fw_events_work <- new_dma_fence_work!("tyr-fw-events"),
+                fw_events: AtomicU32::new(0),
+                sync_upd_work <- new_dma_fence_work!("tyr-sync-upd"),
                 sched_wq,
                 wq: job_wq,
                 reset_wq,

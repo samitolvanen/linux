@@ -86,5 +86,9 @@ impl TyrIrqTrait for JobIrq {
         }
 
         self.boot_wait.notify_all();
+
+        tdev.fw_events
+            .fetch_or(status, core::sync::atomic::Ordering::Release);
+        tdev.schedule_fw_events();
     }
 }

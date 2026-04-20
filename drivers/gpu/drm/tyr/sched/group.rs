@@ -536,6 +536,7 @@ impl Group {
                 }
             }
         }
+        self.tdev.schedule_sync_upd();
     }
 }
 
