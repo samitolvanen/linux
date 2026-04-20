@@ -291,6 +291,9 @@ impl SharedSectionEntry for CommandStream {
             core::mem::offset_of!(Input, req),
             &self.output_area,
             core::mem::offset_of!(Output, ack),
+            crate::fw::IfaceType::Cs(self.csg_id as u32, self.cs_id as u32),
+            false,
+            kernel::c_str!("req"),
         ))
     }
 }

@@ -20,6 +20,7 @@ mod mmap;
 mod mmu;
 mod regs;
 mod sched;
+mod trace;
 mod wait;
 
 kernel::module_platform_driver! {

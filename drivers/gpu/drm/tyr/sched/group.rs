@@ -363,7 +363,7 @@ impl GroupInner {
 
     /// Evaluates the current state of a queue and applies the correct
     /// park and timeout suspend states to the underlying `JobQueue`.
-    pub(crate) fn sync_queue_state(&mut self, queue_idx: usize) {
+    pub(crate) fn sync_queue_state(&mut self, group_id: u64, queue_idx: usize) {
         let is_blocked = (self.blocked_queues & (1 << queue_idx)) != 0;
 
         // A queue should have its timeout suspended if the group is
@@ -394,6 +394,7 @@ impl GroupInner {
             } else {
                 queue.resume_timeout();
             }
+            crate::trace::queue_timeout_state(group_id, queue_idx as u32, should_suspend);
         }
 
         // We track park state to avoid redundant calls to JobQueue::park()
@@ -405,22 +406,37 @@ impl GroupInner {
             } else {
                 queue.job_queue.unpark();
             }
+            crate::trace::queue_state(group_id, queue_idx as u32, should_park);
         }
     }
 
     /// Helper to update the blocked state of a queue.
-    pub(crate) fn set_queue_blocked(&mut self, queue_idx: usize, blocked: bool) {
+    pub(crate) fn set_queue_blocked(&mut self, group_id: u64, queue_idx: usize, blocked: bool) {
         let mask = 1 << queue_idx;
+        let was_blocked = (self.blocked_queues & mask) != 0;
 
         if blocked {
             self.blocked_queues |= mask;
         } else {
             self.blocked_queues &= !mask;
         }
+
+        if blocked != was_blocked {
+            crate::trace::job_status(
+                self.queues[queue_idx].active_seqno(),
+                group_id,
+                queue_idx as u32,
+                if blocked {
+                    kernel::c_str!("blocked")
+                } else {
+                    kernel::c_str!("unblocked")
+                },
+            );
+        }
     }
 
     /// Helper to update the idle state of a queue.
-    pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
+    pub(crate) fn set_queue_idle(&mut self, group_id: u64, queue_idx: usize, idle: bool) -> bool {
         let mask = 1 << queue_idx;
         let was_idle = (self.idle_queues & mask) != 0;
 
@@ -430,14 +446,19 @@ impl GroupInner {
             self.idle_queues &= !mask;
         }
 
+        if idle != was_idle {
+            crate::trace::queue_idle_state(group_id, queue_idx as u32, idle);
+        }
+
         was_idle
     }
 
     /// Helper to update the fatal state of a queue.
-    pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
+    pub(crate) fn set_queue_fatal(&mut self, group_id: u64, queue_idx: usize) {
         if (self.fatal_queues & (1 << queue_idx)) == 0 {
             self.fatal_queues |= 1 << queue_idx;
             self.fatal_error = Some(kernel::error::code::EFAULT);
+            crate::trace::queue_fatal_state(group_id, queue_idx as u32, true);
         }
     }
 }
@@ -470,8 +491,10 @@ impl Group {
     }
 
     pub(crate) fn set_state(&self, new_state: State) {
+        let group_id = self as *const _ as usize as u64;
         let _ = self.with_locked_inner(|inner| {
             inner.state = new_state;
+            crate::trace::group_update(group_id, new_state as u32);
             Ok(())
         });
     }
@@ -801,6 +824,7 @@ impl DmaFenceWorkItem<0> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
+        crate::trace::work_run(kernel::c_str!("group_sync_upd"));
         let num_queues = this
             .with_locked_inner(|inner| Ok(inner.queues.len()))
             .unwrap_or(0);
@@ -819,6 +843,12 @@ impl DmaFenceWorkItem<0> for Group {
 
                 match fence_to_signal {
                     Some(fence) => {
+                        crate::trace::job_done(
+                            fence.inner().seqno(),
+                            this.as_ref() as *const _ as usize as u64,
+                            queue_idx as u32,
+                            fence.error().err().map_or(0, |e| e.to_errno()),
+                        );
                         fence.signal(Ok(()));
                     }
                     None => break,
@@ -838,6 +868,8 @@ impl DmaFenceWorkItem<1> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
+        crate::trace::work_run(kernel::c_str!("group_term"));
+
         let err = this
             .with_locked_inner(|inner| Ok(inner.fatal_error))
             .unwrap_or(Some(kernel::error::code::ECANCELED));

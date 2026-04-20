@@ -51,6 +51,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    pub(crate) fn group_id(&self) -> u64 {
+        &*self.group as *const _ as usize as u64
+    }
+
     pub(crate) fn create(
         qsubmit: crate::file::QueueSubmit,
         group: Arc<Group>,
@@ -205,6 +209,12 @@ impl Job {
                 Ok(bounds) => bounds,
                 Err(e) => {
                     if e == EBUSY {
+                        crate::trace::job_status(
+                            fence.inner().seqno(),
+                            self.group_id(),
+                            self.queue_idx as u32,
+                            kernel::c_str!("no_resources"),
+                        );
                         // Let JobQueue know that the ring buffer is full.
                         return Ok(SubmitResult::NoResources(fence));
                     } else {
@@ -233,6 +243,13 @@ impl Job {
                 return Err(e);
             }
 
+            crate::trace::job_submit(
+                seqno,
+                self.group.as_ref() as *const _ as usize as u64,
+                self.queue_idx as u32,
+                self.stream_size,
+            );
+
             // Update the user input block to let the firmware know about the new
             // instructions to execute.
             if let Err(e) = queue.commit_instrs(ringbuf_end) {
@@ -244,12 +261,30 @@ impl Job {
                 return Err(e);
             }
 
+            crate::trace::cs_ring_ptrs(
+                self.group_id(),
+                self.queue_idx as u32,
+                ringbuf_end,
+                queue
+                    .interfaces
+                    .read_output()
+                    .map(|o| o.extract)
+                    .unwrap_or(0),
+            );
+
             if inner.csg_id.is_none() {
-                inner.sync_queue_state(self.queue_idx);
+                crate::trace::job_status(
+                    seqno,
+                    self.group_id(),
+                    self.queue_idx as u32,
+                    kernel::c_str!("not bound"),
+                );
+
+                inner.sync_queue_state(self.group_id(), self.queue_idx);
 
                 if !inner.is_queue_blocked(self.queue_idx) {
                     let was_idle = inner.is_idle();
-                    inner.set_queue_idle(self.queue_idx, false);
+                    inner.set_queue_idle(self.group_id(), self.queue_idx, false);
 
                     if was_idle && !inner.is_idle() {
                         needs_runnable = true;
@@ -257,7 +292,7 @@ impl Job {
                     needs_tick = true;
                 }
             } else {
-                let _ = queue.kick(&self.group.tdev);
+                let _ = queue.kick(&self.group.tdev, self.group_id(), self.queue_idx as u32);
                 devfreq::record_busy(&self.group.tdev);
             }
 

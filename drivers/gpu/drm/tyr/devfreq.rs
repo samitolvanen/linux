@@ -80,10 +80,14 @@ impl devfreq::Callbacks for TyrDevfreqCallbacks {
 
         *freq = recommended_freq;
 
-        driver.device.current_frequency.store(
+        let prev_freq = driver.device.current_frequency.swap(
             recommended_freq as usize,
             core::sync::atomic::Ordering::Relaxed,
-        );
+        ) as u64;
+
+        if prev_freq != recommended_freq {
+            crate::trace::devfreq_target(prev_freq, recommended_freq);
+        }
 
         Ok(())
     }

@@ -848,6 +848,17 @@ impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DriverDmaFence<T, V> {
             bindings::dma_fence_set_error(self.inner.fence.get(), err.to_errno());
         }
     }
+
+    /// Get the error from the fence, if any.
+    pub fn error(&self) -> Result {
+        // SAFETY: The pointer is valid per the type invariant.
+        let err = unsafe { (*self.inner.fence.get()).error };
+        if err == 0 {
+            Ok(())
+        } else {
+            Err(Error::from_errno(err))
+        }
+    }
 }
 
 impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {

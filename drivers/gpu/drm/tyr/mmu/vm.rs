@@ -279,15 +279,30 @@ impl Vm {
             preallocated_vas: StepContext::preallocate_vas()?,
         };
 
+        crate::trace::mmu_bind_start(
+            self as *mut Self as usize as u64,
+            va_range.start,
+            va_range.end - va_range.start,
+        );
+
         let vm_bo = self.gpuvm.obtain(bo, TyrVmBoData::new())?;
 
-        self.gpuvm.sm_map(OpMapRequest {
+        let res = self.gpuvm.sm_map(OpMapRequest {
             addr: va_range.start,
             range: va_range.end - va_range.start,
             gem_offset: bo_offset,
             vm_bo: vm_bo,
             context: &mut ctx,
-        })
+        });
+
+        crate::trace::mmu_bind_done(
+            self as *mut Self as usize as u64,
+            va_range.start,
+            va_range.end - va_range.start,
+            res.as_ref().err().map(|e| e.to_errno()).unwrap_or(0),
+        );
+
+        res
     }
 
     /// Unmap a given VA range.

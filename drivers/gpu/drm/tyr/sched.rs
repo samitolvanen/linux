@@ -147,6 +147,10 @@ impl Scheduler {
                 while let Some(group) = cursor.peek_next() {
                     let group_arc: Arc<Group> = group.arc().into();
                     if !group_arc.can_run() {
+                        crate::trace::group_list(
+                            group_arc.as_ref() as *const _ as usize as u64,
+                            group::GroupListState::None as u32,
+                        );
                         group.remove();
                     } else {
                         cursor.move_next();
@@ -158,6 +162,7 @@ impl Scheduler {
             while let Some(group) = cursor.peek_next() {
                 let group_arc: Arc<Group> = group.arc().into();
                 if !group_arc.can_run() {
+                    crate::trace::group_wait(group_arc.as_ref() as *const _ as usize as u64, false);
                     group.remove();
                 } else {
                     cursor.move_next();
@@ -184,6 +189,10 @@ impl Scheduler {
             if list_arc.is_none() {
                 pr_err!("group was marked {:?} but not found\n", list_state);
             } else {
+                crate::trace::group_list(
+                    group as *const _ as usize as u64,
+                    group::GroupListState::None as u32,
+                );
             }
             list_arc
         } else {
@@ -202,6 +211,10 @@ impl Scheduler {
                     if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
                         self.runnable_groups[priority].push_back(list_arc);
                         inner.list_state = group::GroupListState::Runnable;
+                        crate::trace::group_list(
+                            group.as_ref() as *const _ as usize as u64,
+                            group::GroupListState::Runnable as u32,
+                        );
                     }
                 }
             } else if inner.list_state != group::GroupListState::Runnable {
@@ -210,6 +223,10 @@ impl Scheduler {
                 {
                     self.runnable_groups[priority].push_back(list_arc);
                     inner.list_state = group::GroupListState::Runnable;
+                    crate::trace::group_list(
+                        group.as_ref() as *const _ as usize as u64,
+                        group::GroupListState::Runnable as u32,
+                    );
                 }
             }
 
@@ -228,6 +245,10 @@ impl Scheduler {
             } else {
                 inner.list_state = group::GroupListState::Runnable;
             }
+            crate::trace::group_list(
+                list_arc.as_ref() as *const _ as usize as u64,
+                inner.list_state as u32,
+            );
             Ok(())
         });
 
@@ -348,11 +369,14 @@ impl Scheduler {
         let priority = group.priority as usize;
         let mut list_state = group::GroupListState::None;
 
+        crate::trace::group_bind(group.as_ref() as *const _ as usize as u64, csg_idx as u32);
+
         group.with_locked_inner(|inner| {
             list_state = inner.list_state;
             inner.csg_id = Some(csg_idx);
             inner.idle = false;
             inner.list_state = group::GroupListState::None;
+            let group_id = group.as_ref() as *const _ as usize as u64;
             // Dummy doorbell allocation: doorbell is assigned to the group and all
             // queues use the same doorbell.
             //
@@ -361,7 +385,7 @@ impl Scheduler {
             // on queues belonging to the same group that are rarely updated.
             for i in 0..inner.queues.len() {
                 inner.queues[i].doorbell_id = Some(csg_idx + 1);
-                inner.sync_queue_state(i);
+                inner.sync_queue_state(group_id, i);
             }
 
             Ok(())
@@ -442,6 +466,22 @@ impl Scheduler {
 
                 if acked_reqs & CSG_STATUS_UPDATE != 0 {
                     data.fw.with_locked_global_iface(|glb_iface| {
+                        if let Some(csg) = glb_iface.csg(csg_idx) {
+                            if let Ok(output) = csg.read_output() {
+                                let group_id = self.csg_slots[csg_idx]
+                                    .as_ref()
+                                    .map(|slot| slot.group.as_ref() as *const _ as usize as u64)
+                                    .unwrap_or(0);
+                                crate::trace::fw_csg_status_update(
+                                    csg_idx as u32,
+                                    group_id,
+                                    output.status_ep_current,
+                                    output.status_ep_req,
+                                    output.status_state,
+                                    output.resource_dep,
+                                );
+                            }
+                        }
                         self.sync_csg_slot_queues_state(glb_iface, csg_idx)
                     })?;
                 }
@@ -468,12 +508,19 @@ impl Scheduler {
 
         let slot = self.csg_slots[csg_idx].as_mut().ok_or(EINVAL)?;
 
+        crate::trace::group_unbind(
+            slot.group.as_ref() as *const _ as usize as u64,
+            csg_idx as u32,
+        );
+
+        let group_id = slot.group.as_ref() as *const _ as usize as u64;
+
         slot.group.with_locked_inner(|inner| {
             inner.csg_id = None;
 
             for i in 0..inner.queues.len() {
                 inner.queues[i].doorbell_id = None;
-                inner.sync_queue_state(i);
+                inner.sync_queue_state(group_id, i);
             }
             Ok(())
         })?;

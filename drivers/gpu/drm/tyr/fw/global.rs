@@ -388,6 +388,9 @@ impl GlobalInterface {
             core::mem::offset_of!(Input, req),
             &output_area,
             core::mem::offset_of!(Output, ack),
+            crate::fw::IfaceType::Global,
+            false,
+            kernel::c_str!("req"),
         );
         req.update_reqs(GLB_IDLE_EN, GLB_IDLE_EN)?;
 
@@ -457,6 +460,9 @@ impl GlobalInterface {
             core::mem::offset_of!(Input, req),
             &glb_iface.output_area,
             core::mem::offset_of!(Output, ack),
+            crate::fw::IfaceType::Global,
+            false,
+            kernel::c_str!("req"),
         );
 
         req.toggle_reqs(GLB_PING)?;
@@ -575,6 +581,9 @@ impl SharedSectionEntry for GlobalInterface {
             core::mem::offset_of!(Input, req),
             &glb.output_area,
             core::mem::offset_of!(Output, ack),
+            crate::fw::IfaceType::Global,
+            false,
+            kernel::c_str!("req"),
         ))
     }
 
@@ -586,6 +595,9 @@ impl SharedSectionEntry for GlobalInterface {
             core::mem::offset_of!(Input, doorbell_req),
             &glb.output_area,
             core::mem::offset_of!(Output, doorbell_ack),
+            crate::fw::IfaceType::Global,
+            true,
+            kernel::c_str!("doorbell_req"),
         ))
     }
 }

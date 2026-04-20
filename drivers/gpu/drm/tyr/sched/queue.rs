@@ -110,6 +110,13 @@ impl StageOps<job::TyrJobHandler> for HwTimeoutStage {
         let adjusted_elapsed = elapsed.saturating_sub(suspend_allowance_jiffies);
 
         if adjusted_elapsed >= self.timeout {
+            crate::trace::job_status(
+                ctx.submit_fence.seqno(),
+                ctx.job.group_id(),
+                ctx.job.queue_idx(),
+                kernel::c_str!("hw_timeout"),
+            );
+            crate::trace::cs_ring_ptrs(ctx.job.group_id(), ctx.job.queue_idx(), insert, extract);
             return StageAdvance::TimedOut(ETIMEDOUT);
         }
         StageAdvance::WaitFor(self.timeout - adjusted_elapsed)
@@ -258,6 +265,14 @@ impl Queue {
             suspend_start_nanos: core::sync::atomic::AtomicI64::new(0),
             accumulated_suspend_nanos: core::sync::atomic::AtomicI64::new(0),
         })
+    }
+
+    pub(crate) fn active_seqno(&self) -> u64 {
+        if self.pending_submit_fences_head < self.pending_submit_fences.len() {
+            self.pending_submit_fences[self.pending_submit_fences_head].seqno
+        } else {
+            0
+        }
     }
 
     /// Store a submit fence to be signaled when `seqno` is reached.
@@ -414,12 +429,18 @@ impl Queue {
 
     /// Kick the queue. This will notify CSF that new instructions are ready to
     /// be executed.
-    pub(crate) fn kick(&self, tdev: &crate::driver::TyrData) -> Result {
+    pub(crate) fn kick(
+        &self,
+        tdev: &crate::driver::TyrData,
+        group_id: u64,
+        queue_id: u32,
+    ) -> Result {
         // Make sure that all previous writes are visible to the CSF before it
         // can be awaken.
         kernel::sync::barrier::wmb();
 
         let doorbell_id = self.doorbell_id.ok_or(EINVAL)?;
+        crate::trace::queue_doorbell(group_id, queue_id, doorbell_id as u32);
         crate::regs::Doorbell::new(doorbell_id).write(&tdev.iomem, 1)
     }
 

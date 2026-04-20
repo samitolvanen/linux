@@ -96,6 +96,12 @@ impl SharedSectionRange {
     }
 }
 
+pub(crate) enum IfaceType {
+    Global,
+    Csg(u32),
+    Cs(u32, u32),
+}
+
 /// An offset into the shared section that is known to point to the request field.
 ///
 /// It is more convenient to use this type than reading or writing the memory
@@ -104,6 +110,9 @@ impl SharedSectionRange {
 pub(crate) struct RequestField {
     req: SharedSectionRange,
     ack: SharedSectionRange,
+    iface_type: IfaceType,
+    is_doorbell: bool,
+    reg_name: &'static kernel::str::CStr,
 }
 
 impl RequestField {
@@ -112,6 +121,9 @@ impl RequestField {
         req_offset: usize,
         ack_area: &SharedSectionRange,
         ack_offset: usize,
+        iface_type: IfaceType,
+        is_doorbell: bool,
+        reg_name: &'static kernel::str::CStr,
     ) -> Self {
         let req = SharedSectionRange {
             shared_section: req_area.shared_section.clone(),
@@ -125,10 +137,58 @@ impl RequestField {
             end: ack_area.start + ack_offset + core::mem::size_of::<u32>(),
         };
 
-        Self { req, ack }
+        Self {
+            req,
+            ack,
+            iface_type,
+            is_doorbell,
+            reg_name,
+        }
+    }
+
+    fn trace_req(&self, val: u32, update_mask: u32, toggle_mask: u32) {
+        match self.iface_type {
+            IfaceType::Global => {
+                if self.is_doorbell {
+                    crate::trace::fw_glb_doorbell_req(self.reg_name, val, update_mask, toggle_mask)
+                } else {
+                    crate::trace::fw_glb_req(self.reg_name, val, update_mask, toggle_mask)
+                }
+            }
+            IfaceType::Csg(csg_id) => {
+                if self.is_doorbell {
+                    crate::trace::fw_csg_doorbell_req(
+                        csg_id,
+                        self.reg_name,
+                        val,
+                        update_mask,
+                        toggle_mask,
+                    )
+                } else {
+                    crate::trace::fw_csg_req(
+                        csg_id,
+                        0,
+                        self.reg_name,
+                        val,
+                        update_mask,
+                        toggle_mask,
+                    )
+                }
+            }
+            IfaceType::Cs(csg_id, cs_id) => crate::trace::fw_cs_req(
+                csg_id,
+                cs_id,
+                0,
+                self.reg_name,
+                val,
+                update_mask,
+                toggle_mask,
+            ),
+        }
     }
 
     pub(crate) fn write_req(&self, val: u32) -> Result {
+        self.trace_req(val, val, 0);
         self.req.write::<u32>(val)
     }
 
@@ -146,6 +206,8 @@ impl RequestField {
         let cur_req_val = self.req.read::<u32>()?;
         let ack_val = self.ack.read::<u32>()?;
         let new_val = (cur_req_val & !mask) | (!ack_val & mask);
+
+        self.trace_req(new_val, 0, mask);
         self.req.write::<u32>(new_val)
     }
 
@@ -157,6 +219,8 @@ impl RequestField {
     pub(crate) fn update_reqs(&self, val: u32, mask: u32) -> Result {
         let cur_req_val = self.req.read::<u32>()?;
         let new_val = (cur_req_val & !mask) | (val & mask);
+
+        self.trace_req(new_val, mask, 0);
         self.req.write::<u32>(new_val)
     }
 
@@ -177,6 +241,8 @@ impl RequestField {
         if toggle_mask != 0 {
             new_val = (new_val & !toggle_mask) | (!ack_val & toggle_mask);
         }
+
+        self.trace_req(new_val, update_mask, toggle_mask);
         self.req.write::<u32>(new_val)
     }
 
