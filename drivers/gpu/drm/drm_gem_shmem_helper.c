@@ -815,11 +815,24 @@ struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_shmem_object *shmem)
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_get_sg_table);
 
-static struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_shmem_object *shmem)
+/**
+ * drm_gem_shmem_get_pages_sgt_locked - Under dma_resv lock, provide a scatter/gather table of
+ *				        pinned pages for an shmem GEM object.
+ * @shmem: shmem GEM object
+ *
+ * This function is the same as drm_gem_shmem_get_pages_sgt, except that the caller is expected to
+ * already hold the dma_resv lock for @shmem.
+ *
+ * Returns:
+ * A pointer to the scatter/gather table of pinned pages, or error pointer on failure.
+ */
+struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_shmem_object *shmem)
 {
 	struct drm_gem_object *obj = &shmem->base;
 	int ret;
 	struct sg_table *sgt;
+
+	dma_resv_assert_held(shmem->base.resv);
 
 	if (shmem->sgt)
 		return shmem->sgt;
@@ -851,6 +864,7 @@ err_put_pages:
 	drm_gem_shmem_put_pages_locked(shmem);
 	return ERR_PTR(ret);
 }
+EXPORT_SYMBOL_GPL(drm_gem_shmem_get_pages_sgt_locked);
 
 /**
  * drm_gem_shmem_get_pages_sgt - Pin pages, dma map them, and return a
