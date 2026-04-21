@@ -15,6 +15,7 @@
 
 use kernel::{
     bitfield,
+    clk::Clk,
     device::{
         Bound,
         Device, //
@@ -371,10 +372,15 @@ impl<'drm> Firmware<'drm> {
     }
 
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(&self) -> Result {
+    pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
         let shared_section = self.shared_section()?;
-        self.global_iface
-            .lock()
-            .enable(self.vm.dev(), shared_section)
+        self.global_iface.lock().enable(
+            self.vm.dev(),
+            &self.iomem,
+            shared_section,
+            gpu_info,
+            core_clk,
+            &self.ready_wait,
+        )
     }
 }
