@@ -20,6 +20,7 @@ use core::sync::atomic::{
 
 use kernel::{
     bits::genmask_u32,
+    clk::Clk,
     devres::Devres,
     drm::{
         gem::BaseObject,
@@ -337,8 +338,15 @@ impl Firmware {
     }
 
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(&self) -> Result {
+    pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
         let shared_section = self.shared_section()?;
-        self.global_iface.lock().enable(shared_section)
+        self.global_iface.lock().enable(
+            &self.pdev,
+            &self.iomem,
+            shared_section,
+            gpu_info,
+            core_clk,
+            &self.ready_wait,
+        )
     }
 }
