@@ -24,21 +24,46 @@ use core::{
 use pin_init::pin_init_from_closure;
 
 use crate::{
+    alloc::AllocError,
 	bindings,
 	c_str,
+    device::{
+        Bound,
+        Device,
+    },
 	error::to_result,
+    irq::{
+        IrqReturn,
+        ThreadedHandler,
+        ThreadedIrqReturn,
+    },
 	prelude::*,
-	sync::aref::{
-		ARef,
-		AlwaysRefCounted,
+    sync::{
+        aref::{
+            ARef,
+            AlwaysRefCounted,
+        },
+        Arc,
+        LockClassKey,
 	},
-	sync::LockClassKey,
 	time::Jiffies,
 	types::{
 		ForeignOwnable,
 		NotThreadSafe,
 		Opaque,
 	},
+    workqueue::{
+        DelayedWork,
+        HasDelayedWork,
+        HasWork,
+        OwnedQueue,
+        RawDelayedWorkItem,
+        RawWorkItem,
+        Work,
+        WorkItem,
+        WorkItemPointer,
+        WqFlags,
+    },
 };
 
 /// The return type of [`PublicDmaFence::wait_timeout`].
@@ -922,5 +947,342 @@ unsafe impl<T: DriverDmaFenceOps + 'static, V: DriverDmaFenceVisibility> Foreign
             }),
             _p: PhantomData,
         }
+    }
+}
+/// DMA-fence constrained work item.
+///
+/// This is a wrapper around [`Work`] allowing us to re-use the existing workqueue
+/// infrastructure while adding constraints on the type of workqueue such work items
+/// can be scheduled on.
+#[pin_data]
+pub struct DmaFenceWork<T: ?Sized, const ID: u64 = 0> {
+    #[pin]
+    /// The underlying work item constrained to DMA-fence-safe queues.
+    pub inner: Work<T, ID>,
+}
+
+impl<T: ?Sized + WorkItem<ID>, const ID: u64> DmaFenceWork<T, ID> {
+    /// Creates an initialiser for a [`DmaFenceWork`] with the given name and lock class.
+    pub fn new(name: &'static CStr, key: Pin<&'static LockClassKey>) -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- Work::new(name, key),
+        })
+    }
+}
+
+/// Used to safely implement the `HasDmaFenceWork` trait.
+///
+/// # Examples
+///
+/// ```ignore
+/// use kernel::sync::Arc;
+/// use kernel::dma_fence::{impl_has_dma_fence_work, DmaFenceWork};
+///
+/// struct MyStruct {
+///     work_field: DmaFenceWork<MyStruct>,
+/// }
+///
+/// impl_has_dma_fence_work! {
+///     impl HasDmaFenceWork<MyStruct>
+///     for MyStruct { self.work_field }
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_has_dma_fence_work {
+    ($(impl$({$($generics:tt)*})?
+       HasDmaFenceWork<$work_type:ty $(, $id:tt)?>
+       for $self:ty
+       { self.$field:ident }
+    )*) => {$(
+        // SAFETY: The implementation of `raw_get_work` only compiles if the field has the right
+        // type.
+        unsafe impl$(<$($generics)+>)? $crate::workqueue::HasWork<$work_type $(, $id)?> for $self {
+            #[inline]
+            unsafe fn raw_get_work(ptr: *mut Self) -> *mut $crate::workqueue::Work<$work_type $(, $id)?> {
+                // SAFETY: The caller promises that the pointer is not dangling.
+                unsafe { &raw mut (*ptr).$field.inner }
+            }
+
+            #[inline]
+            unsafe fn work_container_of(
+                ptr: *mut $crate::workqueue::Work<$work_type $(, $id)?>,
+            ) -> *mut Self {
+                // SAFETY: The caller promises that the pointer points at a field of the right type
+                // in the right kind of struct.
+                unsafe { $crate::container_of!(ptr, Self, $field.inner) }
+            }
+        }
+
+        impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
+            type Pointer = <Self as $crate::dma_buf::dma_fence::DmaFenceWorkItem<$($id)?>>::Pointer;
+
+            fn run(this: Self::Pointer) {
+                let _annotation = $crate::dma_buf::dma_fence::DmaFenceSignallingAnnotation::new();
+
+                <Self as $crate::dma_buf::dma_fence::DmaFenceWorkItem<$($id)?>>::run(this)
+            }
+        }
+    )*};
+}
+pub use impl_has_dma_fence_work;
+
+/// Creates a [`DmaFenceWork`] initialiser with the given name and a newly-created lock class.
+#[macro_export]
+macro_rules! new_dma_fence_work {
+    ($($name:literal)?) => {
+        $crate::dma_buf::dma_fence::DmaFenceWork::new(
+            $crate::optional_name!($($name)?),
+            $crate::static_lock_class!(),
+        )
+    };
+}
+pub use new_dma_fence_work;
+
+/// DMA-fence constrained delayed work item.
+///
+/// This is a wrapper around [`DelayedWork`] allowing us to re-use the existing workqueue
+/// infrastructure while adding constraints on the type of workqueue such work items
+/// can be scheduled on, and ensuring the work item runs inside a
+/// [`DmaFenceSignallingAnnotation`] section.
+#[pin_data]
+pub struct DmaFenceDelayedWork<T: ?Sized, const ID: u64 = 0> {
+    #[pin]
+    /// The underlying delayed work item constrained to DMA-fence-safe queues.
+    pub inner: DelayedWork<T, ID>,
+}
+
+impl<T: ?Sized + WorkItem<ID>, const ID: u64> DmaFenceDelayedWork<T, ID> {
+    /// Creates an initialiser for a [`DmaFenceDelayedWork`] with the given names and lock
+    /// classes.
+    pub fn new(
+        work_name: &'static CStr,
+        work_key: Pin<&'static LockClassKey>,
+        timer_name: &'static CStr,
+        timer_key: Pin<&'static LockClassKey>,
+    ) -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- DelayedWork::new(work_name, work_key, timer_name, timer_key),
+        })
+    }
+}
+
+/// Used to safely implement the `HasDmaFenceDelayedWork` trait.
+#[macro_export]
+macro_rules! impl_has_dma_fence_delayed_work {
+    ($(impl$({$($generics:tt)*})?
+       HasDmaFenceDelayedWork<$work_type:ty $(, $id:tt)?>
+       for $self:ty
+       { self.$field:ident }
+    )*) => {$(
+        // SAFETY: The `HasWork` impl below uses `DelayedWork::raw_as_work`, returning a
+        // pointer to the `work` field of a `delayed_work`.
+        unsafe impl$(<$($generics)+>)?
+            $crate::workqueue::HasDelayedWork<$work_type $(, $id)?> for $self {}
+
+        // SAFETY: The implementation of `raw_get_work` only compiles if the field has the right
+        // type.
+        unsafe impl$(<$($generics)+>)? $crate::workqueue::HasWork<$work_type $(, $id)?> for $self {
+            #[inline]
+            unsafe fn raw_get_work(
+                ptr: *mut Self,
+            ) -> *mut $crate::workqueue::Work<$work_type $(, $id)?> {
+                // SAFETY: The caller promises that the pointer is not dangling.
+                let ptr: *mut $crate::workqueue::DelayedWork<$work_type $(, $id)?> =
+                    unsafe { &raw mut (*ptr).$field.inner };
+                // SAFETY: The caller promises that the pointer is not dangling.
+                unsafe { $crate::workqueue::DelayedWork::raw_as_work(ptr) }
+            }
+
+            #[inline]
+            unsafe fn work_container_of(
+                ptr: *mut $crate::workqueue::Work<$work_type $(, $id)?>,
+            ) -> *mut Self {
+                // SAFETY: The caller promises that the pointer points at a field of the
+                // right type in the right kind of struct.
+                let ptr = unsafe { $crate::workqueue::Work::raw_get(ptr) };
+                // SAFETY: The caller promises that the pointer points at a field of the
+                // right type in the right kind of struct.
+                let delayed_work = unsafe {
+                    $crate::container_of!(ptr, $crate::bindings::delayed_work, work)
+                };
+                let delayed_work: *mut $crate::workqueue::DelayedWork<$work_type $(, $id)?> =
+                    delayed_work.cast();
+                // SAFETY: The caller promises that the pointer points at a field of the
+                // right type in the right kind of struct.
+                unsafe { $crate::container_of!(delayed_work, Self, $field.inner) }
+            }
+        }
+
+        impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
+            type Pointer =
+                <Self as $crate::dma_buf::dma_fence::DmaFenceDelayedWorkItem<$($id)?>>::Pointer;
+
+            fn run(this: Self::Pointer) {
+                let _annotation = $crate::dma_buf::dma_fence::DmaFenceSignallingAnnotation::new();
+                <Self as $crate::dma_buf::dma_fence::DmaFenceDelayedWorkItem<$($id)?>>::run(this)
+            }
+        }
+    )*};
+}
+pub use impl_has_dma_fence_delayed_work;
+
+/// Creates a [`DmaFenceDelayedWork`] initialiser with the given name and a newly-created
+/// lock class.
+#[macro_export]
+macro_rules! new_dma_fence_delayed_work {
+    () => {
+        $crate::dma_buf::dma_fence::DmaFenceDelayedWork::new(
+            $crate::optional_name!(),
+            $crate::static_lock_class!(),
+            $crate::c_str!(::core::concat!(
+                ::core::file!(),
+                ":",
+                ::core::line!(),
+                "_timer"
+            )),
+            $crate::static_lock_class!(),
+        )
+    };
+    ($name:literal) => {
+        $crate::dma_buf::dma_fence::DmaFenceDelayedWork::new(
+            $crate::c_str!($name),
+            $crate::static_lock_class!(),
+            $crate::c_str!(::core::concat!($name, "_timer")),
+            $crate::static_lock_class!(),
+        )
+    };
+}
+pub use new_dma_fence_delayed_work;
+
+/// Defines the method that should be called when this DMA-fence constrained
+/// work item is executed.
+pub trait DmaFenceWorkItem<const ID: u64 = 0> {
+    /// The pointer type that this struct is wrapped in. This will typically be `Arc<Self>` or
+    /// `Pin<KBox<Self>>`.
+    type Pointer: WorkItemPointer<ID>;
+
+    /// The method that should be called when this work item is executed.
+    fn run(this: Self::Pointer);
+}
+
+/// A raw DMA-fence constrained work item.
+///
+/// # Safety
+///
+/// Implementations must satisfy all the safety requirements of [`RawWorkItem`].
+pub unsafe trait RawDmaFenceWorkItem<const ID: u64>: RawWorkItem<ID> {}
+
+// SAFETY: [`RawWorkItem`] provides all the guarantees we need.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for Arc<T>
+where
+    T: DmaFenceWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+}
+
+// SAFETY: [`RawWorkItem`] provides all the guarantees we need.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for Pin<KBox<T>>
+where
+    T: DmaFenceWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+}
+
+/// Defines the method that should be called when this DMA-fence constrained
+/// delayed work item is executed.
+pub trait DmaFenceDelayedWorkItem<const ID: u64 = 0> {
+    /// The pointer type that this struct is wrapped in. This will typically be `Arc<Self>`.
+    type Pointer: WorkItemPointer<ID>;
+
+    /// The method that should be called when this work item is executed.
+    fn run(this: Self::Pointer);
+}
+
+/// A raw DMA-fence constrained delayed work item.
+///
+/// # Safety
+///
+/// Implementations must satisfy all the safety requirements of [`RawDelayedWorkItem`].
+pub unsafe trait RawDmaFenceDelayedWorkItem<const ID: u64>: RawDelayedWorkItem<ID> {}
+
+// SAFETY: The underlying `RawDelayedWorkItem` impl provides all guarantees.
+unsafe impl<T, const ID: u64> RawDmaFenceDelayedWorkItem<ID> for Arc<T>
+where
+    T: DmaFenceDelayedWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasDelayedWork<T, ID>,
+{
+}
+
+/// Workqueue that can only be used to schedule [`DmaFenceWork`] items.
+pub struct DmaFenceWorkqueue(OwnedQueue);
+
+impl DmaFenceWorkqueue {
+    /// Allocates a new DMA-fence constrained workqueue.
+    #[inline]
+    pub fn new(
+        name: &CStr,
+        flags: WqFlags,
+        max_active: usize,
+    ) -> Result<DmaFenceWorkqueue, AllocError> {
+        let flags = flags | WqFlags::MEM_RECLAIM;
+        let queue = OwnedQueue::new(name, flags, max_active)?;
+        Ok(Self(queue))
+    }
+
+    /// Allocates a new DMA-fence constrained workqueue with a formatted name.
+    #[inline]
+    pub fn new_fmt(
+        name: core::fmt::Arguments<'_>,
+        flags: WqFlags,
+        max_active: usize,
+    ) -> Result<DmaFenceWorkqueue, AllocError> {
+        let flags = flags | WqFlags::MEM_RECLAIM;
+        let queue = OwnedQueue::new_fmt(name, flags, max_active)?;
+        Ok(Self(queue))
+    }
+
+    /// Enqueues a work item.
+    pub fn enqueue<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
+    where
+        W: RawDmaFenceWorkItem<ID> + Send + 'static,
+    {
+        self.0.enqueue(w)
+    }
+
+    /// Enqueues a delayed work item.
+    pub fn enqueue_delayed<W, const ID: u64>(&self, w: W, delay: Jiffies) -> W::EnqueueOutput
+    where
+        W: RawDmaFenceDelayedWorkItem<ID> + Send + 'static,
+    {
+        self.0.enqueue_delayed(w, delay)
+    }
+}
+
+/// Trait used for drivers signalling their DMA-fences from a threaded IRQ handler.
+pub trait DmaFenceIrqThreadedHandler: Sync {
+    /// The hard IRQ handler.
+    #[expect(unused_variables)]
+    fn handle(&self, device: &Device<Bound>) -> ThreadedIrqReturn {
+        ThreadedIrqReturn::WakeThread
+    }
+
+    /// The threaded IRQ handler, called within a [`DmaFenceSignallingAnnotation`] section.
+    fn handle_dma_fence_threaded(&self, device: &Device<Bound>) -> IrqReturn;
+}
+
+/// Adapter that wraps a [`DmaFenceIrqThreadedHandler`] to implement [`ThreadedHandler`].
+pub struct DmaFenceIrqAdapter<T: DmaFenceIrqThreadedHandler>(pub T);
+
+impl<T: DmaFenceIrqThreadedHandler + Send + 'static> ThreadedHandler for DmaFenceIrqAdapter<T> {
+    fn handle(&self, device: &Device<Bound>) -> ThreadedIrqReturn {
+        self.0.handle(device)
+    }
+
+    fn handle_threaded(&self, device: &Device<Bound>) -> IrqReturn {
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        self.0.handle_dma_fence_threaded(device)
     }
 }
