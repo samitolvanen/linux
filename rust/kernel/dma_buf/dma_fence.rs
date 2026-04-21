@@ -8,6 +8,8 @@
 //! C header: [`include/linux/dma-fence.h`](srctree/include/linux/dma-fence.h)
 
 use core::{
+	marker::PhantomData,
+	mem::ManuallyDrop,
 	ops::{
 		Deref,
 		DerefMut,
@@ -464,4 +466,159 @@ impl<T: DriverDmaFenceOps> DerefMut for DriverDmaFenceInner<T> {
 	fn deref_mut(&mut self) -> &mut T {
 		&mut self.data
 	}
+}
+
+/// Trait for DMA fence visibility states.
+///
+/// Implemented by [`Private`] and [`Published`].
+pub trait DriverDmaFenceVisibility {
+    /// Whether fences in this state have been published (shared with the
+    /// outside world).
+    const PUBLISHED: bool;
+}
+
+/// A fence that has not yet been published. It can still be freely mutated
+/// and has not been shared with any external consumer.
+pub struct Private;
+impl DriverDmaFenceVisibility for Private {
+    const PUBLISHED: bool = false;
+}
+
+/// A fence that has been published. An [`ARef<PublicDmaFence>`] has been
+/// handed out and the fence may be waited on by external consumers. The
+/// only remaining operation is to signal it.
+pub struct Published;
+impl DriverDmaFenceVisibility for Published {
+    const PUBLISHED: bool = true;
+}
+
+/// A driver-owned handle to a DMA fence with type-state visibility tracking.
+///
+/// - [`DriverDmaFence<T, Private>`]: a freshly allocated fence that has not
+///   been shared. Can be published via [`publish`](DriverDmaFence::publish).
+/// - [`DriverDmaFence<T, Published>`]: a fence that has been shared with
+///   external consumers. Can be signaled via
+///   [`signal`](DriverDmaFence::signal), which consumes the handle. If
+///   dropped without signaling, the fence is automatically signaled with
+///   `ECANCELED`.
+///
+/// # Invariants
+///
+/// `inner` contains a valid `ARef<DriverDmaFenceInner<T>>`.
+pub struct DriverDmaFence<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility = Private> {
+    inner: ManuallyDrop<ARef<DriverDmaFenceInner<T>>>,
+    visibility: PhantomData<V>,
+}
+
+// SAFETY: The underlying dma_fence is thread-safe.
+unsafe impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Send for DriverDmaFence<T, V> {}
+// SAFETY: The underlying dma_fence is thread-safe.
+unsafe impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Sync for DriverDmaFence<T, V> {}
+
+impl<T: DriverDmaFenceOps> DriverDmaFence<T, Private> {
+    /// Allocate a new private DMA fence.
+    ///
+    /// The fence is initialized with the given context ID and sequence number
+    /// but is not yet visible to any external consumer.
+    pub fn new(data: T, ctx: u64, seqno: u64) -> Result<Self> {
+        let fence = DriverDmaFenceInner::new(data, ctx, seqno)?;
+
+        Ok(Self {
+            inner: ManuallyDrop::new(fence),
+            visibility: PhantomData,
+        })
+    }
+
+    /// Publish the fence, making it visible to external consumers.
+    ///
+    /// Returns the published driver fence handle and an [`ARef<PublicDmaFence>`]
+    /// that can be shared with waiters.
+    pub fn publish(self) -> (DriverDmaFence<T, Published>, ARef<PublicDmaFence>) {
+        let mut fence = self;
+
+        // Create a new public reference by incrementing the refcount.
+        let pub_fence: ARef<PublicDmaFence> = fence.inner.fence.get().into();
+
+        // SAFETY: We are consuming `fence` and transferring the ARef to the
+        // new Published handle. `core::mem::forget` prevents double-drop.
+        let drv_fence = unsafe { ManuallyDrop::take(&mut fence.inner) };
+        core::mem::forget(fence);
+
+        (
+            DriverDmaFence {
+                inner: ManuallyDrop::new(drv_fence),
+                visibility: PhantomData,
+            },
+            pub_fence,
+        )
+    }
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DriverDmaFence<T, V> {
+    /// Access the inner fence object.
+    pub fn inner(&self) -> &DriverDmaFenceInner<T> {
+        &self.inner
+    }
+}
+
+impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {
+    /// Signal the fence with the given result.
+    ///
+    /// Consumes `self`, enforcing at the type level that a fence can only be
+    /// signaled once.
+    ///
+    /// - `Ok(())` signals successful completion.
+    /// - `Err(e)` sets the error on the fence before signaling.
+    pub fn signal(self, result: Result) {
+        let raw_fence = self.inner.fence.get();
+
+		// SAFETY: `raw_fence` is owned by this handle and remains valid for the
+		// duration of the signaling sequence.
+        unsafe {
+            if let Err(e) = result {
+                bindings::dma_fence_set_error(raw_fence, e.to_errno());
+            }
+            bindings::dma_fence_signal(raw_fence);
+        }
+
+        // `self` is dropped here. Since the fence is now signaled, Drop
+        // won't signal ECANCELED.
+    }
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Drop for DriverDmaFence<T, V> {
+    fn drop(&mut self) {
+        // SAFETY: Take the ARef — this is only called on drop, so it's the
+        // final use of `self.inner`. Wrap in ManuallyDrop to prevent
+        // ARef::drop from running — we manage the put manually below.
+        let drv_fence = ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut self.inner) });
+        let raw_fence = drv_fence.fence.get();
+
+        if V::PUBLISHED {
+            // Safety net: if a published fence is dropped without being
+            // signaled, signal it with ECANCELED so waiters don't hang.
+			// SAFETY: `raw_fence` remains valid while this handle still owns the
+			// final driver reference.
+            if !unsafe { bindings::dma_fence_is_signaled(raw_fence) } {
+				// SAFETY: The fence is still valid and we are setting the terminal
+				// error immediately before signaling it.
+                unsafe { bindings::dma_fence_set_error(raw_fence, -(bindings::ECANCELED as i32)) };
+				// SAFETY: The fence is valid and still owned by this handle.
+				unsafe { bindings::dma_fence_signal(raw_fence) };
+            }
+        }
+
+        // SAFETY: We are the sole owner of the DriverDmaFence handle, so no
+        // one else can access T. The pointer is valid — drv_fence is alive
+        // (ManuallyDrop prevents ARef::drop).
+        unsafe { core::ptr::drop_in_place((&raw const drv_fence.data).cast_mut()) };
+
+        // Release our reference. When the refcount reaches 0, C calls
+        // dma_fence_free directly (ops->release is NULL) to free the
+        // allocation. T is already dropped above.
+        //
+        // SAFETY: `raw_fence` is valid and has a non-zero refcount since we own
+        // the ARef.
+        unsafe { bindings::dma_fence_put(raw_fence) };
+    }
 }
