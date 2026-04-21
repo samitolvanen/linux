@@ -8,6 +8,10 @@
 //! C header: [`include/linux/dma-fence.h`](srctree/include/linux/dma-fence.h)
 
 use core::{
+	ops::{
+		Deref,
+		DerefMut,
+	},
 	ptr::NonNull,
 	sync::atomic::{
 		AtomicU64,
@@ -15,8 +19,11 @@ use core::{
 	},
 };
 
+use pin_init::pin_init_from_closure;
+
 use crate::{
 	bindings,
+	c_str,
 	error::to_result,
 	prelude::*,
 	sync::aref::{
@@ -279,5 +286,182 @@ impl Drop for DmaFenceSignallingAnnotation {
 	fn drop(&mut self) {
 		// SAFETY: The cookie was returned by `dma_fence_begin_signalling()`.
 		unsafe { bindings::dma_fence_end_signalling(self.cookie) };
+	}
+}
+
+/// Trait for driver-specific DMA fence operations.
+#[vtable]
+pub trait DriverDmaFenceOps: Sized + Send + Sync {
+	/// Returns the driver name. This is a callback to allow drivers to
+	/// compute the name at runtime, without having it to store permanently
+	/// for each fence, or build a cache of some sort.
+	fn driver_name(&self) -> &'static CStr;
+
+	/// Return the name of the context this fence belongs to. This is a
+	/// callback to allow drivers to compute the name at runtime, without
+	/// having it to store permanently for each fence, or build a cache of
+	/// some sort.
+	fn timeline_name(&self) -> &'static CStr;
+}
+
+/// The in-memory representation of a driver-specific DMA fence.
+///
+/// Contains the raw `dma_fence`, its per-fence spinlock, and the driver's
+/// private data of type `T`.
+///
+/// # Invariants
+///
+/// The `fence` field is always a valid, initialized `dma_fence` whose `ops`
+/// pointer refers to `Self::OPS`.
+#[repr(C)]
+#[pin_data]
+pub struct DriverDmaFenceInner<T: DriverDmaFenceOps> {
+	#[pin]
+	fence: Opaque<bindings::dma_fence>,
+	#[pin]
+	lock: Opaque<bindings::spinlock>,
+	data: T,
+}
+
+// SAFETY: These implement the C backend's refcounting methods which are
+// proven to work correctly.
+unsafe impl<T: DriverDmaFenceOps> AlwaysRefCounted for DriverDmaFenceInner<T> {
+	fn inc_ref(&self) {
+		// SAFETY: `self.fence.get()` is a pointer to a valid `struct dma_fence`.
+		unsafe { bindings::dma_fence_get(self.fence.get()) };
+	}
+
+	unsafe fn dec_ref(obj: NonNull<Self>) {
+		// SAFETY: `obj` is never NULL, and when `dec_ref()` is called the fence
+		// is still valid and has a non-zero refcount.
+		unsafe {
+			let raw_fence = (*obj.as_ptr()).fence.get();
+			bindings::dma_fence_put(raw_fence);
+		}
+	}
+}
+
+#[allow(dead_code)]
+impl<T: DriverDmaFenceOps> DriverDmaFenceInner<T> {
+	const OPS: bindings::dma_fence_ops = bindings::dma_fence_ops {
+		get_driver_name: Some(Self::get_driver_name_cb),
+		get_timeline_name: Some(Self::get_timeline_name_cb),
+		enable_signaling: None,
+		signaled: None,
+		wait: None,
+		release: None,
+		set_deadline: None,
+	};
+
+	/// Create a [`PinInit`] that initializes a `DriverDmaFenceInner<T>` with
+	/// the given driver data, context ID, and sequence number.
+	fn new_init(data: T, ctx: u64, seqno: u64) -> impl PinInit<Self> {
+		// SAFETY: All three fields (`lock`, `fence`, `data`) are fully
+		// initialized inside the closure before it returns `Ok(())`.
+		// `dma_fence_init` runs after `__spin_lock_init`, so the lock pointer is
+		// valid. Initialization is infallible, so there is no partially
+		// initialized state to unwind.
+		unsafe {
+			pin_init_from_closure(move |slot: *mut Self| {
+				(&raw mut (*slot).data).write(data);
+
+				bindings::__spin_lock_init(
+					Opaque::cast_into((&raw mut (*slot).lock).cast_const()),
+					c_str!("drv_dma_fence").as_char_ptr(),
+					crate::static_lock_class!().as_ptr(),
+				);
+
+				bindings::dma_fence_init(
+					Opaque::cast_into((&raw mut (*slot).fence).cast_const()),
+					&Self::OPS,
+					Opaque::cast_into((&raw mut (*slot).lock).cast_const()),
+					ctx,
+					seqno,
+				);
+
+				Ok(())
+			})
+		}
+	}
+
+	/// Allocate and initialize a new `DriverDmaFenceInner<T>`.
+	///
+	/// Returns an `ARef` owning the initial reference created by
+	/// `dma_fence_init`.
+	fn new(data: T, ctx: u64, seqno: u64) -> Result<ARef<Self>> {
+		let boxed = KBox::pin_init(Self::new_init(data, ctx, seqno), GFP_KERNEL)?;
+
+		// Leak the KBox. From this point the C dma_fence refcounting owns the
+		// allocation and the pin guarantee is upheld by that subsystem.
+		// SAFETY: The allocation was just pinned by `KBox::pin_init`, and the
+		// dma_fence backend owns the stable allocation after we leak it.
+		let raw = KBox::into_raw(unsafe { Pin::into_inner_unchecked(boxed) });
+
+		// SAFETY: `raw` is valid and we own the one reference created by
+		// `dma_fence_init`, so take ownership without bumping the refcount.
+		Ok(unsafe { ARef::from_raw(NonNull::new_unchecked(raw)) })
+	}
+
+	/// Recover a `&DriverDmaFenceInner<T>` from a raw `*mut dma_fence`.
+	///
+	/// # Safety
+	///
+	/// `raw_fence` must point at a `dma_fence` embedded in a
+	/// `DriverDmaFenceInner<T>`.
+	unsafe fn from_raw<'a>(raw_fence: *mut bindings::dma_fence) -> &'a Self {
+		// SAFETY: `raw_fence` points at the embedded `fence` field of a valid
+		// `DriverDmaFenceInner<T>` per the function contract.
+		unsafe {
+			&*crate::container_of!(raw_fence.cast::<Opaque<bindings::dma_fence>>(), Self, fence)
+		}
+	}
+
+	/// Returns a pointer to the raw `dma_fence`.
+	pub(crate) fn raw(&self) -> *mut bindings::dma_fence {
+		self.fence.get()
+	}
+
+	/// Returns the fence's sequence number.
+	pub fn seqno(&self) -> u64 {
+		// SAFETY: The fence is initialized per the type invariant.
+		unsafe { (*self.fence.get()).seqno }
+	}
+
+	/// # Safety
+	///
+	/// `fence` must have been initialized by `DriverDmaFenceInner::new_init`
+	/// and therefore belong to a live `DriverDmaFenceInner<T>`.
+	unsafe extern "C" fn get_driver_name_cb(
+		fence: *mut bindings::dma_fence,
+	) -> *const crate::ffi::c_char {
+		// SAFETY: The fence was created by `DriverDmaFenceInner::new_init`.
+		let fence = unsafe { Self::from_raw(fence) };
+		fence.data.driver_name().as_char_ptr()
+	}
+
+	/// # Safety
+	///
+	/// `fence` must have been initialized by `DriverDmaFenceInner::new_init`
+	/// and therefore belong to a live `DriverDmaFenceInner<T>`.
+	unsafe extern "C" fn get_timeline_name_cb(
+		fence: *mut bindings::dma_fence,
+	) -> *const crate::ffi::c_char {
+		// SAFETY: The fence was created by `DriverDmaFenceInner::new_init`.
+		let fence = unsafe { Self::from_raw(fence) };
+		fence.data.timeline_name().as_char_ptr()
+	}
+}
+
+impl<T: DriverDmaFenceOps> Deref for DriverDmaFenceInner<T> {
+	type Target = T;
+
+	fn deref(&self) -> &T {
+		&self.data
+	}
+}
+
+impl<T: DriverDmaFenceOps> DerefMut for DriverDmaFenceInner<T> {
+	fn deref_mut(&mut self) -> &mut T {
+		&mut self.data
 	}
 }
