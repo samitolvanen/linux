@@ -82,13 +82,15 @@ pub enum AllocKind {
     Alloc,
     /// Consider the first element to be at index 1.
     Alloc1,
+    /// Consider the first element to be at index 0, suitable for cyclic allocation.
+    AllocCyclic,
 }
 
 impl<T: ForeignOwnable> XArray<T> {
     /// Creates a new initializer for this type.
     pub fn new(kind: AllocKind) -> impl PinInit<Self> {
         let flags = match kind {
-            AllocKind::Alloc => bindings::XA_FLAGS_ALLOC,
+            AllocKind::Alloc | AllocKind::AllocCyclic => bindings::XA_FLAGS_ALLOC,
             AllocKind::Alloc1 => bindings::XA_FLAGS_ALLOC1,
         };
         pin_init!(Self {
@@ -178,6 +180,33 @@ impl<T> From<StoreError<T>> for Error {
     }
 }
 
+/// A range of valid indices for XArray allocation.
+///
+/// Used with [`Guard::alloc_cyclic`] to constrain which indices are allocated.
+/// Wraps the C `struct xa_limit`.
+#[derive(Copy, Clone)]
+pub struct XaLimit {
+    inner: bindings::xa_limit,
+}
+
+impl XaLimit {
+    /// Create a new limit with the given inclusive min/max bounds.
+    pub const fn new(min: u32, max: u32) -> Self {
+        Self {
+            inner: bindings::xa_limit { min, max },
+        }
+    }
+
+    /// Limit to 32-bit indices: `[0, u32::MAX]`.
+    pub const LIMIT_32B: Self = Self::new(0, u32::MAX);
+
+    /// Limit to 31-bit indices: `[0, i32::MAX as u32]`.
+    pub const LIMIT_31B: Self = Self::new(0, i32::MAX as u32);
+
+    /// Limit to 16-bit indices: `[0, u16::MAX as u32]`.
+    pub const LIMIT_16B: Self = Self::new(0, u16::MAX as u32);
+}
+
 impl<'a, T: ForeignOwnable> Guard<'a, T> {
     fn load<F, U>(&self, index: usize, f: F) -> Option<U>
     where
@@ -265,6 +294,54 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
             // NB: `XA_ZERO_ENTRY` is never returned by functions belonging to the Normal XArray
             // API; such entries present as `NULL`.
             Ok(unsafe { T::try_from_foreign(old) })
+        }
+    }
+
+    /// Allocates the next available index cyclically and stores the given value there.
+    ///
+    /// Starting from `*next`, wraps around within `limit`, and stores `value` at the
+    /// allocated index. On success, returns the allocated index and updates `*next`.
+    ///
+    /// May drop the lock if needed to allocate memory, and then reacquire it afterwards.
+    pub fn alloc_cyclic(
+        &mut self,
+        value: T,
+        limit: XaLimit,
+        next: &mut u32,
+        gfp: alloc::Flags,
+    ) -> Result<usize, StoreError<T>> {
+        build_assert!(
+            T::FOREIGN_ALIGN >= 4,
+            "pointers stored in XArray must be 4-byte aligned"
+        );
+        let new = value.into_foreign();
+        let mut id: u32 = 0;
+
+        // SAFETY:
+        // - `self.xa.xa` is always valid by the type invariant.
+        // - The caller holds the lock.
+        // - `new` came from `T::into_foreign` and satisfies alignment requirements.
+        let ret = unsafe {
+            bindings::__xa_alloc_cyclic(
+                self.xa.xa.get(),
+                &mut id,
+                new.cast(),
+                limit.inner,
+                next,
+                gfp.as_raw(),
+            )
+        };
+
+        if ret < 0 {
+            // SAFETY: `new` came from `T::into_foreign` and `__xa_alloc_cyclic` does not
+            // take ownership on error.
+            let value = unsafe { T::from_foreign(new) };
+            Err(StoreError {
+                value,
+                error: Error::from_errno(ret),
+            })
+        } else {
+            Ok(id as usize)
         }
     }
 }
