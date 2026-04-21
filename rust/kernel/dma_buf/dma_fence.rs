@@ -35,6 +35,7 @@ use crate::{
 	sync::LockClassKey,
 	time::Jiffies,
 	types::{
+		ForeignOwnable,
 		NotThreadSafe,
 		Opaque,
 	},
@@ -804,5 +805,122 @@ impl<T: DriverDmaFenceOps> Drop for UninitDmaFence<T> {
                 ptr.cast::<core::mem::ManuallyDrop<DriverDmaFenceInner<T>>>(),
             )
         });
+    }
+}
+
+/// A borrowed reference to a [`DriverDmaFence`].
+///
+/// This is used by the [`ForeignOwnable`] implementation to provide borrowed
+/// access to a `DriverDmaFence`.
+pub struct DriverDmaFenceBorrow<'a, T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> {
+    // We just borrow the DriverDmaFenceInner, so we don't want Drop to be
+    // called on the DriverDmaFence.
+    inner: ManuallyDrop<DriverDmaFence<T, V>>,
+    _p: PhantomData<&'a ()>,
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Deref for DriverDmaFenceBorrow<'_, T, V> {
+    type Target = DriverDmaFence<T, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// A mutably borrowed reference to a [`DriverDmaFence`].
+///
+/// This is used by the [`ForeignOwnable`] implementation to provide mutably borrowed
+/// access to a `DriverDmaFence`.
+pub struct DriverDmaFenceBorrowMut<'a, T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> {
+    // We just borrow the DriverDmaFenceInner, so we don't want Drop to be
+    // called on the DriverDmaFence.
+    inner: ManuallyDrop<DriverDmaFence<T, V>>,
+    _p: PhantomData<&'a mut ()>,
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Deref
+    for DriverDmaFenceBorrowMut<'_, T, V>
+{
+    type Target = DriverDmaFence<T, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DerefMut
+    for DriverDmaFenceBorrowMut<'_, T, V>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+// SAFETY: `DriverDmaFence` wraps a refcounted `ARef<DriverDmaFenceInner<T>>`, so
+// the raw pointer roundtrip through `into_foreign`/`from_foreign` preserves all
+// invariants.
+unsafe impl<T: DriverDmaFenceOps + 'static, V: DriverDmaFenceVisibility> ForeignOwnable
+    for DriverDmaFence<T, V>
+{
+    const FOREIGN_ALIGN: usize = core::mem::align_of::<DriverDmaFenceInner<T>>();
+
+    type Borrowed<'a> = DriverDmaFenceBorrow<'a, T, V>;
+    type BorrowedMut<'a> = DriverDmaFenceBorrowMut<'a, T, V>;
+
+    fn into_foreign(self) -> *mut crate::ffi::c_void {
+        let mut fence = self;
+        // SAFETY: We're consuming self, so taking the ARef is safe.
+        let drv_fence = unsafe { ManuallyDrop::take(&mut fence.inner) };
+        core::mem::forget(fence);
+
+        ARef::into_raw(drv_fence).as_ptr().cast()
+    }
+
+    unsafe fn from_foreign(ptr: *mut crate::ffi::c_void) -> Self {
+        // SAFETY: The safety requirements of this method ensure that `ptr` is a
+        // valid pointer to a `DriverDmaFenceInner<T>` that was created by a
+        // previous call to `into_foreign`.
+        let inner = unsafe {
+            ARef::from_raw(NonNull::<DriverDmaFenceInner<T>>::new_unchecked(ptr.cast()))
+        };
+
+        Self {
+            inner: ManuallyDrop::new(inner),
+            visibility: PhantomData,
+        }
+    }
+
+    unsafe fn borrow<'a>(ptr: *mut crate::ffi::c_void) -> Self::Borrowed<'a> {
+        // SAFETY: The safety requirements of this method ensure that `ptr` is a
+        // valid pointer to a `DriverDmaFenceInner<T>` that was created by a
+        // previous call to `into_foreign`.
+        let inner = unsafe {
+            ARef::from_raw(NonNull::<DriverDmaFenceInner<T>>::new_unchecked(ptr.cast()))
+        };
+
+        DriverDmaFenceBorrow {
+            inner: ManuallyDrop::new(DriverDmaFence {
+                inner: ManuallyDrop::new(inner),
+                visibility: PhantomData,
+            }),
+            _p: PhantomData,
+        }
+    }
+
+    unsafe fn borrow_mut<'a>(ptr: *mut crate::ffi::c_void) -> Self::BorrowedMut<'a> {
+        // SAFETY: The safety requirements of this method ensure that `ptr` is a
+        // valid pointer to a `DriverDmaFenceInner<T>` that was created by a
+        // previous call to `into_foreign`.
+        let inner = unsafe {
+            ARef::from_raw(NonNull::<DriverDmaFenceInner<T>>::new_unchecked(ptr.cast()))
+        };
+
+        DriverDmaFenceBorrowMut {
+            inner: ManuallyDrop::new(DriverDmaFence {
+                inner: ManuallyDrop::new(inner),
+                visibility: PhantomData,
+            }),
+            _p: PhantomData,
+        }
     }
 }
