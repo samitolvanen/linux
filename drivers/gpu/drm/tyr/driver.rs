@@ -198,7 +198,7 @@ impl platform::Driver for TyrPlatformDriver {
             .wait_ready(1000)
             .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
-        firmware.enable_global_interface()?;
+        firmware.enable_global_interface(&gpu_info, &core_clk)?;
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,

@@ -41,18 +41,32 @@
 
 use iface::FwInterface;
 use kernel::{
+    clk::Clk,
     device::Device,
     io::{
+        register::Array,
         Io,
         Region, //
     },
+    num::Bounded,
     prelude::*,
-    sync::Arc, //
+    sizes::SizeConstants,
+    sync::Arc,
+    time::arch_timer_get_rate, //
 };
 
-use crate::fw::{
-    region::FwRegion,
-    Section, //
+use crate::{
+    driver::IoMem,
+    fw::{
+        region::FwRegion,
+        Section, //
+    },
+    gpu::GpuInfo,
+    regs::doorbell_block::DOORBELL,
+    wait::{
+        Wait,
+        WaitResult, //
+    }, //
 };
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
@@ -1685,8 +1699,93 @@ use cs::*;
 use csg::*;
 use glb::{
     control::*,
+    input::*,
+    output::GLB_ACK,
     *, //
 };
+
+/// Converts a timeout in microseconds to a timeout field value and timer source.
+///
+/// The firmware supports two timer sources:
+/// - System timestamp (arch timer): preferred when available, so the timeout
+///   tracks real elapsed time independently of GPU clock rate.
+/// - GPU cycle counter: fallback when the system timestamp is unavailable.
+///
+/// Returns the encoded timeout value and the selected timer source.
+fn conv_timeout(core_clk: &Clk, timeout_us: u32) -> Result<(u32, TimestampSource)> {
+    // The max timeout is determined by the 31 bit size of the timeout field.
+    let max_timeout = (1u32 << 31) - 1;
+    let core_rate = core_clk.rate().as_hz() as u64;
+
+    let (timer_rate, timer_source) = match arch_timer_get_rate() {
+        Some(rate) => (u64::from(rate), TimestampSource::SystemTimestamp),
+        _ if core_rate != 0 => (core_rate, TimestampSource::GpuCounter),
+        _ => return Err(EINVAL),
+    };
+
+    let timeout_in_cycles = u64::from(timeout_us) * timer_rate;
+
+    // The hardware stores the represented timeout value with a shr(10) to save space.
+    let timeout_shift = u64::SZ_1K;
+    let us_per_second = 1_000_000u64;
+
+    let timeout_val = timeout_in_cycles.div_ceil(us_per_second * timeout_shift);
+    let timeout_val = timeout_val.min(u64::from(max_timeout)) as u32;
+
+    Ok((timeout_val, timer_source))
+}
+
+/// Request/acknowledge communication between Tyr and CSF.
+struct GlobalInterfaceRequests<'a> {
+    /// Global input block where driver writes requests.
+    input: &'a FwInterface<FwRegion<GLB_INPUT_BLOCK_SIZE>>,
+    /// Global output block where firmware writes acknowledgements.
+    output: &'a FwInterface<Region<GLB_OUTPUT_BLOCK_SIZE>>,
+}
+
+impl<'a> GlobalInterfaceRequests<'a> {
+    fn new(
+        input: &'a FwInterface<FwRegion<GLB_INPUT_BLOCK_SIZE>>,
+        output: &'a FwInterface<Region<GLB_OUTPUT_BLOCK_SIZE>>,
+    ) -> Self {
+        Self { input, output }
+    }
+
+    /// Waits for the firmware to acknowledge the given request bits.
+    ///
+    /// The ack condition is `(GLB_ACK & mask) == (GLB_REQ & mask)`.
+    fn wait_acks(&self, reqs_mask: GLB_REQ, event_wait: &Wait, timeout_ms: u32) -> Result {
+        let mask = reqs_mask.into_raw();
+
+        event_wait.wait_interruptible_timeout(timeout_ms, || {
+            let req = self.input.read(GLB_REQ).into_raw() & mask;
+            let ack = self.output.read(GLB_ACK).into_raw() & mask;
+            if req == ack {
+                Ok(WaitResult::Done)
+            } else {
+                Ok(WaitResult::Retry)
+            }
+        })
+    }
+
+    /// Use to make requests, where simply changing the bit value is
+    /// sufficient to make a request; the bit value has no meaning in itself.
+    fn toggle_requests(&self, reqs_mask: GLB_REQ) -> Result {
+        let reqs_mask_val = reqs_mask.into_raw();
+
+        let cur_ack_val = self.output.read(GLB_ACK).into_raw();
+
+        // Calculate which bits to toggle based on ACK state
+        let toggled_bits = (cur_ack_val ^ reqs_mask_val) & reqs_mask_val;
+
+        let cur_req_val = self.input.read(GLB_REQ).into_raw();
+        let preserved_bits = cur_req_val & !reqs_mask_val;
+        let new_val = toggled_bits | preserved_bits;
+
+        self.input.write(GLB_REQ, GLB_REQ::from_raw(new_val));
+        Ok(())
+    }
+}
 
 /// State of the global interface.
 enum GlobalInterfaceState {
@@ -1736,7 +1835,15 @@ impl GlobalInterface {
     /// This reads the firmware's control block to set up the global input/output
     /// interfaces; it configures timers and shader core allocation; and it discovers
     /// available CSG interfaces.
-    pub(crate) fn enable(&mut self, dev: &Device, shared_section: &Section<'_>) -> Result {
+    pub(crate) fn enable(
+        &mut self,
+        dev: &Device,
+        iomem: &IoMem<'_>,
+        shared_section: &Section<'_>,
+        gpu_info: &GpuInfo,
+        core_clk: &Clk,
+        event_wait: &Wait,
+    ) -> Result {
         let vmap = Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?;
         let va_range = shared_section.mem.va_range();
 
@@ -1779,6 +1886,20 @@ impl GlobalInterface {
             output_va.value().get().into(),
         )?;
 
+        Self::configure_glb_input(&glb_input, gpu_info, core_clk)?;
+        let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
+
+        // Ring the global doorbell to notify the MCU.
+        iomem.write(DOORBELL::at(0), DOORBELL::zeroed().with_ring(true));
+
+        // Wait for the firmware to acknowledge the initial global configuration.
+        let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
+
+        if let Err(e) = request_field.wait_acks(ack_mask, event_wait, 1000) {
+            dev_err!(dev, "CSF firmware failed to ACK initial GLB config");
+            return Err(e);
+        }
+
         // Read how many CSG interfaces exist.
         let csg_num = glb_control.read(GLB_GROUP_NUM).value().get();
 
@@ -1818,6 +1939,115 @@ impl GlobalInterface {
         self.state = GlobalInterfaceState::Enabled(enabled);
         self.init_csg(dev, shared_section)?;
         Ok(())
+    }
+
+    /// Programs GLB input-block configuration registers.
+    ///
+    /// Writes shader core allocation and timer values. These settings are applied
+    /// by firmware only after the corresponding GLB_REQ bits are updated.
+    fn configure_glb_input(
+        glb_input: &FwInterface<FwRegion<GLB_INPUT_BLOCK_SIZE>>,
+        gpu_info: &GpuInfo,
+        core_clk: &Clk,
+    ) -> Result {
+        // Make all present shader cores available for endpoint allocation.
+        glb_input.write(
+            GLB_ALLOC_EN,
+            GLB_ALLOC_EN::zeroed().with_mask(gpu_info.shader_present),
+        );
+
+        // Configure power-down delay for shader and tiler domains.
+        // The firmware powers down a domain after it has been idle for this duration,
+        // and cancels the timeout if work arrives before expiry.
+
+        // Power-down delay after idle, in microseconds.
+        const PWROFF_HYSTERESIS_US: u32 = 10_000;
+        let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk, PWROFF_HYSTERESIS_US)?;
+        let pwroff_timeout = Bounded::<u32, 31>::try_new(pwroff_timeout).ok_or(EINVAL)?;
+        glb_input.write(
+            GLB_PWROFF_TIMER,
+            GLB_PWROFF_TIMER::zeroed()
+                .with_timeout(pwroff_timeout)
+                .with_timer_source(pwroff_source),
+        );
+
+        // Configure forward progress timeout.
+        //
+        // Keep this aligned with panthor, which programs a fixed GPU-cycle timeout.
+        // The real-time duration therefore varies with the GPU clock rate (e.g. ~5.24 s
+        // at 500 MHz, longer at lower frequencies).
+        //
+        // The hardware stores the timeout in units of 1024 cycles, so encode the raw
+        // cycle count by shifting right by 10.
+        const PROGRESS_TIMEOUT_CYCLES: u32 = 5 * 500 * 1024 * 1024;
+        const PROGRESS_TIMEOUT_SCALE_SHIFT: u32 = 10;
+        let progress_timeout = PROGRESS_TIMEOUT_CYCLES >> PROGRESS_TIMEOUT_SCALE_SHIFT;
+        glb_input.write(
+            GLB_PROGRESS_TIMER,
+            GLB_PROGRESS_TIMER::zeroed().with_timeout(progress_timeout),
+        );
+
+        // Configure the delay before reporting the GPU as idle.
+        const IDLE_HYSTERESIS_US: u32 = 800;
+        let (idle_timeout, idle_source) = conv_timeout(core_clk, IDLE_HYSTERESIS_US)?;
+        let idle_timeout = Bounded::<u32, 31>::try_new(idle_timeout).ok_or(EINVAL)?;
+        glb_input.write(
+            GLB_IDLE_TIMER,
+            GLB_IDLE_TIMER::zeroed()
+                .with_timeout(idle_timeout)
+                .with_timer_source(idle_source),
+        );
+
+        Ok(())
+    }
+
+    /// Programs GLB_REQ and ACK IRQ mask after GLB input registers are configured.
+    ///
+    /// This sets desired persistent states, toggles configuration-update requests,
+    /// and returns the GLB_REQ bits that must be acknowledged by firmware.
+    fn configure_glb_requests(
+        glb_input: &FwInterface<FwRegion<GLB_INPUT_BLOCK_SIZE>>,
+        glb_output: &FwInterface<Region<GLB_OUTPUT_BLOCK_SIZE>>,
+    ) -> Result<GLB_REQ> {
+        // Firmware updates GLB_ACK (output block) in response to GLB_REQ.
+        // GLB_ACK_IRQ_MASK selects which of these updates trigger a host interrupt.
+        glb_input.write(
+            GLB_ACK_IRQ_MASK,
+            GLB_ACK_IRQ_MASK::zeroed()
+                .with_cfg_progress_timer(true)
+                .with_cfg_alloc_en(true)
+                .with_cfg_pwroff_timer(true)
+                .with_idle_enable(true)
+                .with_idle_event(true)
+                .with_counter_enable(true),
+        );
+
+        // Requests whose value represents the desired persistent state.
+        let cur_req = glb_input.read(GLB_REQ);
+        glb_input.write(
+            GLB_REQ,
+            cur_req.with_idle_enable(true).with_counter_enable(true),
+        );
+
+        let request_field = GlobalInterfaceRequests::new(glb_input, glb_output);
+
+        // Fields that require toggle semantics.
+        let toggle_mask = GLB_REQ::zeroed()
+            .with_cfg_progress_timer(true)
+            .with_cfg_alloc_en(true)
+            .with_cfg_pwroff_timer(true);
+
+        request_field.toggle_requests(toggle_mask)?;
+
+        // All fields we want to wait for completion on (REQ == ACK).
+        let ack_mask = GLB_REQ::zeroed()
+            .with_cfg_progress_timer(true)
+            .with_cfg_alloc_en(true)
+            .with_cfg_pwroff_timer(true)
+            .with_idle_enable(true)
+            .with_counter_enable(true);
+
+        Ok(ack_mask)
     }
 
     /// Initialize CSG interfaces.
