@@ -263,8 +263,9 @@ impl Pool {
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
+        // GFP_ATOMIC: store runs under self.xa's spinlock.
         guard
-            .store(index, heap_ctx, GFP_KERNEL)
+            .store(index, heap_ctx, GFP_ATOMIC)
             .map_err(|_| EINVAL)?;
 
         Ok(CreatedContext {

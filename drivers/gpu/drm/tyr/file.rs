@@ -16,6 +16,7 @@ use kernel::{
     io::Io,
     kvec,
     prelude::*,
+    sync::Arc,
     transmute::{
         AsBytes,
         FromBytes, //
@@ -93,7 +94,11 @@ pub(crate) struct TyrDrmFileData {
     group_pool: group::Pool,
 
     /// Heap pools, indexed by VM ID.
-    heap_pools: Pin<KBox<XArray<KBox<heap::Pool>>>>,
+    ///
+    /// Stored as `Arc` so we can clone the reference and release the XArray
+    /// spinlock before doing any sleeping work (e.g. pool creation or
+    /// `create_heap_context` which takes the `gpu_contexts` mutex).
+    heap_pools: Pin<KBox<XArray<Arc<heap::Pool>>>>,
 
     /// Reference to the device for cleanup
     tdev: ARef<TyrDrmDevice>,
@@ -681,20 +686,30 @@ impl TyrDrmFileData {
             target_in_flight: heapcreate.target_in_flight,
         };
 
+        // Get or create the heap pool for this VM.  We must not hold the
+        // XArray spinlock while doing any sleeping work, so we clone the Arc
+        // under the lock and then drop it before calling into the pool.
         let file_inner = file.inner();
         let xa = file_inner.heap_pools.as_ref();
 
-        {
+        let pool: Arc<heap::Pool> = {
             let guard = xa.lock();
-            if guard.get(vm_id).is_none() {
+            if let Some(existing) = guard.get(vm_id) {
+                // Pool already exists — clone Arc and release spinlock.
+                existing.into()
+            } else {
                 drop(guard);
-                let pool = KBox::new(heap::Pool::create(ddev, vm.clone())?, GFP_KERNEL)?;
-                xa.lock().store(vm_id, pool, GFP_KERNEL)?;
+                let new_pool = Arc::pin_init(heap::Pool::create(ddev, vm.clone())?, GFP_KERNEL)?;
+                let mut guard = xa.lock();
+                if let Some(existing) = guard.get(vm_id) {
+                    existing.into()
+                } else {
+                    guard.store(vm_id, new_pool.clone(), GFP_ATOMIC)?;
+                    new_pool
+                }
             }
-        }
+        };
 
-        let guard = xa.lock();
-        let pool = guard.get(vm_id).ok_or(EINVAL)?;
         let created_context = pool.create_heap_context(ddev, args)?;
 
         heapcreate.handle = heapcreate.vm_id << 16 | created_context.context_id as u32;
@@ -714,8 +729,10 @@ impl TyrDrmFileData {
 
         let file_inner = file.inner();
         let xa = file_inner.heap_pools.as_ref();
-        let guard = xa.lock();
-        let pool = guard.get(vm_id).ok_or(EINVAL)?;
+
+        // Clone the Arc under the spinlock, then release it before calling
+        // destroy_heap_context (which takes the pool's inner XArray spinlock).
+        let pool: Arc<heap::Pool> = xa.lock().get(vm_id).ok_or(EINVAL)?.into();
         pool.destroy_heap_context(heap_idx).ok_or(EINVAL)?;
 
         Ok(0)
