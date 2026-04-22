@@ -677,12 +677,18 @@ impl Firmware {
         &self,
         tdev: &TyrDrmDevice,
         gpu_info: &crate::gpu::GpuInfo,
-        core_clk: &kernel::clk::Clk,
+        core_clk_rate: u64,
         prealloc_csgs: KVec<global::csg::CommandStreamGroup>,
         prealloc_streams: KVec<KVec<global::cs::CommandStream>>,
     ) -> Result {
         self.with_locked_global_iface(|glb| {
-            glb.enable(tdev, gpu_info, core_clk, prealloc_csgs, prealloc_streams)
+            glb.enable(
+                tdev,
+                gpu_info,
+                core_clk_rate,
+                prealloc_csgs,
+                prealloc_streams,
+            )
         })
     }
 }

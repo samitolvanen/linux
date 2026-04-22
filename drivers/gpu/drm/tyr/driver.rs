@@ -313,16 +313,18 @@ impl platform::Driver for TyrPlatformDriverData {
         // Enable the global interface now that the MCU has booted and IRQs are
         // registered. This reads the control structures from the shared section,
         // sets up CSG slots, configures timers, and starts the ping watchdog.
-        {
+        let core_clk_rate = {
             let clks = tdev.clks.lock();
-            tdev.fw.enable_global_iface(
-                &tdev,
-                &tdev.gpu_info,
-                &clks.core,
-                prealloc_csgs,
-                prealloc_streams,
-            )?;
-        }
+            clks.core.rate().as_hz() as u64
+        };
+
+        tdev.fw.enable_global_iface(
+            &tdev,
+            &tdev.gpu_info,
+            core_clk_rate,
+            prealloc_csgs,
+            prealloc_streams,
+        )?;
 
         // Initialize the scheduler now that the global interface is enabled.
         // This reads CSG/CS slot counts from the firmware and prepares the

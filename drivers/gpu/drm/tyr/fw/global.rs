@@ -9,7 +9,6 @@ use csg::CommandStreamGroup;
 use kernel::workqueue;
 use kernel::{
     bits::genmask_u32,
-    clk::Clk,
     devres::Devres,
     impl_has_delayed_work,
     io,
@@ -25,6 +24,7 @@ use kernel::{
         Mutex, //
     },
     time,
+    time::arch_timer,
     types::ARef,
     workqueue::WorkItem, //
 };
@@ -109,8 +109,15 @@ fn glb_timer_val(val: u32) -> u32 {
 struct TimeoutCycles(u32);
 
 impl TimeoutCycles {
-    fn from_micro(core_clk: &Clk, timeout_us: u32) -> Result<Self> {
-        let timer_rate = core_clk.rate().as_hz() as u64;
+    fn from_micro(core_clk_rate: u64, timeout_us: u32) -> Result<Self> {
+        // Prefer the architected timer rate so the firmware can compare its
+        // (architected) counter against our timeout values directly.  When
+        // it is not available, fall back to the core clock rate and ask the
+        // firmware to drive timeouts from its own GPU cycle counter.
+        let (timer_rate, use_cycle_counter) = match arch_timer::cntfrq_hz() {
+            Some(r) => (u64::from(r), false),
+            None => (core_clk_rate, true),
+        };
 
         if timer_rate == 0 {
             return Err(EINVAL);
@@ -124,9 +131,11 @@ impl TimeoutCycles {
         }
 
         let mod_cycles = u32::try_from(mod_cycles)?;
-        Ok(Self(
-            glb_timer_val(mod_cycles) | GLB_TIMER_SOURCE_GPU_COUNTER,
-        ))
+        let mut val = glb_timer_val(mod_cycles);
+        if use_cycle_counter {
+            val |= GLB_TIMER_SOURCE_GPU_COUNTER;
+        }
+        Ok(Self(val))
     }
 }
 
@@ -334,12 +343,11 @@ impl GlobalInterface {
         &mut self,
         tdev: &TyrDrmDevice,
         gpu_info: &GpuInfo,
-        core_clk: &Clk,
+        core_clk_rate: u64,
         mut csgs: KVec<CommandStreamGroup>,
         mut streams_per_csg: KVec<KVec<cs::CommandStream>>,
     ) -> Result {
-        // This takes a mutex internally in clk_prepare().
-        let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
+        let poweroff_timer = TimeoutCycles::from_micro(core_clk_rate, PWROFF_HYSTERESIS_US)?.into();
 
         let control = self.read_control_after_boot()?;
 
