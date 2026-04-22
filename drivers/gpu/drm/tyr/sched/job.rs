@@ -242,6 +242,7 @@ impl Job {
                 }
             } else {
                 queue.kick()?;
+                crate::devfreq::record_busy(&self.group.tdev);
             }
 
             Ok(())

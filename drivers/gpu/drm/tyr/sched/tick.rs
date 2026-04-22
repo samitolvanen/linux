@@ -2,6 +2,7 @@
 
 use super::Scheduler;
 use crate::{
+    devfreq,
     driver::{
         work_id,
         TyrDrmDevice,
@@ -641,6 +642,12 @@ impl<'a> Tick<'a> {
             .sched
             .prune_destroyed_groups(&mut self.teardown_groups[self.num_teardown..]);
         self.num_teardown += count;
+
+        if decision.all_idle {
+            crate::devfreq::record_idle(data);
+        } else {
+            crate::devfreq::record_busy(data);
+        }
 
         self.update_status_and_resched(data, decision);
         Ok(())
