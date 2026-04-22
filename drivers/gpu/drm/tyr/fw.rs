@@ -655,13 +655,35 @@ impl Firmware {
     ///
     /// This reads the control structures from the shared section, sets up CSG
     /// slots, configures timers, and enables the global interface for use.
+    ///
+    /// `prealloc_csgs` and `prealloc_streams` must have been created with
+    /// `KVec::with_capacity` sized to match [`McuTopology::group_num`] /
+    /// [`McuTopology::stream_num`] from a prior [`Firmware::with_locked_global_iface`]
+    /// call into [`EnabledGlobalInterface::read_topology`].  The pushes that
+    /// happen under the firmware mutex rely on this and use `GFP_KERNEL`
+    /// without actually allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying shared-section accesses fail or if
+    /// the firmware reports an inconsistent CSG layout.  In particular,
+    /// `EINVAL` is returned if `prealloc_streams` does not have the expected
+    /// number of preallocated stream vectors.
+    ///
+    /// [`McuTopology::group_num`]: global::McuTopology::group_num
+    /// [`McuTopology::stream_num`]: global::McuTopology::stream_num
+    /// [`EnabledGlobalInterface::read_topology`]: global::EnabledGlobalInterface::read_topology
     pub(crate) fn enable_global_iface(
         &self,
         tdev: &TyrDrmDevice,
         gpu_info: &crate::gpu::GpuInfo,
         core_clk: &kernel::clk::Clk,
+        prealloc_csgs: KVec<global::csg::CommandStreamGroup>,
+        prealloc_streams: KVec<KVec<global::cs::CommandStream>>,
     ) -> Result {
-        self.with_locked_global_iface(|glb| glb.enable(tdev, gpu_info, core_clk))
+        self.with_locked_global_iface(|glb| {
+            glb.enable(tdev, gpu_info, core_clk, prealloc_csgs, prealloc_streams)
+        })
     }
 }
 

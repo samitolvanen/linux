@@ -58,11 +58,13 @@ pub(crate) mod cs;
 pub(crate) mod csg;
 
 #[allow(dead_code)]
-mod constants {
+pub(crate) mod constants {
     use kernel::bits::{
         bit_u32,
         genmask_u32, //
     };
+
+    pub(crate) const CSF_GROUP_CONTROL_OFFSET: u32 = 0x1000;
 
     pub(super) const GLB_TIMER_SOURCE_GPU_COUNTER: u32 = bit_u32(31);
     pub(super) const PROGRESS_TIMEOUT_CYCLES: u32 = 5 * 500 * 1024 * 1024;
@@ -132,6 +134,17 @@ impl From<TimeoutCycles> for u32 {
     fn from(value: TimeoutCycles) -> Self {
         value.0
     }
+}
+
+/// MCU firmware topology, derived from the firmware control area.
+///
+/// Used to size preallocations made before the firmware shared-section
+/// mutex is taken in [`enable`](EnabledGlobalInterface).
+pub(crate) struct McuTopology {
+    /// Number of CSG (Command Stream Group) slots advertised by the MCU.
+    pub(crate) group_num: u32,
+    /// Number of command streams per CSG slot.
+    pub(crate) stream_num: u32,
 }
 
 /// The global control interface.
@@ -269,15 +282,12 @@ impl GlobalInterface {
         })
     }
 
-    pub(crate) fn enable(
-        &mut self,
-        tdev: &TyrDrmDevice,
-        gpu_info: &GpuInfo,
-        core_clk: &Clk,
-    ) -> Result {
-        // This takes a mutex internally in clk_prepare().
-        let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
-
+    /// Reads the firmware's [`Control`] structure once the MCU has booted.
+    ///
+    /// Polls for a non-zero version field for up to 200ms, then returns the
+    /// [`Control`] snapshot. Returns `EINVAL` if the firmware reports
+    /// version 0 after the timeout.
+    fn read_control_after_boot(&self) -> Result<Control> {
         let control_area = SharedSectionRange {
             shared_section: self.shared_section.clone(),
             start: 0,
@@ -298,6 +308,54 @@ impl GlobalInterface {
             pr_err!("MCU firmware version is 0. Firmware may have failed to boot\n");
             return Err(EINVAL);
         }
+        Ok(control)
+    }
+
+    /// Reads the MCU topology (number of CSG slots and command streams per
+    /// CSG) from the firmware's control area.
+    pub(crate) fn read_topology(&self) -> Result<McuTopology> {
+        let control = self.read_control_after_boot()?;
+
+        let csg_start = constants::CSF_GROUP_CONTROL_OFFSET as usize;
+        let csg_control_area = SharedSectionRange {
+            shared_section: self.shared_section.clone(),
+            start: csg_start,
+            end: csg_start + core::mem::size_of::<csg::Control>(),
+        };
+        let csg_control = csg::Control::read(&csg_control_area)?;
+
+        Ok(McuTopology {
+            group_num: control.group_num,
+            stream_num: csg_control.stream_num,
+        })
+    }
+
+    pub(crate) fn enable(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        gpu_info: &GpuInfo,
+        core_clk: &Clk,
+        mut csgs: KVec<CommandStreamGroup>,
+        mut streams_per_csg: KVec<KVec<cs::CommandStream>>,
+    ) -> Result {
+        // This takes a mutex internally in clk_prepare().
+        let poweroff_timer = TimeoutCycles::from_micro(core_clk, PWROFF_HYSTERESIS_US)?.into();
+
+        let control = self.read_control_after_boot()?;
+
+        if streams_per_csg.len() != control.group_num as usize {
+            pr_err!(
+                "Expected {} preallocated stream vectors\n",
+                control.group_num
+            );
+            return Err(EINVAL);
+        }
+
+        let control_area = SharedSectionRange {
+            shared_section: self.shared_section.clone(),
+            start: 0,
+            end: core::mem::size_of::<Control>(),
+        };
 
         let mut input_area =
             self.shared_range(control.input_va.into(), core::mem::size_of::<Input>())?;
@@ -305,14 +363,14 @@ impl GlobalInterface {
         let output_area =
             self.shared_range(control.output_va.into(), core::mem::size_of::<Output>())?;
 
-        /// The start of the CSG control area for the first CSG.
-        const CSF_GROUP_CONTROL_OFFSET: u32 = 0x1000;
-
-        let mut csgs: KVec<CommandStreamGroup> = kvec![];
         for csg_idx in 0..control.group_num {
-            let iface_offset = CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
+            let iface_offset =
+                constants::CSF_GROUP_CONTROL_OFFSET + (csg_idx * control.group_stride);
 
-            let csg = CommandStreamGroup::init(self, iface_offset, csg_idx as usize)?;
+            let prealloc_streams = streams_per_csg.pop().ok_or(EINVAL)?;
+
+            let csg =
+                CommandStreamGroup::init(self, iface_offset, csg_idx as usize, prealloc_streams)?;
 
             if let Some(first) = csgs.first() {
                 if !first.is_identical(&csg)? {
@@ -321,6 +379,7 @@ impl GlobalInterface {
                 }
             }
 
+            // Capacity reserved above; this push cannot allocate.
             csgs.push(csg, GFP_KERNEL)?;
         }
 

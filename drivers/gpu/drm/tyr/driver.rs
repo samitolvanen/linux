@@ -294,13 +294,34 @@ impl platform::Driver for TyrPlatformDriverData {
         devres::register(dev_bound, job_irq, GFP_KERNEL)?;
         fw::irq::JobIrq::enable_hardware(dev_bound, &irq_iomem)?;
 
+        // Read the MCU topology so we can preallocate the CSG / stream
+        // vectors that the firmware enable path will fill in under the
+        // shared-section mutex.
+        let topology = tdev
+            .fw
+            .with_locked_global_iface(|glb| glb.read_topology())?;
+
+        let prealloc_csgs = KVec::with_capacity(topology.group_num as usize, GFP_KERNEL)?;
+        let mut prealloc_streams = KVec::with_capacity(topology.group_num as usize, GFP_KERNEL)?;
+        for _ in 0..topology.group_num {
+            prealloc_streams.push(
+                KVec::with_capacity(topology.stream_num as usize, GFP_KERNEL)?,
+                GFP_KERNEL,
+            )?;
+        }
+
         // Enable the global interface now that the MCU has booted and IRQs are
         // registered. This reads the control structures from the shared section,
         // sets up CSG slots, configures timers, and starts the ping watchdog.
         {
             let clks = tdev.clks.lock();
-            tdev.fw
-                .enable_global_iface(&tdev, &tdev.gpu_info, &clks.core)?;
+            tdev.fw.enable_global_iface(
+                &tdev,
+                &tdev.gpu_info,
+                &clks.core,
+                prealloc_csgs,
+                prealloc_streams,
+            )?;
         }
 
         // Initialize the scheduler now that the global interface is enabled.
