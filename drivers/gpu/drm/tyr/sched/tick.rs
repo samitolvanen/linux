@@ -759,6 +759,12 @@ impl<'a> Tick<'a> {
         self.halt_and_unbind_evicted_groups(data, decision)?;
         self.apply_priorities_and_bind(data, decision)?;
 
+        if decision.all_idle {
+            data.devfreq_state.lock().mark_idle();
+        } else {
+            data.devfreq_state.lock().mark_busy();
+        }
+
         self.update_status_and_resched(data, decision);
         Ok(())
     }

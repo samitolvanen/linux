@@ -797,6 +797,14 @@ impl QueueOps for TyrQueueOps {
                 self.data.signal_submit_fence(completion_point, Err(err));
                 return Err(err);
             }
+            // The doorbell ring above puts the queue back in firmware
+            // hands without going through a tick first. Record the
+            // transition for devfreq accounting now so the governor
+            // observes the busy delta between ticks. The locked
+            // critical section does only `Instant::now()` and field
+            // updates, with no `GFP_KERNEL` allocation, no
+            // `dma_resv_lock`, and no `mmu_notifier` path.
+            group.tdev.devfreq_state.lock().mark_busy();
         } else {
             // Group is unbound; mark it runnable so the rule engine sees
             // it on the tick scheduled below.

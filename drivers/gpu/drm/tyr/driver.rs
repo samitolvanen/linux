@@ -38,7 +38,7 @@ use kernel::{
         poll,
         Io, //
     },
-    new_mutex, of, platform,
+    new_mutex, of, opp, platform,
     prelude::*,
     regulator,
     regulator::Regulator,
@@ -109,8 +109,11 @@ pub(crate) mod work_id {
     pub(crate) const TILER_OOM: u64 = 5;
 }
 
-#[pin_data(PinnedDrop)]
-pub(crate) struct TyrPlatformDriverData;
+#[pin_data]
+#[repr(transparent)]
+pub(crate) struct TyrPlatformDriverData {
+    pub(crate) tdev: ARef<TyrDrmDevice>,
+}
 
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
@@ -121,6 +124,8 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
     pub(crate) mmio_phys_addr: u64,
+
+    pub(crate) max_freq: u64,
 
     pub(crate) fw: Arc<Firmware>,
 
@@ -137,7 +142,7 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
     #[pin]
-    clks: Mutex<Clocks>,
+    pub(crate) clks: Mutex<Clocks>,
 
     #[pin]
     regulators: Mutex<Regulators>,
@@ -219,6 +224,48 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
+
+    #[pin]
+    pub(crate) devfreq_registration:
+        Mutex<Option<kernel::devfreq::Registration<crate::devfreq::TyrDevfreqCallbacks>>>,
+
+    /// Keeps alive the drvdata-trampoline `KBox` pre-installed by
+    /// [`TyrPlatformDriverData::probe`].
+    ///
+    /// # Invariants
+    ///
+    /// The `KBox` holds a `TyrPlatformDriverData` whose `tdev` field
+    /// is an [`ARef<TyrDrmDevice>`](kernel::sync::aref::ARef). The
+    /// containing `TyrDrmDeviceData` is itself owned (transitively)
+    /// by that same `TyrDrmDevice`, so this slot is a strong refcount
+    /// cycle: while it is `Some`, the device cannot reach refcount
+    /// zero. On driver unbind the cycle is not broken, so the device
+    /// tree leaks for the lifetime of the unbound module.
+    ///
+    /// The leak is the deliberate tradeoff. The alternative - a
+    /// non-owning back-pointer used by the devfreq core's
+    /// `get_dev_status` and `get_cur_freq` trampolines - would degrade
+    /// the failure mode from a recoverable leak to a use-after-free
+    /// if the lifetime invariant ever slipped (e.g. a trampoline
+    /// firing after `devfreq_registration` drop).
+    ///
+    /// Declared *after* [`devfreq_registration`](Self::devfreq_registration)
+    /// so [`Drop`] tears down the devfreq device - the only caller of
+    /// the trampolines that observe this pointer - before the `KBox`
+    /// is freed.
+    #[pin]
+    pub(crate) devfreq_temp_data: Mutex<Option<KBox<TyrPlatformDriverData>>>,
+
+    #[pin]
+    pub(crate) devfreq_state: Mutex<crate::devfreq::DevfreqState>,
+
+    #[pin]
+    pub(crate) opp_table: Mutex<Option<kernel::opp::Table>>,
+
+    #[pin]
+    pub(crate) opp_config: Mutex<Option<kernel::opp::ConfigToken>>,
+
+    pub(crate) current_frequency: core::sync::atomic::AtomicUsize,
 }
 
 impl TyrDrmDeviceData {
@@ -436,7 +483,7 @@ impl platform::Driver for TyrPlatformDriverData {
         coregroup_clk.prepare_enable()?;
 
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
-        let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
+        let max_freq = get_max_freq(pdev, &core_clk)?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
         let mmio_phys_addr = request.start();
@@ -487,6 +534,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmu,
                 iomem: iomem.clone(),
                 mmio_phys_addr,
+                max_freq,
                 fw: firmware,
                 wq,
                 sched_wq,
@@ -497,7 +545,6 @@ impl platform::Driver for TyrPlatformDriverData {
                 }),
                 regulators <- new_mutex!(Regulators {
                     _mali: mali_regulator,
-                    _sram: sram_regulator,
                 }),
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
@@ -509,6 +556,12 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
+                devfreq_registration <- new_mutex!(None),
+                devfreq_temp_data <- new_mutex!(None),
+                devfreq_state <- new_mutex!(crate::devfreq::DevfreqState::new()),
+                opp_table <- new_mutex!(None),
+                opp_config <- new_mutex!(None),
+                current_frequency: core::sync::atomic::AtomicUsize::new(0),
         });
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
@@ -529,16 +582,91 @@ impl platform::Driver for TyrPlatformDriverData {
         let scheduler = Scheduler::init(&tdev)?;
         tdev.sched.lock().enable(scheduler);
 
+        let temp_data = KBox::new(TyrPlatformDriverData { tdev: tdev.clone() }, GFP_KERNEL)?;
+        // HACK: rust/kernel/platform.rs installs drvdata after probe returns,
+        // but devfreq_add_device exposes sysfs (and the get_dev_status and
+        // get_cur_freq trampolines that read parent->driver_data) before we
+        // get there. Pre-install drvdata - and a matching type id, so the
+        // safe `Device::drvdata::<TyrPlatformDriverData>()` path also
+        // succeeds in the gap - so the trampolines and any other reader
+        // find a valid, correctly-typed pointer. TyrPlatformDriverData is
+        // #[repr(transparent)] over ARef<TyrDrmDevice>, so the framework's
+        // post-probe set_drvdata overwrites this with a layout-identical
+        // pointer (and re-stamps the same type id) and trampoline reads
+        // stay correct across the overwrite.
+        let pdev_raw: *mut kernel::bindings::device =
+            core::ptr::from_ref(pdev.as_ref()).cast_mut().cast();
+        // SAFETY: pdev is the platform_device the probe callback was invoked
+        // with, so its underlying struct device is valid. The pointee
+        // installed here remains valid for the device's lifetime because
+        // devfreq_temp_data holds the KBox until TyrDrmDeviceData drops.
+        unsafe {
+            kernel::bindings::dev_set_drvdata(
+                pdev_raw,
+                core::ptr::from_ref(&*temp_data).cast_mut().cast(),
+            );
+        }
+        // SAFETY: `pdev_raw` is the probe callback's `struct device`, for
+        // which the driver core has already initialised `dev->p` and the
+        // embedded `driver_type` slot; the slot accepts unaligned writes
+        // of a `TypeId` (see `rust/kernel/device.rs::set_type_id`).
+        unsafe {
+            let private = (*pdev_raw).p;
+            let driver_type = &raw mut (*private).driver_type;
+            driver_type
+                .cast::<core::any::TypeId>()
+                .write_unaligned(core::any::TypeId::of::<TyrPlatformDriverData>());
+        }
+        *tdev.devfreq_temp_data.lock() = Some(temp_data);
+
+        crate::devfreq::init(&tdev, pdev.as_ref())?;
+
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
-        Ok(TyrPlatformDriverData)
+        Ok(TyrPlatformDriverData { tdev })
     }
 }
 
-#[pinned_drop]
-impl PinnedDrop for TyrPlatformDriverData {
-    fn drop(self: Pin<&mut Self>) {}
+fn get_max_freq(pdev: &platform::Device, core_clk: &kernel::clk::Clk) -> Result<u64> {
+    match opp::Table::from_of(&pdev.as_ref().into(), 0) {
+        Ok(table) => match table.opp_from_freq(
+            kernel::clk::Hertz(kernel::ffi::c_ulong::MAX),
+            Some(true), // Only consider available (enabled) OPPs
+            None,       // Use default clock index (0)
+            opp::SearchType::Floor,
+        ) {
+            Ok(opp) => {
+                let freq = opp.freq(None);
+                let voltage = opp.voltage();
+
+                dev_info!(
+                    pdev.as_ref(),
+                    "Max performance: {} Hz @ {} uV\n",
+                    kernel::ffi::c_ulong::from(freq),
+                    kernel::ffi::c_ulong::from(voltage)
+                );
+
+                Ok(freq.as_hz() as u64)
+            }
+            Err(e) => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "Failed to get max OPP: {:?}, using current clock\n",
+                    e
+                );
+                Ok(core_clk.rate().as_hz() as u64)
+            }
+        },
+        Err(e) => {
+            dev_info!(
+                pdev.as_ref(),
+                "No OPP table in device tree: {:?}, using current clock\n",
+                e
+            );
+            Ok(core_clk.rate().as_hz() as u64)
+        }
+    }
 }
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with
@@ -591,10 +719,10 @@ impl drm::Driver for TyrDrmDriver {
     }
 }
 
-struct Clocks {
-    core: Clk,
-    stacks: OptionalClk,
-    coregroup: OptionalClk,
+pub(crate) struct Clocks {
+    pub(crate) core: Clk,
+    pub(crate) stacks: OptionalClk,
+    pub(crate) coregroup: OptionalClk,
 }
 
 impl Drop for Clocks {
@@ -607,5 +735,4 @@ impl Drop for Clocks {
 
 struct Regulators {
     _mali: Regulator<regulator::Enabled>,
-    _sram: Regulator<regulator::Enabled>,
 }
