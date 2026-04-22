@@ -4,6 +4,10 @@
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
 
+#ifdef CONFIG_ARM_ARCH_TIMER
+#include <asm/arch_timer.h>
+#endif
+
 __rust_helper void rust_helper_fsleep(unsigned long usecs)
 {
 	fsleep(usecs);
@@ -38,3 +42,10 @@ __rust_helper void rust_helper_udelay(unsigned long usec)
 {
 	udelay(usec);
 }
+
+#ifdef CONFIG_ARM_ARCH_TIMER
+__rust_helper u32 rust_helper_arch_timer_get_cntfrq(void)
+{
+	return arch_timer_get_cntfrq();
+}
+#endif

@@ -27,6 +27,7 @@
 use core::marker::PhantomData;
 use core::ops;
 
+pub mod arch_timer;
 pub mod delay;
 pub mod hrtimer;
 
