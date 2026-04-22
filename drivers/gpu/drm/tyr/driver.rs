@@ -5,6 +5,7 @@ use kernel::{
         Clk,
         OptionalClk, //
     },
+    devfreq::Registration as DevfreqRegistration,
     device::{
         self,
         Bound,
@@ -34,6 +35,7 @@ use kernel::{
     mm::virt::VmaNew,
     new_mutex,
     of,
+    opp::ConfigToken,
     platform,
     prelude::*,
     regulator,
@@ -68,6 +70,11 @@ use kernel::{
 };
 
 use crate::{
+    devfreq::{
+        self,
+        TyrDevfreqCallbacks,
+        TyrDevfreqData, //
+    },
     file::TyrDrmFileData,
     fw::{
         irq::{
@@ -220,6 +227,13 @@ pub(crate) struct TyrDrmDeviceData {
     /// Deferred tiler heap growth for CS TILER_OOM events.
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
+
+    /// State the devfreq callbacks reach through their `data` argument,
+    /// shared with the devfreq registration via the `Arc`.
+    pub(crate) devfreq_data: Arc<TyrDevfreqData>,
+
+    #[pin]
+    pub(crate) opp_config: Mutex<Option<ConfigToken>>,
 }
 
 impl TyrDrmDeviceData {
@@ -487,6 +501,12 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Freed after the IRQ registrations, so no handler can queue work into it by then.
     pub(crate) heap_wq: OwnedQueue,
 
+    /// Devfreq registration, absent when the device node declares no OPP table.
+    ///
+    /// Freed before `clks` and `regulators`, so the governor stops before the clock
+    /// and supply are released.
+    _devfreq: Option<DevfreqRegistration<TyrDevfreqCallbacks>>,
+
     #[pin]
     clks: Mutex<Clocks>,
 
@@ -544,7 +564,6 @@ impl platform::Driver for TyrPlatformDriver {
         coregroup_clk.prepare_enable()?;
 
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
-        let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
         let mmio_phys_addr = request.start();
@@ -572,6 +591,8 @@ impl platform::Driver for TyrPlatformDriver {
 
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(CsgSlotOps, MAX_CSGS)?;
 
+        let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
@@ -587,6 +608,8 @@ impl platform::Driver for TyrPlatformDriver {
                 sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
+                devfreq_data,
+                opp_config <- new_mutex!(None),
             }? Error),
         )?;
 
@@ -633,6 +656,8 @@ impl platform::Driver for TyrPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        let devfreq = devfreq::init(&unreg_dev, pdev.as_ref(), &core_clk)?;
+
         firmware.boot(io)?;
 
         firmware
@@ -663,6 +688,7 @@ impl platform::Driver for TyrPlatformDriver {
                 wq,
                 sched_wq,
                 heap_wq,
+                _devfreq: devfreq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
@@ -670,7 +696,6 @@ impl platform::Driver for TyrPlatformDriver {
                 }),
                 regulators <- new_mutex!(Regulators {
                     _mali: mali_regulator,
-                    _sram: sram_regulator,
                 }),
                 iomem,
                 gpu_info,
@@ -769,5 +794,4 @@ impl Drop for Clocks {
 
 struct Regulators {
     _mali: Regulator<regulator::Enabled>,
-    _sram: Regulator<regulator::Enabled>,
 }

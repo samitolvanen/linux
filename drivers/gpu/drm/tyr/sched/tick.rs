@@ -928,6 +928,12 @@ impl<'a> Tick<'a> {
         self.halt_and_unbind_evicted_groups(tdev, fw, decision)?;
         self.apply_priorities_and_bind(tdev, fw, decision)?;
 
+        if decision.all_idle {
+            tdev.devfreq_data.devfreq_state.lock().mark_idle();
+        } else {
+            tdev.devfreq_data.devfreq_state.lock().mark_busy();
+        }
+
         self.update_status_and_resched(tdev, decision);
         Ok(())
     }
