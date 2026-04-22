@@ -55,6 +55,7 @@
 #include "cpufreq.c"
 #include "cpumask.c"
 #include "cred.c"
+#include "devfreq.c"
 #include "device.c"
 #include "dma.c"
 #include "dma-fence.c"
