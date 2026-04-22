@@ -93,6 +93,7 @@ pub mod cpufreq;
 pub mod cpumask;
 pub mod cred;
 pub mod debugfs;
+pub mod devfreq;
 pub mod device;
 pub mod device_id;
 pub mod devres;
