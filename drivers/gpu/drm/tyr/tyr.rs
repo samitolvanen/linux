@@ -16,6 +16,7 @@ mod mmu;
 mod regs;
 mod slot;
 mod vm;
+mod wait;
 
 kernel::module_platform_driver! {
     type: TyrPlatformDriverData,
