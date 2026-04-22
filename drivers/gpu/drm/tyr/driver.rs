@@ -303,7 +303,8 @@ impl platform::Driver for TyrPlatformDriverData {
         // Initialize the scheduler now that the global interface is enabled.
         // This reads CSG/CS slot counts from the firmware and prepares the
         // scheduler for accepting group submissions.
-        tdev.sched.lock().init(&tdev)?;
+        let scheduler = Scheduler::init(&tdev)?;
+        *tdev.sched.lock() = SchedulerState::Enabled(scheduler);
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
