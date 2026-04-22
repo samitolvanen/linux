@@ -895,6 +895,8 @@ impl QueueOps for TyrQueueOps {
                 self.data.signal_submit_fence(done_seqno, Err(err));
                 return Err(err);
             }
+            // No tick runs for a resumed queue, so record the busy edge here.
+            group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
         } else {
             // Group is unbound; mark it runnable so the rule engine sees
             // it on the tick scheduled below.
