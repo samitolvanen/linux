@@ -41,6 +41,7 @@ use kernel::{
     },
     new_mutex,
     of,
+    opp::ConfigToken,
     platform,
     prelude::*,
     regulator,
@@ -67,6 +68,10 @@ use kernel::{
 };
 
 use crate::{
+    devfreq::{
+        self,
+        TyrDevfreqData, //
+    },
     file::TyrDrmFileData,
     fw::{
         irq::job_irq_init,
@@ -137,8 +142,9 @@ impl core::ops::Deref for CleanupQueue {
     }
 }
 
-#[pin_data(PinnedDrop)]
-pub(crate) struct TyrPlatformDriverData;
+pub(crate) struct TyrPlatformDriverData {
+    _device: ARef<TyrDrmDevice>,
+}
 
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
@@ -178,7 +184,7 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) cleanup_wq: Arc<CleanupQueue>,
 
     #[pin]
-    clks: Mutex<Clocks>,
+    pub(crate) clks: Mutex<Clocks>,
 
     #[pin]
     regulators: Mutex<Regulators>,
@@ -257,6 +263,13 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
+
+    /// State the devfreq callbacks reach through their `data` argument,
+    /// shared with the devfreq registration via the `Arc`.
+    pub(crate) devfreq_data: Arc<TyrDevfreqData>,
+
+    #[pin]
+    pub(crate) opp_config: Mutex<Option<ConfigToken>>,
 }
 
 impl TyrDrmDeviceData {
@@ -500,7 +513,6 @@ impl platform::Driver for TyrPlatformDriverData {
         coregroup_clk.prepare_enable()?;
 
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
-        let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
         let mmio_phys_addr = request.start();
@@ -563,6 +575,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let csg_slot_ops = CsgSlotOps::new(firmware.clone());
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(csg_slot_ops, MAX_CSGS)?;
 
+        let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
+
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
                 mmu,
@@ -580,7 +594,6 @@ impl platform::Driver for TyrPlatformDriverData {
                 }),
                 regulators <- new_mutex!(Regulators {
                     _mali: mali_regulator,
-                    _sram: sram_regulator,
                 }),
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
@@ -593,6 +606,8 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
+                devfreq_data,
+                opp_config <- new_mutex!(None),
         });
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
@@ -607,6 +622,12 @@ impl platform::Driver for TyrPlatformDriverData {
         let job_irq = job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?;
         devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
 
+        // devres unwinds in reverse order, so the governor stops before
+        // the supplies and clocks registered earlier are released.
+        if let Some(registration) = devfreq::init(&tdev, pdev.as_ref())? {
+            devres::register(pdev.as_ref(), registration, GFP_KERNEL)?;
+        }
+
         tdev.fw.boot()?;
         tdev.fw
             .wait_ready(1000)
@@ -619,13 +640,8 @@ impl platform::Driver for TyrPlatformDriverData {
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
-        Ok(TyrPlatformDriverData)
+        Ok(TyrPlatformDriverData { _device: tdev })
     }
-}
-
-#[pinned_drop]
-impl PinnedDrop for TyrPlatformDriverData {
-    fn drop(self: Pin<&mut Self>) {}
 }
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with
@@ -678,8 +694,8 @@ impl drm::Driver for TyrDrmDriver {
     }
 }
 
-struct Clocks {
-    core: Clk,
+pub(crate) struct Clocks {
+    pub(crate) core: Clk,
     stacks: OptionalClk,
     coregroup: OptionalClk,
 }
@@ -694,5 +710,4 @@ impl Drop for Clocks {
 
 struct Regulators {
     _mali: Regulator<regulator::Enabled>,
-    _sram: Regulator<regulator::Enabled>,
 }
