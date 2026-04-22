@@ -374,9 +374,10 @@ impl GlobalInterface {
         self.ring_glb_doorbell()?;
 
         // Wait for FW to ACK the initial global config.
-        if let Err(e) = req.wait_acks(reqs, &self.event_wait, 1000) {
+        let acked = req.wait_acks(reqs, &self.event_wait, 1000)?;
+        if acked != reqs {
             pr_err!("enable: FW failed to ACK initial config\n");
-            return Err(e);
+            return Err(ETIMEDOUT);
         }
 
         let enabled = EnabledGlobalInterface {
@@ -477,24 +478,22 @@ impl GlobalInterface {
 
         self.ring_glb_doorbell()?;
 
-        match req.wait_acks(GLB_PING, &self.event_wait, 100) {
-            Ok(()) => Ok(()),
-            Err(ETIMEDOUT) => {
-                let ack_to = Output::read(&glb_iface.output_area)?.ack;
-                pr_err!("CSF has not responded to a ping request\n");
-                pr_err!("The firmware probably crashed\n");
-                /* Reset GLB_PING in req so future pings are not silently dropped. */
-                let reset_req = RequestField::new(
-                    &glb_iface.input_area,
-                    core::mem::offset_of!(Input, req),
-                    &glb_iface.output_area,
-                    core::mem::offset_of!(Output, ack),
-                );
-                let _ = reset_req.update_reqs(ack_to, GLB_PING);
-                Err(ETIMEDOUT)
-            }
-            Err(e) => Err(e),
+        let acked = req.wait_acks(GLB_PING, &self.event_wait, 100)?;
+        if acked != GLB_PING {
+            let ack_to = Output::read(&glb_iface.output_area)?.ack;
+            pr_err!("CSF has not responded to a ping request\n");
+            pr_err!("The firmware probably crashed\n");
+            /* Reset GLB_PING in req so future pings are not silently dropped. */
+            let reset_req = RequestField::new(
+                &glb_iface.input_area,
+                core::mem::offset_of!(Input, req),
+                &glb_iface.output_area,
+                core::mem::offset_of!(Output, ack),
+            );
+            let _ = reset_req.update_reqs(ack_to, GLB_PING);
+            return Err(ETIMEDOUT);
         }
+        Ok(())
     }
 
     /// Computes a range into the shared section for a given VA in the shared
@@ -544,7 +543,8 @@ impl GlobalInterface {
         let glb = self.state.enabled()?;
         let csg = glb.csgs.get(csg_idx).ok_or(EINVAL)?;
         let req = csg.input_request()?;
-        req.wait_acks(mask, &self.event_wait, timeout_ms)
+        req.wait_acks(mask, &self.event_wait, timeout_ms)?;
+        Ok(())
     }
 
     /// Whether the firmware has booted or not.

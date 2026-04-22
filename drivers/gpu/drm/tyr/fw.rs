@@ -305,15 +305,40 @@ impl RequestField {
         Ok((cur_req_val ^ cur_ack_val) != 0)
     }
 
+    /// Returns the subset of `reqs` that have been acknowledged by the firmware.
+    pub(crate) fn acked_reqs(&self, reqs: u32) -> Result<u32> {
+        let cur_req_val = self.req.read::<u32>()?;
+        let cur_ack_val = self.ack.read::<u32>()?;
+
+        // Bits that are the same in req and ack are considered acked.
+        Ok(!(cur_req_val ^ cur_ack_val) & reqs)
+    }
+
     /// Waits for the given requests to be acknowledged.
-    pub(crate) fn wait_acks(&self, reqs: u32, events_wait: &Wait, timeout_ms: u32) -> Result {
-        events_wait.wait_interruptible_timeout(timeout_ms, |()| {
+    ///
+    /// Sleeps for at most `timeout_ms` milliseconds and returns the subset of
+    /// `reqs` that the firmware has acknowledged.  The wait result itself
+    /// (timeout, signal, propagated error) is intentionally not surfaced to
+    /// the caller: callers (for example, [`wait_csg_acks`]) interpret the
+    /// returned mask per-bit and decide whether a partial ack is acceptable.
+    /// Unexpected wait errors are logged for diagnostics.
+    pub(crate) fn wait_acks(&self, reqs: u32, events_wait: &Wait, timeout_ms: u32) -> Result<u32> {
+        if let Err(e) = events_wait.wait_interruptible_timeout(timeout_ms, |()| {
             if !self.pending_reqs(reqs)? {
                 Ok(WaitResult::Ok)
             } else {
                 Ok(WaitResult::Retry)
             }
-        })
+        }) {
+            // ETIMEDOUT and ERESTARTSYS are expected (timeout / signal); the
+            // returned ack mask covers them.  Anything else is unexpected and
+            // worth a log line.
+            if e != ETIMEDOUT && e != ERESTARTSYS {
+                pr_warn!("wait_acks: unexpected wait error: {:?}\n", e);
+            }
+        }
+
+        self.acked_reqs(reqs)
     }
 }
 
