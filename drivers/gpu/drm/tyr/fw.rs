@@ -70,7 +70,10 @@ use crate::{
     vm::Vm, //
 };
 
+pub(crate) mod irq;
 mod parser;
+
+const MAX_CSG: u32 = 16;
 
 pub(super) const CSF_MCU_SHARED_REGION_START: u32 = 0x04000000;
 
