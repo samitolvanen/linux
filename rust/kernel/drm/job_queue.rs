@@ -136,3 +136,216 @@
 //! partially-torn-down state. All resources held by the queue (the job data,
 //! the [`QueueOps`] handler, any `Arc`s inside it) stay alive until drop
 //! completes normally.
+
+use crate::{
+    dma_buf::dma_fence::{
+        DmaFenceWorkqueue,
+        DriverDmaFence,
+        DriverDmaFenceOps,
+        PublicDmaFence, //
+        Published,
+    },
+    error::Result,
+    prelude::*,
+    sync::aref::ARef,
+    time::{Delta, Instant, Jiffies, Monotonic},
+};
+
+/// The result returned by a stage's [`StageOps::process`] call.
+///
+/// # Examples
+///
+/// A stage that waits for hardware completion and enforces a 5-second deadline:
+///
+/// ```ignore
+/// fn process(&self, ctx: &StageContext<'_, T>) -> StageAdvance {
+///     if ctx.submit_fence.is_signaled() {
+///         return StageAdvance::Advance;
+///     }
+///     let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+///     if elapsed >= self.timeout {
+///         // Deadline passed — kick off a GPU reset and retire the job.
+///         self.trigger_reset(ctx.job);
+///         return StageAdvance::TimedOut(ETIMEDOUT);
+///     }
+///     // Schedule a wakeup at the deadline so we don't miss it.
+///     StageAdvance::WaitFor(self.timeout - elapsed)
+/// }
+/// ```
+pub enum StageAdvance {
+    /// The job has passed this stage; advance it to the next, or to Done.
+    Advance,
+    /// Re-check when `fence` signals.
+    ///
+    /// The pipeline registers a callback on `fence` and re-invokes
+    /// [`StageOps::process`] when it fires.
+    WaitOn(ARef<PublicDmaFence>),
+    /// Re-check after `delay` jiffies.
+    ///
+    /// Useful for polling intervals or deadline timers. The pipeline schedules
+    /// a delayed work item and re-invokes [`StageOps::process`] when it fires.
+    WaitFor(Jiffies),
+    /// Re-check on the next external tick (new submission, fence signal, or
+    /// explicit driver wakeup). Use when there is no fence or deadline to wait on.
+    Wait,
+    /// The job failed; it is retired to Done immediately.
+    ///
+    /// If the job was already submitted to hardware, the driver must eventually
+    /// signal the submit fence (e.g. after a GPU reset).
+    TimedOut(Error),
+}
+
+/// Per-job context passed to [`StageOps::process`].
+///
+/// Provides access to the job's data, its submit fence, and timing
+/// information. Use [`stage_elapsed`](Self::stage_elapsed) to enforce
+/// per-stage deadlines and [`pipeline_elapsed`](Self::pipeline_elapsed) for
+/// a total pipeline deadline.
+///
+/// # Examples
+///
+/// A stage with both a per-stage and a total pipeline timeout:
+///
+/// ```ignore
+/// fn process(&self, ctx: &StageContext<'_, T>) -> StageAdvance {
+///     if ctx.submit_fence.is_signaled() {
+///         return StageAdvance::Advance;
+///     }
+///     let stage_elapsed    = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+///     let pipeline_elapsed = msecs_to_jiffies(ctx.pipeline_elapsed().as_millis().max(0) as u32);
+///     if stage_elapsed >= self.hw_timeout || pipeline_elapsed >= self.pipeline_timeout {
+///         self.trigger_reset(ctx.job);
+///         return StageAdvance::TimedOut(ETIMEDOUT);
+///     }
+///     // Wake at whichever deadline comes first.
+///     StageAdvance::WaitFor((self.hw_timeout - stage_elapsed).min(self.pipeline_timeout - pipeline_elapsed))
+/// }
+/// ```
+pub struct StageContext<'a, T: QueueOps> {
+    /// The driver's job data.
+    pub job: &'a T::Job,
+    /// Monotonic job counter.
+    pub counter: u64,
+    /// The public submit fence for this job.
+    pub submit_fence: &'a ARef<PublicDmaFence>,
+    entered_at: Instant<Monotonic>,
+    pipeline_entered_at: Instant<Monotonic>,
+}
+
+impl<'a, T: QueueOps> StageContext<'a, T> {
+    /// Returns how long this job has been in the current stage.
+    ///
+    /// The clock resets on every stage transition, so this always measures
+    /// time since the job entered the current stage only.
+    pub fn stage_elapsed(&self) -> Delta {
+        self.entered_at.elapsed()
+    }
+
+    /// Returns how long this job has been in the pipeline since it was first
+    /// committed (i.e. its total age across all stages, from deps to done).
+    ///
+    /// This clock never resets. Combine with a pipeline timeout set via
+    /// [`PipelineBuilder::set_pipeline_timeout`] to enforce an end-to-end
+    /// deadline, or check it directly in a driver stage.
+    pub fn pipeline_elapsed(&self) -> Delta {
+        self.pipeline_entered_at.elapsed()
+    }
+}
+
+/// A driver-defined pipeline stage.
+///
+/// Implement this trait to add custom logic between hardware submission and
+/// job completion. Stages are applied in the order they are added to
+/// [`PipelineBuilder`], after the job has been handed to hardware.
+///
+/// The pipeline calls [`process`](Self::process) on the job at the head of
+/// the stage; jobs behind it are not processed until the front advances.
+/// All methods are called from process context.
+///
+/// # Examples
+///
+/// A stage that waits for hardware completion with a configurable timeout:
+///
+/// ```ignore
+/// struct HwStage {
+///     timeout: Jiffies,
+/// }
+///
+/// impl StageOps<MyHandler> for HwStage {
+///     fn process(&self, ctx: &StageContext<'_, MyHandler>) -> StageAdvance {
+///         if ctx.submit_fence.is_signaled() {
+///             return StageAdvance::Advance;
+///         }
+///         let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+///         if elapsed >= self.timeout {
+///             ctx.job.device.reset();
+///             return StageAdvance::TimedOut(EIO);
+///         }
+///         StageAdvance::WaitFor(self.timeout - elapsed)
+///     }
+///
+///     fn teardown(&self, _job: &MyJob, counter: u64) {
+///         pr_warn!("Job {} cancelled in hw stage\n", counter);
+///     }
+/// }
+/// ```
+pub trait StageOps<T: QueueOps>: Send + Sync + 'static {
+    /// Called by the pipeline on each progress tick for the job at the head
+    /// of this stage. Returns what the pipeline should do next.
+    fn process(&self, ctx: &StageContext<'_, T>) -> StageAdvance;
+
+    /// Called when a job that was in this stage is cancelled (e.g. via
+    /// [`JobQueue::cancel_all`]) without completing the stage normally.
+    /// The implementation should release any per-stage resources that were
+    /// allocated when the job entered this stage.  The default does nothing.
+    fn teardown(&self, _job: &T::Job, _counter: u64) {}
+}
+
+/// The result of a driver's submit call.
+pub enum SubmitResult<FD: DriverDmaFenceOps> {
+    /// The driver accepted the job and took ownership of the submit fence.
+    /// The driver must eventually call [`DriverDmaFence::signal`] when the
+    /// job completes or fails (directly or via a registered callback).
+    Submitted,
+    /// The driver has no resources available (e.g. ring buffer full).
+    /// The fence is returned so the pipeline can retry on the next progress
+    /// check, which is triggered by job completions or new submissions.
+    NoResources(DriverDmaFence<FD, Published>),
+}
+
+/// A read-only reference to a submitted job, provided to the driver's submit
+/// callback.
+pub struct JobRef<'a, J: Send + Sync + 'static> {
+    /// The driver's job data.
+    pub job: &'a J,
+    /// The public fence that will be signaled when this job completes.
+    pub submit_fence: &'a ARef<PublicDmaFence>,
+    /// Monotonic job counter, useful for debug/logging.
+    pub counter: u64,
+}
+
+/// Driver callbacks for [`JobQueue`] -- all calls happen in process context.
+pub trait QueueOps: Send + Sync + 'static {
+    /// The type of job this handler processes.
+    type Job: Send + Sync + 'static;
+
+    /// The driver data type embedded in submit fences.
+    ///
+    /// Use a zero-sized type to avoid per-job allocation overhead.
+    type FenceData: DriverDmaFenceOps + Send + 'static;
+
+    /// Submit a job to the hardware. Called from process context.
+    ///
+    /// `fence` is owned by the call. On [`SubmitResult::Submitted`] the driver
+    /// takes ownership and must eventually call [`DriverDmaFence::signal`]
+    /// (directly or via a callback) when the job completes or fails. On
+    /// [`SubmitResult::NoResources`] the fence is returned to the queue for
+    /// the next retry. On `Err(..)` the driver must signal `fence` with the
+    /// error before returning.
+    fn submit(
+        &self,
+        job: &JobRef<'_, Self::Job>,
+        fence: DriverDmaFence<Self::FenceData, Published>,
+        wq: &DmaFenceWorkqueue,
+    ) -> Result<SubmitResult<Self::FenceData>>;
+}
