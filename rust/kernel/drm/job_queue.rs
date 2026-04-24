@@ -147,7 +147,10 @@ use crate::{
     },
     error::Result,
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        Arc,
+    },
     time::{Delta, Instant, Jiffies, Monotonic},
 };
 
@@ -299,6 +302,110 @@ pub trait StageOps<T: QueueOps>: Send + Sync + 'static {
     /// The implementation should release any per-stage resources that were
     /// allocated when the job entered this stage.  The default does nothing.
     fn teardown(&self, _job: &T::Job, _counter: u64) {}
+}
+
+/// Builder for a driver-defined list of pipeline stages.
+///
+/// Driver stages run after the job has been submitted to hardware. If no
+/// stages are added, the pipeline advances jobs as soon as their submit
+/// fence signals.
+///
+/// Pass the finished builder to [`JobQueue::new`].
+///
+/// # Examples
+///
+/// A queue with a 5-second per-stage hw timeout:
+///
+/// ```ignore
+/// let pipeline = PipelineBuilder::new()
+///     .add_stage(HwStage { timeout: msecs_to_jiffies(5000) })?;
+/// let queue = JobQueue::new(handler, wq, aux_wq, pipeline)?;
+/// ```
+///
+/// A queue with a 10-second total pipeline deadline:
+///
+/// ```ignore
+/// let pipeline = PipelineBuilder::new()
+///     .set_pipeline_timeout(msecs_to_jiffies(10000))
+///     .add_stage(HwStage { timeout: msecs_to_jiffies(5000) })?;
+/// let queue = JobQueue::new(handler, wq, aux_wq, pipeline)?;
+/// ```
+pub struct PipelineBuilder<T: QueueOps> {
+    stages: KVec<Arc<dyn StageOps<T>>>,
+    pipeline_timeout: Option<Jiffies>,
+    cancel_timeout: Option<Jiffies>,
+}
+
+impl<T: QueueOps> Default for PipelineBuilder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: QueueOps> PipelineBuilder<T> {
+    /// Create an empty builder with no stages and no pipeline timeout.
+    pub fn new() -> Self {
+        Self {
+            stages: KVec::new(),
+            pipeline_timeout: None,
+            cancel_timeout: None,
+        }
+    }
+
+    /// Append a driver-defined stage.
+    ///
+    /// Stages are applied in the order they are added, after the job has
+    /// been submitted to hardware.
+    pub fn add_stage<S: StageOps<T>>(mut self, stage: S) -> Result<Self> {
+        let arc: Arc<dyn StageOps<T>> = Arc::new(stage, GFP_KERNEL)?;
+        self.stages.push(arc, GFP_KERNEL)?;
+        Ok(self)
+    }
+
+    /// Set a total pipeline timeout.
+    ///
+    /// Jobs that remain in the pipeline for longer than `timeout` jiffies
+    /// are retired with [`ETIMEDOUT`]. The built-in stages enforce this
+    /// automatically; driver stages can observe the total elapsed time via
+    /// [`StageContext::pipeline_elapsed`].
+    pub fn set_pipeline_timeout(mut self, timeout: Jiffies) -> Self {
+        self.pipeline_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the per-entry timeout used in [`JobQueue::cancel_all`] when waiting
+    /// for hardware fences to signal.
+    ///
+    /// If not set, teardown waits indefinitely. Drivers that interact with
+    /// firmware should set this to a value slightly longer than their longest
+    /// expected firmware round-trip.
+    pub fn set_cancel_timeout(mut self, timeout: Jiffies) -> Self {
+        self.cancel_timeout = Some(timeout);
+        self
+    }
+}
+
+/// Iteration direction for [`JobQueueInner::check_stages`].
+#[allow(dead_code)]
+enum Direction {
+    Backward,
+    Forward,
+}
+
+/// Internal representation of a pipeline stage stored in
+/// [`JobQueueInner::stages`]. Built-in stages carry no data; driver stages
+/// wrap an [`Arc`]-ed [`StageOps`] implementation.
+#[allow(dead_code)]
+enum StageKind<T: QueueOps> {
+    /// Walk dependency fences one at a time, advancing when all are met.
+    WaitingForDeps,
+    /// Call the driver's [`QueueOps::submit`]; advance on acceptance.
+    WaitingForExec,
+    /// Default HW-wait: advance when the submit fence signals.
+    /// Used when the driver supplies no custom stages.
+    Executing,
+    /// A driver-provided stage (replaces [`Executing`] when present).
+    Driver(Arc<dyn StageOps<T>>),
 }
 
 /// The result of a driver's submit call.
