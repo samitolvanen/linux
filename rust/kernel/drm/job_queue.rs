@@ -144,6 +144,7 @@ use core::sync::atomic::{
 };
 
 use crate::{
+    c_str,
     dma_buf::dma_fence::{
         CallbackError,
         DmaFenceContext,
@@ -156,6 +157,7 @@ use crate::{
         DriverDmaFenceOps,
         FenceCallback,
         FenceCallbackRegistration,
+        FenceWaitResult,
         PublicDmaFence, //
         Published,
         UninitDmaFence,
@@ -167,11 +169,36 @@ use crate::{
     sync::{
         aref::ARef,
         Arc,
+        LockClassKey,
         Mutex,
     },
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
-    xarray::XArray,
+    xarray::{
+        AllocKind,
+        ReservedIndex,
+        XArray,
+        XaLimit,
+    },
 };
+
+#[derive(Clone, Copy)]
+/// Lock classes used by a [`JobQueue`] instance.
+pub struct JobQueueLockClasses {
+    /// Lock class for the queue inbox mutex.
+    pub inbox: &'static LockClassKey,
+    /// Lock class for the pipeline state mutex.
+    pub state: &'static LockClassKey,
+    /// Lock class for the main progress work item.
+    pub work: &'static LockClassKey,
+    /// Lock class for the deferred cleanup work item.
+    pub cleanup_work: &'static LockClassKey,
+    /// Lock class for the stage progress delayed work item.
+    pub stage_work: &'static LockClassKey,
+    /// Lock class for the stage progress timer.
+    pub stage_timer: &'static LockClassKey,
+    /// Lock class for per-job driver submit fences.
+    pub driver_fence: &'static LockClassKey,
+}
 
 /// The result returned by a stage's [`StageOps::process`] call.
 ///
@@ -459,6 +486,9 @@ pub trait QueueOps: Send + Sync + 'static {
     ///
     /// Use a zero-sized type to avoid per-job allocation overhead.
     type FenceData: DriverDmaFenceOps + Send + 'static;
+
+    /// Returns the lock classes used by this queue's internal primitives.
+    fn lock_classes() -> JobQueueLockClasses;
 
     /// Submit a job to the hardware. Called from process context.
     ///
@@ -1270,5 +1300,420 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// Schedule deferred cleanup of completed entries.
     fn schedule_cleanup(self: &Arc<Self>) {
         let _ = self.aux_wq.enqueue::<Arc<Self>, 3>(self.clone());
+    }
+}
+
+/// A process-context job queue that manages job dependencies, driver
+/// submission, and hardware completion for GPU jobs.
+pub struct JobQueue<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+}
+
+/// A guard that coalesces multiple fence completions into a single pipeline
+/// tick. While held, automatic tick scheduling from fence callbacks is
+/// suppressed. When dropped, a single tick is performed — either inline
+/// (created via [`JobQueue::coalesce_inline`]) or via the workqueue
+/// (created via [`JobQueue::coalesce`]).
+pub struct CoalesceGuard<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+    /// When true, the tick on drop runs inline in the caller's context.
+    /// When false, the tick is dispatched via the system workqueue.
+    inline: bool,
+}
+
+impl<T: QueueOps> Drop for CoalesceGuard<T> {
+    fn drop(&mut self) {
+        self.inner.coalesce.store(false, Ordering::Relaxed);
+        if self.inline {
+            self.inner.check_progress();
+        } else {
+            self.inner.maybe_check_progress();
+        }
+    }
+}
+
+/// A job that has been fully prepared (all resources allocated) but not yet
+/// committed to the pipeline.
+///
+/// Produced by [`JobQueue::prepare`] and consumed by [`JobQueue::commit`].
+///
+/// The underlying [`XaEntry::Reserved`] lives in the XArray for the duration
+/// between `prepare()` and `commit()`.  Dropping a `PreparedJob` before
+/// `commit()` removes the `Reserved` entry from the XArray and kfrees it.
+/// Because [`dma_fence_init`](crate::dma_fence) was never called, no seqno
+/// was assigned and no fence ever existed — rollback produces no `ECANCELED`
+/// signal and leaves no hole in the seqno sequence.
+pub struct PreparedJob<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+    /// Reserved XArray slot.  `None` once consumed by `commit()`.
+    xa_index: Option<ReservedIndex>,
+}
+
+impl<T: QueueOps> Drop for PreparedJob<T> {
+    fn drop(&mut self) {
+        // Remove and drop XaEntry::Reserved if commit() did not consume it.
+        // The UninitDmaFence inside was never passed to dma_fence_init, so
+        // dropping it is a plain kfree — no ECANCELED, no seqno hole.
+        if let Some(idx) = self.xa_index.take() {
+            drop(self.inner.fifo.lock().remove(idx.index()));
+        }
+    }
+}
+
+impl<T: QueueOps> JobQueue<T> {
+    /// Create a new job queue.
+    ///
+    /// `handler` is the driver's submission logic.
+    /// `wq` is the DMA fence workqueue to schedule pipeline checks on.
+    /// `aux_wq` is the workqueue for deferred cleanup; the driver may pass the
+    /// same workqueue as `wq` if no separation is needed.
+    /// `pipeline` is the set of driver-defined stages jobs pass through after
+    /// HW submission (use [`PipelineBuilder::new()`] for no custom stages).
+    pub fn new(
+        handler: T,
+        wq: Arc<DmaFenceWorkqueue>,
+        aux_wq: Arc<DmaFenceWorkqueue>,
+        mut pipeline: PipelineBuilder<T>,
+    ) -> Result<Self> {
+        // Build the unified stages vec:
+        //   [WaitingForDeps, WaitingForExec, <driver stages or Executing>]
+        let mut all_stages: KVec<StageKind<T>> = KVec::new();
+        all_stages.push(StageKind::WaitingForDeps, GFP_KERNEL)?;
+        all_stages.push(StageKind::WaitingForExec, GFP_KERNEL)?;
+        let pipeline_timeout = pipeline.pipeline_timeout;
+        let cancel_timeout = pipeline.cancel_timeout;
+        if pipeline.stages.is_empty() {
+            all_stages.push(StageKind::Executing, GFP_KERNEL)?;
+        } else {
+            for s in pipeline.stages.drain_all() {
+                all_stages.push(StageKind::Driver(s), GFP_KERNEL)?;
+            }
+        }
+        let pipeline_state = PipelineState::new(all_stages.len())?;
+        let lock_classes = T::lock_classes();
+
+        let inner = Arc::pin_init(
+            try_pin_init!(JobQueueInner {
+                fifo <- XArray::new(AllocKind::Alloc),
+                inbox <- Mutex::new(
+                    InboxState {
+                        cyclic_next: 0,
+                        submitted_end: 0,
+                    },
+                    c_str!("JobQueue::inbox"),
+                    ::core::pin::Pin::static_ref(lock_classes.inbox),
+                ),
+                state <- Mutex::new(
+                    pipeline_state,
+                    c_str!("JobQueue::state"),
+                    ::core::pin::Pin::static_ref(lock_classes.state),
+                ),
+                handler,
+                work <- DmaFenceWork::new(
+                    c_str!("JobQueue::work"),
+                    ::core::pin::Pin::static_ref(lock_classes.work),
+                ),
+                cleanup_work <- DmaFenceWork::new(
+                    c_str!("JobQueue::cleanup_work"),
+                    ::core::pin::Pin::static_ref(lock_classes.cleanup_work),
+                ),
+                wq,
+                aux_wq,
+                fence_ctx: DmaFenceContext::new(0),
+                job_counter: AtomicU64::new(0),
+                coalesce: AtomicBool::new(false),
+                stages: all_stages,
+                pipeline_timeout,
+                cancel_timeout,
+                stage_timer <- DmaFenceDelayedWork::new(
+                    c_str!("JobQueue::stage_timer"),
+                    ::core::pin::Pin::static_ref(lock_classes.stage_work),
+                    c_str!("JobQueue::stage_timer_timer"),
+                    ::core::pin::Pin::static_ref(lock_classes.stage_timer),
+                ),
+            }),
+            GFP_KERNEL,
+        )?;
+
+        Ok(Self { inner })
+    }
+
+    /// Prepare a job for submission, allocating all resources upfront.
+    ///
+    /// Call [`commit`](Self::commit) to assign the seqno, insert the job into
+    /// the pipeline, and receive the public fence.
+    pub fn prepare(
+        &self,
+        job: T::Job,
+        deps: &[ARef<PublicDmaFence>],
+        fence_data: T::FenceData,
+    ) -> Result<PreparedJob<T>> {
+        let lock_classes = T::lock_classes();
+        let uninit_fence = UninitDmaFence::new(
+            fence_data,
+            ::core::pin::Pin::static_ref(lock_classes.driver_fence),
+        )?;
+        let counter = self.inner.job_counter.fetch_add(1, Ordering::SeqCst);
+        let job = Arc::new(job, GFP_KERNEL)?;
+        let mut dep_vec = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
+        dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
+
+        // Allocate the XaEntry::Reserved box *before* acquiring xa_lock:
+        // KBox::new with GFP_KERNEL may sleep, which is forbidden under the
+        // XArray spinlock.  commit() transitions this to Live in-place with
+        // no further allocation.
+        let entry = KBox::new(
+            XaEntry::Reserved {
+                job: job.clone(),
+                uninit_fence: Some(uninit_fence),
+                deps: dep_vec,
+                counter,
+            },
+            GFP_KERNEL,
+        )?;
+
+        let xa_index = {
+            let mut inbox = self.inner.inbox.lock();
+            let mut guard = self.inner.fifo.lock();
+            let idx = guard.alloc_cyclic_reserve(
+                XaLimit::LIMIT_32B,
+                &mut inbox.cyclic_next,
+                GFP_KERNEL,
+            )?;
+            if let Err(store_err) = guard.store_reserved(idx, entry) {
+                drop(store_err);
+                guard.release(idx);
+                return Err(ENOMEM);
+            }
+            idx
+        };
+
+        Ok(PreparedJob {
+            inner: self.inner.clone(),
+            xa_index: Some(xa_index),
+        })
+    }
+
+    /// Commit a prepared job to the pipeline.
+    ///
+    /// Returns the public submit fence.  This function is infallible: all
+    /// failable work (allocation, fence creation) was completed by
+    /// [`prepare()`](Self::prepare).  The `xa_index` inside `prepared` must
+    /// refer to a live `XaEntry::Reserved` slot, which is guaranteed as long
+    /// as `prepared` was produced by `prepare()` on the same queue and has
+    /// not yet been committed or dropped.
+    pub fn commit(&self, mut prepared: PreparedJob<T>) -> ARef<PublicDmaFence> {
+        let xa_index = prepared
+            .xa_index
+            .take()
+            .expect("JobQueue::commit: xa_index already consumed");
+
+        let (ctx, seqno) = self.inner.fence_ctx.next_seqno();
+
+        // Phase 1: extract Reserved fields under the XArray lock.
+        let (job, uninit_fence, deps, counter) = {
+            let mut guard = self.inner.fifo.lock();
+            match guard.get_mut(xa_index.index()) {
+                Some(XaEntry::Reserved {
+                    ref job,
+                    ref mut uninit_fence,
+                    ref mut deps,
+                    counter,
+                }) => {
+                    let j = job.clone();
+                    let uf = uninit_fence.take().expect("BUG: double commit");
+                    let d = core::mem::take(deps);
+                    (j, uf, d, *counter)
+                }
+                _ => {
+                    panic!(
+                        "JobQueue: commit() BUG: entry at {} not Reserved",
+                        xa_index.index()
+                    );
+                }
+            }
+        };
+
+        // Phase 2: initialise the fence outside the lock.  dma_fence_init
+        // must not be called under xa_lock (the debug list takes its own
+        // spinlock, creating a potential lock-ordering violation).
+        let (submit_fence_drv, submit_fence) = uninit_fence.init(ctx, seqno);
+
+        // Phase 3: transition Reserved → Live in-place — no allocation.
+        {
+            let mut guard = self.inner.fifo.lock();
+            let entry = guard
+                .get_mut(xa_index.index())
+                .expect("BUG: XaEntry vanished between commit phases");
+            *entry = XaEntry::Live(JobEntry {
+                job,
+                submit_fence: submit_fence.clone(),
+                submit_fence_drv: Some(submit_fence_drv),
+                counter,
+                deps: JobDependencies {
+                    fences: deps,
+                    current_idx: 0,
+                    active_cb: None,
+                },
+                progress_cb: None,
+                stage_entered_at: Instant::now(),
+                pipeline_entered_at: Instant::now(),
+                stage_wake_cb: None,
+                timed_out: false,
+            });
+        }
+
+        let mut inbox = self.inner.inbox.lock();
+        let expected = inbox.submitted_end;
+        if xa_index.index() as u32 != expected {
+            pr_err!(
+                "JobQueue: commit() BUG: xa_idx={} != submitted_end={} (job={})\n",
+                xa_index.index(),
+                expected,
+                counter
+            );
+        }
+        inbox.submitted_end = inbox.submitted_end.wrapping_add(1);
+        drop(inbox);
+
+        self.inner.maybe_check_progress();
+        submit_fence
+    }
+
+    /// Coalesce fence completions into a single deferred tick.
+    ///
+    /// While the returned guard is held, fence callbacks skip scheduling
+    /// workqueue ticks. When the guard is dropped, a single tick is
+    /// dispatched via the system workqueue.
+    ///
+    /// This is safe to call from any context (including atomic/IRQ).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let guard = job_queue.coalesce();
+    /// hw_fence_1.signal();
+    /// hw_fence_2.signal();
+    /// drop(guard); // single workqueue tick processes both completions
+    /// ```
+    pub fn coalesce(&self) -> CoalesceGuard<T> {
+        self.inner.coalesce.store(true, Ordering::Relaxed);
+        CoalesceGuard {
+            inner: self.inner.clone(),
+            inline: false,
+        }
+    }
+
+    /// Coalesce fence completions into a single inline tick.
+    ///
+    /// Like [`coalesce`](Self::coalesce), but the tick runs inline in
+    /// the caller's context when the guard is dropped, avoiding the
+    /// workqueue roundtrip. This reduces latency when the caller is
+    /// already in process context (e.g. a threaded IRQ handler).
+    ///
+    /// Must be called from process context (the tick acquires a mutex).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let guard = job_queue.coalesce_inline();
+    /// hw_fence_1.signal();
+    /// hw_fence_2.signal();
+    /// hw_fence_3.signal();
+    /// drop(guard); // single inline tick processes all three completions
+    /// ```
+    pub fn coalesce_inline(&self) -> CoalesceGuard<T> {
+        self.inner.coalesce.store(true, Ordering::Relaxed);
+        CoalesceGuard {
+            inner: self.inner.clone(),
+            inline: true,
+        }
+    }
+
+    /// Park the queue, preventing any further jobs from being submitted to
+    /// the driver.
+    ///
+    /// Jobs already in the exec stage stay there and are not failed; they
+    /// will be submitted once `unpark()` is called.
+    pub fn park(&self) {
+        // WaitingForExec is always at index 1 in the stages vec.
+        self.inner.state.lock().parked_at = Some(1);
+    }
+
+    /// Unpark the queue, allowing jobs to be submitted to the driver again.
+    ///
+    /// Immediately schedules a progress check so that any jobs that accumulated
+    /// in the exec stage while the queue was parked are drained without delay.
+    pub fn unpark(&self) {
+        self.inner.state.lock().parked_at = None;
+        self.inner.maybe_check_progress();
+    }
+
+    /// Cancel all pending and running jobs. Waits for HW jobs to drain.
+    ///
+    /// Must be called from process context (it may sleep while waiting for
+    /// hardware fences).
+    pub fn cancel_all(&self) {
+        // WaitingForExec is always at index 1; stages beyond it have been
+        // handed to hardware and need their fences waited on before cancel.
+        const EXEC_STAGE_IDX: usize = 1;
+
+        let mut state = self.inner.state.lock();
+
+        // First, drain inbox so all submitted jobs become visible.
+        self.inner.drain_inbox(&mut state);
+
+        for stage_i in 0..state.stage_ranges.len() {
+            while let Some(idx) = state.stage_ranges[stage_i].pop_front() {
+                let Some(mut xa_entry) =
+                    self.inner.fifo.lock().remove(idx as usize)
+                else {
+                    continue;
+                };
+                // Reserved entries were never committed; just drop them.
+                let Some(entry) = xa_entry.as_live_mut() else {
+                    continue;
+                };
+                // For entries already handed to hardware, wait for the
+                // firmware fence before cancelling. state.lock() is a mutex
+                // so sleeping here is fine; check_progress() will unblock
+                // once we release it.
+                if stage_i > EXEC_STAGE_IDX {
+                    match self.inner.cancel_timeout {
+                        None => {
+                            let _ = entry.submit_fence.wait();
+                        }
+                        Some(t) => {
+                            if let Ok(FenceWaitResult::TimedOut) =
+                                entry.submit_fence.wait_timeout(t)
+                            {
+                                pr_warn!(
+                                    "JobQueue: timed out waiting for HW fence during teardown\n"
+                                );
+                            }
+                        }
+                    }
+                }
+                drop(entry.deps.active_cb.take());
+                drop(entry.progress_cb.take());
+                drop(entry.stage_wake_cb.take());
+                if let StageKind::Driver(s) = &self.inner.stages[stage_i] {
+                    s.teardown(&*entry.job, entry.counter);
+                }
+                if let Some(f) = entry.submit_fence_drv.take() {
+                    f.signal(Err(Error::from_errno(-(bindings::ECANCELED as i32))));
+                }
+            }
+        }
+
+        while let Some(idx) = state.done_range.pop_front() {
+            drop(self.inner.fifo.lock().remove(idx as usize));
+        }
+    }
+}
+
+impl<T: QueueOps> Drop for JobQueue<T> {
+    fn drop(&mut self) {
+        self.cancel_all();
     }
 }
