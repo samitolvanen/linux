@@ -137,21 +137,34 @@
 //! the [`QueueOps`] handler, any `Arc`s inside it) stay alive until drop
 //! completes normally.
 
+use core::sync::atomic::{
+    AtomicBool,
+    AtomicU64,
+};
+
 use crate::{
     dma_buf::dma_fence::{
+        DmaFenceContext,
+        DmaFenceDelayedWork,
+        DmaFenceWork,
         DmaFenceWorkqueue,
         DriverDmaFence,
         DriverDmaFenceOps,
+        FenceCallback,
+        FenceCallbackRegistration,
         PublicDmaFence, //
         Published,
+        UninitDmaFence,
     },
     error::Result,
     prelude::*,
     sync::{
         aref::ARef,
         Arc,
+        Mutex,
     },
     time::{Delta, Instant, Jiffies, Monotonic},
+    xarray::XArray,
 };
 
 /// The result returned by a stage's [`StageOps::process`] call.
@@ -455,4 +468,294 @@ pub trait QueueOps: Send + Sync + 'static {
         fence: DriverDmaFence<Self::FenceData, Published>,
         wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>>;
+}
+
+/// A wrapping range over `u32` indices.
+///
+/// Used to track which XArray indices belong to each pipeline stage.
+/// Handles wraparound at `u32::MAX` via wrapping arithmetic.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct WrapRange {
+    start: u32,
+    end: u32,
+}
+
+#[allow(dead_code)]
+impl WrapRange {
+    const fn new() -> Self {
+        Self { start: 0, end: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    fn pop_front(&mut self) -> Option<u32> {
+        if self.is_empty() {
+            None
+        } else {
+            let idx = self.start;
+            self.start = self.start.wrapping_add(1);
+            Some(idx)
+        }
+    }
+
+    fn push_back(&mut self) -> u32 {
+        let idx = self.end;
+        self.end = self.end.wrapping_add(1);
+        idx
+    }
+}
+
+/// Dependency tracking state for a single job.
+#[allow(dead_code)]
+struct JobDependencies<T: QueueOps> {
+    /// All dependency fences, set at submit time.
+    fences: KVec<ARef<PublicDmaFence>>,
+    /// Which dependency we're currently waiting on.
+    current_idx: usize,
+    /// The currently active dependency callback (at most one at a time).
+    active_cb: Option<Pin<KBox<FenceCallbackRegistration<DepCallback<T>>>>>,
+}
+
+/// A single per-job allocation stored in the XArray.
+///
+/// Each job gets exactly one `JobEntry` that lives for its entire lifetime in
+/// the pipeline.
+#[allow(dead_code)]
+struct JobEntry<T: QueueOps> {
+    /// The driver's job data.
+    job: Arc<T::Job>,
+
+    /// The public fence returned to the caller of `submit()`. Shared with
+    /// dependency waiters and other observers.
+    submit_fence: ARef<PublicDmaFence>,
+
+    /// The driver-side submit fence handle. Present from job creation until
+    /// the job is passed to [`QueueOps::submit`]; `None` thereafter (the
+    /// driver owns it and will signal it when done, or on drop signals
+    /// `ECANCELED`).
+    submit_fence_drv: Option<DriverDmaFence<T::FenceData, Published>>,
+
+    /// Monotonic job counter for debugging.
+    counter: u64,
+
+    deps: JobDependencies<T>,
+
+    /// Callback registered on the submit fence to trigger a pipeline check
+    /// promptly when the driver signals it.
+    progress_cb: Option<Pin<KBox<FenceCallbackRegistration<ProgressCallback<T>>>>>,
+
+    /// Timestamp of when the job entered the current stage.
+    stage_entered_at: Instant<Monotonic>,
+
+    /// Timestamp of when the job first entered the pipeline (set at commit
+    /// time, never reset). Exposed via [`StageContext::pipeline_elapsed`].
+    pipeline_entered_at: Instant<Monotonic>,
+
+    /// Optional callback registered when a stage returns [`StageAdvance::WaitOn`].
+    stage_wake_cb: Option<Pin<KBox<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
+
+    /// Set when a stage returns [`StageAdvance::TimedOut`].
+    ///
+    /// Instead of jumping directly to `done_range` (which would corrupt the
+    /// contiguous [`WrapRange`] invariant), the entry carries this flag and
+    /// drains naturally through each subsequent stage. At the top of
+    /// [`process_stage`](JobQueueInner::process_stage) the flag is checked;
+    /// if set, the stage's [`StageOps::teardown`] is called (for driver stages)
+    /// and [`StageAdvance::Advance`] is returned immediately, skipping
+    /// [`StageOps::process`].
+    timed_out: bool,
+}
+
+/// An XArray entry for a single job, used throughout its lifetime in the queue.
+///
+/// While a job is being prepared (between [`prepare()`] and [`commit()`]) the
+/// entry exists in the `Reserved` variant.  [`commit()`] transitions it to
+/// `Live` in-place -- no allocation at commit time.  The `Reserved` entry is
+/// erased by [`PreparedJob::drop()`] on rollback.
+#[allow(dead_code)]
+enum XaEntry<T: QueueOps> {
+    /// Job reserved by [`prepare()`] but not yet committed.
+    Reserved {
+        job: Arc<T::Job>,
+        /// `Option` so [`commit()`] can `.take()` it without moving out of the
+        /// `&mut` reference returned by `Guard::get_mut`.
+        uninit_fence: Option<UninitDmaFence<T::FenceData>>,
+        deps: KVec<ARef<PublicDmaFence>>,
+        counter: u64,
+    },
+    /// Fully initialised pipeline entry, present from commit until do_cleanup.
+    Live(JobEntry<T>),
+}
+
+#[allow(dead_code)]
+impl<T: QueueOps> XaEntry<T> {
+    fn as_live(&self) -> Option<&JobEntry<T>> {
+        if let XaEntry::Live(e) = self {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    fn as_live_mut(&mut self) -> Option<&mut JobEntry<T>> {
+        if let XaEntry::Live(e) = self {
+            Some(e)
+        } else {
+            None
+        }
+    }
+}
+
+// State managed by `submit()`. This is separate from `PipelineState` to avoid
+// lock ordering issues between `submit()` and `check_progress()`. In other
+// words, new jobs can be submitted even if the pipeline itself is locked.
+#[allow(dead_code)]
+struct InboxState {
+    /// The `next` cursor for `xa_alloc_cyclic`.
+    cyclic_next: u32,
+
+    /// One past the last XArray index that `submit()` has written.
+    /// `check_progress()` advances `submitted_start` up to this value to pull
+    /// new entries into `deps_range`.
+    submitted_end: u32,
+}
+
+/// The locked pipeline state.
+#[allow(dead_code)]
+struct PipelineState {
+    /// Where the pipeline has consumed up to in the submitted range.
+    /// Jobs in `submitted_start..inbox.submitted_end` have not yet been
+    /// pulled into `stage_ranges[0]`.
+    submitted_start: u32,
+
+    /// Per-stage queues, indexed identically to `JobQueueInner::stages`.
+    /// `stage_ranges[i]` holds the XArray indices of jobs currently at
+    /// stage `i`.
+    stage_ranges: KVec<WrapRange>,
+
+    /// Completed jobs awaiting XArray cleanup in process context.
+    done_range: WrapRange,
+
+    /// When `Some(n)`, the pipeline loop stops before advancing any job into
+    /// stage `n`. Used to park the queue at the exec stage.
+    parked_at: Option<usize>,
+}
+
+#[allow(dead_code)]
+impl PipelineState {
+    #[inline]
+    fn new(stage_count: usize) -> Result<Self> {
+        let mut stage_ranges = KVec::new();
+        for _ in 0..stage_count {
+            stage_ranges.push(WrapRange::new(), GFP_KERNEL)?;
+        }
+        Ok(Self {
+            submitted_start: 0,
+            stage_ranges,
+            done_range: WrapRange::new(),
+            parked_at: None,
+        })
+    }
+}
+
+/// The inner state of the job queue, shared via `Arc`.
+#[pin_data]
+#[allow(dead_code)]
+struct JobQueueInner<T: QueueOps> {
+    /// The XArray holding all job entries.
+    ///
+    /// Shared between `submit()` (insert) and `check_progress()`
+    /// (read/modify/remove).
+    ///
+    ///  Access is serialized by the XArray's internal `xa_lock` spinlock.
+    #[pin]
+    fifo: XArray<KBox<XaEntry<T>>>,
+
+    /// Inbox metadata.
+    #[pin]
+    inbox: Mutex<InboxState>,
+
+    /// Pipeline cursors.
+    #[pin]
+    state: Mutex<PipelineState>,
+
+    handler: T,
+
+    /// Runs `check_progress()` in process context.
+    #[pin]
+    work: DmaFenceWork<JobQueueInner<T>>,
+
+    /// Deferred drop of JobEntry in process context.
+    #[pin]
+    cleanup_work: DmaFenceWork<JobQueueInner<T>, 3>,
+
+    /// Workqueue for the main pipeline check (enforces DMA fence signaling rules).
+    wq: Arc<DmaFenceWorkqueue>,
+
+    /// Internal workqueue for cleanup work.
+    aux_wq: Arc<DmaFenceWorkqueue>,
+
+    /// DMA fence context and sequence number counter for submit fences.
+    fence_ctx: DmaFenceContext,
+
+    /// Monotonic job counter.
+    job_counter: AtomicU64,
+
+    /// When true, fence callbacks skip scheduling ticks via the workqueue, and
+    /// ticks have to be manually triggered. This allows batching multiple fence
+    /// signals into a single tick.
+    coalesce: AtomicBool,
+
+    /// All pipeline stages in order: `[WaitingForDeps, WaitingForExec, <driver
+    /// stages or Executing>]`. Built once at construction time.
+    stages: KVec<StageKind<T>>,
+
+    /// Optional total pipeline deadline. If set, jobs that remain in the
+    /// pipeline longer than this are retired with [`ETIMEDOUT`]. The built-in
+    /// stages enforce it automatically; driver stages can observe the elapsed
+    /// time via [`StageContext::pipeline_elapsed`].
+    pipeline_timeout: Option<Jiffies>,
+
+    cancel_timeout: Option<Jiffies>,
+
+    /// Delayed work for stage-timer wakeups.
+    #[pin]
+    stage_timer: DmaFenceDelayedWork<JobQueueInner<T>, 4>,
+}
+
+// SAFETY: `JobQueueInner` only contains thread-safe kernel synchronization
+// primitives and reference-counted handles, and `QueueOps` requires `Send`.
+unsafe impl<T: QueueOps> Send for JobQueueInner<T> {}
+// SAFETY: Shared access is synchronized by the contained kernel primitives,
+// and `QueueOps` requires `Sync`.
+unsafe impl<T: QueueOps> Sync for JobQueueInner<T> {}
+
+#[allow(dead_code)]
+struct DepCallback<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+}
+
+impl<T: QueueOps> FenceCallback for DepCallback<T> {
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {}
+}
+
+#[allow(dead_code)]
+struct ProgressCallback<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+}
+
+impl<T: QueueOps> FenceCallback for ProgressCallback<T> {
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {}
+}
+
+#[allow(dead_code)]
+struct StageWakeCallback<T: QueueOps> {
+    inner: Arc<JobQueueInner<T>>,
+}
+
+impl<T: QueueOps> FenceCallback for StageWakeCallback<T> {
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {}
 }
