@@ -25,11 +25,16 @@ use kernel::{
         poll,
         Io, //
     },
+    new_mutex,
     num::Bounded,
     prelude::*,
     register,
     str::CString,
     sync::{
+        atomic::{
+            Acquire,
+            Atomic, //
+        },
         Arc,
         ArcBorrow, //
     },
@@ -54,6 +59,7 @@ use crate::{
     gpu::GpuInfo,
 
     mmu::Mmu,
+    new_wait,
     regs::{
         gpu_control::{
             McuControlMode,
@@ -62,18 +68,20 @@ use crate::{
             MCU_CONTROL,
             MCU_STATUS, //
         }, //
-        job_control::{
-            JOB_IRQ_CLEAR,
-            JOB_IRQ_RAWSTAT, //
-        }, //
+        job_control::JOB_IRQ_CLEAR, //
     },
-    vm::Vm, //
+    vm::Vm,
+    wait::{
+        Wait,
+        WaitResult, //
+    }, //
 };
 
 pub(crate) mod irq;
 mod parser;
 
-const MAX_CSG: u32 = 16;
+/// Maximum number of CSG interfaces supported by hardware.
+const MAX_CSG: usize = 16;
 
 pub(super) const CSF_MCU_SHARED_REGION_START: u32 = 0x04000000;
 
@@ -160,6 +168,12 @@ pub(crate) struct Firmware<'drm> {
     /// List of firmware sections.
     #[expect(dead_code)]
     sections: KVec<Section<'drm>>,
+
+    /// A condvar representing a wait on a firmware event.
+    pub(crate) ready_wait: Arc<Wait>,
+
+    /// Latched to `true` by the IRQ handler when the firmware signals readiness via the GLB bit.
+    pub(crate) fw_ready: Arc<Atomic<bool>>,
 }
 
 impl<'drm> Drop for Firmware<'drm> {
@@ -263,6 +277,8 @@ impl<'drm> Firmware<'drm> {
                 iomem,
                 vm: vm.clone(),
                 sections,
+                ready_wait: new_wait!()?,
+                fw_ready: Arc::new(Atomic::new(false), GFP_KERNEL)?,
             })
         })();
 
@@ -282,10 +298,8 @@ impl<'drm> Firmware<'drm> {
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
 
         if let Err(e) = poll::read_poll_timeout(
-            || Ok((io.read(MCU_STATUS), io.read(JOB_IRQ_RAWSTAT))),
-            |(mcu_status, irq_rawstat)| {
-                mcu_status.value() == McuStatus::Enabled && irq_rawstat.glb()
-            },
+            || Ok(io.read(MCU_STATUS)),
+            |status| status.value() == McuStatus::Enabled,
             time::Delta::from_millis(1),
             time::Delta::from_millis(100),
         ) {
@@ -297,8 +311,6 @@ impl<'drm> Firmware<'drm> {
             );
             return Err(e);
         }
-
-        io.write_reg(JOB_IRQ_CLEAR::zeroed().with_glb(true));
 
         Ok(())
     }
@@ -323,5 +335,16 @@ impl<'drm> Firmware<'drm> {
         }
 
         Ok(())
+    }
+
+    /// Waits until the firmware signals readiness via the GLB IRQ bit.
+    pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
+        self.ready_wait.wait_interruptible_timeout(timeout_ms, || {
+            if self.fw_ready.load(Acquire) {
+                Ok(WaitResult::Done)
+            } else {
+                Ok(WaitResult::Retry)
+            }
+        })
     }
 }

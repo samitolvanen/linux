@@ -46,7 +46,13 @@ use kernel::{
 
 use crate::{
     file::TyrDrmFileData,
-    fw::Firmware,
+    fw::{
+        irq::{
+            job_irq_init,
+            JobIrq, //
+        },
+        Firmware, //
+    },
     gem::Bo,
     gpu,
     gpu::GpuInfo,
@@ -80,6 +86,10 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Firmware sections.
     pub(crate) fw: Firmware<'drm>,
+
+    /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
+    /// stops.
+    _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<JobIrq<'drm>>>>>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -167,11 +177,31 @@ impl platform::Driver for TyrPlatformDriver {
             &gpu_info,
         )?;
 
+        // SAFETY: The registration is owned by `job_irq` and then by
+        // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
+        // is never forgotten.
+        let job_irq = KBox::pin_init(
+            unsafe {
+                job_irq_init(
+                    pdev,
+                    iomem.clone(),
+                    firmware.fw_ready.clone(),
+                    firmware.ready_wait.clone(),
+                )
+            },
+            GFP_KERNEL,
+        )?;
+
         firmware.boot()?;
+
+        firmware
+            .wait_ready(1000)
+            .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
                 fw: firmware,
+                _job_irq: job_irq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
