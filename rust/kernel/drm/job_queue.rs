@@ -140,13 +140,17 @@
 use core::sync::atomic::{
     AtomicBool,
     AtomicU64,
+    Ordering,
 };
 
 use crate::{
     dma_buf::dma_fence::{
+        CallbackError,
         DmaFenceContext,
         DmaFenceDelayedWork,
+        DmaFenceDelayedWorkItem,
         DmaFenceWork,
+        DmaFenceWorkItem,
         DmaFenceWorkqueue,
         DriverDmaFence,
         DriverDmaFenceOps,
@@ -157,13 +161,15 @@ use crate::{
         UninitDmaFence,
     },
     error::Result,
+    impl_has_dma_fence_delayed_work,
+    impl_has_dma_fence_work,
     prelude::*,
     sync::{
         aref::ARef,
         Arc,
         Mutex,
     },
-    time::{Delta, Instant, Jiffies, Monotonic},
+    time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
     xarray::XArray,
 };
 
@@ -739,7 +745,9 @@ struct DepCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for DepCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {}
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+        self.inner.maybe_check_progress();
+    }
 }
 
 #[allow(dead_code)]
@@ -748,7 +756,9 @@ struct ProgressCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for ProgressCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {}
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+        self.inner.maybe_check_progress();
+    }
 }
 
 #[allow(dead_code)]
@@ -757,5 +767,508 @@ struct StageWakeCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for StageWakeCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {}
+    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+        self.inner.maybe_check_progress();
+    }
+}
+
+impl_has_dma_fence_work! {
+    impl{T: QueueOps} HasDmaFenceWork<JobQueueInner<T>> for JobQueueInner<T> { self.work }
+}
+
+impl_has_dma_fence_work! {
+    impl{T: QueueOps} HasDmaFenceWork<JobQueueInner<T>, 3> for JobQueueInner<T> { self.cleanup_work }
+}
+
+impl<T: QueueOps> DmaFenceWorkItem for JobQueueInner<T> {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        this.check_progress();
+    }
+}
+
+impl<T: QueueOps> DmaFenceWorkItem<3> for JobQueueInner<T> {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        this.do_cleanup();
+    }
+}
+
+impl<T: QueueOps> DmaFenceDelayedWorkItem<4> for JobQueueInner<T> {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        this.check_progress();
+    }
+}
+
+impl_has_dma_fence_delayed_work! {
+    impl{T: QueueOps} HasDmaFenceDelayedWork<JobQueueInner<T>, 4>
+        for JobQueueInner<T> { self.stage_timer }
+}
+
+impl<T: QueueOps> JobQueueInner<T> {
+    /// Pull newly submitted jobs from the inbox into `stage_ranges[0]`.
+    fn drain_inbox(&self, state: &mut PipelineState) {
+        let end = self.inbox.lock().submitted_end;
+        while state.submitted_start != end {
+            state.stage_ranges[0].push_back();
+            state.submitted_start = state.submitted_start.wrapping_add(1);
+        }
+    }
+
+    /// The main pipeline tick. Runs in process context.
+    ///
+    /// Drains the inbox, then walks the pipeline in two passes:
+    ///
+    /// 1. Backward — later stages first, so completed jobs free resources
+    ///    (e.g. ring-buffer slots) before earlier stages try to consume them.
+    /// 2. Forward — picks up jobs that became eligible during the backward
+    ///    pass and advances them immediately, avoiding an extra tick of latency.
+    ///
+    /// For each stage, loops over the jobs queued there (front first) calling
+    /// the appropriate per-stage helper until the stage returns anything other
+    /// than `Advance`. Stage transitions are managed in [`process_stage`](Self::process_stage);
+    /// helpers only return a [`StageAdvance`] without touching `PipelineState`
+    /// themselves.
+    fn check_progress(self: &Arc<Self>) {
+        let mut state = self.state.lock();
+
+        // Drain newly submitted jobs into stage_ranges[0] (DepsStage).
+        self.drain_inbox(&mut state);
+
+        self.check_stages(&mut state, Direction::Backward);
+        self.check_stages(&mut state, Direction::Forward);
+
+        let needs_cleanup = !state.done_range.is_empty();
+        drop(state);
+        if needs_cleanup {
+            self.schedule_cleanup();
+        }
+    }
+
+    /// Walk every stage in the given [`Direction`], processing the front job at
+    /// each stage until it blocks or the stage empties.
+    fn check_stages(self: &Arc<Self>, state: &mut PipelineState, direction: Direction) {
+        let park = state.parked_at.unwrap_or(usize::MAX);
+
+        match direction {
+            Direction::Forward => {
+                for stage_i in 0..self.stages.len() {
+                    if stage_i >= park {
+                        continue;
+                    }
+                    self.process_stage(state, stage_i);
+                }
+            }
+            Direction::Backward => {
+                for stage_i in (0..self.stages.len()).rev() {
+                    if stage_i >= park {
+                        continue;
+                    }
+                    self.process_stage(state, stage_i);
+                }
+            }
+        }
+    }
+
+    /// Process the front job at `stage_i` in a loop until the stage empties
+    /// or the job blocks.
+    fn process_stage(self: &Arc<Self>, state: &mut PipelineState, stage_i: usize) {
+        loop {
+            if state.stage_ranges[stage_i].is_empty() {
+                return;
+            }
+            let entry_idx = state.stage_ranges[stage_i].start;
+
+            // Fast-path: if this entry is already timed out, skip the stage
+            // handler and advance it to the next stage immediately. For driver
+            // stages, cancel() is called to release any per-stage resources.
+            let is_timed_out = {
+                let guard = self.fifo.lock();
+                guard
+                    .get(entry_idx as usize)
+                    .and_then(|e| e.as_live())
+                    .is_some_and(|e| e.timed_out)
+            };
+            let advance = if is_timed_out {
+                if let StageKind::Driver(stage) = &self.stages[stage_i] {
+                    let guard = self.fifo.lock();
+                    if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
+                        stage.teardown(&*entry.job, entry.counter);
+                    }
+                }
+                StageAdvance::Advance
+            } else {
+                match &self.stages[stage_i] {
+                    StageKind::WaitingForDeps => self.process_deps(entry_idx),
+                    StageKind::WaitingForExec => self.process_exec(entry_idx),
+                    StageKind::Executing => self.process_default_hw_wait(entry_idx),
+                    StageKind::Driver(stage) => {
+                        self.process_driver_stage(stage.clone(), entry_idx)
+                    }
+                }
+            };
+
+            match advance {
+                StageAdvance::Advance => {
+                    state.stage_ranges[stage_i].pop_front();
+                    if stage_i + 1 < self.stages.len() {
+                        state.stage_ranges[stage_i + 1].push_back();
+                        // Reset the elapsed timer when entering a new stage
+                        // (only for legitimately advancing jobs, not timed-out
+                        // entries draining through).
+                        if !is_timed_out {
+                            let mut guard = self.fifo.lock();
+                            if let Some(XaEntry::Live(entry)) =
+                                guard.get_mut(entry_idx as usize)
+                            {
+                                entry.stage_entered_at = Instant::now();
+                            }
+                        }
+                    } else {
+                        state.done_range.push_back();
+                    }
+                    // Continue loop: process the new front of this stage.
+                }
+                StageAdvance::TimedOut(_) => {
+                    // Set the timed_out flag and advance to the next stage
+                    // normally. This preserves the contiguous WrapRange
+                    // invariant: every cursor move is a front-of-stage pop,
+                    // so done_range.end always equals stage_ranges[N-1].start.
+                    // The timed-out entry drains silently through subsequent
+                    // stages via the is_timed_out fast-path above.
+                    {
+                        let mut guard = self.fifo.lock();
+                        if let Some(XaEntry::Live(entry)) =
+                            guard.get_mut(entry_idx as usize)
+                        {
+                            entry.timed_out = true;
+                        }
+                    }
+                    state.stage_ranges[stage_i].pop_front();
+                    if stage_i + 1 < self.stages.len() {
+                        state.stage_ranges[stage_i + 1].push_back();
+                    } else {
+                        state.done_range.push_back();
+                    }
+                    // Continue loop: process the new front of this stage.
+                }
+                StageAdvance::WaitOn(fence) => {
+                    let cb = FenceCallbackRegistration::new(
+                        &fence,
+                        StageWakeCallback {
+                            inner: self.clone(),
+                        },
+                    );
+                    match KBox::try_pin_init(cb, GFP_KERNEL) {
+                        Ok(registration) => {
+                            let mut guard = self.fifo.lock();
+                            if let Some(XaEntry::Live(entry)) =
+                                guard.get_mut(entry_idx as usize)
+                            {
+                                entry.stage_wake_cb = Some(registration);
+                            }
+                        }
+                        Err(CallbackError::AlreadySignaled(cb)) => {
+                            cb.inner.maybe_check_progress();
+                        }
+                        Err(CallbackError::Other(e)) => {
+                            pr_err!(
+                                "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
+                                e,
+                                entry_idx
+                            );
+                        }
+                    }
+                    return;
+                }
+                StageAdvance::WaitFor(delay) => {
+                    let _ =
+                        self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay);
+                    return;
+                }
+                StageAdvance::Wait => return,
+            }
+        }
+    }
+
+    /// Deps-stage helper: walk dependency fences one at a time.
+    ///
+    /// Fast-forwards through already-signaled fences, registers a callback on
+    /// the next unsignaled one, and returns `Wait`. Returns `Advance` once all
+    /// dependencies are met.
+    fn process_deps(self: &Arc<Self>, entry_idx: u32) -> StageAdvance {
+        loop {
+            let current_dependency = {
+                let guard = self.fifo.lock();
+                let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
+                    pr_err!(
+                        "JobQueue: process_deps() BUG: xa_idx={} missing\n",
+                        entry_idx
+                    );
+                    return StageAdvance::Advance;
+                };
+                if entry.deps.current_idx >= entry.deps.fences.len() {
+                    None // All deps satisfied.
+                } else {
+                    Some(entry.deps.fences[entry.deps.current_idx].clone())
+                }
+            };
+
+            let Some(dep_fence) = current_dependency else {
+                // All deps met — free the allocation and advance.
+                let mut guard = self.fifo.lock();
+                if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                    entry.deps.fences = KVec::new();
+                }
+                return StageAdvance::Advance;
+            };
+
+            let callback = DepCallback {
+                inner: self.clone(),
+            };
+            match KBox::try_pin_init(
+                FenceCallbackRegistration::new(&dep_fence, callback),
+                GFP_KERNEL,
+            ) {
+                Ok(registration) => {
+                    {
+                        let mut guard = self.fifo.lock();
+                        if let Some(XaEntry::Live(entry)) =
+                            guard.get_mut(entry_idx as usize)
+                        {
+                            entry.deps.active_cb = Some(registration);
+                        }
+                    }
+                    return self.pipeline_wait_or_timeout(entry_idx);
+                }
+                Err(CallbackError::AlreadySignaled(_)) => {
+                    let mut guard = self.fifo.lock();
+                    if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                        entry.deps.active_cb = None;
+                        entry.deps.current_idx += 1;
+                    }
+                    // Continue loop: try the next dependency.
+                }
+                Err(CallbackError::Other(e)) => {
+                    pr_err!(
+                        "JobQueue: process_deps() cb alloc failed: {:?}, skipping dep for entry {}\n",
+                        e,
+                        entry_idx
+                    );
+                    let mut guard = self.fifo.lock();
+                    if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                        entry.deps.active_cb = None;
+                        entry.deps.current_idx += 1;
+                    }
+                    // Continue loop: try the next dependency.
+                }
+            }
+        }
+    }
+
+    /// Exec-stage helper: call the driver's submit handler.
+    ///
+    /// Returns `Advance` on `Submitted`, `Wait` on `NoResources`, and
+    /// `TimedOut(e)` on a driver error.
+    fn process_exec(self: &Arc<Self>, entry_idx: u32) -> StageAdvance {
+        let (job, submit_fence, counter) = {
+            let guard = self.fifo.lock();
+            let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
+                pr_err!(
+                    "JobQueue: process_exec() BUG: xa_idx={} missing\n",
+                    entry_idx
+                );
+                return StageAdvance::Advance;
+            };
+            (entry.job.clone(), entry.submit_fence.clone(), entry.counter)
+        };
+
+        // Take the fence *before* calling the driver so ownership transfers
+        // cleanly on `Submitted`.
+        let fence = {
+            let mut guard = self.fifo.lock();
+            guard
+                .get_mut(entry_idx as usize)
+                .and_then(|e| e.as_live_mut())
+                .and_then(|e| e.submit_fence_drv.take())
+        };
+        let Some(fence) = fence else {
+            // Already submitted — shouldn't happen in normal operation.
+            return StageAdvance::Advance;
+        };
+
+        let job_ref = JobRef {
+            job: &*job,
+            submit_fence: &submit_fence,
+            counter,
+        };
+
+        match self.handler.submit(&job_ref, fence, &self.wq) {
+            Ok(SubmitResult::Submitted) => {
+                // Register a callback on the public submit fence so that the
+                // HW-wait stage wakes up promptly when the driver signals it.
+                let cb_result = KBox::try_pin_init(
+                    FenceCallbackRegistration::new(
+                        &submit_fence,
+                        ProgressCallback {
+                            inner: self.clone(),
+                        },
+                    ),
+                    GFP_KERNEL,
+                );
+                match cb_result {
+                    Ok(registration) => {
+                        let mut guard = self.fifo.lock();
+                        if let Some(XaEntry::Live(entry)) =
+                            guard.get_mut(entry_idx as usize)
+                        {
+                            entry.progress_cb = Some(registration);
+                        }
+                    }
+                    Err(CallbackError::AlreadySignaled(cb)) => {
+                        cb.inner.maybe_check_progress();
+                    }
+                    Err(CallbackError::Other(e)) => {
+                        pr_err!(
+                            "JobQueue: process_exec() progress cb alloc failed: {:?}, job {}\n",
+                            e,
+                            counter
+                        );
+                    }
+                }
+                StageAdvance::Advance
+            }
+            Ok(SubmitResult::NoResources(fence)) => {
+                // Return the fence and retry on the next tick.
+                {
+                    let mut guard = self.fifo.lock();
+                    if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                        entry.submit_fence_drv = Some(fence);
+                    }
+                }
+                self.pipeline_wait_or_timeout(entry_idx)
+            }
+            Err(e) => {
+                // Driver must have set the error on `fence` before returning
+                // Err; if it did not, the fence will be signaled ECANCELED
+                // when the driver drops it.
+                pr_err!(
+                    "JobQueue: process_exec() submit failed: {:?}, job {}\n",
+                    e,
+                    counter
+                );
+                StageAdvance::TimedOut(e)
+            }
+        }
+    }
+
+    /// Default HW-wait helper: advance once the submit fence signals.
+    fn process_default_hw_wait(&self, entry_idx: u32) -> StageAdvance {
+        {
+            let guard = self.fifo.lock();
+            if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
+                if entry.submit_fence.is_signaled() {
+                    return StageAdvance::Advance;
+                }
+            }
+        }
+        self.pipeline_wait_or_timeout(entry_idx)
+    }
+
+    /// Returns the appropriate wait advance for a built-in stage that would
+    /// otherwise stall indefinitely:
+    ///
+    /// - [`StageAdvance::TimedOut`] if the pipeline deadline has expired.
+    /// - [`StageAdvance::WaitFor(remaining)`] if the deadline is set but has
+    ///   not yet expired — the stage timer will re-run the stage at the right
+    ///   moment.
+    /// - [`StageAdvance::Wait`] if no pipeline timeout is configured.
+    fn pipeline_wait_or_timeout(&self, entry_idx: u32) -> StageAdvance {
+        let Some(timeout) = self.pipeline_timeout else {
+            return StageAdvance::Wait;
+        };
+        let elapsed = {
+            let guard = self.fifo.lock();
+            let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
+                return StageAdvance::Wait;
+            };
+            msecs_to_jiffies(
+                entry.pipeline_entered_at.elapsed().as_millis().max(0) as u32
+            )
+        };
+        if elapsed >= timeout {
+            StageAdvance::TimedOut(ETIMEDOUT)
+        } else {
+            StageAdvance::WaitFor(timeout - elapsed)
+        }
+    }
+
+    /// Driver-stage helper: build a [`StageContext`] and delegate to the
+    /// driver's [`StageOps::process`].
+    fn process_driver_stage(
+        &self,
+        stage: Arc<dyn StageOps<T>>,
+        entry_idx: u32,
+    ) -> StageAdvance {
+        // Clear any stale wake callback before re-evaluating; the callback
+        // may have already fired and triggered this check.
+        {
+            let mut guard = self.fifo.lock();
+            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                entry.stage_wake_cb = None;
+            }
+        }
+
+        let (job, submit_fence, counter, stage_entered_at, pipeline_entered_at) = {
+            let guard = self.fifo.lock();
+            let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
+                pr_err!(
+                    "JobQueue: process_driver_stage() BUG: xa_idx={} missing\n",
+                    entry_idx
+                );
+                return StageAdvance::Advance;
+            };
+            (
+                entry.job.clone(),
+                entry.submit_fence.clone(),
+                entry.counter,
+                entry.stage_entered_at,
+                entry.pipeline_entered_at,
+            )
+        };
+
+        let ctx = StageContext {
+            job: &*job,
+            counter,
+            submit_fence: &submit_fence,
+            entered_at: stage_entered_at,
+            pipeline_entered_at,
+        };
+        stage.process(&ctx)
+    }
+
+    /// Remove and drop completed entries. Runs in process context.
+    fn do_cleanup(self: &Arc<Self>) {
+        let mut state = self.state.lock();
+        while let Some(idx) = state.done_range.pop_front() {
+            drop(self.fifo.lock().remove(idx as usize));
+        }
+    }
+
+    /// Schedule a pipeline check on the system workqueue, unless suppressed
+    /// by an active [`CoalesceGuard`].
+    fn maybe_check_progress(self: &Arc<Self>) {
+        if !self.coalesce.load(Ordering::Relaxed) {
+            let _ = self.wq.enqueue::<Arc<Self>, 0>(self.clone());
+        }
+    }
+
+    /// Schedule deferred cleanup of completed entries.
+    fn schedule_cleanup(self: &Arc<Self>) {
+        let _ = self.aux_wq.enqueue::<Arc<Self>, 3>(self.clone());
+    }
 }

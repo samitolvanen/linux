@@ -1088,6 +1088,8 @@ macro_rules! impl_has_dma_fence_delayed_work {
             ) -> *mut $crate::workqueue::Work<$work_type $(, $id)?> {
                 // SAFETY: The caller promises that the pointer is not dangling.
                 let ptr: *mut $crate::workqueue::DelayedWork<$work_type $(, $id)?> =
+                    // SAFETY: `ptr` points at a valid `$self`, so accessing
+                    // the embedded delayed-work field is sound.
                     unsafe { &raw mut (*ptr).$field.inner };
                 // SAFETY: The caller promises that the pointer is not dangling.
                 unsafe { $crate::workqueue::DelayedWork::raw_as_work(ptr) }
