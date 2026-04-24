@@ -62,7 +62,10 @@ use crate::{
     vm::Vm, //
 };
 
+pub(crate) mod irq;
 mod parser;
+
+const MAX_CSG: u32 = 16;
 
 impl_flags!(
     #[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]

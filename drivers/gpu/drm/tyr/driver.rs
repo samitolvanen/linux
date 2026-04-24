@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::marker::PhantomPinned;
+
 use kernel::{
     clk::{
         Clk,
@@ -24,6 +26,13 @@ use kernel::{
     io::{
         poll,
         Io, //
+    },
+    irq::{
+        Flags,
+        IrqReturn,
+        ThreadedHandler,
+        ThreadedIrqReturn,
+        ThreadedRegistration, //
     },
     new_mutex,
     of,
@@ -226,4 +235,65 @@ impl Drop for Clocks {
 struct Regulators {
     _mali: Regulator<regulator::Enabled>,
     _sram: Regulator<regulator::Enabled>,
+}
+
+pub(crate) trait TyrIrqTrait: Sync + 'static {
+    fn read_status(&self, dev: &Device<Bound>) -> u32;
+    fn clear_mask(&self, dev: &Device<Bound>);
+    fn reenable_mask(&self, dev: &Device<Bound>);
+    fn read_raw_status(&self, dev: &Device<Bound>) -> u32;
+    fn clear_status(&self, dev: &Device<Bound>, status: u32);
+    fn mask(&self) -> u32;
+    fn handle(&self, status: u32);
+}
+
+#[pin_data]
+pub(crate) struct TyrIrq<T: TyrIrqTrait> {
+    irq: T,
+    #[pin]
+    _pin: PhantomPinned,
+}
+
+impl<T: TyrIrqTrait> TyrIrq<T> {
+    pub(crate) fn request<'a>(
+        pdev: &'a platform::Device<Bound>,
+        name: &'static CStr,
+        irq: T,
+    ) -> Result<impl PinInit<ThreadedRegistration<Self>, Error> + 'a> {
+        let handler = try_pin_init!(Self {
+            irq,
+            _pin: PhantomPinned,
+        });
+
+        Ok(pdev.request_threaded_irq_by_name(Flags::SHARED, name, name, handler))
+    }
+}
+
+impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
+    fn handle(&self, dev: &Device<Bound>) -> ThreadedIrqReturn {
+        let masked_status = self.irq.read_status(dev);
+
+        if masked_status == 0 {
+            return ThreadedIrqReturn::None;
+        }
+        self.irq.clear_mask(dev);
+        ThreadedIrqReturn::WakeThread
+    }
+
+    fn handle_threaded(&self, dev: &Device<Bound>) -> IrqReturn {
+        let mut ret = IrqReturn::None;
+
+        loop {
+            let raw_status = self.irq.read_raw_status(dev) & self.irq.mask();
+            if raw_status == 0 {
+                break;
+            }
+            self.irq.handle(raw_status);
+            self.irq.clear_status(dev, raw_status);
+            ret = IrqReturn::Handled;
+        }
+
+        self.irq.reenable_mask(dev);
+        ret
+    }
 }
