@@ -3,7 +3,6 @@
 //! IRQ handling for the Job IRQ.
 //!
 //! The Job IRQ signals events from the MCU, including global interface acknowledgements.
-#![allow(dead_code)]
 
 use core::sync::atomic::{
     AtomicBool,

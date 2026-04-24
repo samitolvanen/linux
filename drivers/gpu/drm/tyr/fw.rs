@@ -13,6 +13,11 @@
 //! [`Firmware`]: crate::fw::Firmware
 //! [`Section`]: crate::fw::Section
 
+use core::sync::atomic::{
+    AtomicBool,
+    Ordering, //
+};
+
 use kernel::{
     bits::genmask_u32,
     devres::Devres,
@@ -25,6 +30,7 @@ use kernel::{
         poll,
         Io, //
     },
+    new_mutex,
     platform,
     prelude::*,
     str::CString,
@@ -52,6 +58,7 @@ use crate::{
     },
     gpu::GpuInfo,
     mmu::Mmu,
+    new_wait,
     regs::gpu_control::{
         McuControlMode,
         McuStatus,
@@ -59,13 +66,18 @@ use crate::{
         MCU_CONTROL,
         MCU_STATUS, //
     },
-    vm::Vm, //
+    vm::Vm,
+    wait::{
+        Wait,
+        WaitResult, //
+    }, //
 };
 
 pub(crate) mod irq;
 mod parser;
 
-const MAX_CSG: u32 = 16;
+/// Maximum number of CSG interfaces supported by hardware.
+const MAX_CSG: usize = 16;
 
 impl_flags!(
     #[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]
@@ -142,6 +154,12 @@ pub(crate) struct Firmware {
     /// List of firmware sections.
     #[expect(dead_code)]
     sections: KVec<Section>,
+
+    /// A condvar representing a wait on a firmware event.
+    pub(crate) ready_wait: Arc<Wait>,
+
+    /// Latched to `true` by the IRQ handler when the firmware signals readiness via the GLB bit.
+    pub(crate) fw_ready: Arc<AtomicBool>,
 }
 
 impl Drop for Firmware {
@@ -246,6 +264,8 @@ impl Firmware {
                 iomem,
                 vm,
                 sections,
+                ready_wait: new_wait!()?,
+                fw_ready: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
             },
             GFP_KERNEL,
         )?;
@@ -271,5 +291,16 @@ impl Firmware {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Waits until the firmware signals readiness via the GLB IRQ bit.
+    pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
+        self.ready_wait.wait_interruptible_timeout(timeout_ms, || {
+            if self.fw_ready.load(Ordering::Acquire) {
+                Ok(WaitResult::Done)
+            } else {
+                Ok(WaitResult::Retry)
+            }
+        })
     }
 }

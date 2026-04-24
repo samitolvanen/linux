@@ -12,6 +12,7 @@ use kernel::{
         Core,
         Device, //
     },
+    devres,
     devres::Devres,
     dma::{
         Device as DmaDevice,
@@ -51,7 +52,10 @@ use kernel::{
 
 use crate::{
     file::TyrDrmFileData,
-    fw::Firmware,
+    fw::{
+        irq::job_irq_init,
+        Firmware, //
+    },
     gem::BoData,
     gpu,
     gpu::GpuInfo,
@@ -164,7 +168,19 @@ impl platform::Driver for TyrPlatformDriverData {
             &gpu_info,
         )?;
 
+        let job_irq = job_irq_init(
+            pdev,
+            iomem.clone(),
+            firmware.fw_ready.clone(),
+            firmware.ready_wait.clone(),
+        )?;
+        devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
+
         firmware.boot()?;
+
+        firmware
+            .wait_ready(1000)
+            .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
