@@ -3,7 +3,6 @@
 //! IRQ handling for the Job IRQ.
 //!
 //! The Job IRQ signals events from the MCU, including global interface acknowledgements.
-#![allow(dead_code)]
 
 use kernel::{
     device::Bound,
@@ -60,6 +59,7 @@ pub(crate) unsafe fn job_irq_init<'drm>(
             .with_const_csg::<CSG_IRQ_MASK>()
             .with_glb(true),
     );
+
     let job_irq = JobIrq {
         iomem: iomem.clone(),
         fw_ready,

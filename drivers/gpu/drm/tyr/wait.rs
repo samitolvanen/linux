@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 //! Code to wait on GPU events.
-#![allow(dead_code)]
 
 use kernel::{
     new_condvar,
