@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: GPL-2.0 or MIT
+
+//! Tiler heap management.
+
+use core::sync::atomic::{
+    AtomicUsize,
+    Ordering,
+};
+
+use kernel::{
+    alloc::KVec,
+    drm::gem::BaseObject,
+    io::Io,
+    kvec,
+    prelude::*,
+    sync::Arc,
+    uapi::{
+        SZ_128K,
+        SZ_8M,
+    },
+    xarray,
+    xarray::XArray,
+};
+
+use crate::{
+    driver::TyrDrmDevice,
+    gem,
+    vm::{
+        Vm,
+        VmFlag,
+        VmMapFlags,
+    },
+};
+
+const MAX_HEAPS_PER_POOL: u32 = 128;
+const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
+
+pub(crate) struct ChunkHeader {
+    next: u64,
+    _unknown: [u32; 14],
+}
+
+impl ChunkHeader {
+    fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
+        if offset > mem.size() {
+            return Err(EINVAL);
+        }
+
+        let vmap = mem.vmap();
+        // SAFETY: `offset <= mem.size()` was checked above and `vmap.addr()` points
+        // to the mapped BO backing storage for this header.
+        let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
+
+        // SAFETY: `ptr` points to a properly aligned header inside the mapped BO.
+        Ok(unsafe { core::ptr::read_volatile(ptr) })
+    }
+
+    fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
+        if offset > mem.size() {
+            return Err(EINVAL);
+        }
+
+        let vmap = mem.vmap();
+        // SAFETY: `offset <= mem.size()` was checked above and `vmap.addr()` points
+        // to the mapped BO backing storage for this header.
+        let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
+
+        // SAFETY: `ptr` points to a properly aligned header inside the mapped BO.
+        unsafe { core::ptr::write_volatile(ptr, value) };
+
+        Ok(())
+    }
+}
+
+pub(crate) struct ContextCreateArgs {
+    pub(crate) initial_chunk_count: u32,
+    pub(crate) chunk_size: u32,
+    pub(crate) max_chunks: u32,
+    pub(crate) target_in_flight: u32,
+}
+
+pub(crate) struct CreatedContext {
+    pub(crate) context_id: usize,
+    pub(crate) context_gpu_va: u64,
+    pub(crate) first_chunk_gpu_va: u64,
+}
+
+struct Context {
+    vm: Arc<Vm>,
+    chunks: KVec<Arc<gem::MappedBo>>,
+    chunk_size: u32,
+}
+
+impl Context {
+    fn alloc_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
+        let chunk_bo = {
+            let flags = VmMapFlags::from(VmFlag::Noexec);
+            let chunk_bo = gem::new_kernel_object(tdev, &self.vm, self.chunk_size as usize, flags)?;
+
+            let vmap = chunk_bo.vmap();
+            let size = vmap.owner().size();
+            // SAFETY: `vmap` owns a writable CPU mapping for the BO and `size`
+            // matches the mapped object size.
+            let mem = unsafe { core::slice::from_raw_parts_mut(vmap.addr() as *mut u8, size) };
+            mem.fill(0);
+
+            chunk_bo
+        };
+
+        if let Some(last) = self.chunks.last() {
+            let mut last_hdr = ChunkHeader::read(last, 0)?;
+            last_hdr.next = (chunk_bo.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
+                | (chunk_bo.size() as u64 >> 12);
+            ChunkHeader::write(last, 0, last_hdr)?;
+        }
+
+        self.chunks.push(chunk_bo, GFP_KERNEL)?;
+        Ok(())
+    }
+}
+
+pub(crate) struct Pool {
+    vm: Arc<Vm>,
+    gpu_contexts: Arc<gem::MappedBo>,
+    xa: Pin<KBox<XArray<KBox<Context>>>>,
+    free_index: AtomicUsize,
+}
+
+impl Pool {
+    pub(crate) fn create(tdev: &TyrDrmDevice, vm: Arc<Vm>) -> Result<Self> {
+        let stride = tdev.gpu_info.heap_context_stride();
+        let bo_size = (MAX_HEAPS_PER_POOL * stride).next_multiple_of(4096) as usize;
+
+        let flags = VmMapFlags::from(VmFlag::Noexec);
+        let gpu_contexts = gem::new_kernel_object(tdev, &vm, bo_size, flags)?;
+        let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
+
+        Ok(Self {
+            vm,
+            gpu_contexts,
+            xa,
+            free_index: AtomicUsize::new(1),
+        })
+    }
+
+    pub(crate) fn create_heap_context(
+        &self,
+        tdev: &TyrDrmDevice,
+        args: ContextCreateArgs,
+    ) -> Result<CreatedContext> {
+        if args.initial_chunk_count == 0 {
+            return Err(EINVAL);
+        }
+
+        if args.initial_chunk_count > args.max_chunks {
+            return Err(EINVAL);
+        }
+
+        if args.chunk_size != args.chunk_size.next_multiple_of(4096) {
+            return Err(EINVAL);
+        }
+
+        if args.chunk_size < SZ_128K || args.chunk_size > SZ_8M {
+            return Err(EINVAL);
+        }
+
+        let _ = args.target_in_flight;
+
+        let mut heap_ctx = KBox::new(
+            Context {
+                vm: self.vm.clone(),
+                chunks: kvec![],
+                chunk_size: args.chunk_size,
+            },
+            GFP_KERNEL,
+        )?;
+
+        for _ in 0..args.initial_chunk_count {
+            heap_ctx.alloc_chunk(tdev)?;
+        }
+
+        let first_chunk_gpu_va = heap_ctx
+            .chunks
+            .first()
+            .and_then(|bo| bo.kernel_va())
+            .ok_or(EINVAL)?
+            .start;
+
+        let index = self.free_index.fetch_add(1, Ordering::Relaxed);
+        let context_gpu_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start
+            + index as u64 * u64::from(tdev.gpu_info.heap_context_stride());
+
+        let xa = self.xa.as_ref();
+        let mut guard = xa.lock();
+        guard.store(index, heap_ctx, GFP_KERNEL).map_err(|_| EINVAL)?;
+
+        Ok(CreatedContext {
+            context_id: index,
+            context_gpu_va,
+            first_chunk_gpu_va,
+        })
+    }
+
+    pub(crate) fn destroy_heap_context(&self, context_id: usize) -> Result {
+        let xa = self.xa.as_ref();
+        let mut guard = xa.lock();
+        guard.remove(context_id).ok_or(EINVAL)?;
+
+        Ok(())
+    }
+}

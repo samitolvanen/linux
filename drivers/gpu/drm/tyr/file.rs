@@ -9,11 +9,16 @@ use kernel::{
         SZ_4K,
         SZ_64K,
     },
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        Arc,
+    },
     transmute::AsBytes,
     transmute::FromBytes,
     uaccess::UserSlice,
     uapi, //
+    xarray,
+    xarray::XArray,
 };
 
 use crate::{
@@ -22,6 +27,7 @@ use crate::{
         TyrDrmDriver, //
     },
     gem,
+    heap,
     regs::{
         gpu_control,
         join_u64,
@@ -64,6 +70,7 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
+    heap_pools: Pin<KBox<XArray<Arc<heap::Pool>>>>,
 }
 
 /// Convenience type alias for our DRM `File` type
@@ -77,6 +84,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
                 group_pool: group::Pool::create()?,
+                heap_pools <- KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?,
             }),
             GFP_KERNEL,
         )
@@ -434,6 +442,67 @@ impl TyrDrmFileData {
             groupgetstate.state |=
                 uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
         }
+
+        Ok(0)
+    }
+
+    pub(crate) fn heap_create(
+        ddev: &TyrDrmDevice,
+        heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        let vm_id = heapcreate.vm_id as usize;
+        let vm = file.inner().vm_pool().get_vm(vm_id).ok_or(EINVAL)?;
+
+        let args = heap::ContextCreateArgs {
+            initial_chunk_count: heapcreate.initial_chunk_count,
+            chunk_size: heapcreate.chunk_size,
+            max_chunks: heapcreate.max_chunks,
+            target_in_flight: heapcreate.target_in_flight,
+        };
+
+        let file_inner = file.inner();
+        let xa = file_inner.heap_pools.as_ref();
+
+        {
+            let guard = xa.lock();
+            if guard.get(vm_id).is_none() {
+                drop(guard);
+                let pool = Arc::new(heap::Pool::create(ddev, vm.clone())?, GFP_KERNEL)?;
+                xa.lock().store(vm_id, pool, GFP_KERNEL)?;
+            }
+        }
+
+        let created_context = {
+            let guard = xa.lock();
+            let pool = guard.get(vm_id).ok_or(EINVAL)?;
+            pool.create_heap_context(ddev, args)?
+        };
+
+        heapcreate.handle = heapcreate.vm_id << 16 | created_context.context_id as u32;
+        heapcreate.tiler_heap_ctx_gpu_va = created_context.context_gpu_va;
+        heapcreate.first_heap_chunk_gpu_va = created_context.first_chunk_gpu_va;
+
+        Ok(0)
+    }
+
+    pub(crate) fn heap_destroy(
+        _ddev: &TyrDrmDevice,
+        heapdestroy: &mut uapi::drm_panthor_tiler_heap_destroy,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if heapdestroy.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let vm_id = (heapdestroy.handle >> 16) as usize;
+        let heap_idx = (heapdestroy.handle & 0xffff) as usize;
+
+        let file_inner = file.inner();
+        let xa = file_inner.heap_pools.as_ref();
+        let guard = xa.lock();
+        let pool = guard.get(vm_id).ok_or(EINVAL)?;
+        pool.destroy_heap_context(heap_idx)?;
 
         Ok(0)
     }

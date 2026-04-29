@@ -84,7 +84,6 @@ pub(crate) struct MappedBo {
     vmap: shmem::VMapOwned<BoData>,
 }
 
-#[expect(dead_code)]
 impl MappedBo {
     pub(crate) fn new(kernel_bo: KernelBo, kernel_node: range::LiveRange) -> Result<Arc<Self>> {
         let vmap = kernel_bo.bo.owned_vmap::<0>()?;
@@ -156,7 +155,6 @@ pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> 
     shmem::Object::lookup_handle(file, handle)
 }
 
-#[expect(dead_code)]
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
 pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
     dev: &TyrDrmDevice<Ctx>,

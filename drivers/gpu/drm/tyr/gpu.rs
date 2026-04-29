@@ -138,6 +138,13 @@ impl GpuInfo {
             self.tiler_present,
         );
     }
+
+    pub(crate) fn heap_context_stride(&self) -> u32 {
+        let line_size = 1u32 << L2_FEATURES::from_raw(self.l2_features).line_size().get();
+        let heap_context_size = 32u32;
+
+        heap_context_size.next_multiple_of(line_size)
+    }
 }
 
 impl Deref for GpuInfo {
