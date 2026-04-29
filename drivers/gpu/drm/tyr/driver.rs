@@ -79,6 +79,10 @@ pub(crate) struct TyrDrmDeviceData {
 
 	pub(crate) mmu: Arc<Mmu>,
 
+    pub(crate) iomem: Arc<Devres<IoMem>>,
+
+	pub(crate) mmio_phys_addr: u64,
+
     pub(crate) fw: Arc<Firmware>,
 
     #[pin]
@@ -91,6 +95,9 @@ pub(crate) struct TyrDrmDeviceData {
     ///
     /// This is mainly queried by userspace, i.e.: Mesa.
     pub(crate) gpu_info: GpuInfo,
+
+	#[pin]
+	pub(crate) csif_info: Mutex<gpu::CsifInfo>,
 }
 
 fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
@@ -141,6 +148,7 @@ impl platform::Driver for TyrPlatformDriverData {
         let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
+		let mmio_phys_addr = request.start();
         let iomem = Arc::pin_init(request.iomap_sized::<SZ_2M>(), GFP_KERNEL)?;
 
         issue_soft_reset(pdev.as_ref(), &iomem)?;
@@ -187,6 +195,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
 				mmu,
+				iomem: iomem.clone(),
+				mmio_phys_addr,
                 fw: firmware,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
@@ -198,6 +208,7 @@ impl platform::Driver for TyrPlatformDriverData {
                     _sram: sram_regulator,
                 }),
                 gpu_info,
+				csif_info <- new_mutex!(gpu::CsifInfo::default()),
         });
 
         Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
@@ -236,6 +247,21 @@ impl drm::Driver for TyrDrmDriver {
         (PANTHOR_DEV_QUERY, drm_panthor_dev_query, ioctl::RENDER_ALLOW, TyrDrmFileData::dev_query),
 		(PANTHOR_VM_CREATE, drm_panthor_vm_create, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_create),
 		(PANTHOR_VM_DESTROY, drm_panthor_vm_destroy, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_destroy),
+        (PANTHOR_VM_BIND, drm_panthor_vm_bind, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_bind),
+        (PANTHOR_VM_GET_STATE, drm_panthor_vm_get_state, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_get_state),
+        (PANTHOR_BO_CREATE, drm_panthor_bo_create, ioctl::RENDER_ALLOW, TyrDrmFileData::bo_create),
+        (PANTHOR_BO_MMAP_OFFSET, drm_panthor_bo_mmap_offset, ioctl::RENDER_ALLOW, TyrDrmFileData::bo_mmap_offset),
+    }
+
+    fn mmap(
+        device: &TyrDrmDevice,
+        file: &drm::File<TyrDrmFileData>,
+        vma: &kernel::mm::virt::VmaNew,
+    ) -> Option<Result>
+    where
+        Self: Sized,
+    {
+        crate::mmap::mmap(device, &file.inner(), vma)
     }
 }
 

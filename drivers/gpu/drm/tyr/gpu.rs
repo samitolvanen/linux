@@ -29,6 +29,21 @@ use crate::{
     }, //
 };
 
+/// CSIF (Command Stream Interface) information.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CsifInfo {
+    pub(crate) csg_slot_count: u32,
+    pub(crate) cs_slot_count: u32,
+    pub(crate) cs_reg_count: u32,
+    pub(crate) scoreboard_slot_count: u32,
+    pub(crate) unpreserved_cs_reg_count: u32,
+    pub(crate) pad: u32,
+}
+
+// SAFETY: Same layout as drm_panthor_csif_info, repr(C) with no padding.
+unsafe impl AsBytes for CsifInfo {}
+
 /// Struct containing information that can be queried by userspace. This is read from
 /// the GPU's registers.
 ///
