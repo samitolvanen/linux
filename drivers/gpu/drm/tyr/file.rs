@@ -5,6 +5,10 @@ use kernel::{
     drm::gem::BaseObject,
     io::Io,
     prelude::*,
+    sizes::{
+        SZ_4K,
+        SZ_64K,
+    },
     sync::aref::ARef,
     transmute::AsBytes,
     transmute::FromBytes,
@@ -23,6 +27,7 @@ use crate::{
         join_u64,
         read_u64_no_tearing,
     },
+    sched::group,
     vm::{
         self,
         VmMapFlags,
@@ -58,6 +63,7 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
+    group_pool: group::Pool,
 }
 
 /// Convenience type alias for our DRM `File` type
@@ -70,6 +76,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
         KBox::try_pin_init(
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
+                group_pool: group::Pool::create()?,
             }),
             GFP_KERNEL,
         )
@@ -79,6 +86,10 @@ impl drm::file::DriverFile for TyrDrmFileData {
 #[pinned_drop]
 impl PinnedDrop for TyrDrmFileData {
     fn drop(self: Pin<&mut Self>) {
+        if let Err(e) = self.as_ref().group_pool().destroy_all() {
+            pr_err!("Failed to destroy all groups: {:?}\n", e);
+        }
+
         if let Err(e) = self.as_ref().vm_pool().destroy_all() {
             pr_err!("Failed to destroy all VMs: {:?}\n", e);
         }
@@ -88,6 +99,10 @@ impl PinnedDrop for TyrDrmFileData {
 impl TyrDrmFileData {
     pub(crate) fn vm_pool(self: Pin<&Self>) -> &vm::Pool {
         &self.get_ref().vm_pool
+    }
+
+    pub(crate) fn group_pool(self: Pin<&Self>) -> &group::Pool {
+        &self.get_ref().group_pool
     }
 
     pub(crate) fn dev_query(
@@ -336,6 +351,92 @@ impl TyrDrmFileData {
 
         Ok(0)
     }
+
+    pub(crate) fn group_create(
+        ddev: &TyrDrmDevice,
+        groupcreate: &mut uapi::drm_panthor_group_create,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if groupcreate.queues.count == 0 {
+            return Err(EINVAL);
+        }
+
+        if groupcreate.queues.stride as usize
+            != core::mem::size_of::<uapi::drm_panthor_queue_create>()
+        {
+            return Err(ENOTSUPP);
+        }
+
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(groupcreate.queues.array as usize),
+            groupcreate.queues.stride as usize * groupcreate.queues.count as usize,
+        )
+        .reader();
+
+        for _ in 0..groupcreate.queues.count {
+            let queue: QueueCreate = reader.read()?;
+            queue.validate()?;
+        }
+
+        let handle = file
+            .inner()
+            .group_pool()
+            .create_group(ddev, groupcreate, file)?;
+
+        groupcreate.group_handle = handle as u32;
+
+        Ok(0)
+    }
+
+    pub(crate) fn group_destroy(
+        _ddev: &TyrDrmDevice,
+        groupdestroy: &mut uapi::drm_panthor_group_destroy,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if groupdestroy.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        file.inner()
+            .group_pool()
+            .destroy_group(groupdestroy.group_handle as usize)?;
+
+        Ok(0)
+    }
+
+    pub(crate) fn group_submit(
+        _ddev: &TyrDrmDevice,
+        _groupsubmit: &mut uapi::drm_panthor_group_submit,
+        _file: &TyrDrmFile,
+    ) -> Result<u32> {
+        Err(ENOTSUPP)
+    }
+
+    pub(crate) fn group_get_state(
+        _ddev: &TyrDrmDevice,
+        groupgetstate: &mut uapi::drm_panthor_group_get_state,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if groupgetstate.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let group = file
+            .inner()
+            .group_pool()
+            .group(groupgetstate.group_handle as usize)
+            .ok_or(EINVAL)?;
+
+        groupgetstate.state = 0;
+        groupgetstate.fatal_queues = group.fatal_queues();
+
+        if groupgetstate.fatal_queues != 0 {
+            groupgetstate.state |=
+                uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+        }
+
+        Ok(0)
+    }
 }
 
 #[repr(transparent)]
@@ -343,3 +444,30 @@ struct VmBindOp(uapi::drm_panthor_vm_bind_op);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for VmBindOp {}
+
+#[repr(transparent)]
+struct QueueCreate(uapi::drm_panthor_queue_create);
+
+// SAFETY: this struct is safe to be transmuted from a byte slice.
+unsafe impl FromBytes for QueueCreate {}
+
+impl QueueCreate {
+    fn validate(&self) -> Result {
+        if self.0.pad != [0; 3] {
+            return Err(EINVAL);
+        }
+
+        if self.0.priority > 15 {
+            return Err(EINVAL);
+        }
+
+        if self.0.ringbuf_size < SZ_4K as u32
+            || self.0.ringbuf_size > SZ_64K as u32
+            || !self.0.ringbuf_size.is_power_of_two()
+        {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+}
