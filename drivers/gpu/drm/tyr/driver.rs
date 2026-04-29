@@ -85,6 +85,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Parent platform device.
     pub(crate) pdev: &'drm platform::Device<Bound>,
 
+    /// MMU manager backing every VM on this device.
+    pub(crate) mmu: Arc<Mmu>,
+
     /// Firmware sections.
     pub(crate) fw: Firmware<'drm>,
 
@@ -204,6 +207,7 @@ impl platform::Driver for TyrPlatformDriver {
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
+                mmu,
                 fw: firmware,
                 _job_irq: job_irq,
                 clks <- new_mutex!(Clocks {
@@ -258,6 +262,8 @@ impl drm::Driver for TyrDrmDriver {
 
     kernel::declare_drm_ioctls! {
         (PANTHOR_DEV_QUERY, drm_panthor_dev_query, ioctl::RENDER_ALLOW, TyrDrmFileData::dev_query),
+        (PANTHOR_VM_CREATE, drm_panthor_vm_create, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_create),
+        (PANTHOR_VM_DESTROY, drm_panthor_vm_destroy, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_destroy),
     }
 }
 

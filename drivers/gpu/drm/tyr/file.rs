@@ -10,14 +10,19 @@ use kernel::{
     uapi, //
 };
 
-use crate::driver::{
-    TyrDrmDevice,
-    TyrDrmDriver,
-    TyrDrmRegistrationData, //
+use crate::{
+    driver::{
+        TyrDrmDevice,
+        TyrDrmDriver,
+        TyrDrmRegistrationData, //
+    },
+    vm, //
 };
 
-#[pin_data]
-pub(crate) struct TyrDrmFileData {}
+#[pin_data(PinnedDrop)]
+pub(crate) struct TyrDrmFileData {
+    vm_pool: vm::Pool,
+}
 
 /// Convenience type alias for our DRM `File` type
 pub(crate) type TyrDrmFile = drm::file::File<TyrDrmFileData>;
@@ -26,11 +31,29 @@ impl drm::file::DriverFile for TyrDrmFileData {
     type Driver = TyrDrmDriver;
 
     fn open(_dev: &drm::Device<Self::Driver>) -> Result<Pin<KBox<Self>>> {
-        KBox::try_pin_init(try_pin_init!(Self {}), GFP_KERNEL)
+        KBox::try_pin_init(
+            try_pin_init!(Self {
+                vm_pool: vm::Pool::create()?,
+            }),
+            GFP_KERNEL,
+        )
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for TyrDrmFileData {
+    fn drop(self: Pin<&mut Self>) {
+        if let Err(e) = self.as_ref().vm_pool().destroy_all() {
+            pr_err!("Failed to destroy all VMs: {:?}\n", e);
+        }
     }
 }
 
 impl TyrDrmFileData {
+    pub(crate) fn vm_pool(self: Pin<&Self>) -> &vm::Pool {
+        &self.get_ref().vm_pool
+    }
+
     pub(crate) fn dev_query(
         _ddev: &TyrDrmDevice<Registered>,
         reg_data: &TyrDrmRegistrationData<'_>,
@@ -61,5 +84,39 @@ impl TyrDrmFileData {
                 _ => Err(EINVAL),
             }
         }
+    }
+
+    pub(crate) fn vm_create(
+        ddev: &TyrDrmDevice<Registered>,
+        reg_data: &TyrDrmRegistrationData<'_>,
+        vmcreate: &mut uapi::drm_panthor_vm_create,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if vmcreate.flags != 0 {
+            return Err(EINVAL);
+        }
+
+        let (id, user_va_range) =
+            file.inner()
+                .vm_pool()
+                .create_vm(ddev, reg_data, vmcreate.user_va_range)?;
+
+        vmcreate.id = id as u32;
+        vmcreate.user_va_range = user_va_range;
+        Ok(0)
+    }
+
+    pub(crate) fn vm_destroy(
+        _ddev: &TyrDrmDevice<Registered>,
+        _reg_data: &TyrDrmRegistrationData<'_>,
+        vmdestroy: &mut uapi::drm_panthor_vm_destroy,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if vmdestroy.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        file.inner().vm_pool().destroy_vm(vmdestroy.id as usize)?;
+        Ok(0)
     }
 }
