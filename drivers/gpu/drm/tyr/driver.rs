@@ -31,6 +31,7 @@ use kernel::{
         ThreadedIrqReturn,
         ThreadedRegistration, //
     },
+    mm::virt::VmaNew,
     new_mutex,
     of,
     platform,
@@ -57,6 +58,7 @@ use crate::{
     gem::Bo,
     gpu,
     gpu::GpuInfo,
+    mmap,
     mmu::Mmu,
     regs::gpu_control::*, //
 };
@@ -68,6 +70,16 @@ pub(crate) struct TyrDrmDriver;
 
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type TyrDrmDevice<Ctx = drm::Normal> = drm::Device<TyrDrmDriver, Ctx>;
+
+/// Data owned by the DRM device.
+///
+/// `registration_guard()` exists only on `Device<T, Ioctl>`, so driver callbacks running in the
+/// `Normal` context, such as the mmap hook, cannot reach `TyrDrmRegistrationData`. The data
+/// they need lives here.
+pub(crate) struct TyrDrmDeviceData {
+    /// Physical address of the GPU MMIO window.
+    pub(crate) mmio_phys_addr: u64,
+}
 
 pub(crate) struct TyrPlatformDriver;
 
@@ -106,6 +118,10 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// GPU information read from hardware during probe.
     pub(crate) gpu_info: GpuInfo,
+
+    /// Command stream interface information reported to userspace.
+    #[pin]
+    pub(crate) csif_info: Mutex<gpu::CsifInfo>,
 }
 
 fn issue_soft_reset(dev: &Device, iomem: &IoMem<'_>) -> Result {
@@ -152,6 +168,7 @@ impl platform::Driver for TyrPlatformDriver {
         let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
+        let mmio_phys_addr = request.start();
 
         let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?.into_devres()?, GFP_KERNEL)?;
         let io = iomem.access(pdev.as_ref())?;
@@ -170,7 +187,10 @@ impl platform::Driver for TyrPlatformDriver {
         // other threads of execution.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)? };
 
-        let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev, Ok(()))?;
+        let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
+            pdev,
+            Ok(TyrDrmDeviceData { mmio_phys_addr }),
+        )?;
 
         let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info)?;
 
@@ -221,6 +241,7 @@ impl platform::Driver for TyrPlatformDriver {
                 }),
                 iomem,
                 gpu_info,
+                csif_info <- new_mutex!(gpu::CsifInfo::default()),
         });
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
@@ -251,7 +272,7 @@ const INFO: drm::DriverInfo = drm::DriverInfo {
 
 #[vtable]
 impl drm::Driver for TyrDrmDriver {
-    type Data = ();
+    type Data = TyrDrmDeviceData;
     type RegistrationData<'drm> = TyrDrmRegistrationData<'drm>;
     type File = TyrDrmFileData;
     type Object = Bo;
@@ -264,6 +285,17 @@ impl drm::Driver for TyrDrmDriver {
         (PANTHOR_DEV_QUERY, drm_panthor_dev_query, ioctl::RENDER_ALLOW, TyrDrmFileData::dev_query),
         (PANTHOR_VM_CREATE, drm_panthor_vm_create, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_create),
         (PANTHOR_VM_DESTROY, drm_panthor_vm_destroy, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_destroy),
+        (PANTHOR_VM_BIND, drm_panthor_vm_bind, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_bind),
+        (PANTHOR_VM_GET_STATE, drm_panthor_vm_get_state, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_get_state),
+        (PANTHOR_BO_CREATE, drm_panthor_bo_create, ioctl::RENDER_ALLOW, TyrDrmFileData::bo_create),
+        (PANTHOR_BO_MMAP_OFFSET, drm_panthor_bo_mmap_offset, ioctl::RENDER_ALLOW, TyrDrmFileData::bo_mmap_offset),
+    }
+
+    fn mmap(device: &TyrDrmDevice, file: &drm::File<TyrDrmFileData>, vma: &VmaNew) -> Option<Result>
+    where
+        Self: Sized,
+    {
+        mmap::mmap(device, &file.inner(), vma)
     }
 }
 

@@ -28,6 +28,40 @@ use crate::{
     }, //
 };
 
+/// CSIF (Command Stream Interface) information.
+///
+/// # Invariants
+///
+/// - The layout of this struct is identical to the C `struct drm_panthor_csif_info`.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CsifInfo(pub(crate) uapi::drm_panthor_csif_info);
+
+impl Deref for CsifInfo {
+    type Target = uapi::drm_panthor_csif_info;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CsifInfo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// SAFETY: `CsifInfo`'s invariant guarantees that it is the same type that is
+// already exposed to userspace by the C driver. This implies that it fulfills
+// the requirements for `AsBytes`.
+//
+// This means:
+//
+// - No implicit padding,
+// - No kernel pointers,
+// - No interior mutability.
+unsafe impl AsBytes for CsifInfo {}
+
 /// Struct containing information that can be queried by userspace. This is read from
 /// the GPU's registers.
 ///

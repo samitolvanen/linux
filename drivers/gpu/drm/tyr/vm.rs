@@ -7,6 +7,8 @@
 //! Each virtual memory (VM) area is backed by ARM64 LPAE Stage 1 page tables and can be
 //! mapped into hardware address space (AS) slots for GPU execution.
 
+pub(crate) mod range;
+
 use core::ops::Range;
 
 use kernel::{
@@ -49,6 +51,10 @@ use kernel::{
     },
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         Mutex, //
@@ -104,7 +110,6 @@ impl Pool {
         Ok((index, user_va_range))
     }
 
-    #[expect(dead_code)]
     pub(crate) fn get_vm(&self, index: usize) -> Option<Arc<Vm>> {
         self.entries.get(index)
     }
@@ -126,6 +131,9 @@ impl Pool {
         Ok(())
     }
 }
+
+/// 256M of every VM is reserved for kernel objects by default.
+const MIN_KERNEL_VA_SIZE: u64 = 0x10000000;
 
 impl_flags!(
     /// Flags controlling virtual memory mapping behavior.
@@ -378,7 +386,7 @@ fn max_va_range(gpu_info: &GpuInfo) -> u64 {
 }
 
 pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64 {
-    let max_va_range = max_va_range(gpu_info);
+    let max_va_range = max_va_range(gpu_info) - MIN_KERNEL_VA_SIZE;
 
     if requested == 0 {
         max_va_range
@@ -404,8 +412,15 @@ pub(crate) struct Vm {
     /// Non-core part of the GPUVM. Can be used for stuff that doesn't modify the
     /// internal mapping tree, like GpuVm::obtain()
     gpuvm: ARef<GpuVm<GpuVmData>>,
+    /// Whether the VM can no longer service user requests.
+    unusable: Atomic<bool>,
     /// VA range for this VM.
     va_range: Range<u64>,
+    /// Kernel VA allocator for auto-placement of kernel buffer objects.
+    kernel_va: range::RangeAlloc,
+    /// Kernel VA reservations that must live as long as the VM.
+    #[pin]
+    kernel_reservations: Mutex<KVec<range::LiveRange>>,
 }
 
 impl Vm {
@@ -420,6 +435,14 @@ impl Vm {
         let va_bits = mmu_features.va_bits().get();
         let pa_bits = mmu_features.pa_bits().get();
 
+        let total_va_end = if range.end >= max_va_range(gpu_info) {
+            max_va_range(gpu_info)
+        } else {
+            range.end + MIN_KERNEL_VA_SIZE
+        };
+        let total_range = range.start..total_va_end;
+        let kernel_range = (total_va_end - MIN_KERNEL_VA_SIZE)..total_va_end;
+
         let reserve_range = 0..0u64;
 
         // dummy_obj is used to initialize the GPUVM tree.
@@ -431,7 +454,7 @@ impl Vm {
             c"Tyr::GpuVm",
             ddev,
             &*dummy_obj,
-            range.clone(),
+            total_range.clone(),
             reserve_range,
             GpuVmData,
         )
@@ -444,6 +467,7 @@ impl Vm {
             VmAsData::new(&mmu, pdev.as_ref(), va_bits, pa_bits),
             GFP_KERNEL,
         )?;
+        let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
 
         let vm = Arc::pin_init(
             pin_init!(Self{
@@ -452,7 +476,10 @@ impl Vm {
                 mmu: mmu.into(),
                 gpuvm,
                 gpuvm_unique <- new_mutex!(gpuvm_unique),
-                va_range: range,
+                unusable: Atomic::new(false),
+                va_range: total_range,
+                kernel_va,
+                kernel_reservations <- new_mutex!(KVec::new()),
             }),
             GFP_KERNEL,
         )?;
@@ -499,6 +526,14 @@ impl Vm {
             })
     }
 
+    pub(crate) fn is_unusable(&self) -> bool {
+        self.unusable.load(Relaxed)
+    }
+
+    fn mark_unusable(&self) {
+        self.unusable.store(true, Relaxed);
+    }
+
     /// Deactivate the VM by evicting it from its address space slot.
     fn deactivate(&self) -> Result {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
@@ -508,7 +543,7 @@ impl Vm {
 
     /// Kills the VM by deactivating it and unmapping all regions.
     pub(crate) fn kill(&self) {
-        // TODO: Turn the VM into a state where it can't be used.
+        self.mark_unusable();
         let _ = self.deactivate();
         let _ = self
             .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
@@ -696,6 +731,17 @@ impl Vm {
         // happen outside the DMA signalling path.
         self.gpuvm.deferred_cleanup();
         result
+    }
+
+    pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
+        self.kernel_va.allocate(size, GFP_KERNEL)
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn reserve_kernel_range(&self, start: u64, end: u64) -> Result {
+        let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
+        self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
+        Ok(())
     }
 }
 
