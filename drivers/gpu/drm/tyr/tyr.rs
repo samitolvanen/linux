@@ -16,6 +16,7 @@ mod mmap;
 mod mmu;
 mod pool;
 mod regs;
+mod sched;
 mod slot;
 mod vm;
 mod wait;
