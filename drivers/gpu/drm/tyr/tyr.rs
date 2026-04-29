@@ -13,6 +13,7 @@ mod fw;
 mod gem;
 mod gpu;
 mod mmu;
+mod pool;
 mod regs;
 mod slot;
 mod vm;
