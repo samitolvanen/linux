@@ -23,7 +23,6 @@ pub(crate) struct Pool<T: 'static> {
     free_index: Atomic<usize>,
 }
 
-#[expect(dead_code)]
 impl<T: 'static> Pool<T> {
     pub(crate) fn create() -> Result<Self> {
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
