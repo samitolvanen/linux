@@ -45,6 +45,12 @@ pub(crate) struct BoData {
     flags: u32,
 }
 
+impl BoData {
+    pub(crate) fn create_flags(&self) -> u32 {
+        self.flags
+    }
+}
+
 /// Arguments for creating a [`BoData`] instance.
 ///
 /// This structure is used to pass creation parameters when instantiating

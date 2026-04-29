@@ -506,6 +506,44 @@ impl TyrDrmFileData {
 
         Ok(0)
     }
+
+    pub(crate) fn bo_set_label(
+        _ddev: &TyrDrmDevice,
+        _args: &mut uapi::drm_panthor_bo_set_label,
+        _file: &TyrDrmFile,
+    ) -> Result<u32> {
+        Ok(0)
+    }
+
+    pub(crate) fn set_user_mmio_offset(
+        _ddev: &TyrDrmDevice,
+        _args: &mut uapi::drm_panthor_set_user_mmio_offset,
+        _file: &TyrDrmFile,
+    ) -> Result<u32> {
+        Err(ENOTSUPP)
+    }
+
+    pub(crate) fn bo_sync(
+        _ddev: &TyrDrmDevice,
+        _args: &mut uapi::drm_panthor_bo_sync,
+        _file: &TyrDrmFile,
+    ) -> Result<u32> {
+        Ok(0)
+    }
+
+    pub(crate) fn bo_query_info(
+        _ddev: &TyrDrmDevice,
+        args: &mut uapi::drm_panthor_bo_query_info,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        let bo = gem::lookup_handle(file, args.handle)?;
+
+        args.create_flags = bo.create_flags();
+        args.extra_flags = 0;
+        args.pad = 0;
+
+        Ok(0)
+    }
 }
 
 #[repr(transparent)]
