@@ -12,6 +12,7 @@ mod file;
 mod fw;
 mod gem;
 mod gpu;
+mod heap;
 mod mmap;
 mod mmu;
 mod pool;
