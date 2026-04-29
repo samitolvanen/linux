@@ -153,7 +153,8 @@ impl<T: drm::Driver> Deref for UnregisteredDevice<T> {
 
 impl<T: drm::Driver> UnregisteredDevice<T> {
     const fn compute_features() -> u32 {
-        let mut features = drm::driver::FEAT_GEM;
+        let mut features =
+            drm::driver::FEAT_GEM | drm::driver::FEAT_SYNCOBJ | drm::driver::FEAT_SYNCOBJ_TIMELINE;
 
         if T::FEAT_RENDER {
             features |= drm::driver::FEAT_RENDER;
