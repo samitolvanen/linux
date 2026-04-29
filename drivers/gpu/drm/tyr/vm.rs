@@ -67,8 +67,61 @@ use crate::{
         address_space::VmAsData,
         Mmu, //
     },
+    pool::Pool as ObjectPool,
     regs::gpu_control::MMU_FEATURES,
 };
+
+pub(crate) struct Pool {
+    entries: ObjectPool<Vm>,
+}
+
+impl Pool {
+    pub(crate) fn create() -> Result<Self> {
+        Ok(Self {
+            entries: ObjectPool::create()?,
+        })
+    }
+
+    pub(crate) fn create_vm(
+        &self,
+        tdev: &ARef<TyrDrmDevice>,
+        requested_user_va_range: u64,
+    ) -> Result<(usize, u64)> {
+        let user_va_range = normalize_user_va_range(&tdev.gpu_info, requested_user_va_range);
+        let vm = Vm::new_for_user(
+            &tdev.pdev,
+            &**tdev,
+            tdev.mmu.as_arc_borrow(),
+            &tdev.gpu_info,
+            user_va_range,
+        )?;
+
+        let index = self.entries.insert(vm)?;
+
+        Ok((index, user_va_range))
+    }
+
+    pub(crate) fn get_vm(&self, index: usize) -> Option<Arc<Vm>> {
+        self.entries.get(index)
+    }
+
+    pub(crate) fn destroy_vm(&self, index: usize) -> Result {
+        let vm = self.entries.remove(index)?;
+
+        vm.kill();
+        Ok(())
+    }
+
+    pub(crate) fn destroy_all(&self) -> Result {
+        let max_index = self.entries.index_upper_bound();
+
+        for index in 1..max_index {
+            let _ = self.destroy_vm(index);
+        }
+
+        Ok(())
+    }
+}
 
 impl_flags!(
     /// Flags controlling virtual memory mapping behavior.
@@ -303,6 +356,20 @@ impl Drop for PtUpdateContext<'_> {
 /// and associated types for buffer objects, virtual addresses, and contexts.
 pub(crate) struct GpuVmData {}
 
+fn max_va_range(gpu_info: &GpuInfo) -> u64 {
+    1u64 << MMU_FEATURES::from_raw(gpu_info.mmu_features).va_bits().get()
+}
+
+pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64 {
+    let max_va_range = max_va_range(gpu_info);
+
+    if requested == 0 {
+        max_va_range
+    } else {
+        core::cmp::min(requested, max_va_range)
+    }
+}
+
 /// GPU virtual address space.
 ///
 /// Each VM can be mapped into a hardware address space slot.
@@ -325,21 +392,17 @@ pub(crate) struct Vm {
 }
 
 impl Vm {
-    /// Creates a new GPU virtual address space.
-    ///
-    /// The VM is initialized with a page table configured according to the GPU's
-    /// address translation capabilities and registered with the GPUVM framework.
-    pub(crate) fn new<Ctx: DeviceContext>(
+    fn new_with_va_range<Ctx: DeviceContext>(
         pdev: &platform::Device,
         ddev: &TyrDrmDevice<Ctx>,
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
+        range: Range<u64>,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
         let pa_bits = mmu_features.pa_bits().get();
 
-        let range = 0..(1u64 << va_bits);
         let reserve_range = 0..0u64;
 
         // dummy_obj is used to initialize the GPUVM tree.
@@ -375,6 +438,31 @@ impl Vm {
         )?;
 
         Ok(vm)
+    }
+
+    /// Creates a new GPU virtual address space.
+    ///
+    /// The VM is initialized with a page table configured according to the GPU's
+    /// address translation capabilities and registered with the GPUVM framework.
+    pub(crate) fn new<Ctx: DeviceContext>(
+        pdev: &platform::Device,
+        ddev: &TyrDrmDevice<Ctx>,
+        mmu: ArcBorrow<'_, Mmu>,
+        gpu_info: &GpuInfo,
+    ) -> Result<Arc<Vm>> {
+        Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..max_va_range(gpu_info))
+    }
+
+    pub(crate) fn new_for_user<Ctx: DeviceContext>(
+        pdev: &platform::Device,
+        ddev: &TyrDrmDevice<Ctx>,
+        mmu: ArcBorrow<'_, Mmu>,
+        gpu_info: &GpuInfo,
+        user_va_range: u64,
+    ) -> Result<Arc<Vm>> {
+        let user_va_range = normalize_user_va_range(gpu_info, user_va_range);
+
+        Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..user_va_range)
     }
 
     /// Activate the VM in a hardware address space slot.

@@ -77,6 +77,8 @@ pub(crate) struct TyrPlatformDriverData;
 pub(crate) struct TyrDrmDeviceData {
     pub(crate) pdev: ARef<platform::Device>,
 
+	pub(crate) mmu: Arc<Mmu>,
+
     pub(crate) fw: Arc<Firmware>,
 
     #[pin]
@@ -184,6 +186,7 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
+				mmu,
                 fw: firmware,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
@@ -231,6 +234,8 @@ impl drm::Driver for TyrDrmDriver {
 
     kernel::declare_drm_ioctls! {
         (PANTHOR_DEV_QUERY, drm_panthor_dev_query, ioctl::RENDER_ALLOW, TyrDrmFileData::dev_query),
+		(PANTHOR_VM_CREATE, drm_panthor_vm_create, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_create),
+		(PANTHOR_VM_DESTROY, drm_panthor_vm_destroy, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_destroy),
     }
 }
 
