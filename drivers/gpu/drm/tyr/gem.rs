@@ -13,7 +13,8 @@ use kernel::{
     },
     drm::gem::{
         self,
-        shmem, //
+        shmem,
+        BaseObject, //
     },
     prelude::*,
     sync::{
@@ -27,7 +28,9 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDriver, //
     },
+    file::TyrDrmFile,
     vm::{
+        range,
         Vm,
         VmMapFlags, //
     },
@@ -61,6 +64,45 @@ impl gem::DriverObject for BoData {
 /// Type alias for Tyr GEM buffer objects.
 pub(crate) type Bo = gem::shmem::Object<BoData>;
 
+#[expect(dead_code)]
+/// A mapped kernel-owned buffer object with an always-valid kernel mapping.
+pub(crate) struct MappedBo {
+    kernel_bo: KernelBo,
+    kernel_node: range::LiveRange,
+    vmap: shmem::VMapOwned<BoData>,
+}
+
+#[expect(dead_code)]
+impl MappedBo {
+    pub(crate) fn new(kernel_bo: KernelBo, kernel_node: range::LiveRange) -> Result<Arc<Self>> {
+        let vmap = kernel_bo.bo.owned_vmap::<0>()?;
+        Ok(Arc::new(
+            Self {
+                kernel_bo,
+                kernel_node,
+                vmap,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
+        &self.vmap
+    }
+
+    pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
+        Some(self.kernel_node.range())
+    }
+}
+
+impl core::ops::Deref for MappedBo {
+    type Target = Bo;
+
+    fn deref(&self) -> &Bo {
+        self.vmap.owner()
+    }
+}
+
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
 pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice) -> Result<ARef<Bo>> {
     let bo = Bo::new(
@@ -74,6 +116,53 @@ pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice) -> Result<ARef<Bo>> {
     )?;
 
     Ok(bo)
+}
+
+pub(crate) fn new_bo(ddev: &TyrDrmDevice, size: usize, flags: u32) -> Result<ARef<Bo>> {
+    let aligned_size = size.next_multiple_of(1 << 12);
+
+    if size == 0 || size > aligned_size {
+        return Err(EINVAL);
+    }
+
+    Bo::new(
+        ddev,
+        aligned_size,
+        shmem::ObjectConfig {
+            map_wc: true,
+            parent_resv_obj: None,
+        },
+        BoCreateArgs { flags },
+    )
+}
+
+pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
+    shmem::Object::lookup_handle(file, handle)
+}
+
+#[expect(dead_code)]
+/// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
+pub(crate) fn new_kernel_object(
+    dev: &Device<Bound>,
+    ddev: &TyrDrmDevice,
+    vm: &Arc<Vm>,
+    size: usize,
+    flags: VmMapFlags,
+) -> Result<Arc<MappedBo>> {
+    let aligned_size = size.next_multiple_of(1 << 12);
+    let node = vm.alloc_kernel_range(aligned_size)?;
+    let va = node.start();
+
+    let kernel_bo = KernelBo::new(
+        dev,
+        ddev,
+        vm.clone(),
+        aligned_size as u64,
+        KernelBoVaAlloc::Explicit(va),
+        flags,
+    )?;
+
+    MappedBo::new(kernel_bo, node)
 }
 
 /// Specifies how to choose a GPU virtual address for a [`KernelBo`].
