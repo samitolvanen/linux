@@ -42,6 +42,12 @@ pub(crate) struct BoData {
     flags: u32,
 }
 
+impl BoData {
+    pub(crate) fn create_flags(&self) -> u32 {
+        self.flags
+    }
+}
+
 /// Provides a way to pass arguments when creating BoData
 /// as required by the gem::DriverObject trait.
 pub(crate) struct BoCreateArgs {
