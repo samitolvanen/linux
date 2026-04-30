@@ -3,6 +3,7 @@
 use core::{
     ops::Range,
     sync::atomic::{
+        AtomicU64,
         AtomicUsize,
         Ordering,
     },
@@ -41,6 +42,7 @@ pub(crate) struct Queue {
     pub(super) ringbuf: Arc<gem::MappedBo>,
     pub(super) interfaces: Interfaces,
     doorbell_id: AtomicUsize,
+    next_seqno: AtomicU64,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
 }
 
@@ -81,6 +83,7 @@ impl Queue {
             ringbuf,
             interfaces,
             doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
+            next_seqno: AtomicU64::new(0),
             iomem: tdev.iomem.clone(),
         })
     }
@@ -105,6 +108,10 @@ impl Queue {
     pub(super) fn can_append(&self, instr_count: usize) -> Result {
         self.ringbuf_space_for(instr_count)?;
         Ok(())
+    }
+
+    pub(super) fn claim_seqno(&self) -> u64 {
+        self.next_seqno.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     #[allow(dead_code)]
