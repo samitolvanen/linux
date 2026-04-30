@@ -3,6 +3,7 @@
 use core::ops::Range;
 
 use kernel::{
+    drm::gem::BaseObject,
     io::Io,
     prelude::*,
     sizes::SZ_4K,
@@ -44,6 +45,36 @@ impl Queue {
             _ringbuf: ringbuf,
             _interfaces: interfaces,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
+        let mut ringbuf_input = self._interfaces.read_input()?;
+        let ringbuf_sz = self._ringbuf.size() as u64;
+
+        let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
+
+        let ringbuf = self._ringbuf.vmap();
+        let size = ringbuf.owner().size();
+        // SAFETY: `ringbuf` owns a writable CPU mapping for the queue ring buffer
+        // and `size` matches the mapped object size.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(ringbuf.addr() as *mut u8, size) };
+
+        let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
+        bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
+        if first_chunk < instrs.len() {
+            bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
+        }
+
+        kernel::sync::barrier::smp_wmb();
+
+        let ringbuf_output = self._interfaces.read_output()?;
+        ringbuf_input.extract_init = ringbuf_output.extract;
+        ringbuf_input.insert += instrs.len() as u64;
+
+        self._interfaces.write_input(ringbuf_input)?;
+        kernel::sync::barrier::smp_wmb();
+        Ok(())
     }
 }
 
