@@ -28,11 +28,12 @@ use crate::{
 
 /// A minimal hardware queue object owned by a scheduling group.
 pub(crate) struct Queue {
-    _priority: u8,
-    _ringbuf: Arc<gem::MappedBo>,
-    _interfaces: Interfaces,
-    _doorbell_id: Option<usize>,
-    _iomem: Arc<kernel::devres::Devres<IoMem>>,
+    #[allow(dead_code)]
+    pub(super) priority: u8,
+    pub(super) ringbuf: Arc<gem::MappedBo>,
+    pub(super) interfaces: Interfaces,
+    pub(super) doorbell_id: Option<usize>,
+    iomem: Arc<kernel::devres::Devres<IoMem>>,
 }
 
 impl Queue {
@@ -48,22 +49,22 @@ impl Queue {
         let interfaces = Interfaces::new(iface_mem)?;
 
         Ok(Self {
-            _priority: queue_args.priority(),
-            _ringbuf: ringbuf,
-            _interfaces: interfaces,
-            _doorbell_id: None,
-            _iomem: tdev.iomem.clone(),
+            priority: queue_args.priority(),
+            ringbuf,
+            interfaces,
+            doorbell_id: None,
+            iomem: tdev.iomem.clone(),
         })
     }
 
     #[allow(dead_code)]
     pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
-        let mut ringbuf_input = self._interfaces.read_input()?;
-        let ringbuf_sz = self._ringbuf.size() as u64;
+        let mut ringbuf_input = self.interfaces.read_input()?;
+        let ringbuf_sz = self.ringbuf.size() as u64;
 
         let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
 
-        let ringbuf = self._ringbuf.vmap();
+        let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.owner().size();
         // SAFETY: `ringbuf` owns a writable CPU mapping for the queue ring buffer
         // and `size` matches the mapped object size.
@@ -77,20 +78,20 @@ impl Queue {
 
         kernel::sync::barrier::smp_wmb();
 
-        let ringbuf_output = self._interfaces.read_output()?;
+        let ringbuf_output = self.interfaces.read_output()?;
         ringbuf_input.extract_init = ringbuf_output.extract;
         ringbuf_input.insert += instrs.len() as u64;
 
-        self._interfaces.write_input(ringbuf_input)?;
+        self.interfaces.write_input(ringbuf_input)?;
         kernel::sync::barrier::smp_wmb();
         Ok(())
     }
 
     #[allow(dead_code)]
     pub(crate) fn kick(&self) -> Result {
-        let io = self._iomem.try_access().ok_or(EINVAL)?;
+        let io = self.iomem.try_access().ok_or(EINVAL)?;
         let doorbell_reg =
-            doorbell_block::DOORBELL::try_at(self._doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
+            doorbell_block::DOORBELL::try_at(self.doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
 
         io.try_write(
             doorbell_reg,
@@ -114,11 +115,13 @@ pub(super) struct RingBufferOutput {
 }
 
 pub(crate) struct Interfaces {
-    _mem: Arc<gem::MappedBo>,
-    _input_va: Range<u64>,
-    _output_va: Range<u64>,
-    _input_offset: usize,
-    _output_offset: usize,
+    mem: Arc<gem::MappedBo>,
+    #[allow(dead_code)]
+    pub(super) input_va: Range<u64>,
+    #[allow(dead_code)]
+    pub(super) output_va: Range<u64>,
+    input_offset: usize,
+    output_offset: usize,
 }
 
 impl Interfaces {
@@ -128,22 +131,22 @@ impl Interfaces {
         let output_va = output_start..(output_start + SZ_4K as u64);
 
         Ok(Self {
-            _mem: mem,
-            _input_va: input_va,
-            _output_va: output_va,
-            _input_offset: 0,
-            _output_offset: SZ_4K,
+            mem,
+            input_va,
+            output_va,
+            input_offset: 0,
+            output_offset: SZ_4K,
         })
     }
 
     #[allow(dead_code)]
     pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
-        let vmap = self._mem.vmap();
-        // SAFETY: `_input_offset` selects the queue input structure inside the
-        // writable CPU mapping owned by `_mem`.
+        let vmap = self.mem.vmap();
+        // SAFETY: `input_offset` selects the queue input structure inside the
+        // writable CPU mapping owned by `mem`.
         let input = unsafe {
             (vmap.addr() as *mut u8)
-                .add(self._input_offset)
+                .add(self.input_offset)
                 .cast::<RingBufferInput>()
                 .read_volatile()
         };
@@ -153,13 +156,13 @@ impl Interfaces {
 
     #[allow(dead_code)]
     pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
-        let vmap = self._mem.vmap();
+        let vmap = self.mem.vmap();
 
-        // SAFETY: `_input_offset` selects the queue input structure inside the
-        // writable CPU mapping owned by `_mem`.
+        // SAFETY: `input_offset` selects the queue input structure inside the
+        // writable CPU mapping owned by `mem`.
         unsafe {
             (vmap.addr() as *mut u8)
-                .add(self._input_offset)
+                .add(self.input_offset)
                 .cast::<RingBufferInput>()
                 .write_volatile(value)
         };
@@ -169,12 +172,12 @@ impl Interfaces {
 
     #[allow(dead_code)]
     pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
-        let vmap = self._mem.vmap();
-        // SAFETY: `_output_offset` selects the queue output structure inside the
-        // writable CPU mapping owned by `_mem`.
+        let vmap = self.mem.vmap();
+        // SAFETY: `output_offset` selects the queue output structure inside the
+        // writable CPU mapping owned by `mem`.
         let output = unsafe {
             (vmap.addr() as *mut u8)
-                .add(self._output_offset)
+                .add(self.output_offset)
                 .cast::<RingBufferOutput>()
                 .read_volatile()
         };
