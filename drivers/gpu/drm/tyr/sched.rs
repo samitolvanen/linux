@@ -114,12 +114,8 @@ impl Scheduler {
 	}
 
 	pub(crate) fn remove_group(&mut self, group: Arc<Group>) -> Result {
-		if let Some(csg_slot) = self.csg_slots.iter_mut().find(|slot| {
-			slot
-				.as_ref()
-				.map(|other| Arc::ptr_eq(other, &group))
-				.unwrap_or(false)
-		}) {
+		if let Some(csg_id) = group.csg_id() {
+			let csg_slot = self.csg_slots.get_mut(csg_id).ok_or(EINVAL)?;
 			group.set_csg_id(None);
 			*csg_slot = None;
 			return Ok(());
