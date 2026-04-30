@@ -66,7 +66,6 @@ pub(crate) struct Group {
     pub(super) suspend_buf: Arc<gem::MappedBo>,
     #[expect(dead_code)]
     pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
-    #[expect(dead_code)]
     syncobjs: Arc<gem::MappedBo>,
 }
 
@@ -179,6 +178,23 @@ impl Group {
         self.queues.len()
     }
 
+    fn syncobj_offset(&self, queue_index: usize) -> Result<usize> {
+        if queue_index >= self.queues.len() {
+            return Err(EINVAL);
+        }
+
+        Ok(queue_index * core::mem::size_of::<syncs::SyncObj64b>())
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn read_syncobj(&self, queue_index: usize) -> Result<u64> {
+        syncs::SyncObj64b::read_seqno(&self.syncobjs, self.syncobj_offset(queue_index)?)
+    }
+
+    fn write_syncobj(&self, queue_index: usize, value: syncs::SyncObj64b) -> Result {
+        syncs::SyncObj64b::write(&self.syncobjs, self.syncobj_offset(queue_index)?, value)
+    }
+
     pub(super) fn submit(
         &self,
         syncs: KVec<SyncOp>,
@@ -229,6 +245,18 @@ impl Group {
         for queued_stream in queued_streams.iter() {
             let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
             queue.append_instrs(&queued_stream.stream)?;
+        }
+
+        for queued_stream in queued_streams.iter() {
+            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
+            self.write_syncobj(
+                queued_stream.queue_index,
+                syncs::SyncObj64b {
+                    seqno: queue.claim_seqno(),
+                    status: 0,
+                    pad: 0,
+                },
+            )?;
         }
 
         for queued_stream in queued_streams.iter() {
