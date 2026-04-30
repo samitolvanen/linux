@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{
     AtomicU32,
+    AtomicUsize,
     Ordering,
 };
 
@@ -34,8 +35,11 @@ use super::{
     syncs,
 };
 
+const UNBOUND_CSG_ID: usize = usize::MAX;
+
 pub(crate) struct Group {
     pub(crate) fatal_queues: AtomicU32,
+    csg_id: AtomicUsize,
     pub(crate) queues: KVec<Queue>,
     #[allow(dead_code)]
     pub(super) vm: Arc<Vm>,
@@ -121,6 +125,7 @@ impl Group {
         Ok(Arc::new(
             Self {
                 fatal_queues: AtomicU32::new(0),
+                csg_id: AtomicUsize::new(UNBOUND_CSG_ID),
                 queues,
                 vm,
                 priority: group_args.priority,
@@ -140,6 +145,21 @@ impl Group {
 
     pub(crate) fn fatal_queues(&self) -> u32 {
         self.fatal_queues.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn csg_id(&self) -> Option<usize> {
+        let csg_id = self.csg_id.load(Ordering::Relaxed);
+
+        if csg_id == UNBOUND_CSG_ID {
+            None
+        } else {
+            Some(csg_id)
+        }
+    }
+
+    pub(super) fn set_csg_id(&self, csg_id: Option<usize>) {
+        self.csg_id
+            .store(csg_id.unwrap_or(UNBOUND_CSG_ID), Ordering::Relaxed);
     }
 
     pub(crate) fn queue_count(&self) -> usize {

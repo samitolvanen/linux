@@ -79,12 +79,7 @@ impl Scheduler {
 	}
 
 	pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, group: Arc<Group>) -> Result {
-		if self.csg_slots.iter().any(|slot| {
-			slot
-				.as_ref()
-				.map(|other| Arc::ptr_eq(other, &group))
-				.unwrap_or(false)
-		}) {
+		if group.csg_id().is_some() {
 			return Ok(());
 		}
 
@@ -103,6 +98,7 @@ impl Scheduler {
 			.ok_or(EINVAL)?;
 		let group = idle_groups.remove(idle_pos)?;
 		let slot = self.csg_slots.get_mut(csg_slot).ok_or(EINVAL)?;
+		group.set_csg_id(Some(csg_slot));
 		*slot = Some(group);
 
 		Ok(())
@@ -124,6 +120,7 @@ impl Scheduler {
 				.map(|other| Arc::ptr_eq(other, &group))
 				.unwrap_or(false)
 		}) {
+			group.set_csg_id(None);
 			*csg_slot = None;
 			return Ok(());
 		}
