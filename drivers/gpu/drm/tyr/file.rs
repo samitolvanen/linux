@@ -678,6 +678,31 @@ impl QueueSubmit {
 
         Ok(())
     }
+
+    pub(crate) fn queue_index(&self) -> usize {
+        self.0.queue_index as usize
+    }
+
+    pub(crate) fn has_stream(&self) -> bool {
+        self.0.stream_size != 0
+    }
+
+    pub(crate) fn copy_stream(&self) -> Result<KVec<u8>> {
+        let stream_size = self.0.stream_size as usize;
+
+        if stream_size == 0 {
+            return Ok(KVec::new());
+        }
+
+        let mut stream = KVec::with_capacity(stream_size, GFP_KERNEL)?;
+        stream.resize(stream_size, 0, GFP_KERNEL)?;
+
+        let mut reader = UserSlice::new(UserPtr::from_addr(self.0.stream_addr as usize), stream_size)
+            .reader();
+        reader.read_slice(&mut stream[..])?;
+
+        Ok(stream)
+    }
 }
 
 #[repr(transparent)]

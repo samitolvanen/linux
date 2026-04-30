@@ -150,11 +150,11 @@ impl Scheduler {
 
 	pub(crate) fn submit(
 		&mut self,
-		_syncs: KVec<SyncOp>,
-		_group: Arc<Group>,
-		_queue_submits: KVec<QueueSubmit>,
+		syncs: KVec<SyncOp>,
+		group: Arc<Group>,
+		queue_submits: KVec<QueueSubmit>,
 		_file: &TyrDrmFile,
 	) -> Result {
-		Err(ENOTSUPP)
+		group.submit(syncs, queue_submits)
 	}
 }

@@ -83,9 +83,18 @@ impl Queue {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
+    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
         let mut ringbuf_input = self.interfaces.read_input()?;
         let ringbuf_sz = self.ringbuf.size() as u64;
+        let ringbuf_output = self.interfaces.read_output()?;
+
+        if instrs.len() as u64 > ringbuf_sz {
+            return Err(ENOSPC);
+        }
+
+        if ringbuf_input.insert != ringbuf_output.extract {
+            return Err(EBUSY);
+        }
 
         let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
 
@@ -103,7 +112,6 @@ impl Queue {
 
         kernel::sync::barrier::smp_wmb();
 
-        let ringbuf_output = self.interfaces.read_output()?;
         ringbuf_input.extract_init = ringbuf_output.extract;
         ringbuf_input.insert += instrs.len() as u64;
 
@@ -165,7 +173,7 @@ impl Interfaces {
     }
 
     #[allow(dead_code)]
-    pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
+    pub(super) fn read_input(&self) -> Result<RingBufferInput> {
         let vmap = self.mem.vmap();
         // SAFETY: `input_offset` selects the queue input structure inside the
         // writable CPU mapping owned by `mem`.
@@ -180,7 +188,7 @@ impl Interfaces {
     }
 
     #[allow(dead_code)]
-    pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
+    pub(super) fn write_input(&self, value: RingBufferInput) -> Result {
         let vmap = self.mem.vmap();
 
         // SAFETY: `input_offset` selects the queue input structure inside the
@@ -196,7 +204,7 @@ impl Interfaces {
     }
 
     #[allow(dead_code)]
-    pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
+    pub(super) fn read_output(&self) -> Result<RingBufferOutput> {
         let vmap = self.mem.vmap();
         // SAFETY: `output_offset` selects the queue output structure inside the
         // writable CPU mapping owned by `mem`.
