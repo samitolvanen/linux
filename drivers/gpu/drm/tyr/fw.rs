@@ -34,6 +34,7 @@ use kernel::{
     new_mutex,
     platform,
     prelude::*,
+    sizes::SZ_8K,
     str::CString,
     sync::{
         aref::ARef,
@@ -359,6 +360,13 @@ impl Firmware {
         let csg = global_iface.csg(0).ok_or(EINVAL)?;
 
         csg.suspend_buf_sizes()
+    }
+
+    /// Allocate a CS ring-buffer interface in the FW VM (AS0).
+    pub(crate) fn alloc_queue_mem(&self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
+        let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
+
+        gem::new_kernel_object(tdev, &self.vm, SZ_8K, flags)
     }
 
     pub(crate) fn alloc_suspend_buf(

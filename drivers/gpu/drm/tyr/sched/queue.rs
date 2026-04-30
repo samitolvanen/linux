@@ -20,6 +20,7 @@ use crate::{
 pub(crate) struct Queue {
     _priority: u8,
     _ringbuf: Arc<gem::MappedBo>,
+    _iface_mem: Arc<gem::MappedBo>,
 }
 
 impl Queue {
@@ -30,10 +31,12 @@ impl Queue {
     ) -> Result<Self> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let ringbuf = gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
+        let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
 
         Ok(Self {
             _priority: queue_args.priority(),
             _ringbuf: ringbuf,
+            _iface_mem: iface_mem,
         })
     }
 }
