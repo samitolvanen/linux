@@ -19,6 +19,7 @@ use crate::{
 
 pub(crate) struct Group {
     fatal_queues: AtomicU32,
+    queue_count: usize,
 }
 
 impl Group {
@@ -59,6 +60,7 @@ impl Group {
         Ok(Arc::new(
             Self {
                 fatal_queues: AtomicU32::new(0),
+                queue_count: group_args.queues.count as usize,
             },
             GFP_KERNEL,
         )?)
@@ -66,6 +68,10 @@ impl Group {
 
     pub(crate) fn fatal_queues(&self) -> u32 {
         self.fatal_queues.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn queue_count(&self) -> usize {
+        self.queue_count
     }
 }
 

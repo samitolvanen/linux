@@ -414,9 +414,51 @@ impl TyrDrmFileData {
 
     pub(crate) fn group_submit(
         _ddev: &TyrDrmDevice,
-        _groupsubmit: &mut uapi::drm_panthor_group_submit,
-        _file: &TyrDrmFile,
+        groupsubmit: &mut uapi::drm_panthor_group_submit,
+        file: &TyrDrmFile,
     ) -> Result<u32> {
+        if groupsubmit.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        if groupsubmit.queue_submits.count == 0 {
+            return Err(EINVAL);
+        }
+
+        if groupsubmit.queue_submits.stride as usize
+            != core::mem::size_of::<uapi::drm_panthor_queue_submit>()
+        {
+            return Err(ENOTSUPP);
+        }
+
+        let group = file
+            .inner()
+            .group_pool()
+            .group(groupsubmit.group_handle as usize)
+            .ok_or(EINVAL)?;
+
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(groupsubmit.queue_submits.array as usize),
+            groupsubmit.queue_submits.stride as usize * groupsubmit.queue_submits.count as usize,
+        )
+        .reader();
+
+        for _ in 0..groupsubmit.queue_submits.count {
+            let queue: QueueSubmit = reader.read()?;
+            queue.validate(group.queue_count())?;
+
+            let mut sync_reader = UserSlice::new(
+                UserPtr::from_addr(queue.0.syncs.array as usize),
+                queue.0.syncs.stride as usize * queue.0.syncs.count as usize,
+            )
+            .reader();
+
+            for _ in 0..queue.0.syncs.count {
+                let sync: SyncOp = sync_reader.read()?;
+                sync.validate()?;
+            }
+        }
+
         Err(ENOTSUPP)
     }
 
@@ -571,6 +613,69 @@ impl QueueCreate {
         if self.0.ringbuf_size < SZ_4K as u32
             || self.0.ringbuf_size > SZ_64K as u32
             || !self.0.ringbuf_size.is_power_of_two()
+        {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+}
+
+#[repr(transparent)]
+struct QueueSubmit(uapi::drm_panthor_queue_submit);
+
+// SAFETY: this struct is safe to be transmuted from a byte slice.
+unsafe impl FromBytes for QueueSubmit {}
+
+impl QueueSubmit {
+    fn validate(&self, queue_count: usize) -> Result {
+        if self.0.queue_index as usize >= queue_count {
+            return Err(EINVAL);
+        }
+
+        if self.0.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        if (self.0.stream_size == 0) != (self.0.stream_addr == 0) {
+            return Err(EINVAL);
+        }
+
+        if self.0.stream_addr & 63 != 0 || self.0.stream_size & 7 != 0 {
+            return Err(EINVAL);
+        }
+
+        if self.0.syncs.stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
+            return Err(ENOTSUPP);
+        }
+
+        Ok(())
+    }
+}
+
+#[repr(transparent)]
+struct SyncOp(uapi::drm_panthor_sync_op);
+
+// SAFETY: this struct is safe to be transmuted from a byte slice.
+unsafe impl FromBytes for SyncOp {}
+
+impl SyncOp {
+    fn validate(&self) -> Result {
+        let valid_flags = (uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL
+            | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT
+            | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK)
+            as u32;
+
+        if self.0.flags & !valid_flags != 0 {
+            return Err(EINVAL);
+        }
+
+        let handle_type = self.0.flags
+            & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK as u32;
+
+        if handle_type != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ as u32
+            && handle_type
+                != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ as u32
         {
             return Err(EINVAL);
         }
