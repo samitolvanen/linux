@@ -172,7 +172,11 @@ impl Pool {
         self.0.get(index)
     }
 
-    pub(crate) fn destroy_group(&self, _ddev: &TyrDrmDevice, index: usize) -> Result {
+    pub(crate) fn destroy_group(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
+        let group = self.0.get(index).ok_or(EINVAL)?;
+
+        ddev.with_locked_scheduler(|sched| sched.remove_group(group))?;
+
         self.0.remove(index)?;
         Ok(())
     }

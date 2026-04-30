@@ -60,6 +60,10 @@ impl Scheduler {
 		Ok(())
 	}
 
+	pub(crate) fn remove_group(&mut self, _group: Arc<Group>) -> Result {
+		Ok(())
+	}
+
 	pub(crate) fn submit(
 		&mut self,
 		_syncs: KVec<SyncOp>,
