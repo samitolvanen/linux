@@ -469,7 +469,10 @@ impl TyrDrmFileData {
             queue_submits.push(queue, GFP_KERNEL)?;
         }
 
-        ddev.with_locked_scheduler(|sched| sched.submit(syncs, group, queue_submits, file))?;
+        ddev.with_locked_scheduler(|sched| {
+            sched.bind(ddev, group.clone())?;
+            sched.submit(syncs, group, queue_submits, file)
+        })?;
 
         Ok(0)
     }

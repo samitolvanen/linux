@@ -52,6 +52,10 @@ impl Scheduler {
 		Ok(Self)
 	}
 
+	pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, _group: Arc<Group>) -> Result {
+		Ok(())
+	}
+
 	pub(crate) fn submit(
 		&mut self,
 		_syncs: KVec<SyncOp>,
