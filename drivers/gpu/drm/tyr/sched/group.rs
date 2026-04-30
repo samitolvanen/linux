@@ -36,6 +36,20 @@ use super::{
 pub(crate) struct Group {
     pub(crate) fatal_queues: AtomicU32,
     pub(crate) queues: KVec<Queue>,
+    #[allow(dead_code)]
+    pub(super) priority: u8,
+    #[allow(dead_code)]
+    pub(super) compute_core_mask: u64,
+    #[allow(dead_code)]
+    pub(super) fragment_core_mask: u64,
+    #[allow(dead_code)]
+    pub(super) tiler_core_mask: u64,
+    #[allow(dead_code)]
+    pub(super) max_compute_cores: u8,
+    #[allow(dead_code)]
+    pub(super) max_fragment_cores: u8,
+    #[allow(dead_code)]
+    pub(super) max_tiler_cores: u8,
     _suspend_buf: Arc<gem::MappedBo>,
     _protm_suspend_buf: Arc<gem::MappedBo>,
     _syncobjs: Arc<gem::MappedBo>,
@@ -103,6 +117,13 @@ impl Group {
             Self {
                 fatal_queues: AtomicU32::new(0),
                 queues,
+                priority: group_args.priority,
+                compute_core_mask: group_args.compute_core_mask,
+                fragment_core_mask: group_args.fragment_core_mask,
+                tiler_core_mask: group_args.tiler_core_mask,
+                max_compute_cores: group_args.max_compute_cores,
+                max_fragment_cores: group_args.max_fragment_cores,
+                max_tiler_cores: group_args.max_tiler_cores,
                 _suspend_buf: suspend_buf,
                 _protm_suspend_buf: protm_suspend_buf,
                 _syncobjs: syncobjs,
