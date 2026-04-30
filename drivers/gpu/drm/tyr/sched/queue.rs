@@ -102,13 +102,17 @@ impl Queue {
         let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.size();
         let ringbuf_output = self.interfaces.read_output()?;
+        let used = ringbuf_input
+            .insert
+            .checked_sub(ringbuf_output.extract)
+            .ok_or(EIO)?;
 
         if instrs.len() > size {
             return Err(ENOSPC);
         }
 
-        if ringbuf_input.insert != ringbuf_output.extract {
-            return Err(EBUSY);
+        if used > size as u64 || instrs.len() as u64 > size as u64 - used {
+            return Err(ENOSPC);
         }
 
         let cs_insert = (ringbuf_input.insert & (size as u64 - 1)) as usize;
