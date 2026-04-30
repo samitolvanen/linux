@@ -54,7 +54,18 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-	pub(crate) fn init(_tdev: &TyrDrmDevice) -> Result<Self> {
+	pub(crate) fn init(tdev: &TyrDrmDevice) -> Result<Self> {
+		let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
+			tdev.fw.csif_info_counts()?;
+
+		{
+			let mut csif = tdev.csif_info.lock();
+			csif.csg_slot_count = csg_slot_count;
+			csif.cs_slot_count = cs_slot_count;
+			csif.cs_reg_count = cs_reg_count;
+			csif.scoreboard_slot_count = scoreboard_slot_count;
+		}
+
 		Ok(Self {
 			idle_groups: [const { KVec::new() }; GROUP_PRIORITY_COUNT],
 		})

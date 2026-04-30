@@ -355,6 +355,19 @@ impl Firmware {
         )
     }
 
+    pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+        let global_iface = self.global_iface.lock();
+        let csg = global_iface.csg(0).ok_or(EINVAL)?;
+        let cs = csg.cs(0).ok_or(EINVAL)?;
+
+        Ok((
+            global_iface.csg_slot_count()?,
+            csg.cs_slot_count()?,
+            cs.work_regs()?,
+            cs.scoreboards()?,
+        ))
+    }
+
     pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
         let global_iface = self.global_iface.lock();
         let csg = global_iface.csg(0).ok_or(EINVAL)?;

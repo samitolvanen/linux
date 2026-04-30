@@ -2209,14 +2209,12 @@ enum CsInterfaceState {
     /// Interface is not yet initialized.
     Disabled,
     /// Interface is initialized and operational.
-    #[expect(dead_code)]
     Enabled(EnabledCsInterface),
 }
 
 /// When enabled, a CS Interface has control, input, and output system memory interfaces.
 struct EnabledCsInterface {
     /// Control block interface - provides CS capabilities and configuration.
-    #[expect(dead_code)]
     cs_control: FwInterface<CS_CONTROL_BLOCK_SIZE>,
     /// Input block interface - driver writes CS requests here.
     #[expect(dead_code)]
@@ -2306,7 +2304,7 @@ impl CsInterface {
             CsInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        Ok(enabled.cs_control.read(STREAM_FEATURES).work_registers().get().into())
+        Ok(enabled.cs_control.read(STREAM_FEATURES).work_registers().get())
     }
 
     pub(crate) fn scoreboards(&self) -> Result<u32> {
@@ -2318,6 +2316,6 @@ impl CsInterface {
             CsInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        Ok(enabled.cs_control.read(STREAM_FEATURES).scoreboards().get().into())
+        Ok(enabled.cs_control.read(STREAM_FEATURES).scoreboards().get())
     }
 }
