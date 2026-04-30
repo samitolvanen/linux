@@ -213,6 +213,11 @@ impl Group {
 
         for queued_stream in queued_streams.iter() {
             let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
+            queue.can_append(queued_stream.stream.len())?;
+        }
+
+        for queued_stream in queued_streams.iter() {
+            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
             queue.append_instrs(&queued_stream.stream)?;
         }
 

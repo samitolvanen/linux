@@ -45,6 +45,26 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput> {
+        let ringbuf_input = self.interfaces.read_input()?;
+        let ringbuf_sz = self.ringbuf.size() as u64;
+        let ringbuf_output = self.interfaces.read_output()?;
+        let used = ringbuf_input
+            .insert
+            .checked_sub(ringbuf_output.extract)
+            .ok_or(EIO)?;
+
+        if instr_count as u64 > ringbuf_sz {
+            return Err(ENOSPC);
+        }
+
+        if used > ringbuf_sz || instr_count as u64 > ringbuf_sz - used {
+            return Err(ENOSPC);
+        }
+
+        Ok(ringbuf_input)
+    }
+
     pub(crate) fn new(
         tdev: &TyrDrmDevice,
         queue_args: &QueueCreate,
@@ -82,23 +102,16 @@ impl Queue {
         );
     }
 
+    pub(super) fn can_append(&self, instr_count: usize) -> Result {
+        self.ringbuf_space_for(instr_count)?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
-        let mut ringbuf_input = self.interfaces.read_input()?;
+        let mut ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let ringbuf_sz = self.ringbuf.size() as u64;
         let ringbuf_output = self.interfaces.read_output()?;
-        let used = ringbuf_input
-			.insert
-			.checked_sub(ringbuf_output.extract)
-			.ok_or(EIO)?;
-
-        if instrs.len() as u64 > ringbuf_sz {
-            return Err(ENOSPC);
-        }
-
-        if used > ringbuf_sz || instrs.len() as u64 > ringbuf_sz - used {
-			return Err(ENOSPC);
-        }
 
         let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
 
