@@ -97,6 +97,7 @@ impl Scheduler {
 			.position(|other| Arc::ptr_eq(other, &group))
 			.ok_or(EINVAL)?;
 		let group = idle_groups.remove(idle_pos)?;
+		group.vm.activate()?;
 		let slot = self.csg_slots.get_mut(csg_slot).ok_or(EINVAL)?;
 		group.set_csg_id(Some(csg_slot));
 		for queue in group.queues.iter() {
@@ -119,6 +120,7 @@ impl Scheduler {
 	pub(crate) fn remove_group(&mut self, group: Arc<Group>) -> Result {
 		if let Some(csg_id) = group.csg_id() {
 			let csg_slot = self.csg_slots.get_mut(csg_id).ok_or(EINVAL)?;
+			group.vm.deactivate()?;
 			for queue in group.queues.iter() {
 				queue.set_doorbell_id(None);
 			}
