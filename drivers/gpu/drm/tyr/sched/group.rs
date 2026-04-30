@@ -7,6 +7,8 @@ use core::sync::atomic::{
 
 use kernel::{
     alloc::KVec,
+    drm::gem::BaseObject,
+    io::Io,
     prelude::*,
     sync::Arc,
     uapi,
@@ -20,15 +22,23 @@ use crate::{
     },
     gem,
     pool,
+    vm::{
+        VmFlag,
+        VmMapFlags,
+    },
 };
 
-use super::queue::Queue;
+use super::{
+    queue::Queue,
+    syncs,
+};
 
 pub(crate) struct Group {
     pub(crate) fatal_queues: AtomicU32,
     pub(crate) queues: KVec<Queue>,
     _suspend_buf: Arc<gem::MappedBo>,
     _protm_suspend_buf: Arc<gem::MappedBo>,
+    _syncobjs: Arc<gem::MappedBo>,
 }
 
 impl Group {
@@ -74,6 +84,15 @@ impl Group {
             .fw
             .alloc_suspend_buf(ddev, protm_suspend_buf_size as usize)?;
 
+        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
+        let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
+        let syncobjs = gem::new_kernel_object(ddev, &vm, num_syncs, flags)?;
+
+        let vmap = syncobjs.vmap();
+        let size = vmap.owner().size();
+        // SAFETY: `vmap` owns a valid writable mapping for `size` bytes.
+        unsafe { core::ptr::write_bytes(vmap.addr() as *mut u8, 0, size) };
+
         let mut queues = KVec::new();
 
         for queue_arg in queue_args.iter() {
@@ -86,6 +105,7 @@ impl Group {
                 queues,
                 _suspend_buf: suspend_buf,
                 _protm_suspend_buf: protm_suspend_buf,
+                _syncobjs: syncobjs,
             },
             GFP_KERNEL,
         )?)
