@@ -60,6 +60,8 @@ use crate::{
     gpu,
     gpu::GpuInfo,
     mmu::Mmu,
+    sched::Scheduler,
+    sched::SchedulerState,
     regs::gpu_control::*, //
 };
 
@@ -98,6 +100,20 @@ pub(crate) struct TyrDrmDeviceData {
 
 	#[pin]
 	pub(crate) csif_info: Mutex<gpu::CsifInfo>,
+
+    /// The scheduler logic.
+    #[pin]
+    sched: Mutex<SchedulerState>,
+}
+
+impl TyrDrmDeviceData {
+    pub(crate) fn with_locked_scheduler<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Scheduler) -> Result<R>,
+    {
+        let mut sched = self.sched.lock();
+        f(sched.enabled_mut()?)
+    }
 }
 
 fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
@@ -209,9 +225,13 @@ impl platform::Driver for TyrPlatformDriverData {
                 }),
                 gpu_info,
 				csif_info <- new_mutex!(gpu::CsifInfo::default()),
+                sched <- new_mutex!(SchedulerState::Disabled),
         });
 
-        Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
+        let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
+        let tdev: ARef<TyrDrmDevice> = ddev.into();
+
+        tdev.sched.lock().init(&tdev)?;
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
