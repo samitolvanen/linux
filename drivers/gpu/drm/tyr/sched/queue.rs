@@ -51,6 +51,7 @@ pub(crate) struct Queue {
     pub(super) ringbuf: Arc<gem::MappedBo>,
     pub(super) interfaces: Interfaces,
     doorbell_id: Atomic<usize>,
+    next_seqno: Atomic<u64>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
 }
 
@@ -97,6 +98,7 @@ impl Queue {
             ringbuf,
             interfaces,
             doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
+            next_seqno: Atomic::new(0),
             iomem: reg_data.iomem.clone(),
         })
     }
@@ -119,6 +121,10 @@ impl Queue {
     pub(super) fn can_append(&self, instr_count: usize) -> Result {
         self.ringbuf_space_for(instr_count)?;
         Ok(())
+    }
+
+    pub(super) fn claim_seqno(&self) -> u64 {
+        self.next_seqno.fetch_add(1, Relaxed) + 1
     }
 
     pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
