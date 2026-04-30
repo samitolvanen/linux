@@ -5,15 +5,20 @@ use core::ops::Range;
 use kernel::{
     drm::gem::BaseObject,
     io::Io,
+    io::register::Array,
     prelude::*,
     sizes::SZ_4K,
     sync::Arc,
 };
 
 use crate::{
-    driver::TyrDrmDevice,
+    driver::{
+        IoMem,
+        TyrDrmDevice,
+    },
     file::QueueCreate,
     gem,
+    regs::doorbell_block,
     vm::{
         Vm,
         VmFlag,
@@ -26,6 +31,8 @@ pub(crate) struct Queue {
     _priority: u8,
     _ringbuf: Arc<gem::MappedBo>,
     _interfaces: Interfaces,
+    _doorbell_id: Option<usize>,
+    _iomem: Arc<kernel::devres::Devres<IoMem>>,
 }
 
 impl Queue {
@@ -44,6 +51,8 @@ impl Queue {
             _priority: queue_args.priority(),
             _ringbuf: ringbuf,
             _interfaces: interfaces,
+            _doorbell_id: None,
+            _iomem: tdev.iomem.clone(),
         })
     }
 
@@ -75,6 +84,18 @@ impl Queue {
         self._interfaces.write_input(ringbuf_input)?;
         kernel::sync::barrier::smp_wmb();
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn kick(&self) -> Result {
+        let io = self._iomem.try_access().ok_or(EINVAL)?;
+        let doorbell_reg =
+            doorbell_block::DOORBELL::try_at(self._doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
+
+        io.try_write(
+            doorbell_reg,
+            doorbell_block::DOORBELL::zeroed().with_ring(true),
+        )
     }
 }
 
