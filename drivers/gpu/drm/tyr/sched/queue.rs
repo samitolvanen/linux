@@ -401,10 +401,13 @@ impl Queue {
 
     /// Kick the queue. This will notify CSF that new instructions are ready to
     /// be executed.
-    pub(crate) fn kick(&self) -> Result {
+    pub(crate) fn kick(&self, group_id: u64, queue_id: u32) -> Result {
         let io = self.iomem.try_access().ok_or(EINVAL)?;
-        let doorbell_reg =
-            doorbell_block::DOORBELL::try_at(self.doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
+        let doorbell_id = self.doorbell_id.ok_or(EINVAL)?;
+        let doorbell_reg = doorbell_block::DOORBELL::try_at(doorbell_id).ok_or(EINVAL)?;
+
+        crate::trace::queue_doorbell(group_id, queue_id, doorbell_id as u32);
+
         // Use try_write (runtime bounds check) because the doorbell index is
         // determined at runtime and cannot be validated at compile time.
         io.try_write(

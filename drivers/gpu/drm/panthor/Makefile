@@ -13,7 +13,7 @@ panthor-y := \
 	panthor_pwr.o \
 	panthor_sched.o
 
-panthor-$(CONFIG_DRM_PANTHOR_TRACE) += panthor_trace_points.o
+obj-$(CONFIG_DRM_PANTHOR_TRACE) += panthor_trace_points.o
 
 CFLAGS_panthor_trace_points.o := -I$(src)
 

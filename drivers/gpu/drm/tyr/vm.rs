@@ -691,13 +691,28 @@ impl Vm {
                     gfp,
                 )?;
 
-                gpuvm_unique.sm_map(OpMapRequest {
+                crate::trace::mmu_bind_start(
+                    self as *const Self as usize as u64,
+                    pt_upd.region.start,
+                    pt_upd.region.end - pt_upd.region.start,
+                );
+
+                let res = gpuvm_unique.sm_map(OpMapRequest {
                     addr: pt_upd.region.start,
                     range: pt_upd.region.end - pt_upd.region.start,
                     gem_offset: args.bo_offset,
                     vm_bo: &args.vm_bo,
                     context: &mut pt_upd,
-                })
+                });
+
+                crate::trace::mmu_bind_done(
+                    self as *const Self as usize as u64,
+                    pt_upd.region.start,
+                    pt_upd.region.end - pt_upd.region.start,
+                    res.as_ref().err().map(|e| e.to_errno()).unwrap_or(0),
+                );
+
+                res
                 //PtUpdateContext drops here flushing the page table
             }
             VmOpType::Unmap => {

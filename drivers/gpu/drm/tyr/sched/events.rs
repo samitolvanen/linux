@@ -164,10 +164,24 @@ impl Scheduler {
         let input = csg.read_input()?;
         let output = csg.read_output()?;
 
+        let group_id = group
+            .as_ref()
+            .map(|g| g.as_ref() as *const _ as usize as u64)
+            .unwrap_or(0);
+
         // We may have no pending CSG/CS interrupts to process.
         if input.req == output.ack && output.irq_req == input.irq_ack {
             return Ok(());
         }
+
+        crate::trace::csg_irq(
+            csg_id,
+            group_id,
+            input.req,
+            output.ack,
+            output.irq_req,
+            input.irq_ack,
+        );
 
         let csg_events = (input.req ^ output.ack) & CSG_EVT_MASK;
         let mut cs_irqs = output.irq_req ^ input.irq_ack;
@@ -194,11 +208,14 @@ impl Scheduler {
 
         if csg_events & CSG_PROGRESS_TIMER_EVENT != 0 {
             pr_warn!("sched: CSG slot {} progress timeout\n", csg_id);
+            crate::trace::csg_slot_progress_timeout(csg_id);
 
             let group = group.clone();
             if let Some(group) = group {
+                let group_id = group.as_ref() as *const _ as usize as u64;
                 let _ = group.with_locked_inner(|inner| {
                     inner.fatal_error = Some(ETIMEDOUT);
+                    crate::trace::group_timedout(group_id);
                     Ok(())
                 });
             }
@@ -253,6 +270,8 @@ impl Scheduler {
         let input = cs.read_input()?;
         let output = cs.read_output()?;
 
+        crate::trace::cs_irq(csg_id, cs_id, input.req, output.ack);
+
         let cs_events = (input.req ^ output.ack) & CS_EVT_MASK;
 
         if cs_events & CS_FATAL != 0 {
@@ -261,7 +280,10 @@ impl Scheduler {
             let group = group.clone();
             if let Some(group) = group {
                 group.with_locked_inner(|inner| {
-                    inner.set_queue_fatal(cs_id as usize);
+                    inner.set_queue_fatal(
+                        group.as_ref() as *const _ as usize as u64,
+                        cs_id as usize,
+                    );
                     Ok(())
                 })?;
             }
@@ -299,6 +321,12 @@ impl Scheduler {
                                     break;
                                 }
                                 if let Some(fence) = &pending.fence {
+                                    crate::trace::job_done(
+                                        pending.seqno,
+                                        group.as_ref() as *const _ as usize as u64,
+                                        cs_id as u32,
+                                        EINVAL.to_errno(),
+                                    );
                                     fence.set_error(EINVAL.to_errno());
                                 }
                             }
@@ -466,7 +494,10 @@ impl Scheduler {
                         if !inner.has_fatal_queues() {
                             let len = inner.queues.len() as u32;
                             for i in 0..len {
-                                inner.set_queue_fatal(i as usize);
+                                inner.set_queue_fatal(
+                                    group.as_ref() as *const _ as usize as u64,
+                                    i as usize,
+                                );
                             }
                         }
                         Ok(())
@@ -502,9 +533,20 @@ impl Scheduler {
 
         let csg = glb_iface.csg(csg_idx).ok_or(EINVAL)?;
         let output = csg.read_output()?;
+        let group_id = group.as_ref() as *const _ as usize as u64;
+
+        crate::trace::fw_csg_status_update(
+            csg_idx as u32,
+            group_id,
+            output.status_ep_current,
+            output.status_ep_req,
+            output.status_state,
+            output.resource_dep,
+        );
 
         let wait_arc_opt = group.with_locked_inner(|inner| {
             inner.idle = output.is_idle();
+            crate::trace::csg_slot_idle(csg_idx as u32, group_id, inner.idle);
             let mut has_sync_wait = false;
 
             for cs_id in 0..inner.queues.len() {
@@ -514,6 +556,15 @@ impl Scheduler {
                 if let Some(cs) = csg.cs(cs_id) {
                     let cs_out = cs.read_output()?;
                     let blocked_reason = cs_out.blocked_reason()?;
+
+                    crate::trace::fw_cs_status_update(
+                        csg_idx as u32,
+                        cs_id as u32,
+                        group_id,
+                        cs_out.status_wait,
+                        blocked_reason as u32,
+                        cs_out.status_req_resource,
+                    );
 
                     match blocked_reason {
                         BlockedReason::Unblocked => {
@@ -565,7 +616,7 @@ impl Scheduler {
                     }
                 }
 
-                inner.set_queue_idle(cs_id, idle);
+                inner.set_queue_idle(group_id, cs_id, idle);
                 inner.set_queue_blocked(cs_id, blocked);
             }
 
@@ -579,6 +630,7 @@ impl Scheduler {
         })?;
 
         if let Some(wait_arc) = wait_arc_opt {
+            crate::trace::group_wait(wait_arc.as_ref() as *const _ as usize as u64, true);
             self.waiting_groups[priority].push_back(wait_arc);
         }
 
@@ -596,6 +648,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        crate::trace::work_run(kernel::c_str!("fw_events"));
         let _ = this.with_locked_scheduler(|sched| {
             sched.process_events(this.clone()).inspect_err(|e| {
                 pr_err!("Failed to process firmware events: {}", e.to_errno());
@@ -614,6 +667,8 @@ impl DmaFenceWorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        crate::trace::work_run(kernel::c_str!("sync_upd"));
+
         let _ = this.with_locked_scheduler(|sched| {
             let mut immediate_tick = false;
 
@@ -658,7 +713,10 @@ impl DmaFenceWorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
                                     for i in 0..inner.queues.len() {
                                         if (unblocked_queues & (1 << i)) != 0 {
                                             inner.set_queue_blocked(i, false);
-                                            park_actions[i] = inner.sync_queue_state(i);
+                                            park_actions[i] = inner.sync_queue_state(
+                                                group.as_ref() as *const _ as usize as u64,
+                                                i,
+                                            );
                                         }
                                     }
 
@@ -677,6 +735,10 @@ impl DmaFenceWorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
                         if let Some((unblocked, move_to_runnable)) = action {
                             if unblocked {
+                                crate::trace::group_wait(
+                                    group.as_ref() as *const _ as usize as u64,
+                                    false,
+                                );
                                 let list_arc = peek.remove();
 
                                 if move_to_runnable {

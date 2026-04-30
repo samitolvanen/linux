@@ -19,6 +19,7 @@ use crate::fw::{
     global::GlobalInterface,
     impl_shared_section_read,
     impl_shared_section_rw,
+    IfaceType,
     RequestField,
     SharedSectionEntry,
     SharedSectionRange, //
@@ -305,6 +306,9 @@ impl SharedSectionEntry for CommandStream {
             core::mem::offset_of!(Input, req),
             &self.output_area,
             core::mem::offset_of!(Output, ack),
+            IfaceType::Cs(self.csg_id as u32, self.cs_id as u32),
+            false,
+            crate::fw::REQ_STR,
         ))
     }
 }
@@ -504,6 +508,7 @@ pub(crate) struct StatusWait {
     pub(crate) sync_wait: bool,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum BlockedReason {
     /// The command stream is not blocked.
     Unblocked = 0,

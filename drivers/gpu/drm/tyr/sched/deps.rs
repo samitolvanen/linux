@@ -182,12 +182,15 @@ enum JobState {
         prepared_job: PreparedJob<TyrJobHandler>,
         deps: KVec<ResolvedDep>,
         resolved_deps: KVec<Fence>,
+        group_id: u64,
+        queue_id: u32,
     },
     /// VM bind job is prepared, with fences created and dependencies resolved.
     PreparedVmBind {
         prepared_job: PreparedJob<VmBindJobHandler>,
         deps: KVec<ResolvedDep>,
         resolved_deps: KVec<Fence>,
+        vm_id: u64,
     },
     /// Job has been taken out and is being processed
     Taken,
@@ -306,12 +309,18 @@ impl<'a> Context<'a> {
         // capacity, with GFP_NOWAIT.
         let deps = self.collect_job_deps(job_idx)?;
         let resolved_deps = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
+        let group_id = job.group.as_ref() as *const _ as usize as u64;
+        let queue_id = job.queue_idx();
         let prepared_job = job_queue.prepare(job, deps.len())?;
+
+        crate::trace::job_status(0, group_id, queue_id as u32, kernel::c_str!("prepared"));
 
         self.jobs[job_idx].state = JobState::Prepared {
             prepared_job,
             deps,
             resolved_deps,
+            group_id,
+            queue_id: queue_id as u32,
         };
 
         Ok(())
@@ -323,18 +332,27 @@ impl<'a> Context<'a> {
         job_idx: usize,
         job_queue: &JobQueue<TyrJobHandler>,
     ) -> Result<Fence> {
-        let (prepared_job, deps, mut resolved_deps) =
+        let (prepared_job, deps, mut resolved_deps, group_id, queue_id) =
             match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
                 JobState::Prepared {
                     prepared_job,
                     deps,
                     resolved_deps,
-                } => (prepared_job, deps, resolved_deps),
+                    group_id,
+                    queue_id,
+                } => (prepared_job, deps, resolved_deps, group_id, queue_id),
                 _ => return Err(EINVAL),
             };
 
         self.resolve_job_deps(&deps, &mut resolved_deps)?;
         let finished_fence = job_queue.commit(prepared_job, &resolved_deps)?;
+
+        crate::trace::job_status(
+            finished_fence.seqno(),
+            group_id,
+            queue_id as u32,
+            kernel::c_str!("pushed_to_queue"),
+        );
 
         self.update_job_syncs(job_idx, finished_fence.clone())?;
 
@@ -352,14 +370,19 @@ impl<'a> Context<'a> {
             _ => return Err(EINVAL),
         };
 
+        let vm_id = Arc::as_ptr(&job.vm) as usize as u64;
+
         let deps = self.collect_job_deps(job_idx)?;
         let resolved_deps = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
         let prepared_job = job_queue.prepare(job, deps.len())?;
+
+        crate::trace::job_status(0, vm_id, 0, kernel::c_str!("vm_prepared"));
 
         self.jobs[job_idx].state = JobState::PreparedVmBind {
             prepared_job,
             deps,
             resolved_deps,
+            vm_id,
         };
 
         Ok(())
@@ -371,18 +394,26 @@ impl<'a> Context<'a> {
         job_idx: usize,
         job_queue: &JobQueue<VmBindJobHandler>,
     ) -> Result<Fence> {
-        let (prepared_job, deps, mut resolved_deps) =
+        let (prepared_job, deps, mut resolved_deps, vm_id) =
             match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
                 JobState::PreparedVmBind {
                     prepared_job,
                     deps,
                     resolved_deps,
-                } => (prepared_job, deps, resolved_deps),
+                    vm_id,
+                } => (prepared_job, deps, resolved_deps, vm_id),
                 _ => return Err(EINVAL),
             };
 
         self.resolve_job_deps(&deps, &mut resolved_deps)?;
         let finished_fence = job_queue.commit(prepared_job, &resolved_deps)?;
+
+        crate::trace::job_status(
+            finished_fence.seqno(),
+            vm_id,
+            0,
+            kernel::c_str!("vm_pushed_to_queue"),
+        );
 
         self.update_job_syncs(job_idx, finished_fence.clone())?;
 

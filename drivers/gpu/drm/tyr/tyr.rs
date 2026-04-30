@@ -19,6 +19,7 @@ mod mmu;
 mod regs;
 mod sched;
 mod slot;
+mod trace;
 mod vm;
 mod wait;
 

@@ -408,7 +408,13 @@ impl<'a> Tick<'a> {
             .inspect_err(|_| pr_err!("sync_group_states failed\n"))?;
 
         let full_tick =
-            self.sched.last_tick.elapsed().as_millis() >= i64::from(super::TICK_PERIOD_MS);
+            if self.sched.last_tick.elapsed().as_millis() >= super::TICK_PERIOD_MS as i64 {
+                crate::trace::work_run(kernel::c_str!("full tick"));
+                true
+            } else {
+                crate::trace::work_run(kernel::c_str!("tick"));
+                false
+            };
 
         let rules = build_scheduling_rules! {
             // Idle groups are processed identically in both normal and full
@@ -515,6 +521,12 @@ impl<'a> Tick<'a> {
                 self.teardown_groups[self.num_teardown] = Some(group.clone());
                 self.num_teardown += 1;
             }
+
+            crate::trace::sched_evict(
+                i as u32,
+                group.as_ref() as *const _ as usize as u64,
+                group.priority as u8,
+            );
         }
 
         Ok(())
@@ -545,7 +557,17 @@ impl<'a> Tick<'a> {
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
                 match selection {
-                    SelectedGroup::Kept(slot_idx, _sw_prio, cur_fw_prio) => {
+                    SelectedGroup::Kept(slot_idx, sw_prio, cur_fw_prio) => {
+                        let slot_data = csg_slot_manager.slot_data(slot_idx).ok_or(EINVAL)?;
+                        let group = slot_data.group.clone();
+
+                        crate::trace::sched_keep(
+                            slot_idx as u32,
+                            group.as_ref() as *const _ as usize as u64,
+                            sw_prio as u8,
+                            fw_prio,
+                        );
+
                         if cur_fw_prio == fw_prio {
                             continue;
                         }
@@ -564,7 +586,7 @@ impl<'a> Tick<'a> {
                             );
                         }
                     }
-                    SelectedGroup::Pending(idx, _sw_prio) => {
+                    SelectedGroup::Pending(idx, sw_prio) => {
                         let Some(group) = decision.pending_groups[idx].take() else {
                             continue;
                         };
@@ -591,6 +613,19 @@ impl<'a> Tick<'a> {
                             group.priority as usize,
                             list_state,
                         );
+
+                        let slot_idx = group
+                            .csg_seat
+                            .access(&csg_slot_manager)
+                            .slot()
+                            .ok_or(EINVAL)? as usize;
+
+                        crate::trace::sched_bind(
+                            slot_idx as u32,
+                            group.as_ref() as *const _ as usize as u64,
+                            sw_prio as u8,
+                            fw_prio,
+                        );
                     }
                 }
             }
@@ -615,6 +650,8 @@ impl<'a> Tick<'a> {
         self.sched.last_tick = Instant::<Monotonic>::now();
         self.sched.used_csg_slot_count = decision.num_selected as u32;
         self.sched.might_have_idle_groups = decision.idle_group_count > 0;
+
+        crate::trace::csg_slots_status(self.sched.used_csg_slot_count, self.sched.csg_slot_count);
 
         // We only need to time-slice (reschedule periodically) if there is actual
         // contention for the hardware.
@@ -644,9 +681,9 @@ impl<'a> Tick<'a> {
         self.num_teardown += count;
 
         if decision.all_idle {
-            crate::devfreq::record_idle(data);
+            devfreq::record_idle(data);
         } else {
-            crate::devfreq::record_busy(data);
+            devfreq::record_busy(data);
         }
 
         self.update_status_and_resched(data, decision);
@@ -664,6 +701,7 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        crate::trace::work_run(kernel::c_str!("periodic_tick"));
         TyrDrmDeviceData::schedule_tick(&this);
     }
 }

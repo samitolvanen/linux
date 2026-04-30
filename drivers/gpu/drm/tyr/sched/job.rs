@@ -122,6 +122,9 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    pub(crate) fn group_id(&self) -> u64 {
+        &*self.group as *const _ as usize as u64
+    }
     pub(crate) fn queue_idx(&self) -> usize {
         self.queue_idx
     }
@@ -220,7 +223,25 @@ impl Job {
                 submit_fence.clone(),
             )?;
 
+            crate::trace::job_submit(
+                submit_fence.seqno(),
+                self.group_id(),
+                self.queue_idx as u32,
+                self.stream_size,
+            );
+
             queue.commit_instrs(ringbuf_end)?;
+
+            crate::trace::cs_ring_ptrs(
+                self.group_id(),
+                self.queue_idx as u32,
+                ringbuf_end,
+                queue
+                    .interfaces
+                    .read_output()
+                    .map(|o| o.extract)
+                    .unwrap_or(0),
+            );
 
             if inner.csg_id.is_none() {
                 // The framework holds this queue's pipeline-state mutex,
@@ -229,11 +250,11 @@ impl Job {
                 // the framework only invokes `submit()` on an unparked
                 // queue, so `sync_queue_state` returns `None`; the
                 // useful side effect is settling `timeout_suspended`.
-                let _ = inner.sync_queue_state(self.queue_idx);
+                let _ = inner.sync_queue_state(self.group_id(), self.queue_idx);
 
                 if !inner.is_queue_blocked(self.queue_idx) {
                     let was_idle = inner.is_idle();
-                    inner.set_queue_idle(self.queue_idx, false);
+                    inner.set_queue_idle(self.group_id(), self.queue_idx, false);
 
                     if was_idle && !inner.is_idle() {
                         needs_runnable = true;
@@ -241,7 +262,7 @@ impl Job {
                     needs_tick = true;
                 }
             } else {
-                queue.kick()?;
+                queue.kick(self.group_id(), self.queue_idx as u32)?;
                 crate::devfreq::record_busy(&self.group.tdev);
             }
 

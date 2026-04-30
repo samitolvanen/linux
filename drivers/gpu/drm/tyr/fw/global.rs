@@ -2,6 +2,7 @@
 
 //! Code to control the global interface of the CSF firmware.
 
+use crate::fw::IfaceType;
 use csg::CommandStreamGroup;
 #[allow(unused)]
 use kernel::workqueue;
@@ -430,6 +431,9 @@ impl GlobalInterface {
             core::mem::offset_of!(Input, req),
             &output_area,
             core::mem::offset_of!(Output, ack),
+            IfaceType::Global,
+            false,
+            crate::fw::REQ_STR,
         );
         req.update_reqs(GLB_IDLE_EN, GLB_IDLE_EN)?;
 
@@ -466,6 +470,9 @@ impl GlobalInterface {
 
         let req_val = Input::read(&glb.input_area)?.req;
         let ack_val = Output::read(&glb.output_area)?.ack;
+
+        crate::trace::glb_irq(req_val, ack_val);
+
         let pending_evts = (req_val ^ ack_val) & GLB_EVT_MASK;
 
         if pending_evts == 0 {
@@ -479,6 +486,9 @@ impl GlobalInterface {
                 core::mem::offset_of!(Input, req),
                 &glb.output_area,
                 core::mem::offset_of!(Output, ack),
+                IfaceType::Global,
+                false,
+                crate::fw::REQ_STR,
             );
             req.update_reqs(ack_val, GLB_IDLE)?;
             self.ring_glb_doorbell()?;
@@ -552,6 +562,9 @@ impl GlobalInterface {
             core::mem::offset_of!(Input, req),
             &glb_iface.output_area,
             core::mem::offset_of!(Output, ack),
+            IfaceType::Global,
+            false,
+            crate::fw::REQ_STR,
         );
 
         req.toggle_reqs(GLB_PING)?;
@@ -569,6 +582,9 @@ impl GlobalInterface {
                 core::mem::offset_of!(Input, req),
                 &glb_iface.output_area,
                 core::mem::offset_of!(Output, ack),
+                IfaceType::Global,
+                false,
+                crate::fw::REQ_STR,
             );
             let _ = reset_req.update_reqs(ack_to, GLB_PING);
             return Err(ETIMEDOUT);
@@ -677,6 +693,9 @@ impl SharedSectionEntry for GlobalInterface {
             core::mem::offset_of!(Input, req),
             &glb.output_area,
             core::mem::offset_of!(Output, ack),
+            IfaceType::Global,
+            false,
+            crate::fw::REQ_STR,
         ))
     }
 
@@ -688,6 +707,9 @@ impl SharedSectionEntry for GlobalInterface {
             core::mem::offset_of!(Input, doorbell_req),
             &glb.output_area,
             core::mem::offset_of!(Output, doorbell_ack),
+            IfaceType::Global,
+            true,
+            crate::fw::DOORBELL_REQ_STR,
         ))
     }
 }

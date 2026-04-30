@@ -162,6 +162,8 @@ impl SlotOperations for CsgSlotOperations {
         let group = &slot_data.group;
         let fw_priority = slot_data.fw_priority;
 
+        crate::trace::group_bind(group.as_ref() as *const _ as usize as u64, slot_idx as u32);
+
         group.vm.activate()?;
         let as_nr = group.vm.address_space().map(|a| a as u32).ok_or(EINVAL)?;
 
@@ -180,11 +182,14 @@ impl SlotOperations for CsgSlotOperations {
     /// its VM, and clearing doorbells.
     fn evict(
         &mut self,
-        _slot_idx: usize,
+        slot_idx: usize,
         slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
         let group = &slot_data.group;
+
+        let group_id = group.as_ref() as *const _ as usize as u64;
+        crate::trace::group_unbind(group_id, slot_idx as u32);
 
         group.vm.deactivate()?;
 
@@ -198,7 +203,7 @@ impl SlotOperations for CsgSlotOperations {
 
             for i in 0..inner.queues.len() {
                 inner.queues[i].doorbell_id = None;
-                park_actions[i] = inner.sync_queue_state(i);
+                park_actions[i] = inner.sync_queue_state(group as *const _ as usize as u64, i);
             }
             Ok(())
         })?;
@@ -272,7 +277,8 @@ impl CsgSlotOperations {
                 let cs_iface = csg_iface.cs_mut(cs_idx).ok_or(EINVAL)?;
                 Self::program_cs_slot(queue, cs_iface)?;
                 queue_mask |= checked_bit_u32(cs_idx as u32).ok_or(EINVAL)?;
-                park_actions[cs_idx] = inner.sync_queue_state(cs_idx);
+                park_actions[cs_idx] =
+                    inner.sync_queue_state(group as *const _ as usize as u64, cs_idx);
             }
 
             Ok(queue_mask)
@@ -587,6 +593,10 @@ impl Scheduler {
                             return count;
                         }
                         let group_arc: Arc<Group> = group.arc().into();
+                        crate::trace::group_list(
+                            group_arc.as_ref() as *const _ as usize as u64,
+                            group::GroupListState::None as u32,
+                        );
                         group.remove();
                         pruned_groups[count] = Some(group_arc);
                         count += 1;
@@ -603,6 +613,7 @@ impl Scheduler {
                         return count;
                     }
                     let group_arc: Arc<Group> = group.arc().into();
+                    crate::trace::group_wait(group_arc.as_ref() as *const _ as usize as u64, false);
                     group.remove();
                     pruned_groups[count] = Some(group_arc);
                     count += 1;
@@ -636,6 +647,11 @@ impl Scheduler {
             let list_arc = unsafe { list.remove(group) };
             if list_arc.is_none() {
                 pr_err!("group was marked {:?} but not found\n", list_state);
+            } else {
+                crate::trace::group_list(
+                    group as *const _ as usize as u64,
+                    group::GroupListState::None as u32,
+                );
             }
             list_arc
         } else {
@@ -655,6 +671,10 @@ impl Scheduler {
                 inner.list_state = group::GroupListState::Runnable;
             }
 
+            crate::trace::group_list(
+                list_arc.as_ref() as *const _ as usize as u64,
+                inner.list_state as u32,
+            );
             Ok(())
         });
 
@@ -677,6 +697,10 @@ impl Scheduler {
                     if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
                         self.runnable_groups[priority].push_back(list_arc);
                         inner.list_state = group::GroupListState::Runnable;
+                        crate::trace::group_list(
+                            group.as_ref() as *const _ as usize as u64,
+                            group::GroupListState::Runnable as u32,
+                        );
                     }
                 }
             } else if inner.list_state != group::GroupListState::Runnable {
@@ -685,6 +709,10 @@ impl Scheduler {
                 {
                     self.runnable_groups[priority].push_back(list_arc);
                     inner.list_state = group::GroupListState::Runnable;
+                    crate::trace::group_list(
+                        group.as_ref() as *const _ as usize as u64,
+                        group::GroupListState::Runnable as u32,
+                    );
                 }
             }
 

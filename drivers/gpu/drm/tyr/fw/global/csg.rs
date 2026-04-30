@@ -31,6 +31,7 @@ use crate::fw::{
     },
     impl_shared_section_read,
     impl_shared_section_rw,
+    IfaceType,
     RequestField,
     SharedSectionEntry,
     SharedSectionRange, //
@@ -224,6 +225,9 @@ impl SharedSectionEntry for CommandStreamGroup {
             core::mem::offset_of!(Input, req),
             &self.output_area,
             core::mem::offset_of!(Output, ack),
+            IfaceType::Csg(self.csg_id as u32),
+            false,
+            crate::fw::REQ_STR,
         ))
     }
 
@@ -233,6 +237,9 @@ impl SharedSectionEntry for CommandStreamGroup {
             core::mem::offset_of!(Input, doorbell_req),
             &self.output_area,
             core::mem::offset_of!(Output, doorbell_ack),
+            IfaceType::Csg(self.csg_id as u32),
+            true,
+            crate::fw::DOORBELL_REQ_STR,
         ))
     }
 
@@ -244,6 +251,9 @@ impl SharedSectionEntry for CommandStreamGroup {
             core::mem::offset_of!(Input, irq_ack),
             &self.output_area,
             core::mem::offset_of!(Output, irq_req),
+            IfaceType::Csg(self.csg_id as u32),
+            false,
+            kernel::c_str!("irq_ack"),
         ))
     }
 }

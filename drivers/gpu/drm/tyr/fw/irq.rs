@@ -88,6 +88,7 @@ impl TyrIrqTrait for JobIrq {
     fn clear_status(&self, dev: &Device<Bound>, status: u32) {
         if let Ok(io) = self.iomem.access(dev) {
             io.write_reg(job_control::JOB_IRQ_CLEAR::from_raw(status));
+            crate::trace::job_irq_clear(status);
         }
     }
 
@@ -96,6 +97,7 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
+        crate::trace::fw_irq(status);
         self.event_wait.notify_all();
 
         let _ = tdev.fw.with_locked_global_iface(|glb| {

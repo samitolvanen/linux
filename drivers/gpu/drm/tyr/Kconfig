@@ -21,6 +21,7 @@ config DRM_TYR
 	select IOMMU_IO_PGTABLE_LPAE
 	select RUST_DRM_GEM_SHMEM_HELPER
 	select RUST_FW_LOADER_ABSTRACTIONS
+	select DRM_PANTHOR_TRACE
 	depends on IOMMU_SUPPORT
 	default n
 	help

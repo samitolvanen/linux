@@ -30,6 +30,7 @@ use kernel::{
     platform,
     prelude::*,
     sizes::SZ_8K,
+    str::CStr,
     str::CString,
     sync::{
         Arc,
@@ -39,6 +40,10 @@ use kernel::{
     time,
     types::ARef, //
 };
+
+pub(crate) const UNKNOWN_GROUP_ID: u64 = 0;
+pub(crate) const REQ_STR: &CStr = kernel::c_str!("req");
+pub(crate) const DOORBELL_REQ_STR: &CStr = kernel::c_str!("doorbell_req");
 
 use global::GlobalInterface;
 
@@ -248,6 +253,12 @@ impl SharedSectionRange {
     }
 }
 
+pub(crate) enum IfaceType {
+    Global,
+    Csg(u32),
+    Cs(u32, u32),
+}
+
 /// An offset into the shared section that is known to point to the request field.
 ///
 /// It is more convenient to use this type than reading or writing the memory
@@ -256,14 +267,20 @@ impl SharedSectionRange {
 pub(crate) struct RequestField {
     req: SharedSectionRange,
     ack: SharedSectionRange,
+    pub(crate) iface_type: IfaceType,
+    pub(crate) is_doorbell: bool,
+    pub(crate) reg_name: &'static CStr,
 }
 
 impl RequestField {
-    fn new(
+    pub(crate) fn new(
         req_section: &SharedSectionRange,
         req_offset: usize,
         ack_section: &SharedSectionRange,
         ack_offset: usize,
+        iface_type: IfaceType,
+        is_doorbell: bool,
+        reg_name: &'static CStr,
     ) -> Self {
         let req = SharedSectionRange {
             shared_section: req_section.shared_section.clone(),
@@ -277,7 +294,54 @@ impl RequestField {
             end: ack_section.start + ack_offset + core::mem::size_of::<u32>(),
         };
 
-        Self { req, ack }
+        Self {
+            req,
+            ack,
+            iface_type,
+            is_doorbell,
+            reg_name,
+        }
+    }
+
+    fn trace_req(&self, val: u32, update_mask: u32, toggle_mask: u32) {
+        match self.iface_type {
+            IfaceType::Global => {
+                if self.is_doorbell {
+                    crate::trace::fw_glb_doorbell_req(self.reg_name, val, update_mask, toggle_mask)
+                } else {
+                    crate::trace::fw_glb_req(self.reg_name, val, update_mask, toggle_mask)
+                }
+            }
+            IfaceType::Csg(csg_id) => {
+                if self.is_doorbell {
+                    crate::trace::fw_csg_doorbell_req(
+                        csg_id,
+                        self.reg_name,
+                        val,
+                        update_mask,
+                        toggle_mask,
+                    )
+                } else {
+                    crate::trace::fw_csg_req(
+                        csg_id,
+                        UNKNOWN_GROUP_ID,
+                        self.reg_name,
+                        val,
+                        update_mask,
+                        toggle_mask,
+                    )
+                }
+            }
+            IfaceType::Cs(csg_id, cs_id) => crate::trace::fw_cs_req(
+                csg_id,
+                cs_id,
+                UNKNOWN_GROUP_ID,
+                self.reg_name,
+                val,
+                update_mask,
+                toggle_mask,
+            ),
+        }
     }
 
     /// Toggle acknowledge bits to send an event to the FW
@@ -286,6 +350,7 @@ impl RequestField {
         let ack_val = self.ack.read::<u32>()?;
         let new_val = ((ack_val ^ reqs) & reqs) | (cur_req_val & !reqs);
 
+        self.trace_req(new_val, 0, reqs);
         self.req.write::<u32>(new_val)
     }
 
@@ -294,6 +359,7 @@ impl RequestField {
         let cur_req_val = self.req.read::<u32>()?;
         let new_val = (cur_req_val & !reqs) | (val & reqs);
 
+        self.trace_req(new_val, reqs, 0);
         self.req.write::<u32>(new_val)
     }
 
@@ -335,6 +401,7 @@ impl RequestField {
             new_val = (new_val & !toggle_mask) | ((ack_val ^ toggle_mask) & toggle_mask);
         }
 
+        self.trace_req(new_val, update_mask, toggle_mask);
         self.req.write::<u32>(new_val)
     }
 
@@ -349,6 +416,7 @@ impl RequestField {
     /// [`toggle_reqs`]: RequestField::toggle_reqs
     /// [`update_and_toggle_reqs`]: RequestField::update_and_toggle_reqs
     pub(crate) fn write_req(&self, val: u32) -> Result {
+        self.trace_req(val, val, 0);
         self.req.write::<u32>(val)
     }
 

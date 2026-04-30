@@ -181,7 +181,7 @@ impl GroupInner {
     /// Sets a queue as idle or active.
     ///
     /// Returns true if the queue was previously idle.
-    pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
+    pub(crate) fn set_queue_idle(&mut self, group_id: u64, queue_idx: usize, idle: bool) -> bool {
         let mask = 1 << queue_idx;
         let was_idle = (self.idle_queues & mask) != 0;
 
@@ -191,14 +191,19 @@ impl GroupInner {
             self.idle_queues &= !mask;
         }
 
+        if idle != was_idle {
+            crate::trace::queue_idle_state(group_id, queue_idx as u32, idle);
+        }
+
         was_idle
     }
 
     /// Marks a queue as having encountered a fatal error.
-    pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
+    pub(crate) fn set_queue_fatal(&mut self, group_id: u64, queue_idx: usize) {
         if (self.fatal_queues & (1 << queue_idx)) == 0 {
             self.fatal_queues |= 1 << queue_idx;
             self.fatal_error = Some(EFAULT);
+            crate::trace::queue_fatal_state(group_id, queue_idx as u32, true);
         }
     }
 
@@ -221,7 +226,11 @@ impl GroupInner {
     /// Park/unpark cannot run inline: it would close the lock cycle
     /// `Group::inner` -> per-queue pipeline state -> `Group::inner`.
     /// Returns the deferred action to apply after the inner lock is dropped.
-    pub(crate) fn sync_queue_state(&mut self, queue_idx: usize) -> Option<QueueParkAction> {
+    pub(crate) fn sync_queue_state(
+        &mut self,
+        group_id: u64,
+        queue_idx: usize,
+    ) -> Option<QueueParkAction> {
         let is_blocked = (self.blocked_queues & (1 << queue_idx)) != 0;
 
         let should_park = matches!(self.state, State::Terminated | State::Unknown);
@@ -244,10 +253,12 @@ impl GroupInner {
             } else {
                 queue.resume_timeout();
             }
+            crate::trace::queue_timeout_state(group_id, queue_idx as u32, should_suspend);
         }
 
         if should_park != queue.parked {
             queue.parked = should_park;
+            crate::trace::queue_state(group_id, queue_idx as u32, should_park);
             Some(QueueParkAction {
                 job_queue: queue.job_queue.clone(),
                 park: should_park,
@@ -514,8 +525,10 @@ impl Group {
 
     /// Sets the state of the group.
     pub(crate) fn set_state(&self, new_state: State) {
+        let group_id = self as *const _ as usize as u64;
         let _ = self.with_locked_inner(|inner| {
             inner.state = new_state;
+            crate::trace::group_update(group_id, new_state as u32);
             Ok(())
         });
     }
