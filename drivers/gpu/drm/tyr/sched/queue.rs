@@ -55,6 +55,26 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput> {
+        let ringbuf_input = self.interfaces.read_input()?;
+        let size = self.ringbuf.vmap().size();
+        let ringbuf_output = self.interfaces.read_output()?;
+        let used = ringbuf_input
+            .insert
+            .checked_sub(ringbuf_output.extract)
+            .ok_or(EIO)?;
+
+        if instr_count > size {
+            return Err(ENOSPC);
+        }
+
+        if used > size as u64 || instr_count as u64 > size as u64 - used {
+            return Err(ENOSPC);
+        }
+
+        Ok(ringbuf_input)
+    }
+
     pub(crate) fn new(
         tdev: &TyrDrmDevice,
         reg_data: &TyrDrmRegistrationData<'_>,
@@ -96,24 +116,17 @@ impl Queue {
             .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
+    pub(super) fn can_append(&self, instr_count: usize) -> Result {
+        self.ringbuf_space_for(instr_count)?;
+        Ok(())
+    }
+
     pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
-        let mut ringbuf_input = self.interfaces.read_input()?;
+        let mut ringbuf_input = self.ringbuf_space_for(instrs.len())?;
 
         let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.size();
         let ringbuf_output = self.interfaces.read_output()?;
-        let used = ringbuf_input
-            .insert
-            .checked_sub(ringbuf_output.extract)
-            .ok_or(EIO)?;
-
-        if instrs.len() > size {
-            return Err(ENOSPC);
-        }
-
-        if used > size as u64 || instrs.len() as u64 > size as u64 - used {
-            return Err(ENOSPC);
-        }
 
         let cs_insert = (ringbuf_input.insert & (size as u64 - 1)) as usize;
 
