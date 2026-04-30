@@ -4,6 +4,7 @@ use kernel::{
 	alloc::KVec,
 	prelude::*,
 	sync::Arc,
+	uapi,
 };
 
 use crate::{
@@ -16,6 +17,9 @@ use crate::{
 };
 
 use group::Group;
+
+const GROUP_PRIORITY_COUNT: usize =
+	uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME as usize + 1;
 
 pub(crate) mod group;
 pub(crate) mod queue;
@@ -45,22 +49,42 @@ impl SchedulerState {
 }
 
 /// Minimal scheduler shell.
-pub(crate) struct Scheduler;
+pub(crate) struct Scheduler {
+	idle_groups: [KVec<Arc<Group>>; GROUP_PRIORITY_COUNT],
+}
 
 impl Scheduler {
 	pub(crate) fn init(_tdev: &TyrDrmDevice) -> Result<Self> {
-		Ok(Self)
+		Ok(Self {
+			idle_groups: [const { KVec::new() }; GROUP_PRIORITY_COUNT],
+		})
 	}
 
 	pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, _group: Arc<Group>) -> Result {
 		Ok(())
 	}
 
-	pub(crate) fn add_group(&mut self, _group: Arc<Group>) -> Result {
-		Ok(())
+	pub(crate) fn add_group(&mut self, group: Arc<Group>) -> Result {
+		let groups = self
+			.idle_groups
+			.get_mut(group.priority as usize)
+			.ok_or(EINVAL)?;
+
+		groups.push(group, GFP_KERNEL).map_err(|_| ENOMEM)
 	}
 
-	pub(crate) fn remove_group(&mut self, _group: Arc<Group>) -> Result {
+	pub(crate) fn remove_group(&mut self, group: Arc<Group>) -> Result {
+		let groups = self
+			.idle_groups
+			.get_mut(group.priority as usize)
+			.ok_or(EINVAL)?;
+		let pos = groups
+			.iter()
+			.position(|other| Arc::ptr_eq(other, &group))
+			.ok_or(EINVAL)?;
+
+		groups.remove(pos)?;
+
 		Ok(())
 	}
 
