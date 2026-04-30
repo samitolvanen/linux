@@ -1,8 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use kernel::prelude::*;
+use kernel::{
+	alloc::KVec,
+	prelude::*,
+	sync::Arc,
+};
 
-use crate::driver::TyrDrmDevice;
+use crate::{
+	driver::TyrDrmDevice,
+	file::{
+		QueueSubmit,
+		SyncOp,
+		TyrDrmFile,
+	},
+};
+
+use group::Group;
 
 pub(crate) mod group;
 pub(crate) mod queue;
@@ -37,5 +50,15 @@ pub(crate) struct Scheduler;
 impl Scheduler {
 	pub(crate) fn init(_tdev: &TyrDrmDevice) -> Result<Self> {
 		Ok(Self)
+	}
+
+	pub(crate) fn submit(
+		&mut self,
+		_syncs: KVec<SyncOp>,
+		_group: Arc<Group>,
+		_queue_submits: KVec<QueueSubmit>,
+		_file: &TyrDrmFile,
+	) -> Result {
+		Err(ENOTSUPP)
 	}
 }
