@@ -169,31 +169,50 @@ impl Group {
     }
 
     pub(super) fn submit(&self, syncs: KVec<SyncOp>, queue_submits: KVec<QueueSubmit>) -> Result {
+        struct QueuedStream {
+            queue_index: usize,
+            stream: KVec<u8>,
+        }
+
         if !syncs.is_empty() {
             return Err(ENOTSUPP);
         }
 
-        let mut kicked_queues = KVec::new();
+        let mut queued_streams: KVec<QueuedStream> = KVec::new();
 
         for queue_submit in queue_submits.iter() {
             let queue_index = queue_submit.queue_index();
-
-            if kicked_queues.iter().any(|&queued_index| queued_index == queue_index) {
-                return Err(ENOTSUPP);
-            }
 
             if !queue_submit.has_stream() {
                 continue;
             }
 
             let stream = queue_submit.copy_stream()?;
-            let queue = self.queues.get(queue_index).ok_or(EINVAL)?;
-            queue.append_instrs(&stream)?;
-            kicked_queues.push(queue_index, GFP_KERNEL)?;
+
+            if let Some(queued_stream) = queued_streams
+                .iter_mut()
+                .find(|queued_stream| queued_stream.queue_index == queue_index)
+            {
+                queued_stream.stream.extend_from_slice(&stream, GFP_KERNEL)?;
+                continue;
+            }
+
+            queued_streams.push(
+                QueuedStream {
+                    queue_index,
+                    stream,
+                },
+                GFP_KERNEL,
+            )?;
         }
 
-        for &queue_index in kicked_queues.iter() {
-            let queue = self.queues.get(queue_index).ok_or(EINVAL)?;
+        for queued_stream in queued_streams.iter() {
+            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
+            queue.append_instrs(&queued_stream.stream)?;
+        }
+
+        for queued_stream in queued_streams.iter() {
+            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
             queue.kick()?;
         }
 
