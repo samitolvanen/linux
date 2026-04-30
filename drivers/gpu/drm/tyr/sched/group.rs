@@ -53,8 +53,10 @@ pub(crate) struct Group {
     pub(super) max_fragment_cores: u8,
     #[allow(dead_code)]
     pub(super) max_tiler_cores: u8,
-    _suspend_buf: Arc<gem::MappedBo>,
-    _protm_suspend_buf: Arc<gem::MappedBo>,
+    #[allow(dead_code)]
+    pub(super) suspend_buf: Arc<gem::MappedBo>,
+    #[allow(dead_code)]
+    pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
     _syncobjs: Arc<gem::MappedBo>,
 }
 
@@ -128,8 +130,8 @@ impl Group {
                 max_compute_cores: group_args.max_compute_cores,
                 max_fragment_cores: group_args.max_fragment_cores,
                 max_tiler_cores: group_args.max_tiler_cores,
-                _suspend_buf: suspend_buf,
-                _protm_suspend_buf: protm_suspend_buf,
+                suspend_buf,
+                protm_suspend_buf,
                 _syncobjs: syncobjs,
             },
             GFP_KERNEL,
