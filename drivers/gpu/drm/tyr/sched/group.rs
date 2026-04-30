@@ -6,6 +6,7 @@ use core::sync::atomic::{
 };
 
 use kernel::{
+    alloc::KVec,
     prelude::*,
     sync::Arc,
     uapi,
@@ -13,13 +14,18 @@ use kernel::{
 
 use crate::{
     driver::TyrDrmDevice,
-    file::TyrDrmFile,
+    file::{
+        QueueCreate,
+        TyrDrmFile,
+    },
     pool,
 };
 
+use super::queue::Queue;
+
 pub(crate) struct Group {
     fatal_queues: AtomicU32,
-    queue_count: usize,
+    queues: KVec<Queue>,
 }
 
 impl Group {
@@ -27,6 +33,7 @@ impl Group {
         ddev: &TyrDrmDevice,
         file: &TyrDrmFile,
         group_args: &uapi::drm_panthor_group_create,
+        queue_args: KVec<QueueCreate>,
     ) -> Result<Arc<Self>> {
         if group_args.pad != 0 {
             return Err(EINVAL);
@@ -52,15 +59,22 @@ impl Group {
             return Err(EINVAL);
         }
 
-        file.inner()
+        let vm = file
+            .inner()
             .vm_pool()
             .get_vm(group_args.vm_id as usize)
             .ok_or(EINVAL)?;
 
+        let mut queues = KVec::new();
+
+        for queue_arg in queue_args.iter() {
+            queues.push(Queue::new(ddev, queue_arg, vm.clone())?, GFP_KERNEL)?;
+        }
+
         Ok(Arc::new(
             Self {
                 fatal_queues: AtomicU32::new(0),
-                queue_count: group_args.queues.count as usize,
+                queues,
             },
             GFP_KERNEL,
         )?)
@@ -71,7 +85,7 @@ impl Group {
     }
 
     pub(crate) fn queue_count(&self) -> usize {
-        self.queue_count
+        self.queues.len()
     }
 }
 
@@ -87,8 +101,9 @@ impl Pool {
         ddev: &TyrDrmDevice,
         groupcreate: &uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
+        queue_args: KVec<QueueCreate>,
     ) -> Result<usize> {
-        let group = Group::create(ddev, file, groupcreate)?;
+        let group = Group::create(ddev, file, groupcreate, queue_args)?;
         self.0.insert(group)
     }
 
