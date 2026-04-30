@@ -1996,6 +1996,15 @@ impl GlobalInterface {
 
         Ok(())
     }
+
+    pub(crate) fn csg(&self, index: usize) -> Option<&CsgInterface> {
+        let enabled = match &self.state {
+            GlobalInterfaceState::Enabled(e) => e,
+            GlobalInterfaceState::Disabled => return None,
+        };
+
+        enabled.csg.get(index)
+    }
 }
 
 /// State of a CSG interface.
@@ -2009,7 +2018,6 @@ enum CsgInterfaceState {
 /// When enabled, a CSG Interface has control, input, and output system memory interfaces.
 struct EnabledCsgInterface {
     /// Control block interface - provides CSG capabilities and configuration.
-    #[expect(dead_code)]
     csg_control: FwInterface<CSG_CONTROL_BLOCK_SIZE>,
     /// Input block interface - driver writes CSG requests here.
     #[expect(dead_code)]
@@ -2145,6 +2153,27 @@ impl CsgInterface {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+        use csg::control::{
+            GROUP_PROTM_SUSPEND_SIZE,
+            GROUP_SUSPEND_SIZE,
+        };
+
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let suspend_size = enabled.csg_control.read(GROUP_SUSPEND_SIZE).value().get();
+        let protm_suspend_size = enabled
+            .csg_control
+            .read(GROUP_PROTM_SUSPEND_SIZE)
+            .value()
+            .get();
+
+        Ok((suspend_size, protm_suspend_size))
     }
 }
 

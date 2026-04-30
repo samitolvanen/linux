@@ -18,14 +18,17 @@ use crate::{
         QueueCreate,
         TyrDrmFile,
     },
+    gem,
     pool,
 };
 
 use super::queue::Queue;
 
 pub(crate) struct Group {
-    fatal_queues: AtomicU32,
-    queues: KVec<Queue>,
+    pub(crate) fatal_queues: AtomicU32,
+    pub(crate) queues: KVec<Queue>,
+    _suspend_buf: Arc<gem::MappedBo>,
+    _protm_suspend_buf: Arc<gem::MappedBo>,
 }
 
 impl Group {
@@ -65,6 +68,12 @@ impl Group {
             .get_vm(group_args.vm_id as usize)
             .ok_or(EINVAL)?;
 
+        let (suspend_buf_size, protm_suspend_buf_size) = ddev.fw.group_suspend_buf_sizes()?;
+        let suspend_buf = ddev.fw.alloc_suspend_buf(ddev, suspend_buf_size as usize)?;
+        let protm_suspend_buf = ddev
+            .fw
+            .alloc_suspend_buf(ddev, protm_suspend_buf_size as usize)?;
+
         let mut queues = KVec::new();
 
         for queue_arg in queue_args.iter() {
@@ -75,6 +84,8 @@ impl Group {
             Self {
                 fatal_queues: AtomicU32::new(0),
                 queues,
+                _suspend_buf: suspend_buf,
+                _protm_suspend_buf: protm_suspend_buf,
             },
             GFP_KERNEL,
         )?)

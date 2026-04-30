@@ -71,7 +71,11 @@ use crate::{
         MCU_CONTROL,
         MCU_STATUS, //
     },
-    vm::Vm,
+    vm::{
+        Vm,
+        VmFlag,
+        VmMapFlags,
+    },
     wait::{
         Wait,
         WaitResult, //
@@ -348,5 +352,22 @@ impl Firmware {
             core_clk,
             &self.ready_wait,
         )
+    }
+
+    pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+        let global_iface = self.global_iface.lock();
+        let csg = global_iface.csg(0).ok_or(EINVAL)?;
+
+        csg.suspend_buf_sizes()
+    }
+
+    pub(crate) fn alloc_suspend_buf(
+        &self,
+        tdev: &TyrDrmDevice,
+        suspend_size: usize,
+    ) -> Result<Arc<gem::MappedBo>> {
+        let flags = VmMapFlags::from(VmFlag::Noexec);
+
+        gem::new_kernel_object(tdev, &self.vm, suspend_size, flags)
     }
 }
