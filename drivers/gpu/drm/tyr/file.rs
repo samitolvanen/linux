@@ -72,6 +72,7 @@ pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
     heap_pools: Pin<KBox<XArray<Arc<heap::Pool>>>>,
+    tdev: ARef<TyrDrmDevice>,
 }
 
 /// Convenience type alias for our DRM `File` type
@@ -80,12 +81,15 @@ pub(crate) type TyrDrmFile = drm::file::File<TyrDrmFileData>;
 impl drm::file::DriverFile for TyrDrmFileData {
     type Driver = TyrDrmDriver;
 
-    fn open(_dev: &drm::Device<Self::Driver>) -> Result<Pin<KBox<Self>>> {
+    fn open(dev: &drm::Device<Self::Driver>) -> Result<Pin<KBox<Self>>> {
+        let tdev = ARef::from(dev);
+
         KBox::try_pin_init(
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
                 group_pool: group::Pool::create()?,
                 heap_pools <- KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?,
+                tdev,
             }),
             GFP_KERNEL,
         )
@@ -95,7 +99,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
 #[pinned_drop]
 impl PinnedDrop for TyrDrmFileData {
     fn drop(self: Pin<&mut Self>) {
-        if let Err(e) = self.as_ref().group_pool().destroy_all() {
+        if let Err(e) = self.as_ref().group_pool().destroy_all(&self.tdev) {
             pr_err!("Failed to destroy all groups: {:?}\n", e);
         }
 
@@ -401,7 +405,7 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn group_destroy(
-        _ddev: &TyrDrmDevice,
+        ddev: &TyrDrmDevice,
         groupdestroy: &mut uapi::drm_panthor_group_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
@@ -411,7 +415,7 @@ impl TyrDrmFileData {
 
         file.inner()
             .group_pool()
-            .destroy_group(groupdestroy.group_handle as usize)?;
+            .destroy_group(ddev, groupdestroy.group_handle as usize)?;
 
         Ok(0)
     }

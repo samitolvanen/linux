@@ -169,14 +169,14 @@ impl Pool {
         self.0.get(index)
     }
 
-    pub(crate) fn destroy_group(&self, index: usize) -> Result {
+    pub(crate) fn destroy_group(&self, _ddev: &TyrDrmDevice, index: usize) -> Result {
         self.0.remove(index)?;
         Ok(())
     }
 
-    pub(crate) fn destroy_all(&self) -> Result {
+    pub(crate) fn destroy_all(&self, ddev: &TyrDrmDevice) -> Result {
         for index in 1..self.0.index_upper_bound() {
-            let _ = self.0.remove(index);
+            let _ = self.destroy_group(ddev, index);
         }
 
         Ok(())
