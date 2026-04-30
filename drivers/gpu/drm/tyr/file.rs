@@ -455,7 +455,7 @@ impl TyrDrmFileData {
         let mut syncs = KVec::new();
 
         for _ in 0..groupsubmit.queue_submits.count {
-            let queue: QueueSubmit = reader.read()?;
+            let queue: RawQueueSubmit = reader.read()?;
             queue.validate(group.queue_count())?;
 
             let mut sync_reader = UserSlice::new(
@@ -470,7 +470,7 @@ impl TyrDrmFileData {
                 syncs.push(sync, GFP_KERNEL)?;
             }
 
-            queue_submits.push(queue, GFP_KERNEL)?;
+            queue_submits.push(queue.capture()?, GFP_KERNEL)?;
         }
 
         ddev.with_locked_scheduler(|sched| {
@@ -649,12 +649,12 @@ impl QueueCreate {
 }
 
 #[repr(transparent)]
-pub(crate) struct QueueSubmit(uapi::drm_panthor_queue_submit);
+struct RawQueueSubmit(uapi::drm_panthor_queue_submit);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
-unsafe impl FromBytes for QueueSubmit {}
+unsafe impl FromBytes for RawQueueSubmit {}
 
-impl QueueSubmit {
+impl RawQueueSubmit {
     fn validate(&self, queue_count: usize) -> Result {
         if self.0.queue_index as usize >= queue_count {
             return Err(EINVAL);
@@ -679,29 +679,37 @@ impl QueueSubmit {
         Ok(())
     }
 
-    pub(crate) fn queue_index(&self) -> usize {
-        self.0.queue_index as usize
-    }
-
-    pub(crate) fn has_stream(&self) -> bool {
-        self.0.stream_size != 0
-    }
-
-    pub(crate) fn copy_stream(&self) -> Result<KVec<u8>> {
+    fn capture(self) -> Result<QueueSubmit> {
         let stream_size = self.0.stream_size as usize;
+        let mut stream = KVec::with_capacity(stream_size, GFP_KERNEL)?;
 
-        if stream_size == 0 {
-            return Ok(KVec::new());
+        if stream_size != 0 {
+            stream.resize(stream_size, 0, GFP_KERNEL)?;
+
+            let mut reader =
+                UserSlice::new(UserPtr::from_addr(self.0.stream_addr as usize), stream_size).reader();
+            reader.read_slice(&mut stream[..])?;
         }
 
-        let mut stream = KVec::with_capacity(stream_size, GFP_KERNEL)?;
-        stream.resize(stream_size, 0, GFP_KERNEL)?;
+        Ok(QueueSubmit {
+            queue_index: self.0.queue_index as usize,
+            stream,
+        })
+    }
+}
 
-        let mut reader = UserSlice::new(UserPtr::from_addr(self.0.stream_addr as usize), stream_size)
-            .reader();
-        reader.read_slice(&mut stream[..])?;
+pub(crate) struct QueueSubmit {
+    queue_index: usize,
+    stream: KVec<u8>,
+}
 
-        Ok(stream)
+impl QueueSubmit {
+    pub(crate) fn queue_index(&self) -> usize {
+        self.queue_index
+    }
+
+    pub(crate) fn into_stream(self) -> KVec<u8> {
+        self.stream
     }
 }
 

@@ -180,14 +180,13 @@ impl Group {
 
         let mut queued_streams: KVec<QueuedStream> = KVec::new();
 
-        for queue_submit in queue_submits.iter() {
+        for queue_submit in queue_submits.into_iter() {
             let queue_index = queue_submit.queue_index();
+            let stream = queue_submit.into_stream();
 
-            if !queue_submit.has_stream() {
+            if stream.is_empty() {
                 continue;
             }
-
-            let stream = queue_submit.copy_stream()?;
 
             if let Some(queued_stream) = queued_streams
                 .iter_mut()
