@@ -346,34 +346,46 @@ impl Firmware {
     /// Enable the global interface.
     pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
         let shared_section = self.shared_section()?;
-        self.global_iface.lock().enable(
-            &self.pdev,
-            &self.iomem,
-            shared_section,
-            gpu_info,
-            core_clk,
-            &self.ready_wait,
-        )
+        self.with_locked_global_iface(|global_iface| {
+            global_iface.enable(
+                &self.pdev,
+                &self.iomem,
+                shared_section,
+                gpu_info,
+                core_clk,
+                &self.ready_wait,
+            )
+        })
+    }
+
+    pub(crate) fn with_locked_global_iface<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut GlobalInterface) -> Result<R>,
+    {
+        let mut global_iface = self.global_iface.lock();
+        f(&mut global_iface)
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
-        let global_iface = self.global_iface.lock();
-        let csg = global_iface.csg(0).ok_or(EINVAL)?;
-        let cs = csg.cs(0).ok_or(EINVAL)?;
+        self.with_locked_global_iface(|global_iface| {
+            let csg = global_iface.csg(0).ok_or(EINVAL)?;
+            let cs = csg.cs(0).ok_or(EINVAL)?;
 
-        Ok((
-            global_iface.csg_slot_count()?,
-            csg.cs_slot_count()?,
-            cs.work_regs()?,
-            cs.scoreboards()?,
-        ))
+            Ok((
+                global_iface.csg_slot_count()?,
+                csg.cs_slot_count()?,
+                cs.work_regs()?,
+                cs.scoreboards()?,
+            ))
+        })
     }
 
     pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
-        let global_iface = self.global_iface.lock();
-        let csg = global_iface.csg(0).ok_or(EINVAL)?;
+        self.with_locked_global_iface(|global_iface| {
+            let csg = global_iface.csg(0).ok_or(EINVAL)?;
 
-        csg.suspend_buf_sizes()
+            csg.suspend_buf_sizes()
+        })
     }
 
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
