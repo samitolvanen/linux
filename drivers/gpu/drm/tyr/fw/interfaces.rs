@@ -1817,14 +1817,14 @@ struct EnabledGlobalInterface {
 /// Global CSF Interface
 ///
 /// The CSF controls operations that are common to all CSs.
-pub(crate) struct GlobalInterface {
+pub(super) struct GlobalInterface {
     /// Current interface state (Disabled or Enabled).
     state: GlobalInterfaceState,
 }
 
 impl GlobalInterface {
     /// Creates a new CSF global interface, initially disabled.
-    pub(crate) fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         Ok(Self {
             state: GlobalInterfaceState::Disabled,
         })
@@ -1835,7 +1835,7 @@ impl GlobalInterface {
     /// This reads the firmware's control block to set up the global input/output
     /// interfaces; it configures timers and shader core allocation; and it discovers
     /// available CSG interfaces.
-    pub(crate) fn enable(
+    pub(super) fn enable(
         &mut self,
         dev: &Device,
         iomem: &IoMem<'_>,
@@ -2088,7 +2088,7 @@ impl GlobalInterface {
         Ok(enabled.csg_num as u32)
     }
 
-    pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+    pub(super) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
         let csg = self.csg(0).ok_or(EINVAL)?;
         let cs = csg.cs(0).ok_or(EINVAL)?;
 
@@ -2100,7 +2100,7 @@ impl GlobalInterface {
         ))
     }
 
-    pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+    pub(super) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
         let csg = self.csg(0).ok_or(EINVAL)?;
 
         csg.suspend_buf_sizes()
