@@ -107,6 +107,14 @@ pub(crate) struct TyrDrmDeviceData {
 }
 
 impl TyrDrmDeviceData {
+    pub(crate) fn with_locked_core_clk<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Clk) -> R,
+    {
+        let clks = self.clks.lock();
+        f(&clks.core)
+    }
+
     pub(crate) fn with_locked_scheduler<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Scheduler) -> Result<R>,
@@ -228,10 +236,7 @@ impl platform::Driver for TyrPlatformDriverData {
         tdev.fw
             .wait_ready(1000)
             .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
-        {
-            let clks = tdev.clks.lock();
-            tdev.fw.enable_global_interface(&tdev.gpu_info, &clks.core)?;
-        }
+        tdev.fw.enable_global_interface(&tdev)?;
 
         tdev.sched.lock().init(&tdev)?;
 
