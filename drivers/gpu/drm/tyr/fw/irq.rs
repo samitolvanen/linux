@@ -44,7 +44,8 @@ const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
 
 pub(crate) struct JobIrq {
     fw_ready: Arc<Atomic<bool>>,
-    ready_wait: Arc<Wait>,
+    event_wait: Arc<Wait>,
+    boot_wait: Arc<Wait>,
 }
 
 /// Unmasks the Job IRQ sources and registers the handler.
@@ -58,7 +59,8 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     fw_ready: Arc<Atomic<bool>>,
-    ready_wait: Arc<Wait>,
+    event_wait: Arc<Wait>,
+    boot_wait: Arc<Wait>,
 ) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>, Error> + 'drm> {
     let mask = JOB_IRQ_MASK::zeroed()
         .with_const_csg::<CSG_IRQ_MASK>()
@@ -70,7 +72,8 @@ pub(crate) unsafe fn job_irq_init<'drm>(
 
     let job_irq = JobIrq {
         fw_ready,
-        ready_wait,
+        event_wait,
+        boot_wait,
     };
 
     // SAFETY: The caller guarantees that the registration is not leaked.
@@ -110,9 +113,11 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, _tdev: &TyrDrmDevice, status: u32) {
+        self.event_wait.notify_all();
+
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
             self.fw_ready.store(true, Release);
-            self.ready_wait.notify_all();
+            self.boot_wait.notify_all();
         }
     }
 }

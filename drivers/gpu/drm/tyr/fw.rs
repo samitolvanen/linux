@@ -195,7 +195,10 @@ pub(crate) struct Firmware<'drm> {
     sections: KVec<Section>,
 
     /// A condvar representing a wait on a firmware event.
-    pub(crate) ready_wait: Arc<Wait>,
+    pub(crate) event_wait: Arc<Wait>,
+
+    /// A condvar representing a wait for MCU boot readiness.
+    pub(crate) boot_wait: Arc<Wait>,
 
     /// Latched to `true` by the IRQ handler when the firmware signals readiness via the GLB bit.
     pub(crate) fw_ready: Arc<Atomic<bool>>,
@@ -310,7 +313,8 @@ impl<'drm> Firmware<'drm> {
                 iomem,
                 vm: vm.clone(),
                 sections,
-                ready_wait: new_wait!()?,
+                event_wait: new_wait!()?,
+                boot_wait: new_wait!()?,
                 fw_ready: Arc::new(Atomic::new(false), GFP_KERNEL)?,
                 global_iface: KBox::pin_init(new_mutex!(GlobalInterface::new()?), GFP_KERNEL)?,
             })
@@ -374,7 +378,7 @@ impl<'drm> Firmware<'drm> {
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
-        self.ready_wait.wait_interruptible_timeout(timeout_ms, || {
+        self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
             if self.fw_ready.load(Acquire) {
                 Ok(WaitResult::Done)
             } else {
@@ -398,7 +402,7 @@ impl<'drm> Firmware<'drm> {
                 shared_section,
                 gpu_info,
                 core_clk,
-                &self.ready_wait,
+                &self.event_wait,
             )
         })
     }
