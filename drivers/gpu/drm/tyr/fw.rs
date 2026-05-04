@@ -56,7 +56,7 @@ use crate::{
         TyrRegisters, //
     },
     fw::{
-        interfaces::GlobalInterface,
+        global::GlobalInterface,
         parser::{
             FwParser,
             ParsedSection, //
@@ -89,6 +89,7 @@ use crate::{
     }, //
 };
 
+pub(crate) mod global;
 mod interfaces;
 pub(crate) mod irq;
 mod parser;
