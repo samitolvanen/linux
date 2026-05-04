@@ -4,11 +4,6 @@
 //!
 //! The Job IRQ signals events from the MCU, including global interface acknowledgements.
 
-use core::sync::atomic::{
-    AtomicBool,
-    Ordering, //
-};
-
 use kernel::{
     c_str,
     device::{
@@ -39,23 +34,18 @@ use crate::{
         JOB_IRQ_RAWSTAT,
         JOB_IRQ_STATUS, //
     },
-    wait::Wait, //
 };
 
 const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
 
 pub(crate) struct JobIrq {
     iomem: Arc<Devres<IoMem>>,
-    fw_ready: Arc<AtomicBool>,
-    ready_wait: Arc<Wait>,
 }
 
 pub(crate) fn job_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
     iomem: Arc<Devres<IoMem>>,
-    fw_ready: Arc<AtomicBool>,
-    ready_wait: Arc<Wait>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<JobIrq>>, Error> + 'a> {
     let io = iomem.access(pdev.as_ref())?;
     io.write_reg(
@@ -63,11 +53,7 @@ pub(crate) fn job_irq_init<'a>(
             .with_const_csg::<CSG_IRQ_MASK>()
             .with_glb(true),
     );
-    let job_irq = JobIrq {
-        iomem: iomem.clone(),
-        fw_ready,
-        ready_wait,
-    };
+    let job_irq = JobIrq { iomem: iomem.clone() };
 
     TyrIrq::request(pdev, tdev, c_str!("job"), job_irq)
 }
@@ -116,10 +102,9 @@ impl TyrIrqTrait for JobIrq {
             .into_raw()
     }
 
-    fn handle(&self, _tdev: &TyrDrmDevice, status: u32) {
+    fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
-            self.fw_ready.store(true, Ordering::Release);
-            self.ready_wait.notify_all();
+            tdev.fw.notify_ready();
         }
     }
 }

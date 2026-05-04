@@ -175,10 +175,10 @@ pub(crate) struct Firmware {
     sections: KVec<Section>,
 
     /// A condvar representing a wait on a firmware event.
-    pub(crate) ready_wait: Arc<Wait>,
+    ready_wait: Arc<Wait>,
 
     /// Latched to `true` by the IRQ handler when the firmware signals readiness via the GLB bit.
-    pub(crate) fw_ready: Arc<AtomicBool>,
+    fw_ready: Arc<AtomicBool>,
 
     /// The global FW interface.
     #[pin]
@@ -341,6 +341,11 @@ impl Firmware {
                 Ok(WaitResult::Retry)
             }
         })
+    }
+
+    pub(crate) fn notify_ready(&self) {
+        self.fw_ready.store(true, Ordering::Release);
+        self.ready_wait.notify_all();
     }
 
     /// Enable the global interface.
