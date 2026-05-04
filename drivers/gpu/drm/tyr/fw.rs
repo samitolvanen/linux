@@ -25,6 +25,7 @@ use kernel::{
         gem::BaseObject,
         Uninit, //
     },
+    firmware,
     impl_flags,
     io::{
         poll,
@@ -426,5 +427,28 @@ impl Firmware {
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
         gem::new_kernel_object(tdev, &self.vm, suspend_size, flags)
+    }
+}
+
+/// Add modinfo entries for the firmware blobs needed by Tyr.
+pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
+
+impl<const N: usize> ModInfoBuilder<N> {
+    const FILES: &'static [&'static str] = &[
+        "arm/mali/arch10.8/mali_csffw.bin",
+    ];
+
+    pub(crate) const fn create(
+        module_name: &'static kernel::str::CStr,
+    ) -> kernel::firmware::ModInfoBuilder<N> {
+        let mut builder = kernel::firmware::ModInfoBuilder::new(module_name);
+        let mut index = 0;
+
+        while index < Self::FILES.len() {
+            builder = builder.new_entry().push(Self::FILES[index]);
+            index += 1;
+        }
+
+        builder
     }
 }
