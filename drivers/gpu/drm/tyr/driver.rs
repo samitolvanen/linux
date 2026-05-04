@@ -194,20 +194,6 @@ impl platform::Driver for TyrPlatformDriverData {
             &gpu_info,
         )?;
 
-        let job_irq = job_irq_init(
-            pdev,
-            iomem.clone(),
-            firmware.fw_ready.clone(),
-            firmware.ready_wait.clone(),
-        )?;
-        devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
-
-        firmware.boot()?;
-        firmware
-            .wait_ready(1000)
-            .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
-        firmware.enable_global_interface(&gpu_info, &core_clk)?;
-
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
 				mmu,
@@ -230,6 +216,24 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
+
+        let job_irq = job_irq_init(
+            tdev.clone(),
+            pdev,
+            tdev.iomem.clone(),
+            tdev.fw.fw_ready.clone(),
+            tdev.fw.ready_wait.clone(),
+        )?;
+        devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
+
+        tdev.fw.boot()?;
+        tdev.fw
+            .wait_ready(1000)
+            .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
+        {
+            let clks = tdev.clks.lock();
+            tdev.fw.enable_global_interface(&tdev.gpu_info, &clks.core)?;
+        }
 
         tdev.sched.lock().init(&tdev)?;
 
@@ -316,16 +320,17 @@ struct Regulators {
 
 pub(crate) trait TyrIrqTrait: Sync + 'static {
     fn read_status(&self, dev: &Device<Bound>) -> u32;
-    fn clear_mask(&self, dev: &Device<Bound>);
-    fn reenable_mask(&self, dev: &Device<Bound>);
+    fn disable_all(&self, dev: &Device<Bound>);
+    fn reenable(&self, dev: &Device<Bound>);
     fn read_raw_status(&self, dev: &Device<Bound>) -> u32;
     fn clear_status(&self, dev: &Device<Bound>, status: u32);
     fn mask(&self) -> u32;
-    fn handle(&self, status: u32);
+    fn handle(&self, tdev: &TyrDrmDevice, status: u32);
 }
 
 #[pin_data]
 pub(crate) struct TyrIrq<T: TyrIrqTrait> {
+    tdev: ARef<TyrDrmDevice>,
     irq: T,
     #[pin]
     _pin: PhantomPinned,
@@ -334,10 +339,12 @@ pub(crate) struct TyrIrq<T: TyrIrqTrait> {
 impl<T: TyrIrqTrait> TyrIrq<T> {
     pub(crate) fn request<'a>(
         pdev: &'a platform::Device<Bound>,
+        tdev: ARef<TyrDrmDevice>,
         name: &'static CStr,
         irq: T,
     ) -> Result<impl PinInit<ThreadedRegistration<Self>, Error> + 'a> {
         let handler = try_pin_init!(Self {
+            tdev,
             irq,
             _pin: PhantomPinned,
         });
@@ -353,7 +360,7 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
         if masked_status == 0 {
             return ThreadedIrqReturn::None;
         }
-        self.irq.clear_mask(dev);
+        self.irq.disable_all(dev);
         ThreadedIrqReturn::WakeThread
     }
 
@@ -365,12 +372,12 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
             if raw_status == 0 {
                 break;
             }
-            self.irq.handle(raw_status);
             self.irq.clear_status(dev, raw_status);
+            self.irq.handle(&self.tdev, raw_status);
             ret = IrqReturn::Handled;
         }
 
-        self.irq.reenable_mask(dev);
+        self.irq.reenable(dev);
         ret
     }
 }

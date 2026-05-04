@@ -20,12 +20,16 @@ use kernel::{
     irq::ThreadedRegistration,
     platform,
     prelude::*,
-    sync::Arc, //
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
 };
 
 use crate::{
     driver::{
         IoMem,
+        TyrDrmDevice,
         TyrIrq,
         TyrIrqTrait, //
     },
@@ -47,6 +51,7 @@ pub(crate) struct JobIrq {
 }
 
 pub(crate) fn job_irq_init<'a>(
+    tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
     iomem: Arc<Devres<IoMem>>,
     fw_ready: Arc<AtomicBool>,
@@ -64,7 +69,7 @@ pub(crate) fn job_irq_init<'a>(
         ready_wait,
     };
 
-    TyrIrq::request(pdev, c_str!("job"), job_irq)
+    TyrIrq::request(pdev, tdev, c_str!("job"), job_irq)
 }
 
 impl TyrIrqTrait for JobIrq {
@@ -75,13 +80,13 @@ impl TyrIrqTrait for JobIrq {
         }
     }
 
-    fn clear_mask(&self, dev: &Device<Bound>) {
+    fn disable_all(&self, dev: &Device<Bound>) {
         if let Ok(io) = self.iomem.access(dev) {
             io.write_reg(JOB_IRQ_MASK::zeroed());
         }
     }
 
-    fn reenable_mask(&self, dev: &Device<Bound>) {
+    fn reenable(&self, dev: &Device<Bound>) {
         if let Ok(io) = self.iomem.access(dev) {
             io.write_reg(
                 JOB_IRQ_MASK::zeroed()
@@ -111,7 +116,7 @@ impl TyrIrqTrait for JobIrq {
             .into_raw()
     }
 
-    fn handle(&self, status: u32) {
+    fn handle(&self, _tdev: &TyrDrmDevice, status: u32) {
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
             self.fw_ready.store(true, Ordering::Release);
             self.ready_wait.notify_all();
