@@ -1997,7 +1997,7 @@ impl GlobalInterface {
         Ok(())
     }
 
-    pub(crate) fn csg(&self, index: usize) -> Option<&CsgInterface> {
+    fn csg(&self, index: usize) -> Option<&CsgInterface> {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
             GlobalInterfaceState::Disabled => return None,
@@ -2006,7 +2006,7 @@ impl GlobalInterface {
         enabled.csg.get(index)
     }
 
-    pub(crate) fn csg_slot_count(&self) -> Result<u32> {
+    fn csg_slot_count(&self) -> Result<u32> {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
             GlobalInterfaceState::Disabled => return Err(EINVAL),
@@ -2063,7 +2063,7 @@ struct EnabledCsgInterface {
 /// Command Stream Group Interface
 ///
 /// The CSG interface controls operations for a specific CSG.
-pub(crate) struct CsgInterface {
+struct CsgInterface {
     /// Current interface state (Disabled or Enabled).
     state: CsgInterfaceState,
     /// CSG identifier/index number.
@@ -2182,7 +2182,7 @@ impl CsgInterface {
         Ok(())
     }
 
-    pub(crate) fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+    fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {
         use csg::control::{
             GROUP_PROTM_SUSPEND_SIZE,
             GROUP_SUSPEND_SIZE,
@@ -2203,7 +2203,7 @@ impl CsgInterface {
         Ok((suspend_size, protm_suspend_size))
     }
 
-    pub(crate) fn cs(&self, index: usize) -> Option<&CsInterface> {
+    fn cs(&self, index: usize) -> Option<&CsInterface> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
             CsgInterfaceState::Disabled => return None,
@@ -2212,7 +2212,7 @@ impl CsgInterface {
         enabled.cs.get(index)
     }
 
-    pub(crate) fn cs_slot_count(&self) -> Result<u32> {
+    fn cs_slot_count(&self) -> Result<u32> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
             CsgInterfaceState::Disabled => return Err(EINVAL),
@@ -2245,7 +2245,7 @@ struct EnabledCsInterface {
 /// Command Stream Interface
 ///
 /// The CS interface controls operations for a specific CS.
-pub(crate) struct CsInterface {
+struct CsInterface {
     /// Current interface state (Disabled or Enabled).
     state: CsInterfaceState,
     /// CS identifier/index number.
@@ -2313,7 +2313,7 @@ impl CsInterface {
         Ok(())
     }
 
-    pub(crate) fn work_regs(&self) -> Result<u32> {
+    fn work_regs(&self) -> Result<u32> {
         use cs::control::STREAM_FEATURES;
         use kernel::io::Io;
 
@@ -2325,7 +2325,7 @@ impl CsInterface {
         Ok(enabled.cs_control.read(STREAM_FEATURES).work_registers().get())
     }
 
-    pub(crate) fn scoreboards(&self) -> Result<u32> {
+    fn scoreboards(&self) -> Result<u32> {
         use cs::control::STREAM_FEATURES;
         use kernel::io::Io;
 
