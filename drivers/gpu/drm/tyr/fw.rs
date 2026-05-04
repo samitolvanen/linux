@@ -297,6 +297,61 @@ impl RequestField {
         self.req.write::<u32>(new_val)
     }
 
+    /// Combined masked update and toggle of the request word in a single
+    /// MMIO write.
+    ///
+    /// Bits in `update_mask` are overwritten with the corresponding bits
+    /// from `val`.  Bits in `toggle_mask` are XOR-toggled relative to the
+    /// current ack value, which is the firmware-handshake form: writing
+    /// `req[bit] = ack[bit] ^ 1` raises a "request changed" event for that
+    /// bit, and the firmware acknowledges by mirroring the new req value
+    /// back into ack.
+    ///
+    /// Use case: CSG slot programming wants to set `CSG_STATE` and toggle
+    /// `CSG_ENDPOINT_CONFIG` in one MMIO write so the firmware sees both
+    /// changes simultaneously rather than waking up between them.
+    ///
+    /// `update_mask` and `toggle_mask` should describe disjoint bit sets.
+    /// If they overlap, the toggle takes effect last and wins for the
+    /// overlapping bits; callers should not rely on this ordering.
+    ///
+    /// The caller must hold the firmware shared-section lock for the
+    /// duration of the call; the read-`req` / read-`ack` / write-`req`
+    /// sequence is otherwise racy against firmware acks.
+    pub(crate) fn update_and_toggle_reqs(
+        &self,
+        val: u32,
+        update_mask: u32,
+        toggle_mask: u32,
+    ) -> Result {
+        let cur_req_val = self.req.read::<u32>()?;
+        let ack_val = self.ack.read::<u32>()?;
+
+        let mut new_val = cur_req_val;
+        if update_mask != 0 {
+            new_val = (new_val & !update_mask) | (val & update_mask);
+        }
+        if toggle_mask != 0 {
+            new_val = (new_val & !toggle_mask) | ((ack_val ^ toggle_mask) & toggle_mask);
+        }
+
+        self.req.write::<u32>(new_val)
+    }
+
+    /// Write value directly to the request field.
+    ///
+    /// DANGEROUS: this bypasses the `req`/`ack` toggle handshake that
+    /// [`toggle_reqs`] / [`update_and_toggle_reqs`] implement.  Use it
+    /// only for "level-write" fields that the firmware reads
+    /// straight from `req` without comparing against `ack`, such as
+    /// IRQ-acknowledge masks.
+    ///
+    /// [`toggle_reqs`]: RequestField::toggle_reqs
+    /// [`update_and_toggle_reqs`]: RequestField::update_and_toggle_reqs
+    pub(crate) fn write_req(&self, val: u32) -> Result {
+        self.req.write::<u32>(val)
+    }
+
     /// Returns whether any requests are pending for `reqs`.
     pub(crate) fn pending_reqs(&self, reqs: u32) -> Result<bool> {
         let cur_req_val = self.req.read::<u32>()? & reqs;
@@ -364,7 +419,6 @@ pub(crate) trait SharedSectionEntry {
         Err(ENOTSUPP)
     }
 
-    #[expect(dead_code)]
     fn interrupt_ack(&self) -> Result<RequestField> {
         pr_err!("Interrupt ack not supported for this interface");
         Err(ENOTSUPP)
@@ -690,6 +744,23 @@ impl Firmware {
                 prealloc_streams,
             )
         })
+    }
+
+    /// Waits for the given CSG requests to be acknowledged by the firmware.
+    pub(crate) fn wait_csg_acks(&self, csg_idx: usize, mask: u32, timeout_ms: u32) -> Result<u32> {
+        let req = self.with_locked_global_iface(|glb| {
+            let csg = glb.csg(csg_idx).ok_or(EINVAL)?;
+            csg.input_request()
+        })?;
+        let mut acked = req.wait_acks(mask, &self.event_wait, timeout_ms)?;
+
+        if (acked & global::csg::constants::CSG_STATE_MASK)
+            != global::csg::constants::CSG_STATE_MASK
+        {
+            acked &= !global::csg::constants::CSG_STATE_MASK;
+        }
+
+        Ok(acked)
     }
 }
 

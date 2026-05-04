@@ -151,6 +151,17 @@ pub(crate) mod constants {
         | CS_IDLE_RESOURCE_REQ;
 
     pub(crate) const CS_EVT_MASK: u32 = CS_TILER_OOM | CS_PROTM_PENDING | CS_FATAL | CS_FAULT;
+
+    /// Opcode written by command-stream emitters to mark a synchronisation
+    /// point that propagates the parent group's fault status into this
+    /// stream.  Used by the upcoming submit path to terminate a stream
+    /// gracefully when the group has already faulted.
+    pub(crate) const CS_INHERIT_FAULT: u32 = 0x4b;
+
+    /// Opcode written by command-stream emitters to mark the stream as
+    /// unrecoverable, so the firmware retires it without further
+    /// scheduling rather than attempting to resume execution.
+    pub(crate) const CS_UNRECOVERABLE: u32 = 0x41;
 }
 
 pub(crate) struct CommandStream {

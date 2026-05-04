@@ -27,6 +27,7 @@ use kernel::{
     drm::{
         gpuvm::{
             DriverGpuVm,
+            GpuVa,
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
@@ -39,7 +40,6 @@ use kernel::{
             OpUnmapped,
             UniqueRefGpuVm, //
         },
-        sched,
         DeviceContext, //
     },
     impl_flags,
@@ -426,10 +426,24 @@ pub(crate) struct Vm {
     /// Kernel VA reservations that must live as long as the VM.
     #[pin]
     kernel_reservations: Mutex<KVec<LiveRange>>,
-    /// Whether this VM is in an unusable state due to failed async operations.
+    /// Whether this VM is in an unusable state due to a failed async map
+    /// or unmap operation.
     ///
-    /// Once set, the VM cannot accept new operations and should be destroyed.
+    /// Set by the VM bind path when an op cannot be retried.  Once set,
+    /// the VM cannot accept new bind operations and should be destroyed.
+    /// Distinct from [`unhandled_fault`](Vm::unhandled_fault), which is
+    /// raised by the MMU fault handler when an in-flight GPU access
+    /// could not be recovered; either flag implies the VM is dead, but
+    /// they are reported through different paths.
     unusable: AtomicBool,
+    /// Whether this VM has an MMU fault that the fault handler could not
+    /// fully service.
+    ///
+    /// Set by the MMU fault path when GROW_ON_PAGE_FAULT or a similar
+    /// recovery does not apply, signalling to the scheduler that the
+    /// owning groups must be terminated.  See also
+    /// [`unusable`](Vm::unusable).
+    pub(crate) unhandled_fault: AtomicBool,
     /// Job queue for async VM bind operations.
     pub(crate) job_queue: kernel::drm::job_queue::JobQueue<bind_job::VmBindJobHandler>,
 }
@@ -500,6 +514,7 @@ impl Vm {
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
                 unusable: AtomicBool::new(false),
+                unhandled_fault: AtomicBool::new(false),
                 job_queue,
             }),
             GFP_KERNEL,
@@ -582,6 +597,40 @@ impl Vm {
             .inspect_err(|e| {
                 pr_err!("Failed to unmap range during deactivate: {:?}\n", e);
             });
+    }
+
+    /// Finds the buffer object mapped at the given virtual address.
+    ///
+    /// If a mapping exists at the specified VA, returns the buffer object and
+    /// the offset within the buffer object corresponding to that VA.
+    ///
+    /// The lookup is a snapshot: it returns the BO and offset that were
+    /// mapped at `va` when this call ran.  The caller is responsible for
+    /// ensuring it does not interpret the returned `(Bo, offset)` after the
+    /// mapping at `va` changes (for example, by holding the relevant
+    /// scheduling locks or by serialising against
+    /// [`unmap_range`](Vm::unmap_range)).  In particular, the `ARef<Bo>` keeps
+    /// the BO alive for the consumer's use, but a subsequent unmap+remap
+    /// at the same VA will not invalidate that reference.
+    pub(crate) fn get_bo_for_va(&self, va: u64) -> Option<(ARef<Bo>, u64)> {
+        let _guard = self.gpuvm_unique.lock();
+        let raw_vm = self.gpuvm.as_raw();
+        // SAFETY: `raw_vm` is valid because `self.gpuvm` is a valid reference.
+        // The `gpuvm_unique` lock is held, which protects the GPUVM lists from
+        // concurrent modifications.
+        let gpuva_ptr = unsafe { kernel::bindings::drm_gpuva_find_first(raw_vm, va, 1) };
+        if gpuva_ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: `gpuva_ptr` is not null and was returned by `drm_gpuva_find_first`,
+        // so it points to a valid `GpuVa` object. The `GpuVa` is kept alive by the
+        // `gpuvm_unique` lock.
+        let gpuva = unsafe { GpuVa::<GpuVmData>::from_raw(gpuva_ptr) };
+        let bo = gpuva.obj();
+
+        let bo_offset = gpuva.gem_offset() + (va - gpuva.addr());
+        Some((ARef::from(bo), bo_offset))
     }
 
     /// Returns the hardware address space slot number if the VM is active.

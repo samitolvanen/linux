@@ -82,11 +82,16 @@ pub(crate) mod constants {
     pub(crate) const CSG_EP_REQ_EXCL_COMPUTE: u32 = bit_u32(20);
     pub(crate) const CSG_EP_REQ_EXCL_FRAGMENT: u32 = bit_u32(21);
 
-    pub(crate) const fn csg_ep_req_priority(x: u32) -> u32 {
-        (x << 28) & genmask_u32(28..=31)
-    }
-
+    /// Bit position of the 4-bit `priority` sub-field within the CSG
+    /// `ep_req` register.  Exposed alongside [`csg_ep_req_priority`] so
+    /// the scheduler can compose `ep_req` values directly when it
+    /// already has the masked priority bits in hand.
+    pub(crate) const CSG_EP_REQ_PRIORITY_SHIFT: u32 = 28;
     pub(crate) const CSG_EP_REQ_PRIORITY_MASK: u32 = genmask_u32(28..=31);
+
+    pub(crate) const fn csg_ep_req_priority(x: u32) -> u32 {
+        (x << CSG_EP_REQ_PRIORITY_SHIFT) & CSG_EP_REQ_PRIORITY_MASK
+    }
 }
 
 pub(crate) struct CommandStreamGroup {
