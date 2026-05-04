@@ -65,6 +65,7 @@ use crate::{
     gpu::GpuInfo,
     mmu::Mmu,
     new_wait,
+    regs::job_control::JOB_IRQ_RAWSTAT,
     regs::gpu_control::{
         McuControlMode,
         McuStatus,
@@ -354,6 +355,14 @@ impl Firmware {
     pub(crate) fn notify_ready(&self) {
         self.fw_ready.store(true, Ordering::Release);
         self.boot_wait.notify_all();
+    }
+
+    pub(crate) fn handle_irq(&self, status: u32) {
+        self.notify_event();
+
+        if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
+            self.notify_ready();
+        }
     }
 
     /// Enable the global interface.

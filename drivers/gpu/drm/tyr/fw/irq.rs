@@ -103,10 +103,6 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
-        tdev.fw.notify_event();
-
-        if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
-            tdev.fw.notify_ready();
-        }
+        tdev.fw.handle_irq(status);
     }
 }
