@@ -29,3 +29,5 @@ kernel::module_platform_driver! {
     description: "Arm Mali Tyr DRM driver",
     license: "Dual MIT/GPL",
 }
+
+kernel::module_firmware!(fw::ModInfoBuilder);
