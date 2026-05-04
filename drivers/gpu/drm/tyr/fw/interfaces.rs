@@ -1752,14 +1752,14 @@ struct EnabledGlobalInterface {
 /// Global CSF Interface
 ///
 /// The CSF controls operations that are common to all CSs.
-pub(super) struct GlobalInterface {
+pub(crate) struct GlobalInterface {
     /// Current interface state (Disabled or Enabled).
     state: GlobalInterfaceState,
 }
 
 impl GlobalInterface {
     /// Creates a new CSF global interface, initially disabled.
-    pub(super) fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             state: GlobalInterfaceState::Disabled,
         })
