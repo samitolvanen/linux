@@ -51,7 +51,6 @@ use crate::{
 };
 use iface::FwInterface;
 use kernel::{
-    bindings::SZ_1K,
     clk::Clk,
     devres::Devres,
     io::{
@@ -61,7 +60,6 @@ use kernel::{
     num::Bounded,
     platform,
     prelude::*,
-    time::arch_timer_get_rate, //
 };
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
@@ -1639,37 +1637,6 @@ use glb::{
     *, //
 };
 
-/// Converts a timeout in microseconds to a timeout field value and timer source.
-///
-/// The firmware supports two timer sources:
-/// - System timestamp (arch timer): preferred when available, so the timeout
-///   tracks real elapsed time independently of GPU clock rate.
-/// - GPU cycle counter: fallback when the system timestamp is unavailable.
-///
-/// Returns the encoded timeout value and the selected timer source.
-fn conv_timeout(core_clk: &Clk, timeout_us: u32) -> Result<(u32, TimestampSource)> {
-    // The max timeout is determined by the 31 bit size of the timeout field.
-    let max_timeout = (1u32 << 31) - 1;
-    let core_rate = core_clk.rate().as_hz() as u64;
-
-    let (timer_rate, timer_source) = match arch_timer_get_rate() {
-        Some(rate) => (u64::from(rate), TimestampSource::SystemTimestamp),
-        _ if core_rate != 0 => (core_rate, TimestampSource::GpuCounter),
-        _ => return Err(EINVAL),
-    };
-
-    let timeout_in_cycles = u64::from(timeout_us) * timer_rate;
-
-    // The hardware stores the represented timeout value with a shr(10) to save space.
-    let timeout_shift = u64::from(SZ_1K);
-    let us_per_second = 1_000_000u64;
-
-    let timeout_val = timeout_in_cycles.div_ceil(us_per_second * timeout_shift);
-    let timeout_val = timeout_val.min(u64::from(max_timeout)) as u32;
-
-    Ok((timeout_val, timer_source))
-}
-
 /// Request/acknowledge communication between Tyr and CSF.
 struct GlobalInterfaceRequests<'a> {
     /// Global input block where driver writes requests.
@@ -1889,7 +1856,9 @@ impl GlobalInterface {
 
         // Power-down delay after idle, in microseconds.
         const PWROFF_HYSTERESIS_US: u32 = 10_000;
-        let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk, PWROFF_HYSTERESIS_US)?;
+        let (pwroff_timeout, pwroff_source) =
+            super::global::conv_timeout(core_clk, PWROFF_HYSTERESIS_US)?;
+        let pwroff_source = pwroff_source.into();
         let pwroff_timeout = Bounded::<u32, 31>::try_new(pwroff_timeout).ok_or(EINVAL)?;
         glb_input.write(
             GLB_PWROFF_TIMER,
@@ -1916,7 +1885,9 @@ impl GlobalInterface {
 
         // Configure the delay before reporting the GPU as idle.
         const IDLE_HYSTERESIS_US: u32 = 800;
-        let (idle_timeout, idle_source) = conv_timeout(core_clk, IDLE_HYSTERESIS_US)?;
+        let (idle_timeout, idle_source) =
+            super::global::conv_timeout(core_clk, IDLE_HYSTERESIS_US)?;
+        let idle_source = idle_source.into();
         let idle_timeout = Bounded::<u32, 31>::try_new(idle_timeout).ok_or(EINVAL)?;
         glb_input.write(
             GLB_IDLE_TIMER,
