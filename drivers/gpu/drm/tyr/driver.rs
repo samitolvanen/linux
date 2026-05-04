@@ -40,6 +40,7 @@ use kernel::{
     regulator::Regulator,
     sizes::SZ_2M,
     sync::{
+        aref::ARef,
         Arc,
         Mutex, //
     },
@@ -233,6 +234,7 @@ impl platform::Driver for TyrPlatformDriver {
                 unsafe {
                     job_irq_init(
                         pdev,
+                        ARef::from(&*unreg_dev),
                         iomem.clone(),
                         firmware.fw_ready.clone(),
                         firmware.ready_wait.clone(),
@@ -357,17 +359,18 @@ struct Regulators {
 
 pub(crate) trait TyrIrqTrait: Sync {
     fn read_status(&self, io: &IoMem<'_>) -> u32;
-    fn clear_mask(&self, io: &IoMem<'_>);
-    fn reenable_mask(&self, io: &IoMem<'_>);
+    fn disable_all(&self, io: &IoMem<'_>);
+    fn reenable(&self, io: &IoMem<'_>);
     fn read_raw_status(&self, io: &IoMem<'_>) -> u32;
     fn clear_status(&self, io: &IoMem<'_>, status: u32);
     fn mask(&self) -> u32;
-    fn handle(&self, status: u32);
+    fn handle(&self, tdev: &TyrDrmDevice, status: u32);
 }
 
 #[pin_data]
 pub(crate) struct TyrIrq<'drm, T: TyrIrqTrait> {
     dev: &'drm Device<Bound>,
+    tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     irq: T,
     #[pin]
@@ -383,6 +386,7 @@ impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
     /// `Drop` implementation from running.
     pub(crate) unsafe fn request(
         pdev: &'drm platform::Device<Bound>,
+        tdev: ARef<TyrDrmDevice>,
         name: &'static CStr,
         iomem: Arc<DevresIoMem<SZ_2M>>,
         irq: T,
@@ -392,6 +396,7 @@ impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
     {
         let handler = try_pin_init!(Self {
             dev: pdev.as_ref(),
+            tdev,
             iomem,
             irq,
             _pin: PhantomPinned,
@@ -412,7 +417,7 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
         if masked_status == 0 {
             return ThreadedIrqReturn::None;
         }
-        self.irq.clear_mask(io);
+        self.irq.disable_all(io);
         ThreadedIrqReturn::WakeThread
     }
 
@@ -427,12 +432,12 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
             if raw_status == 0 {
                 break;
             }
-            self.irq.handle(raw_status);
             self.irq.clear_status(io, raw_status);
+            self.irq.handle(&self.tdev, raw_status);
             ret = IrqReturn::Handled;
         }
 
-        self.irq.reenable_mask(io);
+        self.irq.reenable(io);
         ret
     }
 }
