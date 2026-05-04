@@ -175,7 +175,10 @@ pub(crate) struct Firmware {
     sections: KVec<Section>,
 
     /// A condvar representing a wait on a firmware event.
-    ready_wait: Arc<Wait>,
+    event_wait: Arc<Wait>,
+
+    /// A condvar representing a wait for MCU boot readiness.
+    boot_wait: Arc<Wait>,
 
     /// Latched to `true` by the IRQ handler when the firmware signals readiness via the GLB bit.
     fw_ready: Arc<AtomicBool>,
@@ -288,7 +291,8 @@ impl Firmware {
                 iomem,
                 vm,
                 sections,
-                ready_wait: new_wait!()?,
+                event_wait: new_wait!()?,
+                boot_wait: new_wait!()?,
                 fw_ready: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
                 global_iface <- new_mutex!(GlobalInterface::new()?),
             }),
@@ -334,7 +338,7 @@ impl Firmware {
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
-        self.ready_wait.wait_interruptible_timeout(timeout_ms, || {
+        self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
             if self.fw_ready.load(Ordering::Acquire) {
                 Ok(WaitResult::Done)
             } else {
@@ -343,9 +347,13 @@ impl Firmware {
         })
     }
 
+    pub(crate) fn notify_event(&self) {
+        self.event_wait.notify_all();
+    }
+
     pub(crate) fn notify_ready(&self) {
         self.fw_ready.store(true, Ordering::Release);
-        self.ready_wait.notify_all();
+        self.boot_wait.notify_all();
     }
 
     /// Enable the global interface.
@@ -358,7 +366,7 @@ impl Firmware {
                 shared_section,
                 gpu_info,
                 core_clk,
-                &self.ready_wait,
+                &self.event_wait,
             )
         })
     }
