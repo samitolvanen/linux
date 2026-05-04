@@ -15,6 +15,7 @@ use kernel::{
     prelude::*,
     sizes::SZ_2M,
     sync::{
+        aref::ARef,
         atomic::{
             Atomic,
             Release, //
@@ -26,6 +27,7 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
+        TyrDrmDevice,
         TyrIrq,
         TyrIrqTrait, //
     },
@@ -53,6 +55,7 @@ pub(crate) struct JobIrq {
 /// `Drop` implementation from running.
 pub(crate) unsafe fn job_irq_init<'drm>(
     pdev: &'drm platform::Device<Bound>,
+    tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     fw_ready: Arc<Atomic<bool>>,
     ready_wait: Arc<Wait>,
@@ -71,7 +74,7 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     };
 
     // SAFETY: The caller guarantees that the registration is not leaked.
-    Ok(unsafe { TyrIrq::request(pdev, c"job", iomem, job_irq) })
+    Ok(unsafe { TyrIrq::request(pdev, tdev, c"job", iomem, job_irq) })
 }
 
 impl TyrIrqTrait for JobIrq {
@@ -79,11 +82,11 @@ impl TyrIrqTrait for JobIrq {
         io.read(JOB_IRQ_STATUS).into_raw()
     }
 
-    fn clear_mask(&self, io: &IoMem<'_>) {
+    fn disable_all(&self, io: &IoMem<'_>) {
         io.write_reg(JOB_IRQ_MASK::zeroed());
     }
 
-    fn reenable_mask(&self, io: &IoMem<'_>) {
+    fn reenable(&self, io: &IoMem<'_>) {
         io.write_reg(
             JOB_IRQ_MASK::zeroed()
                 .with_const_csg::<CSG_IRQ_MASK>()
@@ -106,7 +109,7 @@ impl TyrIrqTrait for JobIrq {
             .into_raw()
     }
 
-    fn handle(&self, status: u32) {
+    fn handle(&self, _tdev: &TyrDrmDevice, status: u32) {
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
             self.fw_ready.store(true, Release);
             self.ready_wait.notify_all();
