@@ -2014,6 +2014,24 @@ impl GlobalInterface {
 
         Ok(enabled.csg_num as u32)
     }
+
+    pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+        let csg = self.csg(0).ok_or(EINVAL)?;
+        let cs = csg.cs(0).ok_or(EINVAL)?;
+
+        Ok((
+            self.csg_slot_count()?,
+            csg.cs_slot_count()?,
+            cs.work_regs()?,
+            cs.scoreboards()?,
+        ))
+    }
+
+    pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+        let csg = self.csg(0).ok_or(EINVAL)?;
+
+        csg.suspend_buf_sizes()
+    }
 }
 
 /// State of a CSG interface.

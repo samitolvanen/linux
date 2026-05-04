@@ -391,25 +391,11 @@ impl Firmware {
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
-        self.with_locked_global_iface(|global_iface| {
-            let csg = global_iface.csg(0).ok_or(EINVAL)?;
-            let cs = csg.cs(0).ok_or(EINVAL)?;
-
-            Ok((
-                global_iface.csg_slot_count()?,
-                csg.cs_slot_count()?,
-                cs.work_regs()?,
-                cs.scoreboards()?,
-            ))
-        })
+        self.with_locked_global_iface(|global_iface| global_iface.csif_info_counts())
     }
 
     pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
-        self.with_locked_global_iface(|global_iface| {
-            let csg = global_iface.csg(0).ok_or(EINVAL)?;
-
-            csg.suspend_buf_sizes()
-        })
+        self.with_locked_global_iface(|global_iface| global_iface.group_suspend_buf_sizes())
     }
 
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
