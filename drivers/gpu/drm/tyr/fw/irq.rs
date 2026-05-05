@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! IRQ handling for the Job IRQ.
+//! Firmware Job IRQ handling and readiness state.
 //!
-//! The Job IRQ signals events from the MCU, including global interface acknowledgements.
+//! This module owns the Job IRQ registration plus the wait state used for
+//! firmware events and initial GLB readiness.
+
+use core::sync::atomic::{
+    AtomicBool,
+    Ordering,
+};
 
 use kernel::{
     c_str,
@@ -13,6 +19,7 @@ use kernel::{
     devres::Devres,
     io::Io,
     irq::ThreadedRegistration,
+    new_mutex,
     platform,
     prelude::*,
     sync::{
@@ -34,9 +41,53 @@ use crate::{
         JOB_IRQ_RAWSTAT,
         JOB_IRQ_STATUS, //
     },
+    new_wait,
+    wait::{
+        Wait,
+        WaitResult,
+    },
 };
 
 const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
+
+pub(crate) struct JobIrqState {
+    event_wait: Arc<Wait>,
+    boot_wait: Arc<Wait>,
+    fw_ready: Arc<AtomicBool>,
+}
+
+impl JobIrqState {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            event_wait: new_wait!()?,
+            boot_wait: new_wait!()?,
+            fw_ready: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
+        })
+    }
+
+    pub(crate) fn event_wait(&self) -> &Wait {
+        self.event_wait.as_ref()
+    }
+
+    pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
+        self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
+            if self.fw_ready.load(Ordering::Acquire) {
+                Ok(WaitResult::Done)
+            } else {
+                Ok(WaitResult::Retry)
+            }
+        })
+    }
+
+    pub(crate) fn handle(&self, status: u32) {
+        self.event_wait.notify_all();
+
+        if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
+            self.fw_ready.store(true, Ordering::Release);
+            self.boot_wait.notify_all();
+        }
+    }
+}
 
 pub(crate) struct JobIrq {
     iomem: Arc<Devres<IoMem>>,
