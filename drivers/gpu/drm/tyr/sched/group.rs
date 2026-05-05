@@ -21,7 +21,6 @@ use crate::{
     },
     file::{
         QueueCreate,
-        QueueSubmit,
         TyrDrmFile, //
     },
     gem,
@@ -38,7 +37,10 @@ use super::{
         self,
         SyncOp, //
     },
-    job::Job,
+    job::{
+        Job,
+        QueueSubmit, //
+    },
     queue::Queue,
     syncs, //
 };
