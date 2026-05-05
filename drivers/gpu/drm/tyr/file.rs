@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
-    alloc::KVec,
     drm,
     drm::gem::BaseObject,
     io::Io,
@@ -374,34 +373,10 @@ impl TyrDrmFileData {
         groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if groupcreate.queues.count == 0 {
-            return Err(EINVAL);
-        }
-
-        if groupcreate.queues.stride as usize
-            != core::mem::size_of::<uapi::drm_panthor_queue_create>()
-        {
-            return Err(ENOTSUPP);
-        }
-
-        let mut reader = UserSlice::new(
-            UserPtr::from_addr(groupcreate.queues.array as usize),
-            groupcreate.queues.stride as usize * groupcreate.queues.count as usize,
-        )
-        .reader();
-
-        let mut queue_args = KVec::new();
-
-        for _ in 0..groupcreate.queues.count {
-            let queue: QueueCreate = reader.read()?;
-            queue.validate()?;
-            queue_args.push(queue, GFP_KERNEL)?;
-        }
-
         let handle = file
             .inner()
             .group_pool()
-            .create_group(ddev, groupcreate, file, queue_args)?;
+            .create_group(ddev, groupcreate, file)?;
 
         groupcreate.group_handle = handle as u32;
 
@@ -559,7 +534,7 @@ pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
 unsafe impl FromBytes for QueueCreate {}
 
 impl QueueCreate {
-    fn validate(&self) -> Result {
+    pub(crate) fn validate(&self) -> Result {
         if self.0.pad != [0; 3] {
             return Err(EINVAL);
         }

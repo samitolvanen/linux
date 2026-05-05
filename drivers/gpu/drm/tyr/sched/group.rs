@@ -12,6 +12,7 @@ use kernel::{
     io::Io,
     prelude::*,
     sync::Arc,
+    uaccess::UserSlice,
     uapi,
 };
 
@@ -225,8 +226,31 @@ impl Pool {
         ddev: &TyrDrmDevice,
         groupcreate: &uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
-        queue_args: KVec<QueueCreate>,
     ) -> Result<usize> {
+        if groupcreate.queues.count == 0 {
+            return Err(EINVAL);
+        }
+
+        if groupcreate.queues.stride as usize
+            != core::mem::size_of::<uapi::drm_panthor_queue_create>()
+        {
+            return Err(ENOTSUPP);
+        }
+
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(groupcreate.queues.array as usize),
+            groupcreate.queues.stride as usize * groupcreate.queues.count as usize,
+        )
+        .reader();
+
+        let mut queue_args = KVec::new();
+
+        for _ in 0..groupcreate.queues.count {
+            let queue: QueueCreate = reader.read()?;
+            queue.validate()?;
+            queue_args.push(queue, GFP_KERNEL)?;
+        }
+
         let group = Group::create(ddev, file, groupcreate, queue_args)?;
 
         ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
