@@ -112,7 +112,7 @@ impl TyrIrqTrait for JobIrq {
             .into_raw()
     }
 
-    fn handle(&self, _tdev: &TyrDrmDevice, status: u32) {
+    fn handle(&self, _tdev: &TyrDrmDevice, _io: &IoMem<'_>, status: u32) {
         self.event_wait.notify_all();
 
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
