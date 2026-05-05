@@ -90,7 +90,7 @@ impl Pool {
         })
     }
 
-    pub(crate) fn create_vm(
+    fn create_vm_range(
         &self,
         tdev: &ARef<TyrDrmDevice>,
         requested_user_va_range: u64,
@@ -107,6 +107,18 @@ impl Pool {
         let index = self.entries.insert(vm)?;
 
         Ok((index, user_va_range))
+    }
+
+    pub(crate) fn create_vm(
+        &self,
+        tdev: &ARef<TyrDrmDevice>,
+        vmcreate: &mut uapi::drm_panthor_vm_create,
+    ) -> Result {
+        let (id, user_va_range) = self.create_vm_range(tdev, vmcreate.user_va_range)?;
+
+        vmcreate.id = id as u32;
+        vmcreate.user_va_range = user_va_range;
+        Ok(())
     }
 
     pub(crate) fn get_vm(&self, index: usize) -> Option<Arc<Vm>> {

@@ -200,13 +200,7 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
-        let (id, user_va_range) = file
-            .inner()
-            .vm_pool()
-            .create_vm(&ARef::from(ddev), vmcreate.user_va_range)?;
-
-        vmcreate.id = id as u32;
-        vmcreate.user_va_range = user_va_range;
+        file.inner().vm_pool().create_vm(&ARef::from(ddev), vmcreate)?;
         Ok(0)
     }
 
