@@ -37,6 +37,7 @@ use crate::{
     sched::{
         deps::SyncOp,
         group,
+        job::QueueSubmit,
     },
     vm::{
         self,
@@ -682,36 +683,7 @@ impl RawQueueSubmit {
     }
 
     fn capture(self) -> Result<QueueSubmit> {
-        let stream_size = self.0.stream_size as usize;
-        let mut stream = KVec::with_capacity(stream_size, GFP_KERNEL)?;
-
-        if stream_size != 0 {
-            stream.resize(stream_size, 0, GFP_KERNEL)?;
-
-            let mut reader =
-                UserSlice::new(UserPtr::from_addr(self.0.stream_addr as usize), stream_size).reader();
-            reader.read_slice(&mut stream[..])?;
-        }
-
-        Ok(QueueSubmit {
-            queue_index: self.0.queue_index as usize,
-            stream,
-        })
-    }
-}
-
-pub(crate) struct QueueSubmit {
-    queue_index: usize,
-    stream: KVec<u8>,
-}
-
-impl QueueSubmit {
-    pub(crate) fn queue_index(&self) -> usize {
-        self.queue_index
-    }
-
-    pub(crate) fn into_stream(self) -> KVec<u8> {
-        self.stream
+        QueueSubmit::from_uapi(&self.0)
     }
 }
 
