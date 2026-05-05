@@ -25,6 +25,7 @@ use kernel::{
         Arc, //
     },
     uapi::{
+        self,
         SZ_128K,
         SZ_8M, //
     },
@@ -111,6 +112,72 @@ impl Context {
         }
 
         self.chunks.push(chunk_bo, GFP_KERNEL)?;
+        Ok(())
+    }
+}
+
+pub(crate) struct Pools {
+    entries: Pin<KBox<XArray<Arc<Pool>>>>,
+}
+
+impl Pools {
+    pub(crate) fn create() -> Result<Self> {
+        let entries = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
+
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn get_pool(&self, vm_id: usize) -> Option<Arc<Pool>> {
+        let xa = self.entries.as_ref();
+        let guard = xa.lock();
+        let pool = guard.get(vm_id)?;
+
+        Some(pool.into())
+    }
+
+    fn get_or_create_pool(
+        &self,
+        ddev: &TyrDrmDevice,
+        reg_data: &TyrDrmRegistrationData<'_>,
+        vm_id: usize,
+        vm: Arc<Vm>,
+    ) -> Result<Arc<Pool>> {
+        if let Some(pool) = self.get_pool(vm_id) {
+            return Ok(pool);
+        }
+
+        let pool = Arc::new(Pool::create(ddev, reg_data, vm)?, GFP_KERNEL)?;
+        let xa = self.entries.as_ref();
+        let mut guard = xa.lock();
+        guard
+            .store(vm_id, pool.clone(), GFP_KERNEL)
+            .map_err(|_| EINVAL)?;
+
+        Ok(pool)
+    }
+
+    pub(crate) fn create_context(
+        &self,
+        ddev: &TyrDrmDevice,
+        reg_data: &TyrDrmRegistrationData<'_>,
+        vm_id: usize,
+        vm: Arc<Vm>,
+        heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
+    ) -> Result {
+        let args = ContextCreateArgs {
+            initial_chunk_count: heapcreate.initial_chunk_count,
+            chunk_size: heapcreate.chunk_size,
+            max_chunks: heapcreate.max_chunks,
+            target_in_flight: heapcreate.target_in_flight,
+        };
+
+        let pool = self.get_or_create_pool(ddev, reg_data, vm_id, vm)?;
+        let created_context = pool.create_heap_context(ddev, reg_data, args)?;
+
+        heapcreate.handle = heapcreate.vm_id << 16 | created_context.context_id as u32;
+        heapcreate.tiler_heap_ctx_gpu_va = created_context.context_gpu_va;
+        heapcreate.first_heap_chunk_gpu_va = created_context.first_chunk_gpu_va;
+
         Ok(())
     }
 }
