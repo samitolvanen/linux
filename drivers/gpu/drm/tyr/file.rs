@@ -441,23 +441,7 @@ impl TyrDrmFileData {
         groupgetstate: &mut uapi::drm_panthor_group_get_state,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if groupgetstate.pad != 0 {
-            return Err(EINVAL);
-        }
-
-        let group = file
-            .inner()
-            .group_pool()
-            .group(groupgetstate.group_handle as usize)
-            .ok_or(EINVAL)?;
-
-        groupgetstate.state = 0;
-        groupgetstate.fatal_queues = group.fatal_queues();
-
-        if groupgetstate.fatal_queues != 0 {
-            groupgetstate.state |=
-                uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
-        }
+        file.inner().group_pool().get_group_state(groupgetstate)?;
 
         Ok(0)
     }

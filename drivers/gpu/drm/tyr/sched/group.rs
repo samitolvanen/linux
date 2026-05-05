@@ -270,6 +270,27 @@ impl Pool {
         group.submit(syncs, queue_submits, file)
     }
 
+    pub(crate) fn get_group_state(
+        &self,
+        groupgetstate: &mut uapi::drm_panthor_group_get_state,
+    ) -> Result {
+        if groupgetstate.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let group = self.group(groupgetstate.group_handle as usize).ok_or(EINVAL)?;
+
+        groupgetstate.state = 0;
+        groupgetstate.fatal_queues = group.fatal_queues();
+
+        if groupgetstate.fatal_queues != 0 {
+            groupgetstate.state |=
+                uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn destroy_group(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 
