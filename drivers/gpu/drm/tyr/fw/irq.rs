@@ -78,8 +78,8 @@ impl JobIrqState {
         })
     }
 
-    pub(crate) fn event_wait(&self) -> &Wait {
-        &self.event_wait
+    pub(crate) fn event_wait_arc(&self) -> Arc<Wait> {
+        self.event_wait.clone()
     }
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.

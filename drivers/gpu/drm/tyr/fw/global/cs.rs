@@ -12,23 +12,20 @@ use kernel::{
         Io,
         Region, //
     },
-    prelude::*,
-    sync::Arc, //
+    prelude::*, //
 };
 
-use crate::fw::{
-    interfaces::{
-        FwInterface,
-        CS_CONTROL_BLOCK_SIZE,
-        CS_KERNEL_INPUT_BLOCK_SIZE,
-        CS_KERNEL_OUTPUT_BLOCK_SIZE,
-        STREAM_FEATURES,
-        STREAM_INPUT_VA,
-        STREAM_OUTPUT_VA, //
-    },
-    region::FwRegion,
-    Section, //
+use super::SharedSectionInfo;
+use crate::fw::interfaces::{
+    FwInterface,
+    CS_CONTROL_BLOCK_SIZE,
+    CS_KERNEL_INPUT_BLOCK_SIZE,
+    CS_KERNEL_OUTPUT_BLOCK_SIZE,
+    STREAM_FEATURES,
+    STREAM_INPUT_VA,
+    STREAM_OUTPUT_VA, //
 };
+use crate::fw::region::FwRegion;
 
 /// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
 const CS_CONTROL_OFFSET: usize = 0x40;
@@ -81,13 +78,13 @@ impl CsInterface {
     pub(super) fn enable(
         &mut self,
         dev: &Device,
-        shared_section: &Section,
+        shared_section: &SharedSectionInfo,
         csg_control_offset: usize,
         cs_idx: usize,
         cs_stride: usize,
     ) -> Result {
-        let vmap = Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?;
-        let va_range = shared_section.mem.va_range();
+        let vmap = &shared_section.vmap;
+        let va_range = &shared_section.va_range;
 
         // Calculate the runtime offset for this CS's control block.
         let cs_control_offset = CS_CONTROL_OFFSET + cs_idx * cs_stride;
@@ -97,13 +94,13 @@ impl CsInterface {
 
         // Create a bounded interface for this CS's control block at the calculated address.
         let cs_control =
-            FwInterface::<Region<CS_CONTROL_BLOCK_SIZE>>::new(dev, &vmap, va_range, cs_control_va)?;
+            FwInterface::<Region<CS_CONTROL_BLOCK_SIZE>>::new(dev, vmap, va_range, cs_control_va)?;
 
         // Read the input and output VAs from the CS control block.
         let input_va = cs_control.read(STREAM_INPUT_VA).value().get();
         let cs_input = FwInterface::<FwRegion<CS_KERNEL_INPUT_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             input_va.into(),
         )?;
@@ -111,7 +108,7 @@ impl CsInterface {
         let output_va = cs_control.read(STREAM_OUTPUT_VA).value().get();
         let cs_output = FwInterface::<FwRegion<CS_KERNEL_OUTPUT_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             output_va.into(),
         )?;
