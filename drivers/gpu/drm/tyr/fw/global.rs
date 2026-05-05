@@ -47,9 +47,11 @@ use kernel::{
 		register::Array,
 		Io,
 	},
+	new_mutex,
 	num::Bounded,
 	platform,
 	prelude::*,
+	sync::Mutex,
 	time::arch_timer_get_rate,
 };
 
@@ -137,18 +139,57 @@ struct EnabledGlobalInterface {
 	csg: KVec<CsgInterface>,
 }
 
-pub(crate) struct GlobalInterface {
+struct InnerGlobalInterface {
 	state: GlobalInterfaceState,
 }
 
+#[pin_data]
+pub(crate) struct GlobalInterface {
+	#[pin]
+	inner: Mutex<InnerGlobalInterface>,
+}
+
 impl GlobalInterface {
-	pub(crate) fn new() -> Result<Self> {
-		Ok(Self {
-			state: GlobalInterfaceState::Disabled,
+	pub(crate) fn new() -> impl PinInit<Self, Error> {
+		let inner = InnerGlobalInterface::new();
+
+		try_pin_init!(Self {
+			inner <- new_mutex!(inner),
 		})
 	}
 
 	pub(crate) fn enable(
+		&self,
+		pdev: &platform::Device,
+		iomem: &Devres<IoMem>,
+		shared_section: &Section,
+		gpu_info: &GpuInfo,
+		core_clk: &Clk,
+		event_wait: &Wait,
+	) -> Result {
+		let mut inner = self.inner.lock();
+		inner.enable(pdev, iomem, shared_section, gpu_info, core_clk, event_wait)
+	}
+
+	pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+		let inner = self.inner.lock();
+		inner.csif_info_counts()
+	}
+
+	pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+		let inner = self.inner.lock();
+		inner.group_suspend_buf_sizes()
+	}
+}
+
+impl InnerGlobalInterface {
+	fn new() -> Self {
+		Self {
+			state: GlobalInterfaceState::Disabled,
+		}
+	}
+
+	fn enable(
 		&mut self,
 		pdev: &platform::Device,
 		iomem: &Devres<IoMem>,
@@ -347,7 +388,7 @@ impl GlobalInterface {
 		Ok(enabled.csg_num as u32)
 	}
 
-	pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+	fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
 		let csg = self.csg(0).ok_or(EINVAL)?;
 		let cs = csg.cs(0).ok_or(EINVAL)?;
 
@@ -359,7 +400,7 @@ impl GlobalInterface {
 		))
 	}
 
-	pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+	fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
 		let csg = self.csg(0).ok_or(EINVAL)?;
 
 		csg.suspend_buf_sizes()
