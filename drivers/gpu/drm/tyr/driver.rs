@@ -60,7 +60,13 @@ use crate::{
     gpu,
     gpu::GpuInfo,
     mmap,
-    mmu::Mmu,
+    mmu::{
+        irq::{
+            mmu_irq_init,
+            MmuIrq, //
+        },
+        Mmu, //
+    },
     regs::gpu_control::*,
     sched::{
         Scheduler,
@@ -126,6 +132,10 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
     /// stops.
     _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>>>,
+
+    /// MMU IRQ registration. Freed after `mmu`, so faults raised during teardown are still
+    /// reported.
+    _mmu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>>>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -225,6 +235,14 @@ impl platform::Driver for TyrPlatformDriver {
             &gpu_info,
         )?;
 
+        // SAFETY: The registration is owned by `mmu_irq` and then by
+        // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
+        // is never forgotten.
+        let mmu_irq = KBox::pin_init(
+            unsafe { mmu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
+            GFP_KERNEL,
+        )?;
+
         // SAFETY: The registration is owned by `job_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
         // is never forgotten.
@@ -257,6 +275,7 @@ impl platform::Driver for TyrPlatformDriver {
                 mmu,
                 fw: firmware,
                 _job_irq: job_irq,
+                _mmu_irq: mmu_irq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
@@ -362,7 +381,7 @@ pub(crate) trait TyrIrqTrait: Sync {
     fn read_raw_status(&self, io: &IoMem<'_>) -> u32;
     fn clear_status(&self, io: &IoMem<'_>, status: u32);
     fn mask(&self) -> u32;
-    fn handle(&self, tdev: &TyrDrmDevice, status: u32);
+    fn handle(&self, tdev: &TyrDrmDevice, io: &IoMem<'_>, status: u32);
 }
 
 #[pin_data]
@@ -431,7 +450,7 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
                 break;
             }
             self.irq.clear_status(io, raw_status);
-            self.irq.handle(&self.tdev, raw_status);
+            self.irq.handle(&self.tdev, io, raw_status);
             ret = IrqReturn::Handled;
         }
 
