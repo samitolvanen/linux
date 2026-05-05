@@ -50,6 +50,7 @@ use crate::{
 
 const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
 
+#[derive(Clone)]
 pub(crate) struct JobIrqState {
     event_wait: Arc<Wait>,
     boot_wait: Arc<Wait>,
@@ -91,12 +92,14 @@ impl JobIrqState {
 
 pub(crate) struct JobIrq {
     iomem: Arc<Devres<IoMem>>,
+    state: JobIrqState,
 }
 
 pub(crate) fn job_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
     iomem: Arc<Devres<IoMem>>,
+    state: JobIrqState,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<JobIrq>>, Error> + 'a> {
     let io = iomem.access(pdev.as_ref())?;
     io.write_reg(
@@ -104,7 +107,10 @@ pub(crate) fn job_irq_init<'a>(
             .with_const_csg::<CSG_IRQ_MASK>()
             .with_glb(true),
     );
-    let job_irq = JobIrq { iomem: iomem.clone() };
+    let job_irq = JobIrq {
+        iomem: iomem.clone(),
+        state,
+    };
 
     TyrIrq::request(pdev, tdev, c_str!("job"), job_irq)
 }
@@ -154,6 +160,7 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
-        tdev.fw.handle_irq(status);
+        let _ = tdev;
+        self.state.handle(status);
     }
 }

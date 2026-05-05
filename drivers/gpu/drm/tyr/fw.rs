@@ -263,8 +263,8 @@ impl Firmware {
         self.irq_state.wait_ready(timeout_ms)
     }
 
-    pub(crate) fn handle_irq(&self, status: u32) {
-        self.irq_state.handle(status)
+    pub(crate) fn irq_state(&self) -> irq::JobIrqState {
+        self.irq_state.clone()
     }
 
     /// Enable the global interface.

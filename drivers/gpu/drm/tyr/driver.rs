@@ -239,6 +239,7 @@ impl platform::Driver for TyrPlatformDriverData {
             tdev.clone(),
             pdev,
             tdev.iomem.clone(),
+            tdev.fw.irq_state(),
         )?;
         devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
 
