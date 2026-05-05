@@ -369,12 +369,7 @@ impl TyrDrmFileData {
         groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        let handle = file
-            .inner()
-            .group_pool()
-            .create_group(ddev, groupcreate, file)?;
-
-        groupcreate.group_handle = handle as u32;
+        file.inner().group_pool().create_group(ddev, groupcreate, file)?;
 
         Ok(0)
     }
