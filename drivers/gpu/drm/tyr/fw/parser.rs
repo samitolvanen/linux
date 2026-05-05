@@ -18,21 +18,80 @@ use core::{
 use kernel::{
     bits::bit_u32,
     device::Device,
+    num::Bounded,
     prelude::*,
+    register,
     sizes::SZ_4K, //
 };
 
 use crate::{
-    fw::{
-        CacheMode,
-        SectionFlags,
-        CSF_MCU_SHARED_REGION_START, //
-    },
+    driver::TyrRegisters,
+    fw::CSF_MCU_SHARED_REGION_START,
     vm::{
         VmFlag,
         VmMapFlags, //
     }, //
 };
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum CacheMode {
+    None = 0,
+    Cached = 1,
+    UncachedCoherent = 2,
+    CachedCoherent = 3,
+}
+
+impl From<Bounded<u32, 2>> for CacheMode {
+    fn from(value: Bounded<u32, 2>) -> Self {
+        match value.get() {
+            0 => Self::None,
+            1 => Self::Cached,
+            2 => Self::UncachedCoherent,
+            3 => Self::CachedCoherent,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl From<CacheMode> for Bounded<u32, 2> {
+    fn from(value: CacheMode) -> Self {
+        Bounded::try_new(value as u32).unwrap()
+    }
+}
+
+register! {
+    base: TyrRegisters;
+
+     #[allow(non_upper_case_globals)]
+    SectionFlags(u32) @ 0x0 {
+        0:0 read => bool;
+        1:1 write => bool;
+        2:2 exec => bool;
+        4:3 cache_mode => CacheMode;
+        5:5 prot => bool;
+        30:30 shared => bool;
+        31:31 zero => bool;
+    }
+}
+
+impl SectionFlags {
+    const VALID_MASK: u32 = Self::READ_MASK
+        | Self::WRITE_MASK
+        | Self::EXEC_MASK
+        | Self::CACHE_MODE_MASK
+        | Self::PROT_MASK
+        | Self::SHARED_MASK
+        | Self::ZERO_MASK;
+
+    fn try_from_fw(value: u32) -> Result<Self> {
+        if value & !Self::VALID_MASK != 0 {
+            Err(EINVAL)
+        } else {
+            Ok(Self::from_raw(value))
+        }
+    }
+}
 
 /// A parsed firmware section ready for loading into MCU memory.
 ///

@@ -29,10 +29,8 @@ use kernel::{
         Io, //
     },
     new_mutex,
-    num::Bounded,
     platform,
     prelude::*,
-    register,
     sizes::{
         SZ_2M,
         SZ_8K, //
@@ -53,8 +51,7 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice,
-        TyrRegisters, //
+        TyrDrmDevice, //
     },
     fw::{
         global::GlobalInterface,
@@ -108,66 +105,6 @@ const MAX_CS: usize = 16;
 /// the CPU driver and MCU firmware, including the GLB_CONTROL_BLOCK at this base address.
 /// The firmware binary contains a section marked to be loaded at this address.
 pub(super) const CSF_MCU_SHARED_REGION_START: u32 = 0x04000000;
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(super) enum CacheMode {
-    None = 0,
-    Cached = 1,
-    UncachedCoherent = 2,
-    CachedCoherent = 3,
-}
-
-impl From<Bounded<u32, 2>> for CacheMode {
-    fn from(value: Bounded<u32, 2>) -> Self {
-        match value.get() {
-            0 => Self::None,
-            1 => Self::Cached,
-            2 => Self::UncachedCoherent,
-            3 => Self::CachedCoherent,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<CacheMode> for Bounded<u32, 2> {
-    fn from(value: CacheMode) -> Self {
-        Bounded::try_new(value as u32).unwrap()
-    }
-}
-
-register! {
-    base: TyrRegisters;
-
-     #[allow(non_upper_case_globals)]
-    pub(super) SectionFlags(u32) @ 0x0 {
-        0:0 read => bool;
-        1:1 write => bool;
-        2:2 exec => bool;
-        4:3 cache_mode => CacheMode;
-        5:5 prot => bool;
-        30:30 shared => bool;
-        31:31 zero => bool;
-    }
-}
-
-impl SectionFlags {
-    const VALID_MASK: u32 = Self::READ_MASK
-        | Self::WRITE_MASK
-        | Self::EXEC_MASK
-        | Self::CACHE_MODE_MASK
-        | Self::PROT_MASK
-        | Self::SHARED_MASK
-        | Self::ZERO_MASK;
-
-    fn try_from_fw(value: u32) -> Result<Self> {
-        if value & !Self::VALID_MASK != 0 {
-            Err(EINVAL)
-        } else {
-            Ok(Self::from_raw(value))
-        }
-    }
-}
 
 /// A parsed section of the firmware binary.
 pub(crate) struct Section {
