@@ -39,8 +39,8 @@ use crate::{
 /// Represents a single firmware section extracted from the firmware binary, containing
 /// all information needed to map the section's data into the MCU's virtual address space.
 pub(super) struct ParsedSection {
-    /// Byte offset range within the firmware binary where this section's data resides.
-    pub(super) data_range: Range<u32>,
+    /// Firmware bytes for this section, copied out of the source binary.
+    pub(super) data: KVec<u8>,
     /// MCU virtual address range where this section should be mapped.
     pub(super) va: Range<u32>,
     /// Memory protection and caching flags for the mapping.
@@ -231,6 +231,7 @@ impl<'a> FwParser<'a> {
     }
 
     fn parse_entry(&mut self, header_end: usize) -> Result<EntrySection> {
+        let fw_data = self.cursor.data;
         let entry_start = self.cursor.pos();
 
         let entry_header_end = entry_start
@@ -288,7 +289,7 @@ impl<'a> FwParser<'a> {
             match entry_section.entry_hdr.entry_type() {
                 Ok(EntryType::Iface) => Ok(EntrySection {
                     entry_hdr: entry_section.entry_hdr,
-                    inner: Self::parse_section_entry(&mut entry_cursor, firmware_size)?,
+                    inner: Self::parse_section_entry(&mut entry_cursor, fw_data, firmware_size)?,
                 }),
                 Ok(
                     EntryType::Config
@@ -320,8 +321,31 @@ impl<'a> FwParser<'a> {
         entry_section
     }
 
+    fn copy_section_data(
+        dev: &Device,
+        fw_data: &[u8],
+        data_range: &Range<u32>,
+    ) -> Result<KVec<u8>> {
+        let start = data_range.start as usize;
+        let end = data_range.end as usize;
+        let bytes = fw_data.get(start..end).ok_or_else(|| {
+            dev_err!(
+                dev,
+                "Firmware corrupted, section data range [0x{:x}..0x{:x}) is out of bounds",
+                data_range.start,
+                data_range.end,
+            );
+            EINVAL
+        })?;
+
+        let mut data = KVec::new();
+        data.extend_from_slice(bytes, GFP_KERNEL)?;
+        Ok(data)
+    }
+
     fn parse_section_entry(
         entry_cursor: &mut Cursor<'_>,
+        fw_data: &[u8],
         firmware_size: usize,
     ) -> Result<Option<ParsedSection>> {
         let section_hdr: SectionHeader = SectionHeader::new(entry_cursor)?;
@@ -396,8 +420,10 @@ impl<'a> FwParser<'a> {
             vm_map_flags |= VmFlag::Uncached;
         }
 
+        let data = Self::copy_section_data(entry_cursor.dev, fw_data, &section_hdr.data)?;
+
         Ok(Some(ParsedSection {
-            data_range: section_hdr.data.clone(),
+            data,
             va: section_hdr.va,
             vm_map_flags,
         }))
