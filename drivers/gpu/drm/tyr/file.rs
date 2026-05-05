@@ -215,11 +215,7 @@ impl TyrDrmFileData {
         vmdestroy: &mut uapi::drm_panthor_vm_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if vmdestroy.pad != 0 {
-            return Err(EINVAL);
-        }
-
-        file.inner().vm_pool().destroy_vm(vmdestroy.id as usize)?;
+        file.inner().vm_pool().destroy_vm(vmdestroy)?;
         Ok(0)
     }
 

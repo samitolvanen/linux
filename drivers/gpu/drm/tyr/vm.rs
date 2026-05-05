@@ -113,18 +113,26 @@ impl Pool {
         self.entries.get(index)
     }
 
-    pub(crate) fn destroy_vm(&self, index: usize) -> Result {
+    fn destroy_vm_index(&self, index: usize) -> Result {
         let vm = self.entries.remove(index)?;
 
         vm.kill();
         Ok(())
     }
 
+    pub(crate) fn destroy_vm(&self, vmdestroy: &uapi::drm_panthor_vm_destroy) -> Result {
+        if vmdestroy.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        self.destroy_vm_index(vmdestroy.id as usize)
+    }
+
     pub(crate) fn destroy_all(&self) -> Result {
         let max_index = self.entries.index_upper_bound();
 
         for index in 1..max_index {
-            let _ = self.destroy_vm(index);
+            let _ = self.destroy_vm_index(index);
         }
 
         Ok(())
