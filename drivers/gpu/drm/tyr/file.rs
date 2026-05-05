@@ -34,7 +34,10 @@ use crate::{
         join_u64,
         read_u64_no_tearing,
     },
-    sched::group,
+    sched::{
+        deps::SyncOp,
+        group,
+    },
     vm::{
         self,
         VmMapFlags,
@@ -465,9 +468,8 @@ impl TyrDrmFileData {
             .reader();
 
             for _ in 0..queue.0.syncs.count {
-                let sync: SyncOp = sync_reader.read()?;
-                sync.validate()?;
-                syncs.push(sync, GFP_KERNEL)?;
+                let sync: RawSyncOp = sync_reader.read()?;
+                syncs.push(sync.capture()?, GFP_KERNEL)?;
             }
 
             queue_submits.push(queue.capture()?, GFP_KERNEL)?;
@@ -714,32 +716,13 @@ impl QueueSubmit {
 }
 
 #[repr(transparent)]
-pub(crate) struct SyncOp(uapi::drm_panthor_sync_op);
+struct RawSyncOp(uapi::drm_panthor_sync_op);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
-unsafe impl FromBytes for SyncOp {}
+unsafe impl FromBytes for RawSyncOp {}
 
-impl SyncOp {
-    fn validate(&self) -> Result {
-        let valid_flags = (uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL
-            | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT
-            | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK)
-            as u32;
-
-        if self.0.flags & !valid_flags != 0 {
-            return Err(EINVAL);
-        }
-
-        let handle_type = self.0.flags
-            & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK as u32;
-
-        if handle_type != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ as u32
-            && handle_type
-                != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ as u32
-        {
-            return Err(EINVAL);
-        }
-
-        Ok(())
+impl RawSyncOp {
+    fn capture(self) -> Result<SyncOp> {
+        SyncOp::try_from(&self.0)
     }
 }

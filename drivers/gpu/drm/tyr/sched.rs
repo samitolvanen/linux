@@ -11,17 +11,18 @@ use crate::{
 	driver::TyrDrmDevice,
 	file::{
 		QueueSubmit,
-		SyncOp,
 		TyrDrmFile,
 	},
 };
 
+use deps::SyncOp;
 use group::Group;
 
 const GROUP_PRIORITY_COUNT: usize =
 	uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME as usize + 1;
 
 pub(crate) mod group;
+pub(crate) mod deps;
 pub(crate) mod queue;
 pub(crate) mod syncs;
 
