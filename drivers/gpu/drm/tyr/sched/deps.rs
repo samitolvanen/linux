@@ -6,100 +6,118 @@
 //! internal sync handle and operation vocabulary lives here instead of in the
 //! UAPI parsing layer.
 
-use kernel::{
-	prelude::*,
-	uapi,
-};
+use kernel::{drm::syncobj::SyncObj, prelude::*, uapi};
+
+use crate::{driver::TyrDrmDriver, file::TyrDrmFile};
 
 #[repr(i32)]
 pub(crate) enum SyncOpType {
-	Wait = kernel::uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT,
-	Signal = kernel::uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL,
+    Wait = kernel::uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT,
+    Signal = kernel::uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL,
 }
 
 pub(crate) enum SyncHandle {
-	Binary { handle: u32 },
-	Timeline { handle: u32, timeline_value: u64 },
+    Binary { handle: u32 },
+    Timeline { handle: u32, timeline_value: u64 },
 }
 
 impl SyncHandle {
-	pub(crate) fn handle(&self) -> u32 {
-		match self {
-			Self::Binary { handle } | Self::Timeline { handle, .. } => *handle,
-		}
-	}
+    pub(crate) fn handle(&self) -> u32 {
+        match self {
+            Self::Binary { handle } | Self::Timeline { handle, .. } => *handle,
+        }
+    }
 
-	pub(crate) fn timeline_value(&self) -> u64 {
-		match self {
-			Self::Binary { .. } => 0,
-			Self::Timeline { timeline_value, .. } => *timeline_value,
-		}
-	}
+    pub(crate) fn timeline_value(&self) -> u64 {
+        match self {
+            Self::Binary { .. } => 0,
+            Self::Timeline { timeline_value, .. } => *timeline_value,
+        }
+    }
 }
 
 pub(crate) struct SyncOp {
-	pub(crate) ty: SyncOpType,
-	pub(crate) handle: SyncHandle,
+    pub(crate) ty: SyncOpType,
+    pub(crate) handle: SyncHandle,
 }
 
 impl SyncOp {
-	pub(crate) fn is_signal(&self) -> bool {
-		matches!(self.ty, SyncOpType::Signal)
-	}
+    pub(crate) fn is_signal(&self) -> bool {
+        matches!(self.ty, SyncOpType::Signal)
+    }
 }
 
 impl TryFrom<&uapi::drm_panthor_sync_op> for SyncOp {
-	type Error = Error;
+    type Error = Error;
 
-	fn try_from(uapi_sync: &uapi::drm_panthor_sync_op) -> Result<Self> {
-		let valid_flags = (uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL
-			| uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT
-			| uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK)
-			as u32;
+    fn try_from(uapi_sync: &uapi::drm_panthor_sync_op) -> Result<Self> {
+        let valid_flags = (uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL
+            | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_WAIT
+            | uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK)
+            as u32;
 
-		if uapi_sync.flags & !valid_flags != 0 {
-			return Err(EINVAL);
-		}
+        if uapi_sync.flags & !valid_flags != 0 {
+            return Err(EINVAL);
+        }
 
-		let handle_type = uapi_sync.flags
-			& uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK as u32;
+        let handle_type = uapi_sync.flags
+            & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK as u32;
 
-		if handle_type
-			!= uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ as u32
-			&& handle_type
-				!= uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ
-					as u32
-		{
-			return Err(EINVAL);
-		}
+        if handle_type
+            != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ as u32
+            && handle_type
+                != uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ
+                    as u32
+        {
+            return Err(EINVAL);
+        }
 
-		let ty = if uapi_sync.flags
-			& uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL as u32
-			!= 0
-		{
-			SyncOpType::Signal
-		} else {
-			SyncOpType::Wait
-		};
+        let ty = if uapi_sync.flags
+            & uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_SIGNAL as u32
+            != 0
+        {
+            SyncOpType::Signal
+        } else {
+            SyncOpType::Wait
+        };
 
-		let handle = if handle_type
-			== uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ
-				as u32
-		{
-			SyncHandle::Timeline {
-				handle: uapi_sync.handle,
-				timeline_value: uapi_sync.timeline_value,
-			}
-		} else {
-			if uapi_sync.timeline_value != 0 {
-				return Err(EINVAL);
-			}
+        let handle = if handle_type
+            == uapi::drm_panthor_sync_op_flags_DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ
+                as u32
+        {
+            SyncHandle::Timeline {
+                handle: uapi_sync.handle,
+                timeline_value: uapi_sync.timeline_value,
+            }
+        } else {
+            if uapi_sync.timeline_value != 0 {
+                return Err(EINVAL);
+            }
 
-			SyncHandle::Binary {
-				handle: uapi_sync.handle,
-			}
-		};
+            SyncHandle::Binary {
+                handle: uapi_sync.handle,
+            }
+        };
 
-		Ok(Self { ty, handle })
-	}
+        Ok(Self { ty, handle })
+    }
+}
+
+pub(crate) fn wait_for_syncops(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result {
+    if syncops.iter().any(SyncOp::is_signal) {
+        return Err(ENOTSUPP);
+    }
+
+    for sync in syncops.iter() {
+        let fence = SyncObj::<TyrDrmDriver>::find_fence(
+            file,
+            sync.handle.handle(),
+            sync.handle.timeline_value(),
+            0,
+        )?
+        .ok_or(EINVAL)?;
+        fence.wait()?;
+    }
+
+    Ok(())
 }

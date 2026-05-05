@@ -154,8 +154,8 @@ impl Scheduler {
 		syncs: KVec<SyncOp>,
 		group: Arc<Group>,
 		queue_submits: KVec<QueueSubmit>,
-		_file: &TyrDrmFile,
+		file: &TyrDrmFile,
 	) -> Result {
-		group.submit(syncs, queue_submits)
+		group.submit(syncs, queue_submits, file)
 	}
 }

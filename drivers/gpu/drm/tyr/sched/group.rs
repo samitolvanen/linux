@@ -32,7 +32,10 @@ use crate::{
 };
 
 use super::{
-    deps::SyncOp,
+    deps::{
+        self,
+        SyncOp,
+    },
     queue::Queue,
     syncs,
 };
@@ -168,15 +171,18 @@ impl Group {
         self.queues.len()
     }
 
-    pub(super) fn submit(&self, syncs: KVec<SyncOp>, queue_submits: KVec<QueueSubmit>) -> Result {
+    pub(super) fn submit(
+        &self,
+        syncs: KVec<SyncOp>,
+        queue_submits: KVec<QueueSubmit>,
+        file: &TyrDrmFile,
+    ) -> Result {
         struct QueuedStream {
             queue_index: usize,
             stream: KVec<u8>,
         }
 
-        if !syncs.is_empty() {
-            return Err(ENOTSUPP);
-        }
+        deps::wait_for_syncops(file, &syncs)?;
 
         let mut queued_streams: KVec<QueuedStream> = KVec::new();
 
