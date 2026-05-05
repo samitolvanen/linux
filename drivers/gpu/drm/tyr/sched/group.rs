@@ -20,10 +20,7 @@ use crate::{
         TyrDrmDevice,
         TyrDrmRegistrationData, //
     },
-    file::{
-        QueueCreate,
-        TyrDrmFile, //
-    },
+    file::TyrDrmFile,
     gem,
     pool,
     vm::{
@@ -42,7 +39,10 @@ use super::{
         Job,
         QueueSubmit, //
     },
-    queue::Queue,
+    queue::{
+        Queue,
+        QueueCreate, //
+    },
     syncs, //
 };
 
