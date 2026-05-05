@@ -407,15 +407,7 @@ impl TyrDrmFileData {
         heapdestroy: &mut uapi::drm_panthor_tiler_heap_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if heapdestroy.pad != 0 {
-            return Err(EINVAL);
-        }
-
-        let vm_id = (heapdestroy.handle >> 16) as usize;
-        let heap_idx = (heapdestroy.handle & 0xffff) as usize;
-
-        let pool = file.inner().heap_pools().get_pool(vm_id).ok_or(EINVAL)?;
-        pool.destroy_heap_context(heap_idx)?;
+        file.inner().heap_pools().destroy_context(heapdestroy)?;
 
         Ok(0)
     }
