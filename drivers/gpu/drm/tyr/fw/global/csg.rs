@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: GPL-2.0 or MIT
+
+//! Command stream group interface implementation.
+//!
+//! This module owns the runtime CSG interface state discovered through the
+//! firmware global interface. It keeps the CSG-to-CS discovery and suspend-size
+//! queries out of the older monolithic interfaces file.
+
+use kernel::{
+    device::Device,
+    io::{
+        Io,
+        Region, //
+    },
+    prelude::*,
+    sync::Arc, //
+};
+
+use super::cs::CsInterface;
+use crate::fw::{
+    interfaces::{
+        FwInterface,
+        CSG_CONTROL_BLOCK_SIZE,
+        CSG_INPUT_BLOCK_SIZE,
+        CSG_OUTPUT_BLOCK_SIZE,
+        CS_CONTROL_BLOCK_SIZE,
+        GROUP_INPUT_VA,
+        GROUP_OUTPUT_VA,
+        GROUP_PROTM_SUSPEND_SIZE,
+        GROUP_STREAM_NUM,
+        GROUP_STREAM_STRIDE,
+        GROUP_SUSPEND_SIZE, //
+    },
+    region::FwRegion,
+    Section,
+    MAX_CS, //
+};
+
+/// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
+const CSG_GROUP_CONTROL_OFFSET: usize = 0x1000;
+
+/// State of a CSG interface.
+enum CsgInterfaceState {
+    /// Interface is not yet initialized.
+    Disabled,
+    /// Interface is initialized and operational.
+    Enabled(EnabledCsgInterface),
+}
+
+/// When enabled, a CSG Interface has control, input, and output system memory interfaces.
+struct EnabledCsgInterface {
+    /// Control block interface - provides CSG capabilities and configuration.
+    csg_control: FwInterface<Region<CSG_CONTROL_BLOCK_SIZE>>,
+    /// Input block interface - driver writes CSG requests here.
+    #[expect(dead_code)]
+    csg_input: FwInterface<FwRegion<CSG_INPUT_BLOCK_SIZE>>,
+    /// Output block interface - firmware writes CSG acknowledgements here.
+    #[expect(dead_code)]
+    csg_output: FwInterface<Region<CSG_OUTPUT_BLOCK_SIZE>>,
+    /// Runtime stride between CS control blocks (read from GROUP_STREAM_STRIDE).
+    cs_stride: usize,
+    /// Number of CS interfaces reported by hardware for this CSG.
+    cs_num: usize,
+    /// Discovered CS interfaces.
+    cs: KVec<CsInterface>,
+}
+
+/// Command Stream Group Interface
+///
+/// The CSG interface controls operations for a specific CSG.
+pub(in super::super) struct CsgInterface {
+    /// Current interface state (Disabled or Enabled).
+    state: CsgInterfaceState,
+    /// CSG identifier/index number.
+    #[expect(dead_code)]
+    csg_idx: usize,
+}
+
+impl CsgInterface {
+    /// Creates a new disabled CSG interface.
+    pub(in super::super) fn new(csg_idx: usize) -> Result<Self> {
+        Ok(Self {
+            state: CsgInterfaceState::Disabled,
+            csg_idx,
+        })
+    }
+
+    /// Enables the CSG interface.
+    ///
+    /// This calculates the runtime offset of this CSG's control block and creates
+    /// a bounded interface to access it. It then reads the input/output interface
+    /// addresses from the CSG control block.
+    pub(in super::super) fn enable(
+        &mut self,
+        dev: &Device,
+        shared_section: &Section,
+        csg_idx: usize,
+        csg_stride: usize,
+    ) -> Result {
+        let vmap = Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?;
+        let va_range = shared_section.mem.va_range();
+
+        // Calculate the runtime offset for this CSG's control block.
+        // The CSG control blocks start at CSG_GROUP_CONTROL_OFFSET from the GLB control block,
+        // with each CSG spaced by csg_stride bytes.
+        let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
+
+        // The CSG control block's MCU virtual address is relative to the shared section start.
+        let csg_control_va = va_range.start + csg_control_offset as u64;
+
+        // Create a bounded interface for this CSG's control block at the calculated address.
+        let csg_control = FwInterface::<Region<CSG_CONTROL_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            csg_control_va,
+        )?;
+
+        // Read the input and output VAs from the CSG control block.
+        let input_va = csg_control.read(GROUP_INPUT_VA).value().get();
+        let csg_input = FwInterface::<FwRegion<CSG_INPUT_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            input_va.into(),
+        )?;
+
+        let output_va = csg_control.read(GROUP_OUTPUT_VA).value().get();
+        let csg_output = FwInterface::<Region<CSG_OUTPUT_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            output_va.into(),
+        )?;
+
+        // Read the runtime stride between CS control blocks.
+        let cs_stride = csg_control.read(GROUP_STREAM_STRIDE).value().get() as usize;
+
+        if cs_stride < CS_CONTROL_BLOCK_SIZE {
+            dev_err!(
+                dev,
+                "CS stride {} is smaller than control block size {}",
+                cs_stride,
+                CS_CONTROL_BLOCK_SIZE
+            );
+            return Err(EINVAL);
+        }
+
+        // Read how many CS interfaces exist for this CSG.
+        let cs_num = csg_control.read(GROUP_STREAM_NUM).value().get();
+
+        // Validate that the hardware doesn't report more CS than we support.
+        if cs_num as usize > MAX_CS {
+            dev_err!(
+                dev,
+                "Too many CS: hardware reports {}, max supported {}",
+                cs_num,
+                MAX_CS
+            );
+            return Err(EINVAL);
+        }
+
+        let enabled = EnabledCsgInterface {
+            csg_control,
+            csg_input,
+            csg_output,
+            cs_stride,
+            cs_num: cs_num as usize,
+            cs: KVec::with_capacity(cs_num as usize, GFP_KERNEL)?,
+        };
+
+        self.state = CsgInterfaceState::Enabled(enabled);
+        self.init_cs(dev, shared_section, csg_control_offset)?;
+        Ok(())
+    }
+
+    /// Initialize and discover CS interfaces.
+    ///
+    /// This uses the previously read CS count to create and enable each CS interface.
+    fn init_cs(
+        &mut self,
+        dev: &Device,
+        shared_section: &Section,
+        csg_control_offset: usize,
+    ) -> Result {
+        let enabled = match &mut self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        for cs_idx in 0..enabled.cs_num {
+            // Create and enable the CS interface.
+            let mut cs = CsInterface::new(cs_idx)?;
+            cs.enable(
+                dev,
+                shared_section,
+                csg_control_offset,
+                cs_idx,
+                enabled.cs_stride,
+            )?;
+
+            enabled.cs.push(cs, GFP_KERNEL)?;
+        }
+
+        Ok(())
+    }
+
+    pub(in super::super) fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let suspend_size = enabled.csg_control.read(GROUP_SUSPEND_SIZE).value().get();
+        let protm_suspend_size = enabled
+            .csg_control
+            .read(GROUP_PROTM_SUSPEND_SIZE)
+            .value()
+            .get();
+
+        Ok((suspend_size, protm_suspend_size))
+    }
+
+    pub(in super::super) fn cs(&self, index: usize) -> Option<&CsInterface> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return None,
+        };
+
+        enabled.cs.get(index)
+    }
+
+    pub(in super::super) fn cs_slot_count(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_num as u32)
+    }
+}
