@@ -30,7 +30,9 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice,
+        TyrDrmDevice, //
+    },
+    irq::{
         TyrIrq,
         TyrIrqTrait, //
     },
