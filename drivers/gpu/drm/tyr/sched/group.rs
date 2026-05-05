@@ -232,9 +232,9 @@ impl Pool {
         &self,
         ddev: &TyrDrmDevice,
         reg_data: &TyrDrmRegistrationData<'_>,
-        groupcreate: &uapi::drm_panthor_group_create,
+        groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
-    ) -> Result<usize> {
+    ) -> Result {
         if groupcreate.queues.count == 0 {
             return Err(EINVAL);
         }
@@ -263,7 +263,8 @@ impl Pool {
 
         ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
 
-        self.0.insert(group)
+        groupcreate.group_handle = self.0.insert(group)? as u32;
+        Ok(())
     }
 
     pub(crate) fn group(&self, index: usize) -> Option<Arc<Group>> {
