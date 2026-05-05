@@ -35,7 +35,9 @@ use crate::{
         read_u64_no_tearing,
     },
     sched::{
-        deps::SyncOp,
+        deps::{
+            self,
+        },
         group,
         job::QueueSubmit,
     },
@@ -462,16 +464,12 @@ impl TyrDrmFileData {
             let queue: RawQueueSubmit = reader.read()?;
             queue.validate(group.queue_count())?;
 
-            let mut sync_reader = UserSlice::new(
-                UserPtr::from_addr(queue.0.syncs.array as usize),
-                queue.0.syncs.stride as usize * queue.0.syncs.count as usize,
-            )
-            .reader();
-
-            for _ in 0..queue.0.syncs.count {
-                let sync: RawSyncOp = sync_reader.read()?;
-                syncs.push(sync.capture()?, GFP_KERNEL)?;
-            }
+            deps::append_syncops(
+                &mut syncs,
+                queue.0.syncs.array,
+                queue.0.syncs.count,
+                queue.0.syncs.stride,
+            )?;
 
             queue_submits.push(queue.capture()?, GFP_KERNEL)?;
         }
@@ -675,26 +673,10 @@ impl RawQueueSubmit {
             return Err(EINVAL);
         }
 
-        if self.0.syncs.stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
-            return Err(ENOTSUPP);
-        }
-
         Ok(())
     }
 
     fn capture(self) -> Result<QueueSubmit> {
         QueueSubmit::from_uapi(&self.0)
-    }
-}
-
-#[repr(transparent)]
-struct RawSyncOp(uapi::drm_panthor_sync_op);
-
-// SAFETY: this struct is safe to be transmuted from a byte slice.
-unsafe impl FromBytes for RawSyncOp {}
-
-impl RawSyncOp {
-    fn capture(self) -> Result<SyncOp> {
-        SyncOp::try_from(&self.0)
     }
 }
