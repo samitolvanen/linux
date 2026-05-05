@@ -14,10 +14,12 @@ use kernel::{
         aref::ARef,
         Arc,
     },
-    transmute::AsBytes,
-    transmute::FromBytes,
+    transmute::{
+        AsBytes,
+        FromBytes,
+    },
     uaccess::UserSlice,
-    uapi, //
+    uapi,
     xarray,
     xarray::XArray,
 };
@@ -35,11 +37,8 @@ use crate::{
         read_u64_no_tearing,
     },
     sched::{
-        deps::{
-            self,
-        },
         group,
-        job::QueueSubmit,
+        job,
     },
     vm::{
         self,
@@ -439,40 +438,23 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
-        if groupsubmit.queue_submits.stride as usize
-            != core::mem::size_of::<uapi::drm_panthor_queue_submit>()
-        {
-            return Err(ENOTSUPP);
-        }
-
         let group = file
             .inner()
             .group_pool()
             .group(groupsubmit.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        let mut reader = UserSlice::new(
-            UserPtr::from_addr(groupsubmit.queue_submits.array as usize),
-            groupsubmit.queue_submits.stride as usize * groupsubmit.queue_submits.count as usize,
-        )
-        .reader();
-
         let mut queue_submits = KVec::new();
         let mut syncs = KVec::new();
 
-        for _ in 0..groupsubmit.queue_submits.count {
-            let queue: RawQueueSubmit = reader.read()?;
-            queue.validate(group.queue_count())?;
-
-            deps::append_syncops(
-                &mut syncs,
-                queue.0.syncs.array,
-                queue.0.syncs.count,
-                queue.0.syncs.stride,
-            )?;
-
-            queue_submits.push(queue.capture()?, GFP_KERNEL)?;
-        }
+        job::append_queue_submits(
+            &mut syncs,
+            &mut queue_submits,
+            groupsubmit.queue_submits.array,
+            groupsubmit.queue_submits.count,
+            groupsubmit.queue_submits.stride,
+            group.queue_count(),
+        )?;
 
         ddev.with_locked_scheduler(|sched| {
             sched.bind(ddev, group.clone())?;
@@ -649,34 +631,3 @@ impl QueueCreate {
     }
 }
 
-#[repr(transparent)]
-struct RawQueueSubmit(uapi::drm_panthor_queue_submit);
-
-// SAFETY: this struct is safe to be transmuted from a byte slice.
-unsafe impl FromBytes for RawQueueSubmit {}
-
-impl RawQueueSubmit {
-    fn validate(&self, queue_count: usize) -> Result {
-        if self.0.queue_index as usize >= queue_count {
-            return Err(EINVAL);
-        }
-
-        if self.0.pad != 0 {
-            return Err(EINVAL);
-        }
-
-        if (self.0.stream_size == 0) != (self.0.stream_addr == 0) {
-            return Err(EINVAL);
-        }
-
-        if self.0.stream_addr & 63 != 0 || self.0.stream_size & 7 != 0 {
-            return Err(EINVAL);
-        }
-
-        Ok(())
-    }
-
-    fn capture(self) -> Result<QueueSubmit> {
-        QueueSubmit::from_uapi(&self.0)
-    }
-}

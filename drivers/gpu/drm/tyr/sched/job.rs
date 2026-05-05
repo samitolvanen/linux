@@ -9,14 +9,26 @@
 use kernel::{
     alloc::KVec,
     prelude::*,
+    transmute::FromBytes,
     uaccess::UserSlice,
     uapi,
 };
 
 use super::{
+    deps::{
+        self,
+        SyncOp,
+    },
     group::Group,
     syncs,
 };
+
+#[repr(transparent)]
+struct RawQueueSubmit(uapi::drm_panthor_queue_submit);
+
+// SAFETY: This wrapper is layout-identical to the UAPI queue-submit record
+// read from userspace.
+unsafe impl FromBytes for RawQueueSubmit {}
 
 pub(crate) struct QueueSubmit {
     queue_index: usize,
@@ -50,6 +62,63 @@ impl QueueSubmit {
     pub(crate) fn into_stream(self) -> KVec<u8> {
         self.stream
     }
+}
+
+impl RawQueueSubmit {
+    fn validate(&self, queue_count: usize) -> Result {
+        if self.0.queue_index as usize >= queue_count {
+            return Err(EINVAL);
+        }
+
+        if self.0.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        if (self.0.stream_size == 0) != (self.0.stream_addr == 0) {
+            return Err(EINVAL);
+        }
+
+        if self.0.stream_addr & 63 != 0 || self.0.stream_size & 7 != 0 {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+
+    fn capture(self) -> Result<QueueSubmit> {
+        QueueSubmit::from_uapi(&self.0)
+    }
+}
+
+pub(crate) fn append_queue_submits(
+    syncs: &mut KVec<SyncOp>,
+    queue_submits: &mut KVec<QueueSubmit>,
+    array: u64,
+    count: u32,
+    stride: u32,
+    queue_count: usize,
+) -> Result {
+    if stride as usize != core::mem::size_of::<uapi::drm_panthor_queue_submit>() {
+        return Err(ENOTSUPP);
+    }
+
+    let mut reader =
+        UserSlice::new(UserPtr::from_addr(array as usize), stride as usize * count as usize)
+            .reader();
+
+    for _ in 0..count {
+        let queue: RawQueueSubmit = reader.read()?;
+        queue.validate(queue_count)?;
+        deps::append_syncops(
+            syncs,
+            queue.0.syncs.array,
+            queue.0.syncs.count,
+            queue.0.syncs.stride,
+        )?;
+        queue_submits.push(queue.capture()?, GFP_KERNEL)?;
+    }
+
+    Ok(())
 }
 
 pub(crate) struct Job {
