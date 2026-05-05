@@ -252,9 +252,7 @@ impl platform::Driver for TyrPlatformDriver {
                     pdev,
                     ARef::from(&*unreg_dev),
                     iomem.clone(),
-                    firmware.fw_ready.clone(),
-                    firmware.event_wait.clone(),
-                    firmware.boot_wait.clone(),
+                    firmware.irq_state(),
                 )
             }?,
             GFP_KERNEL,

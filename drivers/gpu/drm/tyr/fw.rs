@@ -28,7 +28,6 @@ use kernel::{
         poll,
         Io, //
     },
-    new_mutex,
     platform,
     prelude::*,
     sizes::{
@@ -37,10 +36,6 @@ use kernel::{
     },
     str::CString,
     sync::{
-        atomic::{
-            Acquire,
-            Atomic, //
-        },
         Arc,
         ArcBorrow, //
     },
@@ -67,7 +62,6 @@ use crate::{
     gpu::GpuInfo,
 
     mmu::Mmu,
-    new_wait,
     regs::gpu_control::{
         McuControlMode,
         McuStatus,
@@ -79,10 +73,6 @@ use crate::{
         Vm,
         VmFlag,
         VmMapFlags, //
-    },
-    wait::{
-        Wait,
-        WaitResult, //
     }, //
 };
 
@@ -131,14 +121,8 @@ pub(crate) struct Firmware<'drm> {
     /// List of firmware sections.
     sections: KVec<Section>,
 
-    /// A condvar representing a wait on a firmware event.
-    pub(crate) event_wait: Arc<Wait>,
-
-    /// A condvar representing a wait for MCU boot readiness.
-    pub(crate) boot_wait: Arc<Wait>,
-
-    /// Latched to `true` by the IRQ handler when the firmware signals readiness via the GLB bit.
-    pub(crate) fw_ready: Arc<Atomic<bool>>,
+    /// Firmware IRQ state, including readiness and event wait objects.
+    irq_state: irq::JobIrqState,
 
     /// The global FW interface.
     global_iface: Pin<KBox<GlobalInterface>>,
@@ -240,9 +224,7 @@ impl<'drm> Firmware<'drm> {
                 iomem,
                 vm: vm.clone(),
                 sections,
-                event_wait: new_wait!()?,
-                boot_wait: new_wait!()?,
-                fw_ready: Arc::new(Atomic::new(false), GFP_KERNEL)?,
+                irq_state: irq::JobIrqState::new()?,
                 global_iface: KBox::pin_init(GlobalInterface::new(), GFP_KERNEL)?,
             })
         })();
@@ -305,13 +287,11 @@ impl<'drm> Firmware<'drm> {
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
-        self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
-            if self.fw_ready.load(Acquire) {
-                Ok(WaitResult::Done)
-            } else {
-                Ok(WaitResult::Retry)
-            }
-        })
+        self.irq_state.wait_ready(timeout_ms)
+    }
+
+    pub(crate) fn irq_state(&self) -> irq::JobIrqState {
+        self.irq_state.clone()
     }
 
     /// Enable the global interface.
@@ -328,7 +308,7 @@ impl<'drm> Firmware<'drm> {
             shared_section,
             gpu_info,
             core_clk,
-            &self.event_wait,
+            self.irq_state.event_wait(),
         )
     }
 
