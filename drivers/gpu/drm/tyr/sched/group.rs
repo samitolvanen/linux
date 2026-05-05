@@ -22,7 +22,6 @@ use crate::{
     file::{
         QueueCreate,
         QueueSubmit,
-        SyncOp,
         TyrDrmFile, //
     },
     gem,
@@ -35,6 +34,7 @@ use crate::{
 };
 
 use super::{
+    deps::SyncOp,
     queue::Queue,
     syncs, //
 };
