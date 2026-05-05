@@ -16,6 +16,10 @@ use kernel::{
         Flags as AllocFlags, //
     },
     bindings,
+    dma_buf::{
+        dma_fence::PublicDmaFence,
+        DmaResvUsage, //
+    },
     drm,
     drm::exec::{
         ExecCtx,
@@ -225,6 +229,30 @@ impl<T: DriverGpuVm> GpuVm<T> {
         Ok(GpuVmBoAlloc::new(self, obj, data)?.obtain())
     }
 
+    /// Prepare this GPUVM.
+    ///
+    /// The parameter indicates how many fences to preallocate space for.
+    #[inline]
+    pub fn prepare(&self, num_fences: u32) -> impl PinInit<GpuVmExec<'_, T>, Error> {
+        try_pin_init!(GpuVmExec {
+            exec <- Opaque::try_ffi_init(|exec: *mut bindings::drm_gpuvm_exec| {
+                // SAFETY: exec is valid but unused memory, so we can write.
+                unsafe {
+                    ptr::write_bytes(exec, 0u8, 1usize);
+                    ptr::write(&raw mut (*exec).vm, self.as_raw());
+                    ptr::write(&raw mut (*exec).flags, bindings::DRM_EXEC_INTERRUPTIBLE_WAIT);
+                    ptr::write(&raw mut (*exec).num_fences, num_fences);
+                }
+
+                // SAFETY: If successful, this `struct drm_gpuvm_exec` remains valid until this is
+                // unlocked because it's pinned and unlocks it in drop. The contained pointer to
+                // `self` remains valid because `GpuVmExec` borrows from `self`.
+                to_result(unsafe { bindings::drm_gpuvm_exec_lock(exec) })
+            }),
+            _gpuvm: PhantomData,
+        })
+    }
+
     /// Locks this GPUVM's own reservation in the [`ExecCtx`] round `ctx` and
     /// reserves `num_fences` slots on it, issuing the [`Prepared`] receipt for
     /// it.
@@ -431,5 +459,51 @@ impl<T: DriverGpuVm> Deref for UniqueRefGpuVm<T> {
     #[inline]
     fn deref(&self) -> &GpuVm<T> {
         &self.0
+    }
+}
+
+/// The exec token for preparing the objects.
+///
+/// # Invariants
+///
+/// Owns a GPUVM exec context.
+#[pin_data(PinnedDrop)]
+pub struct GpuVmExec<'vm, T: DriverGpuVm> {
+    #[pin]
+    exec: Opaque<bindings::drm_gpuvm_exec>,
+    _gpuvm: PhantomData<&'vm mut GpuVm<T>>,
+}
+
+impl<'vm, T: DriverGpuVm> GpuVmExec<'vm, T> {
+    /// Add a fence.
+    ///
+    /// The caller must ensure that the preallocated space for fences is sufficient.
+    #[inline]
+    pub fn resv_add_fence(
+        &self,
+        fence: &PublicDmaFence,
+        private_usage: DmaResvUsage,
+        extobj_usage: DmaResvUsage,
+    ) {
+        // SAFETY: This method takes a refcount on the fence, so it's only required to be valid for
+        // the duration of this method. If there is not enough space for the pre-allocated fence,
+        // then this leads to a BUG_ON() but does not trigger UB.
+        unsafe {
+            bindings::drm_gpuvm_resv_add_fence(
+                (*self.exec.get()).vm,
+                &raw mut (*self.exec.get()).exec,
+                fence.raw(),
+                private_usage as u32,
+                extobj_usage as u32,
+            )
+        }
+    }
+}
+
+#[pinned_drop]
+impl<'vm, T: DriverGpuVm> PinnedDrop for GpuVmExec<'vm, T> {
+    fn drop(self: Pin<&mut Self>) {
+        // SAFETY: We hold the lock, so it's safe to unlock.
+        unsafe { bindings::drm_gpuvm_exec_unlock(self.exec.get()) };
     }
 }
