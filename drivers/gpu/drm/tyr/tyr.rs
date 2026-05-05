@@ -13,6 +13,7 @@ mod fw;
 mod gem;
 mod gpu;
 mod heap;
+mod irq;
 mod mmap;
 mod mmu;
 mod pool;

@@ -31,9 +31,11 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice,
+        TyrDrmDevice, //
+    },
+    irq::{
         TyrIrq,
-        TyrIrqTrait, //
+        TyrIrqTrait,
     },
     regs::job_control::{
         JOB_IRQ_CLEAR,

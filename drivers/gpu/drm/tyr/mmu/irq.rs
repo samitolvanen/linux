@@ -27,6 +27,8 @@ use crate::{
     driver::{
         IoMem,
         TyrDrmDevice,
+    },
+    irq::{
         TyrIrq,
         TyrIrqTrait,
     },
