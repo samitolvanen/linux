@@ -253,17 +253,11 @@ impl<'drm> Firmware<'drm> {
         kernel::firmware::Firmware::request(&path, ddev.as_ref().as_ref())
     }
 
-    fn load(
-        dev: &Device,
-        ddev: &TyrDrmDevice,
-        gpu_info: &GpuInfo,
-    ) -> Result<(kernel::firmware::Firmware, KVec<ParsedSection>)> {
+    fn load(dev: &Device, ddev: &TyrDrmDevice, gpu_info: &GpuInfo) -> Result<KVec<ParsedSection>> {
         let fw = Self::request(ddev, gpu_info)?;
         let mut parser = FwParser::new(dev, fw.data());
 
-        let parsed_sections = parser.parse()?;
-
-        Ok((fw, parsed_sections))
+        parser.parse()
     }
 
     /// Load firmware and map sections into MCU VM.
@@ -279,12 +273,17 @@ impl<'drm> Firmware<'drm> {
         vm.activate()?;
 
         let result = (|| {
-            let (fw, parsed_sections) = Self::load(dev, ddev, gpu_info)?;
+            let parsed_sections = Self::load(dev, ddev, gpu_info)?;
             let mut sections = KVec::new();
             for parsed in parsed_sections {
-                let size = u64::from(parsed.va.end.checked_sub(parsed.va.start).ok_or(EINVAL)?);
+                let ParsedSection {
+                    data,
+                    va,
+                    vm_map_flags,
+                } = parsed;
+                let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
 
-                let va = u64::from(parsed.va.start);
+                let va = u64::from(va.start);
 
                 let mut mem = KernelBo::new(
                     dev,
@@ -292,17 +291,8 @@ impl<'drm> Firmware<'drm> {
                     vm.clone(),
                     size,
                     KernelBoVaAlloc::Explicit(va),
-                    parsed.vm_map_flags,
+                    vm_map_flags,
                 )?;
-
-                let section_start = parsed.data_range.start as usize;
-                let section_end = parsed.data_range.end as usize;
-                let mut data = KVec::new();
-
-                // Ensure that the firmware slice is not out of bounds.
-                let fw_data = fw.data();
-                let bytes = fw_data.get(section_start..section_end).ok_or(EINVAL)?;
-                data.extend_from_slice(bytes, GFP_KERNEL)?;
 
                 Self::init_section_mem(dev, &mut mem, &data)?;
 
