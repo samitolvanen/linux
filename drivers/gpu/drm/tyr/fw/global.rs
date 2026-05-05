@@ -18,10 +18,14 @@ use kernel::{
         Io,
         Region, //
     },
+    new_mutex,
     num::Bounded,
     prelude::*,
     sizes::SizeConstants,
-    sync::Arc,
+    sync::{
+        Arc,
+        Mutex, //
+    },
     time::arch_timer_get_rate, //
 };
 
@@ -163,20 +167,59 @@ struct EnabledGlobalInterface {
     csg: KVec<CsgInterface>,
 }
 
-/// Global CSF Interface
-///
-/// The CSF controls operations that are common to all CSs.
-pub(crate) struct GlobalInterface {
+/// Global CSF Interface state, protected by the interface mutex.
+struct InnerGlobalInterface {
     /// Current interface state (Disabled or Enabled).
     state: GlobalInterfaceState,
 }
 
+/// Global CSF Interface
+///
+/// The CSF controls operations that are common to all CSs.
+#[pin_data]
+pub(crate) struct GlobalInterface {
+    #[pin]
+    inner: Mutex<InnerGlobalInterface>,
+}
+
 impl GlobalInterface {
     /// Creates a new CSF global interface, initially disabled.
-    pub(crate) fn new() -> Result<Self> {
-        Ok(Self {
-            state: GlobalInterfaceState::Disabled,
+    pub(crate) fn new() -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            inner <- new_mutex!(InnerGlobalInterface::new()),
         })
+    }
+
+    pub(crate) fn enable(
+        &self,
+        dev: &Device,
+        iomem: &IoMem<'_>,
+        shared_section: &Section,
+        gpu_info: &GpuInfo,
+        core_clk: &Clk,
+        event_wait: &Wait,
+    ) -> Result {
+        let mut inner = self.inner.lock();
+        inner.enable(dev, iomem, shared_section, gpu_info, core_clk, event_wait)
+    }
+
+    pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+        let inner = self.inner.lock();
+        inner.csif_info_counts()
+    }
+
+    pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+        let inner = self.inner.lock();
+        inner.group_suspend_buf_sizes()
+    }
+}
+
+impl InnerGlobalInterface {
+    /// Creates the interface state, initially disabled.
+    fn new() -> Self {
+        Self {
+            state: GlobalInterfaceState::Disabled,
+        }
     }
 
     /// Enables the global interface and discovers the CSG interfaces.
@@ -184,7 +227,7 @@ impl GlobalInterface {
     /// This reads the firmware's control block to set up the global input/output
     /// interfaces; it configures timers and shader core allocation; and it discovers
     /// available CSG interfaces.
-    pub(crate) fn enable(
+    fn enable(
         &mut self,
         dev: &Device,
         iomem: &IoMem<'_>,
@@ -439,7 +482,7 @@ impl GlobalInterface {
         Ok(enabled.csg_num as u32)
     }
 
-    pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
+    fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
         let csg = self.csg(0).ok_or(EINVAL)?;
         let cs = csg.cs(0).ok_or(EINVAL)?;
 
@@ -451,7 +494,7 @@ impl GlobalInterface {
         ))
     }
 
-    pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
+    fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
         let csg = self.csg(0).ok_or(EINVAL)?;
 
         csg.suspend_buf_sizes()
