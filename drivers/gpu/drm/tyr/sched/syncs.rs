@@ -92,14 +92,20 @@ macro_rules! impl_sync_rw {
             /// Merely taking a reference to it would be UB, as the GPU can change the
             /// underlying memory at any time, as it is a core running on its own.
             pub(super) fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
-                if offset > mem.size() {
-                    return Err(EINVAL);
-                }
+                mem.check_offset::<Self>(offset)?;
 
                 let vmap = mem.vmap();
+                // SAFETY: `MappedBo::check_offset` verified that
+                // `offset + size_of::<Self>()` is in bounds of the mapping and
+                // that `offset` is aligned for `Self`.  `vmap.addr()` returns
+                // a non-null pointer to the start of that mapping, so
+                // `add(offset)` stays within the same allocation and the
+                // resulting pointer is suitably aligned.
                 let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
-                // SAFETY: we know that this pointer is aligned and valid for reads for
-                // at least size_of::<Self>() bytes.
+                // SAFETY: `ptr` is aligned and valid for reads for at least
+                // size_of::<Self>() bytes (see above).  The mapping is shared
+                // with the GPU, so we must use a volatile read to avoid
+                // assuming the value cannot change.
                 Ok(unsafe { core::ptr::read_volatile(ptr) })
             }
 
@@ -111,14 +117,20 @@ macro_rules! impl_sync_rw {
             /// Merely taking a reference to it would be UB, as the GPU can change the
             /// underlying memory at any time, as it is a core running on its own.
             pub(super) fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
-                if offset > mem.size() {
-                    return Err(EINVAL);
-                }
+                mem.check_offset::<Self>(offset)?;
 
                 let vmap = mem.vmap();
+                // SAFETY: `MappedBo::check_offset` verified that
+                // `offset + size_of::<Self>()` is in bounds of the mapping and
+                // that `offset` is aligned for `Self`.  `vmap.addr()` returns
+                // a non-null pointer to the start of that mapping, so
+                // `add(offset)` stays within the same allocation and the
+                // resulting pointer is suitably aligned.
                 let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
-                // SAFETY: we know that this pointer is aligned and valid for writes for
-                // at least size_of::<Self>() bytes.
+                // SAFETY: `ptr` is aligned and valid for writes for at least
+                // size_of::<Self>() bytes (see above).  The mapping is shared
+                // with the GPU, so we use a volatile write to ensure the store
+                // is not coalesced or elided.
                 unsafe { core::ptr::write_volatile(ptr, value) };
 
                 Ok(())
