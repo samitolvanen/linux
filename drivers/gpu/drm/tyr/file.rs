@@ -8,18 +8,13 @@ use kernel::{
     },
     io::Io,
     prelude::*,
-    sync::{
-        aref::ARef,
-        Arc, //
-    },
+    sync::aref::ARef,
     transmute::{
         AsBytes,
         FromBytes, //
     },
     uaccess::UserSlice,
-    uapi,
-    xarray,
-    xarray::XArray, //
+    uapi, //
 };
 
 use crate::{
@@ -71,7 +66,7 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
-    heap_pools: Pin<KBox<XArray<Arc<heap::Pool>>>>,
+    heap_pools: heap::Pools,
     tdev: ARef<TyrDrmDevice>,
 }
 
@@ -88,7 +83,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
                 group_pool: group::Pool::create()?,
-                heap_pools <- KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?,
+                heap_pools: heap::Pools::create()?,
                 tdev,
             }),
             GFP_KERNEL,
@@ -120,6 +115,10 @@ impl TyrDrmFileData {
 
     pub(crate) fn group_pool(self: Pin<&Self>) -> &group::Pool {
         &self.get_ref().group_pool
+    }
+
+    pub(crate) fn heap_pools(self: Pin<&Self>) -> &heap::Pools {
+        &self.get_ref().heap_pools
     }
 
     pub(crate) fn dev_query(
@@ -420,34 +419,9 @@ impl TyrDrmFileData {
         let vm_id = heapcreate.vm_id as usize;
         let vm = file.inner().vm_pool().get_vm(vm_id).ok_or(EINVAL)?;
 
-        let args = heap::ContextCreateArgs {
-            initial_chunk_count: heapcreate.initial_chunk_count,
-            chunk_size: heapcreate.chunk_size,
-            max_chunks: heapcreate.max_chunks,
-            target_in_flight: heapcreate.target_in_flight,
-        };
-
-        let file_inner = file.inner();
-        let xa = file_inner.heap_pools.as_ref();
-
-        {
-            let guard = xa.lock();
-            if guard.get(vm_id).is_none() {
-                drop(guard);
-                let pool = Arc::new(heap::Pool::create(ddev, reg_data, vm.clone())?, GFP_KERNEL)?;
-                xa.lock().store(vm_id, pool, GFP_KERNEL)?;
-            }
-        }
-
-        let created_context = {
-            let guard = xa.lock();
-            let pool = guard.get(vm_id).ok_or(EINVAL)?;
-            pool.create_heap_context(ddev, reg_data, args)?
-        };
-
-        heapcreate.handle = heapcreate.vm_id << 16 | created_context.context_id as u32;
-        heapcreate.tiler_heap_ctx_gpu_va = created_context.context_gpu_va;
-        heapcreate.first_heap_chunk_gpu_va = created_context.first_chunk_gpu_va;
+        file.inner()
+            .heap_pools()
+            .create_context(ddev, reg_data, vm_id, vm, heapcreate)?;
 
         Ok(0)
     }
@@ -465,10 +439,7 @@ impl TyrDrmFileData {
         let vm_id = (heapdestroy.handle >> 16) as usize;
         let heap_idx = (heapdestroy.handle & 0xffff) as usize;
 
-        let file_inner = file.inner();
-        let xa = file_inner.heap_pools.as_ref();
-        let guard = xa.lock();
-        let pool = guard.get(vm_id).ok_or(EINVAL)?;
+        let pool = file.inner().heap_pools().get_pool(vm_id).ok_or(EINVAL)?;
         pool.destroy_heap_context(heap_idx)?;
 
         Ok(0)
