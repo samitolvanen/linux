@@ -36,6 +36,7 @@ use super::{
         self,
         SyncOp,
     },
+    job::Job,
     queue::Queue,
     syncs,
 };
@@ -184,7 +185,7 @@ impl Group {
         syncs::SyncObj64b::read(&self._syncobjs, self.syncobj_offset(queue_index)?)
     }
 
-    fn write_syncobj(&self, queue_index: usize, value: syncs::SyncObj64b) -> Result {
+    pub(super) fn write_syncobj(&self, queue_index: usize, value: syncs::SyncObj64b) -> Result {
         syncs::SyncObj64b::write(&self._syncobjs, self.syncobj_offset(queue_index)?, value)
     }
 
@@ -194,65 +195,16 @@ impl Group {
         queue_submits: KVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
-        struct QueuedStream {
-            queue_index: usize,
-            stream: KVec<u8>,
-        }
-
         deps::wait_for_syncops(file, &syncs)?;
 
-        let mut queued_streams: KVec<QueuedStream> = KVec::new();
+        let jobs = Job::from_queue_submits(queue_submits)?;
 
-        for queue_submit in queue_submits.into_iter() {
-            let queue_index = queue_submit.queue_index();
-            let stream = queue_submit.into_stream();
-
-            if stream.is_empty() {
-                continue;
-            }
-
-            if let Some(queued_stream) = queued_streams
-                .iter_mut()
-                .find(|queued_stream| queued_stream.queue_index == queue_index)
-            {
-                queued_stream.stream.extend_from_slice(&stream, GFP_KERNEL)?;
-                continue;
-            }
-
-            queued_streams.push(
-                QueuedStream {
-                    queue_index,
-                    stream,
-                },
-                GFP_KERNEL,
-            )?;
+        for job in jobs.iter() {
+            job.can_submit(self)?;
         }
 
-        for queued_stream in queued_streams.iter() {
-            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
-            queue.can_append(queued_stream.stream.len())?;
-        }
-
-        for queued_stream in queued_streams.iter() {
-            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
-            queue.append_instrs(&queued_stream.stream)?;
-        }
-
-        for queued_stream in queued_streams.iter() {
-            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
-            self.write_syncobj(
-                queued_stream.queue_index,
-                syncs::SyncObj64b {
-                    seqno: queue.claim_seqno(),
-                    status: 0,
-                    pad: 0,
-                },
-            )?;
-        }
-
-        for queued_stream in queued_streams.iter() {
-            let queue = self.queues.get(queued_stream.queue_index).ok_or(EINVAL)?;
-            queue.kick()?;
+        for job in jobs.iter() {
+            job.submit(self)?;
         }
 
         Ok(())

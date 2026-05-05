@@ -23,6 +23,7 @@ const GROUP_PRIORITY_COUNT: usize =
 
 pub(crate) mod group;
 pub(crate) mod deps;
+pub(crate) mod job;
 pub(crate) mod queue;
 pub(crate) mod syncs;
 
