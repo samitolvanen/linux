@@ -309,17 +309,7 @@ impl TyrDrmFileData {
         vmgetstate: &mut uapi::drm_panthor_vm_get_state,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        let vm = file
-            .inner()
-            .vm_pool()
-            .get_vm(vmgetstate.vm_id as usize)
-            .ok_or(EINVAL)?;
-
-        vmgetstate.state = if vm.is_unusable() {
-            uapi::drm_panthor_vm_state_DRM_PANTHOR_VM_STATE_UNUSABLE
-        } else {
-            uapi::drm_panthor_vm_state_DRM_PANTHOR_VM_STATE_USABLE
-        };
+        file.inner().vm_pool().get_vm_state(vmgetstate)?;
 
         Ok(0)
     }

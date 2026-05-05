@@ -113,6 +113,18 @@ impl Pool {
         self.entries.get(index)
     }
 
+    pub(crate) fn get_vm_state(&self, vmgetstate: &mut uapi::drm_panthor_vm_get_state) -> Result {
+        let vm = self.get_vm(vmgetstate.vm_id as usize).ok_or(EINVAL)?;
+
+        vmgetstate.state = if vm.is_unusable() {
+            uapi::drm_panthor_vm_state_DRM_PANTHOR_VM_STATE_UNUSABLE
+        } else {
+            uapi::drm_panthor_vm_state_DRM_PANTHOR_VM_STATE_USABLE
+        };
+
+        Ok(())
+    }
+
     fn destroy_vm_index(&self, index: usize) -> Result {
         let vm = self.entries.remove(index)?;
 
