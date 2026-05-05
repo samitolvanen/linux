@@ -15,7 +15,10 @@ use kernel::{
     io::register::Array,
     prelude::*,
     sizes::SZ_4K,
+    sizes::SZ_64K,
     sync::Arc,
+    transmute::FromBytes,
+    uapi,
 };
 
 use crate::{
@@ -23,7 +26,6 @@ use crate::{
         IoMem,
         TyrDrmDevice,
     },
-    file::QueueCreate,
     gem,
     regs::doorbell_block,
     vm::{
@@ -34,6 +36,42 @@ use crate::{
 };
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
+
+#[repr(transparent)]
+pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
+
+// SAFETY: This wrapper is layout-identical to the UAPI queue-create record
+// read from userspace.
+unsafe impl FromBytes for QueueCreate {}
+
+impl QueueCreate {
+    pub(crate) fn validate(&self) -> Result {
+        if self.0.pad != [0; 3] {
+            return Err(EINVAL);
+        }
+
+        if self.0.priority > 15 {
+            return Err(EINVAL);
+        }
+
+        if self.0.ringbuf_size < SZ_4K as u32
+            || self.0.ringbuf_size > SZ_64K as u32
+            || !self.0.ringbuf_size.is_power_of_two()
+        {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn priority(&self) -> u8 {
+        self.0.priority
+    }
+
+    pub(crate) fn ringbuf_size(&self) -> u32 {
+        self.0.ringbuf_size
+    }
+}
 
 /// A minimal hardware queue object owned by a scheduling group.
 pub(crate) struct Queue {

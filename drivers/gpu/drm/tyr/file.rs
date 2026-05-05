@@ -5,10 +5,6 @@ use kernel::{
     drm::gem::BaseObject,
     io::Io,
     prelude::*,
-    sizes::{
-        SZ_4K,
-        SZ_64K,
-    },
     sync::{
         aref::ARef,
         Arc,
@@ -527,38 +523,6 @@ struct VmBindOp(uapi::drm_panthor_vm_bind_op);
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for VmBindOp {}
 
-#[repr(transparent)]
-pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
 
-// SAFETY: this struct is safe to be transmuted from a byte slice.
-unsafe impl FromBytes for QueueCreate {}
 
-impl QueueCreate {
-    pub(crate) fn validate(&self) -> Result {
-        if self.0.pad != [0; 3] {
-            return Err(EINVAL);
-        }
-
-        if self.0.priority > 15 {
-            return Err(EINVAL);
-        }
-
-        if self.0.ringbuf_size < SZ_4K as u32
-            || self.0.ringbuf_size > SZ_64K as u32
-            || !self.0.ringbuf_size.is_power_of_two()
-        {
-            return Err(EINVAL);
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn priority(&self) -> u8 {
-        self.0.priority
-    }
-
-    pub(crate) fn ringbuf_size(&self) -> u32 {
-        self.0.ringbuf_size
-    }
-}
 
