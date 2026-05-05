@@ -41,7 +41,10 @@
 
 use crate::{
     driver::IoMem,
-    fw::Section,
+    fw::{
+        global::CsgInterface,
+        Section,
+    },
     gpu::GpuInfo,
     regs::doorbell_block::DOORBELL,
     wait::{
@@ -49,7 +52,6 @@ use crate::{
         WaitResult, //
     }, //
 };
-use iface::FwInterface;
 use kernel::{
     clk::Clk,
     devres::Devres,
@@ -62,11 +64,32 @@ use kernel::{
     prelude::*,
 };
 
-/// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
-const CSG_GROUP_CONTROL_OFFSET: usize = 0x1000;
-
-/// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
-const CS_CONTROL_OFFSET: usize = 0x40;
+pub(super) use self::{
+    cs::{
+        control::{
+            STREAM_FEATURES,
+            STREAM_INPUT_VA,
+            STREAM_OUTPUT_VA,
+        },
+        CS_CONTROL_BLOCK_SIZE,
+        CS_KERNEL_INPUT_BLOCK_SIZE,
+        CS_KERNEL_OUTPUT_BLOCK_SIZE,
+    },
+    csg::{
+        control::{
+            GROUP_INPUT_VA,
+            GROUP_OUTPUT_VA,
+            GROUP_PROTM_SUSPEND_SIZE,
+            GROUP_STREAM_NUM,
+            GROUP_STREAM_STRIDE,
+            GROUP_SUSPEND_SIZE,
+        },
+        CSG_CONTROL_BLOCK_SIZE,
+        CSG_INPUT_BLOCK_SIZE,
+        CSG_OUTPUT_BLOCK_SIZE,
+    },
+    iface::FwInterface,
+};
 
 /// Generic firmware interface infrastructure.
 ///
@@ -97,7 +120,7 @@ mod iface {
     ///
     /// Provides bounds-checked access to firmware interface blocks mapped into
     /// driver memory via a VMap.
-    pub(super) struct FwInterface<const FW_IFACE_SIZE: usize> {
+    pub(in crate::fw) struct FwInterface<const FW_IFACE_SIZE: usize> {
         /// Virtual mapping of the shared memory buffer.
         vmap: VMapOwned<BoData>,
         /// Offset within the shared memory buffer where this interface starts.
@@ -108,7 +131,7 @@ mod iface {
         /// Creates a new firmware interface wrapper at the specified MCU virtual address.
         ///
         /// Validates that the whole interface block is within the section's address range.
-        pub(super) fn new(
+        pub(in crate::fw) fn new(
             vmap: &VMapOwned<BoData>,
             va_range: &Range<u64>,
             shared_iface_addr: u64,
@@ -676,13 +699,13 @@ mod csg {
     ///
     /// This covers the per-CSG control registers at offsets 0x00-0x18
     /// STREAM_CONTROL (CS) blocks are accessed separately via runtime calculations.
-    pub(super) const CSG_CONTROL_BLOCK_SIZE: usize = 0x1C;
+    pub(in crate::fw) const CSG_CONTROL_BLOCK_SIZE: usize = 0x1C;
 
     /// Size of the CSG_INPUT_BLOCK register block (up to and including CSG_CONFIG at 0x50 + 4 bytes).
-    pub(super) const CSG_INPUT_BLOCK_SIZE: usize = 0x54;
+    pub(in crate::fw) const CSG_INPUT_BLOCK_SIZE: usize = 0x54;
 
     /// Size of the CSG_OUTPUT_BLOCK register block (up to and including CSG_RESOURCE_DEP at 0x1C + 4 bytes).
-    pub(super) const CSG_OUTPUT_BLOCK_SIZE: usize = 0x20;
+    pub(in crate::fw) const CSG_OUTPUT_BLOCK_SIZE: usize = 0x20;
 
     /// CSG execution state (csg_execution_state_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
@@ -1054,13 +1077,13 @@ mod cs {
     ///
     /// This covers the per-CS control registers at offsets 0x00-0x08
     /// CS blocks are accessed separately via runtime calculations.
-    pub(super) const CS_CONTROL_BLOCK_SIZE: usize = 0xC;
+    pub(in crate::fw) const CS_CONTROL_BLOCK_SIZE: usize = 0xC;
 
     /// Size of the CS_KERNEL_INPUT_BLOCK register block.
-    pub(super) const CS_KERNEL_INPUT_BLOCK_SIZE: usize = 0x58;
+    pub(in crate::fw) const CS_KERNEL_INPUT_BLOCK_SIZE: usize = 0x58;
 
     /// Size of the CS_KERNEL_OUTPUT_BLOCK register block.
-    pub(super) const CS_KERNEL_OUTPUT_BLOCK_SIZE: usize = 0xD8;
+    pub(in crate::fw) const CS_KERNEL_OUTPUT_BLOCK_SIZE: usize = 0xD8;
 
     /// CS execution state (cs_state_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
@@ -1628,8 +1651,6 @@ mod cs {
     }
 }
 
-use cs::*;
-use csg::*;
 use glb::{
     control::*,
     input::*,
@@ -2002,309 +2023,5 @@ impl GlobalInterface {
         let csg = self.csg(0).ok_or(EINVAL)?;
 
         csg.suspend_buf_sizes()
-    }
-}
-
-/// State of a CSG interface.
-enum CsgInterfaceState {
-    /// Interface is not yet initialized.
-    Disabled,
-    /// Interface is initialized and operational.
-    Enabled(EnabledCsgInterface),
-}
-
-/// When enabled, a CSG Interface has control, input, and output system memory interfaces.
-struct EnabledCsgInterface {
-    /// Control block interface - provides CSG capabilities and configuration.
-    csg_control: FwInterface<CSG_CONTROL_BLOCK_SIZE>,
-    /// Input block interface - driver writes CSG requests here.
-    #[expect(dead_code)]
-    csg_input: FwInterface<CSG_INPUT_BLOCK_SIZE>,
-    /// Output block interface - firmware writes CSG acknowledgements here.
-    #[expect(dead_code)]
-    csg_output: FwInterface<CSG_OUTPUT_BLOCK_SIZE>,
-    /// Runtime stride between CS control blocks (read from GROUP_STREAM_STRIDE).
-    cs_stride: usize,
-    /// Number of CS interfaces reported by hardware for this CSG.
-    cs_num: usize,
-    /// Discovered CS interfaces.
-    cs: KVec<CsInterface>,
-}
-
-/// Command Stream Group Interface
-///
-/// The CSG interface controls operations for a specific CSG.
-struct CsgInterface {
-    /// Current interface state (Disabled or Enabled).
-    state: CsgInterfaceState,
-    /// CSG identifier/index number.
-    #[expect(dead_code)]
-    csg_idx: usize,
-}
-
-impl CsgInterface {
-    /// Creates a new disabled CSG interface.
-    pub(super) fn new(csg_idx: usize) -> Result<Self> {
-        Ok(Self {
-            state: CsgInterfaceState::Disabled,
-            csg_idx,
-        })
-    }
-
-    /// Enables the CSG interface.
-    ///
-    /// This calculates the runtime offset of this CSG's control block and creates
-    /// a bounded interface to access it. It then reads the input/output interface
-    /// addresses from the CSG control block.
-    fn enable(&mut self, shared_section: &Section, csg_idx: usize, csg_stride: usize) -> Result {
-        use csg::control::{
-            GROUP_INPUT_VA,
-            GROUP_OUTPUT_VA,
-            GROUP_STREAM_NUM,
-            GROUP_STREAM_STRIDE, //
-        };
-        use kernel::io::Io;
-
-        let vmap = shared_section.mem.bo.owned_vmap::<0>()?;
-        let va_range = shared_section.mem.va_range();
-
-        // Calculate the runtime offset for this CSG's control block.
-        // The CSG control blocks start at CSG_GROUP_CONTROL_OFFSET from the GLB control block,
-        // with each CSG spaced by csg_stride bytes.
-        let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
-
-        // The CSG control block's MCU virtual address is relative to the shared section start.
-        let csg_control_va = va_range.start + csg_control_offset as u64;
-
-        // Create a bounded interface for this CSG's control block at the calculated address.
-        let csg_control =
-            FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(&vmap, &va_range, csg_control_va)?;
-
-        // Read the input and output VAs from the CSG control block.
-        let input_va = csg_control.read(GROUP_INPUT_VA).value().get();
-        let csg_input =
-            FwInterface::<CSG_INPUT_BLOCK_SIZE>::new(&vmap, &va_range, input_va.into())?;
-
-        let output_va = csg_control.read(GROUP_OUTPUT_VA).value().get();
-        let csg_output =
-            FwInterface::<CSG_OUTPUT_BLOCK_SIZE>::new(&vmap, &va_range, output_va.into())?;
-
-        // Read the runtime stride between CS control blocks.
-        let cs_stride = csg_control.read(GROUP_STREAM_STRIDE).value().get() as usize;
-
-        if cs_stride < CS_CONTROL_BLOCK_SIZE {
-            pr_err!(
-                "CS stride {} is smaller than control block size {}\n",
-                cs_stride,
-                CS_CONTROL_BLOCK_SIZE
-            );
-            return Err(EINVAL);
-        }
-
-        // Read how many CS interfaces exist for this CSG.
-        let cs_num = csg_control.read(GROUP_STREAM_NUM).value().get();
-
-        // Validate that the hardware doesn't report more CS than we support.
-        if cs_num as usize > super::MAX_CS {
-            pr_err!(
-                "Too many CS: hardware reports {}, max supported {}\n",
-                cs_num,
-                super::MAX_CS
-            );
-            return Err(EINVAL);
-        }
-
-        let enabled = EnabledCsgInterface {
-            csg_control,
-            csg_input,
-            csg_output,
-            cs_stride,
-            cs_num: cs_num as usize,
-            cs: KVec::with_capacity(cs_num as usize, GFP_KERNEL)?,
-        };
-
-        self.state = CsgInterfaceState::Enabled(enabled);
-        self.init_cs(shared_section, csg_control_offset)?;
-        Ok(())
-    }
-
-    /// Initialize and discover CS interfaces.
-    ///
-    /// This uses the previously read CS count to create and enable each CS interface.
-    fn init_cs(&mut self, shared_section: &Section, csg_control_offset: usize) -> Result {
-        let enabled = match &mut self.state {
-            CsgInterfaceState::Enabled(e) => e,
-            CsgInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        for cs_idx in 0..enabled.cs_num {
-            // Create and enable the CS interface.
-            let mut cs = CsInterface::new(cs_idx)?;
-            cs.enable(
-                shared_section,
-                csg_control_offset,
-                cs_idx,
-                enabled.cs_stride,
-            )?;
-
-            enabled.cs.push(cs, GFP_KERNEL)?;
-        }
-
-        Ok(())
-    }
-
-    fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {
-        use csg::control::{
-            GROUP_PROTM_SUSPEND_SIZE,
-            GROUP_SUSPEND_SIZE,
-        };
-
-        let enabled = match &self.state {
-            CsgInterfaceState::Enabled(e) => e,
-            CsgInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        let suspend_size = enabled.csg_control.read(GROUP_SUSPEND_SIZE).value().get();
-        let protm_suspend_size = enabled
-            .csg_control
-            .read(GROUP_PROTM_SUSPEND_SIZE)
-            .value()
-            .get();
-
-        Ok((suspend_size, protm_suspend_size))
-    }
-
-    fn cs(&self, index: usize) -> Option<&CsInterface> {
-        let enabled = match &self.state {
-            CsgInterfaceState::Enabled(e) => e,
-            CsgInterfaceState::Disabled => return None,
-        };
-
-        enabled.cs.get(index)
-    }
-
-    fn cs_slot_count(&self) -> Result<u32> {
-        let enabled = match &self.state {
-            CsgInterfaceState::Enabled(e) => e,
-            CsgInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        Ok(enabled.cs_num as u32)
-    }
-}
-
-/// State of a CS interface.
-enum CsInterfaceState {
-    /// Interface is not yet initialized.
-    Disabled,
-    /// Interface is initialized and operational.
-    Enabled(EnabledCsInterface),
-}
-
-/// When enabled, a CS Interface has control, input, and output system memory interfaces.
-struct EnabledCsInterface {
-    /// Control block interface - provides CS capabilities and configuration.
-    cs_control: FwInterface<CS_CONTROL_BLOCK_SIZE>,
-    /// Input block interface - driver writes CS requests here.
-    #[expect(dead_code)]
-    cs_input: FwInterface<CS_KERNEL_INPUT_BLOCK_SIZE>,
-    /// Output block interface - firmware writes CS acknowledgements here.
-    #[expect(dead_code)]
-    cs_output: FwInterface<CS_KERNEL_OUTPUT_BLOCK_SIZE>,
-}
-
-/// Command Stream Interface
-///
-/// The CS interface controls operations for a specific CS.
-struct CsInterface {
-    /// Current interface state (Disabled or Enabled).
-    state: CsInterfaceState,
-    /// CS identifier/index number.
-    #[expect(dead_code)]
-    cs_idx: usize,
-}
-
-impl CsInterface {
-    /// Creates a new disabled CS interface.
-    pub(super) fn new(cs_idx: usize) -> Result<Self> {
-        Ok(Self {
-            state: CsInterfaceState::Disabled,
-            cs_idx,
-        })
-    }
-
-    /// Enables the CS interface.
-    ///
-    /// This calculates the runtime offset of this CS's control block and creates
-    /// a bounded interface to access it. It then reads the input/output interface
-    /// addresses from the CS control block.
-    fn enable(
-        &mut self,
-        shared_section: &Section,
-        csg_control_offset: usize,
-        cs_idx: usize,
-        cs_stride: usize,
-    ) -> Result {
-        use cs::control::{
-            STREAM_INPUT_VA,
-            STREAM_OUTPUT_VA, //
-        };
-        use kernel::io::Io;
-
-        let vmap = shared_section.mem.bo.owned_vmap::<0>()?;
-        let va_range = shared_section.mem.va_range();
-
-        // Calculate the runtime offset for this CS's control block.
-        let cs_control_offset = CS_CONTROL_OFFSET + cs_idx * cs_stride;
-
-        // The CS control block's MCU virtual address is relative to the shared section start.
-        let cs_control_va = va_range.start + csg_control_offset as u64 + cs_control_offset as u64;
-
-        // Create a bounded interface for this CS's control block at the calculated address.
-        let cs_control =
-            FwInterface::<CS_CONTROL_BLOCK_SIZE>::new(&vmap, &va_range, cs_control_va)?;
-
-        // Read the input and output VAs from the CS control block.
-        let input_va = cs_control.read(STREAM_INPUT_VA).value().get();
-        let cs_input =
-            FwInterface::<CS_KERNEL_INPUT_BLOCK_SIZE>::new(&vmap, &va_range, input_va.into())?;
-
-        let output_va = cs_control.read(STREAM_OUTPUT_VA).value().get();
-        let cs_output =
-            FwInterface::<CS_KERNEL_OUTPUT_BLOCK_SIZE>::new(&vmap, &va_range, output_va.into())?;
-
-        let enabled = EnabledCsInterface {
-            cs_control,
-            cs_input,
-            cs_output,
-        };
-
-        self.state = CsInterfaceState::Enabled(enabled);
-
-        Ok(())
-    }
-
-    fn work_regs(&self) -> Result<u32> {
-        use cs::control::STREAM_FEATURES;
-        use kernel::io::Io;
-
-        let enabled = match &self.state {
-            CsInterfaceState::Enabled(e) => e,
-            CsInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        Ok(enabled.cs_control.read(STREAM_FEATURES).work_registers().get())
-    }
-
-    fn scoreboards(&self) -> Result<u32> {
-        use cs::control::STREAM_FEATURES;
-        use kernel::io::Io;
-
-        let enabled = match &self.state {
-            CsInterfaceState::Enabled(e) => e,
-            CsInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        Ok(enabled.cs_control.read(STREAM_FEATURES).scoreboards().get())
     }
 }

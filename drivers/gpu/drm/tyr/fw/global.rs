@@ -7,6 +7,9 @@
 //! uses, which lets later commits move GLB-specific implementation out of the
 //! older monolithic helper file without changing those callers again.
 
+mod cs;
+mod csg;
+
 use crate::{
 	driver::IoMem,
 	fw::Section,
@@ -22,6 +25,8 @@ use kernel::{
 	prelude::*,
 	time::arch_timer_get_rate,
 };
+
+pub(super) use self::csg::CsgInterface;
 
 /// Encodes a GLB timer timeout and selects the backing time source.
 pub(super) fn conv_timeout(core_clk: &Clk, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
