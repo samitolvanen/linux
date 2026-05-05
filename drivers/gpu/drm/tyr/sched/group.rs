@@ -238,6 +238,38 @@ impl Pool {
         self.0.get(index)
     }
 
+    pub(crate) fn submit_group(
+        &self,
+        ddev: &TyrDrmDevice,
+        groupsubmit: &uapi::drm_panthor_group_submit,
+        file: &TyrDrmFile,
+    ) -> Result {
+        if groupsubmit.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        if groupsubmit.queue_submits.count == 0 {
+            return Err(EINVAL);
+        }
+
+        let group = self.group(groupsubmit.group_handle as usize).ok_or(EINVAL)?;
+
+        let mut queue_submits = KVec::new();
+        let mut syncs = KVec::new();
+
+        super::job::append_queue_submits(
+            &mut syncs,
+            &mut queue_submits,
+            groupsubmit.queue_submits.array,
+            groupsubmit.queue_submits.count,
+            groupsubmit.queue_submits.stride,
+            group.queue_count(),
+        )?;
+
+        ddev.with_locked_scheduler(|sched| sched.bind(ddev, group.clone()))?;
+        group.submit(syncs, queue_submits, file)
+    }
+
     pub(crate) fn destroy_group(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 

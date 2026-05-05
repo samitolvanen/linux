@@ -38,7 +38,6 @@ use crate::{
     },
     sched::{
         group,
-        job,
     },
     vm::{
         self,
@@ -430,36 +429,9 @@ impl TyrDrmFileData {
         groupsubmit: &mut uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if groupsubmit.pad != 0 {
-            return Err(EINVAL);
-        }
-
-        if groupsubmit.queue_submits.count == 0 {
-            return Err(EINVAL);
-        }
-
-        let group = file
-            .inner()
+        file.inner()
             .group_pool()
-            .group(groupsubmit.group_handle as usize)
-            .ok_or(EINVAL)?;
-
-        let mut queue_submits = KVec::new();
-        let mut syncs = KVec::new();
-
-        job::append_queue_submits(
-            &mut syncs,
-            &mut queue_submits,
-            groupsubmit.queue_submits.array,
-            groupsubmit.queue_submits.count,
-            groupsubmit.queue_submits.stride,
-            group.queue_count(),
-        )?;
-
-        ddev.with_locked_scheduler(|sched| {
-            sched.bind(ddev, group.clone())?;
-            sched.submit(syncs, group, queue_submits, file)
-        })?;
+            .submit_group(ddev, groupsubmit, file)?;
 
         Ok(0)
     }
