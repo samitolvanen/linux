@@ -42,8 +42,7 @@ use kernel::{
             Atomic, //
         },
         Arc,
-        ArcBorrow,
-        Mutex, //
+        ArcBorrow, //
     },
     time, //
 };
@@ -142,7 +141,7 @@ pub(crate) struct Firmware<'drm> {
     pub(crate) fw_ready: Arc<Atomic<bool>>,
 
     /// The global FW interface.
-    global_iface: Pin<KBox<Mutex<GlobalInterface>>>,
+    global_iface: Pin<KBox<GlobalInterface>>,
 }
 
 impl<'drm> Drop for Firmware<'drm> {
@@ -244,7 +243,7 @@ impl<'drm> Firmware<'drm> {
                 event_wait: new_wait!()?,
                 boot_wait: new_wait!()?,
                 fw_ready: Arc::new(Atomic::new(false), GFP_KERNEL)?,
-                global_iface: KBox::pin_init(new_mutex!(GlobalInterface::new()?), GFP_KERNEL)?,
+                global_iface: KBox::pin_init(GlobalInterface::new(), GFP_KERNEL)?,
             })
         })();
 
@@ -323,32 +322,22 @@ impl<'drm> Firmware<'drm> {
         io: &IoMem<'_>,
     ) -> Result {
         let shared_section = self.shared_section()?;
-        self.with_locked_global_iface(|global_iface| {
-            global_iface.enable(
-                self.vm.dev(),
-                io,
-                shared_section,
-                gpu_info,
-                core_clk,
-                &self.event_wait,
-            )
-        })
-    }
-
-    pub(crate) fn with_locked_global_iface<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut GlobalInterface) -> Result<R>,
-    {
-        let mut global_iface = self.global_iface.lock();
-        f(&mut global_iface)
+        self.global_iface.enable(
+            self.vm.dev(),
+            io,
+            shared_section,
+            gpu_info,
+            core_clk,
+            &self.event_wait,
+        )
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
-        self.with_locked_global_iface(|global_iface| global_iface.csif_info_counts())
+        self.global_iface.csif_info_counts()
     }
 
     pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
-        self.with_locked_global_iface(|global_iface| global_iface.group_suspend_buf_sizes())
+        self.global_iface.group_suspend_buf_sizes()
     }
 
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
