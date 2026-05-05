@@ -379,13 +379,7 @@ impl TyrDrmFileData {
         groupdestroy: &mut uapi::drm_panthor_group_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if groupdestroy.pad != 0 {
-            return Err(EINVAL);
-        }
-
-        file.inner()
-            .group_pool()
-            .destroy_group(ddev, groupdestroy.group_handle as usize)?;
+        file.inner().group_pool().destroy_group(ddev, groupdestroy)?;
 
         Ok(0)
     }

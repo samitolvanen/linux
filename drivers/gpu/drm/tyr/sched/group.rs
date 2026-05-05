@@ -316,7 +316,7 @@ impl Pool {
         Ok(())
     }
 
-    pub(crate) fn destroy_group(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
+    fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 
         ddev.with_locked_scheduler(|sched| sched.remove_group(group))?;
@@ -325,9 +325,21 @@ impl Pool {
         Ok(())
     }
 
+    pub(crate) fn destroy_group(
+        &self,
+        ddev: &TyrDrmDevice,
+        groupdestroy: &uapi::drm_panthor_group_destroy,
+    ) -> Result {
+        if groupdestroy.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        self.destroy_group_index(ddev, groupdestroy.group_handle as usize)
+    }
+
     pub(crate) fn destroy_all(&self, ddev: &TyrDrmDevice) -> Result {
         for index in 1..self.0.index_upper_bound() {
-            let _ = self.destroy_group(ddev, index);
+            let _ = self.destroy_group_index(ddev, index);
         }
 
         Ok(())
