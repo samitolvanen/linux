@@ -9,14 +9,11 @@ use kernel::{
 
 use crate::{
     driver::TyrDrmDevice,
-    file::TyrDrmFile,
     fw::Firmware,
     gpu::CsifInfo, //
 };
 
-use deps::SyncOp;
 use group::Group;
-use job::QueueSubmit;
 
 const GROUP_PRIORITY_COUNT: usize =
     uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME as usize + 1;
@@ -151,15 +148,5 @@ impl Scheduler {
         groups.remove(pos)?;
 
         Ok(())
-    }
-
-    pub(crate) fn submit(
-        &mut self,
-        syncs: KVec<SyncOp>,
-        group: Arc<Group>,
-        queue_submits: KVec<QueueSubmit>,
-        file: &TyrDrmFile,
-    ) -> Result {
-        group.submit(syncs, queue_submits, file)
     }
 }
