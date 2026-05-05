@@ -180,6 +180,21 @@ impl Pools {
 
         Ok(())
     }
+
+    pub(crate) fn destroy_context(
+        &self,
+        heapdestroy: &uapi::drm_panthor_tiler_heap_destroy,
+    ) -> Result {
+        if heapdestroy.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let vm_id = (heapdestroy.handle >> 16) as usize;
+        let heap_idx = (heapdestroy.handle & 0xffff) as usize;
+        let pool = self.get_pool(vm_id).ok_or(EINVAL)?;
+
+        pool.destroy_heap_context(heap_idx)
+    }
 }
 
 pub(crate) struct Pool {
@@ -274,8 +289,12 @@ impl Pool {
 
     pub(crate) fn destroy_heap_context(&self, context_id: usize) -> Result {
         let xa = self.xa.as_ref();
-        let mut guard = xa.lock();
-        guard.remove(context_id).ok_or(EINVAL)?;
+        let heap_ctx = {
+            let mut guard = xa.lock();
+            guard.remove(context_id).ok_or(EINVAL)?
+        };
+
+        drop(heap_ctx);
 
         Ok(())
     }
