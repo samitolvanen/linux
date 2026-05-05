@@ -19,14 +19,12 @@ use core::sync::atomic::{
 };
 
 use kernel::{
-    bits::genmask_u32,
     devres::Devres,
     drm::{
         gem::BaseObject,
         Uninit, //
     },
     firmware,
-    impl_flags,
     io::{
         poll,
         Io, //
@@ -95,59 +93,12 @@ const MAX_CSG: usize = 16;
 /// Maximum number of CS interfaces supported by hardware.
 const MAX_CS: usize = 16;
 
-impl_flags!(
-    #[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]
-    pub(super) struct SectionFlags(u32);
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum SectionFlag {
-        Read = 1 << 0,
-        Write = 1 << 1,
-        Exec = 1 << 2,
-        CacheModeNone = 0 << 3,
-        CacheModeCached = 1 << 3,
-        CacheModeUncachedCoherent = 2 << 3,
-        CacheModeCachedCoherent = 3 << 3,
-        Prot = 1 << 5,
-        Shared = 1 << 30,
-        Zero = 1 << 31,
-    }
-);
-
-pub(super) const CACHE_MODE_MASK: SectionFlags = SectionFlags(genmask_u32(3..=4));
-
 /// MCU virtual address where the CSF shared memory region starts.
 ///
 /// This region contains the firmware interface structures for communication between
 /// the CPU driver and MCU firmware, including the GLB_CONTROL_BLOCK at this base address.
 /// The firmware binary contains a section marked to be loaded at this address.
 pub(super) const CSF_MCU_SHARED_REGION_START: u32 = 0x04000000;
-
-impl SectionFlags {
-    fn cache_mode(&self) -> SectionFlags {
-        *self & CACHE_MODE_MASK
-    }
-}
-
-impl TryFrom<u32> for SectionFlags {
-    type Error = Error;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        let valid_flags = SectionFlags::from(SectionFlag::Read)
-            | SectionFlags::from(SectionFlag::Write)
-            | SectionFlags::from(SectionFlag::Exec)
-            | CACHE_MODE_MASK
-            | SectionFlags::from(SectionFlag::Prot)
-            | SectionFlags::from(SectionFlag::Shared)
-            | SectionFlags::from(SectionFlag::Zero);
-
-        if value & valid_flags.0 != value {
-            Err(EINVAL)
-        } else {
-            Ok(Self(value))
-        }
-    }
-}
 
 /// A parsed section of the firmware binary.
 pub(crate) struct Section {

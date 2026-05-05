@@ -15,22 +15,69 @@ use core::{
 };
 
 use kernel::{
-    bits::bit_u32,
+    bits::{
+        bit_u32,
+        genmask_u32,
+    },
+    impl_flags,
     prelude::*,
     str::CString, //
 };
 
 use crate::{
-    fw::{
-        SectionFlag,
-        SectionFlags,
-        CSF_MCU_SHARED_REGION_START, //
-    },
+    fw::CSF_MCU_SHARED_REGION_START,
     vm::{
         VmFlag,
         VmMapFlags, //
     }, //
 };
+
+impl_flags!(
+    #[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]
+    struct SectionFlags(u32);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SectionFlag {
+        Read = 1 << 0,
+        Write = 1 << 1,
+        Exec = 1 << 2,
+        CacheModeNone = 0 << 3,
+        CacheModeCached = 1 << 3,
+        CacheModeUncachedCoherent = 2 << 3,
+        CacheModeCachedCoherent = 3 << 3,
+        Prot = 1 << 5,
+        Shared = 1 << 30,
+        Zero = 1 << 31,
+    }
+);
+
+const CACHE_MODE_MASK: SectionFlags = SectionFlags(genmask_u32(3..=4));
+
+impl SectionFlags {
+    fn cache_mode(&self) -> SectionFlags {
+        *self & CACHE_MODE_MASK
+    }
+}
+
+impl TryFrom<u32> for SectionFlags {
+    type Error = Error;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        let valid_flags = SectionFlags::from(SectionFlag::Read)
+            | SectionFlags::from(SectionFlag::Write)
+            | SectionFlags::from(SectionFlag::Exec)
+            | CACHE_MODE_MASK
+            | SectionFlags::from(SectionFlag::Prot)
+            | SectionFlags::from(SectionFlag::Shared)
+            | SectionFlags::from(SectionFlag::Zero);
+
+        if value & valid_flags.0 != value {
+            Err(EINVAL)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
 
 /// A parsed firmware section ready for loading into MCU memory.
 ///
