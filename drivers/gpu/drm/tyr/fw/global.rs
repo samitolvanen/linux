@@ -10,9 +10,15 @@
 mod cs;
 mod csg;
 
+use core::ops::Range;
+
 use kernel::{
     clk::Clk,
-    device::Device,
+    device::{
+        Bound,
+        Device, //
+    },
+    drm::gem::shmem::VMapOwned,
     io::{
         register::Array,
         Io,
@@ -51,9 +57,11 @@ use crate::{
             GLB_REQ,
             GLB_VERSION, //
         },
+        irq::JobIrqState,
         region::FwRegion,
         Section, //
     },
+    gem::BoData,
     gpu::GpuInfo,
     regs::doorbell_block::DOORBELL,
     wait::{
@@ -173,34 +181,64 @@ struct InnerGlobalInterface {
     state: GlobalInterfaceState,
 }
 
+/// CPU and MCU views of the CSF shared section, mapped once for the whole interface.
+struct SharedSectionInfo {
+    vmap: Arc<VMapOwned<BoData>>,
+    va_range: Range<u64>,
+}
+
+impl SharedSectionInfo {
+    fn new(shared_section: &Section) -> Result<Self> {
+        Ok(Self {
+            vmap: Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?,
+            va_range: shared_section.mem.va_range().clone(),
+        })
+    }
+}
+
 /// Global CSF Interface
 ///
 /// The CSF controls operations that are common to all CSs.
 #[pin_data]
-pub(crate) struct GlobalInterface {
+pub(crate) struct GlobalInterface<'drm> {
+    dev: &'drm Device<Bound>,
+    shared_section: SharedSectionInfo,
+    gpu_info: GpuInfo,
+    event_wait: Arc<Wait>,
     #[pin]
     inner: Mutex<InnerGlobalInterface>,
 }
 
-impl GlobalInterface {
+impl<'drm> GlobalInterface<'drm> {
     /// Creates a new CSF global interface, initially disabled.
-    pub(crate) fn new() -> impl PinInit<Self, Error> {
-        try_pin_init!(Self {
+    pub(crate) fn new(
+        dev: &'drm Device<Bound>,
+        shared_section: &Section,
+        gpu_info: GpuInfo,
+        irq_state: &JobIrqState,
+    ) -> Result<impl PinInit<Self, Error>> {
+        let shared_section = SharedSectionInfo::new(shared_section)?;
+        let event_wait = irq_state.event_wait_arc();
+
+        Ok(try_pin_init!(Self {
+            dev,
+            shared_section,
+            gpu_info,
+            event_wait,
             inner <- new_mutex!(InnerGlobalInterface::new()),
-        })
+        }))
     }
 
-    pub(crate) fn enable(
-        &self,
-        dev: &Device,
-        iomem: &IoMem<'_>,
-        shared_section: &Section,
-        gpu_info: &GpuInfo,
-        core_clk: &Clk,
-        event_wait: &Wait,
-    ) -> Result {
+    pub(crate) fn enable(&self, core_clk: &Clk, io: &IoMem<'_>) -> Result {
         let mut inner = self.inner.lock();
-        inner.enable(dev, iomem, shared_section, gpu_info, core_clk, event_wait)
+        inner.enable(
+            self.dev,
+            io,
+            &self.shared_section,
+            self.gpu_info,
+            core_clk,
+            &self.event_wait,
+        )
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
@@ -231,17 +269,17 @@ impl InnerGlobalInterface {
         &mut self,
         dev: &Device,
         iomem: &IoMem<'_>,
-        shared_section: &Section,
-        gpu_info: &GpuInfo,
+        shared_section: &SharedSectionInfo,
+        gpu_info: GpuInfo,
         core_clk: &Clk,
         event_wait: &Wait,
     ) -> Result {
-        let vmap = Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?;
-        let va_range = shared_section.mem.va_range();
+        let vmap = &shared_section.vmap;
+        let va_range = &shared_section.va_range;
 
         let glb_control = FwInterface::<Region<GLB_CONTROL_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             va_range.start,
         )?;
@@ -265,7 +303,7 @@ impl InnerGlobalInterface {
         let input_va = glb_control.read(GLB_INPUT_VA);
         let glb_input = FwInterface::<FwRegion<GLB_INPUT_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             input_va.value().get().into(),
         )?;
@@ -273,12 +311,12 @@ impl InnerGlobalInterface {
         let output_va = glb_control.read(GLB_OUTPUT_VA);
         let glb_output = FwInterface::<Region<GLB_OUTPUT_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             output_va.value().get().into(),
         )?;
 
-        Self::configure_glb_input(&glb_input, gpu_info, core_clk)?;
+        Self::configure_glb_input(&glb_input, &gpu_info, core_clk)?;
         let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
 
         // Ring the global doorbell to notify the MCU.
@@ -447,7 +485,7 @@ impl InnerGlobalInterface {
     /// Initialize CSG interfaces.
     ///
     /// This uses the previously read CSG count to create and enable each CSG interface.
-    fn init_csg(&mut self, dev: &Device, shared_section: &Section) -> Result {
+    fn init_csg(&mut self, dev: &Device, shared_section: &SharedSectionInfo) -> Result {
         let enabled = match &mut self.state {
             GlobalInterfaceState::Enabled(e) => e,
             GlobalInterfaceState::Disabled => return Err(EINVAL),

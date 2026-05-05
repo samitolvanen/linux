@@ -12,11 +12,13 @@ use kernel::{
         Io,
         Region, //
     },
-    prelude::*,
-    sync::Arc, //
+    prelude::*, //
 };
 
-use super::cs::CsInterface;
+use super::{
+    cs::CsInterface,
+    SharedSectionInfo, //
+};
 use crate::fw::{
     interfaces::{
         FwInterface,
@@ -32,7 +34,6 @@ use crate::fw::{
         GROUP_SUSPEND_SIZE, //
     },
     region::FwRegion,
-    Section,
     MAX_CS, //
 };
 
@@ -90,15 +91,15 @@ impl CsgInterface {
     /// This calculates the runtime offset of this CSG's control block and creates
     /// a bounded interface to access it. It then reads the input/output interface
     /// addresses from the CSG control block.
-    pub(in super::super) fn enable(
+    pub(super) fn enable(
         &mut self,
         dev: &Device,
-        shared_section: &Section,
+        shared_section: &SharedSectionInfo,
         csg_idx: usize,
         csg_stride: usize,
     ) -> Result {
-        let vmap = Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?;
-        let va_range = shared_section.mem.va_range();
+        let vmap = &shared_section.vmap;
+        let va_range = &shared_section.va_range;
 
         // Calculate the runtime offset for this CSG's control block.
         // The CSG control blocks start at CSG_GROUP_CONTROL_OFFSET from the GLB control block,
@@ -111,7 +112,7 @@ impl CsgInterface {
         // Create a bounded interface for this CSG's control block at the calculated address.
         let csg_control = FwInterface::<Region<CSG_CONTROL_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             csg_control_va,
         )?;
@@ -120,7 +121,7 @@ impl CsgInterface {
         let input_va = csg_control.read(GROUP_INPUT_VA).value().get();
         let csg_input = FwInterface::<FwRegion<CSG_INPUT_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             input_va.into(),
         )?;
@@ -128,7 +129,7 @@ impl CsgInterface {
         let output_va = csg_control.read(GROUP_OUTPUT_VA).value().get();
         let csg_output = FwInterface::<Region<CSG_OUTPUT_BLOCK_SIZE>>::new(
             dev,
-            &vmap,
+            vmap,
             va_range,
             output_va.into(),
         )?;
@@ -180,7 +181,7 @@ impl CsgInterface {
     fn init_cs(
         &mut self,
         dev: &Device,
-        shared_section: &Section,
+        shared_section: &SharedSectionInfo,
         csg_control_offset: usize,
     ) -> Result {
         let enabled = match &mut self.state {

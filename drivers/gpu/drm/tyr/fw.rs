@@ -118,14 +118,15 @@ pub(crate) struct Firmware<'drm> {
     /// MCU VM.
     vm: Arc<Vm>,
 
-    /// List of firmware sections.
+    /// Firmware sections, held to keep their mappings alive while the MCU runs.
+    #[expect(dead_code)]
     sections: KVec<Section>,
 
     /// Firmware IRQ state, including readiness and event wait objects.
     irq_state: irq::JobIrqState,
 
     /// The global FW interface.
-    global_iface: Pin<KBox<GlobalInterface>>,
+    global_iface: Pin<KBox<GlobalInterface<'drm>>>,
 }
 
 impl<'drm> Drop for Firmware<'drm> {
@@ -141,6 +142,20 @@ impl<'drm> Drop for Firmware<'drm> {
 }
 
 impl<'drm> Firmware<'drm> {
+    fn find_shared_section<'a>(dev: &Device, sections: &'a KVec<Section>) -> Result<&'a Section> {
+        sections
+            .iter()
+            .find(|section| section.mem.va_range().start == u64::from(CSF_MCU_SHARED_REGION_START))
+            .ok_or_else(|| {
+                dev_err!(
+                    dev,
+                    "CSF shared section not found at 0x{:08x}",
+                    CSF_MCU_SHARED_REGION_START
+                );
+                EINVAL
+            })
+    }
+
     fn init_section_mem(dev: &Device, mem: &mut KernelBo, data: &KVec<u8>) -> Result {
         if data.is_empty() {
             return Ok(());
@@ -219,13 +234,20 @@ impl<'drm> Firmware<'drm> {
                 sections.push(Section { data, mem }, GFP_KERNEL)?;
             }
 
+            let irq_state = irq::JobIrqState::new()?;
+            let shared_section = Self::find_shared_section(dev, &sections)?;
+            let global_iface = KBox::pin_init(
+                GlobalInterface::new(pdev.as_ref(), shared_section, *gpu_info, &irq_state)?,
+                GFP_KERNEL,
+            )?;
+
             Ok(Firmware {
                 dev: pdev,
                 iomem,
                 vm: vm.clone(),
                 sections,
-                irq_state: irq::JobIrqState::new()?,
-                global_iface: KBox::pin_init(GlobalInterface::new(), GFP_KERNEL)?,
+                irq_state,
+                global_iface,
             })
         })();
 
@@ -234,21 +256,6 @@ impl<'drm> Firmware<'drm> {
         }
 
         result
-    }
-
-    /// Get the shared memory section containing firmware interface structures.
-    pub(crate) fn shared_section(&self) -> Result<&Section> {
-        self.sections
-            .iter()
-            .find(|section| section.mem.va_range().start == u64::from(CSF_MCU_SHARED_REGION_START))
-            .ok_or_else(|| {
-                dev_err!(
-                    self.dev,
-                    "CSF shared section not found at 0x{:08x}",
-                    CSF_MCU_SHARED_REGION_START
-                );
-                EINVAL
-            })
     }
 
     pub(crate) fn boot(&self, io: &IoMem<'_>) -> Result {
@@ -295,21 +302,8 @@ impl<'drm> Firmware<'drm> {
     }
 
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(
-        &self,
-        gpu_info: &GpuInfo,
-        core_clk: &Clk,
-        io: &IoMem<'_>,
-    ) -> Result {
-        let shared_section = self.shared_section()?;
-        self.global_iface.enable(
-            self.vm.dev(),
-            io,
-            shared_section,
-            gpu_info,
-            core_clk,
-            self.irq_state.event_wait(),
-        )
+    pub(crate) fn enable_global_interface(&self, core_clk: &Clk, io: &IoMem<'_>) -> Result {
+        self.global_iface.enable(core_clk, io)
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
