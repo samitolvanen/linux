@@ -233,16 +233,11 @@ impl Firmware {
         kernel::firmware::Firmware::request(&path, ddev.as_ref())
     }
 
-    fn load(
-        ddev: &TyrDrmDevice<Uninit>,
-        gpu_info: &GpuInfo,
-    ) -> Result<(kernel::firmware::Firmware, KVec<ParsedSection>)> {
+    fn load(ddev: &TyrDrmDevice<Uninit>, gpu_info: &GpuInfo) -> Result<KVec<ParsedSection>> {
         let fw = Self::request(ddev, gpu_info)?;
         let mut parser = FwParser::new(fw.data());
 
-        let parsed_sections = parser.parse()?;
-
-        Ok((fw, parsed_sections))
+        parser.parse()
     }
 
     /// Load firmware and map sections into MCU VM.
@@ -255,31 +250,27 @@ impl Firmware {
     ) -> Result<Arc<Firmware>> {
         let vm = Vm::new(pdev, ddev, mmu, gpu_info)?;
 
-        let (fw, parsed_sections) = Self::load(ddev, gpu_info)?;
+        let parsed_sections = Self::load(ddev, gpu_info)?;
 
         vm.activate()?;
 
         let mut sections = KVec::new();
         for parsed in parsed_sections {
-            let size = (parsed.va.end - parsed.va.start) as usize;
-            let va = u64::from(parsed.va.start);
+            let ParsedSection {
+                data,
+                va,
+                vm_map_flags,
+            } = parsed;
+            let size = (va.end - va.start) as usize;
+            let va = u64::from(va.start);
 
             let mut mem = KernelBo::new(
                 ddev,
                 vm.as_arc_borrow(),
                 size.try_into().unwrap(),
                 KernelBoVaAlloc::Explicit(va),
-                parsed.vm_map_flags,
+                vm_map_flags,
             )?;
-
-            let section_start = parsed.data_range.start as usize;
-            let section_end = parsed.data_range.end as usize;
-            let mut data = KVec::new();
-
-            // Ensure that the firmware slice is not out of bounds.
-            let fw_data = fw.data();
-            let bytes = fw_data.get(section_start..section_end).ok_or(EINVAL)?;
-            data.extend_from_slice(bytes, GFP_KERNEL)?;
 
             Self::init_section_mem(&mut mem, &data)?;
 
