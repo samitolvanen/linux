@@ -14,6 +14,7 @@ use kernel::{
     kvec,
     prelude::*,
     sync::Arc,
+    uapi,
     uapi::{
         SZ_128K,
         SZ_8M,
@@ -83,6 +84,63 @@ pub(crate) struct CreatedContext {
     pub(crate) context_id: usize,
     pub(crate) context_gpu_va: u64,
     pub(crate) first_chunk_gpu_va: u64,
+}
+
+pub(crate) struct Pools {
+    entries: Pin<KBox<XArray<Arc<Pool>>>>,
+}
+
+impl Pools {
+    pub(crate) fn create() -> Result<Self> {
+        let entries = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
+
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn get_pool(&self, vm_id: usize) -> Option<Arc<Pool>> {
+        let xa = self.entries.as_ref();
+        let guard = xa.lock();
+        let pool = guard.get(vm_id)?;
+
+        Some(pool.into())
+    }
+
+    fn get_or_create_pool(&self, tdev: &TyrDrmDevice, vm_id: usize, vm: Arc<Vm>) -> Result<Arc<Pool>> {
+        if let Some(pool) = self.get_pool(vm_id) {
+            return Ok(pool);
+        }
+
+        let pool = Arc::new(Pool::create(tdev, vm)?, GFP_KERNEL)?;
+        let xa = self.entries.as_ref();
+        let mut guard = xa.lock();
+        guard.store(vm_id, pool.clone(), GFP_KERNEL).map_err(|_| EINVAL)?;
+
+        Ok(pool)
+    }
+
+    pub(crate) fn create_context(
+        &self,
+        tdev: &TyrDrmDevice,
+        vm_id: usize,
+        vm: Arc<Vm>,
+        heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
+    ) -> Result {
+        let args = ContextCreateArgs {
+            initial_chunk_count: heapcreate.initial_chunk_count,
+            chunk_size: heapcreate.chunk_size,
+            max_chunks: heapcreate.max_chunks,
+            target_in_flight: heapcreate.target_in_flight,
+        };
+
+        let pool = self.get_or_create_pool(tdev, vm_id, vm)?;
+        let created_context = pool.create_heap_context(tdev, args)?;
+
+        heapcreate.handle = heapcreate.vm_id << 16 | created_context.context_id as u32;
+        heapcreate.tiler_heap_ctx_gpu_va = created_context.context_gpu_va;
+        heapcreate.first_heap_chunk_gpu_va = created_context.first_chunk_gpu_va;
+
+        Ok(())
+    }
 }
 
 struct Context {
