@@ -11,6 +11,7 @@ use kernel::{
     prelude::*,
 };
 
+use super::SharedSectionInfo;
 use crate::fw::{
     interfaces::{
         FwInterface,
@@ -21,7 +22,6 @@ use crate::fw::{
         CS_KERNEL_INPUT_BLOCK_SIZE,
         CS_KERNEL_OUTPUT_BLOCK_SIZE,
     },
-    Section,
 };
 
 /// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
@@ -56,27 +56,35 @@ impl CsInterface {
 
     pub(super) fn enable(
         &mut self,
-        shared_section: &Section,
+        shared_section: &SharedSectionInfo,
         csg_control_offset: usize,
         cs_idx: usize,
         cs_stride: usize,
     ) -> Result {
-        let vmap = shared_section.mem.bo.owned_vmap::<0>()?;
-        let va_range = shared_section.mem.va_range();
-
         let cs_control_offset = CS_CONTROL_OFFSET + cs_idx * cs_stride;
-        let cs_control_va = va_range.start + csg_control_offset as u64 + cs_control_offset as u64;
+        let cs_control_va = shared_section.va_range.start
+            + csg_control_offset as u64
+            + cs_control_offset as u64;
 
-        let cs_control =
-            FwInterface::<CS_CONTROL_BLOCK_SIZE>::new(&vmap, &va_range, cs_control_va)?;
+        let cs_control = FwInterface::<CS_CONTROL_BLOCK_SIZE>::new(
+            &shared_section.vmap,
+            &shared_section.va_range,
+            cs_control_va,
+        )?;
 
         let input_va = cs_control.read(STREAM_INPUT_VA).value().get();
-        let cs_input =
-            FwInterface::<CS_KERNEL_INPUT_BLOCK_SIZE>::new(&vmap, &va_range, input_va.into())?;
+        let cs_input = FwInterface::<CS_KERNEL_INPUT_BLOCK_SIZE>::new(
+            &shared_section.vmap,
+            &shared_section.va_range,
+            input_va.into(),
+        )?;
 
         let output_va = cs_control.read(STREAM_OUTPUT_VA).value().get();
-        let cs_output =
-            FwInterface::<CS_KERNEL_OUTPUT_BLOCK_SIZE>::new(&vmap, &va_range, output_va.into())?;
+        let cs_output = FwInterface::<CS_KERNEL_OUTPUT_BLOCK_SIZE>::new(
+            &shared_section.vmap,
+            &shared_section.va_range,
+            output_va.into(),
+        )?;
 
         self.state = CsInterfaceState::Enabled(EnabledCsInterface {
             cs_control,

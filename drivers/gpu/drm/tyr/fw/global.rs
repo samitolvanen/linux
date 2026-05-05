@@ -10,6 +10,8 @@
 mod cs;
 mod csg;
 
+use core::ops::Range;
+
 use crate::{
 	driver::IoMem,
 	fw::{
@@ -32,9 +34,11 @@ use crate::{
 			GLB_VERSION,
 			CSG_CONTROL_BLOCK_SIZE,
 		},
+		irq::JobIrqState,
 		Section,
 		MAX_CSG,
 	},
+	gem::BoData,
 	gpu::GpuInfo,
 	regs::doorbell_block::DOORBELL,
 	wait::Wait,
@@ -43,6 +47,7 @@ use kernel::{
 	bindings::SZ_1K,
 	clk::Clk,
 	devres::Devres,
+	drm::gem::shmem::VMapOwned,
 	io::{
 		register::Array,
 		Io,
@@ -51,7 +56,11 @@ use kernel::{
 	num::Bounded,
 	platform,
 	prelude::*,
-	sync::Mutex,
+	sync::{
+		aref::ARef,
+		Arc,
+		Mutex,
+	},
 	time::arch_timer_get_rate,
 };
 
@@ -143,32 +152,64 @@ struct InnerGlobalInterface {
 	state: GlobalInterfaceState,
 }
 
+struct SharedSectionInfo {
+	vmap: VMapOwned<BoData>,
+	va_range: Range<u64>,
+}
+
+impl SharedSectionInfo {
+	fn new(shared_section: &Section) -> Result<Self> {
+		Ok(Self {
+			vmap: shared_section.mem.bo.owned_vmap::<0>()?,
+			va_range: shared_section.mem.va_range(),
+		})
+	}
+}
+
 #[pin_data]
 pub(crate) struct GlobalInterface {
+	pdev: ARef<platform::Device>,
+	iomem: Arc<Devres<IoMem>>,
+	shared_section: SharedSectionInfo,
+	gpu_info: GpuInfo,
+	event_wait: Arc<Wait>,
 	#[pin]
 	inner: Mutex<InnerGlobalInterface>,
 }
 
 impl GlobalInterface {
-	pub(crate) fn new() -> impl PinInit<Self, Error> {
+	pub(crate) fn new(
+		pdev: &platform::Device,
+		iomem: Arc<Devres<IoMem>>,
+		shared_section: &Section,
+		gpu_info: GpuInfo,
+		irq_state: &JobIrqState,
+	) -> Result<impl PinInit<Self, Error>> {
 		let inner = InnerGlobalInterface::new();
+		let pdev: ARef<platform::Device> = pdev.into();
+		let shared_section = SharedSectionInfo::new(shared_section)?;
+		let event_wait = irq_state.event_wait_arc();
 
-		try_pin_init!(Self {
+		Ok(try_pin_init!(Self {
+			pdev,
+			iomem,
+			shared_section,
+			gpu_info,
+			event_wait,
 			inner <- new_mutex!(inner),
-		})
+		}))
 	}
 
-	pub(crate) fn enable(
-		&self,
-		pdev: &platform::Device,
-		iomem: &Devres<IoMem>,
-		shared_section: &Section,
-		gpu_info: &GpuInfo,
-		core_clk: &Clk,
-		event_wait: &Wait,
-	) -> Result {
+	pub(crate) fn enable(&self, core_clk: &Clk) -> Result {
 		let mut inner = self.inner.lock();
-		inner.enable(pdev, iomem, shared_section, gpu_info, core_clk, event_wait)
+		inner.enable(
+			&self.pdev,
+			self.iomem.as_ref(),
+			&self.shared_section,
+			self.gpu_info,
+			core_clk,
+			self.event_wait.as_ref(),
+		)
 	}
 
 	pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
@@ -193,16 +234,17 @@ impl InnerGlobalInterface {
 		&mut self,
 		pdev: &platform::Device,
 		iomem: &Devres<IoMem>,
-		shared_section: &Section,
-		gpu_info: &GpuInfo,
+		shared_section: &SharedSectionInfo,
+		gpu_info: GpuInfo,
 		core_clk: &Clk,
 		event_wait: &Wait,
 	) -> Result {
-		let vmap = shared_section.mem.bo.owned_vmap::<0>()?;
-		let va_range = shared_section.mem.va_range();
-
 		let glb_control =
-			FwInterface::<GLB_CONTROL_BLOCK_SIZE>::new(&vmap, &va_range, va_range.start)?;
+			FwInterface::<GLB_CONTROL_BLOCK_SIZE>::new(
+				&shared_section.vmap,
+				&shared_section.va_range,
+				shared_section.va_range.start,
+			)?;
 
 		let version = glb_control.read(GLB_VERSION);
 		if version.major().get() == 0 {
@@ -218,19 +260,19 @@ impl InnerGlobalInterface {
 
 		let input_va = glb_control.read(GLB_INPUT_VA);
 		let glb_input = FwInterface::<GLB_INPUT_BLOCK_SIZE>::new(
-			&vmap,
-			&va_range,
+			&shared_section.vmap,
+			&shared_section.va_range,
 			input_va.value().get().into(),
 		)?;
 
 		let output_va = glb_control.read(GLB_OUTPUT_VA);
 		let glb_output = FwInterface::<GLB_OUTPUT_BLOCK_SIZE>::new(
-			&vmap,
-			&va_range,
+			&shared_section.vmap,
+			&shared_section.va_range,
 			output_va.value().get().into(),
 		)?;
 
-		Self::configure_glb_input(&glb_input, gpu_info, core_clk)?;
+		Self::configure_glb_input(&glb_input, &gpu_info, core_clk)?;
 		let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
 
 		// SAFETY: Called during probe after the device has been successfully bound,
@@ -355,7 +397,7 @@ impl InnerGlobalInterface {
 			.with_counter_enable(true))
 	}
 
-	fn init_csg(&mut self, shared_section: &Section) -> Result {
+	fn init_csg(&mut self, shared_section: &SharedSectionInfo) -> Result {
 		let enabled = match &mut self.state {
 			GlobalInterfaceState::Enabled(enabled) => enabled,
 			GlobalInterfaceState::Disabled => return Err(EINVAL),

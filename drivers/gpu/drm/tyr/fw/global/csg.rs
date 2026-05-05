@@ -11,7 +11,10 @@ use kernel::{
     prelude::*,
 };
 
-use super::cs::CsInterface;
+use super::{
+    cs::CsInterface,
+    SharedSectionInfo,
+};
 use crate::fw::{
     interfaces::{
         FwInterface,
@@ -26,7 +29,6 @@ use crate::fw::{
         CSG_OUTPUT_BLOCK_SIZE,
         CS_CONTROL_BLOCK_SIZE,
     },
-    Section,
     MAX_CS,
 };
 
@@ -63,28 +65,35 @@ impl CsgInterface {
         })
     }
 
-    pub(in super::super) fn enable(
+    pub(super) fn enable(
         &mut self,
-        shared_section: &Section,
+        shared_section: &SharedSectionInfo,
         csg_idx: usize,
         csg_stride: usize,
     ) -> Result {
-        let vmap = shared_section.mem.bo.owned_vmap::<0>()?;
-        let va_range = shared_section.mem.va_range();
-
         let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
-        let csg_control_va = va_range.start + csg_control_offset as u64;
+        let csg_control_va = shared_section.va_range.start + csg_control_offset as u64;
 
         let csg_control =
-            FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(&vmap, &va_range, csg_control_va)?;
+            FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(
+                &shared_section.vmap,
+                &shared_section.va_range,
+                csg_control_va,
+            )?;
 
         let input_va = csg_control.read(GROUP_INPUT_VA).value().get();
-        let csg_input =
-            FwInterface::<CSG_INPUT_BLOCK_SIZE>::new(&vmap, &va_range, input_va.into())?;
+        let csg_input = FwInterface::<CSG_INPUT_BLOCK_SIZE>::new(
+            &shared_section.vmap,
+            &shared_section.va_range,
+            input_va.into(),
+        )?;
 
         let output_va = csg_control.read(GROUP_OUTPUT_VA).value().get();
-        let csg_output =
-            FwInterface::<CSG_OUTPUT_BLOCK_SIZE>::new(&vmap, &va_range, output_va.into())?;
+        let csg_output = FwInterface::<CSG_OUTPUT_BLOCK_SIZE>::new(
+            &shared_section.vmap,
+            &shared_section.va_range,
+            output_va.into(),
+        )?;
 
         let cs_stride = csg_control.read(GROUP_STREAM_STRIDE).value().get() as usize;
         if cs_stride < CS_CONTROL_BLOCK_SIZE {
@@ -118,7 +127,7 @@ impl CsgInterface {
         self.init_cs(shared_section, csg_control_offset)
     }
 
-    fn init_cs(&mut self, shared_section: &Section, csg_control_offset: usize) -> Result {
+    fn init_cs(&mut self, shared_section: &SharedSectionInfo, csg_control_offset: usize) -> Result {
         let enabled = match &mut self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),

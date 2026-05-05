@@ -66,8 +66,8 @@ impl JobIrqState {
         })
     }
 
-    pub(crate) fn event_wait(&self) -> &Wait {
-        self.event_wait.as_ref()
+    pub(crate) fn event_wait_arc(&self) -> Arc<Wait> {
+        self.event_wait.clone()
     }
 
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
