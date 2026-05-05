@@ -7,8 +7,14 @@
 //! UAPI parsing layer.
 
 use kernel::{
+    drm::syncobj::SyncObj,
     prelude::*,
     uapi, //
+};
+
+use crate::{
+    driver::TyrDrmDriver,
+    file::TyrDrmFile, //
 };
 
 #[repr(i32)]
@@ -23,14 +29,12 @@ pub(crate) enum SyncHandle {
 }
 
 impl SyncHandle {
-    #[expect(dead_code)]
     pub(crate) fn handle(&self) -> u32 {
         match self {
             Self::Binary { handle } | Self::Timeline { handle, .. } => *handle,
         }
     }
 
-    #[expect(dead_code)]
     pub(crate) fn timeline_value(&self) -> u64 {
         match self {
             Self::Binary { .. } => 0,
@@ -41,12 +45,10 @@ impl SyncHandle {
 
 pub(crate) struct SyncOp {
     pub(crate) ty: SyncOpType,
-    #[expect(dead_code)]
     pub(crate) handle: SyncHandle,
 }
 
 impl SyncOp {
-    #[expect(dead_code)]
     pub(crate) fn is_signal(&self) -> bool {
         matches!(self.ty, SyncOpType::Signal)
     }
@@ -106,4 +108,23 @@ impl TryFrom<&uapi::drm_panthor_sync_op> for SyncOp {
 
         Ok(Self { ty, handle })
     }
+}
+
+pub(crate) fn wait_for_syncops(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result {
+    if syncops.iter().any(SyncOp::is_signal) {
+        return Err(ENOTSUPP);
+    }
+
+    for sync in syncops.iter() {
+        let fence = SyncObj::<TyrDrmDriver>::find_fence(
+            file,
+            sync.handle.handle(),
+            sync.handle.timeline_value(),
+            0,
+        )?
+        .ok_or(EINVAL)?;
+        fence.wait()?;
+    }
+
+    Ok(())
 }
