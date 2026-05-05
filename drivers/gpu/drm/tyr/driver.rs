@@ -59,7 +59,10 @@ use crate::{
     gem::BoData,
     gpu,
     gpu::GpuInfo,
-    mmu::Mmu,
+    mmu::{
+        irq::mmu_irq_init,
+        Mmu,
+    },
     sched::Scheduler,
     sched::SchedulerState,
     regs::gpu_control::*, //
@@ -224,6 +227,13 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
+
+        let mmu_irq = mmu_irq_init(
+            tdev.clone(),
+            pdev,
+            tdev.iomem.clone(),
+        )?;
+        devres::register(pdev.as_ref(), mmu_irq, GFP_KERNEL)?;
 
         let job_irq = job_irq_init(
             tdev.clone(),
