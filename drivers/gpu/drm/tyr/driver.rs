@@ -15,6 +15,7 @@ use kernel::{
         Device as DmaDevice,
         DmaMask, //
     },
+    dma_buf::dma_fence::DmaFenceWorkqueue,
     drm,
     drm::ioctl,
     io::{
@@ -129,6 +130,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// MMU IRQ registration. Freed after `mmu`, so faults raised during teardown are still
     /// reported.
     _mmu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>>>,
+
+    /// Workqueue for work items that may signal DMA fences.
+    pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -262,12 +266,18 @@ impl platform::Driver for TyrPlatformDriver {
 
         let csif_info = unreg_dev.sched.lock().init(&unreg_dev, &firmware)?;
 
+        let wq = Arc::new(
+            DmaFenceWorkqueue::new_unbound(c"tyr-dma-fence")?,
+            GFP_KERNEL,
+        )?;
+
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
                 mmu,
                 fw: firmware,
                 _job_irq: job_irq,
                 _mmu_irq: mmu_irq,
+                wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
