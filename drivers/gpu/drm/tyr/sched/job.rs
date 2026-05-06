@@ -16,6 +16,85 @@ use kernel::{
 
 use crate::sched::group::Group;
 
+/// Encoder for Mali CSF command-stream instructions used by the
+/// kernel-side submit path. Opcodes match the Mali CSF programming manual.
+pub(crate) struct Instr;
+
+impl Instr {
+    // Mali CSF opcodes.
+    const MOV48: u64 = 1;
+    const MOV32: u64 = 2;
+    const WAIT: u64 = 3;
+    const CALL: u64 = 32;
+    const FLUSH_CACHE2: u64 = 36;
+    const ERROR_BARRIER: u64 = 47;
+    const SYNC_ADD64: u64 = 51;
+
+    /// `MOV32 reg, val` — load the low 32 bits of `val` into `reg`.
+    pub(crate) fn mov32(reg: u64, val: u64) -> u64 {
+        (Self::MOV32 << 56) | (reg << 48) | (val & 0xFFFF_FFFF)
+    }
+
+    /// `MOV48 reg, val` — load the low 48 bits of `val` into `reg`.
+    /// Used to splat 48-bit GPU addresses in a single instruction.
+    pub(crate) fn mov48(reg: u64, val: u64) -> u64 {
+        (Self::MOV48 << 56) | (reg << 48) | (val & 0xFFFF_FFFF_FFFF)
+    }
+
+    /// `FLUSH_CACHE2 reg` — flush the GPU caches against the
+    /// LATEST_FLUSH counter held in `reg`.  L2 and LSC are
+    /// clean-invalidated; other caches are invalidated only.
+    pub(crate) fn flush_cache2(reg: u64) -> u64 {
+        const L2_CLEAN_INVALIDATE: u64 = 3;
+        const LSC_CLEAN_INVALIDATE: u64 = 3;
+        const OTHER_INVALIDATE: u64 = 2;
+
+        let flush_modes =
+            (OTHER_INVALIDATE << 8) | (LSC_CLEAN_INVALIDATE << 4) | L2_CLEAN_INVALIDATE;
+
+        (Self::FLUSH_CACHE2 << 56) | (reg << 40) | flush_modes
+    }
+
+    /// `WAIT mask` — block the command stream until every scoreboard
+    /// entry indicated by `mask` has retired.
+    pub(crate) fn wait(mask: u64) -> u64 {
+        (Self::WAIT << 56) | (mask << 16)
+    }
+
+    /// `CALL addr_reg, size_reg` — call into the indirect command
+    /// buffer whose base is in `addr_reg` and whose length is in
+    /// `size_reg`.
+    pub(crate) fn call(addr_reg: u64, size_reg: u64) -> u64 {
+        (Self::CALL << 56) | (addr_reg << 40) | (size_reg << 32)
+    }
+
+    /// `SYNC_ADD64 *addr_reg += val_reg`. Error-propagating so a
+    /// prior fault surfaces in the sync status word.
+    pub(crate) fn sync_add64(addr_reg: u64, val_reg: u64) -> u64 {
+        // No scoreboard wait — a prior `WAIT` already drained.
+        const SB_ENTRY: u64 = 0;
+        const SB_MASK: u64 = 0;
+        const SCOPE: u64 = 0;
+        // Surface a prior fault in the sync status word.
+        const ERR_PROPAGATE: u64 = 1;
+
+        (Self::SYNC_ADD64 << 56)
+            | (SB_ENTRY << 48)
+            | (addr_reg << 40)
+            | (val_reg << 32)
+            | (SB_MASK << 16)
+            | (SCOPE << 1)
+            | ERR_PROPAGATE
+    }
+
+    /// `ERROR_BARRIER` — terminate any pending error propagation so a
+    /// later [`sync_add64`](Self::sync_add64) does not inherit a stale
+    /// error state.
+    pub(crate) fn error_barrier() -> u64 {
+        Self::ERROR_BARRIER << 56
+    }
+}
+
 pub(crate) struct Job {
     /// The group whose queue this job will be pushed to.
     group: Arc<Group>,
@@ -75,56 +154,19 @@ impl Job {
 
         let addr_reg = 92;
         let val_reg = 94;
-
-        let opcode = 2; // MOV32
-        let latest_flush_regnum = val_reg;
-        let latest_flush: u64 = self.latest_flush.into();
-        let mov_latest_flush: u64 = opcode << 56 | latest_flush_regnum << 48 | latest_flush;
-
-        let opcode = 36; //FLUSH_CACHE2
-        let flush_cache: u64 = opcode << 56 | 0 << 48 | latest_flush_regnum << 40 | 0 << 16 | 0x233;
-
-        let opcode = 1; // MOV48
-        let cs_start_regnum = addr_reg;
-        let mov_cs_start: u64 = opcode << 56 | cs_start_regnum << 48 | self.stream_addr;
-
-        let opcode = 2; // MOV32
-        let cs_size_regnum = val_reg;
-        let mov_cs_size: u64 = opcode << 56 | cs_size_regnum << 48 | u64::from(self.stream_size);
-
-        let opcode = 3;
-        let wait0: u64 = opcode << 56 | (1 << 16); // WAIT(0)
-
-        let opcode = 32; // CALL
-        let call: u64 = opcode << 56 | cs_start_regnum << 40 | cs_size_regnum << 32;
-
-        let opcode = 1; // MOV48
-        let sync_addr_regnum = addr_reg;
-        let mov_sync_addr: u64 = opcode << 56 | sync_addr_regnum << 48 | self.sync_addr;
-
-        let opcode = 1; // MOV48
-        let sync_val_regnum = val_reg;
-        let mov_sync_val: u64 = opcode << 56 | sync_val_regnum << 48 | 1;
-
-        let opcode = 3; // WAIT(all)
         let wait_all_mask = genmask_u64(0..=7);
-        let wait_all: u64 = opcode << 56 | wait_all_mask << 16;
 
-        let opcode = 51; // SYNC_ADD64
-        let sync_sb_entry = 0;
-        let sync_sb_mask = 0;
-        let sync_scope = 0;
-        let sync_err_propagate = 1;
-        let sync_add: u64 = opcode << 56
-            | sync_sb_entry << 48
-            | sync_addr_regnum << 40
-            | sync_val_regnum << 32
-            | sync_sb_mask << 16
-            | sync_scope << 1
-            | sync_err_propagate;
-
-        let opcode = 47; // ERROR_BARRIER
-        let error_barrier: u64 = opcode << 56;
+        let mov_latest_flush = Instr::mov32(val_reg, self.latest_flush.into());
+        let flush_cache = Instr::flush_cache2(val_reg);
+        let mov_cs_start = Instr::mov48(addr_reg, self.stream_addr);
+        let mov_cs_size = Instr::mov32(val_reg, self.stream_size.into());
+        let wait0 = Instr::wait(1);
+        let call = Instr::call(addr_reg, val_reg);
+        let mov_sync_addr = Instr::mov48(addr_reg, self.sync_addr);
+        let mov_sync_val = Instr::mov48(val_reg, 1);
+        let wait_all = Instr::wait(wait_all_mask);
+        let sync_add = Instr::sync_add64(addr_reg, val_reg);
+        let error_barrier = Instr::error_barrier();
 
         instrs.extend_from_slice(&mov_latest_flush.to_le_bytes(), GFP_KERNEL)?;
         instrs.extend_from_slice(&flush_cache.to_le_bytes(), GFP_KERNEL)?;
