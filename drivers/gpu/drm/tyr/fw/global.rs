@@ -89,11 +89,11 @@ pub(crate) mod constants {
     pub(super) const GLB_PROTM_EXIT: u32 = bit_u32(23);
     pub(super) const GLB_PERFCNT_THRESHOLD: u32 = bit_u32(24);
     pub(super) const GLB_PERFCNT_OVERFLOW: u32 = bit_u32(25);
-    pub(super) const GLB_IDLE: u32 = bit_u32(26);
+    pub(crate) const GLB_IDLE: u32 = bit_u32(26);
     pub(super) const GLB_DBG_CSF: u32 = bit_u32(30);
     pub(super) const GLB_DBG_HOST: u32 = bit_u32(31);
     pub(super) const GLB_REQ_MASK: u32 = genmask_u32(0..=10);
-    pub(super) const GLB_EVT_MASK: u32 = genmask_u32(20..=26);
+    pub(crate) const GLB_EVT_MASK: u32 = genmask_u32(20..=26);
 
     pub(super) const PING_INTERVAL_MS: i64 = 12000;
 }
@@ -501,6 +501,22 @@ impl GlobalInterface {
             doorbell_reg,
             doorbell_block::DOORBELL::zeroed().with_ring(true),
         );
+        Ok(())
+    }
+
+    /// Toggles the per-CSG doorbell-request bits in `mask` and rings the
+    /// global doorbell.
+    ///
+    /// `mask` is a bitmap indexed by CSG slot, with one bit per slot the
+    /// caller wants to wake up.  Each bit is XOR-toggled in the firmware
+    /// `doorbell_req` register and a single global doorbell is rung,
+    /// which is sufficient for the firmware to observe the new request
+    /// state for every selected CSG.
+    #[expect(dead_code)]
+    pub(crate) fn ring_csg_doorbells(&self, mask: u32) -> Result {
+        self.doorbell_request()?.toggle_reqs(mask)?;
+        self.ring_glb_doorbell()?;
+
         Ok(())
     }
 

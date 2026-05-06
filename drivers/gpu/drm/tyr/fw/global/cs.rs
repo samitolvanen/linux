@@ -466,25 +466,25 @@ pub(crate) enum StreamState {
 pub(crate) struct StatusWait {
     /// Mask denoting which scoreboard entries are being waited on by this
     /// command stream.
-    sb_mask: u32,
+    pub(crate) sb_mask: u32,
 
     /// Source of the scoreboard wait status, if any.
-    sb_source: u32,
+    pub(crate) sb_source: u32,
 
     /// Whether the condition is a greater-than comparison.
-    gt: bool,
+    pub(crate) gt: bool,
 
     /// Whether the command stream is waiting for a PROGRESS_WAIT instruction.
-    progress_wait: bool,
+    pub(crate) progress_wait: bool,
 
     /// Whether the command stream is waiting for protected mode execution.
-    protm_pend: bool,
+    pub(crate) protm_pend: bool,
 
     /// Whether the sync object is 32 or 64 bits wide.
-    sync64: bool,
+    pub(crate) sync64: bool,
 
     /// Whether the command stream is waiting for a SYNC_WAIT instruction.
-    sync_wait: bool,
+    pub(crate) sync_wait: bool,
 }
 
 pub(crate) enum BlockedReason {
