@@ -7,11 +7,28 @@ use core::ops::{
 
 use kernel::{
     alloc::KVec,
+    bindings,
     dma_buf::dma_fence::{
         DmaFenceSignallingAnnotation,
+        DmaFenceWorkqueue,
         DriverDmaFence,
         DriverDmaFenceOps,
+        PublicDmaFence,
         Published, //
+    },
+    drm::{
+        job_queue::{
+            JobQueue,
+            JobQueueLockClasses,
+            JobRef,
+            PipelineBuilder,
+            PreparedJob,
+            QueueOps,
+            StageAdvance,
+            StageContext,
+            StageOps,
+            SubmitResult, //
+        }, //
     },
     io::{
         mem::DevresIoMem,
@@ -27,16 +44,24 @@ use kernel::{
         SZ_64K, //
     },
     sync::{
+        aref::ARef,
         atomic::{
+            Acquire,
             Atomic,
-            Relaxed, //
+            Relaxed,
+            Release, //
         },
         barrier::{
             smp_mb,
             Write, //
         },
         Arc,
+        LockClassKey,
         Mutex, //
+    },
+    time::{
+        msecs_to_jiffies,
+        Jiffies, //
     },
     transmute::FromBytes,
     uapi, //
@@ -57,6 +82,24 @@ use crate::{
 };
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
+const JOB_POLL_INTERVAL_MS: u32 = 1;
+const JOB_TIMEOUT_MS: u32 = 5000;
+
+// SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
+// static is never dropped.
+static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: See above.
+static TYR_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: See above.
+static TYR_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: See above.
+static TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: See above.
+static TYR_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: See above.
+static TYR_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: See above.
+static TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 #[repr(transparent)]
 pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
@@ -199,7 +242,6 @@ impl QueueData {
         )
     }
 
-    #[expect(dead_code)]
     fn reserve_pending_submit_fence(&self) -> Result {
         self.pending_submit_fences
             .lock()
@@ -207,7 +249,6 @@ impl QueueData {
             .map_err(Error::from)
     }
 
-    #[expect(dead_code)]
     fn add_pending_submit_fence(
         &self,
         completion_point: u64,
@@ -228,7 +269,6 @@ impl QueueData {
         }
     }
 
-    #[expect(dead_code)]
     fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
         loop {
             let pending_fence = {
@@ -250,7 +290,163 @@ impl QueueData {
             pending_fence.fence.signal(result);
         }
     }
+
+    fn signal_submit_fence(&self, completion_point: u64, result: Result) -> bool {
+        let pending_fence = {
+            let mut pending = self.pending_submit_fences.lock();
+            let mut position = None;
+
+            for (index, pending_fence) in pending.iter().enumerate() {
+                if pending_fence.completion_point == completion_point {
+                    position = Some(index);
+                    break;
+                }
+            }
+
+            position.and_then(|index| pending.remove(index).ok())
+        };
+
+        let Some(pending_fence) = pending_fence else {
+            return false;
+        };
+
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        pending_fence.fence.signal(result);
+        true
+    }
+
+    fn complete_submit_fences(&self) -> Result {
+        let ringbuf_output = self.interfaces.read_output()?;
+        self.signal_submit_fences_up_to(ringbuf_output.extract, Ok(()));
+        Ok(())
+    }
 }
+
+pub(super) struct TyrQueueOps {
+    data: Arc<QueueData>,
+}
+
+impl QueueOps for TyrQueueOps {
+    type Job = QueueJob;
+    type FenceData = QueueFenceData;
+
+    fn lock_classes() -> JobQueueLockClasses {
+        JobQueueLockClasses {
+            inbox: &TYR_QUEUE_INBOX_LOCK_CLASS,
+            state: &TYR_QUEUE_STATE_LOCK_CLASS,
+            work: &TYR_QUEUE_WORK_LOCK_CLASS,
+            cleanup_work: &TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS,
+            stage_work: &TYR_QUEUE_STAGE_WORK_LOCK_CLASS,
+            stage_timer: &TYR_QUEUE_STAGE_TIMER_LOCK_CLASS,
+            driver_fence: &TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS,
+        }
+    }
+
+    fn submit(
+        &self,
+        job: &JobRef<'_, Self::Job>,
+        fence: DriverDmaFence<Self::FenceData, Published>,
+        _wq: &DmaFenceWorkqueue,
+    ) -> Result<SubmitResult<Self::FenceData>> {
+        if job.job.stream.is_empty() {
+            fence.signal(Ok(()));
+            return Ok(SubmitResult::Submitted);
+        }
+
+        if self.data.doorbell_id().is_none() {
+            return Ok(SubmitResult::NoResources(fence));
+        }
+
+        if job.job.stream.len() > self.data.ringbuf.vmap().size() {
+            fence.signal(Err(ENOSPC));
+            return Err(ENOSPC);
+        }
+
+        if let Err(err) = self.data.can_append(job.job.stream.len()) {
+            if err == ENOSPC {
+                return Ok(SubmitResult::NoResources(fence));
+            }
+
+            fence.signal(Err(err));
+            return Err(err);
+        }
+
+        if let Err(err) = self.data.reserve_pending_submit_fence() {
+            fence.signal(Err(err));
+            return Err(err);
+        }
+
+        let completion_point = match self.data.append_instrs(&job.job.stream) {
+            Ok(completion_point) => completion_point,
+            Err(err) => {
+                fence.signal(Err(err));
+                return Err(err);
+            }
+        };
+
+        job.job.set_completion_point(completion_point);
+
+        if let Err((err, fence)) = self.data.add_pending_submit_fence(completion_point, fence) {
+            fence.signal(Err(err));
+            return Err(err);
+        }
+
+        if let Err(err) = self.data.kick() {
+            self.data.signal_submit_fence(completion_point, Err(err));
+            return Err(err);
+        }
+
+        Ok(SubmitResult::Submitted)
+    }
+}
+
+struct QueueCompletionStage {
+    data: Arc<QueueData>,
+    poll_interval: Jiffies,
+    timeout: Jiffies,
+}
+
+impl StageOps<TyrQueueOps> for QueueCompletionStage {
+    fn process(&self, ctx: &StageContext<'_, TyrQueueOps>) -> StageAdvance {
+        if ctx.submit_fence.is_signaled() {
+            return StageAdvance::Advance;
+        }
+
+        if let Err(err) = self.data.complete_submit_fences() {
+            if let Some(completion_point) = ctx.job.completion_point() {
+                self.data.signal_submit_fence(completion_point, Err(err));
+            }
+            return StageAdvance::TimedOut(err);
+        }
+
+        if ctx.submit_fence.is_signaled() {
+            return StageAdvance::Advance;
+        }
+
+        let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+        if elapsed >= self.timeout {
+            pr_err!("Tyr queue job {} timed out\n", ctx.counter);
+            if let Some(completion_point) = ctx.job.completion_point() {
+                self.data
+                    .signal_submit_fence(completion_point, Err(ETIMEDOUT));
+            }
+            return StageAdvance::TimedOut(ETIMEDOUT);
+        }
+
+        StageAdvance::WaitFor(self.poll_interval)
+    }
+
+    fn teardown(&self, job: &QueueJob, _counter: u64) {
+        if let Some(completion_point) = job.completion_point() {
+            self.data.signal_submit_fence(
+                completion_point,
+                Err(Error::from_errno(-(bindings::ECANCELED as i32))),
+            );
+        }
+    }
+}
+
+pub(super) type PreparedQueueJob = PreparedJob<TyrQueueOps>;
 
 #[derive(Default)]
 pub(super) struct QueueFenceData;
@@ -266,6 +462,32 @@ impl DriverDmaFenceOps for QueueFenceData {
     }
 }
 
+pub(super) struct QueueJob {
+    stream: KVec<u8>,
+    completion_point: Atomic<u64>,
+}
+
+impl QueueJob {
+    #[expect(dead_code)]
+    pub(super) fn new(stream: KVec<u8>) -> Self {
+        Self {
+            stream,
+            completion_point: Atomic::new(0),
+        }
+    }
+
+    fn completion_point(&self) -> Option<u64> {
+        match self.completion_point.load(Acquire) {
+            0 => None,
+            completion_point => Some(completion_point),
+        }
+    }
+
+    fn set_completion_point(&self, completion_point: u64) {
+        self.completion_point.store(completion_point, Release);
+    }
+}
+
 struct PendingSubmitFence {
     completion_point: u64,
     fence: DriverDmaFence<QueueFenceData, Published>,
@@ -274,6 +496,7 @@ struct PendingSubmitFence {
 /// A minimal hardware queue object owned by a scheduling group.
 pub(crate) struct Queue {
     data: Arc<QueueData>,
+    job_queue: JobQueue<TyrQueueOps>,
 }
 
 impl Queue {
@@ -307,7 +530,35 @@ impl Queue {
             GFP_KERNEL,
         )?;
 
-        Ok(Self { data })
+        let pipeline = PipelineBuilder::new()
+            .set_cancel_timeout(msecs_to_jiffies(JOB_TIMEOUT_MS))
+            .add_stage(QueueCompletionStage {
+                data: data.clone(),
+                poll_interval: msecs_to_jiffies(JOB_POLL_INTERVAL_MS),
+                timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
+            })?;
+        let job_queue = JobQueue::new(
+            TyrQueueOps { data: data.clone() },
+            reg_data.wq.clone(),
+            reg_data.wq.clone(),
+            pipeline,
+        )?;
+
+        Ok(Self { data, job_queue })
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn prepare_job(
+        &self,
+        job: QueueJob,
+        deps: &[ARef<PublicDmaFence>],
+    ) -> Result<PreparedQueueJob> {
+        self.job_queue.prepare(job, deps, 0, QueueFenceData)
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
+        self.job_queue.commit(prepared)
     }
 }
 
