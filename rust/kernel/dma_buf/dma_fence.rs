@@ -1221,6 +1221,14 @@ where
 /// Workqueue that can only be used to schedule [`DmaFenceWork`] items.
 pub struct DmaFenceWorkqueue(OwnedQueue);
 
+// SAFETY: `DmaFenceWorkqueue` owns a kernel workqueue. The workqueue core
+// synchronizes enqueue and destruction, and this wrapper only exposes enqueue
+// operations through shared references.
+unsafe impl Send for DmaFenceWorkqueue {}
+// SAFETY: Shared access only enqueues work through the synchronized workqueue
+// core; no unsynchronized Rust state is exposed.
+unsafe impl Sync for DmaFenceWorkqueue {}
+
 impl DmaFenceWorkqueue {
     /// Allocates a new DMA-fence constrained workqueue.
     #[inline]
