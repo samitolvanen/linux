@@ -352,7 +352,8 @@ impl Input {
             return Err(EINVAL);
         }
 
-        self.config |= u32::from(priority) & genmask_u32(0..=3);
+        let mask = genmask_u32(0..=3);
+        self.config = (self.config & !mask) | (u32::from(priority) & mask);
         Ok(())
     }
 
@@ -362,7 +363,8 @@ impl Input {
             return Err(EINVAL);
         }
 
-        self.config |= (doorbell_id << 8) & genmask_u32(8..=15);
+        let mask = genmask_u32(8..=15);
+        self.config = (self.config & !mask) | ((doorbell_id << 8) & mask);
         Ok(())
     }
 }
