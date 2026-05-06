@@ -2,8 +2,6 @@
 
 //! Code to control the global interface of the CSF firmware.
 
-use core::ops::Deref;
-
 use csg::CommandStreamGroup;
 #[allow(unused)]
 use kernel::workqueue;
@@ -16,7 +14,6 @@ use kernel::{
         register::Array,
         Io, //
     },
-    kvec,
     new_mutex,
     prelude::*,
     sync::{
@@ -599,14 +596,6 @@ impl GlobalInterface {
         }
     }
 
-    /// Set the CSG state.
-    pub(crate) fn set_csg_state(&mut self, csg_idx: usize, state: csg::GroupState) -> Result {
-        let glb = self.state.enabled_mut()?;
-        let csg_iface = glb.csgs.get_mut(csg_idx).ok_or(EINVAL)?;
-
-        csg_iface.set_group_state(state)
-    }
-
     /// Ring the CSG doorbell, instructing the FW to process requests on the
     /// given CSG slot. Mirrors panthor's panthor_fw_ring_csg_doorbells():
     /// toggle the per-CSG bit in GLB doorbell_req and ring the global doorbell.
@@ -620,19 +609,6 @@ impl GlobalInterface {
     fn shared_section_size(&self) -> usize {
         let shared_section = self.shared_section.lock();
         shared_section.size()
-    }
-
-    pub(crate) fn wait_csg_acks(&self, csg_idx: usize, mask: u32, timeout_ms: u32) -> Result {
-        let glb = self.state.enabled()?;
-        let csg = glb.csgs.get(csg_idx).ok_or(EINVAL)?;
-        let req = csg.input_request()?;
-        req.wait_acks(mask, &self.event_wait, timeout_ms)?;
-        Ok(())
-    }
-
-    /// Whether the firmware has booted or not.
-    pub(crate) fn booted(&self) -> bool {
-        self.booted
     }
 }
 

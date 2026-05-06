@@ -21,7 +21,6 @@
 
 use kernel::{
     bits::bit_u32,
-    kvec,
     prelude::*, //
 };
 
@@ -102,7 +101,6 @@ pub(crate) struct CommandStreamGroup {
     output_area: SharedSectionRange,
 
     streams: KVec<CommandStream>,
-    state: GroupState,
 }
 
 impl CommandStreamGroup {
@@ -156,20 +154,7 @@ impl CommandStreamGroup {
             input_area,
             output_area,
             streams,
-            state: GroupState::Terminate,
         })
-    }
-
-    pub(super) fn set_group_state(&mut self, state: GroupState) -> Result<()> {
-        let req = self.input_request()?;
-        req.update_reqs(state as u32, CSG_STATE_MASK)?;
-
-        if let GroupState::Start = state {
-            req.toggle_reqs(constants::CSG_ENDPOINT_CONFIG)?;
-        }
-
-        self.state = state;
-        Ok(())
     }
 
     pub(super) fn is_identical(&self, other: &CommandStreamGroup) -> Result<bool> {
