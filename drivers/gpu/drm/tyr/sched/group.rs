@@ -34,10 +34,6 @@ use crate::{
 };
 
 use super::{
-    deps::{
-        self,
-        SyncOp, //
-    },
     job::{
         Job,
         QueueSubmit, //
@@ -210,15 +206,12 @@ impl Group {
         self.heap_pool.lock().clone()
     }
 
-    pub(super) fn submit(
-        &self,
-        syncs: KVec<SyncOp>,
-        queue_submits: KVec<QueueSubmit>,
-        file: &TyrDrmFile,
-    ) -> Result {
-        deps::wait_for_syncops(file, &syncs)?;
-
+    pub(super) fn submit(&self, queue_submits: KVec<QueueSubmit>, file: &TyrDrmFile) -> Result {
         let jobs = Job::from_queue_submits(queue_submits)?;
+
+        for job in jobs.iter() {
+            job.wait_syncs(file)?;
+        }
 
         for job in jobs.iter() {
             job.can_submit(self)?;
@@ -311,10 +304,8 @@ impl Pool {
             .ok_or(EINVAL)?;
 
         let mut queue_submits = KVec::new();
-        let mut syncs = KVec::new();
 
         super::job::append_queue_submits(
-            &mut syncs,
             &mut queue_submits,
             groupsubmit.queue_submits.array,
             groupsubmit.queue_submits.count,
@@ -323,7 +314,7 @@ impl Pool {
         )?;
 
         ddev.with_locked_scheduler(|sched| sched.bind(ddev, group.clone()))?;
-        group.submit(syncs, queue_submits, file)
+        group.submit(queue_submits, file)
     }
 
     pub(crate) fn get_group_state(
