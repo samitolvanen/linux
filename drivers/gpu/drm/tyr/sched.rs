@@ -552,7 +552,7 @@ impl Scheduler {
 
         group.with_locked_inner(|inner| {
             let queue = inner.queues.get_mut(0).ok_or(EINVAL)?;
-            queue.append_instrs(&instrs)?;
+            queue.append_and_commit_instrs(&instrs)?;
             queue.kick()
         })?;
 

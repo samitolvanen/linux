@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::sync::atomic::AtomicI64;
+
 use kernel::{
     bits::genmask_u64,
     c_str,
@@ -97,7 +99,7 @@ impl Instr {
 
 pub(crate) struct Job {
     /// The group whose queue this job will be pushed to.
-    group: Arc<Group>,
+    pub(crate) group: Arc<Group>,
 
     /// Index of the queue inside the group.
     queue_idx: usize,
@@ -112,6 +114,10 @@ pub(crate) struct Job {
 
     /// The address of the sync object for the queue.
     sync_addr: u64,
+
+    /// The baseline accumulated suspend time when this job was submitted.
+    #[expect(dead_code)]
+    pub(crate) baseline_suspend_nanos: AtomicI64,
 }
 
 impl Job {
@@ -142,6 +148,7 @@ impl Job {
             stream_size: qsubmit.stream_size,
             latest_flush: qsubmit.latest_flush,
             sync_addr,
+            baseline_suspend_nanos: AtomicI64::new(0),
         })
     }
 
@@ -187,7 +194,7 @@ impl Job {
 
         self.group.with_locked_inner(|inner| {
             let queue = inner.queues.get_mut(self.queue_idx).ok_or(EINVAL)?;
-            queue.append_instrs(&instrs)?;
+            queue.append_and_commit_instrs(&instrs)?;
 
             queue
                 .in_flight_jobs
@@ -200,6 +207,7 @@ impl Job {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TyrJobHandler;
 
 impl kernel::drm::job_queue::QueueOps for TyrJobHandler {
