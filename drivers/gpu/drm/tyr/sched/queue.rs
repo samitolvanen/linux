@@ -73,18 +73,17 @@ impl QueueCreate {
     }
 }
 
-/// A minimal hardware queue object owned by a scheduling group.
-pub(crate) struct Queue {
+struct QueueData {
     #[allow(dead_code)]
-    pub(super) priority: u8,
-    pub(super) ringbuf: Arc<gem::MappedBo>,
-    pub(super) interfaces: Interfaces,
+    priority: u8,
+    ringbuf: Arc<gem::MappedBo>,
+    interfaces: Interfaces,
     doorbell_id: AtomicUsize,
     next_seqno: AtomicU64,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
 }
 
-impl Queue {
+impl QueueData {
     fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput> {
         let ringbuf_input = self.interfaces.read_input()?;
         let ringbuf_sz = self.ringbuf.size() as u64;
@@ -105,28 +104,7 @@ impl Queue {
         Ok(ringbuf_input)
     }
 
-    pub(crate) fn new(
-        tdev: &TyrDrmDevice,
-        queue_args: &QueueCreate,
-        vm: Arc<Vm>,
-    ) -> Result<Self> {
-        let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
-        let ringbuf =
-            gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
-        let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
-        let interfaces = Interfaces::new(iface_mem)?;
-
-        Ok(Self {
-            priority: queue_args.priority(),
-            ringbuf,
-            interfaces,
-            doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
-            next_seqno: AtomicU64::new(0),
-            iomem: tdev.iomem.clone(),
-        })
-    }
-
-    pub(super) fn doorbell_id(&self) -> Option<usize> {
+    fn doorbell_id(&self) -> Option<usize> {
         let doorbell_id = self.doorbell_id.load(Ordering::Relaxed);
 
         if doorbell_id == UNASSIGNED_DOORBELL_ID {
@@ -136,24 +114,23 @@ impl Queue {
         }
     }
 
-    pub(super) fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
+    fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
         self.doorbell_id.store(
             doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID),
             Ordering::Relaxed,
         );
     }
 
-    pub(super) fn can_append(&self, instr_count: usize) -> Result {
+    fn can_append(&self, instr_count: usize) -> Result {
         self.ringbuf_space_for(instr_count)?;
         Ok(())
     }
 
-    pub(super) fn claim_seqno(&self) -> u64 {
+    fn claim_seqno(&self) -> u64 {
         self.next_seqno.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
+    fn append_instrs(&self, instrs: &[u8]) -> Result {
         let mut ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let ringbuf_sz = self.ringbuf.size() as u64;
         let ringbuf_output = self.interfaces.read_output()?;
@@ -182,8 +159,7 @@ impl Queue {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn kick(&self) -> Result {
+    fn kick(&self) -> Result {
         let io = self.iomem.try_access().ok_or(EINVAL)?;
         let doorbell_reg =
             doorbell_block::DOORBELL::try_at(self.doorbell_id().ok_or(EINVAL)?).ok_or(EINVAL)?;
@@ -192,6 +168,59 @@ impl Queue {
             doorbell_reg,
             doorbell_block::DOORBELL::zeroed().with_ring(true),
         )
+    }
+}
+
+/// A minimal hardware queue object owned by a scheduling group.
+pub(crate) struct Queue {
+    data: Arc<QueueData>,
+}
+
+impl Queue {
+    pub(crate) fn new(
+        tdev: &TyrDrmDevice,
+        queue_args: &QueueCreate,
+        vm: Arc<Vm>,
+    ) -> Result<Self> {
+        let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
+        let ringbuf =
+            gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
+        let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
+        let interfaces = Interfaces::new(iface_mem)?;
+
+        let data = Arc::new(
+            QueueData {
+                priority: queue_args.priority(),
+                ringbuf,
+                interfaces,
+                doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
+                next_seqno: AtomicU64::new(0),
+                iomem: tdev.iomem.clone(),
+            },
+            GFP_KERNEL,
+        )?;
+
+        Ok(Self { data })
+    }
+
+    pub(super) fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
+        self.data.set_doorbell_id(doorbell_id);
+    }
+
+    pub(super) fn can_append(&self, instr_count: usize) -> Result {
+        self.data.can_append(instr_count)
+    }
+
+    pub(super) fn claim_seqno(&self) -> u64 {
+        self.data.claim_seqno()
+    }
+
+    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
+        self.data.append_instrs(instrs)
+    }
+
+    pub(crate) fn kick(&self) -> Result {
+        self.data.kick()
     }
 }
 
