@@ -147,7 +147,6 @@ pub(super) struct QueueJob {
 }
 
 impl QueueJob {
-    #[expect(dead_code)]
     pub(super) fn new(stream: KVec<u8>) -> Self {
         Self {
             stream,
@@ -523,7 +522,6 @@ impl Queue {
         Ok(Self { data, job_queue })
     }
 
-    #[expect(dead_code)]
     pub(super) fn prepare_job(
         &self,
         job: QueueJob,
@@ -532,7 +530,6 @@ impl Queue {
         self.job_queue.prepare(job, deps, QueueFenceData)
     }
 
-    #[expect(dead_code)]
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
         self.job_queue.commit(prepared)
     }

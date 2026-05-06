@@ -8,7 +8,9 @@
 
 use kernel::{
     alloc::KVec,
+    dma_buf::dma_fence::PublicDmaFence,
     prelude::*,
+    sync::aref::ARef,
     transmute::FromBytes,
     uaccess::UserSlice,
     uapi,
@@ -20,6 +22,10 @@ use super::{
         SyncOp,
     },
     group::Group,
+    queue::{
+        PreparedQueueJob,
+        QueueJob,
+    },
     syncs,
 };
 
@@ -130,6 +136,32 @@ pub(crate) struct Job {
     syncs: KVec<SyncOp>,
 }
 
+pub(crate) struct PreparedQueueSubmit {
+    queue_index: usize,
+    has_stream: bool,
+    prepared: PreparedQueueJob,
+}
+
+impl PreparedQueueSubmit {
+    pub(crate) fn commit(self, group: &Group) -> Result<ARef<PublicDmaFence>> {
+        let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
+
+        if self.has_stream {
+            let seqno = queue.claim_seqno();
+            group.write_syncobj(
+                self.queue_index,
+                syncs::SyncObj64b {
+                    seqno,
+                    status: 0,
+                    pad: 0,
+                },
+            )?;
+        }
+
+        Ok(queue.commit_job(self.prepared))
+    }
+}
+
 impl Job {
     fn new(queue_index: usize, stream: KVec<u8>, syncs: KVec<SyncOp>) -> Self {
         Self {
@@ -179,35 +211,25 @@ impl Job {
         Ok(jobs)
     }
 
-    pub(crate) fn wait_syncs(&self, file: &crate::file::TyrDrmFile) -> Result {
-        deps::wait_for_syncops(file, &self.syncs)
-    }
-
-    pub(crate) fn can_submit(&self, group: &Group) -> Result {
-        if self.stream.is_empty() {
-            return Ok(());
-        }
-
-        let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
-        queue.can_append(self.stream.len())
-    }
-
-    pub(crate) fn submit(&self, group: &Group) -> Result {
-        if self.stream.is_empty() {
-            return Ok(());
-        }
-
+    pub(crate) fn prepare(
+        self,
+        group: &Group,
+        file: &crate::file::TyrDrmFile,
+    ) -> Result<PreparedQueueSubmit> {
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
 
-        queue.append_instrs(&self.stream)?;
-        group.write_syncobj(
-            self.queue_index,
-            syncs::SyncObj64b {
-                seqno: queue.claim_seqno(),
-                status: 0,
-                pad: 0,
-            },
-        )?;
-        queue.kick()
+        if self.syncs.iter().any(SyncOp::is_signal) {
+            return Err(ENOTSUPP);
+        }
+
+        let deps = deps::wait_fences(file, &self.syncs)?;
+        let has_stream = !self.stream.is_empty();
+        let prepared = queue.prepare_job(QueueJob::new(self.stream), &deps)?;
+
+        Ok(PreparedQueueSubmit {
+            queue_index: self.queue_index,
+            has_stream,
+            prepared,
+        })
     }
 }

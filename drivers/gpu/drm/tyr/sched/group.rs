@@ -36,6 +36,7 @@ use crate::{
 use super::{
     job::{
         Job,
+        PreparedQueueSubmit,
         QueueSubmit,
     },
     queue::{
@@ -214,17 +215,14 @@ impl Group {
         file: &TyrDrmFile,
     ) -> Result {
         let jobs = Job::from_queue_submits(queue_submits)?;
+        let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
 
-        for job in jobs.iter() {
-            job.wait_syncs(file)?;
+        for job in jobs.into_iter() {
+            prepared_jobs.push(job.prepare(self, file)?, GFP_KERNEL)?;
         }
 
-        for job in jobs.iter() {
-            job.can_submit(self)?;
-        }
-
-        for job in jobs.iter() {
-            job.submit(self)?;
+        for prepared_job in prepared_jobs.into_iter() {
+            let _submit_fence = prepared_job.commit(self)?;
         }
 
         Ok(())

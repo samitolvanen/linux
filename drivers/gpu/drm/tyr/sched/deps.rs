@@ -123,18 +123,6 @@ impl TryFrom<&uapi::drm_panthor_sync_op> for SyncOp {
     }
 }
 
-pub(crate) fn wait_for_syncops(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result {
-    if syncops.iter().any(SyncOp::is_signal) {
-        return Err(ENOTSUPP);
-    }
-
-    for fence in wait_fences(file, syncops)?.iter() {
-        fence.wait()?;
-    }
-
-    Ok(())
-}
-
 pub(crate) fn wait_fences(
     file: &TyrDrmFile,
     syncops: &[SyncOp],
