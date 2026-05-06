@@ -12,6 +12,7 @@ use kernel::{
     },
     devres,
     devres::Devres,
+    dma_buf::dma_fence::DmaFenceWorkqueue,
     dma::{
         Device as DmaDevice,
         DmaMask, //
@@ -39,7 +40,10 @@ use kernel::{
         Mutex, //
     },
     time, //
-    workqueue::Work,
+    workqueue::{
+        Work,
+        WqFlags,
+    },
 };
 
 use crate::{
@@ -81,6 +85,8 @@ pub(crate) struct TyrDrmDeviceData {
 	pub(crate) mmio_phys_addr: u64,
 
     pub(crate) fw: Arc<Firmware>,
+
+    pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -200,12 +206,18 @@ impl platform::Driver for TyrPlatformDriverData {
             &gpu_info,
         )?;
 
+        let wq = Arc::new(
+            DmaFenceWorkqueue::new(c"tyr-dma-fence", WqFlags::UNBOUND, 0)?,
+            GFP_KERNEL,
+        )?;
+
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
 				mmu,
 				iomem: iomem.clone(),
 				mmio_phys_addr,
                 fw: firmware,
+                wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
