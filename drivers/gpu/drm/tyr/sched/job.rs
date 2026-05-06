@@ -33,12 +33,14 @@ unsafe impl FromBytes for RawQueueSubmit {}
 pub(crate) struct QueueSubmit {
     queue_index: usize,
     stream: KVec<u8>,
+    syncs: KVec<SyncOp>,
 }
 
 impl QueueSubmit {
     pub(crate) fn from_uapi(uapi_submit: &uapi::drm_panthor_queue_submit) -> Result<Self> {
         let stream_size = uapi_submit.stream_size as usize;
         let mut stream = KVec::with_capacity(stream_size, GFP_KERNEL)?;
+        let mut syncs = KVec::new();
 
         if stream_size != 0 {
             stream.resize(stream_size, 0, GFP_KERNEL)?;
@@ -49,9 +51,17 @@ impl QueueSubmit {
             reader.read_slice(&mut stream[..])?;
         }
 
+        deps::append_syncops(
+            &mut syncs,
+            uapi_submit.syncs.array,
+            uapi_submit.syncs.count,
+            uapi_submit.syncs.stride,
+        )?;
+
         Ok(Self {
             queue_index: uapi_submit.queue_index as usize,
             stream,
+            syncs,
         })
     }
 
@@ -59,8 +69,8 @@ impl QueueSubmit {
         self.queue_index
     }
 
-    pub(crate) fn into_stream(self) -> KVec<u8> {
-        self.stream
+    pub(crate) fn into_parts(self) -> (KVec<u8>, KVec<SyncOp>) {
+        (self.stream, self.syncs)
     }
 }
 
@@ -91,7 +101,6 @@ impl RawQueueSubmit {
 }
 
 pub(crate) fn append_queue_submits(
-    syncs: &mut KVec<SyncOp>,
     queue_submits: &mut KVec<QueueSubmit>,
     array: u64,
     count: u32,
@@ -109,12 +118,6 @@ pub(crate) fn append_queue_submits(
     for _ in 0..count {
         let queue: RawQueueSubmit = reader.read()?;
         queue.validate(queue_count)?;
-        deps::append_syncops(
-            syncs,
-            queue.0.syncs.array,
-            queue.0.syncs.count,
-            queue.0.syncs.stride,
-        )?;
         queue_submits.push(queue.capture()?, GFP_KERNEL)?;
     }
 
@@ -124,11 +127,16 @@ pub(crate) fn append_queue_submits(
 pub(crate) struct Job {
     queue_index: usize,
     stream: KVec<u8>,
+    syncs: KVec<SyncOp>,
 }
 
 impl Job {
-    fn new(queue_index: usize, stream: KVec<u8>) -> Self {
-        Self { queue_index, stream }
+    fn new(queue_index: usize, stream: KVec<u8>, syncs: KVec<SyncOp>) -> Self {
+        Self {
+            queue_index,
+            stream,
+            syncs,
+        }
     }
 
     pub(crate) fn from_queue_submits(queue_submits: KVec<QueueSubmit>) -> Result<KVec<Self>> {
@@ -136,9 +144,10 @@ impl Job {
 
         for queue_submit in queue_submits.into_iter() {
             let queue_index = queue_submit.queue_index();
-            let stream = queue_submit.into_stream();
+            let (stream, syncs) = queue_submit.into_parts();
+            let mut syncs = Some(syncs);
 
-            if stream.is_empty() {
+            if stream.is_empty() && syncs.as_ref().is_some_and(KVec::is_empty) {
                 continue;
             }
 
@@ -146,6 +155,12 @@ impl Job {
             for job in jobs.iter_mut() {
                 if job.queue_index == queue_index {
                     job.stream.extend_from_slice(&stream, GFP_KERNEL)?;
+                    let Some(syncs) = syncs.take() else {
+                        return Err(EINVAL);
+                    };
+                    for sync in syncs.into_iter() {
+                        job.syncs.push(sync, GFP_KERNEL)?;
+                    }
                     merged = true;
                     break;
                 }
@@ -155,18 +170,33 @@ impl Job {
                 continue;
             }
 
-            jobs.push(Self::new(queue_index, stream), GFP_KERNEL)?;
+            jobs.push(
+                Self::new(queue_index, stream, syncs.take().ok_or(EINVAL)?),
+                GFP_KERNEL,
+            )?;
         }
 
         Ok(jobs)
     }
 
+    pub(crate) fn wait_syncs(&self, file: &crate::file::TyrDrmFile) -> Result {
+        deps::wait_for_syncops(file, &self.syncs)
+    }
+
     pub(crate) fn can_submit(&self, group: &Group) -> Result {
+        if self.stream.is_empty() {
+            return Ok(());
+        }
+
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
         queue.can_append(self.stream.len())
     }
 
     pub(crate) fn submit(&self, group: &Group) -> Result {
+        if self.stream.is_empty() {
+            return Ok(());
+        }
+
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
 
         queue.append_instrs(&self.stream)?;
