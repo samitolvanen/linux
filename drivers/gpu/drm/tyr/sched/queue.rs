@@ -10,13 +10,25 @@ use core::{
 };
 
 use kernel::{
+    alloc::KVec,
+    c_str,
+    dma_buf::dma_fence::{
+        DmaFenceSignallingAnnotation,
+        DriverDmaFence,
+        DriverDmaFenceOps,
+        Published,
+    },
     drm::gem::BaseObject,
     io::Io,
     io::register::Array,
+    new_mutex,
     prelude::*,
     sizes::SZ_4K,
     sizes::SZ_64K,
-    sync::Arc,
+    sync::{
+        Arc,
+        Mutex,
+    },
     transmute::FromBytes,
     uapi,
 };
@@ -73,6 +85,26 @@ impl QueueCreate {
     }
 }
 
+#[derive(Default)]
+pub(super) struct QueueFenceData;
+
+#[vtable]
+impl DriverDmaFenceOps for QueueFenceData {
+    fn driver_name(&self) -> &'static CStr {
+        c_str!("tyr")
+    }
+
+    fn timeline_name(&self) -> &'static CStr {
+        c_str!("tyr_queue")
+    }
+}
+
+struct PendingSubmitFence {
+    completion_point: u64,
+    fence: DriverDmaFence<QueueFenceData, Published>,
+}
+
+#[pin_data]
 struct QueueData {
     #[allow(dead_code)]
     priority: u8,
@@ -81,6 +113,8 @@ struct QueueData {
     doorbell_id: AtomicUsize,
     next_seqno: AtomicU64,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
+    #[pin]
+    pending_submit_fences: Mutex<KVec<PendingSubmitFence>>,
 }
 
 impl QueueData {
@@ -169,6 +203,55 @@ impl QueueData {
             doorbell_block::DOORBELL::zeroed().with_ring(true),
         )
     }
+
+    fn reserve_pending_submit_fence(&self) -> Result {
+        self.pending_submit_fences
+            .lock()
+            .reserve(1, GFP_KERNEL)
+            .map_err(Error::from)
+    }
+
+    fn add_pending_submit_fence(
+        &self,
+        completion_point: u64,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> core::result::Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
+        let pending_fence = PendingSubmitFence {
+            completion_point,
+            fence,
+        };
+
+        match self
+            .pending_submit_fences
+            .lock()
+            .push_within_capacity(pending_fence)
+        {
+            Ok(()) => Ok(()),
+            Err(err) => Err((EINVAL, err.0.fence)),
+        }
+    }
+
+    fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
+        loop {
+            let pending_fence = {
+                let mut pending = self.pending_submit_fences.lock();
+
+                match pending.first() {
+                    Some(pending_fence) if pending_fence.completion_point <= completion_point => {
+                        pending.remove(0).ok()
+                    }
+                    _ => None,
+                }
+            };
+
+            let Some(pending_fence) = pending_fence else {
+                break;
+            };
+
+            let _annotation = DmaFenceSignallingAnnotation::new();
+            pending_fence.fence.signal(result);
+        }
+    }
 }
 
 /// A minimal hardware queue object owned by a scheduling group.
@@ -188,15 +271,16 @@ impl Queue {
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
 
-        let data = Arc::new(
-            QueueData {
+        let data = Arc::pin_init(
+            pin_init!(QueueData {
                 priority: queue_args.priority(),
                 ringbuf,
                 interfaces,
                 doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
                 next_seqno: AtomicU64::new(0),
                 iomem: tdev.iomem.clone(),
-            },
+                pending_submit_fences <- new_mutex!(KVec::new()),
+            }),
             GFP_KERNEL,
         )?;
 
@@ -221,6 +305,26 @@ impl Queue {
 
     pub(crate) fn kick(&self) -> Result {
         self.data.kick()
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn reserve_pending_submit_fence(&self) -> Result {
+        self.data.reserve_pending_submit_fence()
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn add_pending_submit_fence(
+        &self,
+        completion_point: u64,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> core::result::Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
+        self.data.add_pending_submit_fence(completion_point, fence)
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
+        self.data
+            .signal_submit_fences_up_to(completion_point, result);
     }
 }
 
