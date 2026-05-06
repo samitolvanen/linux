@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::marker::PhantomPinned;
+use core::sync::atomic::AtomicU32;
 
 use kernel::{
     c_str,
@@ -14,14 +15,20 @@ use kernel::{
         Core,
         Device, //
     },
-    devres,
-    devres::Devres,
+    devres::{
+        self,
+        Devres, //
+    },
     dma::{
         Device as DmaDevice,
         DmaMask, //
     },
-    drm,
+    dma_fence::{
+        DmaFenceWork,
+        DmaFenceWorkqueue, //
+    },
     drm::{
+        self,
         driver::Registration,
         ioctl,
         UnregisteredDevice, //
@@ -30,17 +37,21 @@ use kernel::{
         poll,
         Io, //
     },
-    irq::IrqReturn,
-    irq::ThreadedHandler,
-    irq::ThreadedIrqReturn,
-    irq::ThreadedRegistration,
+    irq::{
+        IrqReturn,
+        ThreadedHandler,
+        ThreadedIrqReturn,
+        ThreadedRegistration, //
+    },
     new_mutex,
     of,
     opp,
     platform,
     prelude::*,
-    regulator,
-    regulator::Regulator,
+    regulator::{
+        self,
+        Regulator, //
+    },
     sizes::SZ_2M,
     sync::{
         aref::ARef,
@@ -53,23 +64,25 @@ use kernel::{
 
 use crate::{
     file::TyrDrmFileData,
-    fw,
-    fw::irq::JobIrq,
-    fw::Firmware,
+    fw::{
+        self,
+        Firmware, //
+    },
     gem::BoData,
-    gpu,
-    gpu::irq::GpuIrq,
-    gpu::GpuInfo,
-    mmu,
-    mmu::irq::MmuIrq,
-    mmu::Mmu,
+    gpu::{
+        self,
+        GpuInfo, //
+    },
+    mmu::{
+        self,
+        Mmu, //
+    },
     new_wait,
-    regs,
     regs::gpu_control::*,
-    sched::Scheduler,
-    sched::SchedulerState,
-    wait::Wait,
-    wait::WaitResult, //
+    sched::{
+        Scheduler,
+        SchedulerState, //
+    },
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -114,25 +127,75 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// The scheduler logic.
     #[pin]
-    sched: Mutex<SchedulerState>,
+    pub(crate) sched: Mutex<SchedulerState>,
 
     pub(crate) reset_wq: &'static workqueue::Queue,
+    /// Single-threaded scheduler workqueue.
+    ///
+    /// Owned by the device data; carries the bottom half of the
+    /// scheduler (tick, fw_events, sync_upd, periodic_tick).  Held
+    /// inline (rather than behind an `Arc`) because no other subsystem
+    /// shares this queue.
+    pub(crate) sched_wq: DmaFenceWorkqueue,
+    /// Job execution workqueue, shared with per-queue `JobQueue`s.
+    ///
+    /// Wrapped in `Arc` because every `JobQueue` holds an owning
+    /// reference to it.  Marked `MEM_RECLAIM` so dma-fence callbacks
+    /// can run during low-memory conditions.
+    pub(crate) job_wq: Arc<DmaFenceWorkqueue>,
 
     /// Work item for the firmware ping.
     #[pin]
     pub(crate) ping_work: workqueue::DelayedWork<TyrDrmDevice, 0>,
 
     /// Work item for the scheduler tick.
+    ///
+    /// Slot [`work_id::TICK`].  Coalesces redundant `schedule_tick`
+    /// requests via the workqueue.
     #[pin]
-    pub(crate) tick_work: workqueue::Work<TyrDrmDevice, 1>,
+    pub(crate) tick_work: DmaFenceWork<crate::driver::TyrDrmDevice, { work_id::TICK }>,
 
     /// Work item for processing firmware events.
+    ///
+    /// Slot [`work_id::FW_EVENTS`].  Drains [`fw_events`](Self::fw_events)
+    /// when scheduled.
     #[pin]
-    pub(crate) fw_events_work: workqueue::Work<TyrDrmDevice, 2>,
+    pub(crate) fw_events_work: DmaFenceWork<crate::driver::TyrDrmDevice, { work_id::FW_EVENTS }>,
 
-    /// Work item for group updates.
+    /// Outstanding firmware events accumulated by IRQ handlers.
+    pub(crate) fw_events: AtomicU32,
+
+    /// The work to process group status updates.
+    ///
+    /// Slot [`work_id::SYNC_UPD`].
     #[pin]
-    pub(crate) group_upd_work: workqueue::Work<TyrDrmDevice, 3>,
+    pub(crate) sync_upd_work: DmaFenceWork<crate::driver::TyrDrmDevice, { work_id::SYNC_UPD }>,
+
+    /// For scheduling periodic ticks.
+    ///
+    /// Slot [`work_id::PERIODIC_TICK`].
+    #[pin]
+    pub(crate) periodic_tick_work:
+        workqueue::DelayedWork<crate::driver::TyrDrmDevice, { work_id::PERIODIC_TICK }>,
+}
+
+/// Per-`TyrDrmDeviceData` work slot identifiers.
+///
+/// Used as the `WORK_ID` const generic on [`DmaFenceWork`] /
+/// [`workqueue::DelayedWork`] and the matching
+/// [`impl_has_dma_fence_work!`] / [`impl_has_delayed_work!`] impls.
+///
+/// [`impl_has_dma_fence_work!`]: kernel::impl_has_dma_fence_work
+/// [`impl_has_delayed_work!`]: kernel::impl_has_delayed_work
+pub(crate) mod work_id {
+    /// Scheduler tick.
+    pub(crate) const TICK: u64 = 1;
+    /// Firmware-event drain.
+    pub(crate) const FW_EVENTS: u64 = 2;
+    /// Group sync-update worker.
+    pub(crate) const SYNC_UPD: u64 = 3;
+    /// Periodic re-arming of the scheduler tick.
+    pub(crate) const PERIODIC_TICK: u64 = 4;
 }
 
 // Both `Clk` and `Regulator` do not implement `Send` or `Sync`, but they
@@ -155,6 +218,37 @@ impl TyrDrmDeviceData {
     {
         let mut sched = self.sched.lock();
         f(sched.enabled_mut()?)
+    }
+
+    /// Enqueues a firmware-events drain on [`sched_wq`](Self::sched_wq).
+    #[expect(dead_code)]
+    pub(crate) fn schedule_fw_events(tdev: &ARef<crate::driver::TyrDrmDevice>) {
+        let _ = tdev
+            .sched_wq
+            .enqueue::<_, { work_id::FW_EVENTS }>(tdev.clone());
+    }
+
+    /// Enqueues a group sync-update worker on [`sched_wq`](Self::sched_wq).
+    #[expect(dead_code)]
+    pub(crate) fn schedule_sync_upd(tdev: &ARef<crate::driver::TyrDrmDevice>) {
+        let _ = tdev
+            .sched_wq
+            .enqueue::<_, { work_id::SYNC_UPD }>(tdev.clone());
+    }
+
+    /// Enqueues a scheduler tick on [`sched_wq`](Self::sched_wq).
+    pub(crate) fn schedule_tick(tdev: &ARef<crate::driver::TyrDrmDevice>) {
+        let _ = tdev.sched_wq.enqueue::<_, { work_id::TICK }>(tdev.clone());
+    }
+
+    /// Re-arms the periodic tick after `delay` jiffies.
+    #[expect(dead_code)]
+    pub(crate) fn schedule_periodic_tick(
+        tdev: &ARef<crate::driver::TyrDrmDevice>,
+        delay: kernel::time::Jiffies,
+    ) {
+        let _ = workqueue::system_unbound()
+            .enqueue_delayed::<_, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
     }
 }
 
@@ -241,6 +335,17 @@ impl platform::Driver for TyrPlatformDriverData {
         let fw_event_wait = firmware.event_wait.clone();
         let irq_iomem = iomem.clone();
 
+        let sched_wq = DmaFenceWorkqueue::new(c_str!("tyr-sched"), workqueue::WqFlags::HIGHPRI, 0)?;
+
+        let job_wq = Arc::new(
+            DmaFenceWorkqueue::new(
+                c_str!("tyr-job"),
+                workqueue::WqFlags::HIGHPRI | workqueue::WqFlags::MEM_RECLAIM,
+                0,
+            )?,
+            GFP_KERNEL,
+        )?;
+
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
                 fw: firmware,
@@ -260,10 +365,14 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmio_phys_addr,
                 sched <- new_mutex!(SchedulerState::Disabled),
                 reset_wq: workqueue::system_unbound(),
+                sched_wq,
+                job_wq,
                 ping_work <- kernel::new_delayed_work!("tyr_ping_work"),
-                tick_work <- kernel::new_work!("tyr_tick_work"),
-                fw_events_work <- kernel::new_work!("tyr_fw_events_work"),
-                group_upd_work <- kernel::new_work!("tyr_group_upd_work"),
+                tick_work <- kernel::new_dma_fence_work!("tyr_tick"),
+                fw_events_work <- kernel::new_dma_fence_work!("tyr-fw-events"),
+                fw_events: AtomicU32::new(0),
+                sync_upd_work <- kernel::new_dma_fence_work!("tyr-sync-upd"),
+                periodic_tick_work <- kernel::new_delayed_work!("tyr_periodic_tick"),
         });
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;

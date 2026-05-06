@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
-    impl_has_work,
+    dma_fence::{
+        impl_has_dma_fence_work,
+        DmaFenceWorkItem, //
+    },
     prelude::*,
     sync::Arc,
     types::ARef,
@@ -10,6 +13,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        work_id,
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
@@ -38,13 +42,27 @@ impl Tick {
     }
 }
 
-impl_has_work! {
-    impl HasWork<TyrDrmDevice, 1> for TyrDrmDeviceData {
+kernel::workqueue::impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
+        self.periodic_tick_work
+    }
+}
+
+impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        TyrDrmDeviceData::schedule_tick(&this);
+    }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::TICK }> for TyrDrmDeviceData {
         self.tick_work
     }
 }
 
-impl WorkItem<1> for TyrDrmDeviceData {
+impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {

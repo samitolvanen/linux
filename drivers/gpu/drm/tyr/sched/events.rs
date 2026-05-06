@@ -8,16 +8,19 @@
 use core::ops::Deref;
 
 use kernel::{
-    dma_fence::RawDmaFence,
-    impl_has_work,
+    dma_fence::{
+        impl_has_dma_fence_work,
+        DmaFenceWorkItem,
+        RawDmaFence, //
+    },
     prelude::*,
     sync::Arc,
-    types::ARef,
-    workqueue::WorkItem, //
+    types::ARef, //
 };
 
 use crate::{
     driver::{
+        work_id,
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
@@ -434,13 +437,13 @@ impl Scheduler {
     }
 }
 
-impl_has_work! {
-    impl HasWork<TyrDrmDevice, 2> for TyrDrmDeviceData {
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }> for TyrDrmDeviceData {
         self.fw_events_work
     }
 }
 
-impl WorkItem<2> for TyrDrmDeviceData {
+impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
@@ -452,13 +455,13 @@ impl WorkItem<2> for TyrDrmDeviceData {
     }
 }
 
-impl_has_work! {
-    impl HasWork<TyrDrmDevice, 3> for TyrDrmDeviceData {
-        self.group_upd_work
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::SYNC_UPD }> for TyrDrmDeviceData {
+        self.sync_upd_work
     }
 }
 
-impl WorkItem<3> for TyrDrmDeviceData {
+impl DmaFenceWorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
