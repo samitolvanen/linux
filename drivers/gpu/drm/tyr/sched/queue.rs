@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::ops::Range;
+use core::ops::{
+    Deref,
+    Range, //
+};
 
 use kernel::{
     alloc::KVec,
@@ -92,7 +95,7 @@ impl QueueCreate {
 }
 
 #[pin_data]
-struct QueueData {
+pub(crate) struct QueueData {
     priority: u8,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
@@ -134,21 +137,21 @@ impl QueueData {
         }
     }
 
-    fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
+    pub(super) fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
         self.doorbell_id
             .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
-    fn can_append(&self, instr_count: usize) -> Result {
+    pub(super) fn can_append(&self, instr_count: usize) -> Result {
         self.ringbuf_space_for(instr_count)?;
         Ok(())
     }
 
-    fn claim_seqno(&self) -> u64 {
+    pub(super) fn claim_seqno(&self) -> u64 {
         self.next_seqno.fetch_add(1, Relaxed) + 1
     }
 
-    fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
+    pub(super) fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
         let mut ringbuf_input = self.ringbuf_space_for(instrs.len())?;
 
         let ringbuf = self.ringbuf.vmap();
@@ -185,7 +188,7 @@ impl QueueData {
         Ok(completion_point)
     }
 
-    fn kick(&self) -> Result {
+    pub(super) fn kick(&self) -> Result {
         let io = self.iomem.try_access().ok_or(ENODEV)?;
         let doorbell_reg =
             doorbell_block::DOORBELL::try_at(self.doorbell_id().ok_or(EINVAL)?).ok_or(EINVAL)?;
@@ -196,6 +199,7 @@ impl QueueData {
         )
     }
 
+    #[expect(dead_code)]
     fn reserve_pending_submit_fence(&self) -> Result {
         self.pending_submit_fences
             .lock()
@@ -203,6 +207,7 @@ impl QueueData {
             .map_err(Error::from)
     }
 
+    #[expect(dead_code)]
     fn add_pending_submit_fence(
         &self,
         completion_point: u64,
@@ -223,6 +228,7 @@ impl QueueData {
         }
     }
 
+    #[expect(dead_code)]
     fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
         loop {
             let pending_fence = {
@@ -303,45 +309,13 @@ impl Queue {
 
         Ok(Self { data })
     }
+}
 
-    pub(super) fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
-        self.data.set_doorbell_id(doorbell_id);
-    }
+impl Deref for Queue {
+    type Target = QueueData;
 
-    pub(super) fn can_append(&self, instr_count: usize) -> Result {
-        self.data.can_append(instr_count)
-    }
-
-    pub(super) fn claim_seqno(&self) -> u64 {
-        self.data.claim_seqno()
-    }
-
-    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
-        self.data.append_instrs(instrs)
-    }
-
-    pub(crate) fn kick(&self) -> Result {
-        self.data.kick()
-    }
-
-    #[expect(dead_code)]
-    pub(super) fn reserve_pending_submit_fence(&self) -> Result {
-        self.data.reserve_pending_submit_fence()
-    }
-
-    #[expect(dead_code)]
-    pub(super) fn add_pending_submit_fence(
-        &self,
-        completion_point: u64,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> core::result::Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
-        self.data.add_pending_submit_fence(completion_point, fence)
-    }
-
-    #[expect(dead_code)]
-    pub(super) fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
-        self.data
-            .signal_submit_fences_up_to(completion_point, result);
+    fn deref(&self) -> &Self::Target {
+        &self.data
     }
 }
 
