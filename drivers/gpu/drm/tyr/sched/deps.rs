@@ -9,6 +9,10 @@ use kernel::{
         FenceChain, //
     },
     drm::{
+        job_queue::{
+            JobQueue,
+            PreparedJob, //
+        },
         sched::Entity,
         syncobj::SyncObj, //
     },
@@ -20,8 +24,14 @@ use kernel::{
 use crate::{
     driver::TyrDrmDriver,
     file::TyrDrmFile,
-    sched::job::Job,
-    vm::VmBindJob, //
+    sched::job::{
+        Job,
+        TyrJobHandler, //
+    },
+    vm::{
+        bind_job::VmBindJobHandler,
+        VmBindJob, //
+    },
 };
 
 /// Represents either a GPU job or a VM bind job
@@ -146,10 +156,39 @@ impl SyncSignal {
     }
 }
 
-/// Job state tracking for a job in the submission context
+/// A dependency collected during the prepare pass. `External` fences
+/// are resolved immediately; `IntraBatch` ones wait until commit, when
+/// the producing job's fence is available.
+enum ResolvedDep {
+    External(Fence),
+    IntraBatch {
+        /// syncobj handle of the producing job's signal slot.
+        handle: u32,
+        /// timeline point on that syncobj.
+        point: u64,
+    },
+}
+
+/// Job state in the submission context.
+///
+/// `Prepared` and `PreparedVmBind` differ only in the `PreparedJob<H>`
+/// type parameter; duplicating the variants is cheaper than parameterising
+/// [`JobContext`] over a pair of handlers.
 enum JobState {
     /// Job is ready to be processed
     Pending(JobType),
+    /// Job is prepared, with fences created and dependencies resolved.
+    Prepared {
+        prepared_job: PreparedJob<TyrJobHandler>,
+        deps: KVec<ResolvedDep>,
+        resolved_deps: KVec<Fence>,
+    },
+    /// VM bind job is prepared, with fences created and dependencies resolved.
+    PreparedVmBind {
+        prepared_job: PreparedJob<VmBindJobHandler>,
+        deps: KVec<ResolvedDep>,
+        resolved_deps: KVec<Fence>,
+    },
     /// Job has been taken out and is being processed
     Taken,
 }
@@ -242,6 +281,109 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
+    /// Prepare a job by gathering dependencies and creating the completion fence.
+    #[expect(dead_code)]
+    pub(crate) fn prepare(
+        &mut self,
+        job_idx: usize,
+        job_queue: &JobQueue<TyrJobHandler>,
+    ) -> Result {
+        let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
+            JobState::Pending(JobType::Gpu(job)) => job,
+            _ => return Err(EINVAL),
+        };
+
+        // Pre-size `resolved_deps` here (outside the dma-fence signalling
+        // section) so `resolve_job_deps` in `commit` only pushes within
+        // capacity, with GFP_NOWAIT.
+        let deps = self.collect_job_deps_resolved(job_idx)?;
+        let resolved_deps = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
+        let prepared_job = job_queue.prepare(job, deps.len())?;
+
+        self.jobs[job_idx].state = JobState::Prepared {
+            prepared_job,
+            deps,
+            resolved_deps,
+        };
+
+        Ok(())
+    }
+
+    /// Commits a prepared GPU job to the hardware queue.
+    #[expect(dead_code)]
+    pub(crate) fn commit(
+        &mut self,
+        job_idx: usize,
+        job_queue: &JobQueue<TyrJobHandler>,
+    ) -> Result<Fence> {
+        let (prepared_job, deps, mut resolved_deps) =
+            match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
+                JobState::Prepared {
+                    prepared_job,
+                    deps,
+                    resolved_deps,
+                } => (prepared_job, deps, resolved_deps),
+                _ => return Err(EINVAL),
+            };
+
+        self.resolve_job_deps(&deps, &mut resolved_deps)?;
+        let finished_fence = job_queue.commit(prepared_job, &resolved_deps)?;
+
+        self.update_job_syncs(job_idx, finished_fence.clone())?;
+
+        Ok(finished_fence)
+    }
+
+    /// Prepare a VM bind job by gathering dependencies and creating the completion fence.
+    #[expect(dead_code)]
+    pub(crate) fn prepare_vm_bind_job(
+        &mut self,
+        job_idx: usize,
+        job_queue: &JobQueue<VmBindJobHandler>,
+    ) -> Result {
+        let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
+            JobState::Pending(JobType::VmBind(job)) => job,
+            _ => return Err(EINVAL),
+        };
+
+        let deps = self.collect_job_deps_resolved(job_idx)?;
+        let resolved_deps = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
+        let prepared_job = job_queue.prepare(job, deps.len())?;
+
+        self.jobs[job_idx].state = JobState::PreparedVmBind {
+            prepared_job,
+            deps,
+            resolved_deps,
+        };
+
+        Ok(())
+    }
+
+    /// Commits a prepared VM bind job.
+    #[expect(dead_code)]
+    pub(crate) fn commit_vm_bind_job(
+        &mut self,
+        job_idx: usize,
+        job_queue: &JobQueue<VmBindJobHandler>,
+    ) -> Result<Fence> {
+        let (prepared_job, deps, mut resolved_deps) =
+            match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
+                JobState::PreparedVmBind {
+                    prepared_job,
+                    deps,
+                    resolved_deps,
+                } => (prepared_job, deps, resolved_deps),
+                _ => return Err(EINVAL),
+            };
+
+        self.resolve_job_deps(&deps, &mut resolved_deps)?;
+        let finished_fence = job_queue.commit(prepared_job, &resolved_deps)?;
+
+        self.update_job_syncs(job_idx, finished_fence.clone())?;
+
+        Ok(finished_fence)
+    }
+
     /// Add jobs dependencies, arm jobs, and push them to the scheduler
     ///
     /// This method takes the entity as a parameter, processes jobs for the specified
@@ -264,6 +406,7 @@ impl<'a> Context<'a> {
                     }
                 }
                 JobState::Pending(JobType::VmBind(_)) => continue,
+                JobState::Prepared { .. } | JobState::PreparedVmBind { .. } => continue,
                 JobState::Taken => continue,
             }
 
@@ -301,6 +444,7 @@ impl<'a> Context<'a> {
             match &self.jobs[job_idx].state {
                 JobState::Pending(JobType::VmBind(_)) => {}
                 JobState::Pending(JobType::Gpu(_)) => continue,
+                JobState::Prepared { .. } | JobState::PreparedVmBind { .. } => continue,
                 JobState::Taken => continue,
             }
 
@@ -429,6 +573,55 @@ impl<'a> Context<'a> {
         }
 
         Ok(deps)
+    }
+
+    /// Collect waits for [`Self::prepare`] / [`Self::commit`] in a deferred
+    /// form, so that intra-batch fences can be resolved when [`Self::commit`]
+    /// runs in the dma-fence signalling section instead of at prepare time.
+    fn collect_job_deps_resolved(&self, job_idx: usize) -> Result<KVec<ResolvedDep>> {
+        let syncops = &self.jobs[job_idx].syncops;
+        let mut deps = KVec::new();
+
+        for syncop in syncops.iter() {
+            if !matches!(syncop.ty, SyncOpType::Wait) {
+                continue;
+            }
+
+            let handle = syncop.handle.handle();
+            let point = syncop.handle.timeline_value();
+
+            // First check if we have this signal in our internal context.
+            if self.search_sync_signal(handle, point).is_some() {
+                deps.push(ResolvedDep::IntraBatch { handle, point }, GFP_KERNEL)?;
+            } else {
+                // Otherwise, this is from a different submission - look it up.
+                match SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)? {
+                    Some(fence) => deps.push(ResolvedDep::External(fence), GFP_KERNEL)?,
+                    None => return Err(EINVAL), // A wait for which we can't find a fence is broken.
+                }
+            }
+        }
+
+        Ok(deps)
+    }
+
+    /// Resolve a list of [`ResolvedDep`]s into [`Fence`]s using only
+    /// non-sleeping operations, so this can run inside the dma-fence
+    /// signalling section.
+    fn resolve_job_deps(&self, deps: &[ResolvedDep], resolved: &mut KVec<Fence>) -> Result {
+        for dep in deps {
+            match dep {
+                ResolvedDep::External(fence) => {
+                    resolved.push(fence.clone(), GFP_NOWAIT)?;
+                }
+                ResolvedDep::IntraBatch { handle, point } => {
+                    let sig_sync = self.search_sync_signal(*handle, *point).ok_or(EINVAL)?;
+                    let fence = sig_sync.current_fence().ok_or(EINVAL)?.clone();
+                    resolved.push(fence, GFP_NOWAIT)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_job_syncs(&mut self, job_idx: usize, done_fence: Fence) -> Result {
