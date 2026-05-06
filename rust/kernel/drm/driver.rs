@@ -138,6 +138,22 @@ pub trait Driver {
     /// usable from the render node (i.e. marked DRM_RENDER_ALLOW), whereas
     /// userspace processes using the master node can invoke any ioctl.
     const FEAT_RENDER: bool = false;
+
+    /// Custom mmap handler.
+    ///
+    /// If provided, this handler will be called for all mmap operations on the DRM device.
+    /// The driver can handle custom mappings (like MMIO regions) by returning `Some(Ok(()))`,
+    /// or defer to the default GEM mmap behavior by returning `None`.
+    fn mmap(
+        _device: &drm::device::Device<Self>,
+        _file: &drm::file::File<Self::File>,
+        _vma: &crate::mm::virt::VmaNew,
+    ) -> Option<Result>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// The registration type of a `drm::Device`.
