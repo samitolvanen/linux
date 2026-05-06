@@ -258,13 +258,6 @@ impl Scheduler {
         Ok(ring_db)
     }
 
-    pub(crate) fn set_events(&mut self, tdev: &TyrDrmDevice, events: u32) {
-        let old_events = self.events.unwrap_or_default();
-        self.events = Some(events | old_events);
-
-        let _ = self.wq.enqueue::<_, 2>(ARef::from(tdev));
-    }
-
     fn update_group(&mut self, group: Arc<Group>, _data: &TyrDrmDevice) -> Result {
         let mut no_in_flight_jobs = true;
         let mut csg_id = None;

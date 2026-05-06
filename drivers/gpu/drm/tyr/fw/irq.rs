@@ -19,10 +19,13 @@ use kernel::{
     types::ARef, //
 };
 
+use core::sync::atomic::Ordering;
+
 use crate::{
     driver::{
         IoMem,
         TyrDrmDevice,
+        TyrDrmDeviceData,
         TyrIrq,
         TyrIrqTrait, //
     },
@@ -104,10 +107,8 @@ impl TyrIrqTrait for JobIrq {
 
         self.boot_wait.notify_all();
 
-        let _ = tdev.with_locked_scheduler(|sched| {
-            sched.set_events(tdev, status);
-            Ok(())
-        });
+        tdev.fw_events.fetch_or(status, Ordering::Release);
+        TyrDrmDeviceData::schedule_fw_events(&ARef::from(tdev));
     }
 }
 

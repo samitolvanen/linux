@@ -24,6 +24,7 @@ use crate::{
     driver::{
         IoMem,
         TyrDrmDevice,
+        TyrDrmDeviceData,
         TyrIrq,
         TyrIrqTrait, //
     },
@@ -106,10 +107,12 @@ impl TyrIrqTrait for MmuIrq {
         self.mask
     }
 
-    fn handle(&self, _: &TyrDrmDevice, status: u32) {
+    fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
         let fault_bits = status & u32::from(PAGE_FAULT_BITS);
         if fault_bits != 0 {
             let _ = decode_faults(fault_bits, &self.iomem);
+            // schedule_tick coalesces redundant requests via the workqueue.
+            TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
         }
     }
 }
