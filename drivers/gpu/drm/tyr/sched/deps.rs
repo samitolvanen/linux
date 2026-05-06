@@ -8,8 +8,10 @@
 
 use kernel::{
 	alloc::KVec,
+    dma_buf::dma_fence::PublicDmaFence,
 	drm::syncobj::SyncObj,
 	prelude::*,
+    sync::aref::ARef,
 	transmute::FromBytes,
 	uaccess::UserSlice,
 	uapi,
@@ -58,6 +60,10 @@ pub(crate) struct SyncOp {
 impl SyncOp {
     pub(crate) fn is_signal(&self) -> bool {
         matches!(self.ty, SyncOpType::Signal)
+    }
+
+    pub(crate) fn is_wait(&self) -> bool {
+        matches!(self.ty, SyncOpType::Wait)
     }
 }
 
@@ -122,7 +128,20 @@ pub(crate) fn wait_for_syncops(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result 
         return Err(ENOTSUPP);
     }
 
-    for sync in syncops.iter() {
+    for fence in wait_fences(file, syncops)?.iter() {
+        fence.wait()?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn wait_fences(
+    file: &TyrDrmFile,
+    syncops: &[SyncOp],
+) -> Result<KVec<ARef<PublicDmaFence>>> {
+    let mut fences = KVec::new();
+
+    for sync in syncops.iter().filter(|sync| sync.is_wait()) {
         let fence = SyncObj::<TyrDrmDriver>::find_fence(
             file,
             sync.handle.handle(),
@@ -130,9 +149,10 @@ pub(crate) fn wait_for_syncops(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result 
             0,
         )?
         .ok_or(EINVAL)?;
-        fence.wait()?;
+        fences.push(fence, GFP_KERNEL)?;
     }
-    Ok(())
+
+    Ok(fences)
 }
 
 pub(crate) fn append_syncops(
