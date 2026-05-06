@@ -203,8 +203,15 @@ impl CommandStream {
     }
 
     pub(crate) fn set_state(&mut self, state: StreamState) -> Result {
-        self.input_request()?
-            .update_reqs(state as u32, CS_STATE_MASK)?;
+        let mut req_val = state as u32;
+        let mut req_mask = CS_STATE_MASK;
+
+        if state == StreamState::Start {
+            req_val |= CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY;
+            req_mask |= CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY;
+        }
+
+        self.input_request()?.update_reqs(req_val, req_mask)?;
 
         self.state = state;
         Ok(())
