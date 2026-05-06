@@ -348,6 +348,7 @@ impl GlobalInterface {
         mut streams_per_csg: KVec<KVec<cs::CommandStream>>,
     ) -> Result {
         let poweroff_timer = TimeoutCycles::from_micro(core_clk_rate, PWROFF_HYSTERESIS_US)?.into();
+        let idle_timer = TimeoutCycles::from_micro(core_clk_rate, IDLE_HYSTERESIS_US)?.into();
 
         let control = self.read_control_after_boot()?;
 
@@ -408,13 +409,13 @@ impl GlobalInterface {
         // Setup timers.
         input.poweroff_timer = poweroff_timer;
         input.progress_timer = PROGRESS_TIMEOUT_CYCLES >> PROGRESS_TIMEOUT_SCALE_SHIFT;
-        input.idle_timer = IDLE_HYSTERESIS_US;
+        input.idle_timer = idle_timer;
 
         // Enable the interrupts we care about.
         input.ack_irq_mask = GLB_CFG_ALLOC_EN
             | GLB_PING
             | GLB_CFG_POWEROFF_TIMER
-            | GLB_CFG_POWEROFF_TIMER
+            | GLB_CFG_PROGRESS_TIMER
             | GLB_IDLE_EN
             | GLB_IDLE;
 
