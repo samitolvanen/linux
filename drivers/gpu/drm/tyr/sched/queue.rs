@@ -164,7 +164,7 @@ impl QueueData {
         self.next_seqno.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn append_instrs(&self, instrs: &[u8]) -> Result {
+    fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
         let mut ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let ringbuf_sz = self.ringbuf.size() as u64;
         let ringbuf_output = self.interfaces.read_output()?;
@@ -187,10 +187,11 @@ impl QueueData {
 
         ringbuf_input.extract_init = ringbuf_output.extract;
         ringbuf_input.insert += instrs.len() as u64;
+        let completion_point = ringbuf_input.insert;
 
         self.interfaces.write_input(ringbuf_input)?;
         kernel::sync::barrier::smp_wmb();
-        Ok(())
+        Ok(completion_point)
     }
 
     fn kick(&self) -> Result {
@@ -299,7 +300,7 @@ impl Queue {
         self.data.claim_seqno()
     }
 
-    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
+    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
         self.data.append_instrs(instrs)
     }
 
