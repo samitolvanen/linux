@@ -411,10 +411,10 @@ impl Scheduler {
         let doorbell_id = queue.doorbell_id.ok_or(EINVAL)?;
         let mut cs_input = cs_iface.read_input()?;
 
-        let mut ringbuf_input = queue.interfaces.read_input()?;
+        let ringbuf_input = queue.interfaces.read_input()?;
         let ringbuf_output = queue.interfaces.read_output()?;
-        ringbuf_input.extract_init = ringbuf_output.extract;
-        let _ = queue.interfaces.write_input(ringbuf_input);
+        queue.interfaces.write_extract_init(ringbuf_output.extract);
+        queue.interfaces.write_insert(ringbuf_input.insert);
 
         cs_input.ringbuf_base = queue.ringbuf.kernel_va().ok_or(EINVAL)?.start;
         cs_input.ringbuf_size = queue.ringbuf.size() as u32;

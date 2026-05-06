@@ -149,7 +149,7 @@ impl Queue {
     /// The queue's doorbell needs to be rung after this function is called in
     /// order to get CSF to act on the new values.
     pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
-        let mut ringbuf_input = self.interfaces.read_input()?;
+        let ringbuf_input = self.interfaces.read_input()?;
         let ringbuf_sz = self.ringbuf.size() as u64;
 
         let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
@@ -172,10 +172,9 @@ impl Queue {
         // We need to always save the latest extract point in case the CS is
         // stopped and then resumed.
         let ringbuf_output = self.interfaces.read_output()?;
-        ringbuf_input.extract_init = ringbuf_output.extract;
-        ringbuf_input.insert += instrs.len() as u64;
-
-        self.interfaces.write_input(ringbuf_input)?;
+        self.interfaces.write_extract_init(ringbuf_output.extract);
+        self.interfaces
+            .write_insert(ringbuf_input.insert + instrs.len() as u64);
         kernel::sync::barrier::smp_wmb();
         Ok(())
     }
@@ -225,16 +224,37 @@ impl Interfaces {
         Ok(input)
     }
 
-    pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
+    /// Volatile-stores `val` to a field of `RingBufferInput` at `field_offset`
+    /// bytes from the start of the input record.
+    ///
+    /// The mapping is shared with the GPU, so the store is volatile to
+    /// match the agreed publication primitive. Ordering against the
+    /// surrounding `wmb()` / `smp_wmb()` is the caller's responsibility.
+    fn write_input_field<T>(&mut self, field_offset: usize, val: T) {
         let vmap = self.mem.vmap();
+        // SAFETY: `self.mem` is large enough to contain a `RingBufferInput`
+        // at `self.input_offset` (verified by `Interfaces::new`), so the
+        // byte offset `input_offset + field_offset` is in bounds of the
+        // same allocated object. Callers pass `offset_of!` of a `T`-typed
+        // field so the resulting pointer is naturally aligned for `T`.
+        // No `&mut RingBufferInput` is created, so the volatile store
+        // does not race a concurrent reader through Rust's aliasing rules.
         unsafe {
             (vmap.addr() as *mut u8)
-                .add(self.input_offset)
-                .cast::<RingBufferInput>()
-                .write_volatile(value)
+                .add(self.input_offset + field_offset)
+                .cast::<T>()
+                .write_volatile(val)
         };
+    }
 
-        Ok(())
+    /// Writes the `extract_init` field of the ring buffer input state.
+    pub(super) fn write_extract_init(&mut self, val: u64) {
+        self.write_input_field::<u64>(core::mem::offset_of!(RingBufferInput, extract_init), val);
+    }
+
+    /// Writes the `insert` field of the ring buffer input state.
+    pub(super) fn write_insert(&mut self, val: u64) {
+        self.write_input_field::<u64>(core::mem::offset_of!(RingBufferInput, insert), val);
     }
 
     pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
