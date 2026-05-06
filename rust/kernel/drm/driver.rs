@@ -121,6 +121,22 @@ pub trait Driver {
 
     /// IOCTL list. See `kernel::drm::ioctl::declare_drm_ioctls!{}`.
     const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor];
+
+    /// Custom mmap handler.
+    ///
+    /// If provided, this handler will be called for all mmap operations on the DRM device.
+    /// The driver can handle custom mappings (like MMIO regions) by returning `Some(Ok(()))`,
+    /// or defer to the default GEM mmap behavior by returning `None`.
+    fn mmap(
+        _device: &drm::device::Device<Self>,
+        _file: &drm::file::File<Self::File>,
+        _vma: &crate::mm::virt::VmaNew,
+    ) -> Option<Result>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// The registration type of a `drm::Device`.
