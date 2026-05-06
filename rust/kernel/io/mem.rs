@@ -39,6 +39,11 @@ impl<'a> IoRequest<'a> {
         IoRequest { device, resource }
     }
 
+    /// Returns the physical start address of the resource.
+    pub fn start(&self) -> u64 {
+        self.resource.start()
+    }
+
     /// Maps an [`IoRequest`] where the size is known at compile time.
     ///
     /// This uses the [`ioremap()`] C API.
