@@ -43,6 +43,12 @@ impl<'a> IoRequest<'a> {
         IoRequest { device, resource }
     }
 
+    /// Returns the physical start address of the resource.
+    pub fn start(&self) -> u64 {
+        #[allow(clippy::useless_conversion)]
+        u64::from(self.resource.start())
+    }
+
     /// Maps an [`IoRequest`] where the size is known at compile time.
     ///
     /// This uses the [`ioremap()`] C API.
