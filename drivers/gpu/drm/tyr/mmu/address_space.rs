@@ -422,6 +422,81 @@ impl AddressSpaceManager {
         Ok(())
     }
 
+    /// Issues a GPU-side cache flush, bracketed by an MMU AS lock/unlock.
+    ///
+    /// Locks `region` on AS slot `as_nr`, runs the GPU `flush_caches`
+    /// command (L2 and LSC clean-invalidate, other caches invalidate),
+    /// waits for `clean_caches_completed` (polled every 10us, 100ms
+    /// timeout), then issues `MmuCommand::Unlock` for the region. The
+    /// `clean_caches_completed` IRQ bit is cleared on entry and exit so
+    /// the poll only observes events from this command and a subsequent
+    /// flush starts from a clean slate.
+    ///
+    /// `region` must be non-empty. Pass `0..u64::MAX` to lock the full
+    /// AS when no tighter bound is available.
+    ///
+    /// The lock is always released on return, even if the GPU-side flush
+    /// failed — leaving the AS locked would block subsequent translations
+    /// on this slot.
+    fn hw_flush_caches_for(
+        &mut self,
+        iomem: &Devres<IoMem>,
+        as_nr: usize,
+        region: Range<u64>,
+    ) -> Result {
+        self.as_start_update(as_nr, &region)?;
+
+        // Run the GPU-side flush; do not propagate errors with `?` until
+        // after we have had a chance to release the lock.
+        let flush_result = self.do_gpu_flush(iomem);
+
+        // Always release the AS lock if as_start_update succeeded, even
+        // if the flush failed.
+        let unlock_result = self
+            .as_send_cmd(as_nr, MmuCommand::Unlock)
+            .and_then(|_| self.as_wait_ready(as_nr));
+
+        flush_result.and(unlock_result)
+    }
+
+    /// Issues the GPU-side `flush_caches` command and waits for completion.
+    ///
+    /// Used by [`hw_flush_caches_for`]; does not touch the MMU lock state.
+    fn do_gpu_flush(&self, iomem: &Devres<IoMem>) -> Result {
+        let dev = self.dev();
+        let io = iomem.access(dev)?;
+
+        let gpu_cmd = crate::regs::gpu_control::GPU_COMMAND::flush_caches(
+            crate::regs::gpu_control::FlushMode::CleanInvalidate,
+            crate::regs::gpu_control::FlushMode::CleanInvalidate,
+            crate::regs::gpu_control::FlushMode::Invalidate,
+        );
+
+        // Clear any stale clean_caches_completed before kicking off this op.
+        io.write(
+            crate::regs::gpu_control::GPU_IRQ_CLEAR,
+            crate::regs::gpu_control::GPU_IRQ_CLEAR::zeroed().with_clean_caches_completed(true),
+        );
+
+        io.write_reg(gpu_cmd);
+
+        let op = || Ok(io.read(crate::regs::gpu_control::GPU_IRQ_RAWSTAT));
+        let cond = |status: &crate::regs::gpu_control::GPU_IRQ_RAWSTAT| -> bool {
+            status.clean_caches_completed()
+        };
+        let res =
+            poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
+
+        // Always clear the bit, even on timeout, to leave the next caller
+        // in a known state.
+        io.write(
+            crate::regs::gpu_control::GPU_IRQ_CLEAR,
+            crate::regs::gpu_control::GPU_IRQ_CLEAR::zeroed().with_clean_caches_completed(true),
+        );
+
+        res.map(|_| ())
+    }
+
     /// Locks a region of the translation tables for an atomic update.
     ///
     /// Programs the MMU LOCKADDR register for the given address space and issues
@@ -499,8 +574,10 @@ impl AddressSpaceManager {
     /// Returns an error if the slot is invalid or if the flush command fails.
     fn as_end_update(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushPt)?;
-        Ok(())
+        // Re-lock the full AS for the GPU-side flush; tighter bounds are a
+        // possible follow-up.
+        let iomem = self.iomem.clone();
+        self.hw_flush_caches_for(&iomem, as_nr, 0..u64::MAX)
     }
 
     /// Flushes the translation table cache for an AS slot.
@@ -508,7 +585,8 @@ impl AddressSpaceManager {
     /// Returns an error if the slot is invalid or if the flush command fails.
     fn as_flush(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
-        self.as_send_cmd(as_nr, MmuCommand::FlushPt)
+        let iomem = self.iomem.clone();
+        self.hw_flush_caches_for(&iomem, as_nr, 0..u64::MAX)
     }
 }
 
