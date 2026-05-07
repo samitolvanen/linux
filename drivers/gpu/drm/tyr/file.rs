@@ -335,11 +335,21 @@ impl TyrDrmFileData {
                 let deps = deps::wait_fences(file, &syncs)?;
                 let signals = deps::signal_syncs(file, &syncs)?;
                 let prepared = vm.prepare_bind_job(job, &deps)?;
-                let fence = vm.commit_bind_job(prepared);
 
-                for signal in signals {
-                    signal.publish(&fence);
-                }
+                vm.with_prepared_vm(1, |mut prepared_vm| {
+                    let fence = vm.commit_bind_job(prepared);
+                    prepared_vm.resv_add_fence(
+                        &fence,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    );
+
+                    for signal in signals {
+                        signal.publish(&fence);
+                    }
+
+                    Ok(())
+                })?;
 
                 Ok(0)
             };

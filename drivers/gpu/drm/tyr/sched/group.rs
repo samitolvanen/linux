@@ -221,9 +221,19 @@ impl Group {
             prepared_jobs.push(job.prepare(self, file)?, GFP_KERNEL)?;
         }
 
-        for prepared_job in prepared_jobs.into_iter() {
-            let _submit_fence = prepared_job.commit(self)?;
-        }
+        self.vm
+            .with_prepared_vm(prepared_jobs.len() as u32, |mut prepared_vm| {
+                for prepared_job in prepared_jobs.into_iter() {
+                    let submit_fence = prepared_job.commit(self)?;
+                    prepared_vm.resv_add_fence(
+                        &submit_fence,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    );
+                }
+
+                Ok(())
+            })?;
 
         Ok(())
     }
