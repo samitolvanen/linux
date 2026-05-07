@@ -28,11 +28,32 @@ use crate::{
         TyrIrqTrait, //
     },
     mmu::decode_faults,
-    regs::mmu_control, //
+    regs::{
+        mmu_control,
+        MAX_AS, //
+    },
 };
 
+/// Bit mask covering the per-AS PAGE_FAULT bits (one per address space).
+const PAGE_FAULT_BITS: u16 = ((1u32 << MAX_AS) - 1) as u16;
+
+/// Returns the bitmask for the MMU interrupts the driver actively handles.
+///
+/// Currently this enables the per-AS page-fault bits (one per address
+/// space, up to [`MAX_AS`]) so [`decode_faults`] can identify and process
+/// faulting transactions; other MMU events stay masked.
+pub(crate) fn mmu_interrupts_mask() -> u32 {
+    mmu_control::IRQ_MASK::zeroed()
+        .with_page_fault(PAGE_FAULT_BITS)
+        .into_raw()
+}
+
+/// MMU interrupt handler data.
 pub(crate) struct MmuIrq {
     iomem: Arc<Devres<IoMem>>,
+    /// Cached value of [`mmu_interrupts_mask`] so the per-interrupt
+    /// `mask()` does not rebuild it on every call.
+    mask: u32,
 }
 
 pub(crate) fn mmu_irq_init<'a>(
@@ -40,13 +61,9 @@ pub(crate) fn mmu_irq_init<'a>(
     pdev: &'a platform::Device<kernel::device::Bound>,
     iomem: Arc<Devres<IoMem>>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<MmuIrq>>, Error> + 'a> {
-    // SAFETY: pdev is a bound device.
-    let dev = unsafe { pdev.as_ref().as_bound() };
-    let io = iomem.access(dev)?;
-    io.write_reg(mmu_control::IRQ_MASK::from_raw(u32::MAX));
-
     let irq_type = MmuIrq {
         iomem: iomem.clone(),
+        mask: mmu_interrupts_mask(),
     };
 
     TyrIrq::request(pdev, tdev, c_str!("mmu"), irq_type)
@@ -86,13 +103,28 @@ impl TyrIrqTrait for MmuIrq {
     }
 
     fn mask(&self) -> u32 {
-        u32::MAX // for now.
+        self.mask
     }
 
     fn handle(&self, _: &TyrDrmDevice, status: u32) {
-        let fault_bits = status & kernel::bits::genmask_u32(0..=15);
+        let fault_bits = status & u32::from(PAGE_FAULT_BITS);
         if fault_bits != 0 {
             let _ = decode_faults(fault_bits, &self.iomem);
         }
+    }
+}
+
+impl MmuIrq {
+    /// Enables the MMU interrupts in hardware.
+    ///
+    /// Clears any latched bits in `IRQ_RAWSTAT` left over from a previous
+    /// probe before unmasking, then writes [`mmu_interrupts_mask`] to
+    /// `IRQ_MASK`.
+    pub(crate) fn enable_hardware(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+        let io = iomem.access(dev)?;
+        // Drop any latched IRQs from a previous probe.
+        io.write_reg(mmu_control::IRQ_CLEAR::from_raw(u32::MAX));
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(mmu_interrupts_mask()));
+        Ok(())
     }
 }

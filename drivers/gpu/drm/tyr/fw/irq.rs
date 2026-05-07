@@ -46,11 +46,6 @@ pub(crate) fn job_irq_init<'a>(
     event_wait: Arc<Wait>,
     boot_wait: Arc<Wait>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<JobIrq>>, Error> + 'a> {
-    // SAFETY: pdev is a bound device.
-    let dev = unsafe { pdev.as_ref().as_bound() };
-    let io = iomem.access(dev)?;
-    io.write_reg(job_control::JOB_IRQ_MASK::from_raw(u32::MAX));
-
     let irq_type = JobIrq {
         iomem: iomem.clone(),
         event_wait,
@@ -113,5 +108,20 @@ impl TyrIrqTrait for JobIrq {
             sched.set_events(tdev, status);
             Ok(())
         });
+    }
+}
+
+impl JobIrq {
+    /// Enables the Job interrupts in hardware.
+    ///
+    /// Clears any latched bits in `JOB_IRQ_RAWSTAT` left over from a
+    /// previous probe before unmasking, then writes `JOB_IRQ_MASK` so the
+    /// MCU and CSG slot events can be observed.
+    pub(crate) fn enable_hardware(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+        let io = iomem.access(dev)?;
+        // Drop any latched IRQs from a previous probe.
+        io.write_reg(job_control::JOB_IRQ_CLEAR::from_raw(u32::MAX));
+        io.write_reg(job_control::JOB_IRQ_MASK::from_raw(u32::MAX));
+        Ok(())
     }
 }

@@ -278,18 +278,21 @@ impl platform::Driver for TyrPlatformDriverData {
         let gpu_irq =
             gpu::irq::gpu_irq_init(tdev.clone(), pdev_bound, irq_iomem.clone(), power_on_wait)?;
         devres::register(dev_bound, gpu_irq, GFP_KERNEL)?;
+        gpu::irq::GpuIrq::enable_hardware(dev_bound, &irq_iomem)?;
 
         let mmu_irq = mmu::irq::mmu_irq_init(tdev.clone(), pdev_bound, irq_iomem.clone())?;
         devres::register(dev_bound, mmu_irq, GFP_KERNEL)?;
+        mmu::irq::MmuIrq::enable_hardware(dev_bound, &irq_iomem)?;
 
         let job_irq = fw::irq::job_irq_init(
             tdev.clone(),
             pdev_bound,
-            irq_iomem,
+            irq_iomem.clone(),
             fw_event_wait,
             boot_wait,
         )?;
         devres::register(dev_bound, job_irq, GFP_KERNEL)?;
+        fw::irq::JobIrq::enable_hardware(dev_bound, &irq_iomem)?;
 
         // Enable the global interface now that the MCU has booted and IRQs are
         // registered. This reads the control structures from the shared section,
