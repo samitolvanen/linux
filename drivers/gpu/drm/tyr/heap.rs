@@ -131,7 +131,7 @@ impl Pools {
         vm_id: usize,
         vm: Arc<Vm>,
         heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
-    ) -> Result {
+    ) -> Result<Arc<Pool>> {
         let args = ContextCreateArgs {
             initial_chunk_count: heapcreate.initial_chunk_count,
             chunk_size: heapcreate.chunk_size,
@@ -146,7 +146,7 @@ impl Pools {
         heapcreate.tiler_heap_ctx_gpu_va = created_context.context_gpu_va;
         heapcreate.first_heap_chunk_gpu_va = created_context.first_chunk_gpu_va;
 
-        Ok(())
+        Ok(pool)
     }
 
     pub(crate) fn destroy_context(

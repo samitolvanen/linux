@@ -50,6 +50,19 @@ impl<T: 'static> Pool<T> {
 		Some(value.into())
 	}
 
+	pub(crate) fn for_each<F>(&self, mut f: F) -> Result
+	where
+		F: FnMut(usize, Arc<T>) -> Result,
+	{
+		for index in 1..self.index_upper_bound() {
+			if let Some(value) = self.get(index) {
+				f(index, value)?;
+			}
+		}
+
+		Ok(())
+	}
+
 	pub(crate) fn remove(&self, index: usize) -> Result<Arc<T>> {
 		let xa = self.xa.as_ref();
 		let mut guard = xa.lock();

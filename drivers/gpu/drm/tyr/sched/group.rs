@@ -10,8 +10,12 @@ use kernel::{
     alloc::KVec,
     drm::gem::BaseObject,
     io::Io,
+    new_mutex,
     prelude::*,
-    sync::Arc,
+    sync::{
+        Arc,
+        Mutex,
+    },
     uaccess::UserSlice,
     uapi,
 };
@@ -20,6 +24,7 @@ use crate::{
     driver::TyrDrmDevice,
     file::TyrDrmFile,
     gem,
+    heap,
     pool,
     vm::{
         Vm,
@@ -46,6 +51,7 @@ use super::{
 
 const UNBOUND_CSG_ID: usize = usize::MAX;
 
+#[pin_data]
 pub(crate) struct Group {
     pub(crate) fatal_queues: AtomicU32,
     csg_id: AtomicUsize,
@@ -71,6 +77,8 @@ pub(crate) struct Group {
     #[allow(dead_code)]
     pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
     _syncobjs: Arc<gem::MappedBo>,
+    #[pin]
+    heap_pool: Mutex<Option<Arc<heap::Pool>>>,
 }
 
 impl Group {
@@ -131,8 +139,8 @@ impl Group {
             queues.push(Queue::new(ddev, queue_arg, vm.clone())?, GFP_KERNEL)?;
         }
 
-        Ok(Arc::new(
-            Self {
+        Arc::pin_init(
+            pin_init!(Self {
                 fatal_queues: AtomicU32::new(0),
                 csg_id: AtomicUsize::new(UNBOUND_CSG_ID),
                 queues,
@@ -147,9 +155,10 @@ impl Group {
                 suspend_buf,
                 protm_suspend_buf,
                 _syncobjs: syncobjs,
-            },
+                heap_pool <- new_mutex!(file.inner().heap_pools().get_pool(group_args.vm_id as usize)),
+            }),
             GFP_KERNEL,
-        )?)
+        )
     }
 
     pub(crate) fn fatal_queues(&self) -> u32 {
@@ -190,6 +199,15 @@ impl Group {
 
     pub(super) fn write_syncobj(&self, queue_index: usize, value: syncs::SyncObj64b) -> Result {
         syncs::SyncObj64b::write(&self._syncobjs, self.syncobj_offset(queue_index)?, value)
+    }
+
+    pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
+        *self.heap_pool.lock() = Some(pool);
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
+        self.heap_pool.lock().clone()
     }
 
     pub(super) fn submit(
@@ -261,6 +279,16 @@ impl Pool {
 
     pub(crate) fn group(&self, index: usize) -> Option<Arc<Group>> {
         self.0.get(index)
+    }
+
+    pub(crate) fn set_heap_pool_for_vm(&self, vm: &Arc<Vm>, pool: Arc<heap::Pool>) -> Result {
+        self.0.for_each(|_, group| {
+            if Arc::ptr_eq(&group.vm, vm) {
+                group.set_heap_pool(pool.clone());
+            }
+
+            Ok(())
+        })
     }
 
     pub(crate) fn submit_group(
