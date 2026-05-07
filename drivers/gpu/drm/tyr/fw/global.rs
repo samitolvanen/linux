@@ -64,7 +64,7 @@ use kernel::{
 	time::arch_timer_get_rate,
 };
 
-pub(super) use self::csg::CsgInterface;
+pub(crate) use self::csg::CsgInterface;
 
 use crate::wait::WaitResult;
 

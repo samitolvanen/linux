@@ -39,6 +39,7 @@ use kernel::{
         Mutex, //
     },
     time, //
+    workqueue::Work,
 };
 
 use crate::{
@@ -98,6 +99,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
+
+    #[pin]
+    pub(crate) tiler_oom_work: Work<TyrDrmDevice, 4>,
 }
 
 impl TyrDrmDeviceData {
@@ -214,6 +218,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
 				csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 sched <- new_mutex!(SchedulerState::Disabled),
+                tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;

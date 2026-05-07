@@ -26,6 +26,7 @@ use kernel::{
         aref::ARef,
         Arc, //
     },
+    workqueue,
 };
 
 use crate::{
@@ -166,6 +167,20 @@ impl TyrIrqTrait for JobIrq {
             let _ = tdev.fw.process_global_irq().inspect_err(|err| {
                 pr_err!("Failed to process firmware global IRQ: {:?}\n", err);
             });
+        }
+
+        let csg_events = JOB_IRQ_RAWSTAT::from_raw(status).csg();
+        if csg_events != 0 {
+            let queued_tiler_oom = tdev
+                .with_locked_scheduler(|sched| sched.process_csg_irqs(*csg_events, tdev))
+                .inspect_err(|err| {
+                    pr_err!("Failed to process firmware CSG IRQs: {:?}\n", err);
+                })
+                .unwrap_or(false);
+
+            if queued_tiler_oom {
+                let _ = workqueue::system().enqueue::<ARef<TyrDrmDevice>, 4>(ARef::from(tdev));
+            }
         }
 
         self.state.handle(status);

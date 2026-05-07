@@ -55,7 +55,7 @@ struct EnabledCsgInterface {
     cs: KVec<CsInterface>,
 }
 
-pub(in super::super) struct CsgInterface {
+pub(crate) struct CsgInterface {
     state: CsgInterfaceState,
     #[expect(dead_code)]
     csg_idx: usize,
@@ -172,7 +172,7 @@ impl CsgInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn cs_mut(&mut self, index: usize) -> Option<&mut CsInterface> {
+    pub(crate) fn cs_mut(&mut self, index: usize) -> Option<&mut CsInterface> {
         let enabled = match &mut self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return None,
@@ -199,7 +199,7 @@ impl CsgInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn read_input_db_req(&self) -> Result<CSG_DB_REQ> {
+    pub(crate) fn read_input_db_req(&self) -> Result<CSG_DB_REQ> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),
@@ -209,14 +209,14 @@ impl CsgInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn write_input_db_req(&self, req: CSG_DB_REQ) {
+    pub(crate) fn write_input_db_req(&self, req: CSG_DB_REQ) {
         if let CsgInterfaceState::Enabled(enabled) = &self.state {
             enabled.csg_input.write(CSG_DB_REQ, req);
         }
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn read_input_irq_ack(&self) -> Result<CSG_IRQ_ACK> {
+    pub(crate) fn read_input_irq_ack(&self) -> Result<CSG_IRQ_ACK> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),
@@ -226,7 +226,7 @@ impl CsgInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn write_input_irq_ack(&self, ack: CSG_IRQ_ACK) {
+    pub(crate) fn write_input_irq_ack(&self, ack: CSG_IRQ_ACK) {
         if let CsgInterfaceState::Enabled(enabled) = &self.state {
             enabled.csg_input.write(CSG_IRQ_ACK, ack);
         }
@@ -253,7 +253,7 @@ impl CsgInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn read_output_irq_req(&self) -> Result<CSG_IRQ_REQ> {
+    pub(crate) fn read_output_irq_req(&self) -> Result<CSG_IRQ_REQ> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),

@@ -15,6 +15,10 @@ use super::SharedSectionInfo;
 use crate::fw::{
     interfaces::{
         CS_ACK,
+        CS_HEAP_ADDRESS,
+        CS_HEAP_FRAG_END,
+        CS_HEAP_VT_END,
+        CS_HEAP_VT_START,
         FwInterface,
         CS_REQ,
         CS_TILER_HEAP_END,
@@ -42,10 +46,17 @@ struct EnabledCsInterface {
     cs_output: FwInterface<CS_KERNEL_OUTPUT_BLOCK_SIZE>,
 }
 
-pub(in super::super) struct CsInterface {
+pub(crate) struct CsInterface {
     state: CsInterfaceState,
     #[expect(dead_code)]
     cs_idx: usize,
+}
+
+pub(crate) struct HeapOutputState {
+    pub(crate) heap_address: u64,
+    pub(crate) vt_start: u32,
+    pub(crate) vt_end: u32,
+    pub(crate) frag_end: u32,
 }
 
 impl CsInterface {
@@ -116,7 +127,7 @@ impl CsInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn read_input_req(&self) -> Result<CS_REQ> {
+    pub(crate) fn read_input_req(&self) -> Result<CS_REQ> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
             CsInterfaceState::Disabled => return Err(EINVAL),
@@ -126,7 +137,7 @@ impl CsInterface {
     }
 
     #[allow(dead_code)]
-    pub(in super::super) fn write_input_req(&self, req: CS_REQ) {
+    pub(crate) fn write_input_req(&self, req: CS_REQ) {
         if let CsInterfaceState::Enabled(enabled) = &self.state {
             enabled.cs_input.write(CS_REQ, req);
         }
@@ -148,13 +159,31 @@ impl CsInterface {
         }
     }
 
+    pub(crate) fn write_tiler_heap_raw(&self, start: u64, end: u64) {
+        self.write_tiler_heap(CS_TILER_HEAP_START::from_raw(start), CS_TILER_HEAP_END::from_raw(end));
+    }
+
     #[allow(dead_code)]
-    pub(in super::super) fn read_output_ack(&self) -> Result<CS_ACK> {
+    pub(crate) fn read_output_ack(&self) -> Result<CS_ACK> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
             CsInterfaceState::Disabled => return Err(EINVAL),
         };
 
         Ok(enabled.cs_output.read(CS_ACK))
+    }
+
+    pub(crate) fn read_heap_output_state(&self) -> Result<HeapOutputState> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(HeapOutputState {
+            heap_address: enabled.cs_output.read(CS_HEAP_ADDRESS).pointer().get(),
+            vt_start: enabled.cs_output.read(CS_HEAP_VT_START).value().get(),
+            vt_end: enabled.cs_output.read(CS_HEAP_VT_END).value().get(),
+            frag_end: enabled.cs_output.read(CS_HEAP_FRAG_END).value().get(),
+        })
     }
 }

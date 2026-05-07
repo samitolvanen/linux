@@ -54,6 +54,7 @@ const UNBOUND_CSG_ID: usize = usize::MAX;
 #[pin_data]
 pub(crate) struct Group {
     pub(crate) fatal_queues: AtomicU32,
+    pub(crate) tiler_oom: AtomicU32,
     csg_id: AtomicUsize,
     pub(crate) queues: KVec<Queue>,
     #[allow(dead_code)]
@@ -142,6 +143,7 @@ impl Group {
         Arc::pin_init(
             pin_init!(Self {
                 fatal_queues: AtomicU32::new(0),
+                tiler_oom: AtomicU32::new(0),
                 csg_id: AtomicUsize::new(UNBOUND_CSG_ID),
                 queues,
                 vm,

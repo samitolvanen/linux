@@ -293,6 +293,17 @@ impl Firmware {
         self.global_iface.group_suspend_buf_sizes()
     }
 
+    pub(crate) fn with_csg_mut<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut global::CsgInterface) -> Result<R>,
+    {
+        self.global_iface.with_csg_mut(csg_idx, f)
+    }
+
+    pub(crate) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
+        self.global_iface.ring_csg_doorbell(csg_idx)
+    }
+
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
     pub(crate) fn alloc_queue_mem(&self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
