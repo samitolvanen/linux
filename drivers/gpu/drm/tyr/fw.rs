@@ -276,6 +276,10 @@ impl Firmware {
         self.irq_state.clone()
     }
 
+    pub(super) fn process_global_irq(&self) -> Result {
+        self.global_iface.process_global_irq()
+    }
+
     /// Enable the global interface.
     pub(crate) fn enable_global_interface(&self, tdev: &TyrDrmDevice) -> Result {
         tdev.with_locked_core_clk(|core_clk| self.global_iface.enable(core_clk))

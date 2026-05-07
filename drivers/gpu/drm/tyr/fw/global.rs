@@ -221,6 +221,34 @@ impl GlobalInterface {
 		let inner = self.inner.lock();
 		inner.group_suspend_buf_sizes()
 	}
+
+	pub(super) fn process_global_irq(&self) -> Result {
+		let mut inner = self.inner.lock();
+		inner.process_global_irq(&self.event_wait)
+	}
+
+	#[allow(dead_code)]
+	pub(super) fn with_csg_mut<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
+	where
+		F: FnOnce(&mut csg::CsgInterface) -> Result<R>,
+	{
+		let mut inner = self.inner.lock();
+		let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
+		f(csg)
+	}
+
+	#[allow(dead_code)]
+	pub(super) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
+		self.ring_doorbell(csg_idx + 1)
+	}
+
+	fn ring_doorbell(&self, doorbell_id: usize) -> Result {
+		// SAFETY: Firmware global interface access only happens after the device is bound.
+		let dev = unsafe { self.pdev.as_ref().as_bound() };
+		let io = self.iomem.access(dev)?;
+		let doorbell = Array::try_at(doorbell_id).ok_or(EINVAL)?;
+		io.try_write(doorbell, DOORBELL::zeroed().with_ring(true))
+	}
 }
 
 impl InnerGlobalInterface {
@@ -419,6 +447,35 @@ impl InnerGlobalInterface {
 		};
 
 		enabled.csg.get(index)
+	}
+
+	fn csg_mut(&mut self, index: usize) -> Option<&mut CsgInterface> {
+		let enabled = match &mut self.state {
+			GlobalInterfaceState::Enabled(enabled) => enabled,
+			GlobalInterfaceState::Disabled => return None,
+		};
+
+		enabled.csg.get_mut(index)
+	}
+
+	fn process_global_irq(&mut self, event_wait: &Wait) -> Result {
+		let enabled = match &self.state {
+			GlobalInterfaceState::Enabled(enabled) => enabled,
+			GlobalInterfaceState::Disabled => return Ok(()),
+		};
+
+		let request_field = GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
+		let req = enabled.glb_input.read(GLB_REQ);
+		let ack = enabled.glb_output.read(GLB_ACK);
+		let pending_idle = req.idle_event() ^ ack.idle_event();
+
+		if pending_idle {
+			let idle_mask = GLB_REQ::zeroed().with_idle_event(true);
+			request_field.toggle_requests(idle_mask)?;
+			request_field.wait_acks(idle_mask, event_wait, 1000)?;
+		}
+
+		Ok(())
 	}
 
 	fn csg_slot_count(&self) -> Result<u32> {

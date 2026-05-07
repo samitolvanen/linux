@@ -17,6 +17,15 @@ use super::{
 };
 use crate::fw::{
     interfaces::{
+        CSG_ACK,
+        CSG_CONTROL_BLOCK_SIZE,
+        CSG_DB_ACK,
+        CSG_DB_REQ,
+        CSG_INPUT_BLOCK_SIZE,
+        CSG_IRQ_ACK,
+        CSG_IRQ_REQ,
+        CSG_OUTPUT_BLOCK_SIZE,
+        CSG_REQ,
         FwInterface,
         GROUP_INPUT_VA,
         GROUP_OUTPUT_VA,
@@ -24,9 +33,6 @@ use crate::fw::{
         GROUP_STREAM_NUM,
         GROUP_STREAM_STRIDE,
         GROUP_SUSPEND_SIZE,
-        CSG_CONTROL_BLOCK_SIZE,
-        CSG_INPUT_BLOCK_SIZE,
-        CSG_OUTPUT_BLOCK_SIZE,
         CS_CONTROL_BLOCK_SIZE,
     },
     MAX_CS,
@@ -42,9 +48,7 @@ enum CsgInterfaceState {
 
 struct EnabledCsgInterface {
     csg_control: FwInterface<CSG_CONTROL_BLOCK_SIZE>,
-    #[expect(dead_code)]
     csg_input: FwInterface<CSG_INPUT_BLOCK_SIZE>,
-    #[expect(dead_code)]
     csg_output: FwInterface<CSG_OUTPUT_BLOCK_SIZE>,
     cs_stride: usize,
     cs_num: usize,
@@ -165,6 +169,97 @@ impl CsgInterface {
         };
 
         enabled.cs.get(index)
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn cs_mut(&mut self, index: usize) -> Option<&mut CsInterface> {
+        let enabled = match &mut self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return None,
+        };
+
+        enabled.cs.get_mut(index)
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_input_req(&self) -> Result<CSG_REQ> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_input.read(CSG_REQ))
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn write_input_req(&self, req: CSG_REQ) {
+        if let CsgInterfaceState::Enabled(enabled) = &self.state {
+            enabled.csg_input.write(CSG_REQ, req);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_input_db_req(&self) -> Result<CSG_DB_REQ> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_input.read(CSG_DB_REQ))
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn write_input_db_req(&self, req: CSG_DB_REQ) {
+        if let CsgInterfaceState::Enabled(enabled) = &self.state {
+            enabled.csg_input.write(CSG_DB_REQ, req);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_input_irq_ack(&self) -> Result<CSG_IRQ_ACK> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_input.read(CSG_IRQ_ACK))
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn write_input_irq_ack(&self, ack: CSG_IRQ_ACK) {
+        if let CsgInterfaceState::Enabled(enabled) = &self.state {
+            enabled.csg_input.write(CSG_IRQ_ACK, ack);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_output_ack(&self) -> Result<CSG_ACK> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_output.read(CSG_ACK))
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_output_db_ack(&self) -> Result<CSG_DB_ACK> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_output.read(CSG_DB_ACK))
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_output_irq_req(&self) -> Result<CSG_IRQ_REQ> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_output.read(CSG_IRQ_REQ))
     }
 
     pub(in super::super) fn cs_slot_count(&self) -> Result<u32> {

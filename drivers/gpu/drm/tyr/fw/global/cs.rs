@@ -14,7 +14,11 @@ use kernel::{
 use super::SharedSectionInfo;
 use crate::fw::{
     interfaces::{
+        CS_ACK,
         FwInterface,
+        CS_REQ,
+        CS_TILER_HEAP_END,
+        CS_TILER_HEAP_START,
         STREAM_FEATURES,
         STREAM_INPUT_VA,
         STREAM_OUTPUT_VA,
@@ -34,9 +38,7 @@ enum CsInterfaceState {
 
 struct EnabledCsInterface {
     cs_control: FwInterface<CS_CONTROL_BLOCK_SIZE>,
-    #[expect(dead_code)]
     cs_input: FwInterface<CS_KERNEL_INPUT_BLOCK_SIZE>,
-    #[expect(dead_code)]
     cs_output: FwInterface<CS_KERNEL_OUTPUT_BLOCK_SIZE>,
 }
 
@@ -111,5 +113,48 @@ impl CsInterface {
         };
 
         Ok(enabled.cs_control.read(STREAM_FEATURES).scoreboards().get())
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_input_req(&self) -> Result<CS_REQ> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_input.read(CS_REQ))
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn write_input_req(&self, req: CS_REQ) {
+        if let CsInterfaceState::Enabled(enabled) = &self.state {
+            enabled.cs_input.write(CS_REQ, req);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn write_tiler_heap(
+        &self,
+        start: CS_TILER_HEAP_START,
+        end: CS_TILER_HEAP_END,
+    ) {
+        if let CsInterfaceState::Enabled(enabled) = &self.state {
+            enabled
+                .cs_input
+                .write(CS_TILER_HEAP_START, start);
+            enabled
+                .cs_input
+                .write(CS_TILER_HEAP_END, end);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(in super::super) fn read_output_ack(&self) -> Result<CS_ACK> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_output.read(CS_ACK))
     }
 }
