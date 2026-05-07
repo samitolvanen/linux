@@ -116,7 +116,6 @@ pub(crate) struct Job {
     sync_addr: u64,
 
     /// The baseline accumulated suspend time when this job was submitted.
-    #[expect(dead_code)]
     pub(crate) baseline_suspend_nanos: AtomicI64,
 }
 

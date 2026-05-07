@@ -18,7 +18,13 @@ use kernel::{
     },
     drm::{
         gem::BaseObject,
-        job_queue::JobQueue, //
+        job_queue::{
+            JobQueue,
+            PipelineBuilder,
+            StageAdvance,
+            StageContext,
+            StageOps, //
+        },
     },
     io::{
         register::Array,
@@ -35,7 +41,9 @@ use kernel::{
     },
     time::{
         hrtimer::HrTimerExpires,
+        msecs_to_jiffies,
         Instant,
+        Jiffies,
         Monotonic, //
     }, //
 };
@@ -101,6 +109,53 @@ pub(crate) struct PendingSubmitFence {
     pub(crate) ringbuf_end: u64,
     /// The fence that will be signaled when the job completes.
     pub(crate) fence: Option<Fence>,
+}
+
+struct HwTimeoutStage {
+    timeout: Jiffies,
+}
+
+impl StageOps<job::TyrJobHandler> for HwTimeoutStage {
+    fn process(&self, ctx: &StageContext<'_, job::TyrJobHandler>) -> StageAdvance {
+        if ctx.submit_fence.is_signaled() {
+            return StageAdvance::Advance;
+        }
+
+        let mut suspended_time = 0;
+        let mut is_suspended = false;
+        let mut start = 0;
+
+        let _ = ctx.job.group.with_locked_inner(|inner| {
+            if let Some(queue) = inner.queues.get_mut(ctx.job.queue_idx()) {
+                suspended_time = queue.accumulated_suspend_nanos.load(Ordering::Relaxed);
+                // Acquire pairs with the Release-store in `suspend_timeout`,
+                // so when `is_suspended` is true the load of
+                // `suspend_start_nanos` below sees the matching start time.
+                is_suspended = queue.timeout_suspended.load(Ordering::Acquire);
+                start = queue.suspend_start_nanos.load(Ordering::Relaxed);
+            }
+            Ok(())
+        });
+
+        if is_suspended {
+            let now = HrTimerExpires::as_nanos(&Instant::<Monotonic>::now());
+            if now > start {
+                suspended_time += now - start;
+            }
+        }
+
+        let baseline = ctx.job.baseline_suspend_nanos.load(Ordering::Relaxed);
+        let suspend_allowance = suspended_time.saturating_sub(baseline);
+        let suspend_allowance_jiffies = msecs_to_jiffies((suspend_allowance / 1_000_000) as u32);
+
+        let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+        let adjusted_elapsed = elapsed.saturating_sub(suspend_allowance_jiffies);
+
+        if adjusted_elapsed >= self.timeout {
+            return StageAdvance::TimedOut(ETIMEDOUT);
+        }
+        StageAdvance::WaitFor(self.timeout - adjusted_elapsed)
+    }
 }
 
 /// Represents a hardware executiion queue.
@@ -173,12 +228,12 @@ impl Queue {
             )?,
             GFP_KERNEL,
         )?;
-        let job_queue = JobQueue::new(
-            job::TyrJobHandler,
-            wq.clone(),
-            wq,
-            kernel::drm::job_queue::PipelineBuilder::new(),
-        )?;
+        let pipeline = PipelineBuilder::new()
+            .add_stage(HwTimeoutStage {
+                timeout: msecs_to_jiffies(JOB_TIMEOUT_MS as u32),
+            })?
+            .set_cancel_timeout(msecs_to_jiffies(JOB_TIMEOUT_MS as u32));
+        let job_queue = JobQueue::new(job::TyrJobHandler, wq.clone(), wq, pipeline)?;
         let iomem = tdev.iomem.clone();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let ringbuf = gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size as usize, flags)?;
