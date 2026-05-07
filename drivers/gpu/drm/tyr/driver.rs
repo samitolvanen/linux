@@ -80,9 +80,11 @@ use crate::{
     new_wait,
     regs::gpu_control::*,
     sched::{
+        CsgSlotManager, //
         Scheduler,
-        SchedulerState, //
+        SchedulerState,
     },
+    slot::SlotManager,
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -95,6 +97,24 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData;
 
+/// Per-device DRM data for the Tyr driver.
+///
+/// # Lock ordering
+///
+/// When multiple Tyr-owned locks are acquired by the same code path, they
+/// must be taken in this order (outer first):
+///
+/// 1. [`TyrDrmDeviceData::sched`] (the [`crate::sched::SchedulerState`]
+///    mutex).
+/// 2. [`TyrDrmDeviceData::csg_slot_manager`] (the CSG
+///    [`crate::slot::SlotManager`] mutex).
+/// 3. [`crate::sched::group::Group::inner`] (per-group state mutex).
+/// 4. Per-queue state inside `GroupInner` (e.g. the
+///    [`kernel::dma_fence::JobQueue`] held by each queue).
+///
+/// Locks at the same level may not be nested. The firmware global
+/// interface lock (acquired through `Firmware::with_locked_global_iface`)
+/// is leaf-level and may be taken under any of the above.
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
     pub(crate) pdev: ARef<platform::Device>,
@@ -128,6 +148,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// The scheduler logic.
     #[pin]
     pub(crate) sched: Mutex<SchedulerState>,
+
+    /// CSG slot manager.
+    #[pin]
+    pub(crate) csg_slot_manager: Mutex<CsgSlotManager>,
 
     pub(crate) reset_wq: &'static workqueue::Queue,
     /// Single-threaded scheduler workqueue.
@@ -229,7 +253,6 @@ impl TyrDrmDeviceData {
     }
 
     /// Enqueues a group sync-update worker on [`sched_wq`](Self::sched_wq).
-    #[expect(dead_code)]
     pub(crate) fn schedule_sync_upd(tdev: &ARef<crate::driver::TyrDrmDevice>) {
         let _ = tdev
             .sched_wq
@@ -242,7 +265,6 @@ impl TyrDrmDeviceData {
     }
 
     /// Re-arms the periodic tick after `delay` jiffies.
-    #[expect(dead_code)]
     pub(crate) fn schedule_periodic_tick(
         tdev: &ARef<crate::driver::TyrDrmDevice>,
         delay: kernel::time::Jiffies,
@@ -335,6 +357,12 @@ impl platform::Driver for TyrPlatformDriverData {
         let fw_event_wait = firmware.event_wait.clone();
         let irq_iomem = iomem.clone();
 
+        let topology = firmware.with_locked_global_iface(|glb_iface| glb_iface.read_topology())?;
+
+        let gpu_as_count = gpu_info.as_present & kernel::bits::genmask_u32(1..=31);
+        let gpu_as_count = gpu_as_count.count_ones();
+        let csg_count = core::cmp::min(topology.group_num, gpu_as_count) as usize;
+
         let sched_wq = DmaFenceWorkqueue::new(c_str!("tyr-sched"), workqueue::WqFlags::HIGHPRI, 0)?;
 
         let job_wq = Arc::new(
@@ -364,6 +392,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 iomem: iomem.clone(),
                 mmio_phys_addr,
                 sched <- new_mutex!(SchedulerState::Disabled),
+                csg_slot_manager <- new_mutex!(SlotManager::new(crate::sched::CsgSlotOperations, csg_count)?),
                 reset_wq: workqueue::system_unbound(),
                 sched_wq,
                 job_wq,
@@ -403,13 +432,9 @@ impl platform::Driver for TyrPlatformDriverData {
         devres::register(dev_bound, job_irq, GFP_KERNEL)?;
         fw::irq::JobIrq::enable_hardware(dev_bound, &irq_iomem)?;
 
-        // Read the MCU topology so we can preallocate the CSG / stream
-        // vectors that the firmware enable path will fill in under the
-        // shared-section mutex.
-        let topology = tdev
-            .fw
-            .with_locked_global_iface(|glb| glb.read_topology())?;
-
+        // Reuse the topology read earlier (above csg_count) to size the
+        // CSG / stream preallocations the firmware enable path will
+        // consume under the shared-section mutex.
         let prealloc_csgs = KVec::with_capacity(topology.group_num as usize, GFP_KERNEL)?;
         let mut prealloc_streams = KVec::with_capacity(topology.group_num as usize, GFP_KERNEL)?;
         for _ in 0..topology.group_num {

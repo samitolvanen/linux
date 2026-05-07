@@ -412,7 +412,6 @@ pub(crate) struct Output {
     pub(crate) heap_address: u64,
 }
 
-#[expect(dead_code)]
 impl Output {
     pub(crate) fn cs_fault_exception_type(&self) -> u32 {
         self.fault & genmask_u32(0..=7)

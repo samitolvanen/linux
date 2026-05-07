@@ -659,10 +659,10 @@ impl TyrDrmFileData {
         groupgetstate.fatal_queues = 0;
 
         group.with_locked_inner(|inner| {
-            if inner.fatal_queues != 0 {
+            if inner.has_fatal_queues() {
                 groupgetstate.state |=
                     uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
-                groupgetstate.fatal_queues = inner.fatal_queues;
+                groupgetstate.fatal_queues = inner.fatal_queues();
             }
 
             Ok(())

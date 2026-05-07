@@ -512,7 +512,6 @@ impl GlobalInterface {
     /// `doorbell_req` register and a single global doorbell is rung,
     /// which is sufficient for the firmware to observe the new request
     /// state for every selected CSG.
-    #[expect(dead_code)]
     pub(crate) fn ring_csg_doorbells(&self, mask: u32) -> Result {
         self.doorbell_request()?.toggle_reqs(mask)?;
         self.ring_glb_doorbell()?;

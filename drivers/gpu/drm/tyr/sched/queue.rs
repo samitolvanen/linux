@@ -9,12 +9,9 @@ use core::sync::atomic::{
 };
 
 use kernel::{
-    c_str,
     devres::Devres,
     dma_fence::{
-        Fence,
-        FenceContexts,
-        UserFence, //
+        Fence, //
     },
     drm::{
         gem::BaseObject,
@@ -60,7 +57,6 @@ use crate::{
     },
     gem,
     regs::doorbell_block,
-    sched::job::Job,
     vm::{
         Vm,
         VmFlag,
@@ -73,15 +69,11 @@ use super::job;
 const JOB_TIMEOUT_MS: usize = 5000;
 pub(crate) const CSF_MAX_QUEUE_PRIO: u32 = 15;
 
-/// Threshold below which the head-pointer indirection in
-/// [`Queue::pop_pending_fence_up_to`] is preserved to avoid `O(n)`
-/// shifts on every pop.  Once both the head index has advanced past
-/// this many slots and past half of the vector, the trailing entries
-/// are shifted down so the head can return to zero.
+/// Minimum head advance before [`Queue::compact_pending_fences`]
+/// shifts trailing entries to index 0.
 const PENDING_FENCES_COMPACT_THRESHOLD: usize = 16;
 
 /// Synchronization wait parameters.
-#[expect(dead_code)]
 #[derive(Default, Clone)]
 pub(crate) struct SyncWait {
     /// The GPU virtual address of the sync object.
@@ -99,7 +91,6 @@ pub(crate) struct SyncWait {
 }
 
 /// A pending fence for a submitted job.
-#[expect(dead_code)]
 pub(crate) struct PendingSubmitFence {
     /// The sequence number of the job.
     pub(crate) seqno: u64,
@@ -158,7 +149,7 @@ impl StageOps<job::TyrJobHandler> for HwTimeoutStage {
     }
 }
 
-/// Represents a hardware executiion queue.
+/// Represents a hardware execution queue.
 pub(crate) struct Queue {
     /// The JobQueue used for this queue.
     pub(super) job_queue: JobQueue<job::TyrJobHandler>,
@@ -166,7 +157,7 @@ pub(crate) struct Queue {
     /// A priority number, between 0 and 15.
     pub(crate) priority: u8,
 
-    // Doorbell assigned to this queue, if any.
+    /// Doorbell assigned to this queue, if any.
     pub(crate) doorbell_id: Option<usize>,
 
     /// The ring buffer used to communicate with the firmware.
@@ -175,11 +166,6 @@ pub(crate) struct Queue {
     pub(super) interfaces: Interfaces,
 
     iomem: Arc<Devres<IoMem>>,
-
-    pub(super) in_flight_jobs: KVec<kernel::dma_fence::Fence>,
-
-    #[expect(dead_code)]
-    pub(super) fence_ctx: kernel::dma_fence::FenceContexts,
 
     #[expect(dead_code)]
     pub(crate) syncwait: SyncWait,
@@ -221,14 +207,7 @@ impl Queue {
 
         let priority = queue_args.priority;
 
-        let wq = Arc::new(
-            kernel::dma_fence::DmaFenceWorkqueue::new(
-                kernel::c_str!("queue_wq"),
-                kernel::workqueue::WqFlags::HIGHPRI,
-                0,
-            )?,
-            GFP_KERNEL,
-        )?;
+        let wq = tdev.job_wq.clone();
         let pipeline = PipelineBuilder::new()
             .add_stage(HwTimeoutStage {
                 timeout: msecs_to_jiffies(JOB_TIMEOUT_MS as u32),
@@ -254,8 +233,6 @@ impl Queue {
             output_offset: SZ_4K,
         };
 
-        let fence_ctx = kernel::dma_fence::FenceContexts::new(1, c_str!("tyr_fence"), None, 1)?;
-
         let max_jobs = queue_args.ringbuf_size as usize / 64;
 
         Ok(Queue {
@@ -265,8 +242,6 @@ impl Queue {
             ringbuf,
             interfaces,
             iomem,
-            in_flight_jobs: KVec::new(),
-            fence_ctx,
             syncwait: Default::default(),
             timeout_suspended: AtomicBool::new(false),
             parked: false,
@@ -278,84 +253,9 @@ impl Queue {
         })
     }
 
-    /// Append instructions to this queue and publish INSERT in one step.
-    ///
-    /// The queue's doorbell needs to be rung after this function is called in
-    /// order to get CSF to act on the new values.
-    ///
-    /// Removed when the legacy submit path is retired; new code should use
-    /// the [`append_instrs`](Self::append_instrs) /
-    /// [`commit_instrs`](Self::commit_instrs) pair.
-    pub(crate) fn append_and_commit_instrs(&mut self, instrs: &[u8]) -> Result {
-        let ringbuf_input = self.interfaces.read_input()?;
-        let ringbuf_sz = self.ringbuf.size() as u64;
-
-        let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
-
-        let ringbuf = self.ringbuf.vmap();
-        let size = ringbuf.owner().size();
-        let bytes = unsafe { core::slice::from_raw_parts_mut(ringbuf.addr() as *mut u8, size) };
-
-        // Handle wrap-around: split the copy if instructions cross the buffer
-        // boundary, matching panthor's copy_instrs_to_ringbuf().
-        let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
-        bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
-        if first_chunk < instrs.len() {
-            bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
-        }
-
-        // Make sure that the ring buffer is updated before the INSERT register.
-        kernel::sync::barrier::smp_wmb();
-
-        // We need to always save the latest extract point in case the CS is
-        // stopped and then resumed.
-        let ringbuf_output = self.interfaces.read_output()?;
-        self.interfaces.write_extract_init(ringbuf_output.extract);
-        self.interfaces
-            .write_insert(ringbuf_input.insert + instrs.len() as u64);
-        kernel::sync::barrier::smp_wmb();
-        Ok(())
-    }
-
-    /// Kick the queue. This will notify CSF that new instructions are ready to
-    /// be executed.
-    pub(crate) fn kick(&self) -> Result {
-        let io = self.iomem.try_access().ok_or(EINVAL)?;
-        let doorbell_reg =
-            doorbell_block::DOORBELL::try_at(self.doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
-        // Use try_write (runtime bounds check) because the doorbell index is
-        // determined at runtime and cannot be validated at compile time.
-        io.try_write(
-            doorbell_reg,
-            doorbell_block::DOORBELL::zeroed().with_ring(true),
-        )
-    }
-
-    /// Records a [`PendingSubmitFence`] for an in-flight job.
-    ///
-    /// `seqno` is the per-queue sequence number assigned to the job;
-    /// `ringbuf_start..ringbuf_end` is the slice of the ringbuffer the
-    /// job's instructions occupy, used by [`Queue::ringbuf_space`] to
-    /// compute free space without polling the firmware.  `fence` is the
-    /// completion fence returned from [`JobQueue::commit`] and is the
-    /// one consumers (e.g. timeline syncobjs, [`pop_pending_fence_up_to`])
-    /// will eventually wait on.
-    ///
-    /// The vector is reserved up to `ringbuf_size / 64` entries by
-    /// [`Queue::new`], so this push runs with `GFP_NOWAIT` and cannot
-    /// block — required to be safe inside the dma-fence signalling
-    /// section.  Entries are appended in submit order, giving a strict
-    /// FIFO over `seqno`.
-    ///
-    /// # Errors
-    ///
-    /// `ENOMEM` if the preallocated capacity has been exceeded; this
-    /// would indicate the caller submitted more jobs than fit in the
-    /// ringbuffer's worst-case packing.
-    ///
-    /// [`pop_pending_fence_up_to`]: Queue::pop_pending_fence_up_to
-    /// [`JobQueue::commit`]: kernel::drm::job_queue::JobQueue::commit
-    #[expect(dead_code)]
+    /// Records a pending fence. Called from the dma-fence signalling
+    /// section; capacity is pre-reserved by [`Queue::new`] so this
+    /// cannot allocate.
     pub(crate) fn add_pending_submit_fence(
         &mut self,
         seqno: u64,
@@ -375,20 +275,8 @@ impl Queue {
         Ok(())
     }
 
-    /// Pops the next pending fence with `seqno' <= seqno`, in FIFO order.
-    ///
-    /// Returns `Some(fence)` for each retired job up to and including
-    /// `seqno`, then `None` once no more pending entries fall in that
-    /// range.  Entries with no attached fence (i.e. ones whose `fence`
-    /// has already been taken) are skipped past silently.
-    ///
-    /// Callers loop on this to drain all completed entries:
-    /// `while let Some(fence) = q.pop_pending_fence_up_to(s) { ... }`.
-    ///
-    /// The internal head pointer is compacted via
-    /// [`compact_pending_fences`](Queue::compact_pending_fences) once it
-    /// has advanced far enough to amortise the shift.
-    #[expect(dead_code)]
+    /// Pop the next pending fence with sequence number `<= seqno`.
+    /// Caller loops to drain all completed entries.
     pub(crate) fn pop_pending_fence_up_to(&mut self, seqno: u64) -> Option<Fence> {
         while let Some(first_fence) = self
             .pending_submit_fences
@@ -409,15 +297,9 @@ impl Queue {
         None
     }
 
-    /// Compacts the [`pending_submit_fences`] vector by shifting the
-    /// remaining entries down to index 0 once the head has advanced past
-    /// [`PENDING_FENCES_COMPACT_THRESHOLD`] and past half of the vector.
-    ///
-    /// The two-condition guard keeps amortised cost low: small vectors
-    /// keep using the head-pointer indirection (no shifts) and large
-    /// ones only compact every `len/2` pops.
-    ///
-    /// [`pending_submit_fences`]: Queue::pending_submit_fences
+    /// Shift live entries down to index 0. Only runs once the head has
+    /// drained past [`PENDING_FENCES_COMPACT_THRESHOLD`] and past half
+    /// the vector, to avoid copying on every pop.
     fn compact_pending_fences(&mut self) {
         let head = self.pending_submit_fences_head;
         let len = self.pending_submit_fences.len();
@@ -430,31 +312,16 @@ impl Queue {
         }
     }
 
-    /// Drains the whole pending-fence FIFO and resets the head pointer.
-    ///
-    /// Used when the queue is being torn down (e.g. group destruction
-    /// or fault recovery), so the caller can either signal or set an
-    /// error on every still-attached completion fence outside the
-    /// queue's lock.
-    #[expect(dead_code)]
+    /// Take ownership of the pending-fence FIFO so teardown or fault
+    /// recovery can signal each fence with the queue lock dropped.
     pub(crate) fn take_all_fences(&mut self) -> KVec<PendingSubmitFence> {
         self.pending_submit_fences_head = 0;
         core::mem::take(&mut self.pending_submit_fences)
     }
 
-    /// Returns the bytes free in the queue's ringbuffer.
-    ///
-    /// Uses the oldest pending fence's `ringbuf_start` as the effective
-    /// extract pointer when there are pending jobs (so the firmware's
-    /// real EXTRACT advancing past a job that the host has not yet
-    /// retired does not look like free space), or the current INSERT
-    /// when there are none.  Reserves one cache line of margin so the
-    /// FW can distinguish full from empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying error if reading the ringbuffer input
-    /// page fails (i.e. the device is gone).
+    /// Bytes free in the ringbuffer. Uses the oldest pending fence's
+    /// `ringbuf_start` instead of the firmware's EXTRACT, so we don't
+    /// reuse the slots of jobs the host hasn't yet retired.
     pub(crate) fn ringbuf_space(&mut self) -> Result<u64> {
         let ringbuf_input = self.interfaces.read_input()?;
         let ringbuf_sz = self.ringbuf.size() as u64;
@@ -475,20 +342,9 @@ impl Queue {
         }
     }
 
-    /// Append instructions to the ring buffer without publishing INSERT.
-    ///
-    /// Returns the start and end ring-buffer offsets. The caller can then
-    /// register a pending fence (via
-    /// [`Self::add_pending_submit_fence`]) before publishing INSERT via
-    /// [`Self::commit_instrs`].
-    ///
-    /// # Errors
-    ///
-    /// `EBUSY` if the ringbuffer does not have strictly more space than
-    /// the instruction stream (the firmware cannot tell a full ring
-    /// from an empty one). Other errors propagate from reading the
-    /// ringbuffer input page.
-    #[expect(dead_code)]
+    /// Write instructions into the ringbuffer and return the range
+    /// they occupy. The caller must register a pending fence with that
+    /// range, then call [`Self::commit_instrs`] and ring the doorbell.
     pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result<(u64, u64)> {
         let ringbuf_input = self.interfaces.read_input()?;
         let ringbuf_sz = self.ringbuf.size() as u64;
@@ -528,22 +384,9 @@ impl Queue {
         Ok((ringbuf_start, ringbuf_end))
     }
 
-    /// Publishes the INSERT pointer for instructions previously written
-    /// by [`append_instrs`](Self::append_instrs).
-    ///
-    /// This is the dma-fence-signalling-critical step of the submit path:
-    /// it issues the `wmb()` that makes the ringbuffer writes visible to
-    /// the firmware, then writes the new INSERT.
-    ///
-    /// `ringbuf_end` must be the value previously returned from
-    /// `append_instrs`; passing a stale value will leak a portion of the
-    /// ringbuffer until the next commit.
-    ///
-    /// # Errors
-    ///
-    /// Propagates errors from reading the ringbuffer output page (used
-    /// to keep `extract_init` in sync for resume-after-suspend).
-    #[expect(dead_code)]
+    /// Update the ringbuffer pointers to make the instructions written
+    /// by [`append_instrs`](Queue::append_instrs) visible to the
+    /// firmware. Runs inside the dma-fence signalling section.
     pub(crate) fn commit_instrs(&mut self, ringbuf_end: u64) -> Result {
         // Make sure that the ring buffer is updated before the INSERT register.
         wmb();
@@ -556,29 +399,23 @@ impl Queue {
         Ok(())
     }
 
-    /// Suspends the queue's timeout timer.
-    ///
-    /// Marks the queue as suspended off its CSG slot and records the
-    /// monotonic-clock instant so a later [`resume_timeout`] can subtract
-    /// the suspended interval from the per-job timeout.  Idempotent: if
-    /// the queue is already suspended, the recorded start time is left
-    /// alone.
-    ///
-    /// Takes `&self` because the field set is small and atomic; callers
-    /// from the scheduler bottom half do not always hold an exclusive
-    /// reference to the queue (e.g. fence callbacks observe the queue
-    /// through the group).
-    ///
-    /// `suspend_start_nanos` is stored before `timeout_suspended` is
-    /// flipped to true with Release ordering, so any observer that
-    /// loads `timeout_suspended` with Acquire and sees `true` is
-    /// guaranteed to see the new start time.
-    ///
-    /// [`resume_timeout`]: Queue::resume_timeout
-    #[expect(dead_code)]
+    /// Kick the queue. This will notify CSF that new instructions are ready to
+    /// be executed.
+    pub(crate) fn kick(&self) -> Result {
+        let io = self.iomem.try_access().ok_or(EINVAL)?;
+        let doorbell_reg =
+            doorbell_block::DOORBELL::try_at(self.doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
+        // Use try_write (runtime bounds check) because the doorbell index is
+        // determined at runtime and cannot be validated at compile time.
+        io.try_write(
+            doorbell_reg,
+            doorbell_block::DOORBELL::zeroed().with_ring(true),
+        )
+    }
+
+    /// Pause the per-job timeout while the queue is not bound to a
+    /// CSG slot. Idempotent.
     pub(crate) fn suspend_timeout(&self) {
-        // Fast path: already suspended; preserve the existing start
-        // time so an in-progress suspension is not reset.
         if self.timeout_suspended.load(Ordering::Relaxed) {
             return;
         }
@@ -587,19 +424,8 @@ impl Queue {
         self.timeout_suspended.store(true, Ordering::Release);
     }
 
-    /// Resumes the queue's timeout timer.
-    ///
-    /// Adds the time spent suspended (since the matching
-    /// [`suspend_timeout`]) to `accumulated_suspend_nanos`, which the
-    /// timeout calculation subtracts from the per-job deadline.
-    /// Idempotent: a no-op if the queue is not currently suspended.
-    ///
-    /// The Acquire on `timeout_suspended.swap` synchronizes with the
-    /// matching Release-store in [`suspend_timeout`], so the load of
-    /// `suspend_start_nanos` observes the value stored there.
-    ///
-    /// [`suspend_timeout`]: Queue::suspend_timeout
-    #[expect(dead_code)]
+    /// Resume the per-job timeout. The suspended interval is credited
+    /// toward the deadline. Idempotent.
     pub(crate) fn resume_timeout(&self) {
         if self.timeout_suspended.swap(false, Ordering::Acquire) {
             let start = self.suspend_start_nanos.load(Ordering::Relaxed);
@@ -630,8 +456,10 @@ pub(crate) struct Interfaces {
 }
 
 impl Interfaces {
+    /// Reads the ring buffer input state.
     pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
         let vmap = self.mem.vmap();
+        // SAFETY: The queue memory is allocated to be large enough to contain the input structure at input_offset.
         let input = unsafe {
             (vmap.addr() as *mut u8)
                 .add(self.input_offset)
@@ -675,8 +503,10 @@ impl Interfaces {
         self.write_input_field::<u64>(core::mem::offset_of!(RingBufferInput, insert), val);
     }
 
+    /// Reads the ring buffer output state.
     pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
         let vmap = self.mem.vmap();
+        // SAFETY: The queue memory is allocated to be large enough to contain the output structure at output_offset.
         let output = unsafe {
             (vmap.addr() as *mut u8)
                 .add(self.output_offset)

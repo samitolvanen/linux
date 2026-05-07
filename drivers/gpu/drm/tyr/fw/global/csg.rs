@@ -320,7 +320,6 @@ pub(crate) struct Output {
 }
 
 impl Output {
-    #[expect(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         self.status_state & bit_u32(0) != 0
     }

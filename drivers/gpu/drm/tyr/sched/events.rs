@@ -5,18 +5,23 @@
 //! the work currently submitted, as well as other scheduler-related events,
 //! like device idleness, CSG/CS interrupts, fault decoding and etc.
 
-use core::ops::Deref;
-
 use kernel::{
-    dma_fence::{
-        impl_has_dma_fence_work,
-        DmaFenceWorkItem,
-        RawDmaFence, //
-    },
+    dma_fence::DmaFenceWorkItem,
+    impl_has_dma_fence_work,
+    list::List,
+    list::ListArc,
     prelude::*,
     sync::Arc,
+    time::{
+        msecs_to_jiffies,
+        Delta,
+        Instant,
+        Monotonic, //
+    },
     types::ARef, //
 };
+
+use core::sync::atomic::Ordering;
 
 use crate::{
     driver::{
@@ -26,24 +31,33 @@ use crate::{
     },
     fw::{
         global::{
-            cs,
-            csg,
-            csg::CommandStreamGroup,
+            cs::{
+                constants::*,
+                BlockedReason,
+                StreamState, //
+            },
+            csg::constants::*,
             GlobalInterface, //
         },
         SharedSectionEntry, //
     },
     regs::JOB_IRQ_GLOBAL_IF,
     sched::{
-        csg::GroupState,
-        group::State,
+        csg::{
+            CommandStreamGroup,
+            GroupState, //
+        },
+        group::{
+            Group,
+            QueueParkAction,
+            State,
+            MAX_CS_PER_GROUP, //
+        },
+        queue,
+        CsgUpdateContext,
+        Priority,
         Scheduler, //
-    }, //
-};
-
-use super::{
-    group::Group,
-    syncs, //
+    },
 };
 
 impl Scheduler {
@@ -51,6 +65,7 @@ impl Scheduler {
     // somehow.
     fn process_tiler_oom(
         &mut self,
+        data: &TyrDrmDeviceData,
         csg: &mut CommandStreamGroup,
         csg_id: u32,
         cs_id: u32,
@@ -74,8 +89,15 @@ impl Scheduler {
             frag_end
         );
 
-        let slot = self.csg_slots[csg_id as usize].as_ref().ok_or(EINVAL)?;
-        let _vm = slot.group.vm.clone();
+        let group = {
+            let csg_slot_manager = data.csg_slot_manager.lock();
+            csg_slot_manager
+                .slot_data(csg_id as usize)
+                .ok_or(EINVAL)?
+                .group
+                .clone()
+        };
+        let _vm = group.vm.clone();
 
         unimplemented!("We can't get the heap pool from the VM yet");
 
@@ -95,52 +117,59 @@ impl Scheduler {
         // Ok(())
     }
 
-    pub(crate) fn process_events(&mut self, data: &TyrDrmDevice) -> Result {
-        // TODO: we need to annotate this function with the dma signalling token.
-
+    pub(crate) fn process_events(&mut self, data: ARef<TyrDrmDevice>) -> Result {
         let fw = &data.fw;
-        let mut events = self.events.take().unwrap_or_default();
+        // Drain accumulated events. Paired with the IRQ handler's
+        // `fetch_or(Release)` in `fw/irq.rs::handle` so a single `swap`
+        // empties the word.
+        let mut events = data.fw_events.swap(0, Ordering::AcqRel);
 
         if events & JOB_IRQ_GLOBAL_IF != 0 {
             events &= !JOB_IRQ_GLOBAL_IF;
             fw.with_locked_global_iface(|glb| glb.process_global_irq())?;
+            TyrDrmDeviceData::schedule_tick(&data);
         }
 
-        fw.with_locked_global_iface(|glb| {
-            while events != 0 {
-                let csg_id = events.trailing_zeros();
-                let mask = kernel::bits::bit_u32(csg_id);
+        while events != 0 {
+            let csg_id = events.trailing_zeros();
+            let mask = kernel::bits::bit_u32(csg_id);
 
-                self.process_csg_irq(data, glb, csg_id)?;
-                events &= !mask;
-            }
+            let group = {
+                let csg_slot_manager = data.csg_slot_manager.lock();
+                csg_slot_manager
+                    .slot_data(csg_id as usize)
+                    .map(|d| d.group.clone())
+            };
 
-            Ok(())
-        })?;
+            fw.with_locked_global_iface(|glb| {
+                self.process_csg_irq(data.clone(), glb, csg_id, group)?;
+                Ok(())
+            })?;
+
+            events &= !mask;
+        }
 
         Ok(())
     }
 
-    fn process_csg_irq(
+    pub(crate) fn process_csg_irq(
         &mut self,
-        data: &TyrDrmDevice,
+        data: ARef<TyrDrmDevice>,
         glb: &mut GlobalInterface,
         csg_id: u32,
+        group: Option<Arc<Group>>,
     ) -> Result {
-        // TODO: we need to annotate this function with the dma signalling token.
-
         let csg = glb.csg_mut(csg_id as usize).ok_or(EINVAL)?;
 
-        let mut input = csg.read_input()?;
+        let input = csg.read_input()?;
         let output = csg.read_output()?;
 
-        let csg_events = (input.req ^ output.ack) & csg::constants::CSG_EVT_MASK;
-
-        // // We may have no pending CSG/CS interrupts to process.
+        // We may have no pending CSG/CS interrupts to process.
         if input.req == output.ack && output.irq_req == input.irq_ack {
             return Ok(());
         }
 
+        let csg_events = (input.req ^ output.ack) & CSG_EVT_MASK;
         let mut cs_irqs = output.irq_req ^ input.irq_ack;
 
         // Immediately set IRQ_ACK bits to be same as the IRQ_REQ bits before
@@ -148,22 +177,46 @@ impl Scheduler {
         // doesn't miss an interrupt for the CS in the race scenario where
         // whilst Host is servicing an interrupt for the CS, firmware sends
         // another interrupt for that CS.
-        input.irq_ack = output.irq_req;
-        csg.write_input(input)?;
+        csg.interrupt_ack()?.write_req(output.irq_req)?;
 
         let req = csg.input_request()?;
-        let reenable_mask = csg::constants::CSG_SYNC_UPDATE;
+        req.update_reqs(
+            output.ack,
+            CSG_SYNC_UPDATE | CSG_IDLE | CSG_PROGRESS_TIMER_EVENT,
+        )?;
 
-        /* Use captured ack to avoid re-read race with FW setting SYNC_UPDATE. */
-        req.update_reqs(output.ack, reenable_mask)?;
+        let mut needs_tick = false;
+
+        if csg_events & CSG_IDLE != 0 {
+            self.might_have_idle_groups = true;
+            needs_tick = true;
+        }
+
+        if csg_events & CSG_PROGRESS_TIMER_EVENT != 0 {
+            pr_warn!("sched: CSG slot {} progress timeout\n", csg_id);
+
+            let group = group.clone();
+            if let Some(group) = group {
+                let _ = group.with_locked_inner(|inner| {
+                    inner.fatal_error = Some(ETIMEDOUT);
+                    Ok(())
+                });
+            }
+
+            needs_tick = true;
+        }
+
+        if needs_tick {
+            TyrDrmDeviceData::schedule_tick(&data);
+        }
+
         let mut ring_cs_db_mask = 0;
 
         while cs_irqs != 0 {
             let cs_id = cs_irqs.trailing_zeros();
             let mask = kernel::bits::bit_u32(cs_id);
 
-            let processed = self.process_cs_irq(csg, csg_id, cs_id)?;
-
+            let processed = self.process_cs_irq(&data, csg, csg_id, cs_id, group.clone())?;
             if processed {
                 ring_cs_db_mask |= mask;
             }
@@ -171,21 +224,17 @@ impl Scheduler {
             cs_irqs &= !mask;
         }
 
-        if ring_cs_db_mask != 0 {
-            let req = csg.doorbell_request()?;
-            req.toggle_reqs(ring_cs_db_mask)?;
+        if csg_events & CSG_SYNC_UPDATE != 0 {
+            let group = group.clone();
+            if let Some(group) = group {
+                group.schedule_sync_upd();
+            }
+
+            TyrDrmDeviceData::schedule_sync_upd(&data);
         }
 
-        if csg_events & csg::constants::CSG_SYNC_UPDATE != 0 {
-            let group = self.csg_slots[csg_id as usize]
-                .as_mut()
-                .ok_or(EINVAL)?
-                .group
-                .clone();
-
-            self.unsynced_groups.push(group, GFP_KERNEL)?;
-
-            let _ = self.wq.enqueue::<_, 3>(ARef::from(data));
+        if ring_cs_db_mask != 0 {
+            csg.doorbell_request()?.toggle_reqs(ring_cs_db_mask)?;
         }
 
         glb.ring_csg_doorbell(csg_id as usize)
@@ -193,238 +242,345 @@ impl Scheduler {
 
     fn process_cs_irq(
         &mut self,
+        data: &ARef<TyrDrmDevice>,
         csg: &mut CommandStreamGroup,
         csg_id: u32,
         cs_id: u32,
+        group: Option<Arc<Group>>,
     ) -> Result<bool> {
         let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
 
         let input = cs.read_input()?;
         let output = cs.read_output()?;
 
-        let cs_events = (input.req ^ output.ack) & cs::constants::CS_EVT_MASK;
+        let cs_events = (input.req ^ output.ack) & CS_EVT_MASK;
 
-        let faulty =
-            cs_events & cs::constants::CS_FATAL != 0 || cs_events & cs::constants::CS_FAULT != 0;
-
-        if cs_events & cs::constants::CS_FATAL != 0 {
+        if cs_events & CS_FATAL != 0 {
             cs.decode_fatal()?;
-            if let Some(slot) = &mut self.csg_slots[csg_id as usize] {
-                slot.group.with_locked_inner(|inner| {
-                    inner.fatal_queues |= 1 << cs_id;
+
+            let group = group.clone();
+            if let Some(group) = group {
+                group.with_locked_inner(|inner| {
+                    inner.set_queue_fatal(cs_id as usize);
                     Ok(())
                 })?;
             }
+
+            if output.cs_fatal_exception_type() == CS_UNRECOVERABLE {
+                // If this exception is unrecoverable, queue a reset, and make
+                // sure we stop scheduling groups until the reset has happened.
+                // TODO: schedule a reset and cancel tick work.
+            } else {
+                TyrDrmDeviceData::schedule_tick(data);
+            }
         }
 
-        if cs_events & cs::constants::CS_FAULT != 0 {
+        if cs_events & CS_FAULT != 0 {
             cs.decode_fault()?;
+
+            if output.cs_fault_exception_type() == CS_INHERIT_FAULT {
+                let group = group.clone();
+                if let Some(group) = group {
+                    let _ = group.with_locked_inner(|inner| {
+                        let queue = &mut inner.queues[cs_id as usize];
+
+                        if let Ok(ringbuf_output) = queue.interfaces.read_output() {
+                            let cs_extract = ringbuf_output.extract;
+
+                            for pending in queue
+                                .pending_submit_fences
+                                .iter()
+                                .skip(queue.pending_submit_fences_head)
+                            {
+                                if cs_extract >= pending.ringbuf_end {
+                                    continue;
+                                }
+                                if cs_extract < pending.ringbuf_start {
+                                    break;
+                                }
+                                if let Some(fence) = &pending.fence {
+                                    fence.set_error(EINVAL.to_errno());
+                                }
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            }
         }
 
-        if cs_events & cs::constants::CS_TILER_OOM != 0 {
-            self.process_tiler_oom(csg, csg_id, cs_id)?;
+        if cs_events & CS_TILER_OOM != 0 {
+            self.process_tiler_oom(data, csg, csg_id, cs_id)?;
         }
 
-        if faulty {
-            // TODO: we cannot sleep in the signalling path.
-            self.csg_slots[csg_id as usize]
-                .as_mut()
-                .ok_or(EINVAL)?
-                .group
-                .with_locked_inner(|inner| {
-                    for job_fence in &inner.queues[cs_id as usize].in_flight_jobs {
-                        // Just mark everything in flight as failed.
-                        //
-                        // This is not exactly the right thing to do, but while
-                        // the driver is being developed, this will let us at
-                        // least signal all fences, even if we have errored out.
-                        //
-                        // Also, there is no error recovery for now. If we have
-                        // failed, we just want to stop everything and further
-                        // debug the driver code.
-                        job_fence.set_error(EINVAL.to_errno());
-                        job_fence.signal()?;
-                    }
+        let req = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?.input_request()?;
+        req.update_reqs(output.ack, CS_FATAL | CS_FAULT)?;
 
-                    // Let's also mark this group as destroyed just so we don't
-                    // take anymore work. We will come back to this when the
-                    // driver is more developed.
-                    inner.destroyed = true;
-                    Ok(())
-                })?;
-        }
-
-        let ring_db = cs_events & cs::constants::CS_FAULT != 0;
+        let ring_db = cs_events & (CS_FAULT | CS_TILER_OOM) != 0;
         Ok(ring_db)
     }
 
-    fn update_group(&mut self, group: Arc<Group>, _data: &TyrDrmDevice) -> Result {
-        let mut no_in_flight_jobs = true;
-        let mut csg_id = None;
+    /// Schedules a group for execution based on priority and idle state.
+    pub(crate) fn schedule_group(&mut self, data: &ARef<TyrDrmDevice>, priority: Option<Priority>) {
+        if priority == Some(Priority::RealTime) || self.might_have_idle_groups {
+            TyrDrmDeviceData::schedule_tick(data);
+            return;
+        }
 
-        // TODO: we need to annotate this function with the dma signalling token.
-        // TODO: we cannot sleep in the signalling path.
-        group.with_locked_inner(|inner| {
-            csg_id = inner.csg_id;
-            for (queue_idx, queue) in inner.queues.iter_mut().enumerate() {
-                let sync_offset = queue_idx * core::mem::size_of::<syncs::SyncObj64b>();
-                let sync_obj = syncs::SyncObj64b::read(&mut inner.syncobjs, sync_offset)?;
-
-                // TODO: this has to be moved somewhere else. It should probably
-                // be in TyrDrmDeviceData, or anywhere else we can easily access from
-                // here. It should also be protected by a SpinLock instead,
-                // because we cannot sleep in the signalling path.
-                let mut res = Ok(());
-                queue.in_flight_jobs.retain(|fence| {
-                    if sync_obj.seqno < fence.seqno() {
-                        return true;
-                    }
-
-                    res = fence.signal();
-                    false
-                });
-                res?;
-
-                no_in_flight_jobs &= queue.in_flight_jobs.is_empty();
+        if self.resched_target.is_some() {
+            if self.used_csg_slot_count < self.csg_slot_count {
+                TyrDrmDeviceData::schedule_tick(data);
             }
+            return;
+        }
 
-            Ok(())
-        })?;
+        let now = Instant::<Monotonic>::now();
+        let target = self.last_tick + Delta::from_millis(i64::from(super::TICK_PERIOD_MS));
+        self.resched_target = Some(target);
 
-        // TODO: we need to restore CS_EXTRACT when restarting groups, or else
-        // this will re-execute the whole ringbuffer from the start.
-        //
-        // TODO: We should not remove IDLE groups if there's nothing to
-        // schedule, as it's actually counter-productive to do so.
-        //
-        // For now, just disable this.
-        //
-        // if no_in_flight_jobs {
-        //     self.mark_group_idle(group, data, csg_id)?;
-        // }
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn mark_group_idle(
-        &mut self,
-        _group: Arc<Group>,
-        data: &TyrDrmDevice,
-        csg_id: Option<usize>,
-    ) -> Result {
-        // data.with_locked_mmu(|mmu| mmu.unbind_vm(&group.vm, &data.iomem))?;
-        // self.idle_groups[group.priority as usize].push(group, GFP_KERNEL)?;
-        if let Some(csg_idx) = csg_id {
-            if let Some(slot) = &mut self.csg_slots[csg_idx] {
-                slot.idle = true;
+        let delay_jiffies =
+            if self.used_csg_slot_count == self.csg_slot_count && (target - now).as_nanos() > 0 {
+                msecs_to_jiffies((target - now).as_millis() as kernel::time::Msecs)
             } else {
-                pr_warn!("Cannot mark empty slot {} idle\n", csg_idx);
-            }
-        }
+                0
+            };
 
-        if let None = &self.resched_target {
-            self.resched_target = Some(kernel::time::Instant::now());
-            let _ = self.wq.enqueue::<_, 1>(ARef::from(data));
+        if delay_jiffies > 0 {
+            TyrDrmDeviceData::schedule_periodic_tick(data, delay_jiffies);
+        } else {
+            TyrDrmDeviceData::schedule_tick(data);
         }
-        Ok(())
     }
 
-    /// update group at `csg_idx` as it changes from `old_state` to `new_state`.
-    fn handle_state_change(
+    /// Synchronizes the priority of a CSG slot with the firmware.
+    pub(crate) fn sync_csg_slot_priority(
         &mut self,
-        new_state: State,
-        old_state: State,
-        data: &TyrDrmDevice,
         glb_iface: &mut GlobalInterface,
+        csg_slot_manager: &mut crate::sched::CsgSlotManager,
         csg_idx: usize,
     ) -> Result {
-        self.process_csg_irq(data, glb_iface, csg_idx as _)?;
-        self.csg_slots[csg_idx]
-            .as_ref()
-            .ok_or(EINVAL)?
-            .group
-            .with_locked_inner(|inner| {
-                if new_state == State::Unknown {
-                    //TODO: schedule reset
-                }
-                if new_state == State::Suspended {
-                    // TODO: handle reg `status_blocked_reason` here
-                }
-                if old_state == State::Active {
-                    let csg_iface = glb_iface.csg_mut(csg_idx).ok_or(EINVAL)?;
-                    for (cs_idx, _) in inner.queues.iter_mut().enumerate() {
-                        let cs_iface = csg_iface.cs_mut(cs_idx).ok_or(EINVAL)?;
-                        pr_info!("Stopping cs id {}\n", cs_idx);
-                        cs_iface.set_state(crate::sched::StreamState::Stop)?;
-                    }
-                }
-                Ok(())
-            })
+        if let Some(slot_data) = csg_slot_manager.slot_data_mut(csg_idx) {
+            let csg = glb_iface.csg(csg_idx).ok_or(EINVAL)?;
+            let input = csg.read_input()?;
+            slot_data.fw_priority =
+                (input.csg_ep_req & CSG_EP_REQ_PRIORITY_MASK) >> CSG_EP_REQ_PRIORITY_SHIFT;
+        }
+        Ok(())
     }
 
-    /// inform the firmware of the changes of the group at `csg_idx` and update the group
-    /// based on the response.
-    pub(crate) fn sync_group_state(&mut self, data: &TyrDrmDevice, csg_idx: usize) -> Result {
-        if csg_idx >= self.csg_slot_count as usize {
-            pr_err!("sync_group: invalid group index {}", csg_idx);
-            return Err(EINVAL);
-        }
-        if self.csg_slots[csg_idx].is_none() {
-            pr_err!("sync_group: group slot is empty");
-            return Err(EINVAL);
-        }
-
-        let slot = self.csg_slots[csg_idx].as_ref().ok_or(EINVAL)?;
-        let is_idle = self.csg_slots[csg_idx].as_ref().ok_or(EINVAL)?.idle;
-        let (old_state, can_run) = slot.group.with_locked_inner(|inner| {
-            Ok((inner.state, {
-                inner.state != State::Terminated
-                    && inner.state != State::Unknown
-                    && inner.destroyed == false
-                    && inner.fatal_queues == 0
-            }))
-        })?;
-
-        let update = if is_idle {
-            if can_run {
-                GroupState::Suspend
-            } else {
-                GroupState::Terminate
-            }
-        } else {
-            if old_state == State::Suspended {
-                GroupState::Resume
-            } else {
-                GroupState::Start
-            }
+    /// Synchronizes the hardware state of a CSG slot with the scheduler state.
+    pub(crate) fn sync_csg_slot_state(
+        &mut self,
+        data: &TyrDrmDeviceData,
+        glb_iface: &mut GlobalInterface,
+        csg_slot_manager: &crate::sched::CsgSlotManager,
+        csg_idx: usize,
+    ) -> Result {
+        let group = {
+            csg_slot_manager
+                .slot_data(csg_idx)
+                .ok_or(EINVAL)?
+                .group
+                .clone()
         };
 
-        let fw = &data.fw;
-        fw.with_locked_global_iface(|glb_iface| {
-            pr_info!(
-                "Syncing group at csg_idx {}: {:?} -> {:?}\n",
-                csg_idx,
-                old_state,
-                update
-            );
-            glb_iface.set_csg_state(csg_idx, update)?;
-            glb_iface.ring_csg_doorbell(csg_idx)?;
-            let output = glb_iface.read_output()?;
-            let ack = output.ack;
+        let old_state = group.state();
 
-            let new_state = match GroupState::try_from(ack) {
-                Ok(GroupState::Start) => State::Active,
-                Ok(GroupState::Resume) => State::Active,
-                Ok(GroupState::Terminate) => State::Terminated,
-                Ok(GroupState::Suspend) => State::Suspended,
-                _ => State::Unknown,
-            };
-            if old_state == new_state {
-                return Ok(());
+        let csg = glb_iface.csg(csg_idx).ok_or(EINVAL)?;
+        let output = csg.read_output()?;
+
+        let new_state = match GroupState::try_from(output.ack) {
+            Ok(GroupState::Start) => State::Active,
+            Ok(GroupState::Resume) => State::Active,
+            Ok(GroupState::Terminate) => State::Terminated,
+            Ok(GroupState::Suspend) => State::Suspended,
+            _ => State::Unknown,
+        };
+
+        if old_state == new_state {
+            return Ok(());
+        }
+
+        if new_state == State::Unknown {
+            let _ = group.with_locked_inner(|inner| {
+                inner.fatal_error = Some(EINVAL);
+                Ok(())
+            });
+            // TODO: schedule reset
+        }
+        if new_state == State::Suspended {
+            self.sync_csg_slot_queues_state(data, glb_iface, csg_slot_manager, csg_idx)?;
+        }
+
+        if old_state == State::Active {
+            if let Some(csg) = glb_iface.csg_mut(csg_idx) {
+                // Reset the queue slots so we start from a clean
+                // state when starting/resuming a new group on this
+                // CSG slot. No wait needed here, and no ringbell
+                // either, since the CS slot will only be re-used
+                // on the next CSG start operation.
+                let mut i = 0;
+                while let Some(cs) = csg.cs_mut(i) {
+                    let _ = cs.set_state(StreamState::Stop);
+                    i += 1;
+                }
             }
-            self.handle_state_change(new_state, old_state, data, glb_iface, csg_idx)
+        }
+
+        group.set_state(new_state);
+        Ok(())
+    }
+
+    /// Synchronizes the state of all groups.
+    pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
+        let mut context = CsgUpdateContext::new();
+
+        // Hold the slot-manager lock across the whole inspection pass so we
+        // see a consistent view of the slot map. The firmware update at
+        // the end (`apply_csg_updates`) re-acquires the lock itself, so we
+        // drop the guard before calling into it.
+        {
+            let csg_slot_manager = data.csg_slot_manager.lock();
+
+            for csg_idx in 0..self.csg_slot_count as usize {
+                let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
+                    continue;
+                };
+                let group = slot_data.group.clone();
+                let unhandled_fault = group.vm.unhandled_fault.load(Ordering::Relaxed);
+
+                // If there was an unhandled fault on the VM, force processing
+                // of CSG IRQs so we can flag the faulty queue.
+                if unhandled_fault {
+                    data.fw.with_locked_global_iface(|glb_iface| {
+                        self.process_csg_irq(
+                            data.clone(),
+                            glb_iface,
+                            csg_idx as u32,
+                            Some(group.clone()),
+                        )
+                    })?;
+
+                    group.with_locked_inner(|inner| {
+                        // No fatal fault reported, flag all queues as faulty.
+                        if !inner.has_fatal_queues() {
+                            let len = inner.queues.len() as u32;
+                            for i in 0..len {
+                                inner.set_queue_fatal(i as usize);
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+
+                context.toggle_reqs(csg_idx, CSG_STATUS_UPDATE);
+            }
+        }
+
+        // Apply the request and wait for the firmware's response.
+        self.apply_csg_updates(data.clone(), &mut context)?;
+
+        Ok(())
+    }
+
+    /// Synchronizes the state of the queues within a CSG slot.
+    pub(crate) fn sync_csg_slot_queues_state(
+        &mut self,
+        _data: &TyrDrmDeviceData,
+        glb_iface: &mut GlobalInterface,
+        csg_slot_manager: &crate::sched::CsgSlotManager,
+        csg_idx: usize,
+    ) -> Result {
+        let group = {
+            csg_slot_manager
+                .slot_data(csg_idx)
+                .ok_or(EINVAL)?
+                .group
+                .clone()
+        };
+        let priority = group.priority as usize;
+
+        let csg = glb_iface.csg(csg_idx).ok_or(EINVAL)?;
+        let output = csg.read_output()?;
+
+        let wait_arc_opt = group.with_locked_inner(|inner| {
+            inner.idle = output.is_idle();
+            let mut has_sync_wait = false;
+
+            for cs_id in 0..inner.queues.len() {
+                let mut idle = false;
+                let mut blocked = false;
+
+                if let Some(cs) = csg.cs(cs_id) {
+                    let cs_out = cs.read_output()?;
+                    let blocked_reason = cs_out.blocked_reason()?;
+
+                    match blocked_reason {
+                        BlockedReason::Unblocked => {
+                            let mut empty = false;
+                            if let Some(queue) = inner.queues.get_mut(cs_id) {
+                                if let (Ok(input), Ok(output)) = (
+                                    queue.interfaces.read_input(),
+                                    queue.interfaces.read_output(),
+                                ) {
+                                    empty = input.insert == output.extract;
+                                }
+                            }
+                            // Checked through scoreboard
+                            if empty && cs_out.status_scoreboards == 0 {
+                                idle = true;
+                            }
+                        }
+                        BlockedReason::SyncWait => {
+                            has_sync_wait = true;
+                            let status_wait = cs_out.status_wait()?;
+
+                            let mut ref_val = u64::from(cs_out.status_wait_sync_value);
+                            if status_wait.sync64 {
+                                ref_val |= u64::from(cs_out.status_wait_sync_value_hi) << 32;
+                            }
+
+                            let syncwait = queue::SyncWait {
+                                gpu_va: cs_out.status_wait_sync_ptr,
+                                ref_val,
+                                sync64: status_wait.sync64,
+                                gt: status_wait.gt,
+                                bo: None,
+                                bo_offset: 0,
+                            };
+
+                            if let Some(queue) = inner.queues.get_mut(cs_id) {
+                                queue.syncwait = syncwait;
+                            }
+
+                            // Only blocked if there's no deferred operation pending
+                            if cs_out.status_scoreboards == 0 {
+                                blocked = true;
+                            }
+                        }
+                        _ => {
+                            // Other reasons are not blocking. Consider the queue as
+                            // runnable in those cases.
+                        }
+                    }
+                }
+
+                inner.set_queue_idle(cs_id, idle);
+                inner.set_queue_blocked(cs_id, blocked);
+            }
+
+            if has_sync_wait {
+                if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group.clone()) {
+                    return Ok(Some(wait_arc));
+                }
+            }
+
+            Ok(None)
         })?;
+
+        if let Some(wait_arc) = wait_arc_opt {
+            self.waiting_groups[priority].push_back(wait_arc);
+        }
 
         Ok(())
     }
@@ -441,7 +597,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         let _ = this.with_locked_scheduler(|sched| {
-            sched.process_events(&*this).inspect_err(|e| {
+            sched.process_events(this.clone()).inspect_err(|e| {
                 pr_err!("Failed to process firmware events: {}", e.to_errno());
             })
         });
@@ -459,10 +615,95 @@ impl DmaFenceWorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         let _ = this.with_locked_scheduler(|sched| {
-            while let Some(group) = sched.unsynced_groups.pop() {
-                sched.update_group(group, &*this).inspect_err(|e| {
-                    pr_err!("Failed to process firmware events: {}", e.to_errno());
-                })?;
+            let mut immediate_tick = false;
+
+            for prio in 0..Priority::num_priorities() {
+                // Collect groups that need to be made runnable to avoid borrowing `sched`
+                // mutably while iterating over `sched.waiting_groups`.
+                let mut make_runnable = List::<Group, 1>::new();
+
+                {
+                    let mut cursor = sched.waiting_groups[prio].cursor_front();
+                    while let Some(peek) = cursor.peek_next() {
+                        let group: Arc<Group> = peek.arc().into();
+
+                        let mut tested_queues: u32 = group
+                            .with_locked_inner(|inner| Ok(inner.blocked_queues()))
+                            .unwrap_or(0);
+                        let mut unblocked_queues = 0;
+
+                        while tested_queues != 0 {
+                            let cs_id = tested_queues.trailing_zeros();
+
+                            match group.eval_syncwait(cs_id as usize) {
+                                Ok(true) => {
+                                    unblocked_queues |= 1 << cs_id;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    pr_err!("eval_syncwait failed: {}", e.to_errno());
+                                    unblocked_queues |= 1 << cs_id;
+                                }
+                            }
+
+                            tested_queues &= !(1 << cs_id);
+                        }
+
+                        let mut park_actions: [Option<QueueParkAction>; MAX_CS_PER_GROUP] =
+                            [const { None }; MAX_CS_PER_GROUP];
+
+                        let action = group
+                            .with_locked_inner(|inner| {
+                                if unblocked_queues != 0 {
+                                    for i in 0..inner.queues.len() {
+                                        if (unblocked_queues & (1 << i)) != 0 {
+                                            inner.set_queue_blocked(i, false);
+                                            park_actions[i] = inner.sync_queue_state(i);
+                                        }
+                                    }
+
+                                    if inner.csg_id.is_none() {
+                                        return Ok(Some((!inner.has_blocked_queues(), true)));
+                                    }
+                                }
+
+                                Ok(Some((!inner.has_blocked_queues(), false)))
+                            })
+                            .unwrap_or(None);
+
+                        for park_action in park_actions.into_iter().flatten() {
+                            park_action.apply();
+                        }
+
+                        if let Some((unblocked, move_to_runnable)) = action {
+                            if unblocked {
+                                let list_arc = peek.remove();
+
+                                if move_to_runnable {
+                                    make_runnable.push_back(list_arc);
+
+                                    if prio == Priority::RealTime as usize {
+                                        immediate_tick = true;
+                                    }
+                                }
+                            } else {
+                                cursor.move_next();
+                            }
+                        } else {
+                            cursor.move_next();
+                        }
+                    }
+                }
+
+                // Now we can mutate `sched` safely
+                while let Some(list_arc) = make_runnable.pop_front() {
+                    let group = list_arc.into_arc();
+                    sched.mark_group_runnable(&group);
+                }
+            }
+
+            if immediate_tick {
+                TyrDrmDeviceData::schedule_tick(&this);
             }
 
             Ok(())

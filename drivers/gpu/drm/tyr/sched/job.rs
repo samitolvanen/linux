@@ -3,18 +3,18 @@
 use core::sync::atomic::AtomicI64;
 
 use kernel::{
-    bits::genmask_u64,
-    c_str,
-    dma_fence,
-    dma_fence::{
-        FenceObject,
-        FenceOps, //
+    bindings::ECANCELED,
+    dma_fence::Fence,
+    drm::job_queue::{
+        JobRef,
+        QueueOps,
+        SubmitResult, //
     },
-    drm::sched::JobImpl,
-    kvec,
     prelude::*,
     sync::Arc, //
 };
+
+use core::{mem::size_of, sync::atomic::Ordering};
 
 use crate::sched::group::Group;
 
@@ -97,6 +97,7 @@ impl Instr {
     }
 }
 
+/// A hardware execution job.
 pub(crate) struct Job {
     /// The group whose queue this job will be pushed to.
     pub(crate) group: Arc<Group>,
@@ -110,6 +111,7 @@ pub(crate) struct Job {
     /// Size of the userspace command stream.
     stream_size: u32,
 
+    /// Latest flush value.
     latest_flush: u32,
 
     /// The address of the sync object for the queue.
@@ -120,6 +122,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    pub(crate) fn queue_idx(&self) -> usize {
+        self.queue_idx
+    }
+
     pub(crate) fn create(
         qsubmit: crate::file::QueueSubmit,
         group: Arc<Group>,
@@ -151,56 +157,107 @@ impl Job {
         })
     }
 
-    pub(crate) fn queue_idx(&self) -> usize {
-        self.queue_idx
-    }
+    /// Submits the job to the hardware by generating instructions and appending them to the queue.
+    pub(crate) fn submit_to_hw(&self, submit_fence: &Fence) -> Result {
+        let mut instrs = [0u8; 128];
 
-    pub(crate) fn submit_to_hw(&self, submit_fence: &kernel::dma_fence::Fence) -> Result {
-        let mut instrs = kvec![];
+        // Snapshot CSIF info under one lock acquisition so all the values
+        // used below come from the same observation.
+        let csif = *self.group.tdev.csif_info.lock();
+        let cs_reg_count = u64::from(csif.cs_reg_count);
+        let unpreserved_cs_reg_count = u64::from(csif.unpreserved_cs_reg_count);
+        let sb_slot_count = csif.scoreboard_slot_count;
 
-        let addr_reg = 92;
-        let val_reg = 94;
-        let wait_all_mask = genmask_u64(0..=7);
+        let addr_reg = cs_reg_count - unpreserved_cs_reg_count;
+        let val_reg = addr_reg + 2;
 
-        let mov_latest_flush = Instr::mov32(val_reg, self.latest_flush.into());
-        let flush_cache = Instr::flush_cache2(val_reg);
-        let mov_cs_start = Instr::mov48(addr_reg, self.stream_addr);
-        let mov_cs_size = Instr::mov32(val_reg, self.stream_size.into());
-        let wait0 = Instr::wait(1);
-        let call = Instr::call(addr_reg, val_reg);
-        let mov_sync_addr = Instr::mov48(addr_reg, self.sync_addr);
-        let mov_sync_val = Instr::mov48(val_reg, 1);
-        let wait_all = Instr::wait(wait_all_mask);
-        let sync_add = Instr::sync_add64(addr_reg, val_reg);
-        let error_barrier = Instr::error_barrier();
+        let wait_all_mask = (1u64 << sb_slot_count) - 1;
 
-        instrs.extend_from_slice(&mov_latest_flush.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&flush_cache.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&mov_cs_start.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&mov_cs_size.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&wait0.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&call.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&mov_sync_addr.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&mov_sync_val.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&wait_all.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&sync_add.to_le_bytes(), GFP_KERNEL)?;
-        instrs.extend_from_slice(&error_barrier.to_le_bytes(), GFP_KERNEL)?;
+        let instrs_u64 = [
+            Instr::mov32(val_reg, self.latest_flush.into()),
+            Instr::flush_cache2(val_reg),
+            Instr::mov48(addr_reg, self.stream_addr),
+            Instr::mov32(val_reg, self.stream_size.into()),
+            Instr::wait(1),
+            Instr::call(addr_reg, val_reg),
+            Instr::mov48(addr_reg, self.sync_addr),
+            Instr::mov48(val_reg, 1),
+            Instr::wait(wait_all_mask),
+            Instr::sync_add64(addr_reg, val_reg),
+            Instr::error_barrier(),
+        ];
 
-        let pad = instrs.len().next_multiple_of(64) - instrs.len();
-        for _ in 0..pad {
-            instrs.push(0, GFP_KERNEL)?;
+        // Size is 128 bytes to accommodate 11 instructions (88 bytes) and pad to the required 64-byte boundary.
+        let instr_size = size_of::<u64>();
+        for (i, instr) in instrs_u64.iter().enumerate() {
+            let start = i * instr_size;
+            instrs[start..start + instr_size].copy_from_slice(&instr.to_le_bytes());
         }
+        // The remaining 40 bytes serve as the required padding.
+
+        let mut needs_runnable = false;
+        let mut needs_tick = false;
 
         self.group.with_locked_inner(|inner| {
-            let queue = inner.queues.get_mut(self.queue_idx).ok_or(EINVAL)?;
-            queue.append_and_commit_instrs(&instrs)?;
+            if !inner.can_run() {
+                return Err(Error::from_errno(-(ECANCELED as i32)));
+            }
 
-            queue
-                .in_flight_jobs
-                .push(submit_fence.clone(), GFP_KERNEL)?;
-            queue.kick()?;
+            let queue = inner.queues.get_mut(self.queue_idx).ok_or(EINVAL)?;
+
+            self.baseline_suspend_nanos.store(
+                queue.accumulated_suspend_nanos.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+
+            let (ringbuf_start, ringbuf_end) = queue.append_instrs(&instrs)?;
+
+            let seqno = queue.next_seqno.fetch_add(1, Ordering::Relaxed) + 1;
+            queue.add_pending_submit_fence(
+                seqno,
+                ringbuf_start,
+                ringbuf_end,
+                submit_fence.clone(),
+            )?;
+
+            queue.commit_instrs(ringbuf_end)?;
+
+            if inner.csg_id.is_none() {
+                // The framework holds this queue's pipeline-state mutex,
+                // so a park/unpark action here would self-deadlock.
+                // `can_run()` above rules out park-triggering states and
+                // the framework only invokes `submit()` on an unparked
+                // queue, so `sync_queue_state` returns `None`; the
+                // useful side effect is settling `timeout_suspended`.
+                let _ = inner.sync_queue_state(self.queue_idx);
+
+                if !inner.is_queue_blocked(self.queue_idx) {
+                    let was_idle = inner.is_idle();
+                    inner.set_queue_idle(self.queue_idx, false);
+
+                    if was_idle && !inner.is_idle() {
+                        needs_runnable = true;
+                    }
+                    needs_tick = true;
+                }
+            } else {
+                queue.kick()?;
+            }
+
             Ok(())
         })?;
+
+        if needs_runnable || needs_tick {
+            self.group.tdev.with_locked_scheduler(|sched| {
+                if needs_runnable {
+                    sched.mark_group_runnable(&self.group);
+                }
+                if needs_tick {
+                    sched.schedule_group(&self.group.tdev, Some(self.group.priority));
+                }
+                Ok(())
+            })?;
+        }
 
         Ok(())
     }
@@ -209,33 +266,19 @@ impl Job {
 #[derive(Clone)]
 pub(crate) struct TyrJobHandler;
 
-impl kernel::drm::job_queue::QueueOps for TyrJobHandler {
+impl QueueOps for TyrJobHandler {
     type Job = Job;
 
-    fn submit(
-        &self,
-        job: &kernel::drm::job_queue::JobRef<'_, Self::Job>,
-    ) -> Result<kernel::drm::job_queue::SubmitResult> {
-        job.job.submit_to_hw(job.submit_fence)?;
-        Ok(kernel::drm::job_queue::SubmitResult::Submitted)
+    fn submit(&self, job: &JobRef<'_, Self::Job>) -> Result<SubmitResult> {
+        match job.job.submit_to_hw(job.submit_fence) {
+            Ok(()) => Ok(SubmitResult::Submitted),
+            Err(e) if e == EBUSY => Ok(SubmitResult::NoResources),
+            Err(e) => Err(e),
+        }
     }
 }
 
+// SAFETY: Jobs are safe to send across threads.
 unsafe impl Send for Job {}
+// SAFETY: Jobs are safe to share across threads.
 unsafe impl Sync for Job {}
-
-#[expect(dead_code)]
-pub(crate) struct Fence;
-
-#[vtable]
-impl FenceOps for Fence {
-    const USE_64BIT_SEQNO: bool = true;
-
-    fn get_driver_name<'a>(self: &'a kernel::dma_fence::FenceObject<Self>) -> &'a CStr {
-        c_str!("tyr")
-    }
-
-    fn get_timeline_name<'a>(self: &'a kernel::dma_fence::FenceObject<Self>) -> &'a CStr {
-        c_str!("tyr_fence")
-    }
-}
