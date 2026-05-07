@@ -461,7 +461,13 @@ impl AddressSpaceManager {
         //
         // The MMU ignores the low lock_region_log2 bits of LOCKADDR base, so ensure
         // they are cleared in software to avoid ambiguity.
-        let lockaddr_base = region.start & !((1u64 << lock_region_log2) - 1);
+        debug_assert!(lock_region_log2 <= 64);
+        let lockaddr_base = if lock_region_log2 >= 64 {
+            // log2 == 64 means the lock covers the entire AS; mask is all-ones.
+            0
+        } else {
+            region.start & !((1u64 << lock_region_log2) - 1)
+        };
 
         // The LOCKADDR size field encodes the lock region size as log2(size) - 1,
         // per the hardware definition. For example, a 32 KiB region is encoded as 14
