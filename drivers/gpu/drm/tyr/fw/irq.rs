@@ -32,6 +32,7 @@ use crate::{
         IoMem,
         TyrDrmDevice, //
     },
+    fw::global::GlobalInterface,
     irq::{
         TyrIrq,
         TyrIrqTrait, //
@@ -105,8 +106,9 @@ impl JobIrqState {
     }
 }
 
-pub(crate) struct JobIrq {
+pub(crate) struct JobIrq<'drm> {
     state: JobIrqState,
+    global_iface: Arc<GlobalInterface<'drm>>,
 }
 
 /// Unmasks the Job IRQ sources and registers the handler.
@@ -120,20 +122,24 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     state: JobIrqState,
-) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>, Error> + 'drm> {
+    global_iface: Arc<GlobalInterface<'drm>>,
+) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>, Error> + 'drm> {
     let mask = job_irq_sources();
 
     let io = iomem.access(pdev.as_ref())?;
     io.write_reg(JOB_IRQ_CLEAR::from_raw(mask.into_raw()));
     io.write_reg(mask);
 
-    let job_irq = JobIrq { state };
+    let job_irq = JobIrq {
+        state,
+        global_iface,
+    };
 
     // SAFETY: The caller guarantees that the registration is not leaked.
     Ok(unsafe { TyrIrq::request(pdev, tdev, c"job", iomem, job_irq) })
 }
 
-impl TyrIrqTrait for JobIrq {
+impl TyrIrqTrait for JobIrq<'_> {
     fn read_status(&self, io: &IoMem<'_>) -> u32 {
         io.read(JOB_IRQ_STATUS).into_raw()
     }
@@ -159,6 +165,12 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, _tdev: &TyrDrmDevice, _io: &IoMem<'_>, status: u32) {
+        if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
+            let _ = self.global_iface.process_global_irq().inspect_err(|err| {
+                pr_err!("Failed to process firmware global IRQ: {:?}\n", err);
+            });
+        }
+
         self.state.handle(status);
     }
 }

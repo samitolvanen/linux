@@ -124,7 +124,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
     /// stops.
-    _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>>>,
+    _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>>>,
 
     /// MMU IRQ registration. Freed after `mmu`, so faults raised during teardown are still
     /// reported.
@@ -246,6 +246,7 @@ impl platform::Driver for TyrPlatformDriver {
                     ARef::from(&*unreg_dev),
                     iomem.clone(),
                     firmware.irq_state(),
+                    firmware.global_iface(),
                 )
             }?,
             GFP_KERNEL,

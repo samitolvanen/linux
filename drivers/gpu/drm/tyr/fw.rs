@@ -126,7 +126,7 @@ pub(crate) struct Firmware<'drm> {
     irq_state: irq::JobIrqState,
 
     /// The global FW interface.
-    global_iface: Pin<KBox<GlobalInterface<'drm>>>,
+    global_iface: Arc<GlobalInterface<'drm>>,
 }
 
 impl<'drm> Drop for Firmware<'drm> {
@@ -236,8 +236,14 @@ impl<'drm> Firmware<'drm> {
 
             let irq_state = irq::JobIrqState::new()?;
             let shared_section = Self::find_shared_section(dev, &sections)?;
-            let global_iface = KBox::pin_init(
-                GlobalInterface::new(pdev.as_ref(), shared_section, *gpu_info, &irq_state)?,
+            let global_iface = Arc::pin_init(
+                GlobalInterface::new(
+                    pdev.as_ref(),
+                    iomem.clone(),
+                    shared_section,
+                    *gpu_info,
+                    &irq_state,
+                )?,
                 GFP_KERNEL,
             )?;
 
@@ -299,6 +305,10 @@ impl<'drm> Firmware<'drm> {
 
     pub(crate) fn irq_state(&self) -> irq::JobIrqState {
         self.irq_state.clone()
+    }
+
+    pub(crate) fn global_iface(&self) -> Arc<GlobalInterface<'drm>> {
+        self.global_iface.clone()
     }
 
     /// Enable the global interface.
