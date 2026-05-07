@@ -13,11 +13,11 @@ use kernel::{
     xarray::XArray, //
 };
 
-use crate::driver::TyrDrmDevice;
 use super::{
     Vm,
     VmLayout, //
 };
+use crate::driver::TyrDrmDevice;
 
 /// The pool for user VMs.
 pub(crate) struct Pool {

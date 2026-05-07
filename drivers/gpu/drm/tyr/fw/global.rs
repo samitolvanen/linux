@@ -5,6 +5,8 @@
 use core::ops::Deref;
 
 use csg::CommandStreamGroup;
+#[allow(unused)]
+use kernel::workqueue;
 use kernel::{
     bits::genmask_u32,
     clk::Clk,
@@ -26,8 +28,6 @@ use kernel::{
     types::ARef,
     workqueue::WorkItem, //
 };
-#[allow(unused)]
-use kernel::workqueue;
 
 use crate::{
     driver::{
@@ -428,7 +428,10 @@ impl GlobalInterface {
         kernel::sync::barrier::smp_mb();
         let io = self.iomem.try_access().ok_or(EINVAL)?;
         let doorbell_reg = doorbell_block::DOORBELL::try_at(CSF_GLB_DOORBELL_ID).ok_or(EINVAL)?;
-        io.write(doorbell_reg, doorbell_block::DOORBELL::zeroed().with_ring(true));
+        io.write(
+            doorbell_reg,
+            doorbell_block::DOORBELL::zeroed().with_ring(true),
+        );
         Ok(())
     }
 

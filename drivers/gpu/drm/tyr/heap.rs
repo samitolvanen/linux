@@ -138,12 +138,7 @@ impl Context {
     fn alloc_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
         let chunk_bo = {
             let flags = VmMapFlags::from(VmFlag::Noexec);
-            let chunk_bo = gem::new_kernel_object(
-                tdev,
-                &self.vm,
-                self.chunk_size as usize,
-                flags,
-            )?;
+            let chunk_bo = gem::new_kernel_object(tdev, &self.vm, self.chunk_size as usize, flags)?;
 
             let vmap = chunk_bo.vmap();
             let size = vmap.owner().size();
@@ -180,22 +175,14 @@ pub(crate) struct Pool {
 }
 
 impl Pool {
-    pub(crate) fn create(
-        tdev: &TyrDrmDevice,
-        vm: Arc<Vm>,
-    ) -> Result<Self> {
+    pub(crate) fn create(tdev: &TyrDrmDevice, vm: Arc<Vm>) -> Result<Self> {
         let stride = tdev.gpu_info.heap_context_stride();
 
         let bo_size = MAX_HEAPS_PER_POOL * stride;
         let bo_size = bo_size.next_multiple_of(4096) as usize;
 
         let flags = VmMapFlags::from(VmFlag::Noexec);
-        let gpu_contexts = gem::new_kernel_object(
-            tdev,
-            &vm,
-            bo_size,
-            flags,
-        )?;
+        let gpu_contexts = gem::new_kernel_object(tdev, &vm, bo_size, flags)?;
 
         let gpu_contexts = KBox::pin_init(new_mutex!(gpu_contexts), GFP_KERNEL)?;
 

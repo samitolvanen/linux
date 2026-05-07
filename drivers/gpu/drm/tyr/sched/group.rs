@@ -195,12 +195,7 @@ impl Group {
 
         let num_syncs = group_args.queues.count as usize * core::mem::size_of::<SyncObj64b>();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
-        let syncobjs = gem::new_kernel_object(
-            tdev,
-            &vm,
-            num_syncs,
-            flags,
-        )?;
+        let syncobjs = gem::new_kernel_object(tdev, &vm, num_syncs, flags)?;
 
         let vmap = syncobjs.vmap();
         let size = vmap.owner().size();
@@ -294,66 +289,71 @@ impl Group {
         let mut fences = KVec::with_capacity(queue_submits.len(), GFP_KERNEL)?;
 
         // Prepare the VM with enough slots for all submissions
-        self.vm.with_prepared_vm(queue_submits.len() as u32, |mut locked_vm| {
-            // Create all jobs and add them to the context
-            self.with_locked_inner(|inner| {
-                for queue_submit in queue_submits.iter() {
-                    let queue = inner
-                        .queues
-                        .get_mut(queue_submit.queue_index as usize)
-                        .ok_or(EINVAL)?;
+        self.vm
+            .with_prepared_vm(queue_submits.len() as u32, |mut locked_vm| {
+                // Create all jobs and add them to the context
+                self.with_locked_inner(|inner| {
+                    for queue_submit in queue_submits.iter() {
+                        let queue = inner
+                            .queues
+                            .get_mut(queue_submit.queue_index as usize)
+                            .ok_or(EINVAL)?;
 
-                    let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
-                    let sync_addr = sync_addr.start
-                        + u64::from(queue_submit.queue_index)
-                            * core::mem::size_of::<syncs::SyncObj64b>() as u64;
+                        let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
+                        let sync_addr = sync_addr.start
+                            + u64::from(queue_submit.queue_index)
+                                * core::mem::size_of::<syncs::SyncObj64b>() as u64;
 
-                    let fence: UserFence<_> = queue
-                        .fence_ctx
-                        .new_fence(0, crate::sched::job::Fence)?
-                        .into();
+                        let fence: UserFence<_> = queue
+                            .fence_ctx
+                            .new_fence(0, crate::sched::job::Fence)?
+                            .into();
 
-                    let job =
-                        job::Job::create(*queue_submit, self.clone(), fence.clone(), sync_addr)?;
+                        let job = job::Job::create(
+                            *queue_submit,
+                            self.clone(),
+                            fence.clone(),
+                            sync_addr,
+                        )?;
 
-                    ctx.add_job(job, internal_syncs.clone())?;
+                        ctx.add_job(job, internal_syncs.clone())?;
 
-                    // Store the fence to return later
-                    fences.push(fence, GFP_KERNEL)?;
-                }
-                Ok(())
-            })?;
-
-            ctx.collect_signal_ops(&internal_syncs)?;
-
-            // Collect unique queue indices from all queue submits
-            let mut queue_indices = kvec![];
-            for queue_submit in queue_submits.iter() {
-                let idx = queue_submit.queue_index as usize;
-                if !queue_indices.iter().any(|&qi| qi == idx) {
-                    queue_indices.push(idx, GFP_KERNEL)?;
-                }
-            }
-
-            // Process jobs for each queue
-            for &queue_idx in queue_indices.iter() {
-                let finished_fences = self.with_locked_inner(|inner| {
-                    let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                    ctx.add_deps_and_push_jobs(&mut queue.entity, queue_idx)
+                        // Store the fence to return later
+                        fences.push(fence, GFP_KERNEL)?;
+                    }
+                    Ok(())
                 })?;
 
-                // Add the finished fences to the reservation objects
-                for fence in &finished_fences {
-                    locked_vm.resv_add_fence(
-                        fence,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    );
-                }
-            }
+                ctx.collect_signal_ops(&internal_syncs)?;
 
-            Ok(())
-        })?;
+                // Collect unique queue indices from all queue submits
+                let mut queue_indices = kvec![];
+                for queue_submit in queue_submits.iter() {
+                    let idx = queue_submit.queue_index as usize;
+                    if !queue_indices.iter().any(|&qi| qi == idx) {
+                        queue_indices.push(idx, GFP_KERNEL)?;
+                    }
+                }
+
+                // Process jobs for each queue
+                for &queue_idx in queue_indices.iter() {
+                    let finished_fences = self.with_locked_inner(|inner| {
+                        let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                        ctx.add_deps_and_push_jobs(&mut queue.entity, queue_idx)
+                    })?;
+
+                    // Add the finished fences to the reservation objects
+                    for fence in &finished_fences {
+                        locked_vm.resv_add_fence(
+                            fence,
+                            kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                            kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                        );
+                    }
+                }
+
+                Ok(())
+            })?;
 
         // Push all signal fences to their syncobjs
         ctx.push_fences();

@@ -52,13 +52,13 @@ use crate::{
         ParsedSection, //
     },
     gem,
-    new_wait,
     gem::{
         KernelBo,
         KernelBoVaAlloc,
         MappedBo, //
     },
     mmu::Mmu,
+    new_wait,
     regs::gpu_control::{
         McuControlMode,
         McuStatus,
@@ -484,8 +484,7 @@ impl Firmware {
         // Set the auto-VA range to the MCU shared region.  FW sections
         // with explicit VAs are reserved below to prevent collisions.
         let fw_kernel_va_start = CSF_MCU_SHARED_REGION_START as u64;
-        let fw_kernel_va_end =
-            (CSF_MCU_SHARED_REGION_START + CSF_MCU_SHARED_REGION_SIZE) as u64;
+        let fw_kernel_va_end = (CSF_MCU_SHARED_REGION_START + CSF_MCU_SHARED_REGION_SIZE) as u64;
 
         let vm = Vm::new(
             pdev,
@@ -537,8 +536,7 @@ impl Firmware {
 
             if is_shared {
                 let shared_obj = MappedBo::new(&mem.bo)?;
-                shared_section_backing =
-                    Some(SharedSectionBacking::new(shared_obj, va..va_end));
+                shared_section_backing = Some(SharedSectionBacking::new(shared_obj, va..va_end));
             }
 
             sections.push(
@@ -566,14 +564,17 @@ impl Firmware {
             }
         };
 
-        let firmware = Arc::pin_init(try_pin_init!(Firmware {
-                pdev: pdev.into(),
-                iomem,
-                vm,
-                sections,
-                global_iface <- new_mutex!(global_iface),
-                event_wait,
-        }), GFP_KERNEL)?;
+        let firmware = Arc::pin_init(
+            try_pin_init!(Firmware {
+                    pdev: pdev.into(),
+                    iomem,
+                    vm,
+                    sections,
+                    global_iface <- new_mutex!(global_iface),
+                    event_wait,
+            }),
+            GFP_KERNEL,
+        )?;
 
         Ok(firmware)
     }
@@ -635,9 +636,7 @@ impl Firmware {
         gpu_info: &crate::gpu::GpuInfo,
         core_clk: &kernel::clk::Clk,
     ) -> Result {
-        self.with_locked_global_iface(|glb| {
-            glb.enable(tdev, gpu_info, core_clk)
-        })
+        self.with_locked_global_iface(|glb| glb.enable(tdev, gpu_info, core_clk))
     }
 }
 
@@ -645,9 +644,7 @@ impl Firmware {
 pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
 
 impl<const N: usize> ModInfoBuilder<N> {
-    const FILES: &'static [&'static str] = &[
-        "arm/mali/arch10.8/mali_csffw.bin",
-    ];
+    const FILES: &'static [&'static str] = &["arm/mali/arch10.8/mali_csffw.bin"];
 
     pub(crate) const fn create(
         module_name: &'static kernel::str::CStr,

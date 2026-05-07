@@ -22,7 +22,11 @@ use crate::{
 const DRM_PANTHOR_USER_MMIO_OFFSET_64BIT: u64 = 1u64 << 56;
 const DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET: u64 = DRM_PANTHOR_USER_MMIO_OFFSET_64BIT;
 
-pub(crate) fn mmap(device: &TyrDrmDevice, _file: &crate::file::TyrDrmFileData, vma: &VmaNew) -> Option<Result> {
+pub(crate) fn mmap(
+    device: &TyrDrmDevice,
+    _file: &crate::file::TyrDrmFileData,
+    vma: &VmaNew,
+) -> Option<Result> {
     let offset = (vma.pgoff() as u64) << PAGE_SHIFT;
 
     if offset < DRM_PANTHOR_USER_MMIO_OFFSET_64BIT {

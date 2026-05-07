@@ -54,7 +54,8 @@ impl JobImpl for VmBindJob {
                 flags,
             } => {
                 let size = va_range.end - va_range.start;
-                job.vm.map_bo_range(&bo, *bo_offset, size, va_range.start, *flags)
+                job.vm
+                    .map_bo_range(&bo, *bo_offset, size, va_range.start, *flags)
             }
             VmOperation::Unmap { va_range } => {
                 let size = va_range.end - va_range.start;
@@ -63,7 +64,10 @@ impl JobImpl for VmBindJob {
         };
 
         if let Err(ref e) = result {
-            pr_err!("Async VM bind operation failed, marking VM as unusable: {:?}\n", e);
+            pr_err!(
+                "Async VM bind operation failed, marking VM as unusable: {:?}\n",
+                e
+            );
             job.vm.mark_unusable();
         }
 

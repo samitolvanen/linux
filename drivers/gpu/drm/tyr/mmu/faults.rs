@@ -98,9 +98,12 @@ pub(crate) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
         let as_index = (status | (status >> 16)).trailing_zeros();
         let mask = kernel::bits::bit_u32(as_index);
 
-        let fault_status_reg = mmu_as_control::FAULTSTATUS::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_lo_reg = mmu_as_control::FAULTADDRESS_LO::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_hi_reg = mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
+        let fault_status_reg =
+            mmu_as_control::FAULTSTATUS::try_at(as_index as usize).ok_or(EINVAL)?;
+        let fault_addr_lo_reg =
+            mmu_as_control::FAULTADDRESS_LO::try_at(as_index as usize).ok_or(EINVAL)?;
+        let fault_addr_hi_reg =
+            mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
 
         let fault_status_val = io.read(fault_status_reg);
         let fault_status_raw = fault_status_val.into_raw();

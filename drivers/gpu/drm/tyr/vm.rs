@@ -454,22 +454,10 @@ impl Vm {
 
         let as_data = Arc::pin_init(VmAsData::new(&mmu, pdev, va_bits, pa_bits), GFP_KERNEL)?;
 
-        let kernel_va = RangeAlloc::new(
-            kernel_va_range.start,
-            kernel_va_range.end,
-            GFP_KERNEL,
-        )?;
+        let kernel_va = RangeAlloc::new(kernel_va_range.start, kernel_va_range.end, GFP_KERNEL)?;
 
-        let bind_scheduler = sched::Scheduler::new(
-            ddev.as_ref(),
-            1,
-            1,
-            1,
-            1000,
-            c_str!("tyr_vm"),
-        )?;
-        let bind_entity =
-            sched::Entity::new(&bind_scheduler, sched::Priority::Low)?;
+        let bind_scheduler = sched::Scheduler::new(ddev.as_ref(), 1, 1, 1, 1000, c_str!("tyr_vm"))?;
+        let bind_entity = sched::Entity::new(&bind_scheduler, sched::Priority::Low)?;
 
         let vm = Arc::pin_init(
             pin_init!(Self{
@@ -526,11 +514,7 @@ impl Vm {
     /// Acquires the GPUVM exec lock (reserving `num_slots` fence slots) and
     /// the bind context mutex, then calls the provided closure with both a
     /// [`PreparedVm`] and the bind [`Entity`].
-    pub(crate) fn with_prepared_vm_and_bind_entity<F, R>(
-        &self,
-        num_slots: u32,
-        f: F,
-    ) -> Result<R>
+    pub(crate) fn with_prepared_vm_and_bind_entity<F, R>(&self, num_slots: u32, f: F) -> Result<R>
     where
         F: FnOnce(&mut PreparedVm<'_>, &mut sched::Entity<VmBindJob>) -> Result<R>,
     {
@@ -579,8 +563,7 @@ impl Vm {
         num_slots: u32,
         f: impl FnOnce(PreparedVm<'_>) -> Result,
     ) -> Result {
-        let exec_token =
-            exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
+        let exec_token = exec::ExecToken::prepare(&self.gpuvm, num_slots)?;
         let prepared_vm = PreparedVm {
             exec_token,
             num_slots,
@@ -718,10 +701,7 @@ impl Vm {
     }
 
     /// Allocate a kernel VA range from the VM's kernel VA allocator.
-    pub(crate) fn alloc_kernel_range(
-        &self,
-        size: usize,
-    ) -> Result<range::LiveRange> {
+    pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
         self.kernel_va.allocate(size, GFP_KERNEL)
     }
 
