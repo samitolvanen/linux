@@ -19,6 +19,7 @@ const GROUP_PRIORITY_COUNT: usize =
     uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME as usize + 1;
 
 pub(crate) mod deps;
+pub(crate) mod events;
 pub(crate) mod group;
 pub(crate) mod job;
 pub(crate) mod queue;

@@ -74,7 +74,7 @@ use crate::{
     }, //
 };
 
-pub(super) use self::csg::CsgInterface;
+pub(crate) use self::csg::CsgInterface;
 
 /// Encodes a GLB timer timeout and selects the backing time source.
 pub(super) fn conv_timeout(core_clk: &Clk, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
@@ -263,8 +263,7 @@ impl<'drm> GlobalInterface<'drm> {
         inner.process_global_irq(&self.event_wait)
     }
 
-    #[expect(dead_code)]
-    pub(super) fn with_csg_mut<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
+    pub(crate) fn with_csg_mut<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
     where
         F: FnOnce(&mut csg::CsgInterface) -> Result<R>,
     {
@@ -273,8 +272,7 @@ impl<'drm> GlobalInterface<'drm> {
         f(csg)
     }
 
-    #[expect(dead_code)]
-    pub(super) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
+    pub(crate) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
         self.ring_doorbell(csg_idx + 1)
     }
 
