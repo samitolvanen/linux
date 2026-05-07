@@ -301,12 +301,10 @@ pub(crate) struct VmBindJob {
 }
 
 impl VmBindJob {
-    #[expect(dead_code)]
     pub(crate) fn new() -> Self {
         Self { ops: KVec::new() }
     }
 
-    #[expect(dead_code)]
     pub(crate) fn push_map(
         &mut self,
         bo: ARef<Bo>,
@@ -328,7 +326,6 @@ impl VmBindJob {
         .map_err(Error::from)
     }
 
-    #[expect(dead_code)]
     pub(crate) fn push_unmap(&mut self, va: u64, size: u64) -> Result {
         self.ops
             .push(VmBindJobOp::Unmap { va, size }, GFP_KERNEL)
@@ -748,15 +745,17 @@ impl Vm {
         Ok(())
     }
 
-    #[expect(dead_code)]
-    pub(crate) fn prepare_bind_job(&self, job: VmBindJob) -> Result<PreparedVmBindJob> {
+    pub(crate) fn prepare_bind_job(
+        &self,
+        job: VmBindJob,
+        deps: &[ARef<PublicDmaFence>],
+    ) -> Result<PreparedVmBindJob> {
         self.bind_queue
             .as_ref()
             .ok_or(EINVAL)?
-            .prepare(job, &[], VmBindFenceData)
+            .prepare(job, deps, VmBindFenceData)
     }
 
-    #[expect(dead_code)]
     pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob) -> ARef<PublicDmaFence> {
         self.bind_queue
             .as_ref()
