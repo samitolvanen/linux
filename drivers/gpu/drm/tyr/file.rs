@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
+    alloc::KVec,
     drm,
     drm::gem::BaseObject,
     io::Io,
@@ -29,6 +30,7 @@ use crate::{
         read_u64_no_tearing,
     },
     sched::{
+        deps,
         group,
     },
     vm::{
@@ -215,7 +217,7 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn vm_bind(
-        _ddev: &TyrDrmDevice,
+        ddev: &TyrDrmDevice,
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
@@ -226,7 +228,7 @@ impl TyrDrmFileData {
         }
 
         if vmbind.flags & async_flag != 0 {
-            return Err(ENOTSUPP);
+            return Self::vm_bind_async(ddev, vmbind, file);
         }
 
         if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
@@ -285,6 +287,58 @@ impl TyrDrmFileData {
                         vm.unmap_range(op.0.va, op.0.size)?;
                     }
                     _ => Err(ENOTSUPP)?,
+                }
+
+                Ok(0)
+            };
+
+            if let Err(e) = res {
+                vmbind.ops.count = i as u32;
+                return Err(e);
+            }
+        }
+
+        Ok(0)
+    }
+
+    fn vm_bind_async(
+        _ddev: &TyrDrmDevice,
+        vmbind: &mut uapi::drm_panthor_vm_bind,
+        file: &TyrDrmFile,
+    ) -> Result<u32> {
+        if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
+            return Err(ENOTSUPP);
+        }
+
+        let count = vmbind.ops.count as usize;
+        let stride = vmbind.ops.stride as usize;
+        let vm = file
+            .inner()
+            .vm_pool()
+            .get_vm(vmbind.vm_id as usize)
+            .ok_or(EINVAL)?;
+
+        if vm.is_unusable() {
+            return Err(EINVAL);
+        }
+
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(vmbind.ops.array as usize),
+            stride * count,
+        )
+        .reader();
+
+        for i in 0..count {
+            let res = {
+                let op: VmBindOp = reader.read()?;
+                let (job, syncs) = op.capture(file, true)?;
+                let deps = deps::wait_fences(file, &syncs)?;
+                let signals = deps::signal_syncs(file, &syncs)?;
+                let prepared = vm.prepare_bind_job(job, &deps)?;
+                let fence = vm.commit_bind_job(prepared);
+
+                for signal in signals {
+                    signal.publish(&fence);
                 }
 
                 Ok(0)
@@ -460,6 +514,80 @@ struct VmBindOp(uapi::drm_panthor_vm_bind_op);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for VmBindOp {}
+
+impl VmBindOp {
+    fn capture(
+        &self,
+        file: &TyrDrmFile,
+        is_async: bool,
+    ) -> Result<(vm::VmBindJob, KVec<deps::SyncOp>)> {
+        let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+        let map_flags = (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
+            | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
+            | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
+            as u32;
+        let mut syncs = KVec::new();
+
+        if is_async {
+            deps::append_syncops(
+                &mut syncs,
+                self.0.syncs.array,
+                self.0.syncs.count,
+                self.0.syncs.stride,
+            )?;
+        } else if self.0.syncs.count != 0 || self.0.syncs.array != 0 {
+            return Err(EINVAL);
+        }
+
+        let mut job = vm::VmBindJob::new();
+
+        match self.0.flags as i32 & type_mask {
+            uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP => {
+                let bo = gem::lookup_handle(file, self.0.bo_handle)?;
+
+                if self.0.flags & !((type_mask as u32) | map_flags) != 0 {
+                    return Err(EINVAL);
+                }
+
+                job.push_map(
+                    bo,
+                    self.0.bo_offset,
+                    self.0.size,
+                    self.0.va,
+                    VmMapFlags::try_from(self.0.flags & map_flags)?,
+                )?;
+            }
+            uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP => {
+                if self.0.bo_handle != 0 || self.0.bo_offset != 0 {
+                    return Err(EINVAL);
+                }
+
+                if self.0.flags & !(type_mask as u32) != 0 {
+                    return Err(EINVAL);
+                }
+
+                job.push_unmap(self.0.va, self.0.size)?;
+            }
+            uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY => {
+                if !is_async
+                    || self.0.bo_handle != 0
+                    || self.0.bo_offset != 0
+                    || self.0.va != 0
+                    || self.0.size != 0
+                {
+                    return Err(EINVAL);
+                }
+
+                if self.0.flags & !(type_mask as u32) != 0 || syncs.is_empty() {
+                    return Err(EINVAL);
+                }
+            }
+            _ => return Err(ENOTSUPP),
+        }
+
+        Ok((job, syncs))
+    }
+}
 
 
 
