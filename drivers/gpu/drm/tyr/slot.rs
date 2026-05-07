@@ -111,11 +111,22 @@ pub(crate) trait SlotOperations {
     /// Implementation-specific data associated with each slot.
     type SlotData;
 
+    /// Caller-provided context threaded through [`SlotManager::activate`]
+    /// and [`SlotManager::evict`] into the callbacks.
+    ///
+    /// Implementations that don't need a context should set this to `()`.
+    type Context;
+
     /// Called when a slot is being activated for a seat.
     ///
     /// This callback allows hardware-specific actions to be performed when a slot
     /// becomes active, such as updating hardware registers or invalidating caches.
-    fn activate(&mut self, _slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
+    fn activate(
+        &mut self,
+        _slot_idx: usize,
+        _slot_data: &Self::SlotData,
+        _ctx: &mut Self::Context,
+    ) -> Result {
         Ok(())
     }
 
@@ -124,7 +135,12 @@ pub(crate) trait SlotOperations {
     /// This callback allows hardware-specific cleanup when a slot is being
     /// completely freed, either explicitly or when an idle slot is being
     /// reused for a different seat. Any hardware state should be invalidated.
-    fn evict(&mut self, _slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
+    fn evict(
+        &mut self,
+        _slot_idx: usize,
+        _slot_data: &Self::SlotData,
+        _ctx: &mut Self::Context,
+    ) -> Result {
         Ok(())
     }
 }
@@ -252,8 +268,9 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
         slot_idx: usize,
         locked_seat: &LockedSeat<T, MAX_SLOTS>,
         slot_data: T::SlotData,
+        ctx: &mut T::Context,
     ) -> Result {
-        self.manager.activate(slot_idx, &slot_data)?;
+        self.manager.activate(slot_idx, &slot_data, ctx)?;
         self.record_active_slot(slot_idx, locked_seat, slot_data)
     }
 
@@ -266,6 +283,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
         &mut self,
         locked_seat: &LockedSeat<T, MAX_SLOTS>,
         slot_data: T::SlotData,
+        ctx: &mut T::Context,
     ) -> Result {
         let slots = &self.slots[..self.slot_count];
 
@@ -275,7 +293,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
         for (slot_idx, slot) in slots.iter().enumerate() {
             match slot {
                 Slot::Free => {
-                    return self.activate_slot(slot_idx, locked_seat, slot_data);
+                    return self.activate_slot(slot_idx, locked_seat, slot_data, ctx);
                 }
                 Slot::Idle(slot_info) => {
                     if idle_slot_idx.is_none() || slot_info.seqno < idle_slot_seqno {
@@ -291,9 +309,9 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
             Some(slot_idx) => {
                 // Lazily evict idle slot just before it is reused
                 if let Slot::Idle(slot_info) = &self.slots[slot_idx] {
-                    self.manager.evict(slot_idx, &slot_info.slot_data)?;
+                    self.manager.evict(slot_idx, &slot_info.slot_data, ctx)?;
                 }
-                self.activate_slot(slot_idx, locked_seat, slot_data)
+                self.activate_slot(slot_idx, locked_seat, slot_data, ctx)
             }
             None => {
                 pr_err!(
@@ -332,10 +350,15 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
     /// Evicts a seat from its slot and marks the slot as free.
     ///
     /// Calls the eviction callback then frees the slot and resets the seat to `NoSeat`.
-    fn evict_slot(&mut self, slot_idx: usize, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
+    fn evict_slot(
+        &mut self,
+        slot_idx: usize,
+        locked_seat: &LockedSeat<T, MAX_SLOTS>,
+        ctx: &mut T::Context,
+    ) -> Result {
         match &self.slots[slot_idx] {
             Slot::Active(slot_info) | Slot::Idle(slot_info) => {
-                self.manager.evict(slot_idx, &slot_info.slot_data)?;
+                self.manager.evict(slot_idx, &slot_info.slot_data, ctx)?;
                 take(&mut self.slots[slot_idx]);
             }
             _ => (),
@@ -375,6 +398,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
         &mut self,
         locked_seat: &LockedSeat<T, MAX_SLOTS>,
         slot_data: T::SlotData,
+        ctx: &mut T::Context,
     ) -> Result {
         self.check_seat(locked_seat);
         match locked_seat.access(self) {
@@ -383,7 +407,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
                 // valid for both Active and Idle slots, so just update our records
                 self.record_active_slot(seat_info.slot as usize, locked_seat, slot_data)
             }
-            _ => self.allocate_slot(locked_seat, slot_data),
+            _ => self.allocate_slot(locked_seat, slot_data, ctx),
         }
     }
 
@@ -405,14 +429,18 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
     /// for other users.
     ///
     /// May return errors from the eviction callback.
-    pub(crate) fn evict(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
+    pub(crate) fn evict(
+        &mut self,
+        locked_seat: &LockedSeat<T, MAX_SLOTS>,
+        ctx: &mut T::Context,
+    ) -> Result {
         self.check_seat(locked_seat);
 
         match locked_seat.access(self) {
             Seat::Active(seat_info) | Seat::Idle(seat_info) => {
                 let slot_idx = seat_info.slot as usize;
 
-                self.evict_slot(slot_idx, locked_seat)?;
+                self.evict_slot(slot_idx, locked_seat, ctx)?;
             }
             _ => (),
         }
