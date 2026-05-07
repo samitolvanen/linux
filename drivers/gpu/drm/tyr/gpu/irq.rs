@@ -90,8 +90,11 @@ impl TyrIrqTrait for GpuIrq {
     }
 
     fn handle(&self, _: &TyrDrmDevice, status: u32) {
-        let raw = gpu_control::GPU_IRQ_RAWSTAT::from_raw(status);
-        if raw.reset_completed() && raw.power_changed_single() && raw.power_changed_all() {
+        let status_reg = gpu_control::GPU_IRQ_STATUS::from_raw(status);
+        if status_reg.reset_completed()
+            || status_reg.power_changed_single()
+            || status_reg.power_changed_all()
+        {
             let _ = self.power_on_wait.with_locked_data(|powered_on| {
                 *powered_on = true;
                 Ok(())
