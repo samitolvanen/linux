@@ -178,6 +178,7 @@ pub(crate) struct Queue {
 
     pub(super) in_flight_jobs: KVec<kernel::dma_fence::Fence>,
 
+    #[expect(dead_code)]
     pub(super) fence_ctx: kernel::dma_fence::FenceContexts,
 
     #[expect(dead_code)]

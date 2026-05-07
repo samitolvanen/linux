@@ -348,42 +348,23 @@ impl TyrDrmFileData {
             ctx.add_vm_bind_job(job, internal_syncs)?;
         }
 
-        // Collect signal operations across all jobs (second pass).
-        let mut reader = UserSlice::new(
-            UserPtr::from_addr(vmbind.ops.array as usize),
-            stride * count,
-        )
-        .reader();
-
-        for _ in 0..count {
-            let op: VmBindOp = reader.read()?;
-
-            let sync_count = op.0.syncs.count as usize;
-            let sync_stride = op.0.syncs.stride as usize;
-
-            let mut sync_reader = UserSlice::new(
-                UserPtr::from_addr(op.0.syncs.array as usize),
-                sync_stride * sync_count,
-            )
-            .reader();
-
-            let mut sync_ops = kvec![];
-            for _ in 0..sync_count {
-                let sync_op_uapi: SyncOp = sync_reader.read()?;
-                sync_ops.push(sync_op_uapi, GFP_KERNEL)?;
-            }
-
-            let internal_syncs = deps::SyncOp::from_uapi_slice(&sync_ops)?;
-            ctx.collect_signal_ops(&internal_syncs)?;
-        }
+        // Collect all signal operations across all jobs
+        ctx.collect_signal_ops()?;
 
         // Push all VM bind jobs with dependencies and update reservation objects.
         vm.with_prepared_vm_and_job_queue(count as u32, |mut prepared_vm, job_queue| {
-            let finished_fences = ctx.add_deps_and_push_vm_bind_jobs(job_queue)?;
+            // Prepare all jobs and resolve dependencies (Pass 1)
+            for job_idx in 0..count {
+                ctx.prepare_vm_bind_job(job_idx, job_queue)?;
+            }
 
-            for fence in &finished_fences {
+            // Process jobs in the order they were submitted (Pass 2)
+            for job_idx in 0..count {
+                let fence = ctx.commit_vm_bind_job(job_idx, job_queue)?;
+
+                // Add the finished fences to the reservation objects
                 prepared_vm.resv_add_fence(
-                    fence,
+                    &fence,
                     kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                 );
@@ -592,7 +573,7 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn group_submit(
-        ddev: &TyrDrmDevice,
+        _ddev: &TyrDrmDevice,
         groupsubmit: &mut uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result<u32> {
@@ -607,7 +588,7 @@ impl TyrDrmFileData {
         .reader();
 
         let mut queue_submits = kvec![];
-        let mut syncs = kvec![];
+        let mut all_syncs = kvec![];
 
         for _ in 0..groupsubmit.queue_submits.count {
             let queue: QueueSubmit = reader.read()?;
@@ -618,6 +599,7 @@ impl TyrDrmFileData {
             )
             .reader();
 
+            let mut sync_ops = kvec![];
             for _ in 0..queue.syncs.count {
                 let sync: SyncOp = sync_reader.read()?;
 
@@ -640,9 +622,10 @@ impl TyrDrmFileData {
                     return Err(EINVAL);
                 }
 
-                syncs.push(sync, GFP_KERNEL)?;
+                sync_ops.push(sync, GFP_KERNEL)?;
             }
 
+            all_syncs.push(sync_ops, GFP_KERNEL)?;
             queue_submits.push(queue, GFP_KERNEL)?;
         }
 
@@ -652,10 +635,7 @@ impl TyrDrmFileData {
             .group(groupsubmit.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        ddev.with_locked_scheduler(|sched| {
-            sched.bind(ddev, group.clone())?;
-            sched.submit(syncs, group, queue_submits, file)
-        })?;
+        group.clone().submit(all_syncs, queue_submits, file)?;
 
         Ok(0)
     }

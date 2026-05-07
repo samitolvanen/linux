@@ -4,7 +4,6 @@ use kernel::{
     bits::checked_bit_u32,
     bits::genmask_u32,
     c_str,
-    dma_fence::UserFence,
     drm::gem::BaseObject,
     io::Io,
     kvec,
@@ -22,11 +21,6 @@ use crate::{
     driver::{
         TyrDrmDevice,
         TyrDrmDeviceData, //
-    },
-    file::{
-        QueueSubmit,
-        SyncOp,
-        TyrDrmFile, //
     },
     fw::{
         global::cs::{
@@ -571,15 +565,6 @@ impl Scheduler {
         Ok(())
     }
 
-    pub(crate) fn submit(
-        &mut self,
-        syncs: KVec<SyncOp>,
-        group: Arc<Group>,
-        queue_submits: KVec<QueueSubmit>,
-        file: &TyrDrmFile,
-    ) -> Result<KVec<UserFence<job::Fence>>> {
-        group.submit(syncs, queue_submits, file)
-    }
 }
 
 pub(crate) struct CommandStreamGroupSlot {

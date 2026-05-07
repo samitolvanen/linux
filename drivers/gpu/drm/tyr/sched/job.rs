@@ -224,6 +224,7 @@ impl kernel::drm::job_queue::QueueOps for TyrJobHandler {
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
+#[expect(dead_code)]
 pub(crate) struct Fence;
 
 #[vtable]

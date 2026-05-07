@@ -13,9 +13,9 @@ use kernel::{
             JobQueue,
             PreparedJob, //
         },
-        sched::Entity,
         syncobj::SyncObj, //
     },
+    kvec,
     prelude::*,
     sync::Arc,
     uapi, //
@@ -34,7 +34,7 @@ use crate::{
     },
 };
 
-/// Represents either a GPU job or a VM bind job
+/// Represents either a GPU job or a VM bind job.
 pub(crate) enum JobType {
     Gpu(Job),
     VmBind(VmBindJob),
@@ -272,17 +272,25 @@ impl<'a> Context<'a> {
     }
 
     /// Collect all signal operations in a batch.
-    pub(crate) fn collect_signal_ops(&mut self, syncops: &[SyncOp]) -> Result {
-        for syncop in syncops.iter() {
-            if matches!(syncop.ty, SyncOpType::Signal) {
-                self.get_sync_signal(syncop.handle.handle(), syncop.handle.timeline_value())?;
+    pub(crate) fn collect_signal_ops(&mut self) -> Result {
+        let mut signals_to_add = kvec![];
+        for job_ctx in self.jobs.iter() {
+            for syncop in job_ctx.syncops.iter() {
+                if matches!(syncop.ty, SyncOpType::Signal) {
+                    signals_to_add.push(
+                        (syncop.handle.handle(), syncop.handle.timeline_value()),
+                        GFP_KERNEL,
+                    )?;
+                }
             }
+        }
+        for (handle, value) in signals_to_add {
+            self.get_sync_signal(handle, value)?;
         }
         Ok(())
     }
 
     /// Prepare a job by gathering dependencies and creating the completion fence.
-    #[expect(dead_code)]
     pub(crate) fn prepare(
         &mut self,
         job_idx: usize,
@@ -296,7 +304,7 @@ impl<'a> Context<'a> {
         // Pre-size `resolved_deps` here (outside the dma-fence signalling
         // section) so `resolve_job_deps` in `commit` only pushes within
         // capacity, with GFP_NOWAIT.
-        let deps = self.collect_job_deps_resolved(job_idx)?;
+        let deps = self.collect_job_deps(job_idx)?;
         let resolved_deps = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
         let prepared_job = job_queue.prepare(job, deps.len())?;
 
@@ -310,7 +318,6 @@ impl<'a> Context<'a> {
     }
 
     /// Commits a prepared GPU job to the hardware queue.
-    #[expect(dead_code)]
     pub(crate) fn commit(
         &mut self,
         job_idx: usize,
@@ -335,7 +342,6 @@ impl<'a> Context<'a> {
     }
 
     /// Prepare a VM bind job by gathering dependencies and creating the completion fence.
-    #[expect(dead_code)]
     pub(crate) fn prepare_vm_bind_job(
         &mut self,
         job_idx: usize,
@@ -346,7 +352,7 @@ impl<'a> Context<'a> {
             _ => return Err(EINVAL),
         };
 
-        let deps = self.collect_job_deps_resolved(job_idx)?;
+        let deps = self.collect_job_deps(job_idx)?;
         let resolved_deps = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
         let prepared_job = job_queue.prepare(job, deps.len())?;
 
@@ -360,7 +366,6 @@ impl<'a> Context<'a> {
     }
 
     /// Commits a prepared VM bind job.
-    #[expect(dead_code)]
     pub(crate) fn commit_vm_bind_job(
         &mut self,
         job_idx: usize,
@@ -382,90 +387,6 @@ impl<'a> Context<'a> {
         self.update_job_syncs(job_idx, finished_fence.clone())?;
 
         Ok(finished_fence)
-    }
-
-    /// Add jobs dependencies, arm jobs, and push them to the scheduler
-    ///
-    /// This method takes the entity as a parameter, processes jobs for the specified
-    /// queue_idx, and pushes them immediately to avoid lifetime conflicts.
-    ///
-    /// Returns a vector of finished fences that need to be added to reservation objects.
-    pub(crate) fn add_deps_and_push_jobs(
-        &mut self,
-        job_queue: &kernel::drm::job_queue::JobQueue<crate::sched::job::TyrJobHandler>,
-        queue_idx: usize,
-    ) -> Result<KVec<Fence>> {
-        let mut finished_fences = KVec::new();
-
-        for job_idx in 0..self.jobs.len() {
-            // Only process GPU jobs with this entity
-            match &self.jobs[job_idx].state {
-                JobState::Pending(JobType::Gpu(job)) => {
-                    if job.queue_idx() != queue_idx {
-                        continue;
-                    }
-                }
-                JobState::Pending(JobType::VmBind(_)) => continue,
-                JobState::Prepared { .. } | JobState::PreparedVmBind { .. } => continue,
-                JobState::Taken => continue,
-            }
-
-            let fences = self.collect_job_deps(job_idx)?;
-
-            let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
-                JobState::Pending(JobType::Gpu(job)) => job,
-                _ => {
-                    return Err(EINVAL);
-                }
-            };
-
-            let finished_fence = job_queue.submit(job, &fences)?;
-
-            // Update the sync signal fences with the job's completion fence
-            self.update_job_syncs(job_idx, finished_fence.clone())?;
-
-            finished_fences.push(finished_fence, GFP_KERNEL)?;
-        }
-
-        Ok(finished_fences)
-    }
-
-    /// Add VM bind job dependencies, arm jobs, and push them to the scheduler.
-    ///
-    /// Returns a vector of finished fences that need to be added to reservation objects.
-    pub(crate) fn add_deps_and_push_vm_bind_jobs(
-        &mut self,
-        job_queue: &kernel::drm::job_queue::JobQueue<crate::vm::bind_job::VmBindJobHandler>,
-    ) -> Result<KVec<Fence>> {
-        let mut finished_fences = KVec::new();
-
-        for job_idx in 0..self.jobs.len() {
-            // Only process VM bind jobs with this entity
-            match &self.jobs[job_idx].state {
-                JobState::Pending(JobType::VmBind(_)) => {}
-                JobState::Pending(JobType::Gpu(_)) => continue,
-                JobState::Prepared { .. } | JobState::PreparedVmBind { .. } => continue,
-                JobState::Taken => continue,
-            }
-
-            let fences = self.collect_job_deps(job_idx)?;
-
-            let job = match core::mem::replace(&mut self.jobs[job_idx].state, JobState::Taken) {
-                JobState::Pending(JobType::VmBind(job)) => job,
-                _ => {
-                    return Err(EINVAL);
-                }
-            };
-
-            let finished_fence = job_queue.submit(job, &fences)?;
-
-            // Update the sync signal fences with the job's completion fence
-            self.update_job_syncs(job_idx, finished_fence.clone())?;
-
-            finished_fences.push(finished_fence, GFP_KERNEL)?;
-        }
-
-        Ok(finished_fences)
     }
 
     /// Push signal fences to their associated syncobjs
@@ -543,42 +464,7 @@ impl<'a> Context<'a> {
         self.add_sync_signal(handle, point)
     }
 
-    fn collect_job_deps(&self, job_idx: usize) -> Result<KVec<Fence>> {
-        let syncops = &self.jobs[job_idx].syncops;
-        let mut deps = KVec::new();
-
-        for syncop in syncops.iter() {
-            if !matches!(syncop.ty, SyncOpType::Wait) {
-                continue;
-            }
-
-            let handle = syncop.handle.handle();
-            let point = syncop.handle.timeline_value();
-
-            // First check if we have this signal in our internal context.
-            let fence = if let Some(sig_sync) = self.search_sync_signal(handle, point) {
-                match sig_sync.current_fence() {
-                    Some(f) => f.clone(),
-                    None => return Err(EINVAL),
-                }
-            } else {
-                // Otherwise, this is from a different submission - look it up.
-                match SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)? {
-                    Some(f) => f,
-                    None => return Err(EINVAL), // A wait for which we can't find a fence is broken.
-                }
-            };
-
-            deps.push(fence, GFP_KERNEL)?;
-        }
-
-        Ok(deps)
-    }
-
-    /// Collect waits for [`Self::prepare`] / [`Self::commit`] in a deferred
-    /// form, so that intra-batch fences can be resolved when [`Self::commit`]
-    /// runs in the dma-fence signalling section instead of at prepare time.
-    fn collect_job_deps_resolved(&self, job_idx: usize) -> Result<KVec<ResolvedDep>> {
+    fn collect_job_deps(&self, job_idx: usize) -> Result<KVec<ResolvedDep>> {
         let syncops = &self.jobs[job_idx].syncops;
         let mut deps = KVec::new();
 

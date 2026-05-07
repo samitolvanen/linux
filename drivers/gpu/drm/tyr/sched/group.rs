@@ -4,7 +4,6 @@ use core::sync::atomic::AtomicUsize;
 
 use kernel::{
     bits::genmask_checked_u32,
-    dma_fence::UserFence,
     drm::gem::BaseObject,
     io::Io,
     kvec,
@@ -263,12 +262,13 @@ impl Group {
         f(&mut inner)
     }
 
-    pub(super) fn submit(
+    /// Submits jobs to the group.
+    pub(crate) fn submit(
         self: Arc<Self>,
-        syncs: KVec<SyncOp>,
+        all_syncs: KVec<KVec<SyncOp>>,
         queue_submits: KVec<QueueSubmit>,
         file: &TyrDrmFile,
-    ) -> Result<KVec<UserFence<job::Fence>>> {
+    ) -> Result<KVec<kernel::dma_fence::Fence>> {
         if self.vm.address_space().is_none() {
             pr_err!("group_submit: invalid address space");
             return Err(EINVAL);
@@ -281,70 +281,66 @@ impl Group {
             return Err(EINVAL);
         }
 
-        // Convert UAPI sync operations to internal representation
-        let internal_syncs = deps::SyncOp::from_uapi_slice(&syncs)?;
-
         let mut ctx = deps::Context::new(file);
-
         let mut fences = KVec::with_capacity(queue_submits.len(), GFP_KERNEL)?;
 
         // Prepare the VM with enough slots for all submissions
         self.vm
             .with_prepared_vm(queue_submits.len() as u32, |mut locked_vm| {
                 // Create all jobs and add them to the context
-                self.with_locked_inner(|inner| {
-                    for queue_submit in queue_submits.iter() {
-                        let queue = inner
+                for (queue_submit, syncs) in core::iter::zip(queue_submits.iter(), all_syncs.iter())
+                {
+                    let sync_addr = self.with_locked_inner(|inner| {
+                        inner
                             .queues
-                            .get_mut(queue_submit.queue_index as usize)
+                            .get(queue_submit.queue_index as usize)
                             .ok_or(EINVAL)?;
 
                         let sync_addr = inner.syncobjs.kernel_va().ok_or(EINVAL)?;
-                        let sync_addr = sync_addr.start
+                        Ok(sync_addr.start
                             + u64::from(queue_submit.queue_index)
-                                * core::mem::size_of::<syncs::SyncObj64b>() as u64;
-
-                        let fence: UserFence<_> = queue
-                            .fence_ctx
-                            .new_fence(0, crate::sched::job::Fence)?
-                            .into();
-
-                        let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
-
-                        ctx.add_job(job, internal_syncs.clone())?;
-
-                        // Store the fence to return later
-                        fences.push(fence, GFP_KERNEL)?;
-                    }
-                    Ok(())
-                })?;
-
-                ctx.collect_signal_ops(&internal_syncs)?;
-
-                // Collect unique queue indices from all queue submits
-                let mut queue_indices = kvec![];
-                for queue_submit in queue_submits.iter() {
-                    let idx = queue_submit.queue_index as usize;
-                    if !queue_indices.iter().any(|&qi| qi == idx) {
-                        queue_indices.push(idx, GFP_KERNEL)?;
-                    }
-                }
-
-                // Process jobs for each queue
-                for &queue_idx in queue_indices.iter() {
-                    let finished_fences = self.with_locked_inner(|inner| {
-                        let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
-                        ctx.add_deps_and_push_jobs(&queue.job_queue, queue_idx)
+                                * core::mem::size_of::<syncs::SyncObj64b>() as u64)
                     })?;
 
-                    // Add the finished fences to the reservation objects
-                    for fence in &finished_fences {
-                        locked_vm.resv_add_fence(
-                            fence,
-                            kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                            kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        );
-                    }
+                    let job = job::Job::create(*queue_submit, self.clone(), sync_addr)?;
+                    let internal_syncs = deps::SyncOp::from_uapi_slice(syncs)?;
+
+                    ctx.add_job(job, internal_syncs)?;
+                }
+
+                ctx.collect_signal_ops()?;
+
+                // Prepare all jobs and resolve dependencies (Pass 1)
+                for (job_idx, queue_submit) in queue_submits.iter().enumerate() {
+                    let queue_idx = queue_submit.queue_index as usize;
+
+                    let job_queue = self.with_locked_inner(|inner| {
+                        let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                        Ok(queue.job_queue.clone())
+                    })?;
+
+                    ctx.prepare(job_idx, &job_queue)?;
+                }
+
+                // Process jobs in the order they were submitted (Pass 2)
+                for (job_idx, queue_submit) in queue_submits.iter().enumerate() {
+                    let queue_idx = queue_submit.queue_index as usize;
+
+                    let job_queue = self.with_locked_inner(|inner| {
+                        let queue = inner.queues.get_mut(queue_idx).ok_or(EINVAL)?;
+                        Ok(queue.job_queue.clone())
+                    })?;
+
+                    let fence = ctx.commit(job_idx, &job_queue)?;
+
+                    // Add the finished fence to the reservation objects and
+                    // collect them to return to the caller (for syncobj signalling).
+                    locked_vm.resv_add_fence(
+                        &fence,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    );
+                    fences.push(fence, GFP_KERNEL)?;
                 }
 
                 Ok(())
