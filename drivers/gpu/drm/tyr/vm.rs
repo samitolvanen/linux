@@ -22,6 +22,13 @@ use core::{
 
 use kernel::{
     c_str,
+    dma_buf::dma_fence::{
+        DmaFenceWorkqueue,
+        DriverDmaFence,
+        DriverDmaFenceOps,
+        Published,
+        PublicDmaFence,
+    },
     device::{
         Bound,
         Device, //
@@ -40,6 +47,15 @@ use kernel::{
             OpUnmap,
             OpUnmapped,
             UniqueRefGpuVm, //
+        },
+        job_queue::{
+            JobQueue,
+            JobQueueLockClasses,
+            JobRef,
+            PipelineBuilder,
+            PreparedJob,
+            QueueOps,
+            SubmitResult,
         },
         DeviceContext, //
     },
@@ -61,6 +77,7 @@ use kernel::{
         aref::ARef,
         Arc,
         ArcBorrow,
+        LockClassKey,
         Mutex, //
     },
     uapi, //
@@ -82,6 +99,18 @@ use crate::{
     regs::gpu_control::MMU_FEATURES,
 };
 
+static VM_BIND_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey =
+    unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey =
+    unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey =
+    unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey =
+    unsafe { LockClassKey::new_static() };
+
 pub(crate) struct Pool {
     entries: ObjectPool<Vm>,
 }
@@ -101,7 +130,7 @@ impl Pool {
         let user_va_range = normalize_user_va_range(&tdev.gpu_info, requested_user_va_range);
         let vm = Vm::new_for_user(
             &tdev.pdev,
-            &**tdev,
+            tdev,
             tdev.mmu.as_arc_borrow(),
             &tdev.gpu_info,
             user_va_range,
@@ -238,6 +267,134 @@ impl core::fmt::Display for VmMapFlags {
         Ok(())
     }
 }
+
+#[derive(Default)]
+pub(crate) struct VmBindFenceData;
+
+#[vtable]
+impl DriverDmaFenceOps for VmBindFenceData {
+    fn driver_name(&self) -> &'static CStr {
+        c_str!("tyr")
+    }
+
+    fn timeline_name(&self) -> &'static CStr {
+        c_str!("tyr_vm_bind")
+    }
+}
+
+pub(crate) enum VmBindJobOp {
+    Map {
+        bo: ARef<Bo>,
+        bo_offset: u64,
+        size: u64,
+        va: u64,
+        flags: VmMapFlags,
+    },
+    Unmap {
+        va: u64,
+        size: u64,
+    },
+}
+
+pub(crate) struct VmBindJob {
+    ops: KVec<VmBindJobOp>,
+}
+
+impl VmBindJob {
+    #[expect(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self { ops: KVec::new() }
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn push_map(
+        &mut self,
+        bo: ARef<Bo>,
+        bo_offset: u64,
+        size: u64,
+        va: u64,
+        flags: VmMapFlags,
+    ) -> Result {
+        self.ops.push(
+            VmBindJobOp::Map {
+                bo,
+                bo_offset,
+                size,
+                va,
+                flags,
+            },
+            GFP_KERNEL,
+        )
+        .map_err(Error::from)
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn push_unmap(&mut self, va: u64, size: u64) -> Result {
+        self.ops
+            .push(VmBindJobOp::Unmap { va, size }, GFP_KERNEL)
+            .map_err(Error::from)
+    }
+}
+
+pub(crate) struct VmBindQueueOps {
+    exec: Arc<VmExec>,
+}
+
+impl QueueOps for VmBindQueueOps {
+    type Job = VmBindJob;
+    type FenceData = VmBindFenceData;
+
+    fn lock_classes() -> JobQueueLockClasses {
+        JobQueueLockClasses {
+            inbox: &VM_BIND_QUEUE_INBOX_LOCK_CLASS,
+            state: &VM_BIND_QUEUE_STATE_LOCK_CLASS,
+            work: &VM_BIND_QUEUE_WORK_LOCK_CLASS,
+            cleanup_work: &VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS,
+            stage_work: &VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS,
+            stage_timer: &VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS,
+            driver_fence: &VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS,
+        }
+    }
+
+    fn submit(
+        &self,
+        job: &JobRef<'_, Self::Job>,
+        fence: DriverDmaFence<Self::FenceData, Published>,
+        _wq: &DmaFenceWorkqueue,
+    ) -> Result<SubmitResult<Self::FenceData>> {
+        let result = (|| {
+            for op in job.job.ops.iter() {
+                match op {
+                    VmBindJobOp::Map {
+                        bo,
+                        bo_offset,
+                        size,
+                        va,
+                        flags,
+                    } => self.exec.map_bo_range_inner(bo, *bo_offset, *size, *va, *flags)?,
+                    VmBindJobOp::Unmap { va, size } => self.exec.unmap_range_inner(*va, *size)?,
+                }
+            }
+
+            Ok(())
+        })();
+
+        self.exec.flush_deferred_cleanup();
+
+        match result {
+            Ok(()) => {
+                fence.signal(Ok(()));
+                Ok(SubmitResult::Submitted)
+            }
+            Err(err) => {
+                fence.signal(Err(err));
+                Err(err)
+            }
+        }
+    }
+}
+
+pub(crate) type PreparedVmBindJob = PreparedJob<VmBindQueueOps>;
 
 impl TryFrom<u32> for VmMapFlags {
     type Error = Error;
@@ -445,6 +602,7 @@ pub(crate) struct VmExec {
 #[pin_data]
 pub(crate) struct Vm {
     exec: Arc<VmExec>,
+    bind_queue: Option<JobQueue<VmBindQueueOps>>,
     /// VA range for this VM.
     va_range: Range<u64>,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
@@ -461,6 +619,7 @@ impl Vm {
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
         range: Range<u64>,
+        bind_wq: Option<Arc<DmaFenceWorkqueue>>,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
@@ -508,10 +667,20 @@ impl Vm {
             }),
             GFP_KERNEL,
         )?;
+        let bind_queue = match bind_wq {
+            Some(wq) => Some(JobQueue::new(
+                VmBindQueueOps { exec: exec.clone() },
+                wq.clone(),
+                wq,
+                PipelineBuilder::new(),
+            )?),
+            None => None,
+        };
 
         let vm = Arc::pin_init(
             pin_init!(Self {
                 exec,
+                bind_queue,
                 va_range: total_range,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
@@ -532,19 +701,26 @@ impl Vm {
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
     ) -> Result<Arc<Vm>> {
-        Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..max_va_range(gpu_info))
+        Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..max_va_range(gpu_info), None)
     }
 
-    pub(crate) fn new_for_user<Ctx: DeviceContext>(
+    pub(crate) fn new_for_user(
         pdev: &platform::Device,
-        ddev: &TyrDrmDevice<Ctx>,
+        ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
         user_va_range: u64,
     ) -> Result<Arc<Vm>> {
         let user_va_range = normalize_user_va_range(gpu_info, user_va_range);
 
-        Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..user_va_range)
+        Self::new_with_va_range(
+            pdev,
+            ddev,
+            mmu,
+            gpu_info,
+            0..user_va_range,
+            Some(ddev.wq.clone()),
+        )
     }
 
     /// Activate the VM in a hardware address space slot.
@@ -570,6 +746,22 @@ impl Vm {
         let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
         self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
         Ok(())
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn prepare_bind_job(&self, job: VmBindJob) -> Result<PreparedVmBindJob> {
+        self.bind_queue
+            .as_ref()
+            .ok_or(EINVAL)?
+            .prepare(job, &[], VmBindFenceData)
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob) -> ARef<PublicDmaFence> {
+        self.bind_queue
+            .as_ref()
+            .expect("Vm::commit_bind_job called without a bind queue")
+            .commit(prepared)
     }
 }
 
