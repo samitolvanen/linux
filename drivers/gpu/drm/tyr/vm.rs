@@ -631,7 +631,7 @@ impl Vm {
     /// backing the GEM object, starting at `bo_offset` bytes into the object and
     /// spanning `size` bytes. The mapping respects the access permissions and
     /// caching behavior specified in `flags`.
-    pub(crate) fn map_bo_range(
+    fn map_bo_range_inner(
         &self,
         bo: &Bo,
         bo_offset: u64,
@@ -658,10 +658,27 @@ impl Vm {
 
         self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)?;
 
+        Ok(())
+    }
+
+    pub(crate) fn flush_deferred_cleanup(&self) {
+        self.gpuvm.deferred_cleanup();
+    }
+
+    pub(crate) fn map_bo_range(
+        &self,
+        bo: &Bo,
+        bo_offset: u64,
+        size: u64,
+        va: u64,
+        flags: VmMapFlags,
+    ) -> Result {
+        self.map_bo_range_inner(bo, bo_offset, size, va, flags)?;
+
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
-        self.gpuvm.deferred_cleanup();
+        self.flush_deferred_cleanup();
         Ok(())
     }
 
@@ -669,7 +686,7 @@ impl Vm {
     ///
     /// This removes any existing mappings in the specified range, freeing the
     /// virtual address space for reuse.
-    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+    fn unmap_range_inner(&self, va: u64, size: u64) -> Result {
         let req = VmOpRequest {
             op_type: VmOpType::Unmap,
             region: va..(va + size),
@@ -685,10 +702,16 @@ impl Vm {
 
         self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)?;
 
+        Ok(())
+    }
+
+    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+        self.unmap_range_inner(va, size)?;
+
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
-        self.gpuvm.deferred_cleanup();
+        self.flush_deferred_cleanup();
         Ok(())
     }
 
