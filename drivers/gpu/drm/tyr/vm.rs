@@ -9,7 +9,10 @@
 
 pub(crate) mod range;
 
-use core::ops::Range;
+use core::ops::{
+    Deref,
+    Range, //
+};
 
 use kernel::{
     device::{
@@ -432,7 +435,7 @@ pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64
 ///
 /// Each VM can be mapped into a hardware address space slot.
 #[pin_data]
-pub(crate) struct Vm {
+pub(crate) struct VmExec {
     /// Data referenced by an AS when the VM is active
     as_data: Arc<VmAsData>,
     /// MMU manager.
@@ -449,6 +452,16 @@ pub(crate) struct Vm {
     unusable: Atomic<bool>,
     /// VA range for this VM.
     va_range: Range<u64>,
+}
+
+/// GPU virtual address space.
+///
+/// Owns the user-visible VM lifetime and the kernel-only VA allocators, while
+/// [`VmExec`] carries the execution-facing state that async VM_BIND will need
+/// to reference independently.
+#[pin_data]
+pub(crate) struct Vm {
+    exec: Arc<VmExec>,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
     kernel_va: range::RangeAlloc,
     /// Kernel VA reservations that must live as long as the VM.
@@ -502,8 +515,8 @@ impl Vm {
         )?;
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
 
-        let vm = Arc::pin_init(
-            pin_init!(Self{
+        let exec = Arc::pin_init(
+            pin_init!(VmExec {
                 as_data,
                 pdev: pdev.into(),
                 mmu: mmu.into(),
@@ -511,6 +524,13 @@ impl Vm {
                 gpuvm_unique <- new_mutex!(gpuvm_unique),
                 unusable: Atomic::new(false),
                 va_range: total_range,
+            }),
+            GFP_KERNEL,
+        )?;
+
+        let vm = Arc::pin_init(
+            pin_init!(Self {
+                exec,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
             }),
@@ -545,6 +565,43 @@ impl Vm {
         Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..user_va_range)
     }
 
+    /// Kills the VM by deactivating it and unmapping all regions.
+    pub(crate) fn kill(&self) {
+        self.exec.mark_unusable();
+        let _ = self.exec.deactivate();
+        let _ = self
+            .exec
+            .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
+            .inspect_err(|e| {
+                dev_err!(
+                    self.dev(),
+                    "Failed to unmap range during deactivate: {:?}",
+                    e
+                );
+            });
+    }
+
+    pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
+        self.kernel_va.allocate(size, GFP_KERNEL)
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn reserve_kernel_range(&self, start: u64, end: u64) -> Result {
+        let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
+        self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
+        Ok(())
+    }
+}
+
+impl Deref for Vm {
+    type Target = VmExec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.exec
+    }
+}
+
+impl VmExec {
     /// Returns the parent device of this VM.
     pub(crate) fn dev(&self) -> &Device {
         self.pdev.as_ref()
@@ -572,21 +629,6 @@ impl Vm {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
             dev_err!(self.dev(), "Failed to deactivate VM: {:?}", e);
         })
-    }
-
-    /// Kills the VM by deactivating it and unmapping all regions.
-    pub(crate) fn kill(&self) {
-        self.mark_unusable();
-        let _ = self.deactivate();
-        let _ = self
-            .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
-            .inspect_err(|e| {
-                dev_err!(
-                    self.dev(),
-                    "Failed to unmap range during deactivate: {:?}",
-                    e
-                );
-            });
     }
 
     /// Executes a virtual memory operation.
@@ -782,17 +824,6 @@ impl Vm {
         // happen outside the DMA signalling path.
         self.flush_deferred_cleanup();
         result
-    }
-
-    pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
-        self.kernel_va.allocate(size, GFP_KERNEL)
-    }
-
-    #[expect(dead_code)]
-    pub(crate) fn reserve_kernel_range(&self, start: u64, end: u64) -> Result {
-        let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
-        self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
-        Ok(())
     }
 }
 
