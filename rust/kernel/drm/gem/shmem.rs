@@ -208,7 +208,6 @@ impl<T: DriverObject> Object<T> {
         // - We won't be using the gem resources on `this` after this call.
         unsafe { bindings::drm_gem_shmem_release(shmem_obj) };
 
-
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(this) };
     }
