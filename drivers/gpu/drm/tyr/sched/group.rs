@@ -3,13 +3,15 @@
 use kernel::{
     drm::gem::BaseObject,
     io::IoBase,
+    new_mutex,
     prelude::*,
     sync::{
         atomic::{
             Atomic,
             Relaxed, //
         },
-        Arc, //
+        Arc,
+        Mutex, //
     },
     uaccess::UserSlice,
     uapi, //
@@ -22,6 +24,7 @@ use crate::{
     },
     file::TyrDrmFile,
     gem,
+    heap,
     pool,
     vm::{
         Vm,
@@ -48,29 +51,24 @@ use super::{
 
 const UNBOUND_CSG_ID: usize = usize::MAX;
 
+#[pin_data]
 pub(crate) struct Group {
     pub(crate) fatal_queues: Atomic<u32>,
     csg_id: Atomic<usize>,
     pub(crate) queues: KVec<Queue>,
     pub(super) vm: Arc<Vm>,
     pub(super) priority: u8,
-    #[expect(dead_code)]
     pub(super) compute_core_mask: u64,
-    #[expect(dead_code)]
     pub(super) fragment_core_mask: u64,
-    #[expect(dead_code)]
     pub(super) tiler_core_mask: u64,
-    #[expect(dead_code)]
     pub(super) max_compute_cores: u8,
-    #[expect(dead_code)]
     pub(super) max_fragment_cores: u8,
-    #[expect(dead_code)]
     pub(super) max_tiler_cores: u8,
-    #[expect(dead_code)]
     pub(super) suspend_buf: Arc<gem::MappedBo>,
-    #[expect(dead_code)]
     pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
     syncobjs: Arc<gem::MappedBo>,
+    #[pin]
+    heap_pool: Mutex<Option<Arc<heap::Pool>>>,
 }
 
 impl Group {
@@ -139,8 +137,8 @@ impl Group {
             )?;
         }
 
-        Ok(Arc::new(
-            Self {
+        Arc::pin_init(
+            pin_init!(Self {
                 fatal_queues: Atomic::new(0),
                 csg_id: Atomic::new(UNBOUND_CSG_ID),
                 queues,
@@ -155,9 +153,13 @@ impl Group {
                 suspend_buf,
                 protm_suspend_buf,
                 syncobjs,
-            },
+                heap_pool <- new_mutex!(file
+                    .inner()
+                    .heap_pools()
+                    .get_pool(group_args.vm_id as usize)),
+            }),
             GFP_KERNEL,
-        )?)
+        )
     }
 
     pub(crate) fn fatal_queues(&self) -> u32 {
@@ -197,6 +199,15 @@ impl Group {
 
     pub(super) fn write_syncobj(&self, queue_index: usize, value: syncs::SyncObj64b) -> Result {
         syncs::SyncObj64b::write(&self.syncobjs, self.syncobj_offset(queue_index)?, value)
+    }
+
+    pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
+        *self.heap_pool.lock() = Some(pool);
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
+        self.heap_pool.lock().clone()
     }
 
     pub(super) fn submit(
@@ -269,6 +280,16 @@ impl Pool {
 
     pub(crate) fn group(&self, index: usize) -> Option<Arc<Group>> {
         self.0.get(index)
+    }
+
+    pub(crate) fn set_heap_pool_for_vm(&self, vm: &Arc<Vm>, pool: Arc<heap::Pool>) -> Result {
+        self.0.for_each(|_, group| {
+            if Arc::ptr_eq(&group.vm, vm) {
+                group.set_heap_pool(pool.clone());
+            }
+
+            Ok(())
+        })
     }
 
     pub(crate) fn submit_group(

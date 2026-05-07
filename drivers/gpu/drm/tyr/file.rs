@@ -419,9 +419,15 @@ impl TyrDrmFileData {
         let vm_id = heapcreate.vm_id as usize;
         let vm = file.inner().vm_pool().get_vm(vm_id).ok_or(EINVAL)?;
 
-        file.inner()
-            .heap_pools()
-            .create_context(ddev, reg_data, vm_id, vm, heapcreate)?;
+        let pool = file.inner().heap_pools().create_context(
+            ddev,
+            reg_data,
+            vm_id,
+            vm.clone(),
+            heapcreate,
+        )?;
+
+        file.inner().group_pool().set_heap_pool_for_vm(&vm, pool)?;
 
         Ok(0)
     }
