@@ -37,7 +37,8 @@ use kernel::{
         Arc,
         Mutex, //
     },
-    time, //
+    time,
+    workqueue::Work, //
 };
 
 use crate::{
@@ -78,9 +79,8 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Normal> = drm::Device<TyrDrmDriver, Ctx>
 
 /// Data owned by the DRM device.
 ///
-/// `registration_guard()` exists only on `Device<T, Ioctl>`, so driver callbacks running in the
-/// `Normal` context, such as the mmap hook, cannot reach `TyrDrmRegistrationData`. The data
-/// they need lives here.
+/// Driver callbacks that cannot take a registration guard, such as the mmap hook, reach the
+/// state they need through here.
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
     /// Physical address of the GPU MMIO window.
@@ -89,6 +89,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
+
+    /// Deferred tiler heap growth for CS TILER_OOM events.
+    #[pin]
+    pub(crate) tiler_oom_work: Work<TyrDrmDevice, 4>,
 }
 
 impl TyrDrmDeviceData {
@@ -219,6 +223,7 @@ impl platform::Driver for TyrPlatformDriver {
             try_pin_init!(TyrDrmDeviceData {
                 mmio_phys_addr,
                 sched <- new_mutex!(SchedulerState::Disabled),
+                tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
             }? Error),
         )?;
 

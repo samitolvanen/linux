@@ -50,6 +50,7 @@ const UNBOUND_CSG_ID: usize = usize::MAX;
 #[pin_data]
 pub(crate) struct Group {
     pub(crate) fatal_queues: Atomic<u32>,
+    pub(crate) tiler_oom: Atomic<u32>,
     csg_id: Atomic<usize>,
     pub(crate) queues: KVec<Queue>,
     pub(super) vm: Arc<Vm>,
@@ -136,6 +137,7 @@ impl Group {
         Arc::pin_init(
             pin_init!(Self {
                 fatal_queues: Atomic::new(0),
+                tiler_oom: Atomic::new(0),
                 csg_id: Atomic::new(UNBOUND_CSG_ID),
                 queues,
                 vm,
@@ -197,12 +199,22 @@ impl Group {
         syncs::SyncObj64b::write(&self.syncobjs, self.syncobj_offset(queue_index)?, value)
     }
 
+    /// Records a pending TILER_OOM event for the command stream at `cs_id`.
+    ///
+    /// The kernel atomics have no fetch_or, so the bit is merged with a compare-exchange loop.
+    pub(crate) fn set_tiler_oom(&self, cs_id: u32) {
+        let mut old = self.tiler_oom.load(Relaxed);
+
+        while let Err(current) = self.tiler_oom.cmpxchg(old, old | (1u32 << cs_id), Relaxed) {
+            old = current;
+        }
+    }
+
     pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
         *self.heap_pool.lock() = Some(pool);
     }
 
-    #[expect(dead_code)]
-    pub(super) fn get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
+    pub(crate) fn get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
         self.heap_pool.lock().clone()
     }
 

@@ -295,7 +295,6 @@ impl Pool {
         })
     }
 
-    #[expect(dead_code)]
     pub(crate) fn grow_heap_context(
         &self,
         ddev: &TyrDrmDevice,
