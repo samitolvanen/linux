@@ -8,7 +8,10 @@
 
 use kernel::{
 	alloc::KVec,
-    dma_buf::dma_fence::PublicDmaFence,
+    dma_buf::dma_fence::{
+        FenceChain,
+        PublicDmaFence,
+    },
 	drm::syncobj::SyncObj,
 	prelude::*,
     sync::aref::ARef,
@@ -55,6 +58,28 @@ impl SyncHandle {
 pub(crate) struct SyncOp {
     pub(crate) ty: SyncOpType,
     pub(crate) handle: SyncHandle,
+}
+
+pub(crate) enum SyncSignal {
+    Binary(SyncObj<TyrDrmDriver>),
+    Timeline {
+        syncobj: SyncObj<TyrDrmDriver>,
+        point: u64,
+        chain: FenceChain,
+    },
+}
+
+impl SyncSignal {
+    pub(crate) fn publish(self, fence: &PublicDmaFence) {
+        match self {
+            Self::Binary(syncobj) => syncobj.replace_fence(Some(fence)),
+            Self::Timeline {
+                syncobj,
+                point,
+                chain,
+            } => syncobj.add_point(chain, fence, point),
+        }
+    }
 }
 
 impl SyncOp {
@@ -141,6 +166,25 @@ pub(crate) fn wait_fences(
     }
 
     Ok(fences)
+}
+
+pub(crate) fn signal_syncs(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result<KVec<SyncSignal>> {
+    let mut signals = KVec::new();
+
+    for sync in syncops.iter().filter(|sync| sync.is_signal()) {
+        let syncobj = SyncObj::<TyrDrmDriver>::lookup_handle(file, sync.handle.handle())?;
+        let signal = match sync.handle {
+            SyncHandle::Binary { .. } => SyncSignal::Binary(syncobj),
+            SyncHandle::Timeline { timeline_value, .. } => SyncSignal::Timeline {
+                syncobj,
+                point: timeline_value,
+                chain: FenceChain::new()?,
+            },
+        };
+        signals.push(signal, GFP_KERNEL)?;
+    }
+
+    Ok(signals)
 }
 
 pub(crate) fn append_syncops(

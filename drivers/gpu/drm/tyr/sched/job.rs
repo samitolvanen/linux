@@ -20,6 +20,7 @@ use super::{
     deps::{
         self,
         SyncOp,
+        SyncSignal,
     },
     group::Group,
     queue::{
@@ -140,6 +141,7 @@ pub(crate) struct PreparedQueueSubmit {
     queue_index: usize,
     has_stream: bool,
     prepared: PreparedQueueJob,
+    signals: KVec<SyncSignal>,
 }
 
 impl PreparedQueueSubmit {
@@ -158,7 +160,13 @@ impl PreparedQueueSubmit {
             )?;
         }
 
-        Ok(queue.commit_job(self.prepared))
+        let submit_fence = queue.commit_job(self.prepared);
+
+        for signal in self.signals.into_iter() {
+            signal.publish(&submit_fence);
+        }
+
+        Ok(submit_fence)
     }
 }
 
@@ -218,11 +226,8 @@ impl Job {
     ) -> Result<PreparedQueueSubmit> {
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
 
-        if self.syncs.iter().any(SyncOp::is_signal) {
-            return Err(ENOTSUPP);
-        }
-
         let deps = deps::wait_fences(file, &self.syncs)?;
+        let signals = deps::signal_syncs(file, &self.syncs)?;
         let has_stream = !self.stream.is_empty();
         let prepared = queue.prepare_job(QueueJob::new(self.stream), &deps)?;
 
@@ -230,6 +235,7 @@ impl Job {
             queue_index: self.queue_index,
             has_stream,
             prepared,
+            signals,
         })
     }
 }
