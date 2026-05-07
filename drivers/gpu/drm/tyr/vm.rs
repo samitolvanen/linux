@@ -7,6 +7,7 @@
 //! Each virtual memory (VM) area is backed by ARM64 LPAE Stage 1 page tables and can be
 //! mapped into hardware address space (AS) slots for GPU execution.
 
+mod exec;
 pub(crate) mod range;
 
 use core::{
@@ -738,6 +739,20 @@ impl Vm {
         self.kernel_va.allocate(size, GFP_KERNEL)
     }
 
+    pub(crate) fn with_prepared_vm<R>(
+        &self,
+        num_slots: u32,
+        f: impl FnOnce(PreparedVm<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let exec_token = exec::ExecToken::prepare(&self.exec.gpuvm, num_slots)?;
+        let prepared_vm = PreparedVm {
+            exec_token,
+            num_slots,
+        };
+
+        f(prepared_vm)
+    }
+
     #[expect(dead_code)]
     pub(crate) fn reserve_kernel_range(&self, start: u64, end: u64) -> Result {
         let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
@@ -769,6 +784,24 @@ impl Deref for Vm {
 
     fn deref(&self) -> &Self::Target {
         &self.exec
+    }
+}
+
+pub(crate) struct PreparedVm<'a> {
+    exec_token: exec::ExecToken<'a, GpuVmData>,
+    #[expect(dead_code)]
+    num_slots: u32,
+}
+
+impl PreparedVm<'_> {
+    pub(crate) fn resv_add_fence(
+        &mut self,
+        fence: &PublicDmaFence,
+        private_usage: u32,
+        extobj_usage: u32,
+    ) {
+        self.exec_token
+            .resv_add_fence(fence, private_usage, extobj_usage);
     }
 }
 
