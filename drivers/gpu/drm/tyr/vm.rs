@@ -652,7 +652,7 @@ impl Vm {
     /// backing the GEM object, starting at `bo_offset` bytes into the object and
     /// spanning `map_size` bytes. The mapping respects the access permissions and
     /// caching behavior specified in `flags`.
-    pub(crate) fn map_bo_range(
+    fn map_bo_range_inner(
         &self,
         dev: &Device<Bound>,
         bo: &Bo,
@@ -701,22 +701,38 @@ impl Vm {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
         };
-        let result = {
-            let mut gpuvm_unique = self.gpuvm_unique.lock();
-            self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)
-        };
+        let mut gpuvm_unique = self.gpuvm_unique.lock();
+        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)
+    }
+
+    pub(crate) fn flush_deferred_cleanup(&self) {
+        self.gpuvm.deferred_cleanup();
+    }
+
+    pub(crate) fn map_bo_range(
+        &self,
+        dev: &Device<Bound>,
+        bo: &Bo,
+        bo_offset: u64,
+        map_size: u64,
+        va: u64,
+        flags: VmMapFlags,
+    ) -> Result {
+        self.map_bo_range_inner(dev, bo, bo_offset, map_size, va, flags)?;
+
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
-        self.gpuvm.deferred_cleanup();
-        result
+        self.flush_deferred_cleanup();
+
+        Ok(())
     }
 
     /// Unmaps a virtual address range from the VM.
     ///
     /// This removes any existing mappings in the specified range, freeing the
     /// virtual address space for reuse.
-    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+    fn unmap_range_inner(&self, va: u64, size: u64) -> Result {
         if size == 0 || va % SZ_4K as u64 != 0 || size % SZ_4K as u64 != 0 {
             return Err(EINVAL);
         }
@@ -755,15 +771,19 @@ impl Vm {
                 ]
             },
         };
-        let result = {
-            let mut gpuvm_unique = self.gpuvm_unique.lock();
-            self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)
-        };
+        let mut gpuvm_unique = self.gpuvm_unique.lock();
+        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)
+    }
+
+    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+        self.unmap_range_inner(va, size)?;
+
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
-        self.gpuvm.deferred_cleanup();
-        result
+        self.flush_deferred_cleanup();
+
+        Ok(())
     }
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
