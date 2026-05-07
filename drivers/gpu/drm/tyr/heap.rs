@@ -83,6 +83,8 @@ struct Context {
     vm: Arc<Vm>,
     chunks: KVec<Arc<gem::MappedBo>>,
     chunk_size: u32,
+    max_chunks: u32,
+    target_in_flight: u32,
 }
 
 impl Context {
@@ -114,6 +116,12 @@ impl Context {
         self.chunks.push(chunk_bo, GFP_KERNEL)?;
         Ok(())
     }
+}
+
+pub(crate) struct ContextGrowArgs {
+    pub(crate) heap_gpu_va: u64,
+    pub(crate) renderpasses_in_flight: u32,
+    pub(crate) pending_frag_count: u32,
 }
 
 pub(crate) struct Pools {
@@ -248,13 +256,13 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        let _ = args.target_in_flight;
-
         let mut heap_ctx = KBox::new(
             Context {
                 vm: self.vm.clone(),
                 chunks: kvec![],
                 chunk_size: args.chunk_size,
+                max_chunks: args.max_chunks,
+                target_in_flight: args.target_in_flight,
             },
             GFP_KERNEL,
         )?;
@@ -285,6 +293,37 @@ impl Pool {
             context_gpu_va,
             first_chunk_gpu_va,
         })
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn grow_heap_context(
+        &self,
+        ddev: &TyrDrmDevice,
+        reg_data: &TyrDrmRegistrationData<'_>,
+        args: ContextGrowArgs,
+    ) -> Result<u64> {
+        let _ = args.pending_frag_count;
+
+        let offset = args.heap_gpu_va - self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
+        let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
+        let index = offset / reg_data.gpu_info.heap_context_stride();
+
+        let xa = self.xa.as_ref();
+        let mut guard = xa.lock();
+        let heap_ctx = guard.get_mut(index as usize).ok_or(EINVAL)?;
+
+        if args.renderpasses_in_flight > heap_ctx.target_in_flight
+            || heap_ctx.chunks.len() >= heap_ctx.max_chunks as usize
+        {
+            return Err(ENOMEM);
+        }
+
+        heap_ctx.alloc_chunk(reg_data.pdev.as_ref(), ddev)?;
+
+        let chunk_bo = heap_ctx.chunks.last().ok_or(EINVAL)?;
+        let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
+
+        Ok((chunk_start & CHUNK_SIZE_MASK) | (chunk_bo.size() as u64 >> 12))
     }
 
     pub(crate) fn destroy_heap_context(&self, context_id: usize) -> Result {
