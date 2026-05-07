@@ -20,6 +20,7 @@ use kernel::{
     },
     drm::gem::shmem::VMapOwned,
     io::{
+        mem::DevresIoMem,
         register::Array,
         Io,
         Region, //
@@ -27,7 +28,10 @@ use kernel::{
     new_mutex,
     num::Bounded,
     prelude::*,
-    sizes::SizeConstants,
+    sizes::{
+        SizeConstants,
+        SZ_2M, //
+    },
     sync::{
         Arc,
         Mutex, //
@@ -202,6 +206,7 @@ impl SharedSectionInfo {
 #[pin_data]
 pub(crate) struct GlobalInterface<'drm> {
     dev: &'drm Device<Bound>,
+    iomem: Arc<DevresIoMem<SZ_2M>>,
     shared_section: SharedSectionInfo,
     gpu_info: GpuInfo,
     event_wait: Arc<Wait>,
@@ -213,6 +218,7 @@ impl<'drm> GlobalInterface<'drm> {
     /// Creates a new CSF global interface, initially disabled.
     pub(crate) fn new(
         dev: &'drm Device<Bound>,
+        iomem: Arc<DevresIoMem<SZ_2M>>,
         shared_section: &Section,
         gpu_info: GpuInfo,
         irq_state: &JobIrqState,
@@ -222,6 +228,7 @@ impl<'drm> GlobalInterface<'drm> {
 
         Ok(try_pin_init!(Self {
             dev,
+            iomem,
             shared_section,
             gpu_info,
             event_wait,
@@ -249,6 +256,34 @@ impl<'drm> GlobalInterface<'drm> {
     pub(crate) fn group_suspend_buf_sizes(&self) -> Result<(u32, u32)> {
         let inner = self.inner.lock();
         inner.group_suspend_buf_sizes()
+    }
+
+    pub(super) fn process_global_irq(&self) -> Result {
+        let mut inner = self.inner.lock();
+        inner.process_global_irq(&self.event_wait)
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn with_csg_mut<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut csg::CsgInterface) -> Result<R>,
+    {
+        let mut inner = self.inner.lock();
+        let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
+        f(csg)
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
+        self.ring_doorbell(csg_idx + 1)
+    }
+
+    fn ring_doorbell(&self, doorbell_id: usize) -> Result {
+        let doorbell = DOORBELL::try_at(doorbell_id).ok_or(EINVAL)?;
+
+        self.iomem
+            .access(self.dev)?
+            .try_write(doorbell, DOORBELL::zeroed().with_ring(true))
     }
 }
 
@@ -509,6 +544,35 @@ impl InnerGlobalInterface {
         };
 
         enabled.csg.get(index)
+    }
+
+    fn csg_mut(&mut self, index: usize) -> Option<&mut CsgInterface> {
+        let enabled = match &mut self.state {
+            GlobalInterfaceState::Enabled(e) => e,
+            GlobalInterfaceState::Disabled => return None,
+        };
+
+        enabled.csg.get_mut(index)
+    }
+
+    fn process_global_irq(&mut self, event_wait: &Wait) -> Result {
+        let enabled = match &self.state {
+            GlobalInterfaceState::Enabled(e) => e,
+            GlobalInterfaceState::Disabled => return Ok(()),
+        };
+
+        let request_field = GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
+        let req = enabled.glb_input.read(GLB_REQ);
+        let ack = enabled.glb_output.read(GLB_ACK);
+        let pending_idle = req.idle_event() ^ ack.idle_event();
+
+        if pending_idle {
+            let idle_mask = GLB_REQ::zeroed().with_idle_event(true);
+            request_field.toggle_requests(idle_mask)?;
+            request_field.wait_acks(idle_mask, event_wait, 1000)?;
+        }
+
+        Ok(())
     }
 
     fn csg_slot_count(&self) -> Result<u32> {

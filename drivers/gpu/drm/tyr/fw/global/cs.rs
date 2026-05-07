@@ -18,9 +18,13 @@ use kernel::{
 use super::SharedSectionInfo;
 use crate::fw::interfaces::{
     FwInterface,
+    CS_ACK,
     CS_CONTROL_BLOCK_SIZE,
     CS_KERNEL_INPUT_BLOCK_SIZE,
     CS_KERNEL_OUTPUT_BLOCK_SIZE,
+    CS_REQ,
+    CS_TILER_HEAP_END,
+    CS_TILER_HEAP_START,
     STREAM_FEATURES,
     STREAM_INPUT_VA,
     STREAM_OUTPUT_VA, //
@@ -43,10 +47,8 @@ struct EnabledCsInterface {
     /// Control block interface - provides CS capabilities and configuration.
     cs_control: FwInterface<Region<CS_CONTROL_BLOCK_SIZE>>,
     /// Input block interface - driver writes CS requests here.
-    #[expect(dead_code)]
     cs_input: FwInterface<FwRegion<CS_KERNEL_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes CS acknowledgements here.
-    #[expect(dead_code)]
     cs_output: FwInterface<FwRegion<CS_KERNEL_OUTPUT_BLOCK_SIZE>>,
 }
 
@@ -144,5 +146,44 @@ impl CsInterface {
         };
 
         Ok(enabled.cs_control.read(STREAM_FEATURES).scoreboards().get())
+    }
+
+    #[expect(dead_code)]
+    pub(in super::super) fn read_input_req(&self) -> Result<CS_REQ> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_input.read(CS_REQ))
+    }
+
+    #[expect(dead_code)]
+    pub(in super::super) fn write_input_req(&self, req: CS_REQ) {
+        if let CsInterfaceState::Enabled(enabled) = &self.state {
+            enabled.cs_input.write(CS_REQ, req);
+        }
+    }
+
+    #[expect(dead_code)]
+    pub(in super::super) fn write_tiler_heap(
+        &self,
+        start: CS_TILER_HEAP_START,
+        end: CS_TILER_HEAP_END,
+    ) {
+        if let CsInterfaceState::Enabled(enabled) = &self.state {
+            enabled.cs_input.write(CS_TILER_HEAP_START, start);
+            enabled.cs_input.write(CS_TILER_HEAP_END, end);
+        }
+    }
+
+    #[expect(dead_code)]
+    pub(in super::super) fn read_output_ack(&self) -> Result<CS_ACK> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_output.read(CS_ACK))
     }
 }
