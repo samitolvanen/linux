@@ -67,7 +67,7 @@ pub(crate) mod irq;
 mod parser;
 
 /// Maximum number of CSG interfaces supported by hardware.
-const MAX_CSG: usize = 16;
+pub(crate) const MAX_CSG: usize = 16;
 
 /// Maximum number of CS interfaces supported by hardware.
 const MAX_CS: usize = 16;
