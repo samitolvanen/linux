@@ -7,7 +7,11 @@
 
 #![expect(dead_code)]
 
-use kernel::{drm::gem::BaseObject, io::Io, prelude::*, sync::Arc};
+use kernel::{
+    io::Io,
+    prelude::*,
+    sync::Arc, //
+};
 
 use crate::gem;
 
@@ -69,40 +73,24 @@ macro_rules! impl_sync_rw {
     ($type:ty) => {
         impl $type {
             pub(super) fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
-                let end = offset
-                    .checked_add(core::mem::size_of::<Self>())
-                    .ok_or(EINVAL)?;
-
-                if end > mem.size() {
-                    return Err(EINVAL);
-                }
+                mem.check_offset::<Self>(offset)?;
 
                 let vmap = mem.vmap();
-                // SAFETY: `offset..end` was bounds-checked against the mapped object size,
-                // so the computed pointer is valid for a single sync-object read.
+                // SAFETY: `check_offset` verified bounds and alignment for `Self` at `offset`.
                 let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
 
-                // SAFETY: `ptr` points into the mapped sync-object storage and is valid
-                // for one volatile read of `Self`.
+                // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
                 Ok(unsafe { core::ptr::read_volatile(ptr) })
             }
 
             pub(super) fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
-                let end = offset
-                    .checked_add(core::mem::size_of::<Self>())
-                    .ok_or(EINVAL)?;
-
-                if end > mem.size() {
-                    return Err(EINVAL);
-                }
+                mem.check_offset::<Self>(offset)?;
 
                 let vmap = mem.vmap();
-                // SAFETY: `offset..end` was bounds-checked against the mapped object size,
-                // so the computed pointer is valid for a single sync-object write.
+                // SAFETY: `check_offset` verified bounds and alignment for `Self` at `offset`.
                 let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
 
-                // SAFETY: `ptr` points into the mapped sync-object storage and is valid
-                // for one volatile write of `Self`.
+                // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
                 unsafe { core::ptr::write_volatile(ptr, value) };
 
                 Ok(())

@@ -33,30 +33,24 @@ pub(crate) struct ChunkHeader {
 
 impl ChunkHeader {
     fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
-        if offset > mem.size() {
-            return Err(EINVAL);
-        }
+        mem.check_offset::<Self>(offset)?;
 
         let vmap = mem.vmap();
-        // SAFETY: `offset <= mem.size()` was checked above and `vmap.addr()` points
-        // to the mapped BO backing storage for this header.
+        // SAFETY: `check_offset` verified bounds and alignment for `Self` at `offset`.
         let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
 
-        // SAFETY: `ptr` points to a properly aligned header inside the mapped BO.
+        // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
         Ok(unsafe { core::ptr::read_volatile(ptr) })
     }
 
     fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
-        if offset > mem.size() {
-            return Err(EINVAL);
-        }
+        mem.check_offset::<Self>(offset)?;
 
         let vmap = mem.vmap();
-        // SAFETY: `offset <= mem.size()` was checked above and `vmap.addr()` points
-        // to the mapped BO backing storage for this header.
+        // SAFETY: `check_offset` verified bounds and alignment for `Self` at `offset`.
         let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
 
-        // SAFETY: `ptr` points to a properly aligned header inside the mapped BO.
+        // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
         unsafe { core::ptr::write_volatile(ptr, value) };
 
         Ok(())
