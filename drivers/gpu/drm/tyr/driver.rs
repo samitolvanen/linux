@@ -111,6 +111,8 @@ impl core::ops::Deref for CleanupQueue {
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
 pub(crate) mod work_id {
+    /// Scheduler tick worker.
+    pub(crate) const TICK: u64 = 1;
     /// Firmware-event drain worker.
     pub(crate) const FW_EVENTS: u64 = 2;
     /// Tiler heap out-of-memory growth worker.
@@ -164,6 +166,10 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
+    /// Scheduler tick worker. Enqueued on `sched_wq`.
+    #[pin]
+    tick_work: DmaFenceWork<TyrDrmDevice, { work_id::TICK }>,
+
     /// Deferred tiler heap growth for CS TILER_OOM events.
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
@@ -213,10 +219,31 @@ impl TyrDrmDeviceData {
                 .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
         });
     }
+
+    /// Schedules an immediate scheduler tick on
+    /// `sched_wq`.
+    ///
+    /// Safe to call from any context including the threaded IRQ
+    /// handler. Repeated calls coalesce in the workqueue.
+    pub(crate) fn schedule_tick(tdev: &ARef<TyrDrmDevice>) {
+        let Some(guard) = tdev.registration_guard() else {
+            return;
+        };
+
+        guard.registration_data_with(|reg_data| {
+            let _ = reg_data
+                .sched_wq
+                .enqueue::<ARef<TyrDrmDevice>, { work_id::TICK }>(tdev.clone());
+        });
+    }
 }
 
 impl_has_dma_fence_work! {
     impl HasDmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }> for TyrDrmDeviceData { self.fw_events_work }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::TICK }> for TyrDrmDeviceData { self.tick_work }
 }
 
 impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
@@ -253,6 +280,12 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             }
         });
     }
+}
+
+impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(_this: Self::Pointer) {}
 }
 
 pub(crate) struct TyrPlatformDriver;
@@ -394,6 +427,7 @@ impl platform::Driver for TyrPlatformDriver {
                 sched <- new_mutex!(SchedulerState::Disabled),
                 fw_events: Atomic::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
+                tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
             }? Error),
         )?;
