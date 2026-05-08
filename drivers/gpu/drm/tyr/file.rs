@@ -139,8 +139,11 @@ impl TyrDrmFileData {
                     Ok(0)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_CSIF_INFO => {
-                    let csif = ddev.csif_info.lock();
-                    set_uobj(devquery.pointer, devquery.size, &*csif)?;
+                    let csif_data = {
+                        let csif = ddev.csif_info.lock();
+                        *csif
+                    };
+                    set_uobj(devquery.pointer, devquery.size, &csif_data)?;
 
                     Ok(0)
                 }
