@@ -23,10 +23,7 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
-    fw::{
-        global::GlobalInterface,
-        Firmware, //
-    },
+    fw::Firmware,
     heap, //
 };
 
@@ -117,36 +114,28 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
 }
 
 impl Scheduler {
-    pub(crate) fn process_csg_irqs(
-        &mut self,
-        mut events: u32,
-        global_iface: &GlobalInterface<'_>,
-    ) -> Result<bool> {
+    pub(crate) fn process_csg_irqs(&mut self, mut events: u32, fw: &Firmware<'_>) -> Result<bool> {
         let mut queued_tiler_oom = false;
 
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            queued_tiler_oom |= self.process_csg_irq(global_iface, csg_id)?;
+            queued_tiler_oom |= self.process_csg_irq(fw, csg_id)?;
             events &= !mask;
         }
 
         Ok(queued_tiler_oom)
     }
 
-    fn process_csg_irq(
-        &mut self,
-        global_iface: &GlobalInterface<'_>,
-        csg_id: usize,
-    ) -> Result<bool> {
+    fn process_csg_irq(&mut self, fw: &Firmware<'_>, csg_id: usize) -> Result<bool> {
         let group = match self.csg_slots.get(csg_id).and_then(Option::as_ref) {
             Some(slot) => slot.group.clone(),
             None => return Ok(false),
         };
 
         let mut queued_tiler_oom = false;
-        global_iface.with_csg_mut(csg_id, |csg| {
+        fw.with_csg_mut(csg_id, |csg| {
             let irq_req = csg.read_output_irq_req()?.mask();
             let irq_ack = csg.read_input_irq_ack()?;
             let pending_cs_irqs = irq_req ^ irq_ack.mask();

@@ -15,7 +15,13 @@ use kernel::{
         Device as DmaDevice,
         DmaMask, //
     },
-    dma_buf::dma_fence::DmaFenceWorkqueue,
+    dma_buf::dma_fence::{
+        impl_has_dma_fence_work,
+        new_dma_fence_work,
+        DmaFenceWork,
+        DmaFenceWorkItem,
+        DmaFenceWorkqueue, //
+    },
     drm,
     drm::ioctl,
     io::{
@@ -34,6 +40,12 @@ use kernel::{
     sizes::SZ_2M,
     sync::{
         aref::ARef,
+        atomic::{
+            Acquire,
+            Atomic,
+            Relaxed,
+            Release, //
+        },
         Arc,
         Mutex, //
     },
@@ -99,6 +111,8 @@ impl core::ops::Deref for CleanupQueue {
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
 pub(crate) mod work_id {
+    /// Firmware-event drain worker.
+    pub(crate) const FW_EVENTS: u64 = 2;
     /// Tiler heap out-of-memory growth worker.
     pub(crate) const TILER_OOM: u64 = 5;
 }
@@ -133,6 +147,23 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sched: Mutex<SchedulerState>,
 
+    /// Outstanding firmware-events bits accumulated by IRQ handlers.
+    ///
+    /// Producers OR new status bits in via `fw_events_or` from any
+    /// context. The consumer reads-and-clears with `fw_events_take`.
+    /// This keeps scheduler-mutex work off the threaded IRQ handler.
+    fw_events: Atomic<u32>,
+
+    /// Worker that drains `fw_events` under the
+    /// scheduler mutex. Enqueued on `sched_wq`.
+    ///
+    /// Typed as `DmaFenceWork` so it can ride on `sched_wq` (a
+    /// `DmaFenceWorkqueue`), not because the body signals dma-fences.
+    /// It only ACKs CSG events. Sharing the queue with the tick worker
+    /// keeps it on `WQ_HIGHPRI` without a second workqueue.
+    #[pin]
+    fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
+
     /// Deferred tiler heap growth for CS TILER_OOM events.
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
@@ -145,6 +176,82 @@ impl TyrDrmDeviceData {
     {
         let mut sched = self.sched.lock();
         f(sched.enabled_mut()?)
+    }
+
+    /// Accumulates `bits` into the firmware-events word.
+    ///
+    /// Safe to call from any context, including threaded IRQ handlers.
+    /// `Release` pairs with the `Acquire` in `fw_events_take` so the
+    /// drain side observes any state the producer wrote before raising
+    /// the bit.
+    pub(crate) fn fw_events_or(&self, bits: u32) {
+        let mut old = self.fw_events.load(Relaxed);
+
+        while let Err(current) = self.fw_events.cmpxchg(old, old | bits, Release) {
+            old = current;
+        }
+    }
+
+    /// Atomically reads and clears the firmware-events word, returning
+    /// the bits that were set.
+    pub(crate) fn fw_events_take(&self) -> u32 {
+        self.fw_events.xchg(0, Acquire)
+    }
+
+    /// Schedules the fw-events worker on the scheduler workqueue.
+    ///
+    /// Safe to call from any context including the threaded IRQ
+    /// handler. Repeated calls coalesce in the workqueue.
+    pub(crate) fn schedule_fw_events(tdev: &ARef<TyrDrmDevice>) {
+        let Some(guard) = tdev.registration_guard() else {
+            return;
+        };
+
+        guard.registration_data_with(|reg_data| {
+            let _ = reg_data
+                .sched_wq
+                .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
+        });
+    }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }> for TyrDrmDeviceData { self.fw_events_work }
+}
+
+impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        let tdev = &*this;
+
+        let events = tdev.fw_events_take();
+        if events == 0 {
+            return;
+        }
+
+        let Some(guard) = tdev.registration_guard() else {
+            return;
+        };
+
+        guard.registration_data_with(|reg_data| {
+            let queued_tiler_oom = tdev
+                .with_locked_scheduler(|sched| sched.process_csg_irqs(events, &reg_data.fw))
+                .inspect_err(|err| {
+                    dev_err!(
+                        reg_data.pdev,
+                        "fw_events_work: failed to process firmware CSG IRQs: {:?}\n",
+                        err
+                    );
+                })
+                .unwrap_or(false);
+
+            if queued_tiler_oom {
+                let _ = reg_data
+                    .heap_wq
+                    .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this.clone());
+            }
+        });
     }
 }
 
@@ -285,6 +392,8 @@ impl platform::Driver for TyrPlatformDriver {
                 coherent,
                 cleanup_wq: device_cleanup_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
+                fw_events: Atomic::new(0),
+                fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
             }? Error),
         )?;
