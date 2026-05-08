@@ -71,6 +71,7 @@ mod parser;
 // firmware module. The bitfield definitions themselves stay private
 // to `crate::fw`; the apply path only depends on these typed views.
 pub(crate) use interfaces::{
+    CsFaultExceptionType,
     CsgExecutionState,
     CSG_CONFIG,
     CSG_EP_REQ,

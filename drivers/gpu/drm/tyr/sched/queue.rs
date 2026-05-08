@@ -310,6 +310,28 @@ impl QueueData {
         self.signal_submit_fences_up_to(ringbuf_output.extract, Ok(()));
         Ok(())
     }
+
+    /// Reads the firmware-visible `EXTRACT` for this queue and stages
+    /// `err` on every pending submit fence whose `completion_point` is
+    /// strictly past it, i.e. submissions whose ringbuf range the firmware
+    /// has not yet reached.
+    ///
+    /// The fences are left in the pending list; the regular seqno-ordered
+    /// drain in [`Self::complete_pending_fences_up_to`] will signal them
+    /// at their natural completion points so waiters still observe a
+    /// monotonic submit-order signal sequence.
+    ///
+    /// Safe to call from inside a [`DmaFenceSignallingAnnotation`] section.
+    pub(in crate::sched) fn fail_inflight_submit_fences(&self, err: Error) -> Result {
+        let extract = self.interfaces.read_output()?.extract;
+        let mut pending = self.pending_submit_fences.lock();
+        for entry in pending.iter_mut() {
+            if entry.completion_point > extract {
+                entry.fence.set_error(err);
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct TyrQueueOps {

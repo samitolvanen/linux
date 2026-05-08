@@ -152,8 +152,6 @@ impl GroupInner {
         was_idle
     }
 
-    /// Marks a queue as having encountered a fatal error.
-    #[expect(dead_code)]
     pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
         if (self.fatal_queues & (1 << queue_idx)) == 0 {
             self.fatal_queues |= 1 << queue_idx;

@@ -6,7 +6,10 @@ use kernel::{
         ListArc, //
     },
     prelude::*,
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     types::ScopeGuard,
 };
 
@@ -689,6 +692,6 @@ impl Scheduler {
             }
         }
 
-        self.apply_csg_updates(data, &mut context)
+        self.apply_csg_updates(&data, &mut context)
     }
 }
