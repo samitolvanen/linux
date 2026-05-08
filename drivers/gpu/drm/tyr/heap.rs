@@ -116,7 +116,7 @@ impl Pools {
         let xa = self.entries.as_ref();
         let mut guard = xa.lock();
         guard
-            .store(vm_id, pool.clone(), GFP_KERNEL)
+            .store(vm_id, pool.clone(), GFP_ATOMIC)
             .map_err(|_| EINVAL)?;
 
         Ok(pool)
@@ -272,7 +272,7 @@ impl Pool {
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
         guard
-            .store(index, heap_ctx, GFP_KERNEL)
+            .store(index, heap_ctx, GFP_ATOMIC)
             .map_err(|_| EINVAL)?;
 
         Ok(CreatedContext {
