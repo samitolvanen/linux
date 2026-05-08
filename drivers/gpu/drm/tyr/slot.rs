@@ -496,7 +496,6 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
     ///
     /// Same semantics as [`SlotManager::slot_data`] but yields a `&mut`
     /// reference.
-    #[expect(dead_code)]
     pub(crate) fn slot_data_mut(&mut self, slot_idx: usize) -> Option<&mut T::SlotData> {
         if slot_idx >= self.slot_count {
             return None;
