@@ -10,9 +10,10 @@ use kernel::{io::Io, prelude::*};
 
 use super::SharedSectionInfo;
 use crate::fw::interfaces::{
-    FwInterface, CS_ACK, CS_CONTROL_BLOCK_SIZE, CS_HEAP_ADDRESS, CS_HEAP_FRAG_END, CS_HEAP_VT_END,
-    CS_HEAP_VT_START, CS_KERNEL_INPUT_BLOCK_SIZE, CS_KERNEL_OUTPUT_BLOCK_SIZE, CS_REQ,
-    CS_TILER_HEAP_END, CS_TILER_HEAP_START, STREAM_FEATURES, STREAM_INPUT_VA, STREAM_OUTPUT_VA,
+    CsState, FwInterface, CS_ACK, CS_CONTROL_BLOCK_SIZE, CS_HEAP_ADDRESS, CS_HEAP_FRAG_END,
+    CS_HEAP_VT_END, CS_HEAP_VT_START, CS_KERNEL_INPUT_BLOCK_SIZE, CS_KERNEL_OUTPUT_BLOCK_SIZE,
+    CS_REQ, CS_TILER_HEAP_END, CS_TILER_HEAP_START, STREAM_FEATURES, STREAM_INPUT_VA,
+    STREAM_OUTPUT_VA,
 };
 
 /// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
@@ -127,6 +128,25 @@ impl CsInterface {
         if let CsInterfaceState::Enabled(enabled) = &self.state {
             enabled.cs_input.write(CS_REQ, req);
         }
+    }
+
+    /// Clears the `CS_REQ.state` field (sets it to `CsState::Stop`).
+    ///
+    /// No doorbell is rung; the reset takes effect on the next
+    /// `CSG_REQ.state = Start` transition.
+    ///
+    /// Returns [`EINVAL`] if the interface is not enabled.
+    pub(crate) fn clear_input_req_state(&self) -> Result {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let cur = enabled.cs_input.read(CS_REQ);
+        enabled
+            .cs_input
+            .write(CS_REQ, cur.with_state(CsState::Stop));
+        Ok(())
     }
 
     #[allow(dead_code)]

@@ -46,7 +46,6 @@ use super::{
 pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 
 /// The group's lifecycle state.
-#[expect(dead_code)]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub(crate) enum State {
     Created,
@@ -363,7 +362,6 @@ impl Group {
         self.inner.lock().state
     }
 
-    #[expect(dead_code)]
     pub(crate) fn set_state(&self, new_state: State) {
         self.with_locked_inner(|inner| {
             inner.state = new_state;
