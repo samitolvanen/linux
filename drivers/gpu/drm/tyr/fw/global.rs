@@ -32,7 +32,6 @@ use crate::{
 };
 use kernel::{
     bindings::SZ_1K,
-    clk::Clk,
     devres::Devres,
     drm::gem::shmem::VMapOwned,
     io::{register::Array, Io},
@@ -50,14 +49,13 @@ pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 use crate::wait::WaitResult;
 
 /// Encodes a GLB timer timeout and selects the backing time source.
-pub(super) fn conv_timeout(core_clk: &Clk, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
+pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
     // The max timeout is determined by the 31 bit size of the timeout field.
     let max_timeout = (1u32 << 31) - 1;
-    let core_rate = core_clk.rate().as_hz() as u64;
 
     let (timer_rate, timer_source) = match arch_timer_get_rate() {
         Some(rate) => (u64::from(rate), Bounded::try_new(0).unwrap()),
-        _ if core_rate != 0 => (core_rate, Bounded::try_new(1).unwrap()),
+        _ if core_clk_rate != 0 => (core_clk_rate, Bounded::try_new(1).unwrap()),
         _ => return Err(EINVAL),
     };
 
@@ -181,14 +179,14 @@ impl GlobalInterface {
         }))
     }
 
-    pub(crate) fn enable(&self, core_clk: &Clk) -> Result {
+    pub(crate) fn enable(&self, core_clk_rate: u64) -> Result {
         let mut inner = self.inner.lock();
         inner.enable(
             &self.pdev,
             self.iomem.as_ref(),
             &self.shared_section,
             self.gpu_info,
-            core_clk,
+            core_clk_rate,
             self.event_wait.as_ref(),
         )
     }
@@ -315,7 +313,7 @@ impl InnerGlobalInterface {
         iomem: &Devres<IoMem>,
         shared_section: &SharedSectionInfo,
         gpu_info: GpuInfo,
-        core_clk: &Clk,
+        core_clk_rate: u64,
         event_wait: &Wait,
     ) -> Result {
         let glb_control = FwInterface::<GLB_CONTROL_BLOCK_SIZE>::new(
@@ -350,7 +348,7 @@ impl InnerGlobalInterface {
             output_va.value().get().into(),
         )?;
 
-        Self::configure_glb_input(&glb_input, &gpu_info, core_clk)?;
+        Self::configure_glb_input(&glb_input, &gpu_info, core_clk_rate)?;
         let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
 
         // SAFETY: Called during probe after the device has been successfully bound,
@@ -401,7 +399,7 @@ impl InnerGlobalInterface {
     fn configure_glb_input(
         glb_input: &FwInterface<GLB_INPUT_BLOCK_SIZE>,
         gpu_info: &GpuInfo,
-        core_clk: &Clk,
+        core_clk_rate: u64,
     ) -> Result {
         glb_input.write(
             GLB_ALLOC_EN,
@@ -409,7 +407,7 @@ impl InnerGlobalInterface {
         );
 
         const PWROFF_HYSTERESIS_US: u32 = 10_000;
-        let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk, PWROFF_HYSTERESIS_US)?;
+        let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk_rate, PWROFF_HYSTERESIS_US)?;
         let pwroff_timeout = Bounded::<u32, 31>::try_new(pwroff_timeout).ok_or(EINVAL)?;
         glb_input.write(
             GLB_PWROFF_TIMER,
@@ -427,7 +425,7 @@ impl InnerGlobalInterface {
         );
 
         const IDLE_HYSTERESIS_US: u32 = 800;
-        let (idle_timeout, idle_source) = conv_timeout(core_clk, IDLE_HYSTERESIS_US)?;
+        let (idle_timeout, idle_source) = conv_timeout(core_clk_rate, IDLE_HYSTERESIS_US)?;
         let idle_timeout = Bounded::<u32, 31>::try_new(idle_timeout).ok_or(EINVAL)?;
         glb_input.write(
             GLB_IDLE_TIMER,
