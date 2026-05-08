@@ -95,6 +95,8 @@ pub(crate) mod work_id {
     pub(crate) const TICK: u64 = 1;
     /// Firmware-event drain worker.
     pub(crate) const FW_EVENTS: u64 = 2;
+    /// Group sync-update worker.
+    pub(crate) const SYNC_UPD: u64 = 3;
     /// Periodic re-arming of the scheduler tick.
     pub(crate) const PERIODIC_TICK: u64 = 4;
     /// Tiler heap out-of-memory growth worker.
@@ -171,6 +173,21 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     tick_work: DmaFenceWork<TyrDrmDevice, { work_id::TICK }>,
 
+    /// Group sync-update worker.
+    ///
+    /// Enqueued via [`schedule_sync_upd`](Self::schedule_sync_upd) onto
+    /// the global `system_unbound()` queue. Scans groups whose queues
+    /// reported a `SYNC_UPDATE` event and unblocks any whose syncwait
+    /// has now been satisfied.
+    ///
+    /// Plain [`Work`], not [`DmaFenceWork`]: re-evaluating a foreign-BO
+    /// syncwait requires `drm_gem_shmem_vmap`, which acquires
+    /// `dma_resv_lock` and allocates with `GFP_KERNEL`. We want to avoid
+    /// both on the DMA fence signalling path, so the worker stays
+    /// outside it.
+    #[pin]
+    sync_upd_work: Work<TyrDrmDevice, { work_id::SYNC_UPD }>,
+
     /// Periodic re-arm worker for [`tick_work`](Self::tick_work).
     ///
     /// Enqueued on `system_unbound()` rather than [`sched_wq`](Self::sched_wq)
@@ -227,6 +244,17 @@ impl TyrDrmDeviceData {
             .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
     }
 
+    /// Schedules the group sync-update worker on the global
+    /// `system_unbound()` queue.
+    ///
+    /// Safe to call from any context including the threaded IRQ
+    /// handler. Repeated calls coalesce in the workqueue.
+    #[expect(dead_code)]
+    pub(crate) fn schedule_sync_upd(tdev: &ARef<TyrDrmDevice>) {
+        let _ = workqueue::system_unbound()
+            .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());
+    }
+
     /// Schedules an immediate scheduler tick on
     /// [`sched_wq`](Self::sched_wq).
     ///
@@ -258,6 +286,10 @@ impl_has_dma_fence_work! {
 
 impl_has_dma_fence_work! {
     impl HasDmaFenceWork<TyrDrmDevice, { work_id::TICK }> for TyrDrmDeviceData { self.tick_work }
+}
+
+kernel::impl_has_work! {
+    impl HasWork<TyrDrmDevice, { work_id::SYNC_UPD }> for TyrDrmDeviceData { self.sync_upd_work }
 }
 
 impl_has_delayed_work! {
@@ -293,6 +325,12 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 }
 
 impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(_this: Self::Pointer) {}
+}
+
+impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(_this: Self::Pointer) {}
@@ -417,6 +455,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 fw_events: AtomicU32::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
+                sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
