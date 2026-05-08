@@ -45,12 +45,6 @@ impl Deref for CsifInfo {
     }
 }
 
-impl DerefMut for CsifInfo {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 // SAFETY: `CsifInfo`'s invariant guarantees that it is the same type that is
 // already exposed to userspace by the C driver. This implies that it fulfills
 // the requirements for `AsBytes`.
