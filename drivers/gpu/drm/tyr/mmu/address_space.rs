@@ -229,14 +229,26 @@ impl SlotOperations for AddressSpaceManager {
     /// VM address space data stored in each hardware slot.
     type SlotData = Arc<VmAsData>;
 
+    type Context = ();
+
     /// Activates an address space in a hardware slot.
-    fn activate(&mut self, slot_idx: usize, slot_data: &Self::SlotData) -> Result {
+    fn activate(
+        &mut self,
+        slot_idx: usize,
+        slot_data: &Self::SlotData,
+        _ctx: &mut Self::Context,
+    ) -> Result {
         let as_config = slot_data.as_config(self.dev())?;
         self.as_enable(slot_idx, &as_config)
     }
 
     /// Evicts an address space from a hardware slot.
-    fn evict(&mut self, slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
+    fn evict(
+        &mut self,
+        slot_idx: usize,
+        _slot_data: &Self::SlotData,
+        _ctx: &mut Self::Context,
+    ) -> Result {
         if self.iomem.try_access().is_some() {
             self.as_disable(slot_idx)?;
         }
@@ -580,7 +592,7 @@ impl AsSlotManager {
     /// Allocates a hardware address space slot for the VM and configures
     /// it with the VM's translation table and memory attributes.
     pub(super) fn activate_vm(&mut self, vm: ArcBorrow<'_, VmAsData>) -> Result {
-        self.activate(&vm.as_seat, vm.into())
+        self.activate(&vm.as_seat, vm.into(), &mut ())
     }
 
     /// Deactivates a VM by evicting it from its hardware slot.
@@ -588,6 +600,6 @@ impl AsSlotManager {
     /// Flushes any pending operations and clears the hardware slot's
     /// configuration, freeing the slot for use by other VMs.
     pub(super) fn deactivate_vm(&mut self, vm: &VmAsData) -> Result {
-        self.evict(&vm.as_seat)
+        self.evict(&vm.as_seat, &mut ())
     }
 }
