@@ -34,10 +34,8 @@ pub(crate) enum SchedulerState {
 }
 
 impl SchedulerState {
-    pub(crate) fn init(&mut self, tdev: &TyrDrmDevice, fw: &Firmware<'_>) -> Result<CsifInfo> {
-        let (scheduler, csif) = Scheduler::init(tdev, fw)?;
+    pub(crate) fn enable(&mut self, scheduler: Scheduler) {
         *self = Self::Enabled(scheduler);
-        Ok(csif)
     }
 
     pub(crate) fn enabled_mut(&mut self) -> Result<&mut Scheduler> {

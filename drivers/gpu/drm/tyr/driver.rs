@@ -278,7 +278,8 @@ impl platform::Driver for TyrPlatformDriver {
 
         firmware.enable_global_interface(&core_clk, io)?;
 
-        let csif_info = unreg_dev.sched.lock().init(&unreg_dev, &firmware)?;
+        let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware)?;
+        unreg_dev.sched.lock().enable(scheduler);
 
         let wq = Arc::new(
             DmaFenceWorkqueue::new_unbound(c"tyr-dma-fence")?,
