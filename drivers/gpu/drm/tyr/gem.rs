@@ -110,6 +110,23 @@ impl MappedBo {
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
         Some(self.kernel_node.range())
     }
+
+    /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
+    /// mapping and that `offset` is aligned for `T`.
+    pub(crate) fn check_offset<T>(&self, offset: usize) -> Result {
+        if offset % core::mem::align_of::<T>() != 0 {
+            return Err(EINVAL);
+        }
+
+        let end = offset
+            .checked_add(core::mem::size_of::<T>())
+            .ok_or(EINVAL)?;
+        if end > self.size() {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
 }
 
 impl core::ops::Deref for MappedBo {
