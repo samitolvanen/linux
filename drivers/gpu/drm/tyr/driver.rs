@@ -242,7 +242,8 @@ impl platform::Driver for TyrPlatformDriverData {
             .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
         tdev.fw.enable_global_interface(&tdev)?;
 
-        tdev.sched.lock().init(&tdev)?;
+        let scheduler = Scheduler::init(&tdev)?;
+        tdev.sched.lock().enable(scheduler);
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.

@@ -25,10 +25,8 @@ pub(crate) enum SchedulerState {
 }
 
 impl SchedulerState {
-    pub(crate) fn init(&mut self, tdev: &TyrDrmDevice) -> Result {
-        let scheduler = Scheduler::init(tdev)?;
+    pub(crate) fn enable(&mut self, scheduler: Scheduler) {
         *self = Self::Enabled(scheduler);
-        Ok(())
     }
 
     pub(crate) fn enabled_mut(&mut self) -> Result<&mut Scheduler> {
