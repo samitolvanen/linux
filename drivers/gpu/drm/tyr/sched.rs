@@ -285,7 +285,6 @@ pub(crate) struct Scheduler {
     /// Groups whose queues are all idle (nothing to execute or blocked).
     pub(in crate::sched) idle_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
     /// Groups whose queues are blocked on a sync object.
-    #[expect(dead_code)]
     pub(in crate::sched) waiting_groups: [List<Group, 1>; GROUP_PRIORITY_COUNT],
 }
 

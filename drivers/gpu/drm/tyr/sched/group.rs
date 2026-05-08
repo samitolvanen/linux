@@ -373,7 +373,6 @@ impl Group {
         });
     }
 
-    #[expect(dead_code)]
     pub(crate) fn can_run(&self) -> bool {
         self.inner.lock().can_run()
     }
