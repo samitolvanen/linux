@@ -52,7 +52,10 @@ use crate::{
     gem::BoData,
     gpu,
     gpu::GpuInfo,
-    mmu::{irq::mmu_irq_init, Mmu},
+    mmu::{
+        irq::mmu_irq_init,
+        Mmu, //
+    },
     regs::gpu_control::*, //
     sched::Scheduler,
     sched::SchedulerState,

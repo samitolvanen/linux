@@ -95,11 +95,14 @@ pub(crate) fn job_irq_init<'a>(
     state: JobIrqState,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<JobIrq>>, Error> + 'a> {
     let io = iomem.access(pdev.as_ref())?;
+    // Drop any latched IRQs from a previous probe.
+    io.write_reg(JOB_IRQ_CLEAR::from_raw(u32::MAX));
     io.write_reg(
         JOB_IRQ_MASK::zeroed()
             .with_const_csg::<CSG_IRQ_MASK>()
             .with_glb(true),
     );
+
     let job_irq = JobIrq {
         iomem: iomem.clone(),
         state,
