@@ -1169,6 +1169,18 @@ where
 {
 }
 
+// SAFETY: The [`RawWorkItem`] impl for [`ARef<T>`] gives the ownership model
+// `RawDmaFenceWorkItem` requires. The queue holds one reference for the
+// duration of the run callback.
+unsafe impl<T, const ID: u64> RawDmaFenceWorkItem<ID> for ARef<T>
+where
+    T: AlwaysRefCounted,
+    T: DmaFenceWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+}
+
 /// Defines the method that should be called when this DMA-fence constrained
 /// delayed work item is executed.
 pub trait DmaFenceDelayedWorkItem<const ID: u64 = 0> {
@@ -1189,6 +1201,18 @@ pub unsafe trait RawDmaFenceDelayedWorkItem<const ID: u64>: RawDelayedWorkItem<I
 // SAFETY: The underlying `RawDelayedWorkItem` impl provides all guarantees.
 unsafe impl<T, const ID: u64> RawDmaFenceDelayedWorkItem<ID> for Arc<T>
 where
+    T: DmaFenceDelayedWorkItem<ID, Pointer = Self>,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasDelayedWork<T, ID>,
+{
+}
+
+// SAFETY: The [`RawDelayedWorkItem`] impl for [`ARef<T>`] gives the ownership
+// model `RawDmaFenceDelayedWorkItem` requires. The queue holds one reference
+// for the duration of the run callback.
+unsafe impl<T, const ID: u64> RawDmaFenceDelayedWorkItem<ID> for ARef<T>
+where
+    T: AlwaysRefCounted,
     T: DmaFenceDelayedWorkItem<ID, Pointer = Self>,
     T: WorkItem<ID, Pointer = Self>,
     T: HasDelayedWork<T, ID>,
