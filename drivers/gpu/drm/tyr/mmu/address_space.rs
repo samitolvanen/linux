@@ -53,6 +53,12 @@ use crate::{
         Mmu, //
     },
     regs::{
+        gpu_control::{
+            FlushMode,
+            GPU_COMMAND,
+            GPU_IRQ_CLEAR,
+            GPU_IRQ_RAWSTAT, //
+        },
         mmu_control::mmu_as_control,
         mmu_control::mmu_as_control::*,
         MAX_AS, //
@@ -483,19 +489,61 @@ impl AddressSpaceManager {
 
     /// Completes an atomic translation table update.
     ///
-    /// Returns an error if the slot is invalid or if the flush command fails.
+    /// Issues a global GPU cache flush and unlocks the AS slot.
     fn as_end_update(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushPt)?;
-        Ok(())
+        self.gpu_flush_caches(
+            FlushMode::CleanInvalidate,
+            FlushMode::CleanInvalidate,
+            FlushMode::Invalidate,
+        )?;
+        self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)
     }
 
-    /// Flushes the translation table cache for an AS slot.
+    /// Flushes GPU caches for an AS slot.
     ///
-    /// Returns an error if the slot is invalid or if the flush command fails.
+    /// Issues the global GPU cache flush command. No AS lock is taken.
     fn as_flush(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
-        self.as_send_cmd(as_nr, MmuCommand::FlushPt)
+        self.gpu_flush_caches(
+            FlushMode::CleanInvalidate,
+            FlushMode::CleanInvalidate,
+            FlushMode::Invalidate,
+        )
+    }
+
+    /// Issues the GPU-side `flush_caches` command and waits for completion.
+    ///
+    /// The completion bit is cleared before and after polling so each call
+    /// observes only its own completion event. This affects all GPU caches
+    /// globally; it does not touch MMU AS lock state.
+    fn gpu_flush_caches(&self, l2: FlushMode, lsc: FlushMode, other: FlushMode) -> Result {
+        let dev = self.dev();
+        let io = self.iomem.access(dev)?;
+
+        let gpu_cmd = GPU_COMMAND::flush_caches(l2, lsc, other);
+
+        // Clear any stale clean_caches_completed before kicking off this op.
+        io.write(
+            GPU_IRQ_CLEAR,
+            GPU_IRQ_CLEAR::zeroed().with_clean_caches_completed(true),
+        );
+
+        io.write_reg(gpu_cmd);
+
+        let op = || Ok(io.read(GPU_IRQ_RAWSTAT));
+        let cond = |status: &GPU_IRQ_RAWSTAT| -> bool { status.clean_caches_completed() };
+        let res =
+            poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
+
+        // Always clear the bit, even on timeout, to leave the next caller
+        // in a known state.
+        io.write(
+            GPU_IRQ_CLEAR,
+            GPU_IRQ_CLEAR::zeroed().with_clean_caches_completed(true),
+        );
+
+        res.map(|_| ())
     }
 }
 
