@@ -161,8 +161,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     pub(crate) gpu_info: GpuInfo,
 
     /// Command stream interface information reported to userspace.
-    #[pin]
-    pub(crate) csif_info: Mutex<gpu::CsifInfo>,
+    pub(crate) csif_info: gpu::CsifInfo,
 }
 
 fn issue_soft_reset(dev: &Device, iomem: &IoMem<'_>) -> Result {
@@ -315,7 +314,7 @@ impl platform::Driver for TyrPlatformDriver {
                         }),
                         iomem,
                         gpu_info,
-                        csif_info <- new_mutex!(csif_info),
+                        csif_info,
                     }),
                 )},
                 _: { dev_dbg!(pdev, "Tyr initialized correctly.") },
