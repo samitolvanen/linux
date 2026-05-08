@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::AtomicU32;
 
 use kernel::{
     alloc::KVec,
@@ -26,13 +26,143 @@ use super::{
     syncs,
 };
 
-const UNBOUND_CSG_ID: usize = usize::MAX;
+/// Upper bound on queues per group, set by the width of the per-queue
+/// bitmasks (`blocked_queues`, `idle_queues`, `fatal_queues`).
+#[expect(dead_code)]
+pub(crate) const MAX_CS_PER_GROUP: usize = 32;
+
+/// The group's lifecycle state.
+#[expect(dead_code)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum State {
+    Created,
+    Active,
+    /// Suspended from a CSG slot; may resume.
+    Suspended,
+    Terminated,
+    /// Unknown state, typically after a firmware error.
+    Unknown,
+}
+
+/// Which scheduler list (idle / runnable / none) a group is currently on.
+#[expect(dead_code)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum GroupListState {
+    None,
+    Idle,
+    Runnable,
+}
+
+/// The mutable scheduler-visible state for a [`Group`].
+///
+/// Protected by the `inner` mutex on [`Group`]; access via
+/// [`Group::with_locked_inner`].
+#[expect(dead_code)]
+pub(crate) struct GroupInner {
+    pub(crate) state: State,
+    pub(crate) list_state: GroupListState,
+    /// CSG slot id when the group is bound, otherwise `None`.
+    pub(crate) csg_id: Option<usize>,
+    blocked_queues: u32,
+    idle_queues: u32,
+    fatal_queues: u32,
+    pub(crate) fatal_error: Option<Error>,
+    // Cached from Group::queues.len(); GroupInner has no borrow of Group.
+    queue_count: usize,
+}
+
+impl GroupInner {
+    /// Returns false if the group is terminated, in an unknown state, or
+    /// has a fatal error recorded.
+    #[expect(dead_code)]
+    pub(crate) fn can_run(&self) -> bool {
+        self.state != State::Terminated
+            && self.state != State::Unknown
+            && self.fatal_error.is_none()
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn blocked_queues(&self) -> u32 {
+        self.blocked_queues
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn has_blocked_queues(&self) -> bool {
+        self.blocked_queues != 0
+    }
+
+    /// Returns true if the queue at `queue_idx` is currently blocked.
+    #[expect(dead_code)]
+    pub(crate) fn is_queue_blocked(&self, queue_idx: usize) -> bool {
+        (self.blocked_queues & (1 << queue_idx)) != 0
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn has_fatal_queues(&self) -> bool {
+        self.fatal_queues != 0
+    }
+
+    pub(crate) fn fatal_queues(&self) -> u32 {
+        self.fatal_queues
+    }
+
+    /// Sets a queue as blocked or unblocked.
+    #[expect(dead_code)]
+    pub(crate) fn set_queue_blocked(&mut self, queue_idx: usize, blocked: bool) {
+        let mask = 1 << queue_idx;
+
+        if blocked {
+            self.blocked_queues |= mask;
+        } else {
+            self.blocked_queues &= !mask;
+        }
+    }
+
+    /// Sets a queue as idle or active.
+    ///
+    /// Returns true if the queue was previously idle.
+    #[expect(dead_code)]
+    pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
+        let mask = 1 << queue_idx;
+        let was_idle = (self.idle_queues & mask) != 0;
+
+        if idle {
+            self.idle_queues |= mask;
+        } else {
+            self.idle_queues &= !mask;
+        }
+
+        was_idle
+    }
+
+    /// Marks a queue as having encountered a fatal error.
+    #[expect(dead_code)]
+    pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
+        if (self.fatal_queues & (1 << queue_idx)) == 0 {
+            self.fatal_queues |= 1 << queue_idx;
+            self.fatal_error = Some(EFAULT);
+        }
+    }
+
+    /// Returns true when every queue is either blocked or idle.
+    #[expect(dead_code)]
+    pub(crate) fn is_idle(&self) -> bool {
+        let inactive_queues = self.blocked_queues | self.idle_queues;
+        inactive_queues.count_ones() == self.queue_count as u32
+    }
+}
 
 #[pin_data]
 pub(crate) struct Group {
-    pub(crate) fatal_queues: AtomicU32,
+    /// The mutable, lock-protected portion of the group state.
+    #[pin]
+    inner: Mutex<GroupInner>,
     pub(crate) tiler_oom: AtomicU32,
-    csg_id: AtomicUsize,
+    /// The group's queues.
+    ///
+    /// The container is immutable for the lifetime of the group; the
+    /// per-queue state inside each [`Queue`] uses interior mutability so
+    /// callers do not need the group's `inner` lock to operate on it.
     pub(crate) queues: KVec<Queue>,
     #[allow(dead_code)]
     pub(super) vm: Arc<Vm>,
@@ -118,11 +248,21 @@ impl Group {
             queues.push(Queue::new(ddev, queue_arg, vm.clone())?, GFP_KERNEL)?;
         }
 
+        let queue_count = queues.len();
+
         Arc::pin_init(
             pin_init!(Self {
-                fatal_queues: AtomicU32::new(0),
+                inner <- new_mutex!(GroupInner {
+                    state: State::Created,
+                    list_state: GroupListState::None,
+                    csg_id: None,
+                    blocked_queues: 0,
+                    idle_queues: 0,
+                    fatal_queues: 0,
+                    fatal_error: None,
+                    queue_count,
+                }),
                 tiler_oom: AtomicU32::new(0),
-                csg_id: AtomicUsize::new(UNBOUND_CSG_ID),
                 queues,
                 vm,
                 priority: group_args.priority,
@@ -141,23 +281,26 @@ impl Group {
         )
     }
 
+    /// Caller must not already hold `inner`.
+    #[expect(dead_code)]
+    pub(crate) fn with_locked_inner<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut GroupInner) -> R,
+    {
+        let mut inner = self.inner.lock();
+        f(&mut inner)
+    }
+
     pub(crate) fn fatal_queues(&self) -> u32 {
-        self.fatal_queues.load(Ordering::Relaxed)
+        self.inner.lock().fatal_queues()
     }
 
     pub(super) fn csg_id(&self) -> Option<usize> {
-        let csg_id = self.csg_id.load(Ordering::Relaxed);
-
-        if csg_id == UNBOUND_CSG_ID {
-            None
-        } else {
-            Some(csg_id)
-        }
+        self.inner.lock().csg_id
     }
 
     pub(super) fn set_csg_id(&self, csg_id: Option<usize>) {
-        self.csg_id
-            .store(csg_id.unwrap_or(UNBOUND_CSG_ID), Ordering::Relaxed);
+        self.inner.lock().csg_id = csg_id;
     }
 
     pub(crate) fn queue_count(&self) -> usize {
