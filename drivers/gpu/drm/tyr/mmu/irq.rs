@@ -7,7 +7,6 @@
 //! human-readable fault reporting to `faults.rs`.
 
 use kernel::{
-    bits::genmask_u32,
     device::Bound,
     io::{
         mem::DevresIoMem,
@@ -33,8 +32,18 @@ use crate::{
         TyrIrqTrait, //
     },
     mmu::faults::decode_faults,
-    regs::mmu_control, //
+    regs::{
+        mmu_control,
+        MAX_AS, //
+    }, //
 };
+
+const PAGE_FAULT_BITS: u16 = ((1u32 << MAX_AS) - 1) as u16;
+
+/// Returns the MMU IRQ sources the driver services.
+fn mmu_irq_sources() -> mmu_control::IRQ_MASK {
+    mmu_control::IRQ_MASK::zeroed().with_page_fault(PAGE_FAULT_BITS)
+}
 
 pub(crate) struct MmuIrq;
 
@@ -49,9 +58,12 @@ pub(crate) unsafe fn mmu_irq_init<'drm>(
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
 ) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>, Error> + 'drm> {
-    iomem
-        .access(pdev.as_ref())?
-        .write_reg(mmu_control::IRQ_MASK::from_raw(u32::MAX));
+    let mask = mmu_irq_sources();
+    let io = iomem.access(pdev.as_ref())?;
+
+    // Drop any latched IRQs from a previous probe.
+    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(mask.into_raw()));
+    io.write_reg(mask);
 
     // SAFETY: The caller guarantees that the registration is not leaked.
     Ok(unsafe { TyrIrq::request(pdev, tdev, c"mmu", iomem, MmuIrq) })
@@ -79,11 +91,11 @@ impl TyrIrqTrait for MmuIrq {
     }
 
     fn mask(&self) -> u32 {
-        u32::MAX
+        mmu_irq_sources().into_raw()
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, io: &IoMem<'_>, status: u32) {
-        let fault_bits = status & genmask_u32(0..=15);
+        let fault_bits = status & u32::from(PAGE_FAULT_BITS);
         if fault_bits != 0 {
             let _ = decode_faults(tdev, fault_bits, io);
         }
