@@ -370,7 +370,10 @@ impl Firmware {
 
     /// Enable the global interface.
     pub(crate) fn enable_global_interface(&self, tdev: &TyrDrmDevice) -> Result {
-        tdev.with_locked_core_clk(|core_clk| self.global_iface.enable(core_clk))
+        // Drop the clks lock before enable(), which can block on
+        // firmware ack waits for up to a second.
+        let core_clk_rate = tdev.with_locked_core_clk(|core_clk| core_clk.rate().as_hz() as u64);
+        self.global_iface.enable(core_clk_rate)
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
