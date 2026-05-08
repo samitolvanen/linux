@@ -115,9 +115,7 @@ impl Pools {
         let pool = Arc::new(Pool::create(tdev, vm)?, GFP_KERNEL)?;
         let xa = self.entries.as_ref();
         let mut guard = xa.lock();
-        guard
-            .store(vm_id, pool.clone(), GFP_KERNEL)
-            .map_err(|_| EINVAL)?;
+        guard.store(vm_id, pool.clone(), GFP_KERNEL)?;
 
         Ok(pool)
     }
@@ -271,9 +269,7 @@ impl Pool {
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
-        guard
-            .store(index, heap_ctx, GFP_KERNEL)
-            .map_err(|_| EINVAL)?;
+        guard.store(index, heap_ctx, GFP_KERNEL)?;
 
         Ok(CreatedContext {
             context_id: index,
