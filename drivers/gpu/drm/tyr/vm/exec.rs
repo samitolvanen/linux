@@ -5,14 +5,8 @@
 use kernel::{
     bindings::drm_gpuvm_exec,
     dma_buf::dma_fence::PublicDmaFence,
-    drm::gpuvm::{
-        DriverGpuVm,
-        GpuVm,
-    },
-    error::{
-        Result,
-        to_result,
-    },
+    drm::gpuvm::{DriverGpuVm, GpuVm},
+    error::{to_result, Result},
     prelude::*,
 };
 

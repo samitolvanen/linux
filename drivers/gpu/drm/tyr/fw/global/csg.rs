@@ -6,34 +6,15 @@
 //! firmware global interface. It keeps the CSG-to-CS discovery and suspend-size
 //! queries out of the older monolithic interfaces file.
 
-use kernel::{
-    io::Io,
-    prelude::*,
-};
+use kernel::{io::Io, prelude::*};
 
-use super::{
-    cs::CsInterface,
-    SharedSectionInfo,
-};
+use super::{cs::CsInterface, SharedSectionInfo};
 use crate::fw::{
     interfaces::{
-        CSG_ACK,
-        CSG_CONTROL_BLOCK_SIZE,
-        CSG_DB_ACK,
-        CSG_DB_REQ,
-        CSG_INPUT_BLOCK_SIZE,
-        CSG_IRQ_ACK,
-        CSG_IRQ_REQ,
-        CSG_OUTPUT_BLOCK_SIZE,
-        CSG_REQ,
-        FwInterface,
-        GROUP_INPUT_VA,
-        GROUP_OUTPUT_VA,
-        GROUP_PROTM_SUSPEND_SIZE,
-        GROUP_STREAM_NUM,
-        GROUP_STREAM_STRIDE,
-        GROUP_SUSPEND_SIZE,
-        CS_CONTROL_BLOCK_SIZE,
+        FwInterface, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_DB_ACK, CSG_DB_REQ, CSG_INPUT_BLOCK_SIZE,
+        CSG_IRQ_ACK, CSG_IRQ_REQ, CSG_OUTPUT_BLOCK_SIZE, CSG_REQ, CS_CONTROL_BLOCK_SIZE,
+        GROUP_INPUT_VA, GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM,
+        GROUP_STREAM_STRIDE, GROUP_SUSPEND_SIZE,
     },
     MAX_CS,
 };
@@ -78,12 +59,11 @@ impl CsgInterface {
         let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
         let csg_control_va = shared_section.va_range.start + csg_control_offset as u64;
 
-        let csg_control =
-            FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(
-                &shared_section.vmap,
-                &shared_section.va_range,
-                csg_control_va,
-            )?;
+        let csg_control = FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(
+            &shared_section.vmap,
+            &shared_section.va_range,
+            csg_control_va,
+        )?;
 
         let input_va = csg_control.read(GROUP_INPUT_VA).value().get();
         let csg_input = FwInterface::<CSG_INPUT_BLOCK_SIZE>::new(
@@ -139,7 +119,12 @@ impl CsgInterface {
 
         for cs_idx in 0..enabled.cs_num {
             let mut cs = CsInterface::new(cs_idx)?;
-            cs.enable(shared_section, csg_control_offset, cs_idx, enabled.cs_stride)?;
+            cs.enable(
+                shared_section,
+                csg_control_offset,
+                cs_idx,
+                enabled.cs_stride,
+            )?;
             enabled.cs.push(cs, GFP_KERNEL)?;
         }
 

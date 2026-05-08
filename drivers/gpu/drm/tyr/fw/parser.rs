@@ -15,10 +15,7 @@ use core::{
 };
 
 use kernel::{
-    bits::{
-        bit_u32,
-        genmask_u32,
-    },
+    bits::{bit_u32, genmask_u32},
     impl_flags,
     prelude::*,
     str::CString, //
@@ -335,7 +332,10 @@ impl<'a> FwParser<'a> {
         Ok(data)
     }
 
-    fn parse_section_entry(entry_cursor: &mut Cursor<'_>, fw_data: &[u8]) -> Result<Option<ParsedSection>> {
+    fn parse_section_entry(
+        entry_cursor: &mut Cursor<'_>,
+        fw_data: &[u8],
+    ) -> Result<Option<ParsedSection>> {
         let section_hdr: SectionHeader = SectionHeader::new(entry_cursor)?;
 
         if section_hdr.data.end < section_hdr.data.start {

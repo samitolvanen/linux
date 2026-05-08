@@ -8,30 +8,18 @@
 
 use kernel::{
     c_str,
-    device::{
-        Bound,
-        Device,
-    },
+    device::{Bound, Device},
     devres::Devres,
     io::Io,
     irq::ThreadedRegistration,
     platform,
     prelude::*,
-    sync::{
-        aref::ARef,
-        Arc,
-    },
+    sync::{aref::ARef, Arc},
 };
 
 use crate::{
-    driver::{
-        IoMem,
-        TyrDrmDevice,
-    },
-    irq::{
-        TyrIrq,
-        TyrIrqTrait,
-    },
+    driver::{IoMem, TyrDrmDevice},
+    irq::{TyrIrq, TyrIrqTrait},
     mmu::faults::decode_faults,
     regs::mmu_control,
 };
