@@ -8,6 +8,10 @@ use crate::{
     alloc::allocator::Kmalloc,
     bindings,
     device,
+    dma_buf::dma_fence::{
+        DmaFenceDelayedWorkItem,
+        DmaFenceWorkItem, //
+    },
     drm::{
         self,
         driver::AllocImpl,
@@ -489,4 +493,40 @@ where
     T: drm::Driver,
     T::Data: HasDelayedWork<Device<T>, ID>,
 {
+}
+
+// Dma-fence-constrained mirror of the `WorkItem<ID> for Device<T>` shim
+// above. Drivers implement `T::Data: DmaFenceWorkItem<ID>`; this forwards
+// `Device<T>: DmaFenceWorkItem<ID>` to the data type so
+// `RawDmaFenceWorkItem<ARef<Device<T>>>` resolves and the device handle
+// can be enqueued onto a `DmaFenceWorkqueue`.
+impl<T, const ID: u64> DmaFenceWorkItem<ID> for Device<T>
+where
+    T: drm::Driver,
+    T::Data: DmaFenceWorkItem<ID, Pointer = ARef<Device<T>>>,
+    T::Data: WorkItem<ID, Pointer = ARef<Device<T>>>,
+    T::Data: HasWork<Device<T>, ID>,
+{
+    type Pointer = ARef<Device<T>>;
+
+    fn run(ptr: ARef<Device<T>>) {
+        <T::Data as DmaFenceWorkItem<ID>>::run(ptr);
+    }
+}
+
+// Delayed-work variant of the shim above. Forwards
+// `Device<T>: DmaFenceDelayedWorkItem<ID>` to the data type so
+// `RawDmaFenceDelayedWorkItem<ARef<Device<T>>>` resolves.
+impl<T, const ID: u64> DmaFenceDelayedWorkItem<ID> for Device<T>
+where
+    T: drm::Driver,
+    T::Data: DmaFenceDelayedWorkItem<ID, Pointer = ARef<Device<T>>>,
+    T::Data: WorkItem<ID, Pointer = ARef<Device<T>>>,
+    T::Data: HasDelayedWork<Device<T>, ID>,
+{
+    type Pointer = ARef<Device<T>>;
+
+    fn run(ptr: ARef<Device<T>>) {
+        <T::Data as DmaFenceDelayedWorkItem<ID>>::run(ptr);
+    }
 }
