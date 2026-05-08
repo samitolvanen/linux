@@ -40,7 +40,7 @@ use kernel::{
     },
     new_mutex,
     of,
-    platform,
+    platform, //
     prelude::*,
     regulator,
     regulator::Regulator,
@@ -50,8 +50,18 @@ use kernel::{
         Arc,
         Mutex, //
     },
-    time, //
-    workqueue::{Work, WqFlags},
+    time::{
+        self,
+        Jiffies, //
+    },
+    workqueue::{
+        self,
+        impl_has_delayed_work,
+        DelayedWork,
+        Work,
+        WorkItem,
+        WqFlags, //
+    },
 };
 
 use crate::{
@@ -83,8 +93,12 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, 
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
 pub(crate) mod work_id {
+    /// Scheduler tick worker.
+    pub(crate) const TICK: u64 = 1;
     /// Firmware-event drain worker.
     pub(crate) const FW_EVENTS: u64 = 2;
+    /// Periodic re-arming of the scheduler tick.
+    pub(crate) const PERIODIC_TICK: u64 = 4;
     /// Tiler heap out-of-memory growth worker.
     pub(crate) const TILER_OOM: u64 = 5;
 }
@@ -151,6 +165,17 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
+    /// Scheduler tick worker. Enqueued on [`sched_wq`](Self::sched_wq).
+    #[pin]
+    tick_work: DmaFenceWork<TyrDrmDevice, { work_id::TICK }>,
+
+    /// Periodic re-arm worker for [`tick_work`](Self::tick_work).
+    ///
+    /// Enqueued on `system_unbound()` rather than [`sched_wq`](Self::sched_wq)
+    /// so a long-delay timer expiry does not hold a scheduler worker.
+    #[pin]
+    periodic_tick_work: DelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }>,
+
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 }
@@ -199,10 +224,42 @@ impl TyrDrmDeviceData {
             .sched_wq
             .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
     }
+
+    /// Schedules an immediate scheduler tick on
+    /// [`sched_wq`](Self::sched_wq).
+    ///
+    /// Safe to call from any context including the threaded IRQ
+    /// handler. Repeated calls coalesce in the workqueue: a second
+    /// `schedule_tick` while a tick is already pending is a no-op.
+    pub(crate) fn schedule_tick(tdev: &ARef<TyrDrmDevice>) {
+        let _ = tdev
+            .sched_wq
+            .enqueue::<ARef<TyrDrmDevice>, { work_id::TICK }>(tdev.clone());
+    }
+
+    /// Re-arms the scheduler tick `delay` jiffies from now.
+    ///
+    /// If a periodic tick is already pending, `delay` is ignored:
+    /// `queue_delayed_work_on` will not shorten an in-flight delay.
+    /// To force an earlier tick, call [`schedule_tick`](Self::schedule_tick)
+    /// directly.
+    #[expect(dead_code)]
+    pub(crate) fn schedule_periodic_tick(tdev: &ARef<TyrDrmDevice>, delay: Jiffies) {
+        let _ = workqueue::system_unbound()
+            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
+    }
 }
 
 impl_has_dma_fence_work! {
     impl HasDmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }> for TyrDrmDeviceData { self.fw_events_work }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::TICK }> for TyrDrmDeviceData { self.tick_work }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }> for TyrDrmDeviceData { self.periodic_tick_work }
 }
 
 impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
@@ -230,6 +287,20 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             let _ = kernel::workqueue::system()
                 .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this);
         }
+    }
+}
+
+impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(_this: Self::Pointer) {}
+}
+
+impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        Self::schedule_tick(&this);
     }
 }
 
@@ -343,6 +414,8 @@ impl platform::Driver for TyrPlatformDriverData {
                 sched <- new_mutex!(SchedulerState::Disabled),
                 fw_events: AtomicU32::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
+                tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
+                periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
 
