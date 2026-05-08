@@ -22,14 +22,13 @@ use kernel::{
         aref::ARef,
         Arc, //
     },
-    workqueue,
 };
 
 use crate::{
     driver::{
-        work_id,
         IoMem,
-        TyrDrmDevice, //
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
     },
     irq::{TyrIrq, TyrIrqTrait},
     new_wait,
@@ -163,19 +162,11 @@ impl TyrIrqTrait for JobIrq {
             });
         }
 
-        let csg_events = JOB_IRQ_RAWSTAT::from_raw(status).csg();
+        // Defer to sleepable context via fw_events_work.
+        let csg_events = *JOB_IRQ_RAWSTAT::from_raw(status).csg();
         if csg_events != 0 {
-            let queued_tiler_oom = tdev
-                .with_locked_scheduler(|sched| sched.process_csg_irqs(*csg_events, tdev))
-                .inspect_err(|err| {
-                    pr_err!("Failed to process firmware CSG IRQs: {:?}\n", err);
-                })
-                .unwrap_or(false);
-
-            if queued_tiler_oom {
-                let _ = workqueue::system()
-                    .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(ARef::from(tdev));
-            }
+            tdev.fw_events_or(csg_events);
+            TyrDrmDeviceData::schedule_fw_events(&ARef::from(tdev));
         }
 
         self.state.handle(status);

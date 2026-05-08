@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::sync::atomic::{
+    AtomicU32,
+    Ordering, //
+};
+
 use kernel::{
     clk::{
         Clk,
@@ -16,7 +21,13 @@ use kernel::{
         Device as DmaDevice,
         DmaMask, //
     },
-    dma_buf::dma_fence::DmaFenceWorkqueue,
+    dma_buf::dma_fence::{
+        impl_has_dma_fence_work,
+        new_dma_fence_work,
+        DmaFenceWork,
+        DmaFenceWorkItem,
+        DmaFenceWorkqueue, //
+    },
     drm,
     drm::{
         driver::Registration,
@@ -76,6 +87,8 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, 
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
 pub(crate) mod work_id {
+    /// Firmware-event drain worker.
+    pub(crate) const FW_EVENTS: u64 = 2;
     /// Tiler heap out-of-memory growth worker.
     pub(crate) const TILER_OOM: u64 = 5;
 }
@@ -162,6 +175,23 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sched: Mutex<SchedulerState>,
 
+    /// Outstanding firmware-events bits accumulated by IRQ handlers.
+    ///
+    /// Producers OR new status bits in via `fw_events_or` from any
+    /// context; the consumer reads-and-clears with `fw_events_take`.
+    /// This keeps scheduler-mutex work off the threaded IRQ handler.
+    fw_events: AtomicU32,
+
+    /// Worker that drains `fw_events` under the
+    /// scheduler mutex. Enqueued on `sched_wq`.
+    ///
+    /// Typed as `DmaFenceWork` so it can ride on `sched_wq` (a
+    /// `DmaFenceWorkqueue`), not because the body signals dma-fences:
+    /// it only ACKs CSG events. Sharing the queue with the tick worker
+    /// keeps it on `WQ_HIGHPRI` without a second workqueue.
+    #[pin]
+    fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
+
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 }
@@ -181,6 +211,64 @@ impl TyrDrmDeviceData {
     {
         let mut sched = self.sched.lock();
         f(sched.enabled_mut()?)
+    }
+
+    /// Accumulates `bits` into the firmware-events word.
+    ///
+    /// Safe to call from any context, including threaded IRQ handlers.
+    /// `Release` pairs with the `Acquire` in `fw_events_take` so the
+    /// drain side observes any state the producer wrote before raising
+    /// the bit.
+    pub(crate) fn fw_events_or(&self, bits: u32) {
+        self.fw_events.fetch_or(bits, Ordering::Release);
+    }
+
+    /// Atomically reads and clears the firmware-events word, returning
+    /// the bits that were set.
+    pub(crate) fn fw_events_take(&self) -> u32 {
+        self.fw_events.swap(0, Ordering::Acquire)
+    }
+
+    /// Schedules the fw-events worker on the scheduler workqueue.
+    ///
+    /// Safe to call from any context including the threaded IRQ
+    /// handler. Repeated calls coalesce in the workqueue.
+    pub(crate) fn schedule_fw_events(tdev: &ARef<TyrDrmDevice>) {
+        let _ = tdev
+            .sched_wq
+            .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
+    }
+}
+
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }> for TyrDrmDeviceData { self.fw_events_work }
+}
+
+impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        let tdev = &*this;
+
+        let events = tdev.fw_events_take();
+        if events == 0 {
+            return;
+        }
+
+        let queued_tiler_oom = tdev
+            .with_locked_scheduler(|sched| sched.process_csg_irqs(events, tdev))
+            .inspect_err(|err| {
+                pr_err!(
+                    "fw_events_work: failed to process firmware CSG IRQs: {:?}\n",
+                    err
+                );
+            })
+            .unwrap_or(false);
+
+        if queued_tiler_oom {
+            let _ = kernel::workqueue::system()
+                .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this);
+        }
     }
 }
 
@@ -303,6 +391,8 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 sched <- new_mutex!(SchedulerState::Disabled),
+                fw_events: AtomicU32::new(0),
+                fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
 
