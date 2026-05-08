@@ -21,11 +21,27 @@ use crate::{
     driver::{IoMem, TyrDrmDevice},
     irq::{TyrIrq, TyrIrqTrait},
     mmu::faults::decode_faults,
-    regs::mmu_control,
+    regs::{
+        mmu_control,
+        MAX_AS, //
+    },
 };
+
+/// Bit mask covering the per-AS PAGE_FAULT bits (one per address space).
+const PAGE_FAULT_BITS: u16 = ((1u32 << MAX_AS) - 1) as u16;
+
+/// Per-AS PAGE_FAULT bits, one bit per address space.
+pub(crate) fn mmu_interrupts_mask() -> u32 {
+    mmu_control::IRQ_MASK::zeroed()
+        .with_page_fault(PAGE_FAULT_BITS)
+        .into_raw()
+}
 
 pub(crate) struct MmuIrq {
     iomem: Arc<Devres<IoMem>>,
+    /// Cached value of [`mmu_interrupts_mask`] so the per-interrupt
+    /// `mask()` does not rebuild it on every call.
+    mask: u32,
 }
 
 pub(crate) fn mmu_irq_init<'a>(
@@ -33,13 +49,14 @@ pub(crate) fn mmu_irq_init<'a>(
     pdev: &'a platform::Device<Bound>,
     iomem: Arc<Devres<IoMem>>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<MmuIrq>>, Error> + 'a> {
-    // SAFETY: `pdev` is already bound, so reborrowing the underlying bound
-    // device reference is valid for the duration of this initialization call.
-    let dev = unsafe { pdev.as_ref().as_bound() };
-    let io = iomem.access(dev)?;
-    io.write_reg(mmu_control::IRQ_MASK::from_raw(u32::MAX));
+    let mask = mmu_interrupts_mask();
+    let io = iomem.access(pdev.as_ref())?;
+    // Drop any latched IRQs from a previous probe.
+    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(u32::MAX));
+    io.write_reg(mmu_control::IRQ_MASK::from_raw(mask));
 
-    TyrIrq::request(pdev, tdev, c_str!("mmu"), MmuIrq { iomem })
+    let irq_type = MmuIrq { iomem, mask };
+    TyrIrq::request(pdev, tdev, c_str!("mmu"), irq_type)
 }
 
 impl TyrIrqTrait for MmuIrq {
@@ -76,11 +93,11 @@ impl TyrIrqTrait for MmuIrq {
     }
 
     fn mask(&self) -> u32 {
-        u32::MAX
+        self.mask
     }
 
     fn handle(&self, _: &TyrDrmDevice, status: u32) {
-        let fault_bits = status & kernel::bits::genmask_u32(0..=15);
+        let fault_bits = status & u32::from(PAGE_FAULT_BITS);
         if fault_bits != 0 {
             let _ = decode_faults(fault_bits, &self.iomem);
         }
