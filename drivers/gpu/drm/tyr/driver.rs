@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::sync::atomic::{
+    AtomicU32,
+    Ordering, //
+};
+
 use kernel::{
     clk::{
         Clk,
@@ -121,6 +126,16 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sched: Mutex<SchedulerState>,
 
+    /// Outstanding firmware-events bits accumulated by IRQ handlers.
+    ///
+    /// Producers OR new status bits in via [`fw_events_or`] from any
+    /// context; the consumer reads-and-clears with [`fw_events_take`].
+    /// This keeps scheduler-mutex work off the threaded IRQ handler.
+    ///
+    /// [`fw_events_or`]: TyrDrmDeviceData::fw_events_or
+    /// [`fw_events_take`]: TyrDrmDeviceData::fw_events_take
+    fw_events: AtomicU32,
+
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 }
@@ -140,6 +155,26 @@ impl TyrDrmDeviceData {
     {
         let mut sched = self.sched.lock();
         f(sched.enabled_mut()?)
+    }
+
+    /// Accumulates `bits` into the firmware-events word.
+    ///
+    /// Safe to call from any context, including threaded IRQ handlers.
+    /// `Release` pairs with the `Acquire` in [`fw_events_take`] so the
+    /// drain side observes any state the producer wrote before raising
+    /// the bit.
+    ///
+    /// [`fw_events_take`]: TyrDrmDeviceData::fw_events_take
+    #[expect(dead_code)]
+    pub(crate) fn fw_events_or(&self, bits: u32) {
+        self.fw_events.fetch_or(bits, Ordering::Release);
+    }
+
+    /// Atomically reads and clears the firmware-events word, returning
+    /// the bits that were set.
+    #[expect(dead_code)]
+    pub(crate) fn fw_events_take(&self) -> u32 {
+        self.fw_events.swap(0, Ordering::Acquire)
     }
 }
 
@@ -251,6 +286,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 sched <- new_mutex!(SchedulerState::Disabled),
+                fw_events: AtomicU32::new(0),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
 
