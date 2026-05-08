@@ -419,6 +419,37 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
 
         Ok(())
     }
+
+    /// Returns the per-slot driver data for `slot_idx`.
+    ///
+    /// Returns `Some(&data)` when the slot is allocated to a group
+    /// (states [`Slot::Active`] and [`Slot::Idle`]), and `None` when
+    /// the index is out of range or the slot has no group assigned.
+    #[expect(dead_code)]
+    pub(crate) fn slot_data(&self, slot_idx: usize) -> Option<&T::SlotData> {
+        if slot_idx >= self.slot_count {
+            return None;
+        }
+        match &self.slots[slot_idx] {
+            Slot::Active(info) | Slot::Idle(info) => Some(&info.slot_data),
+            _ => None,
+        }
+    }
+
+    /// Returns the per-slot driver data for `slot_idx`.
+    ///
+    /// Same semantics as [`SlotManager::slot_data`] but yields a `&mut`
+    /// reference.
+    #[expect(dead_code)]
+    pub(crate) fn slot_data_mut(&mut self, slot_idx: usize) -> Option<&mut T::SlotData> {
+        if slot_idx >= self.slot_count {
+            return None;
+        }
+        match &mut self.slots[slot_idx] {
+            Slot::Active(info) | Slot::Idle(info) => Some(&mut info.slot_data),
+            _ => None,
+        }
+    }
 }
 
 impl<T: SlotOperations, const MAX_SLOTS: usize> Deref for SlotManager<T, MAX_SLOTS> {
