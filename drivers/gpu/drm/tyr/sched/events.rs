@@ -21,6 +21,10 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
+    fw::{
+        CsFaultExceptionType,
+        CSG_REQ, //
+    },
     heap,
 };
 
@@ -127,7 +131,32 @@ impl Scheduler {
             }
         };
 
+        let pending_mask =
+            CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
+
+        let progress_event = tdev.fw.with_csg_mut(csg_id, |csg| {
+            let req = csg.read_input_req()?.into_raw();
+            let ack = csg.read_output_ack()?.into_raw();
+            let pending = (req ^ ack) & pending_mask;
+            if pending != 0 {
+                csg.update_input_req(ack & pending, pending)?;
+            }
+            Ok(pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0)
+        })?;
+
+        if progress_event {
+            // Progress-timer expiry: the firmware-imposed forward-progress
+            // window elapsed without the group advancing.
+            group.with_locked_inner(|inner| {
+                if inner.fatal_error.is_none() {
+                    inner.fatal_error = Some(ETIMEDOUT);
+                }
+            });
+        }
+
         let mut queued_tiler_oom = false;
+        let mut cs_fatal_mask: u32 = 0;
+        let mut cs_inherit_fault_mask: u32 = 0;
         tdev.fw.with_csg_mut(csg_id, |csg| {
             let irq_req = csg.read_output_irq_req()?.mask();
             let irq_ack = csg.read_input_irq_ack()?;
@@ -155,10 +184,58 @@ impl Scheduler {
                     group.tiler_oom.fetch_or(1u32 << cs_id, Ordering::Relaxed);
                     queued_tiler_oom = true;
                 }
+
+                let fatal_event = input_req.fatal() != output_ack.fatal() && output_ack.fatal();
+                let fault_event = input_req.fault() != output_ack.fault() && output_ack.fault();
+
+                if fatal_event {
+                    let _ = cs.decode_fatal(csg_id, cs_id)?;
+                    cs_fatal_mask |= 1u32 << cs_id;
+                }
+
+                if fault_event {
+                    if cs.decode_fault(csg_id, cs_id)?
+                        == CsFaultExceptionType::CsInheritFault as u32
+                    {
+                        cs_inherit_fault_mask |= 1u32 << cs_id;
+                    }
+                }
+
+                if fatal_event || fault_event {
+                    let new_req = input_req
+                        .with_fatal(output_ack.fatal())
+                        .with_fault(output_ack.fault());
+                    cs.write_input_req(new_req);
+                }
             }
 
             Ok(())
         })?;
+
+        if cs_fatal_mask != 0 {
+            group.with_locked_inner(|inner| {
+                let mut mask = cs_fatal_mask;
+                while mask != 0 {
+                    let cs_id = mask.trailing_zeros() as usize;
+                    mask &= !(1u32 << cs_id);
+                    inner.set_queue_fatal(cs_id);
+                }
+            });
+        }
+
+        let mut mask = cs_inherit_fault_mask;
+        while mask != 0 {
+            let cs_id = mask.trailing_zeros() as usize;
+            mask &= !(1u32 << cs_id);
+            if let Some(queue) = group.queues.get(cs_id) {
+                queue.fail_inflight_submit_fences(EINVAL)?;
+            }
+        }
+
+        if cs_fatal_mask != 0 {
+            let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
+            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+        }
 
         Ok(queued_tiler_oom)
     }
