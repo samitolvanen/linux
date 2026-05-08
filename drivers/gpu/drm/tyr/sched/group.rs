@@ -6,6 +6,13 @@ use kernel::{
     alloc::KVec,
     drm::gem::BaseObject,
     io::Io,
+    list::{
+        impl_list_arc_safe,
+        impl_list_item,
+        AtomicTracker,
+        ListLinks,
+        TryNewListArc, //
+    },
     new_mutex,
     prelude::*,
     sync::{Arc, Mutex},
@@ -169,6 +176,14 @@ pub(crate) struct Group {
     /// per-queue state inside each [`Queue`] uses interior mutability so
     /// callers do not need the group's `inner` lock to operate on it.
     pub(crate) queues: KVec<Queue>,
+    #[pin]
+    pub(crate) links: ListLinks,
+    #[pin]
+    pub(crate) tracker: AtomicTracker<0>,
+    #[pin]
+    pub(crate) wait_links: ListLinks<1>,
+    #[pin]
+    pub(crate) wait_tracker: AtomicTracker<1>,
     #[allow(dead_code)]
     pub(super) vm: Arc<Vm>,
     /// Software-visible scheduling priority.
@@ -192,6 +207,30 @@ pub(crate) struct Group {
     _syncobjs: Arc<gem::MappedBo>,
     #[pin]
     heap_pool: Mutex<Option<Arc<heap::Pool>>>,
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<0> for Group {
+        tracked_by tracker: AtomicTracker<0>;
+    }
+}
+
+impl_list_item! {
+    impl ListItem<0> for Group {
+        using ListLinks { self.links };
+    }
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<1> for Group {
+        tracked_by wait_tracker: AtomicTracker<1>;
+    }
+}
+
+impl_list_item! {
+    impl ListItem<1> for Group {
+        using ListLinks { self.wait_links };
+    }
 }
 
 impl Group {
@@ -271,6 +310,10 @@ impl Group {
                 }),
                 tiler_oom: AtomicU32::new(0),
                 queues,
+                links <- ListLinks::new(),
+                tracker <- AtomicTracker::new(),
+                wait_links <- ListLinks::new(),
+                wait_tracker <- AtomicTracker::new(),
                 vm,
                 priority,
                 compute_core_mask: group_args.compute_core_mask,
