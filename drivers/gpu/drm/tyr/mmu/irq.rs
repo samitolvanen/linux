@@ -25,7 +25,8 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice, //
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
     },
     irq::{
         TyrIrq,
@@ -98,6 +99,7 @@ impl TyrIrqTrait for MmuIrq {
         let fault_bits = status & u32::from(PAGE_FAULT_BITS);
         if fault_bits != 0 {
             let _ = decode_faults(tdev, fault_bits, io);
+            TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
         }
     }
 }
