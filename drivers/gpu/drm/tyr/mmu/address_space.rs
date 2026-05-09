@@ -503,18 +503,6 @@ impl AddressSpaceManager {
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)
     }
 
-    /// Flushes GPU caches for an AS slot.
-    ///
-    /// Issues the global GPU cache flush command. No AS lock is taken.
-    fn as_flush(&mut self, as_nr: usize) -> Result {
-        self.validate_as_slot(as_nr)?;
-        self.gpu_flush_caches(
-            FlushMode::CleanInvalidate,
-            FlushMode::CleanInvalidate,
-            FlushMode::Invalidate,
-        )
-    }
-
     /// Issues the GPU-side `flush_caches` command and waits for completion.
     ///
     /// The completion bit is cleared before and after polling so each call
@@ -582,23 +570,6 @@ impl AsSlotManager {
             Some(slot) => {
                 let as_nr = slot as usize;
                 self.as_end_update(as_nr)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Flushes translation table cache if the VM has an active slot.
-    ///
-    /// If the VM is currently assigned to a hardware slot, invalidates cached
-    /// translation table entries to ensure subsequent GPU accesses use updated translations.
-    ///
-    /// If the VM is not resident in a hardware slot, this is a no-op.
-    pub(super) fn flush_vm(&mut self, vm: &VmAsData) -> Result {
-        let seat = vm.as_seat.access(self);
-        match seat.slot() {
-            Some(slot) => {
-                let as_nr = slot as usize;
-                self.as_flush(as_nr)
             }
             _ => Ok(()),
         }

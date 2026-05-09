@@ -528,10 +528,6 @@ impl Drop for PtUpdateContext<'_> {
         if let Err(e) = self.mmu.end_vm_update(self.as_data) {
             pr_err!("Failed to end VM update {:?}\n", e);
         }
-
-        if let Err(e) = self.mmu.flush_vm(self.as_data) {
-            pr_err!("Failed to flush VM {:?}\n", e);
-        }
     }
 }
 
