@@ -3,6 +3,7 @@
 use core::{
     ops::{Deref, Range},
     sync::atomic::{
+        AtomicBool,
         AtomicI64,
         AtomicU64,
         AtomicUsize,
@@ -122,6 +123,72 @@ struct PendingSubmitFence {
     fence: DriverDmaFence<QueueFenceData, Published>,
 }
 
+/// State protected by the pending-submit-fences mutex.
+///
+/// `vec` carries the live ordered list of in-flight per-job fences.
+/// `outstanding` counts reservations made by
+/// [`Queue::reserve_pending_submit_fence`] whose [`PendingFenceReservation`]
+/// guard has not yet been consumed or dropped.
+///
+/// Tracking `outstanding` separately is what makes multiple consecutive
+/// reserves accumulate space. `KVec::reserve(additional)` only ensures
+/// `capacity - len >= additional` at the moment of the call, so without
+/// `outstanding` the second of two back-to-back reserves on an empty
+/// vec would observe `capacity - len == 1` already, do nothing, and
+/// the matching second push would fail `push_within_capacity` from
+/// inside the dma-fence signalling section that wraps the submit path.
+struct PendingFences {
+    vec: KVec<PendingSubmitFence>,
+    outstanding: usize,
+}
+
+/// RAII guard for a pending-submit-fence reservation.
+pub(in crate::sched) struct PendingFenceReservation {
+    queue: Arc<QueueData>,
+    consumed: AtomicBool,
+}
+
+impl PendingFenceReservation {
+    fn new(queue: Arc<QueueData>) -> Self {
+        Self {
+            queue,
+            consumed: AtomicBool::new(false),
+        }
+    }
+
+    /// Pushes `fence` into the queue's pending list, consuming this reservation.
+    fn consume(
+        &self,
+        completion_point: u64,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
+        let pending_fence = PendingSubmitFence {
+            completion_point,
+            fence,
+        };
+
+        let mut pending = self.queue.pending_submit_fences.lock();
+        match pending.vec.push_within_capacity(pending_fence) {
+            Ok(()) => {
+                pending.outstanding = pending.outstanding.saturating_sub(1);
+                self.consumed.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => Err((EINVAL, err.0.fence)),
+        }
+    }
+}
+
+impl Drop for PendingFenceReservation {
+    fn drop(&mut self) {
+        if *self.consumed.get_mut() {
+            return;
+        }
+        let mut pending = self.queue.pending_submit_fences.lock();
+        pending.outstanding = pending.outstanding.saturating_sub(1);
+    }
+}
+
 /// Per-queue snapshot of the active GPU sync-wait. Populated when the
 /// firmware reports `BlockedReason::SyncWait` for the queue's CS.
 ///
@@ -184,15 +251,22 @@ pub(super) struct QueueJob {
     /// [`TyrQueueOps::submit`] to reach the scheduler workqueue when
     /// no CSG doorbell has been assigned to the queue yet.
     pub(super) group: Arc<Group>,
+    /// Reserved at prepare time, consumed in submit, rolled back on drop.
+    reservation: Option<PendingFenceReservation>,
 }
 
 impl QueueJob {
-    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>) -> Self {
+    pub(super) fn new(
+        stream: KVec<u8>,
+        group: Arc<Group>,
+        reservation: Option<PendingFenceReservation>,
+    ) -> Self {
         Self {
             stream,
             completion_point: AtomicU64::new(0),
             baseline_suspend_nanos: AtomicI64::new(0),
             group,
+            reservation,
         }
     }
 
@@ -246,7 +320,7 @@ pub(crate) struct QueueData {
     next_seqno: AtomicU64,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
-    pending_submit_fences: Mutex<KVec<PendingSubmitFence>>,
+    pending_submit_fences: Mutex<PendingFences>,
     /// Active GPU sync-wait captured for this queue. The `Default`
     /// value (`gpu_va == 0`) means no wait is currently active.
     #[pin]
@@ -379,41 +453,14 @@ impl QueueData {
         )
     }
 
-    fn reserve_pending_submit_fence(&self) -> Result {
-        self.pending_submit_fences
-            .lock()
-            .reserve(1, GFP_KERNEL)
-            .map_err(Error::from)
-    }
-
-    fn add_pending_submit_fence(
-        &self,
-        completion_point: u64,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> core::result::Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
-        let pending_fence = PendingSubmitFence {
-            completion_point,
-            fence,
-        };
-
-        match self
-            .pending_submit_fences
-            .lock()
-            .push_within_capacity(pending_fence)
-        {
-            Ok(()) => Ok(()),
-            Err(err) => Err((EINVAL, err.0.fence)),
-        }
-    }
-
     fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
         loop {
             let pending_fence = {
                 let mut pending = self.pending_submit_fences.lock();
 
-                match pending.first() {
+                match pending.vec.first() {
                     Some(pending_fence) if pending_fence.completion_point <= completion_point => {
-                        pending.remove(0).ok()
+                        pending.vec.remove(0).ok()
                     }
                     _ => None,
                 }
@@ -440,7 +487,7 @@ impl QueueData {
             let mut pending = self.pending_submit_fences.lock();
 
             let mut k = 0usize;
-            for entry in pending.iter() {
+            for entry in pending.vec.iter() {
                 if entry.completion_point > up_to {
                     break;
                 }
@@ -458,14 +505,14 @@ impl QueueData {
             // Reverse once so the leading prefix is at the tail; pop
             // returns the original head-first sequence in O(1) each.
             // Reverse the surviving suffix back after the pop loop.
-            pending.reverse();
+            pending.vec.reverse();
             for _ in 0..k {
-                let Some(entry) = pending.pop() else {
+                let Some(entry) = pending.vec.pop() else {
                     break;
                 };
                 let _ = drained.push_within_capacity(entry);
             }
-            pending.reverse();
+            pending.vec.reverse();
 
             drained
         };
@@ -481,14 +528,14 @@ impl QueueData {
             let mut pending = self.pending_submit_fences.lock();
             let mut position = None;
 
-            for (index, pending_fence) in pending.iter().enumerate() {
+            for (index, pending_fence) in pending.vec.iter().enumerate() {
                 if pending_fence.completion_point == completion_point {
                     position = Some(index);
                     break;
                 }
             }
 
-            position.and_then(|index| pending.remove(index).ok())
+            position.and_then(|index| pending.vec.remove(index).ok())
         };
 
         let Some(pending_fence) = pending_fence else {
@@ -527,7 +574,7 @@ impl QueueData {
     pub(in crate::sched) fn fail_inflight_submit_fences(&self, err: Error) -> Result {
         let extract = self.interfaces.read_output()?.extract;
         let mut pending = self.pending_submit_fences.lock();
-        for entry in pending.iter_mut() {
+        for entry in pending.vec.iter_mut() {
             if entry.completion_point > extract {
                 entry.fence.set_error(err);
             }
@@ -723,11 +770,6 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
-        if let Err(err) = self.data.reserve_pending_submit_fence() {
-            fence.signal(Err(err));
-            return Err(err);
-        }
-
         // Fold any in-flight suspend interval into the baseline so it
         // matches the shape the timeout stage uses on the consumer
         // side; subtraction is exact only when both sides fold.
@@ -748,7 +790,12 @@ impl QueueOps for TyrQueueOps {
 
         job.job.set_completion_point(completion_point);
 
-        if let Err((err, fence)) = self.data.add_pending_submit_fence(completion_point, fence) {
+        let Some(reservation) = job.job.reservation.as_ref() else {
+            fence.signal(Err(EINVAL));
+            return Err(EINVAL);
+        };
+
+        if let Err((err, fence)) = reservation.consume(completion_point, fence) {
             fence.signal(Err(err));
             return Err(err);
         }
@@ -891,7 +938,10 @@ impl Queue {
                 doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
                 next_seqno: AtomicU64::new(0),
                 iomem: tdev.iomem.clone(),
-                pending_submit_fences <- new_mutex!(KVec::new()),
+                pending_submit_fences <- new_mutex!(PendingFences {
+                    vec: KVec::new(),
+                    outstanding: 0,
+                }),
                 syncwait <- new_mutex!(SyncWait::default()),
                 suspend_state <- new_mutex!(SuspendState::default()),
             }),
@@ -920,6 +970,21 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
     ) -> Result<PreparedQueueJob> {
         self.job_queue.prepare(job, deps, QueueFenceData)
+    }
+
+    /// Reserves capacity for one pending submit fence and returns an
+    /// RAII guard for the reservation.
+    pub(in crate::sched) fn reserve_pending_submit_fence(&self) -> Result<PendingFenceReservation> {
+        let mut pending = self.data.pending_submit_fences.lock();
+        // Keeps `capacity - len >= outstanding` true once the new
+        // reservation is counted.
+        let additional = pending.outstanding.checked_add(1).ok_or(EOVERFLOW)?;
+        pending
+            .vec
+            .reserve(additional, GFP_KERNEL)
+            .map_err(Error::from)?;
+        pending.outstanding = additional;
+        Ok(PendingFenceReservation::new(self.data.clone()))
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
