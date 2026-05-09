@@ -24,10 +24,20 @@ use kernel::{
     },
     uaccess::UserSlice,
     uapi,
+    workqueue::{
+        self,
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
+    },
 };
 
 use crate::{
-    driver::TyrDrmDevice,
+    driver::{
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
+    },
     file::TyrDrmFile,
     fw::global::csg::Priority,
     gem, heap, pool,
@@ -92,6 +102,15 @@ pub(crate) struct GroupInner {
     pub(crate) fatal_error: Option<Error>,
     // Cached from Group::queues.len(); GroupInner has no borrow of Group.
     queue_count: usize,
+    /// Set once [`Group::schedule_term`] has enqueued the per-group
+    /// [`term_work`](Group::term_work). Latches for the remaining
+    /// lifetime of the group so duplicate enqueues (e.g. from a
+    /// destroy-of-unbound followed by a tick that picks the same
+    /// group up via [`Scheduler::prune_destroyed_groups`]) are
+    /// dropped on the floor.
+    ///
+    /// [`Scheduler::prune_destroyed_groups`]: crate::sched::Scheduler::prune_destroyed_groups
+    term_scheduled: bool,
 }
 
 impl GroupInner {
@@ -212,6 +231,26 @@ pub(crate) struct Group {
     /// per-queue state inside each [`Queue`] uses interior mutability so
     /// callers do not need the group's `inner` lock to operate on it.
     pub(crate) queues: KVec<Queue>,
+    /// Worker that drives [`Group::cancel_queues`] off
+    /// `system_unbound()`.
+    ///
+    /// Enqueued by [`Group::schedule_term`] when the tick lifecycle
+    /// evicts a group whose `can_run()` is false (fatal error, user
+    /// destroy, timeout). The body does not carry an outer
+    /// [`DmaFenceSignallingAnnotation`]: dropping the last
+    /// `Arc<Group>` reference at the end of the run cascades into
+    /// [`MappedUserBo`]'s drop, which in turn drops the
+    /// [`VMap`](kernel::drm::gem::shmem::VMap) that wraps the
+    /// per-queue syncwait buffer and acquires `dma_resv_lock`. An
+    /// outer signalling annotation would forbid that. The per-fence
+    /// signalling inside the body opens its own local annotation
+    /// per signal call, satisfying the dma-fence signalling-section
+    /// rules.
+    ///
+    /// [`DmaFenceSignallingAnnotation`]: kernel::dma_buf::dma_fence::DmaFenceSignallingAnnotation
+    /// [`MappedUserBo`]: crate::gem::MappedUserBo
+    #[pin]
+    term_work: Work<Group, 1>,
     #[pin]
     pub(crate) links: ListLinks,
     #[pin]
@@ -343,11 +382,13 @@ impl Group {
                     fatal_queues: 0,
                     fatal_error: None,
                     queue_count,
+                    term_scheduled: false,
                 }),
                 tiler_oom: AtomicU32::new(0),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
+                term_work <- new_work!("tyr-group-term"),
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
                 wait_links <- ListLinks::new(),
@@ -406,6 +447,56 @@ impl Group {
             can_run: inner.can_run(),
             is_idle: inner.is_idle(),
             csg_id: inner.csg_id,
+        }
+    }
+
+    /// Schedules terminal cleanup for the group.
+    ///
+    /// Called by the tick lifecycle for groups whose `can_run()` is
+    /// false at eviction time. Enqueues
+    /// [`term_work`](Self::term_work) on the global
+    /// `system_unbound()` queue; the owning `Arc<Group>` is held by
+    /// the workqueue for the duration of the worker's run, so the
+    /// suspend buffers and syncobj pages stay live until cancellation
+    /// has completed.
+    ///
+    /// Idempotent: a group can be reached by more than one teardown
+    /// path (e.g. a destroy-of-unbound that calls `schedule_term`
+    /// directly, followed by a later tick that picks the same group
+    /// up via [`Scheduler::prune_destroyed_groups`]). Repeat calls are
+    /// dropped via the `term_scheduled` latch in [`GroupInner`].
+    ///
+    /// [`Scheduler::prune_destroyed_groups`]: crate::sched::Scheduler::prune_destroyed_groups
+    pub(crate) fn schedule_term(self: &Arc<Self>) {
+        let already_scheduled = self.with_locked_inner(|inner| {
+            let was = inner.term_scheduled;
+            inner.term_scheduled = true;
+            was
+        });
+        if already_scheduled {
+            return;
+        }
+        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 1>(self.clone());
+    }
+
+    /// Cancels every queue in the group with `err`.
+    ///
+    /// Writes the per-queue terminator syncobj with `status = !0` and
+    /// the highest seqno so GPU-side consumers observe the queue as
+    /// done.
+    pub(crate) fn cancel_queues(self: &Arc<Self>, err: Error) {
+        for (queue_idx, queue) in self.queues.iter().enumerate() {
+            queue.cancel(err);
+
+            let seqno = queue.next_seqno();
+            let _ = self.write_syncobj(
+                queue_idx,
+                syncs::SyncObj64b {
+                    seqno,
+                    status: !0,
+                    pad: 0,
+                },
+            );
         }
     }
 
@@ -569,6 +660,26 @@ impl Group {
     }
 }
 
+impl_has_work! {
+    impl HasWork<Group, 1> for Group {
+        self.term_work
+    }
+}
+
+impl WorkItem<1> for Group {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Self::Pointer) {
+        // Use the error captured at eviction time (fatal fault, user
+        // destroy, or tick timeout); fall back to ECANCELED if none
+        // was recorded.
+        let err = this
+            .with_locked_inner(|inner| inner.fatal_error)
+            .unwrap_or(ECANCELED);
+        this.cancel_queues(err);
+    }
+}
+
 pub(crate) struct Pool(pool::Pool<Group>);
 
 impl Pool {
@@ -684,9 +795,26 @@ impl Pool {
     fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 
-        ddev.with_locked_scheduler(|sched| sched.remove_group(ddev, group))?;
+        let csg_id = group.with_locked_inner(|inner| {
+            inner.fatal_error = Some(ECANCELED);
+            inner.csg_id
+        });
 
         self.0.remove(index)?;
+
+        if csg_id.is_some() {
+            // Bound: the tick observes `can_run() == false`, stages
+            // terminate, evicts, and routes the group through
+            // `schedule_term`.
+            TyrDrmDeviceData::schedule_tick(&ARef::from(ddev));
+        } else {
+            let _ = ddev.with_locked_scheduler(|sched| {
+                sched.detach_destroyed_group(&group);
+                Ok(())
+            });
+            group.schedule_term();
+        }
+
         Ok(())
     }
 

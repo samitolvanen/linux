@@ -203,9 +203,15 @@ impl CsgUpdateContext {
 /// CSG slot operations.
 ///
 /// `activate` programs the static CSG_INPUT registers and stages a
-/// `CSG_REQ.state = Start`; `evict` releases the AS slot. The
-/// firmware-visible `CSG_REQ` write, doorbell ring and ack wait are
-/// driven by [`Scheduler::apply_csg_updates`].
+/// `CSG_REQ.state = Start`. The firmware-visible `CSG_REQ` write,
+/// doorbell ring and ack wait are driven by
+/// [`Scheduler::apply_csg_updates`].
+///
+/// Eviction releases the AS slot; the firmware-visible
+/// `CSG_REQ.state = Terminate` is staged by the tick worker (see
+/// `Tick::halt_and_unbind_evicted_groups`) and applied with the
+/// scheduler mutex dropped before this callback runs, so the
+/// callback itself just tears the binding down.
 pub(crate) struct CsgSlotOps {
     fw: Arc<fw::Firmware>,
 }
@@ -446,37 +452,6 @@ impl Scheduler {
         });
 
         self.idle_groups[priority].push_back(list_arc);
-        Ok(())
-    }
-
-    pub(crate) fn remove_group(&mut self, tdev: &TyrDrmDevice, group: Arc<Group>) -> Result {
-        let mut slot_manager = tdev.csg_slot_manager.lock();
-
-        if group.csg_seat.access(&slot_manager).slot().is_some() {
-            for queue in group.queues.iter() {
-                queue.set_doorbell_id(None);
-            }
-
-            let mut ctx = CsgUpdateContext::new();
-            slot_manager.evict(&group.csg_seat, &mut ctx)?;
-            return Ok(());
-        }
-
-        // Drop the slot-manager lock before we touch the scheduler's
-        // own idle queues. We don't take any other lock from the slot
-        // manager callbacks, but releasing it here keeps the lock
-        // ordering (sched > csg_slot_manager) one-directional.
-        drop(slot_manager);
-
-        let priority = group.priority as usize;
-        let list_state = group.with_locked_inner(|inner| {
-            let state = inner.list_state;
-            inner.list_state = GroupListState::None;
-            state
-        });
-
-        let _ = self.remove_group_from_list(&group, priority, list_state);
-
         Ok(())
     }
 
