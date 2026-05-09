@@ -17,9 +17,8 @@ use kernel::{
         Instant,
         Monotonic, //
     },
+    types::ScopeGuard,
 };
-
-use kernel::types::ScopeGuard;
 
 use crate::{
     driver::{
@@ -30,6 +29,7 @@ use crate::{
     fw::{
         global::{
             csg::Priority,
+            CsActivateInputs,
             CsgActivateInputs,
             //
         },
@@ -123,8 +123,13 @@ pub(crate) struct CsgUpdateContext {
     /// tick's `req_value` writes. Bits in `req_mask` missing from here
     /// mark the slot as timed out (see `timedout_mask`).
     pub(crate) acked_reqs: [CSG_REQ; MAX_CSGS],
-    #[expect(dead_code)]
-    db_toggle: [u32; MAX_CSGS],
+    /// CSG_DB_REQ bits to toggle per slot (per-CS doorbell ring requests).
+    ///
+    /// One bit per CS in the group; flipped against `CSG_DB_ACK` by
+    /// `apply_csg_updates` before the global doorbell ring so the
+    /// firmware kicks the matching streams when it processes the
+    /// per-CSG doorbell event.
+    pub(crate) db_toggle: [u32; MAX_CSGS],
     pub(crate) update_mask: u32,
     /// Bitmask of CSG slot indices whose request timed out during the
     /// most recent apply cycle.
@@ -198,6 +203,22 @@ impl CsgUpdateContext {
             CSG_REQ_STATE_MASK,
         );
     }
+
+    /// Adds `mask` to the per-CS doorbell-ring set for `csg_idx`.
+    ///
+    /// Each bit in `mask` corresponds to a CS within the CSG; the
+    /// `apply_csg_updates` step flips the matching `CSG_DB_REQ` bits
+    /// against `CSG_DB_ACK` before ringing the per-CSG doorbell.
+    /// Calling this also marks the slot as having pending updates so
+    /// the apply loop visits it even if no `CSG_REQ` bits were staged.
+    pub(crate) fn add_db_toggle(&mut self, csg_idx: usize, mask: u32) {
+        debug_assert!(csg_idx < MAX_CSGS);
+        if mask == 0 {
+            return;
+        }
+        self.db_toggle[csg_idx] |= mask;
+        self.update_mask |= 1u32 << csg_idx;
+    }
 }
 
 /// CSG slot operations.
@@ -234,7 +255,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
     ) -> Result {
         slot_data.group.vm.activate()?;
 
-        // Release the AS-slot binding on any failure of the CSG_INPUT
+        // Release the AS-slot binding on any failure of the per-CS
         // programming below.
         let rollback = ScopeGuard::new(|| {
             if let Err(e) = slot_data.group.vm.deactivate() {
@@ -271,8 +292,30 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             config,
         };
 
-        self.fw
-            .with_csg_mut(slot_idx, |csg| csg.program_activate_inputs(&inputs))?;
+        // Per-CS doorbells follow the slot index (`slot_idx + 1`) and
+        // remain stable for as long as the slot is active.
+        let cs_doorbell = (slot_idx as u32) + 1;
+
+        // Stage per-CS inputs on the stack so a per-queue EINVAL bails
+        // before any firmware write, and to keep the activate path
+        // allocation-free.
+        let mut cs_inputs: [Option<CsActivateInputs>; group::MAX_CS_PER_GROUP] =
+            [const { None }; group::MAX_CS_PER_GROUP];
+        for (cs_idx, queue) in group.queues.iter().enumerate() {
+            cs_inputs[cs_idx] = Some(queue.cs_activate_inputs(cs_doorbell)?);
+        }
+
+        let mut db_mask: u32 = 0;
+        self.fw.with_csg_mut(slot_idx, |csg| {
+            csg.program_activate_inputs(&inputs)?;
+            for (cs_idx, cs_input) in cs_inputs.iter().enumerate() {
+                let Some(cs_input) = cs_input else { break };
+                let cs = csg.cs_mut(cs_idx).ok_or(EINVAL)?;
+                cs.program_activate_inputs(cs_input)?;
+                db_mask |= 1u32 << cs_idx;
+            }
+            Ok(())
+        })?;
 
         // Publish the per-queue doorbell ids and the bound CSG slot
         // index together under the group's `inner` mutex. The two
@@ -295,6 +338,9 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         });
 
         ctx.set_state(slot_idx, CsgExecutionState::Start);
+        // Stage the per-CS doorbell ring so `apply_csg_updates` flips
+        // CSG_DB_REQ for these CSes before the global doorbell write.
+        ctx.add_db_toggle(slot_idx, db_mask);
         rollback.dismiss();
         Ok(())
     }
@@ -510,6 +556,21 @@ impl Scheduler {
                     toggle_mask.into_raw(),
                 )
             })?;
+        }
+
+        // Flip CSG_DB_REQ for every slot with pending per-CS doorbell
+        // requests so the firmware kicks the streams on the global
+        // doorbell ring below.
+        for csg_id in 0..MAX_CSGS {
+            if context.update_mask & (1u32 << csg_id) == 0 {
+                continue;
+            }
+            let db_mask = context.db_toggle[csg_id];
+            if db_mask == 0 {
+                continue;
+            }
+            data.fw
+                .with_csg_mut(csg_id, |csg| csg.toggle_input_db_req(db_mask))?;
         }
 
         data.fw.ring_csg_doorbells(context.update_mask)?;

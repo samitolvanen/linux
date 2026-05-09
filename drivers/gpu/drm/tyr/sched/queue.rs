@@ -37,6 +37,7 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
+    fw::global::CsActivateInputs,
     gem,
     regs::doorbell_block,
     vm::{Vm, VmFlag, VmMapFlags},
@@ -175,7 +176,6 @@ impl QueueJob {
 
 #[pin_data]
 pub(crate) struct QueueData {
-    #[allow(dead_code)]
     priority: u8,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
@@ -454,6 +454,22 @@ impl QueueData {
         let input = self.interfaces.read_input()?;
         let output = self.interfaces.read_output()?;
         Ok(input.insert == output.extract)
+    }
+
+    /// Builds the [`CsActivateInputs`] needed to program this queue's
+    /// CS slot at CSG-bind time.
+    ///
+    /// `doorbell_id` is the per-CS doorbell index assigned by the
+    /// caller (in practice `slot_idx + 1`).
+    pub(crate) fn cs_activate_inputs(&self, doorbell_id: u32) -> Result<CsActivateInputs> {
+        Ok(CsActivateInputs {
+            ringbuf_base: self.ringbuf.kernel_va().ok_or(EINVAL)?.start,
+            ringbuf_size: self.ringbuf.size() as u32,
+            ringbuf_input_va: self.interfaces.input_va.start,
+            ringbuf_output_va: self.interfaces.output_va.start,
+            priority: self.priority,
+            doorbell_id,
+        })
     }
 }
 

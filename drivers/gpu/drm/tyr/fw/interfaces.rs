@@ -45,10 +45,23 @@ pub(in crate::fw) use self::{
     cs::{
         control::{STREAM_FEATURES, STREAM_INPUT_VA, STREAM_OUTPUT_VA},
         input::{
-            CS_ACK_IRQ_MASK, CS_BASE, CS_CONFIG, CS_REQ, CS_SIZE, CS_TILER_HEAP_END,
-            CS_TILER_HEAP_START, CS_USER_INPUT, CS_USER_OUTPUT,
+            CS_ACK_IRQ_MASK,
+            CS_BASE,
+            CS_CONFIG,
+            CS_REQ,
+            CS_SIZE,
+            CS_TILER_HEAP_END,
+            CS_TILER_HEAP_START,
+            CS_USER_INPUT,
+            CS_USER_OUTPUT, //
         },
-        output::{CS_ACK, CS_HEAP_ADDRESS, CS_HEAP_FRAG_END, CS_HEAP_VT_END, CS_HEAP_VT_START},
+        output::{
+            CS_ACK,
+            CS_HEAP_ADDRESS,
+            CS_HEAP_FRAG_END,
+            CS_HEAP_VT_END,
+            CS_HEAP_VT_START, //
+        },
         CS_CONTROL_BLOCK_SIZE, CS_KERNEL_INPUT_BLOCK_SIZE, CS_KERNEL_OUTPUT_BLOCK_SIZE,
     },
     csg::{
