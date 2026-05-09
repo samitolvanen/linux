@@ -39,6 +39,8 @@
 //! ```
 //!
 
+// Re-exports visible to the firmware module only. Most CSF interface
+// bitfields and helpers stay confined to `crate::fw::*`.
 pub(in crate::fw) use self::{
     cs::{
         control::{STREAM_FEATURES, STREAM_INPUT_VA, STREAM_OUTPUT_VA},
@@ -51,20 +53,33 @@ pub(in crate::fw) use self::{
             GROUP_INPUT_VA, GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM,
             GROUP_STREAM_STRIDE, GROUP_SUSPEND_SIZE,
         },
-        input::{CSG_DB_REQ, CSG_IRQ_ACK, CSG_REQ},
+        input::{
+            CSG_ACK_IRQ_MASK, CSG_ALLOW_COMPUTE, CSG_ALLOW_FRAGMENT, CSG_ALLOW_OTHER, CSG_DB_REQ,
+            CSG_IRQ_ACK, CSG_PROTM_SUSPEND_BUF, CSG_SUSPEND_BUF,
+        },
         output::{CSG_ACK, CSG_DB_ACK, CSG_IRQ_REQ},
         CSG_CONTROL_BLOCK_SIZE, CSG_INPUT_BLOCK_SIZE, CSG_OUTPUT_BLOCK_SIZE,
     },
     glb::{
         control::{GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_INPUT_VA, GLB_OUTPUT_VA, GLB_VERSION},
         input::{
-            GLB_ACK_IRQ_MASK, GLB_ALLOC_EN, GLB_IDLE_TIMER, GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER,
-            GLB_REQ,
+            GLB_ACK_IRQ_MASK, GLB_ALLOC_EN, GLB_DB_REQ, GLB_IDLE_TIMER, GLB_PROGRESS_TIMER,
+            GLB_PWROFF_TIMER, GLB_REQ,
         },
-        output::GLB_ACK,
+        output::{GLB_ACK, GLB_DB_ACK},
         GLB_CONTROL_BLOCK_SIZE, GLB_INPUT_BLOCK_SIZE, GLB_OUTPUT_BLOCK_SIZE,
     },
     iface::FwInterface,
+};
+
+// Re-exports visible crate-wide. The scheduler's per-tick CSG_INPUT
+// programming (`CsgSlotOps::activate`) and per-tick CSG_REQ apply step
+// (`Scheduler::apply_csg_updates`) construct typed bitfield values for
+// these registers without otherwise depending on the rest of the
+// `crate::fw` module.
+pub(crate) use self::csg::{
+    input::{CSG_CONFIG, CSG_EP_REQ, CSG_REQ},
+    CsgExecutionState,
 };
 
 /// Generic firmware interface infrastructure.
@@ -698,7 +713,7 @@ mod csg {
     /// CSG execution state (csg_execution_state_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsgExecutionState {
+    pub(crate) enum CsgExecutionState {
         /// Terminate execution without saving any state.
         Terminate = 0,
         /// Start execution of the command stream group without restoring any state.
@@ -949,7 +964,6 @@ mod csg {
         };
 
         impl CSG_REQ {
-            #[expect(dead_code)]
             #[inline(always)]
             pub(crate) const fn is_empty(self) -> bool {
                 self.into_raw() == 0

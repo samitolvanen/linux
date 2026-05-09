@@ -359,7 +359,6 @@ impl Group {
         self.inner.lock().fatal_queues()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn state(&self) -> State {
         self.inner.lock().state
     }
@@ -534,7 +533,11 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        ddev.with_locked_scheduler(|sched| sched.bind(ddev, group.clone()))?;
+        let mut ctx = super::CsgUpdateContext::new();
+        ddev.with_locked_scheduler(|sched| {
+            sched.bind(ddev, group.clone(), &mut ctx)?;
+            sched.apply_csg_updates(ddev, &mut ctx)
+        })?;
         group.submit(queue_submits, file)
     }
 

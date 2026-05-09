@@ -100,6 +100,17 @@ impl Mmu {
         self.as_manager.lock().deactivate_vm(vm)
     }
 
+    /// Returns the AS slot index `vm` is currently bound to, or `None`
+    /// if it is not resident.
+    ///
+    /// The returned value is a snapshot taken under the AS slot manager
+    /// mutex. Callers that act on the slot id must serialise their use
+    /// against [`Mmu::deactivate_vm`]; otherwise the AS slot manager
+    /// may evict the VM in between.
+    pub(crate) fn vm_as_slot(&self, vm: &VmAsData) -> Option<u8> {
+        self.as_manager.lock().vm_as_slot(vm)
+    }
+
     /// Flags the start of a VM update.
     ///
     /// If the VM is resident, any GPU access on the memory range being
