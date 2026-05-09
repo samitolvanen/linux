@@ -319,6 +319,57 @@ impl<T: DriverGpuVm> UniqueRefGpuVm<T> {
         // SAFETY: By the type invariants we may access `data`.
         unsafe { &mut *self.0.data.get() }
     }
+
+    /// Returns the first [`GpuVa`] mapped within `[addr, addr + range)`,
+    /// or `None` if no mapping intersects the range.
+    ///
+    /// Returns `None` for an empty range (`range == 0`), for ranges where
+    /// `addr + range` overflows `u64`, and skips the GPUVM's internal
+    /// reserved-range placeholder and sparse mappings, neither of which
+    /// is associated with a [`GpuVmBo`].
+    #[inline]
+    pub fn find_first(&self, addr: u64, range: u64) -> Option<&GpuVa<T>> {
+        if range == 0 {
+            return None;
+        }
+        // The C helper computes `last = addr + range - 1`; reject ranges
+        // whose end would overflow `u64` before issuing the FFI call.
+        addr.checked_add(range)?;
+
+        // SAFETY: `self.as_raw()` is a valid `drm_gpuvm`; the
+        // `&UniqueRefGpuVm<T>` borrow keeps the interval tree stable
+        // for the duration of the call.
+        let ptr = unsafe { bindings::drm_gpuva_find_first(self.as_raw(), addr, range) };
+        if ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: `self.as_raw()` returns a valid `drm_gpuvm` pointer; taking
+        // the address of its `kernel_alloc_node` field does not dereference
+        // the field itself.
+        let kernel_alloc_node = unsafe { &raw mut (*self.as_raw()).kernel_alloc_node };
+        if ptr::eq(ptr, kernel_alloc_node) {
+            return None;
+        }
+
+        // SAFETY: `ptr` is a non-null `drm_gpuva` returned by
+        // `drm_gpuva_find_first` and resident in this GPUVM under the
+        // `&UniqueRefGpuVm<T>` borrow, so the `flags` field is valid to
+        // read.
+        let flags = unsafe { (*ptr).flags };
+        if flags & bindings::drm_gpuva_flags_DRM_GPUVA_SPARSE != 0 {
+            return None;
+        }
+
+        // SAFETY: `ptr` is a non-null `drm_gpuva` resident in this `GpuVm<T>`,
+        // and the `&UniqueRefGpuVm<T>` borrow keeps it resident for the
+        // returned borrow. The filters above exclude both cases where the VA
+        // would lack an associated `GpuVmBo<T>`: the GPUVM's
+        // `kernel_alloc_node` and sparse mappings. Any remaining VA is
+        // associated with a `GpuVmBo<T>` whose BO is on the GEM list,
+        // satisfying `GpuVa::from_raw`'s contract.
+        Some(unsafe { GpuVa::<T>::from_raw(ptr) })
+    }
 }
 
 impl<T: DriverGpuVm> Deref for UniqueRefGpuVm<T> {
