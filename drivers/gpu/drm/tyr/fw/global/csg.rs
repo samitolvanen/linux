@@ -41,7 +41,6 @@ pub(crate) enum Priority {
 
 impl Priority {
     /// Number of distinct software priority bands.
-    #[expect(dead_code)]
     pub(crate) const fn num_priorities() -> usize {
         4
     }

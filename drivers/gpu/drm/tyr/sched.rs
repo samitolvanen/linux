@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use kernel::{alloc::KVec, prelude::*, sync::Arc, uapi};
+use kernel::{
+    alloc::KVec,
+    list::{
+        List,
+        ListArc, //
+    },
+    prelude::*,
+    sync::Arc,
+    types::ScopeGuard,
+};
 
-use crate::driver::TyrDrmDevice;
+use crate::{
+    driver::TyrDrmDevice,
+    fw::global::csg::Priority,
+    sched::group::GroupListState, //
+};
 
 use group::Group;
 
-const GROUP_PRIORITY_COUNT: usize =
-    uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME as usize + 1;
+const GROUP_PRIORITY_COUNT: usize = Priority::num_priorities();
 
 pub(crate) mod deps;
 pub(crate) mod events;
@@ -43,7 +55,13 @@ struct CommandStreamGroupSlot {
 
 /// Minimal scheduler shell.
 pub(crate) struct Scheduler {
-    idle_groups: [KVec<Arc<Group>>; GROUP_PRIORITY_COUNT],
+    /// Groups that have at least one queue that can be currently scheduled.
+    pub(in crate::sched) runnable_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
+    /// Groups whose queues are all idle (nothing to execute or blocked).
+    pub(in crate::sched) idle_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
+    /// Groups whose queues are blocked on a sync object.
+    #[expect(dead_code)]
+    pub(in crate::sched) waiting_groups: [List<Group, 1>; GROUP_PRIORITY_COUNT],
     csg_slots: KVec<Option<CommandStreamGroupSlot>>,
 }
 
@@ -66,9 +84,38 @@ impl Scheduler {
         }
 
         Ok(Self {
-            idle_groups: [const { KVec::new() }; GROUP_PRIORITY_COUNT],
+            runnable_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
+            idle_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
+            waiting_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
             csg_slots,
         })
+    }
+
+    /// Removes `group` from the list named by `list_state`.
+    pub(crate) fn remove_group_from_list(
+        &mut self,
+        group: &Group,
+        priority: usize,
+        list_state: GroupListState,
+    ) -> Option<ListArc<Group, 0>> {
+        let list = match list_state {
+            GroupListState::Idle => Some(&mut self.idle_groups[priority]),
+            GroupListState::Runnable => Some(&mut self.runnable_groups[priority]),
+            GroupListState::None => None,
+        };
+
+        if let Some(list) = list {
+            // SAFETY: list_state was read under the group's inner mutex,
+            // and the scheduler mutex serialises every code path that
+            // changes a group's list membership, so `group` is on `list`.
+            let list_arc = unsafe { list.remove(group) };
+            if list_arc.is_none() {
+                pr_err!("group was marked {:?} but not found\n", list_state);
+            }
+            list_arc
+        } else {
+            None
+        }
     }
 
     pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, group: Arc<Group>) -> Result {
@@ -81,33 +128,58 @@ impl Scheduler {
             .iter_mut()
             .position(|slot| slot.is_none())
             .ok_or(ENOSPC)?;
-        let idle_groups = self
-            .idle_groups
-            .get_mut(group.priority as usize)
+
+        // Pull `group` off its current list. Clear list_state while
+        // in flight; the ScopeGuard below restores it on failure.
+        let priority = group.priority as usize;
+        let prior_list_state = group.with_locked_inner(|inner| {
+            let prior = inner.list_state;
+            inner.list_state = GroupListState::None;
+            prior
+        });
+
+        let list_arc = self
+            .remove_group_from_list(&group, priority, prior_list_state)
             .ok_or(EINVAL)?;
-        let idle_pos = idle_groups
-            .iter()
-            .position(|other| Arc::ptr_eq(other, &group))
-            .ok_or(EINVAL)?;
-        let group = idle_groups.remove(idle_pos)?;
+
+        let restore_list = match prior_list_state {
+            GroupListState::Runnable => &mut self.runnable_groups[priority],
+            GroupListState::Idle => &mut self.idle_groups[priority],
+            // Unreachable: ok_or(EINVAL)? above takes the error path.
+            GroupListState::None => unreachable!(),
+        };
+        let list_arc = ScopeGuard::new_with_data(list_arc, |list_arc| {
+            restore_list.push_back(list_arc);
+            group.with_locked_inner(|inner| {
+                inner.list_state = prior_list_state;
+            });
+        });
+
         group.vm.activate()?;
         let slot = self.csg_slots.get_mut(csg_slot).ok_or(EINVAL)?;
         group.set_csg_id(Some(csg_slot));
         for queue in group.queues.iter() {
             queue.set_doorbell_id(Some(csg_slot + 1));
         }
-        *slot = Some(CommandStreamGroupSlot { group });
+        *slot = Some(CommandStreamGroupSlot {
+            group: Arc::clone(&group),
+        });
 
+        // Bind succeeded; drop the list_arc rather than restoring.
+        let _ = list_arc.dismiss();
         Ok(())
     }
 
     pub(crate) fn add_group(&mut self, group: Arc<Group>) -> Result {
-        let groups = self
-            .idle_groups
-            .get_mut(group.priority as usize)
-            .ok_or(EINVAL)?;
+        let priority = group.priority as usize;
+        let list_arc = ListArc::try_from_arc(group.clone()).map_err(|_| EINVAL)?;
 
-        groups.push(group, GFP_KERNEL).map_err(|_| ENOMEM)
+        group.with_locked_inner(|inner| {
+            inner.list_state = GroupListState::Idle;
+        });
+
+        self.idle_groups[priority].push_back(list_arc);
+        Ok(())
     }
 
     pub(crate) fn remove_group(&mut self, group: Arc<Group>) -> Result {
@@ -123,16 +195,14 @@ impl Scheduler {
             return Ok(());
         }
 
-        let groups = self
-            .idle_groups
-            .get_mut(group.priority as usize)
-            .ok_or(EINVAL)?;
-        let pos = groups
-            .iter()
-            .position(|other| Arc::ptr_eq(other, &group))
-            .ok_or(EINVAL)?;
+        let priority = group.priority as usize;
+        let list_state = group.with_locked_inner(|inner| {
+            let state = inner.list_state;
+            inner.list_state = GroupListState::None;
+            state
+        });
 
-        groups.remove(pos)?;
+        let _ = self.remove_group_from_list(&group, priority, list_state);
 
         Ok(())
     }
