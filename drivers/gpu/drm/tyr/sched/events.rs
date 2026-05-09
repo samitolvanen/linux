@@ -114,9 +114,17 @@ impl Scheduler {
     }
 
     fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
-        let group = match self.csg_slots.get(csg_id).and_then(Option::as_ref) {
-            Some(slot) => slot.group.clone(),
-            None => return Ok(false),
+        // Take a snapshot of the group binding under the slot-manager
+        // lock and drop the lock before calling into the firmware
+        // interface. Holding slot-manager across with_csg_mut() would
+        // order it ahead of fw.inner, but other paths take fw.inner
+        // standalone; introducing that order would risk ABBA.
+        let group = {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            match slot_manager.slot_data(csg_id) {
+                Some(data) => data.group.clone(),
+                None => return Ok(false),
+            }
         };
 
         let mut queued_tiler_oom = false;
@@ -158,17 +166,31 @@ impl Scheduler {
     fn collect_pending_tiler_ooms(&mut self, tdev: &TyrDrmDevice) -> Result<KVec<PendingOom>> {
         let mut pending = KVec::new();
 
-        for (csg_id, slot) in self.csg_slots.iter().enumerate() {
-            let slot = match slot.as_ref() {
-                Some(slot) => slot,
-                None => continue,
-            };
+        // Snapshot the (csg_id, group) pairs that have a pending
+        // tiler-OOM bit set, then drop the slot-manager lock before
+        // we read the per-CS OOM state from the firmware. Holding
+        // slot-manager across with_csg_mut() would order it ahead of
+        // fw.inner, but other paths take fw.inner standalone;
+        // introducing that order would risk ABBA.
+        let mut to_visit: KVec<(usize, Arc<Group>, u32)> = KVec::new();
+        {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            for csg_id in 0..super::MAX_CSGS {
+                let data = match slot_manager.slot_data(csg_id) {
+                    Some(data) => data,
+                    None => continue,
+                };
 
-            let oom_mask = slot.group.tiler_oom.swap(0, Ordering::Relaxed);
-            if oom_mask == 0 {
-                continue;
+                let oom_mask = data.group.tiler_oom.swap(0, Ordering::Relaxed);
+                if oom_mask == 0 {
+                    continue;
+                }
+
+                to_visit.push((csg_id, data.group.clone(), oom_mask), GFP_KERNEL)?;
             }
+        }
 
+        for (csg_id, group, oom_mask) in to_visit.into_iter() {
             for cs_id in 0u32..32 {
                 if oom_mask & (1u32 << cs_id) == 0 {
                     continue;
@@ -191,7 +213,7 @@ impl Scheduler {
 
                 pending.push(
                     PendingOom {
-                        group: slot.group.clone(),
+                        group: group.clone(),
                         csg_id,
                         cs_id,
                         saved_tiler_oom_ack,
@@ -215,9 +237,17 @@ impl Scheduler {
         chunk_vas: &KVec<u64>,
     ) -> Result {
         for (index, oom) in pending.iter().enumerate() {
-            match self.csg_slots.get(oom.csg_id).and_then(Option::as_ref) {
-                Some(slot) if Arc::ptr_eq(&slot.group, &oom.group) => {}
-                _ => continue,
+            // The collect phase dropped the slot-manager lock so that
+            // the firmware MMIO below can run without ordering
+            // slot-manager ahead of fw.inner (which other paths take
+            // standalone). Re-acquire briefly to confirm the slot is
+            // still owned by the same group.
+            {
+                let slot_manager = tdev.csg_slot_manager.lock();
+                match slot_manager.slot_data(oom.csg_id) {
+                    Some(data) if Arc::ptr_eq(&data.group, &oom.group) => {}
+                    _ => continue,
+                }
             }
 
             let new_chunk_va = *chunk_vas.get(index).ok_or(EINVAL)?;

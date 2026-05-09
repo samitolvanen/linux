@@ -15,7 +15,11 @@ use kernel::{
     },
     new_mutex,
     prelude::*,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        LockedBy,
+        Mutex, //
+    },
     uaccess::UserSlice,
     uapi,
 };
@@ -25,6 +29,8 @@ use crate::{
     file::TyrDrmFile,
     fw::global::csg::Priority,
     gem, heap, pool,
+    sched::CsgSlotManager,
+    slot::Seat,
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
@@ -175,6 +181,15 @@ pub(crate) struct Group {
     #[pin]
     inner: Mutex<GroupInner>,
     pub(crate) tiler_oom: AtomicU32,
+    /// CSG slot manager seat for this group.
+    ///
+    /// The owner is the per-device [`CsgSlotManager`] mutex. Callers
+    /// must hold that lock to look the seat up, e.g.
+    /// `group.csg_seat.access(&slot_manager).slot()` to retrieve the
+    /// slot index when the seat is currently
+    /// [`Seat::Active`](crate::slot::Seat::Active), or `None` when the
+    /// group is idle or has never been bound.
+    pub(crate) csg_seat: LockedBy<Seat, CsgSlotManager>,
     /// The group's queues.
     ///
     /// The container is immutable for the lifetime of the group; the
@@ -314,6 +329,7 @@ impl Group {
                     queue_count,
                 }),
                 tiler_oom: AtomicU32::new(0),
+                csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
@@ -347,14 +363,6 @@ impl Group {
 
     pub(crate) fn fatal_queues(&self) -> u32 {
         self.inner.lock().fatal_queues()
-    }
-
-    pub(super) fn csg_id(&self) -> Option<usize> {
-        self.inner.lock().csg_id
-    }
-
-    pub(super) fn set_csg_id(&self, csg_id: Option<usize>) {
-        self.inner.lock().csg_id = csg_id;
     }
 
     #[expect(dead_code)]
@@ -562,7 +570,7 @@ impl Pool {
     fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 
-        ddev.with_locked_scheduler(|sched| sched.remove_group(group))?;
+        ddev.with_locked_scheduler(|sched| sched.remove_group(ddev, group))?;
 
         self.0.remove(index)?;
         Ok(())

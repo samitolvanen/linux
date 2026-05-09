@@ -76,8 +76,14 @@ use crate::{
         Mmu, //
     },
     regs::gpu_control::*, //
-    sched::Scheduler,
-    sched::SchedulerState,
+    sched::{
+        CsgSlotManager,
+        CsgSlotOps,
+        Scheduler,
+        SchedulerState,
+        MAX_CSGS, //
+    },
+    slot::SlotManager,
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -147,6 +153,22 @@ pub(crate) struct TyrDrmDeviceData {
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
+
+    /// Slot manager for the firmware-visible CSG slots.
+    ///
+    /// Pinned at probe time with [`MAX_CSGS`] as an upper bound so the
+    /// per-group [`Seat`](crate::slot::Seat) field
+    /// (`LockedBy<Seat, CsgSlotManager>`) has a stable owner address
+    /// from the moment the device data is initialised. The actual
+    /// hardware slot count, which is only known after firmware boot,
+    /// is applied by [`Scheduler::init`] via
+    /// [`SlotManager::set_slot_count`].
+    ///
+    /// The lock ordering is `sched > csg_slot_manager`: callers that
+    /// hold [`sched`](Self::sched) may acquire this mutex, but not the
+    /// other way round.
+    #[pin]
+    pub(crate) csg_slot_manager: Mutex<CsgSlotManager>,
 
     /// Outstanding firmware-events bits accumulated by IRQ handlers.
     ///
@@ -432,6 +454,9 @@ impl platform::Driver for TyrPlatformDriverData {
             GFP_KERNEL,
         )?;
 
+        let csg_slot_ops = CsgSlotOps::new(firmware.clone());
+        let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(csg_slot_ops, MAX_CSGS)?;
+
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
                 mmu,
@@ -452,6 +477,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 sched <- new_mutex!(SchedulerState::Disabled),
+                csg_slot_manager <- new_mutex!(csg_slot_manager),
                 fw_events: AtomicU32::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
