@@ -269,7 +269,6 @@ impl TyrDrmDeviceData {
     ///
     /// Safe to call from any context including the threaded IRQ
     /// handler. Repeated calls coalesce in the workqueue.
-    #[expect(dead_code)]
     pub(crate) fn schedule_sync_upd(tdev: &ARef<TyrDrmDevice>) {
         let _ = workqueue::system_unbound()
             .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());

@@ -132,16 +132,28 @@ impl Scheduler {
         let pending_mask =
             CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
 
-        let progress_event = tdev.fw.with_csg_mut(csg_id, |csg| {
+        let (idle_event, sync_event, progress_event) = tdev.fw.with_csg_mut(csg_id, |csg| {
             let req = csg.read_input_req()?.into_raw();
             let ack = csg.read_output_ack()?.into_raw();
             let pending = (req ^ ack) & pending_mask;
             if pending != 0 {
                 csg.update_input_req(CSG_REQ::from_raw(ack & pending), CSG_REQ::from_raw(pending))?;
             }
-            Ok(pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0)
+            Ok((
+                pending & CSG_REQ::IDLE_MASK != 0,
+                pending & CSG_REQ::SYNC_UPDATE_MASK != 0,
+                pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0,
+            ))
         })?;
 
+        if idle_event {
+            // Tell the rule engine that at least one resident group may
+            // now be idle so it considers the `Take from idle_groups`
+            // rules on the next tick. The actual per-queue idle state
+            // is refreshed from the firmware in
+            // `sync_csg_slot_queues_state` when the tick runs.
+            self.might_have_idle_groups = true;
+        }
         if progress_event {
             // Progress-timer expiry: the firmware-imposed forward-progress
             // window elapsed without the group advancing.
@@ -150,6 +162,10 @@ impl Scheduler {
                     inner.fatal_error = Some(ETIMEDOUT);
                 }
             });
+        }
+        if sync_event {
+            let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
+            TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
         let mut queued_tiler_oom = false;
