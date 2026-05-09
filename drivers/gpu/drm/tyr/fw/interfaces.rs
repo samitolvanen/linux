@@ -87,7 +87,8 @@ mod iface {
             IoCapable,
             IoKnownSize, //
         },
-        prelude::*, //
+        prelude::*,
+        sync::Arc, //
     };
 
     use crate::gem::BoData;
@@ -98,7 +99,7 @@ mod iface {
     /// driver memory via a VMap.
     pub(in crate::fw) struct FwInterface<const FW_IFACE_SIZE: usize> {
         /// Virtual mapping of the shared memory buffer.
-        vmap: VMapOwned<BoData>,
+        vmap: Arc<VMapOwned<BoData>>,
         /// Offset within the shared memory buffer where this interface starts.
         offset: usize,
     }
@@ -132,7 +133,7 @@ mod iface {
 
             let offset = (shared_iface_addr - shared_mem_start) as usize;
             Ok(FwInterface {
-                vmap: vmap.clone(),
+                vmap: Arc::new(vmap.clone(), GFP_KERNEL)?,
                 offset,
             })
         }
