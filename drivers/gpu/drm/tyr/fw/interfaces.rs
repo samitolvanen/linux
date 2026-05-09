@@ -87,7 +87,8 @@ mod iface {
             IoCapable,
             IoKnownSize, //
         },
-        prelude::*, //
+        prelude::*,
+        sync::Arc, //
     };
 
     use crate::gem::BoData;
@@ -98,7 +99,19 @@ mod iface {
     /// driver memory via a VMap.
     pub(in crate::fw) struct FwInterface<const FW_IFACE_SIZE: usize> {
         /// Virtual mapping of the shared memory buffer.
-        vmap: VMapOwned<BoData>,
+        ///
+        /// # Invariants
+        ///
+        /// The final `Arc<VMapOwned>` drop must NOT happen inside a
+        /// dma-fence signalling section: `VMapOwned::drop` acquires
+        /// `dma_resv_lock`. Today the last reference drops on
+        /// `EnabledCsgInterface` teardown (driver shutdown), which
+        /// satisfies the rule trivially. New callers
+        /// that clone this `Arc` into work-item paths must ensure the
+        /// clone outlives any signalling annotation it traverses, or
+        /// that the drop happens on a non-annotated path (e.g.
+        /// `system_unbound()`).
+        vmap: Arc<VMapOwned<BoData>>,
         /// Offset within the shared memory buffer where this interface starts.
         offset: usize,
     }
@@ -132,7 +145,7 @@ mod iface {
 
             let offset = (shared_iface_addr - shared_mem_start) as usize;
             Ok(FwInterface {
-                vmap: vmap.clone(),
+                vmap: Arc::new(vmap.clone(), GFP_KERNEL)?,
                 offset,
             })
         }
