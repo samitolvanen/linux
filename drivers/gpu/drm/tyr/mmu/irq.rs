@@ -6,6 +6,7 @@
 //! wires the generic Tyr IRQ wrapper to the MMU IRQ registers and delegates the
 //! human-readable fault reporting to `faults.rs`.
 
+use core::sync::atomic::Ordering;
 use kernel::{
     c_str,
     device::{Bound, Device},
@@ -100,6 +101,16 @@ impl TyrIrqTrait for MmuIrq {
         let fault_bits = status & u32::from(PAGE_FAULT_BITS);
         if fault_bits != 0 {
             let _ = decode_faults(fault_bits, &self.iomem);
+
+            let as_manager = tdev.mmu.as_manager.lock();
+            for as_idx in 0..MAX_AS {
+                if (fault_bits & (1 << as_idx)) != 0 {
+                    if let Some(vm_as_data) = as_manager.slot_data(as_idx) {
+                        vm_as_data.unhandled_fault.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+
             TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
         }
     }

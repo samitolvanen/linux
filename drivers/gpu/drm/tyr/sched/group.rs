@@ -121,7 +121,6 @@ impl GroupInner {
         (self.blocked_queues & (1 << queue_idx)) != 0
     }
 
-    #[expect(dead_code)]
     pub(crate) fn has_fatal_queues(&self) -> bool {
         self.fatal_queues != 0
     }
@@ -160,7 +159,6 @@ impl GroupInner {
     }
 
     /// Marks a queue as having encountered a fatal error.
-    #[expect(dead_code)]
     pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
         if (self.fatal_queues & (1 << queue_idx)) == 0 {
             self.fatal_queues |= 1 << queue_idx;

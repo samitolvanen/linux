@@ -13,6 +13,7 @@
 //! [`SlotOperations`]: crate::slot::SlotOperations
 
 use core::ops::Range;
+use core::sync::atomic::AtomicBool;
 
 use kernel::{
     device::{
@@ -112,6 +113,9 @@ pub(crate) struct VmAsData {
     /// Virtual address bits for this address space.
     va_bits: u8,
 
+    /// Whether the VM has unhandled faults.
+    pub(crate) unhandled_fault: AtomicBool,
+
     /// Page table.
     ///
     /// Managed by devres to ensure proper cleanup. The page table maps
@@ -146,6 +150,7 @@ impl VmAsData {
         try_pin_init!(Self {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             va_bits: va_bits as u8,
+            unhandled_fault: AtomicBool::new(false),
             page_table <- page_table_init,
         }? Error)
     }

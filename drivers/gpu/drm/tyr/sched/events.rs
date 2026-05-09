@@ -113,7 +113,7 @@ impl Scheduler {
         Ok(queued_tiler_oom)
     }
 
-    fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
+    pub(super) fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
         // Take a snapshot of the group binding under the slot-manager
         // lock and drop the lock before calling into the firmware
         // interface. Holding slot-manager across with_csg_mut() would

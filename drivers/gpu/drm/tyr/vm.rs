@@ -559,7 +559,7 @@ pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64
 #[pin_data]
 pub(crate) struct VmExec {
     /// Data referenced by an AS when the VM is active
-    as_data: Arc<VmAsData>,
+    pub(crate) as_data: Arc<VmAsData>,
     /// MMU manager.
     mmu: Arc<Mmu>,
     /// Platform device reference (needed to access the page table via devres).

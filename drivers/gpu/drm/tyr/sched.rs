@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::sync::atomic::Ordering;
+
 use kernel::{
-    alloc::KVec,
     list::{
         List,
         ListArc, //
@@ -682,5 +683,52 @@ impl Scheduler {
         _csg_idx: usize,
     ) -> Result {
         Ok(())
+    }
+
+    /// Stages a `CSG_REQ.status_update` for every bound CSG slot and
+    /// applies the batch, refreshing `GroupInner::idle` from the
+    /// firmware view via the post-ack sync pass.
+    #[expect(dead_code)]
+    pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
+        let mut context = CsgUpdateContext::new();
+        let mut faulted_groups: [Option<(usize, Arc<Group>)>; MAX_CSGS] =
+            [const { None }; MAX_CSGS];
+
+        {
+            let csg_slot_manager = data.csg_slot_manager.lock();
+            for csg_idx in 0..csg_slot_manager.slot_count() {
+                let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
+                    continue;
+                };
+                if slot_data
+                    .group
+                    .vm
+                    .as_data
+                    .unhandled_fault
+                    .load(Ordering::Relaxed)
+                {
+                    faulted_groups[csg_idx] = Some((csg_idx, slot_data.group.clone()));
+                }
+                context.toggle_reqs(csg_idx, CSG_REQ_STATUS_UPDATE);
+            }
+        }
+
+        for slot in faulted_groups.iter() {
+            let Some((csg_idx, group)) = slot else {
+                continue;
+            };
+            self.process_csg_irq(&data, *csg_idx)?;
+            let queue_count = group.queue_count();
+            group.with_locked_inner(|inner| {
+                if inner.has_fatal_queues() {
+                    return;
+                }
+                for cs_id in 0..queue_count {
+                    inner.set_queue_fatal(cs_id);
+                }
+            });
+        }
+
+        self.apply_csg_updates(data, &mut context)
     }
 }
