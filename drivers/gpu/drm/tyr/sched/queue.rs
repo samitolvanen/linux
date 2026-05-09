@@ -374,6 +374,54 @@ impl QueueData {
         }
     }
 
+    /// Drains every leading entry of `pending_submit_fences` whose
+    /// `completion_point` is `<= up_to` into a local vec, then
+    /// signals each drained fence with `Ok(())` with no driver lock
+    /// held.
+    ///
+    /// Per Documentation/driver-api/dma-buf.rst, no driver lock may
+    /// be held across `dma_fence_signal()`.
+    fn complete_pending_fences_up_to(&self, up_to: u64) {
+        let drained = {
+            let mut pending = self.pending_submit_fences.lock();
+
+            let mut k = 0usize;
+            for entry in pending.iter() {
+                if entry.completion_point > up_to {
+                    break;
+                }
+                k += 1;
+            }
+
+            let mut drained = match KVec::with_capacity(k, GFP_KERNEL) {
+                Ok(v) => v,
+                Err(_) => {
+                    pr_err!("Tyr queue: drain allocation failed; deferring drain\n");
+                    return;
+                }
+            };
+
+            // Reverse once so the leading prefix is at the tail; pop
+            // returns the original head-first sequence in O(1) each.
+            // Reverse the surviving suffix back after the pop loop.
+            pending.reverse();
+            for _ in 0..k {
+                let Some(entry) = pending.pop() else {
+                    break;
+                };
+                let _ = drained.push_within_capacity(entry);
+            }
+            pending.reverse();
+
+            drained
+        };
+
+        for pending_fence in drained.into_iter() {
+            let _annotation = DmaFenceSignallingAnnotation::new();
+            pending_fence.fence.signal(Ok(()));
+        }
+    }
+
     fn signal_submit_fence(&self, completion_point: u64, result: Result) -> bool {
         let pending_fence = {
             let mut pending = self.pending_submit_fences.lock();
@@ -398,9 +446,16 @@ impl QueueData {
         true
     }
 
-    fn complete_submit_fences(&self) -> Result {
+    /// Reads the firmware-visible `EXTRACT` for this queue and signals
+    /// every leading pending submit fence whose `completion_point` is
+    /// at or below it.
+    ///
+    /// Used by both [`HwTimeoutStage::process`] (its progress-poll
+    /// path) and the IRQ-driven completion path on the scheduler
+    /// side.
+    pub(in crate::sched) fn complete_submit_fences(&self) -> Result {
         let ringbuf_output = self.interfaces.read_output()?;
-        self.signal_submit_fences_up_to(ringbuf_output.extract, Ok(()));
+        self.complete_pending_fences_up_to(ringbuf_output.extract);
         Ok(())
     }
 

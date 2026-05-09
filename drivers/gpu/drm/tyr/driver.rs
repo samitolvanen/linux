@@ -363,8 +363,13 @@ impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
 impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
+    /// The submit-fence drain runs outside the scheduler mutex
+    /// because fence signalling cannot nest inside a wide driver
+    /// lock.
     fn run(this: Self::Pointer) {
-        let immediate_tick = this
+        let tdev = &*this;
+        Scheduler::drain_resident_queue_completions(tdev);
+        let immediate_tick = tdev
             .with_locked_scheduler(|sched| Ok(sched.sync_upd_step()))
             .unwrap_or(false);
 
