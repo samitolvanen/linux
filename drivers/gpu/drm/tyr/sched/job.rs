@@ -137,6 +137,10 @@ pub(crate) struct Job {
 pub(crate) struct PreparedQueueSubmit {
     queue_index: usize,
     has_stream: bool,
+    /// Per-queue submit seqno claimed at prepare time. Zero when
+    /// `has_stream` is false (stream-less jobs never reach the GPU
+    /// and so do not consume a seqno).
+    seqno: u64,
     prepared: PreparedQueueJob,
     signals: KVec<SyncSignal>,
 }
@@ -146,11 +150,10 @@ impl PreparedQueueSubmit {
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
 
         if self.has_stream {
-            let seqno = queue.claim_seqno();
             group.write_syncobj(
                 self.queue_index,
                 syncs::SyncObj64b {
-                    seqno,
+                    seqno: self.seqno,
                     status: 0,
                     pad: 0,
                 },
@@ -226,11 +229,18 @@ impl Job {
         let deps = deps::wait_fences(file, &self.syncs)?;
         let signals = deps::signal_syncs(file, &self.syncs)?;
         let has_stream = !self.stream.is_empty();
+
         let prepared = queue.prepare_job(QueueJob::new(self.stream, group.clone()), &deps)?;
+
+        // Claim the seqno after every fallible prepare step has
+        // succeeded, so an Err return cannot leave a gap in
+        // next_seqno that no GPU-visible syncobj seed fills.
+        let seqno = if has_stream { queue.claim_seqno() } else { 0 };
 
         Ok(PreparedQueueSubmit {
             queue_index: self.queue_index,
             has_stream,
+            seqno,
             prepared,
             signals,
         })
