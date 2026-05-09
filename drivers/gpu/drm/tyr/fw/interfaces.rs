@@ -143,6 +143,12 @@ mod iface {
     /// Provides bounds-checked access to firmware interface blocks mapped into
     /// driver memory via a VMap.
     ///
+    /// The final `Arc<VMapOwned>` must not be dropped inside a dma-fence
+    /// signalling section, because `VMapOwned::drop` takes `dma_resv_lock`.
+    /// The shared section and the stored interfaces hold their references
+    /// until the global interface is torn down, so the last one drops there,
+    /// never in a signalling section.
+    ///
     /// # Invariants
     ///
     /// `offset .. offset + T::MIN_SIZE` lies within `vmap`, `vmap`'s base
