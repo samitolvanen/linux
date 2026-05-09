@@ -16,8 +16,8 @@ use crate::{
     driver::IoMem,
     fw::{
         interfaces::{
-            FwInterface, CSG_CONTROL_BLOCK_SIZE, GLB_ACK, GLB_ACK_IRQ_MASK, GLB_ALLOC_EN,
-            GLB_CONTROL_BLOCK_SIZE, GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_IDLE_TIMER,
+            FwInterface, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_REQ, GLB_ACK, GLB_ACK_IRQ_MASK,
+            GLB_ALLOC_EN, GLB_CONTROL_BLOCK_SIZE, GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_IDLE_TIMER,
             GLB_INPUT_BLOCK_SIZE, GLB_INPUT_VA, GLB_OUTPUT_BLOCK_SIZE, GLB_OUTPUT_VA,
             GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER, GLB_REQ, GLB_VERSION,
         },
@@ -214,6 +214,69 @@ impl GlobalInterface {
         let mut inner = self.inner.lock();
         let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
         f(csg)
+    }
+
+    /// Waits for the CSG_REQ bits in `mask` at slot `csg_idx` to be
+    /// mirrored into CSG_ACK by the firmware. Returns the bits that
+    /// were actually acknowledged (`!(req ^ ack) & mask`); a partial
+    /// flip of the 3-bit CSG_REQ::state field is reported as not acked
+    /// and cleared from the returned mask.
+    ///
+    /// Wait timeouts and transient I/O errors are visible in the
+    /// returned mask rather than in the error path, so callers can
+    /// distinguish a stuck slot from a successful transition and see
+    /// exactly which sub-requests were honoured. Signal interrupts
+    /// (`ERESTARTSYS`) propagate as `Err` so callers in syscall
+    /// context honour the kernel's restart-on-signal semantics.
+    ///
+    /// The wait predicate runs under the event-wait lock and must not
+    /// re-acquire `inner`. `process_global_irq` already holds `inner`
+    /// across the GLB-side wait_acks (which takes the event-wait lock
+    /// internally), so a predicate that took `inner` from inside the
+    /// event-wait lock would invert that order and deadlock. The MMIO
+    /// snapshot taken before entering the wait keeps the predicate
+    /// `inner`-free.
+    #[expect(dead_code)]
+    pub(crate) fn wait_csg_acks(
+        &self,
+        csg_idx: usize,
+        mask: CSG_REQ,
+        timeout_ms: u32,
+    ) -> Result<CSG_REQ> {
+        let state_mask = CSG_REQ::from_raw(CSG_REQ::STATE_MASK);
+
+        let (csg_input, csg_output) = {
+            let mut inner = self.inner.lock();
+            let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
+            csg.clone_req_ack_io()?
+        };
+
+        // Caller is the sole writer of CSG_REQ for this slot, so req is
+        // stable across the wait.
+        let req = csg_input.read(CSG_REQ) & mask;
+
+        let wait_result = self.event_wait.wait_interruptible_timeout(timeout_ms, || {
+            let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
+            if ack == req {
+                Ok(WaitResult::Done)
+            } else {
+                Ok(WaitResult::Retry)
+            }
+        });
+        if wait_result == Err(ERESTARTSYS) {
+            return Err(ERESTARTSYS);
+        }
+
+        // Re-read ACK so the returned mask reflects what the firmware
+        // acked even on timeout.
+        let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
+        let mut acked = !(req ^ ack) & mask;
+
+        if (acked & state_mask) != (mask & state_mask) {
+            acked &= !state_mask;
+        }
+
+        Ok(acked)
     }
 
     #[allow(dead_code)]

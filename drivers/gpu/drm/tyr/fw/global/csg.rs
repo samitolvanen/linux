@@ -176,6 +176,24 @@ impl CsgInterface {
         Ok(enabled.csg_input.read(CSG_REQ))
     }
 
+    /// Returns owned clones of the CSG input and output [`FwInterface`]s
+    /// so the caller can poll `CSG_REQ` / `CSG_ACK` after dropping the
+    /// inner mutex.
+    #[expect(dead_code)]
+    pub(in super::super) fn clone_req_ack_io(
+        &self,
+    ) -> Result<(
+        FwInterface<CSG_INPUT_BLOCK_SIZE>,
+        FwInterface<CSG_OUTPUT_BLOCK_SIZE>,
+    )> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok((enabled.csg_input.clone(), enabled.csg_output.clone()))
+    }
+
     #[allow(dead_code)]
     pub(in super::super) fn write_input_req(&self, req: CSG_REQ) {
         if let CsgInterfaceState::Enabled(enabled) = &self.state {
