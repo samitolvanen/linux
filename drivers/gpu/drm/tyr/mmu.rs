@@ -100,14 +100,6 @@ impl Mmu {
         self.as_manager.lock().deactivate_vm(vm)
     }
 
-    /// Flush caches after a VM update.
-    ///
-    /// If the VM is no longer resident, this is a NOP, otherwise, the
-    /// AS manager will flush the GPU and MMU Translation Lookaside Buffer (TLB) caches.
-    pub(crate) fn flush_vm(&self, vm: &VmAsData) -> Result {
-        self.as_manager.lock().flush_vm(vm)
-    }
-
     /// Flags the start of a VM update.
     ///
     /// If the VM is resident, any GPU access on the memory range being
