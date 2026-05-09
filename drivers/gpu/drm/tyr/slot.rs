@@ -341,13 +341,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
                 }
                 self.activate_slot(slot_idx, locked_seat, slot_data, ctx)
             }
-            None => {
-                pr_err!(
-                    "Slot allocation failed: all {} slots in use\n",
-                    self.slot_count
-                );
-                Err(EBUSY)
-            }
+            None => Err(EBUSY),
         }
     }
 
