@@ -22,6 +22,7 @@ use crate::{
         TyrDrmDeviceData, //
     },
     fw::{
+        CsDbMask,
         CsFaultExceptionType,
         CSG_REQ, //
     },
@@ -358,13 +359,7 @@ impl Scheduler {
                     cs.write_input_req(req);
                 }
 
-                let bit = 1u32 << oom.cs_id;
-                let db_req = csg.read_input_db_req()?;
-                let db_ack = csg.read_output_db_ack()?;
-                csg.write_input_db_req(
-                    db_req.with_mask((db_req.mask() & !bit) | ((db_ack.mask() ^ bit) & bit)),
-                );
-                Ok(())
+                csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
             })?;
 
             tdev.fw.ring_csg_doorbell(oom.csg_id)?;
