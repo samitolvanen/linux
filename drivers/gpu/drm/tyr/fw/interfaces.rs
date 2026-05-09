@@ -97,6 +97,7 @@ mod iface {
     ///
     /// Provides bounds-checked access to firmware interface blocks mapped into
     /// driver memory via a VMap.
+    #[derive(Clone)]
     pub(in crate::fw) struct FwInterface<const FW_IFACE_SIZE: usize> {
         /// Virtual mapping of the shared memory buffer.
         vmap: Arc<VMapOwned<BoData>>,
@@ -914,6 +915,84 @@ mod csg {
                 3:0 jasid;
                 8:8 l2c_allocate_ring => bool;
                 16:16 l2c_allocate_other => bool;
+            }
+        }
+
+        // Bitwise composition for CSG_REQ values and bit-masks of fields
+        // within CSG_REQ. The per-tick CSG scheduler uses CSG_REQ both
+        // as the typed register value and as the masks of bits it owns
+        // (`STATE_MASK`, `EP_CFG_MASK`, `STATUS_UPDATE_MASK`, ...), so
+        // these operators let it compose without round-tripping through
+        // the raw u32 storage.
+        use core::{
+            fmt,
+            ops::{
+                BitAnd,
+                BitAndAssign,
+                BitOr,
+                BitOrAssign,
+                BitXor,
+                Not, //
+            }, //
+        };
+
+        impl CSG_REQ {
+            #[expect(dead_code)]
+            #[inline(always)]
+            pub(crate) const fn is_empty(self) -> bool {
+                self.into_raw() == 0
+            }
+        }
+
+        impl BitOr for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn bitor(self, rhs: Self) -> Self {
+                Self::from_raw(self.into_raw() | rhs.into_raw())
+            }
+        }
+
+        impl BitOrAssign for CSG_REQ {
+            #[inline(always)]
+            fn bitor_assign(&mut self, rhs: Self) {
+                *self = *self | rhs;
+            }
+        }
+
+        impl BitAnd for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn bitand(self, rhs: Self) -> Self {
+                Self::from_raw(self.into_raw() & rhs.into_raw())
+            }
+        }
+
+        impl BitAndAssign for CSG_REQ {
+            #[inline(always)]
+            fn bitand_assign(&mut self, rhs: Self) {
+                *self = *self & rhs;
+            }
+        }
+
+        impl BitXor for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn bitxor(self, rhs: Self) -> Self {
+                Self::from_raw(self.into_raw() ^ rhs.into_raw())
+            }
+        }
+
+        impl Not for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn not(self) -> Self {
+                Self::from_raw(!self.into_raw())
+            }
+        }
+
+        impl fmt::LowerHex for CSG_REQ {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerHex::fmt(&self.into_raw(), f)
             }
         }
     }
