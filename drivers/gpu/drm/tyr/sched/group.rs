@@ -53,11 +53,11 @@ pub(crate) enum State {
 }
 
 /// Which scheduler list (idle / runnable / none) a group is currently on.
-#[expect(dead_code)]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub(crate) enum GroupListState {
     None,
     Idle,
+    #[expect(dead_code)]
     Runnable,
 }
 
@@ -77,7 +77,6 @@ pub(crate) struct GroupStatus {
 ///
 /// Protected by the `inner` mutex on [`Group`]; access via
 /// [`Group::with_locked_inner`].
-#[expect(dead_code)]
 pub(crate) struct GroupInner {
     pub(crate) state: State,
     pub(crate) list_state: GroupListState,
