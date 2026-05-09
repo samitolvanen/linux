@@ -577,6 +577,21 @@ impl<'a> Tick<'a> {
             .apply_csg_updates(data, &mut context)
             .inspect_err(|_| pr_err!("apply_csg_updates (halt) failed\n"))?;
 
+        // Drain any pending CSG IRQs on each evicted slot so the
+        // group's per-queue / per-CSG bookkeeping reflects the latest
+        // firmware state before we tear the binding down. Runs
+        // *before* taking the slot-manager lock below because
+        // `process_csg_irq` re-takes the slot-manager lock itself to
+        // look the group up.
+        for i in 0..slot_count {
+            if (decision.keep_mask & (1u32 << i)) != 0 {
+                continue;
+            }
+            if let Err(e) = self.sched.process_csg_irq(data, i) {
+                pr_err!("process_csg_irq {} failed: {}\n", i, e.to_errno());
+            }
+        }
+
         let mut csg_slot_manager = data.csg_slot_manager.lock();
         for i in 0..slot_count {
             if (decision.keep_mask & (1u32 << i)) != 0 {
