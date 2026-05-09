@@ -117,7 +117,7 @@ impl Scheduler {
         Ok(queued_tiler_oom)
     }
 
-    fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
+    pub(super) fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
         // Holding slot-manager across with_csg_mut() would order it
         // ahead of fw.inner, but other paths take fw.inner standalone;
         // introducing that order would risk ABBA.

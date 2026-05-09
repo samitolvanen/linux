@@ -50,12 +50,19 @@ use kernel::{
         Arc,
         Mutex, //
     },
-    time, //
+    time::{
+        self,
+        Jiffies, //
+    },
     workqueue::{
+        self,
+        impl_has_delayed_work,
+        DelayedWork,
         OwnedQueue,
         Work,
+        WorkItem,
         WqFlags, //
-    },
+    }, //
 };
 
 use crate::{
@@ -97,6 +104,8 @@ pub(crate) mod work_id {
     pub(crate) const TICK: u64 = 1;
     /// Firmware-event drain worker.
     pub(crate) const FW_EVENTS: u64 = 2;
+    /// Periodic re-arming of the scheduler tick.
+    pub(crate) const PERIODIC_TICK: u64 = 4;
     /// Tiler heap out-of-memory growth worker.
     pub(crate) const TILER_OOM: u64 = 5;
 }
@@ -220,6 +229,13 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     tick_work: DmaFenceWork<TyrDrmDevice, { work_id::TICK }>,
 
+    /// Periodic re-arm worker for `tick_work`.
+    ///
+    /// Enqueued on `system_unbound()` rather than `sched_wq`
+    /// so a long-delay timer expiry does not hold a scheduler worker.
+    #[pin]
+    periodic_tick_work: DelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }>,
+
     #[pin]
     pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 }
@@ -278,6 +294,17 @@ impl TyrDrmDeviceData {
             .sched_wq
             .enqueue::<ARef<TyrDrmDevice>, { work_id::TICK }>(tdev.clone());
     }
+
+    /// Re-arms the scheduler tick `delay` jiffies from now.
+    ///
+    /// If a periodic tick is already pending, `delay` is ignored:
+    /// `queue_delayed_work_on` will not shorten an in-flight delay.
+    /// To force an earlier tick, call `schedule_tick`
+    /// directly.
+    pub(crate) fn schedule_periodic_tick(tdev: &ARef<TyrDrmDevice>, delay: Jiffies) {
+        let _ = workqueue::system_unbound()
+            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
+    }
 }
 
 impl_has_dma_fence_work! {
@@ -286,6 +313,10 @@ impl_has_dma_fence_work! {
 
 impl_has_dma_fence_work! {
     impl HasDmaFenceWork<TyrDrmDevice, { work_id::TICK }> for TyrDrmDeviceData { self.tick_work }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }> for TyrDrmDeviceData { self.periodic_tick_work }
 }
 
 impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
@@ -309,6 +340,14 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             })
             .unwrap_or(false);
 
+        // A CSG IRQ that the firmware raised for any of the slots we
+        // own is by definition an observable state change from the
+        // scheduler's point of view: a CSG_REQ ack might have flipped,
+        // or a CS in the slot might have hit a fault or run out of
+        // tiler heap. Arm the periodic tick so it re-evaluates
+        // residency and applies any pending state transitions.
+        crate::sched::Scheduler::request_tick(&this);
+
         if queued_tiler_oom {
             let _ = kernel::workqueue::system()
                 .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this);
@@ -319,7 +358,19 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
-    fn run(_this: Self::Pointer) {}
+    fn run(this: Self::Pointer) {
+        if let Err(err) = crate::sched::tick::tick_step(&this) {
+            pr_err!("tick_step failed: {:?}\n", err);
+        }
+    }
+}
+
+impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        Self::schedule_tick(&this);
+    }
 }
 
 fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
@@ -448,6 +499,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 fw_events: AtomicU32::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
+                periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
 
