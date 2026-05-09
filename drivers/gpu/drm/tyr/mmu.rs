@@ -114,11 +114,6 @@ impl Mmu {
         self.as_manager.lock().vm_as_slot(vm_as_data)
     }
 
-    /// Flush MMU translation caches after a VM update.
-    pub(crate) fn flush_vm(&self, vm_as_data: &VmAsData) -> Result {
-        self.as_manager.lock().flush_vm(vm_as_data)
-    }
-
     /// Flags the start of a VM update.
     ///
     /// If the VM is resident, any GPU access on the memory range being
