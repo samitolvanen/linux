@@ -295,7 +295,6 @@ impl TyrDrmDeviceData {
     /// `queue_delayed_work_on` will not shorten an in-flight delay.
     /// To force an earlier tick, call [`schedule_tick`](Self::schedule_tick)
     /// directly.
-    #[expect(dead_code)]
     pub(crate) fn schedule_periodic_tick(tdev: &ARef<TyrDrmDevice>, delay: Jiffies) {
         let _ = workqueue::system_unbound()
             .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
@@ -339,6 +338,14 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             })
             .unwrap_or(false);
 
+        // A CSG IRQ that the firmware raised for any of the slots we
+        // own is by definition an observable state change from the
+        // scheduler's point of view: a CSG_REQ ack might have flipped,
+        // or a CS in the slot might have hit a fault or run out of
+        // tiler heap. Kick the tick so it can re-evaluate residency
+        // and apply any pending state transitions.
+        crate::sched::Scheduler::request_tick(&this);
+
         if queued_tiler_oom {
             let _ = kernel::workqueue::system()
                 .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this);
@@ -349,7 +356,11 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
-    fn run(_this: Self::Pointer) {}
+    fn run(this: Self::Pointer) {
+        if let Err(err) = crate::sched::tick::tick_step(&this) {
+            pr_err!("tick_step failed: {:?}\n", err);
+        }
+    }
 }
 
 impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {

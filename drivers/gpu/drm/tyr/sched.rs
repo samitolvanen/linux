@@ -12,8 +12,14 @@ use kernel::{
         aref::ARef,
         Arc, //
     },
-    types::ScopeGuard,
+    time::{
+        msecs_to_jiffies,
+        Instant,
+        Monotonic, //
+    },
 };
+
+use kernel::types::ScopeGuard;
 
 use crate::{
     driver::{
@@ -58,6 +64,7 @@ pub(crate) mod group;
 pub(crate) mod job;
 pub(crate) mod queue;
 pub(crate) mod syncs;
+pub(crate) mod tick;
 
 /// The scheduler object.
 pub(crate) enum SchedulerState {
@@ -259,6 +266,26 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         self.fw
             .with_csg_mut(slot_idx, |csg| csg.program_activate_inputs(&inputs))?;
 
+        // Publish the per-queue doorbell ids and the bound CSG slot
+        // index together under the group's `inner` mutex. The two
+        // publishes share a single critical section because
+        // `TyrQueueOps::submit` decides bound-vs-unbound by observing
+        // `csg_id` under the same lock and rings the doorbell on the
+        // matching `doorbell_id`; pairing them here keeps a stale
+        // `UNASSIGNED` doorbell from being observed alongside an
+        // already-bound `csg_id` on weakly-ordered architectures. The
+        // per-CS doorbells wired here remain stable for as long as
+        // the slot is active; the matching clear lives in `evict`
+        // below. The `csg_slot_manager > inner` lock ordering matches
+        // the rest of the scheduler: callers already hold the
+        // slot-manager mutex when they reach the activate callback.
+        group.with_locked_inner(|inner| {
+            for queue in group.queues.iter() {
+                queue.set_doorbell_id(Some(slot_idx + 1));
+            }
+            inner.csg_id = Some(slot_idx);
+        });
+
         ctx.set_state(slot_idx, CsgExecutionState::Start);
         rollback.dismiss();
         Ok(())
@@ -270,6 +297,18 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
+        // The firmware-side Terminate is staged by
+        // `halt_and_unbind_evicted_groups` and acked via
+        // `apply_csg_updates` (which drops the scheduler mutex around
+        // the wait) before this callback runs. This callback only
+        // tears the binding down: clear `csg_id` / per-queue
+        // `doorbell_id`, release the AS slot.
+        slot_data.group.with_locked_inner(|inner| {
+            for queue in slot_data.group.queues.iter() {
+                queue.set_doorbell_id(None);
+            }
+            inner.csg_id = None;
+        });
         slot_data.group.vm.deactivate()?;
         Ok(())
     }
@@ -286,6 +325,14 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) idle_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
     /// Groups whose queues are blocked on a sync object.
     pub(in crate::sched) waiting_groups: [List<Group, 1>; GROUP_PRIORITY_COUNT],
+    /// Number of CSG slots used by the most recent tick.
+    pub(in crate::sched) used_csg_slot_count: u32,
+    /// True if an active group might have become idle.
+    pub(in crate::sched) might_have_idle_groups: bool,
+    /// When the next tick should occur, if any.
+    pub(in crate::sched) resched_target: Option<Instant<Monotonic>>,
+    /// When the last tick occurred.
+    pub(in crate::sched) last_tick: Instant<Monotonic>,
 }
 
 impl Scheduler {
@@ -315,6 +362,10 @@ impl Scheduler {
             runnable_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
             idle_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
             waiting_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
+            used_csg_slot_count: 0,
+            might_have_idle_groups: false,
+            resched_target: None,
+            last_tick: Instant::<Monotonic>::now(),
         })
     }
 
@@ -345,64 +396,31 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn bind(
-        &mut self,
-        tdev: &TyrDrmDevice,
-        group: Arc<Group>,
-        ctx: &mut CsgUpdateContext,
-    ) -> Result {
-        let mut slot_manager = tdev.csg_slot_manager.lock();
-
-        // Already resident; nothing to do.
-        if group.csg_seat.access(&slot_manager).slot().is_some() {
-            return Ok(());
-        }
-
-        // Pull `group` off its current list. Clear list_state while
-        // in flight; the ScopeGuard below restores it on failure.
+    /// Detaches `group` from every scheduler list it is currently on.
+    ///
+    /// The id-0 (idle/runnable) and id-1 (waiting) memberships are
+    /// independent; both are handled.
+    pub(crate) fn detach_destroyed_group(&mut self, group: &Arc<Group>) {
         let priority = group.priority as usize;
-        let prior_list_state = group.with_locked_inner(|inner| {
-            let prior = inner.list_state;
-            inner.list_state = GroupListState::None;
-            prior
-        });
+        let list_state = group.with_locked_inner(|inner| inner.list_state);
 
-        let list_arc = self
-            .remove_group_from_list(&group, priority, prior_list_state)
-            .ok_or(EINVAL)?;
-
-        let restore_list = match prior_list_state {
-            GroupListState::Runnable => &mut self.runnable_groups[priority],
-            GroupListState::Idle => &mut self.idle_groups[priority],
-            // Unreachable: ok_or(EINVAL)? above takes the error path.
-            GroupListState::None => unreachable!(),
-        };
-        let list_arc = ScopeGuard::new_with_data(list_arc, |list_arc| {
-            restore_list.push_back(list_arc);
+        if !matches!(list_state, GroupListState::None) {
+            let _ = self.remove_group_from_list(group, priority, list_state);
             group.with_locked_inner(|inner| {
-                inner.list_state = prior_list_state;
+                inner.list_state = GroupListState::None;
             });
-        });
-
-        let slot_data = CsgSlotData {
-            group: Arc::clone(&group),
-            fw_priority: 0,
-        };
-
-        slot_manager.activate(&group.csg_seat, slot_data, ctx)?;
-
-        // Cache the CSG doorbell id on each queue so submit-side kicks
-        // can find it without reaching back into the slot manager. The
-        // doorbells wired here remain stable for as long as the slot
-        // is active.
-        let slot_idx = group.csg_seat.access(&slot_manager).slot().ok_or(EINVAL)? as usize;
-        for queue in group.queues.iter() {
-            queue.set_doorbell_id(Some(slot_idx + 1));
         }
 
-        // Bind succeeded; drop the list_arc rather than restoring.
-        let _ = list_arc.dismiss();
-        Ok(())
+        let target = Arc::as_ptr(group);
+        let mut cursor = self.waiting_groups[priority].cursor_front();
+        while let Some(peek) = cursor.peek_next() {
+            let here: *const Group = &*peek.arc();
+            if core::ptr::eq(here, target) {
+                let _ = peek.remove();
+                return;
+            }
+            cursor.move_next();
+        }
     }
 
     pub(crate) fn add_group(&mut self, group: Arc<Group>) -> Result {
@@ -446,6 +464,17 @@ impl Scheduler {
         let _ = self.remove_group_from_list(&group, priority, list_state);
 
         Ok(())
+    }
+
+    /// Schedules the next scheduler tick `TICK_PERIOD_MS` from now.
+    ///
+    /// Wraps [`TyrDrmDeviceData::schedule_periodic_tick`] with the
+    /// scheduler-policy-defined period so callers don't have to know
+    /// the right delay value. Coalescing semantics are inherited from
+    /// the underlying `enqueue_delayed` call: requesting a tick while
+    /// one is already pending does not shorten the existing delay.
+    pub(crate) fn request_tick(tdev: &ARef<TyrDrmDevice>) {
+        TyrDrmDeviceData::schedule_periodic_tick(tdev, msecs_to_jiffies(tick::TICK_PERIOD_MS));
     }
 
     /// Apply accumulated CSG updates.
@@ -556,7 +585,6 @@ impl Scheduler {
     /// Stages a firmware-priority update for CSG slot `csg_idx`.
     ///
     /// Caller must hold the slot-manager lock.
-    #[expect(dead_code)]
     pub(crate) fn update_csg_slot_priority(
         &mut self,
         data: &TyrDrmDeviceData,
@@ -684,10 +712,29 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Requeues a group onto the idle or runnable list.
+    pub(crate) fn requeue_group(&mut self, list_arc: ListArc<Group, 0>, is_idle: bool) {
+        let group_arc: Arc<Group> = list_arc.clone_arc();
+        let priority = group_arc.priority as usize;
+
+        group_arc.with_locked_inner(|inner| {
+            inner.list_state = if is_idle {
+                group::GroupListState::Idle
+            } else {
+                group::GroupListState::Runnable
+            };
+        });
+
+        if is_idle {
+            self.idle_groups[priority].push_back(list_arc);
+        } else {
+            self.runnable_groups[priority].push_back(list_arc);
+        }
+    }
+
     /// Stages a `CSG_REQ.status_update` for every bound CSG slot and
     /// applies the batch, refreshing `GroupInner::idle` from the
     /// firmware view via the post-ack sync pass.
-    #[expect(dead_code)]
     pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
         let mut context = CsgUpdateContext::new();
         let mut faulted_groups: [Option<(usize, Arc<Group>)>; MAX_CSGS] =
