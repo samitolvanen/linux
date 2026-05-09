@@ -44,6 +44,7 @@ use kernel::{
     time::arch_timer_get_rate,
 };
 
+pub(crate) use self::cs::CsActivateInputs;
 pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 
 use crate::wait::WaitResult;
@@ -322,6 +323,9 @@ impl GlobalInterface {
         let dev = unsafe { self.pdev.as_ref().as_bound() };
         let io = self.iomem.access(dev)?;
         let doorbell = Array::try_at(doorbell_id).ok_or(EINVAL)?;
+        // Ensure prior writes to firmware-shared memory (CSG_REQ, GLB_DB_REQ,
+        // ring buffers) reach the firmware before the doorbell.
+        kernel::sync::barrier::wmb();
         io.try_write(doorbell, DOORBELL::zeroed().with_ring(true))
     }
 }
