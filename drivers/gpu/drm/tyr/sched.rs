@@ -6,7 +6,10 @@ use kernel::{
         ListArc, //
     },
     prelude::*,
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     types::ScopeGuard,
 };
 
@@ -113,7 +116,6 @@ const CSG_REQ_STATE_MASK: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::STATE_MASK);
 /// CSG_REQ::ep_cfg bit (4:4). Endpoint-configuration toggle.
 const CSG_REQ_EP_CFG: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::EP_CFG_MASK);
 /// CSG_REQ::status_update bit (5:5). Status-update toggle.
-#[expect(dead_code)]
 const CSG_REQ_STATUS_UPDATE: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::STATUS_UPDATE_MASK);
 
 impl CsgUpdateContext {
@@ -656,5 +658,24 @@ impl Scheduler {
 
         group.set_state(new_state);
         Ok(())
+    }
+
+    /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
+    /// applies the batch. The post-ack sync pass refreshes per-queue
+    /// firmware-status state.
+    #[expect(dead_code)]
+    pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
+        let mut context = CsgUpdateContext::new();
+
+        {
+            let csg_slot_manager = data.csg_slot_manager.lock();
+            for csg_idx in 0..csg_slot_manager.slot_count() {
+                if csg_slot_manager.slot_data(csg_idx).is_some() {
+                    context.toggle_reqs(csg_idx, CSG_REQ_STATUS_UPDATE);
+                }
+            }
+        }
+
+        self.apply_csg_updates(&data, &mut context)
     }
 }
