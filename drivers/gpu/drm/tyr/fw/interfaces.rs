@@ -39,6 +39,8 @@
 //! ```
 //!
 
+// Re-exports visible to the firmware module only. Most CSF interface
+// bitfields and helpers stay confined to `crate::fw::*`.
 pub(in crate::fw) use self::{
     cs::{
         control::{STREAM_FEATURES, STREAM_INPUT_VA, STREAM_OUTPUT_VA},
@@ -51,20 +53,40 @@ pub(in crate::fw) use self::{
             GROUP_INPUT_VA, GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM,
             GROUP_STREAM_STRIDE, GROUP_SUSPEND_SIZE,
         },
-        input::{CSG_DB_REQ, CSG_IRQ_ACK, CSG_REQ},
+        input::{
+            CSG_ACK_IRQ_MASK, CSG_ALLOW_COMPUTE, CSG_ALLOW_FRAGMENT, CSG_ALLOW_OTHER, CSG_DB_REQ,
+            CSG_IRQ_ACK, CSG_PROTM_SUSPEND_BUF, CSG_SUSPEND_BUF,
+        },
         output::{CSG_ACK, CSG_DB_ACK, CSG_IRQ_REQ},
         CSG_CONTROL_BLOCK_SIZE, CSG_INPUT_BLOCK_SIZE, CSG_OUTPUT_BLOCK_SIZE,
     },
     glb::{
         control::{GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_INPUT_VA, GLB_OUTPUT_VA, GLB_VERSION},
         input::{
-            GLB_ACK_IRQ_MASK, GLB_ALLOC_EN, GLB_IDLE_TIMER, GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER,
-            GLB_REQ,
+            GLB_ACK_IRQ_MASK, GLB_ALLOC_EN, GLB_DB_REQ, GLB_IDLE_TIMER, GLB_PROGRESS_TIMER,
+            GLB_PWROFF_TIMER, GLB_REQ,
         },
-        output::GLB_ACK,
+        output::{
+            GLB_ACK,
+            GLB_DB_ACK, //
+        },
         GLB_CONTROL_BLOCK_SIZE, GLB_INPUT_BLOCK_SIZE, GLB_OUTPUT_BLOCK_SIZE,
     },
     iface::FwInterface,
+};
+
+// Re-exports visible crate-wide. The scheduler's per-tick CSG_INPUT
+// programming (`CsgSlotOps::activate`) and per-tick CSG_REQ apply step
+// (`Scheduler::apply_csg_updates`) construct typed bitfield values for
+// these registers without otherwise depending on the rest of the
+// `crate::fw` module.
+pub(crate) use self::csg::{
+    input::{
+        CSG_CONFIG,
+        CSG_EP_REQ,
+        CSG_REQ, //
+    },
+    CsgExecutionState, //
 };
 
 /// Generic firmware interface infrastructure.
@@ -97,6 +119,7 @@ mod iface {
     ///
     /// Provides bounds-checked access to firmware interface blocks mapped into
     /// driver memory via a VMap.
+    #[derive(Clone)]
     pub(in crate::fw) struct FwInterface<const FW_IFACE_SIZE: usize> {
         /// Virtual mapping of the shared memory buffer.
         ///
@@ -691,7 +714,7 @@ mod csg {
     /// CSG execution state (csg_execution_state_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsgExecutionState {
+    pub(crate) enum CsgExecutionState {
         /// Terminate execution without saving any state.
         Terminate = 0,
         /// Start execution of the command stream group without restoring any state.
@@ -920,6 +943,83 @@ mod csg {
                 3:0 jasid;
                 8:8 l2c_allocate_ring => bool;
                 16:16 l2c_allocate_other => bool;
+            }
+        }
+
+        // Bitwise composition for CSG_REQ values and bit-masks of fields
+        // within CSG_REQ. The per-tick CSG scheduler uses CSG_REQ both
+        // as the typed register value and as the masks of bits it owns
+        // (`STATE_MASK`, `EP_CFG_MASK`, `STATUS_UPDATE_MASK`, ...), so
+        // these operators let it compose without round-tripping through
+        // the raw u32 storage.
+        use core::{
+            fmt,
+            ops::{
+                BitAnd,
+                BitAndAssign,
+                BitOr,
+                BitOrAssign,
+                BitXor,
+                Not, //
+            }, //
+        };
+
+        impl CSG_REQ {
+            #[inline(always)]
+            pub(crate) const fn is_empty(self) -> bool {
+                self.into_raw() == 0
+            }
+        }
+
+        impl BitOr for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn bitor(self, rhs: Self) -> Self {
+                Self::from_raw(self.into_raw() | rhs.into_raw())
+            }
+        }
+
+        impl BitOrAssign for CSG_REQ {
+            #[inline(always)]
+            fn bitor_assign(&mut self, rhs: Self) {
+                *self = *self | rhs;
+            }
+        }
+
+        impl BitAnd for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn bitand(self, rhs: Self) -> Self {
+                Self::from_raw(self.into_raw() & rhs.into_raw())
+            }
+        }
+
+        impl BitAndAssign for CSG_REQ {
+            #[inline(always)]
+            fn bitand_assign(&mut self, rhs: Self) {
+                *self = *self & rhs;
+            }
+        }
+
+        impl BitXor for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn bitxor(self, rhs: Self) -> Self {
+                Self::from_raw(self.into_raw() ^ rhs.into_raw())
+            }
+        }
+
+        impl Not for CSG_REQ {
+            type Output = Self;
+            #[inline(always)]
+            fn not(self) -> Self {
+                Self::from_raw(!self.into_raw())
+            }
+        }
+
+        impl fmt::LowerHex for CSG_REQ {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerHex::fmt(&self.into_raw(), f)
             }
         }
     }

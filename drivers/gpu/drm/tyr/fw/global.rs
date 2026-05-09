@@ -16,13 +16,14 @@ use crate::{
     driver::IoMem,
     fw::{
         interfaces::{
-            FwInterface, CSG_CONTROL_BLOCK_SIZE, GLB_ACK, GLB_ACK_IRQ_MASK, GLB_ALLOC_EN,
-            GLB_CONTROL_BLOCK_SIZE, GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_IDLE_TIMER,
-            GLB_INPUT_BLOCK_SIZE, GLB_INPUT_VA, GLB_OUTPUT_BLOCK_SIZE, GLB_OUTPUT_VA,
-            GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER, GLB_REQ, GLB_VERSION,
+            FwInterface, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_REQ, GLB_ACK, GLB_ACK_IRQ_MASK,
+            GLB_ALLOC_EN, GLB_CONTROL_BLOCK_SIZE, GLB_DB_ACK, GLB_DB_REQ, GLB_GROUP_NUM,
+            GLB_GROUP_STRIDE, GLB_IDLE_TIMER, GLB_INPUT_BLOCK_SIZE, GLB_INPUT_VA,
+            GLB_OUTPUT_BLOCK_SIZE, GLB_OUTPUT_VA, GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER, GLB_REQ,
+            GLB_VERSION,
         },
         irq::JobIrqState,
-        Section, MAX_CSG,
+        CsgSlotMask, Section, MAX_CSG,
     },
     gem::BoData,
     gpu::GpuInfo,
@@ -43,7 +44,7 @@ use kernel::{
     time::arch_timer_get_rate,
 };
 
-pub(crate) use self::csg::CsgInterface;
+pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 
 use crate::wait::WaitResult;
 
@@ -234,9 +235,86 @@ impl GlobalInterface {
         f(csg)
     }
 
+    /// Waits for the CSG_REQ bits in `mask` at slot `csg_idx` to be
+    /// mirrored into CSG_ACK by the firmware. Returns the bits that
+    /// were actually acknowledged (`!(req ^ ack) & mask`); a partial
+    /// flip of the 3-bit CSG_REQ::state field is reported as not acked
+    /// and cleared from the returned mask.
+    ///
+    /// Wait timeouts and transient I/O errors are visible in the
+    /// returned mask rather than in the error path, so callers can
+    /// distinguish a stuck slot from a successful transition and see
+    /// exactly which sub-requests were honoured. Signal interrupts
+    /// (`ERESTARTSYS`) propagate as `Err` so callers in syscall
+    /// context honour the kernel's restart-on-signal semantics.
+    ///
+    /// The wait predicate runs under the event-wait lock and must not
+    /// re-acquire `inner`. `process_global_irq` already holds `inner`
+    /// across the GLB-side wait_acks (which takes the event-wait lock
+    /// internally), so a predicate that took `inner` from inside the
+    /// event-wait lock would invert that order and deadlock. The MMIO
+    /// snapshot taken before entering the wait keeps the predicate
+    /// `inner`-free.
+    pub(crate) fn wait_csg_acks(
+        &self,
+        csg_idx: usize,
+        mask: CSG_REQ,
+        timeout_ms: u32,
+    ) -> Result<CSG_REQ> {
+        let state_mask = CSG_REQ::from_raw(CSG_REQ::STATE_MASK);
+
+        let (csg_input, csg_output) = {
+            let mut inner = self.inner.lock();
+            let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
+            csg.clone_req_ack_io()?
+        };
+
+        // Caller is the sole writer of CSG_REQ for this slot, so req is
+        // stable across the wait.
+        let req = csg_input.read(CSG_REQ) & mask;
+
+        let wait_result = self.event_wait.wait_interruptible_timeout(timeout_ms, || {
+            let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
+            if ack == req {
+                Ok(WaitResult::Done)
+            } else {
+                Ok(WaitResult::Retry)
+            }
+        });
+        if wait_result == Err(ERESTARTSYS) {
+            return Err(ERESTARTSYS);
+        }
+
+        // Re-read ACK so the returned mask reflects what the firmware
+        // acked even on timeout.
+        let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
+        let mut acked = !(req ^ ack) & mask;
+
+        if (acked & state_mask) != (mask & state_mask) {
+            acked &= !state_mask;
+        }
+
+        Ok(acked)
+    }
+
     #[allow(dead_code)]
     pub(super) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
         self.ring_doorbell(csg_idx + 1)
+    }
+
+    /// Toggles the `GLB_DB_REQ` bits that differ from `GLB_DB_ACK` for
+    /// each slot in `csg_mask`, then writes the global doorbell so the
+    /// firmware re-evaluates the global input block. Toggling against
+    /// the live ack guarantees the request transitions to a value the
+    /// firmware has not already acknowledged, so the event is observed
+    /// as a fresh edge rather than collapsed.
+    pub(super) fn ring_csg_doorbells(&self, csg_mask: CsgSlotMask) -> Result {
+        if csg_mask.is_empty() {
+            return Ok(());
+        }
+
+        self.inner.lock().toggle_glb_db_req(csg_mask)?;
+        self.ring_doorbell(0)
     }
 
     fn ring_doorbell(&self, doorbell_id: usize) -> Result {
@@ -459,6 +537,25 @@ impl InnerGlobalInterface {
         };
 
         enabled.csg.get_mut(index)
+    }
+
+    fn toggle_glb_db_req(&self, csg_mask: CsgSlotMask) -> Result {
+        let enabled = match &self.state {
+            GlobalInterfaceState::Enabled(enabled) => enabled,
+            GlobalInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        // Toggle the requested doorbell bits relative to the firmware-
+        // owned ack so each one becomes a fresh "event pending" edge.
+        // Other bits in the GLB_DB_REQ word are preserved.
+        let csg_mask = csg_mask.into_raw();
+        let cur_req = enabled.glb_input.read(GLB_DB_REQ).into_raw();
+        let cur_ack = enabled.glb_output.read(GLB_DB_ACK).into_raw();
+        let new_req = (cur_req & !csg_mask) | ((cur_ack ^ csg_mask) & csg_mask);
+        enabled
+            .glb_input
+            .write(GLB_DB_REQ, GLB_DB_REQ::from_raw(new_req));
+        Ok(())
     }
 
     fn process_global_irq(&mut self) -> Result {
