@@ -242,12 +242,16 @@ impl QueueData {
         self.next_seqno.load(Ordering::Relaxed)
     }
 
-    pub(super) fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
-        let mut ringbuf_input = self.ringbuf_space_for(instrs.len())?;
+    /// Copies `instrs` into the ringbuffer at the current `INSERT`. The
+    /// returned completion point is the `INSERT` value
+    /// [`Self::commit_ringbuf_range`] will publish once the caller has
+    /// registered the matching pending submit fence.
+    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64> {
+        let ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let ringbuf_sz = self.ringbuf.size() as u64;
-        let ringbuf_output = self.interfaces.read_output()?;
 
-        let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
+        let ringbuf_start = ringbuf_input.insert;
+        let cs_insert = (ringbuf_start & (ringbuf_sz - 1)) as usize;
 
         let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.owner().size();
@@ -261,15 +265,27 @@ impl QueueData {
             bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
         }
 
+        let completion_point = ringbuf_start + instrs.len() as u64;
+        Ok(completion_point)
+    }
+
+    /// Publishes a previously claimed ringbuffer range to the firmware.
+    ///
+    /// `completion_point` must equal the value returned from the matching
+    /// [`Self::claim_ringbuf_range`]. The leading `smp_wmb()` orders the
+    /// prior byte-copy before the `INSERT` write; the trailing `smp_wmb()`
+    /// orders the `INSERT` write before the doorbell ring that follows.
+    pub(super) fn commit_ringbuf_range(&self, completion_point: u64) -> Result {
         kernel::sync::barrier::smp_wmb();
 
+        let mut ringbuf_input = self.interfaces.read_input()?;
+        let ringbuf_output = self.interfaces.read_output()?;
         ringbuf_input.extract_init = ringbuf_output.extract;
-        ringbuf_input.insert += instrs.len() as u64;
-        let completion_point = ringbuf_input.insert;
+        ringbuf_input.insert = completion_point;
 
         self.interfaces.write_input(ringbuf_input)?;
         kernel::sync::barrier::smp_wmb();
-        Ok(completion_point)
+        Ok(())
     }
 
     pub(super) fn kick(&self) -> Result {
@@ -523,7 +539,7 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
-        let completion_point = match self.data.append_instrs(&job.job.stream) {
+        let completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(completion_point) => completion_point,
             Err(err) => {
                 fence.signal(Err(err));
@@ -535,6 +551,11 @@ impl QueueOps for TyrQueueOps {
 
         if let Err((err, fence)) = self.data.add_pending_submit_fence(completion_point, fence) {
             fence.signal(Err(err));
+            return Err(err);
+        }
+
+        if let Err(err) = self.data.commit_ringbuf_range(completion_point) {
+            self.data.signal_submit_fence(completion_point, Err(err));
             return Err(err);
         }
 
