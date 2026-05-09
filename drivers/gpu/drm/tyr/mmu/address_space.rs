@@ -230,6 +230,13 @@ pub(crate) struct AddressSpaceManager {
 
     /// Bitmask of available address space slots from GPU_AS_PRESENT register.
     as_present: u32,
+
+    /// Whether hardware AS slot N currently holds a region lock.
+    ///
+    /// The lock is tracked per slot. Every Lock and Unlock on a slot goes
+    /// through `as_start_update`, `as_end_update`, and `as_disable` under the
+    /// `as_manager` mutex, so the flag follows whichever VM occupies the slot.
+    lock_pending: [bool; MAX_AS],
 }
 
 impl SlotOperations for AddressSpaceManager {
@@ -257,7 +264,6 @@ impl SlotOperations for AddressSpaceManager {
         _ctx: &mut Self::Context,
     ) -> Result {
         if self.iomem.try_access().is_some() {
-            self.as_flush(slot_idx)?;
             self.as_disable(slot_idx)?;
         }
         Ok(())
@@ -278,6 +284,7 @@ impl AddressSpaceManager {
             pdev: pdev.into(),
             iomem: iomem.into(),
             as_present,
+            lock_pending: [false; MAX_AS],
         })
     }
 
@@ -398,8 +405,18 @@ impl AddressSpaceManager {
     fn as_disable(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
 
-        // Flush AS before disabling
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushMem)?;
+        self.gpu_flush_caches(
+            FlushMode::CleanInvalidate,
+            FlushMode::CleanInvalidate,
+            FlushMode::Invalidate,
+        )?;
+
+        // Reclaiming a slot mid-update leaves the region lock from
+        // `as_start_update` unbalanced. Release it before the slot is reused.
+        if self.lock_pending[as_nr] {
+            self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
+        }
+        self.lock_pending[as_nr] = false;
 
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
@@ -503,7 +520,9 @@ impl AddressSpaceManager {
             LOCKADDR_HI::from_raw((lockaddr_val >> 32) as u32),
         );
 
-        self.as_send_cmd(as_nr, MmuCommand::Lock)
+        self.as_send_cmd(as_nr, MmuCommand::Lock)?;
+        self.lock_pending[as_nr] = true;
+        Ok(())
     }
 
     /// Completes an atomic translation table update.
@@ -517,19 +536,9 @@ impl AddressSpaceManager {
             FlushMode::CleanInvalidate,
             FlushMode::Invalidate,
         )?;
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)
-    }
-
-    /// Flushes GPU caches for an AS slot.
-    ///
-    /// Issues the global GPU cache flush command. No AS lock is taken.
-    fn as_flush(&mut self, as_nr: usize) -> Result {
-        self.validate_as_slot(as_nr)?;
-        self.gpu_flush_caches(
-            FlushMode::CleanInvalidate,
-            FlushMode::CleanInvalidate,
-            FlushMode::Invalidate,
-        )
+        self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
+        self.lock_pending[as_nr] = false;
+        Ok(())
     }
 
     /// Issues the GPU-side `flush_caches` command and waits for completion.
@@ -599,23 +608,6 @@ impl AsSlotManager {
             Some(slot) => {
                 let as_nr = slot as usize;
                 self.as_end_update(as_nr)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Flushes translation table cache if the VM has an active slot.
-    ///
-    /// If the VM is currently assigned to a hardware slot, invalidates cached
-    /// translation table entries to ensure subsequent GPU accesses use updated translations.
-    ///
-    /// If the VM is not resident in a hardware slot, this is a no-op.
-    pub(super) fn flush_vm(&mut self, vm: &VmAsData) -> Result {
-        let seat = vm.as_seat.access(self);
-        match seat.slot() {
-            Some(slot) => {
-                let as_nr = slot as usize;
-                self.as_flush(as_nr)
             }
             _ => Ok(()),
         }
