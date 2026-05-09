@@ -944,9 +944,56 @@ impl Scheduler {
         });
     }
 
+    /// Drains every resident queue's pending submit fences whose
+    /// `completion_point` is at or below the firmware-visible
+    /// `EXTRACT`.
+    ///
+    /// Must be called *outside* `TyrDrmDeviceData::with_locked_scheduler`:
+    /// the per-queue `complete_submit_fences` opens a
+    /// `DmaFenceSignallingAnnotation` and signals user-visible
+    /// dma-fences, and signalling-section code may not nest inside a
+    /// wide driver lock like the scheduler mutex.
+    ///
+    /// Snapshots the bound groups under the slot-manager lock and
+    /// drops it before touching firmware-shared memory; the snapshot
+    /// is a fixed-capacity `[Option<Arc<Group>>; MAX_CSGS]` so this
+    /// stays allocation-free. Per-queue read errors are logged and
+    /// skipped.
+    pub(crate) fn drain_resident_queue_completions(tdev: &TyrDrmDevice) {
+        let mut snapshot: [Option<Arc<Group>>; MAX_CSGS] = [const { None }; MAX_CSGS];
+        {
+            let csg_slot_manager = tdev.csg_slot_manager.lock();
+            for (csg_idx, slot) in snapshot.iter_mut().enumerate() {
+                if let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) {
+                    *slot = Some(slot_data.group.clone());
+                }
+            }
+        }
+
+        for entry in snapshot.iter() {
+            let Some(group) = entry else {
+                continue;
+            };
+            for queue in group.queues.iter() {
+                if let Err(err) = queue.complete_submit_fences() {
+                    pr_err!(
+                        "sync_upd: queue completion drain failed: {}\n",
+                        err.to_errno()
+                    );
+                }
+            }
+        }
+    }
+
     /// Walks `waiting_groups` once, re-evaluating each blocked queue's
     /// captured `SyncWait` and moving newly unblocked groups onto
     /// `runnable_groups`.
+    ///
+    /// The companion submit-fence drain runs from the `sync_upd`
+    /// worker before the scheduler lock is taken (see
+    /// [`Self::drain_resident_queue_completions`]), so this routine
+    /// itself does no fence signalling and can run with the scheduler
+    /// mutex held.
     ///
     /// Returns `true` if an unbound RealTime-priority group was
     /// promoted to `runnable_groups`, in which case the caller fires
