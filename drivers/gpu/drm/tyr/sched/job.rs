@@ -7,8 +7,13 @@
 //! group object focus on group state and scheduler coordination.
 
 use kernel::{
-    alloc::KVec, dma_buf::dma_fence::PublicDmaFence, prelude::*, sync::aref::ARef,
-    transmute::FromBytes, uaccess::UserSlice, uapi,
+    alloc::KVec,
+    dma_buf::dma_fence::PublicDmaFence,
+    prelude::*,
+    sync::{aref::ARef, Arc},
+    transmute::FromBytes,
+    uaccess::UserSlice,
+    uapi,
 };
 
 use super::{
@@ -213,7 +218,7 @@ impl Job {
 
     pub(crate) fn prepare(
         self,
-        group: &Group,
+        group: &Arc<Group>,
         file: &crate::file::TyrDrmFile,
     ) -> Result<PreparedQueueSubmit> {
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
@@ -221,7 +226,7 @@ impl Job {
         let deps = deps::wait_fences(file, &self.syncs)?;
         let signals = deps::signal_syncs(file, &self.syncs)?;
         let has_stream = !self.stream.is_empty();
-        let prepared = queue.prepare_job(QueueJob::new(self.stream), &deps)?;
+        let prepared = queue.prepare_job(QueueJob::new(self.stream, group.clone()), &deps)?;
 
         Ok(PreparedQueueSubmit {
             queue_index: self.queue_index,

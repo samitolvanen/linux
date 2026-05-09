@@ -32,11 +32,17 @@ use kernel::{
 };
 
 use crate::{
-    driver::{IoMem, TyrDrmDevice},
+    driver::{
+        IoMem,
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
+    },
     gem,
     regs::doorbell_block,
     vm::{Vm, VmFlag, VmMapFlags},
 };
+
+use super::group::Group;
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
 const JOB_POLL_INTERVAL_MS: u32 = 1;
@@ -108,13 +114,18 @@ struct PendingSubmitFence {
 pub(super) struct QueueJob {
     stream: KVec<u8>,
     completion_point: AtomicU64,
+    /// Back-reference to the owning group; used by
+    /// [`TyrQueueOps::submit`] to reach the scheduler workqueue when
+    /// no CSG doorbell has been assigned to the queue yet.
+    pub(super) group: Arc<Group>,
 }
 
 impl QueueJob {
-    pub(super) fn new(stream: KVec<u8>) -> Self {
+    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>) -> Self {
         Self {
             stream,
             completion_point: AtomicU64::new(0),
+            group,
         }
     }
 
@@ -365,10 +376,6 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         }
 
-        if self.data.doorbell_id().is_none() {
-            return Ok(SubmitResult::NoResources(fence));
-        }
-
         if job.job.stream.len() as u64 > self.data.ringbuf.size() as u64 {
             fence.signal(Err(ENOSPC));
             return Err(ENOSPC);
@@ -403,9 +410,39 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
-        if let Err(err) = self.data.kick() {
-            self.data.signal_submit_fence(completion_point, Err(err));
-            return Err(err);
+        // Decide bound-vs-unbound under the group's inner mutex and
+        // ring the doorbell while still holding it. The publish side
+        // (`CsgSlotOps::activate`) and the clear side
+        // (`CsgSlotOps::evict`) both update `csg_id` and the per-queue
+        // `doorbell_id` together under the same lock, so observing
+        // `csg_id == Some(_)` here guarantees `doorbell_id` is still
+        // assigned for the entire kick. Without the lock-spanning
+        // kick, a concurrent eviction could clear `doorbell_id`
+        // between the bound test and the MMIO write, surfacing
+        // `EINVAL` on already-committed ringbuf bytes that will
+        // execute as soon as the queue rebinds. The locked window is
+        // one MMIO doorbell write: no `GFP_KERNEL` allocation, no
+        // `dma_resv_lock`, no `mmu_notifier` path.
+        let group = &job.job.group;
+        let (bound, kick_err) = group.with_locked_inner(|inner| {
+            if inner.csg_id.is_none() {
+                return (false, Ok(()));
+            }
+            let kick_res = self.data.kick();
+            (true, kick_res)
+        });
+
+        if bound {
+            if let Err(err) = kick_err {
+                self.data.signal_submit_fence(completion_point, Err(err));
+                return Err(err);
+            }
+        } else {
+            // Group is unbound; ask the scheduler to bind it. The
+            // per-CS doorbell ring that activate() stages on bind picks
+            // up the instructions we just committed, and the framework's
+            // existing completion-stage polling drives forward progress.
+            TyrDrmDeviceData::schedule_tick(&group.tdev);
         }
 
         Ok(SubmitResult::Submitted)
