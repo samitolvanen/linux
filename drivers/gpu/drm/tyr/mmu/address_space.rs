@@ -238,7 +238,6 @@ impl SlotOperations for AddressSpaceManager {
     /// Evicts an address space from a hardware slot.
     fn evict(&mut self, slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
         if self.iomem.try_access().is_some() {
-            self.as_flush(slot_idx)?;
             self.as_disable(slot_idx)?;
         }
         Ok(())
@@ -379,8 +378,12 @@ impl AddressSpaceManager {
     fn as_disable(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
 
-        // Flush AS before disabling
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushMem)?;
+        self.gpu_flush_caches(
+            FlushMode::CleanInvalidate,
+            FlushMode::CleanInvalidate,
+            FlushMode::Invalidate,
+        )?;
+        self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
 
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
