@@ -2,7 +2,12 @@
 
 use core::{
     ops::{Deref, Range},
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{
+        AtomicI64,
+        AtomicU64,
+        AtomicUsize,
+        Ordering, //
+    },
 };
 
 use kernel::{
@@ -26,7 +31,13 @@ use kernel::{
     sizes::SZ_4K,
     sizes::SZ_64K,
     sync::{aref::ARef, Arc, LockClassKey, Mutex},
-    time::{msecs_to_jiffies, Jiffies},
+    time::{
+        msecs_to_jiffies,
+        Delta,
+        Instant,
+        Jiffies,
+        Monotonic, //
+    },
     transmute::FromBytes,
     uapi,
 };
@@ -46,7 +57,6 @@ use crate::{
 use super::group::Group;
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
-const JOB_POLL_INTERVAL_MS: u32 = 1;
 const JOB_TIMEOUT_MS: u32 = 5000;
 
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -164,6 +174,12 @@ pub(crate) struct CachedBo {
 pub(super) struct QueueJob {
     stream: KVec<u8>,
     completion_point: AtomicU64,
+    /// Snapshot of `QueueData::suspend_snapshot` taken at submit
+    /// time, folded with any in-flight suspend interval; subtracted
+    /// from the queue's current accumulator by the timeout stage so a
+    /// job is not faulted for time the queue spent suspended off its
+    /// CSG slot before this job was submitted.
+    baseline_suspend_nanos: AtomicI64,
     /// Back-reference to the owning group; used by
     /// [`TyrQueueOps::submit`] to reach the scheduler workqueue when
     /// no CSG doorbell has been assigned to the queue yet.
@@ -175,6 +191,7 @@ impl QueueJob {
         Self {
             stream,
             completion_point: AtomicU64::new(0),
+            baseline_suspend_nanos: AtomicI64::new(0),
             group,
         }
     }
@@ -189,6 +206,34 @@ impl QueueJob {
     fn set_completion_point(&self, completion_point: u64) {
         self.completion_point
             .store(completion_point, Ordering::Release);
+    }
+
+    pub(super) fn baseline_suspend(&self) -> Delta {
+        Delta::from_nanos(self.baseline_suspend_nanos.load(Ordering::Relaxed))
+    }
+
+    fn set_baseline_suspend(&self, baseline: Delta) {
+        self.baseline_suspend_nanos
+            .store(baseline.as_nanos(), Ordering::Relaxed);
+    }
+}
+
+/// Per-queue accounting of time spent off the CSG slot.
+struct SuspendState {
+    /// `Some(t)` when the queue is currently suspended off its CSG
+    /// slot; `t` is the monotonic instant at which the suspend began.
+    since: Option<Instant<Monotonic>>,
+    /// Total time the queue has spent suspended off its CSG slot
+    /// since creation.
+    accumulated: Delta,
+}
+
+impl Default for SuspendState {
+    fn default() -> Self {
+        Self {
+            since: None,
+            accumulated: Delta::ZERO,
+        }
     }
 }
 
@@ -206,6 +251,15 @@ pub(crate) struct QueueData {
     /// value (`gpu_va == 0`) means no wait is currently active.
     #[pin]
     syncwait: Mutex<SyncWait>,
+    /// Per-queue accounting of off-slot suspend time; advanced by
+    /// [`Self::suspend_timeout`] / [`Self::resume_timeout`] from
+    /// [`CsgSlotOps::evict`] / [`CsgSlotOps::activate`] and snapshotted
+    /// by [`TyrQueueOps::submit`] for the per-job baseline.
+    ///
+    /// [`CsgSlotOps::activate`]: crate::sched::CsgSlotOps::activate
+    /// [`CsgSlotOps::evict`]: crate::sched::CsgSlotOps::evict
+    #[pin]
+    suspend_state: Mutex<SuspendState>,
 }
 
 impl QueueData {
@@ -450,9 +504,9 @@ impl QueueData {
     /// every leading pending submit fence whose `completion_point` is
     /// at or below it.
     ///
-    /// Used by both [`HwTimeoutStage::process`] (its progress-poll
-    /// path) and the IRQ-driven completion path on the scheduler
-    /// side.
+    /// Called from both the IRQ-driven completion path on the
+    /// scheduler side and from [`QueueCompletionStage::process`] as a
+    /// defensive backstop in case a sync-update IRQ was missed.
     pub(in crate::sched) fn complete_submit_fences(&self) -> Result {
         let ringbuf_output = self.interfaces.read_output()?;
         self.complete_pending_fences_up_to(ringbuf_output.extract);
@@ -586,6 +640,42 @@ impl QueueData {
             doorbell_id,
         })
     }
+
+    /// Atomic snapshot of `(accumulated, in_flight_since)` for the
+    /// timeout stage. The returned `since` is `Some(t)` when the queue
+    /// is currently suspended off its CSG slot; `t` is the monotonic
+    /// instant at which that suspend interval began.
+    fn suspend_snapshot(&self) -> (Delta, Option<Instant<Monotonic>>) {
+        let state = self.suspend_state.lock();
+        (state.accumulated, state.since)
+    }
+
+    /// Marks the queue as suspended off its CSG slot.
+    ///
+    /// Records the current monotonic instant so a later
+    /// [`Self::resume_timeout`] can fold the interval into
+    /// [`SuspendState::accumulated`]. No-op when the queue is already
+    /// suspended; this preserves the existing start time rather than
+    /// restarting the interval.
+    pub(super) fn suspend_timeout(&self) {
+        let mut state = self.suspend_state.lock();
+        if state.since.is_none() {
+            state.since = Some(Instant::<Monotonic>::now());
+        }
+    }
+
+    /// Marks the queue as resumed onto its CSG slot.
+    ///
+    /// Adds the time since the matching [`Self::suspend_timeout`] to
+    /// [`SuspendState::accumulated`]. No-op if the queue is not
+    /// currently suspended.
+    pub(super) fn resume_timeout(&self) {
+        let mut state = self.suspend_state.lock();
+        if let Some(start) = state.since.take() {
+            let elapsed = Instant::<Monotonic>::now() - start;
+            state.accumulated += elapsed;
+        }
+    }
 }
 
 pub(super) struct TyrQueueOps {
@@ -637,6 +727,16 @@ impl QueueOps for TyrQueueOps {
             fence.signal(Err(err));
             return Err(err);
         }
+
+        // Fold any in-flight suspend interval into the baseline so it
+        // matches the shape the timeout stage uses on the consumer
+        // side; subtraction is exact only when both sides fold.
+        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
+        let baseline = match in_flight_since {
+            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
+            None => accumulated,
+        };
+        job.job.set_baseline_suspend(baseline);
 
         let completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(completion_point) => completion_point,
@@ -702,9 +802,13 @@ impl QueueOps for TyrQueueOps {
     }
 }
 
+/// Bounds an in-flight job by `JOB_TIMEOUT_MS` of on-slot time.
+///
+/// "Suspend-adjusted" means the time the queue spent evicted off
+/// its CSG slot for higher-priority work is credited back against
+/// the per-job deadline.
 struct QueueCompletionStage {
     data: Arc<QueueData>,
-    poll_interval: Jiffies,
     timeout: Jiffies,
 }
 
@@ -725,8 +829,20 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::Advance;
         }
 
+        // Compute the suspend allowance under one lock acquire so the
+        // in-flight interval and the accumulator are read atomically.
+        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
+        let mut suspended = accumulated;
+        if let Some(start) = in_flight_since {
+            suspended += Instant::<Monotonic>::now() - start;
+        }
+        let allowance = suspended - ctx.job.baseline_suspend();
+        let allowance_jiffies = msecs_to_jiffies(allowance.as_millis().max(0) as u32);
+
         let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
-        if elapsed >= self.timeout {
+        let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
+
+        if adjusted_elapsed >= self.timeout {
             pr_err!("Tyr queue job {} timed out\n", ctx.counter);
             if let Some(completion_point) = ctx.job.completion_point() {
                 self.data
@@ -735,7 +851,13 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::TimedOut(ETIMEDOUT);
         }
 
-        StageAdvance::WaitFor(self.poll_interval)
+        // Wake at the remaining deadline. The submit fence's
+        // progress callback (registered by the framework's
+        // `process_exec`) will wake the pipeline earlier when
+        // `Scheduler::sync_upd_step` signals the fence in response
+        // to a sync-update IRQ; this `WaitFor` is just the
+        // worst-case bound for actually faulting the job.
+        StageAdvance::WaitFor(self.timeout - adjusted_elapsed)
     }
 
     fn teardown(&self, job: &QueueJob, _counter: u64) {
@@ -771,6 +893,7 @@ impl Queue {
                 iomem: tdev.iomem.clone(),
                 pending_submit_fences <- new_mutex!(KVec::new()),
                 syncwait <- new_mutex!(SyncWait::default()),
+                suspend_state <- new_mutex!(SuspendState::default()),
             }),
             GFP_KERNEL,
         )?;
@@ -779,7 +902,6 @@ impl Queue {
             .set_cancel_timeout(msecs_to_jiffies(JOB_TIMEOUT_MS))
             .add_stage(QueueCompletionStage {
                 data: data.clone(),
-                poll_interval: msecs_to_jiffies(JOB_POLL_INTERVAL_MS),
                 timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
             })?;
         let job_queue = JobQueue::new(

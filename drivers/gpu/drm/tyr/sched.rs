@@ -319,13 +319,18 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // `UNASSIGNED` doorbell from being observed alongside an
         // already-bound `csg_id` on weakly-ordered architectures. The
         // per-CS doorbells wired here remain stable for as long as
-        // the slot is active; the matching clear lives in `evict`
-        // below. The `csg_slot_manager > inner` lock ordering matches
-        // the rest of the scheduler: callers already hold the
-        // slot-manager mutex when they reach the activate callback.
+        // the slot is active. Pair the doorbell publish with
+        // `resume_timeout()` so the suspend interval that started when
+        // the queue was last evicted (if any) is folded into the
+        // queue's accumulated suspend time. The matching clear lives
+        // in `evict` below. The `csg_slot_manager > inner` lock
+        // ordering matches the rest of the scheduler: callers already
+        // hold the slot-manager mutex when they reach the activate
+        // callback.
         group.with_locked_inner(|inner| {
             for queue in group.queues.iter() {
                 queue.set_doorbell_id(Some(slot_idx + 1));
+                queue.resume_timeout();
             }
             inner.csg_id = Some(slot_idx);
         });
@@ -356,6 +361,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
+                queue.suspend_timeout();
             }
             inner.csg_id = None;
         });
