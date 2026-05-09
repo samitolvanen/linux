@@ -130,7 +130,14 @@ pub(crate) struct SyncWait {
     /// Wait condition: `true` for `>` (Gt), `false` for `<=` (Le).
     pub(crate) gt: bool,
     /// Cached BO that backs `gpu_va`, if previously resolved.
-    pub(crate) bo: Option<Arc<gem::MappedBo>>,
+    ///
+    /// Only populated when the awaited sync object lives in a
+    /// userspace-mapped BO reached via [`Vm::get_bo_for_va`]; sync
+    /// waits targeting the group's own per-queue syncobjs pool do
+    /// not allocate this cache.
+    ///
+    /// [`Vm::get_bo_for_va`]: crate::vm::Vm::get_bo_for_va
+    pub(crate) bo: Option<Arc<gem::MappedUserBo>>,
     /// Offset within `bo` corresponding to `gpu_va`.
     pub(crate) bo_offset: usize,
 }
@@ -373,18 +380,21 @@ impl QueueData {
     }
 
     /// Returns a clone of the active sync-wait snapshot.
-    #[expect(dead_code)]
     pub(crate) fn syncwait_snapshot(&self) -> SyncWait {
         self.syncwait.lock().clone()
     }
 
     /// Updates the firmware-reported fields of the active sync-wait
-    /// snapshot. Leaves the cached `(bo, bo_offset)` resolution intact;
-    /// a follow-on commit clears the cache explicitly when the wait is
-    /// satisfied so the drop of the cached BO runs outside the
-    /// dma-fence signalling annotation that wraps this caller.
+    /// snapshot. Preserves the cached `(bo, bo_offset)` resolution
+    /// across re-reports of the same `(gpu_va, sync64)`; otherwise the
+    /// cache no longer describes the awaited sync object and is
+    /// dropped.
     pub(crate) fn set_syncwait(&self, gpu_va: u64, ref_val: u64, sync64: bool, gt: bool) {
         let mut wait = self.syncwait.lock();
+        if wait.gpu_va != gpu_va || wait.sync64 != sync64 {
+            wait.bo = None;
+            wait.bo_offset = 0;
+        }
         wait.gpu_va = gpu_va;
         wait.ref_val = ref_val;
         wait.sync64 = sync64;
@@ -392,23 +402,45 @@ impl QueueData {
     }
 
     /// Stores a resolved `(bo, bo_offset)` cache on the active
-    /// sync-wait snapshot, but only if `gpu_va` still matches the
-    /// currently captured wait. Returns `true` if the cache was
-    /// applied.
-    #[expect(dead_code)]
+    /// sync-wait snapshot, but only if `gpu_va` and `sync64` still
+    /// match the currently captured wait.
+    ///
+    /// Used by `Group::eval_syncwait` to memoise the GPU-VA → BO
+    /// translation so later re-evaluations of the same wait can skip
+    /// the gpuvm walk. Both `gpu_va` and `sync64` are re-checked
+    /// under the lock so a concurrent `set_syncwait` that reuses the
+    /// same address with a different sync-object width does not
+    /// install a stale resolution that would later be read with the
+    /// wrong type. Returns `true` if the cache was applied.
     pub(crate) fn cache_syncwait_bo(
         &self,
         gpu_va: u64,
-        bo: Arc<gem::MappedBo>,
+        sync64: bool,
+        bo: Arc<gem::MappedUserBo>,
         bo_offset: usize,
     ) -> bool {
         let mut wait = self.syncwait.lock();
-        if wait.gpu_va != gpu_va {
+        if wait.gpu_va != gpu_va || wait.sync64 != sync64 {
             return false;
         }
         wait.bo = Some(bo);
         wait.bo_offset = bo_offset;
         true
+    }
+
+    /// Removes any cached `(bo, bo_offset)` resolution from the active
+    /// sync-wait snapshot. Used by [`Group::eval_syncwait`] to
+    /// invalidate the cache once a wait is satisfied so the next wait
+    /// captured for this queue does a fresh gpuvm walk.
+    ///
+    /// Must not be called from a dma-fence signalling section: the
+    /// returned value's drop acquires `dma_resv_lock`.
+    ///
+    /// [`Group::eval_syncwait`]: crate::sched::group::Group::eval_syncwait
+    pub(crate) fn take_syncwait_bo(&self) -> Option<Arc<gem::MappedUserBo>> {
+        let mut wait = self.syncwait.lock();
+        wait.bo_offset = 0;
+        wait.bo.take()
     }
 
     /// Returns `true` if the firmware-visible ring buffer is currently

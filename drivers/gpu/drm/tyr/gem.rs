@@ -137,6 +137,62 @@ impl core::ops::Deref for MappedBo {
     }
 }
 
+/// A vmap of a user-mapped GPU buffer object.
+///
+/// Unlike [`MappedBo`] (which is kernel-only and carries the
+/// kernel-side VA allocation), `MappedUserBo` is for BOs whose GPU
+/// VA was allocated by userspace via the gpuvm ioctls. The wrapper
+/// exists so the scheduler's foreign-BO sync-wait evaluator can read
+/// sync values out of user BOs without those BOs being kernel-owned.
+///
+/// The BO must be pinned (i.e. it has at least one live GPU mapping)
+/// for the vmap to be safe. All current callers materialise the BO
+/// via [`Vm::get_bo_for_va`], which only returns BOs reachable
+/// through a live `drm_gpuva`, satisfying that precondition.
+pub(crate) struct MappedUserBo {
+    #[expect(dead_code)]
+    bo: ARef<Bo>,
+    vmap: shmem::VMapOwned<BoData>,
+}
+
+impl MappedUserBo {
+    pub(crate) fn new(bo: &Bo) -> Result<Arc<Self>> {
+        let vmap = bo.owned_vmap::<0>()?;
+        Ok(Arc::new(
+            Self {
+                bo: bo.into(),
+                vmap,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
+        &self.vmap
+    }
+
+    /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
+    /// mapping and that `offset` is aligned for `T`.
+    pub(crate) fn check_offset<T>(&self, offset: usize) -> Result {
+        if offset % core::mem::align_of::<T>() != 0 {
+            return Err(EINVAL);
+        }
+
+        let end = offset
+            .checked_add(core::mem::size_of::<T>())
+            .ok_or(EINVAL)?;
+        if end > self.size() {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.vmap.owner().size()
+    }
+}
+
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
 pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> Result<ARef<Bo>> {
     let bo = gem::shmem::Object::<BoData>::new(

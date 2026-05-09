@@ -4,6 +4,7 @@ use core::sync::atomic::AtomicU32;
 
 use kernel::{
     alloc::KVec,
+    c_str,
     drm::gem::BaseObject,
     io::Io,
     list::{
@@ -412,6 +413,107 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
+    /// is satisfied.
+    ///
+    /// Reads the queue's [`SyncWait`] snapshot, looks up the awaited
+    /// sync object via the group's `_syncobjs` pool when the address
+    /// lies inside it or via a [`Vm::get_bo_for_va`] walk plus
+    /// [`gem::MappedUserBo`] vmap otherwise, and applies the captured
+    /// comparison.
+    ///
+    /// On a malformed snapshot the caller should treat the queue as
+    /// still blocked and surface the error.
+    ///
+    /// First-time foreign-BO resolutions are memoised on the
+    /// `SyncWait` snapshot via [`QueueData::cache_syncwait_bo`] so
+    /// subsequent re-evaluations skip the gpuvm walk.
+    ///
+    /// Must not be called from a dma-fence signalling section:
+    /// the foreign-BO path takes `dma_resv_lock` and `GFP_KERNEL`-vmaps.
+    ///
+    /// [`Vm::get_bo_for_va`]: crate::vm::Vm::get_bo_for_va
+    /// [`QueueData::cache_syncwait_bo`]: crate::sched::queue::QueueData::cache_syncwait_bo
+    #[expect(dead_code)]
+    pub(crate) fn eval_syncwait(&self, queue_idx: usize) -> Result<bool> {
+        let queue = self.queues.get(queue_idx).ok_or(EINVAL)?;
+        let syncwait = queue.syncwait_snapshot();
+
+        if syncwait.gpu_va == 0 {
+            return Ok(false);
+        }
+
+        let syncobjs_va = self._syncobjs.kernel_va().ok_or(EINVAL)?;
+
+        // Resolve the awaited sync object's CPU mapping. If the wait
+        // targets this group's own per-queue syncobjs pool, read
+        // directly from `_syncobjs` at the matching offset.
+        // Otherwise, if a previous evaluation cached the resolved
+        // BO/offset on the snapshot, read from `bo` at `bo_offset`.
+        // Failing both, this is a first-time foreign wait: walk the
+        // group's VM to find the BO backing `gpu_va`, vmap it, cache
+        // the result on the snapshot, and read from it.
+        let value = if syncwait.gpu_va >= syncobjs_va.start && syncwait.gpu_va < syncobjs_va.end {
+            let offset = (syncwait.gpu_va - syncobjs_va.start) as usize;
+            if syncwait.sync64 {
+                syncs::SyncObj64b::read(&self._syncobjs, offset)?.seqno
+            } else {
+                u64::from(syncs::SyncObj32b::read(&self._syncobjs, offset)?.seqno)
+            }
+        } else if let Some(cached_bo) = &syncwait.bo {
+            if syncwait.sync64 {
+                syncs::SyncObj64b::read(cached_bo, syncwait.bo_offset)?.seqno
+            } else {
+                u64::from(syncs::SyncObj32b::read(cached_bo, syncwait.bo_offset)?.seqno)
+            }
+        } else {
+            let (bo, bo_offset) = self.vm.get_bo_for_va(syncwait.gpu_va).ok_or(EINVAL)?;
+            let mapped_bo = gem::MappedUserBo::new(&bo)?;
+            let bo_offset = bo_offset as usize;
+
+            // Memoise the resolved `(bo, bo_offset)` so subsequent
+            // re-evaluations of the same wait take the case-2 fast
+            // path. `cache_syncwait_bo` re-checks that the snapshot
+            // still names the same `(gpu_va, sync64)` before
+            // installing the cache; if it returns false, `set_syncwait`
+            // ran concurrently and changed either the address or the
+            // sync-object width, so abandon this evaluation and let
+            // the next cycle handle the new wait rather than reading
+            // from a stale BO or with the wrong type.
+            if !queue.cache_syncwait_bo(
+                syncwait.gpu_va,
+                syncwait.sync64,
+                mapped_bo.clone(),
+                bo_offset,
+            ) {
+                return Ok(false);
+            }
+
+            if syncwait.sync64 {
+                syncs::SyncObj64b::read(&mapped_bo, bo_offset)?.seqno
+            } else {
+                u64::from(syncs::SyncObj32b::read(&mapped_bo, bo_offset)?.seqno)
+            }
+        };
+
+        let satisfied = if syncwait.gt {
+            value > syncwait.ref_val
+        } else {
+            value <= syncwait.ref_val
+        };
+        if satisfied {
+            // Drop the cached BO resolution in this caller's context
+            // (`sync_upd_work`, which runs on `system_unbound()`) so
+            // the next wait does a fresh gpuvm walk and we do not run
+            // `gem::MappedUserBo::drop` (which acquires
+            // `dma_resv_lock` via `shmem::VMapOwned`'s drop) from
+            // inside the dma-fence signalling annotation that wraps
+            // `Queue::set_syncwait`'s caller.
+            drop(queue.take_syncwait_bo());
+        }
+        Ok(satisfied)
     }
 
     fn syncobj_offset(&self, queue_index: usize) -> Result<usize> {
