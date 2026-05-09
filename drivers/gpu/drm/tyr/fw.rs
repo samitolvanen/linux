@@ -125,6 +125,51 @@ impl CsgSlotMask {
     }
 }
 
+/// Bitmap over CS indices within a CSG, in `[0, MAX_CS_PER_GROUP)`.
+///
+/// Each bit at position `i` indicates that CS `i` within a CSG slot has
+/// a pending per-CS doorbell ring request.
+///
+/// Distinct from `CsgSlotMask`, whose bits are CSG slot indices in
+/// `[0, MAX_CSG)`. Both are 32-bit bitmaps but the bit positions mean
+/// different things.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct CsDbMask(u32);
+
+impl CsDbMask {
+    pub(crate) const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn into_raw(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[expect(dead_code)]
+    pub(crate) const fn contains(self, cs_idx: usize) -> bool {
+        (self.0 & (1u32 << cs_idx)) != 0
+    }
+
+    pub(crate) fn insert(&mut self, cs_idx: usize) {
+        debug_assert!(cs_idx < crate::sched::group::MAX_CS_PER_GROUP);
+        self.0 |= 1u32 << cs_idx;
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn iter(self) -> impl Iterator<Item = usize> {
+        (0..crate::sched::group::MAX_CS_PER_GROUP)
+            .filter(move |&cs_idx| (self.0 & (1u32 << cs_idx)) != 0)
+    }
+}
+
 /// Maximum number of CS interfaces supported by hardware.
 const MAX_CS: usize = 16;
 

@@ -37,6 +37,7 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
+    fw::global::CsActivateInputs,
     gem,
     regs::doorbell_block,
     vm::{Vm, VmFlag, VmMapFlags},
@@ -193,7 +194,6 @@ impl QueueJob {
 
 #[pin_data]
 pub(crate) struct QueueData {
-    #[allow(dead_code)]
     priority: u8,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
@@ -470,6 +470,42 @@ impl QueueData {
         let input = self.interfaces.read_input()?;
         let output = self.interfaces.read_output()?;
         Ok(input.insert == output.extract)
+    }
+
+    /// Synchronises the queue's `input.extract_init` from the firmware's
+    /// current `output.extract` value.
+    ///
+    /// Mirrors Panthor's `cs_slot_prog_locked` invariant: must be
+    /// called before staging `CS_REQ.state = Start` at CSG-bind time
+    /// so the firmware sees a consistent `(insert, extract_init)`
+    /// snapshot when it starts reading the per-queue ringbuf mailbox.
+    ///
+    /// The read-modify-write preserves `insert`: only `extract_init`
+    /// is updated. This matches Panthor, which writes
+    /// `queue->iface.input->extract = queue->iface.output->extract`
+    /// and leaves `insert` untouched.
+    pub(crate) fn sync_extract_init(&self) -> Result {
+        let ringbuf_output = self.interfaces.read_output()?;
+        let mut ringbuf_input = self.interfaces.read_input()?;
+        ringbuf_input.extract_init = ringbuf_output.extract;
+        self.interfaces.write_input(ringbuf_input)?;
+        Ok(())
+    }
+
+    /// Builds the [`CsActivateInputs`] needed to program this queue's
+    /// CS slot at CSG-bind time.
+    ///
+    /// `doorbell_id` is the per-CS doorbell index assigned by the
+    /// caller (in practice `slot_idx + 1`).
+    pub(crate) fn cs_activate_inputs(&self, doorbell_id: u32) -> Result<CsActivateInputs> {
+        Ok(CsActivateInputs {
+            ringbuf_base: self.ringbuf.kernel_va().ok_or(EINVAL)?.start,
+            ringbuf_size: self.ringbuf.size() as u32,
+            ringbuf_input_va: self.interfaces.input_va.start,
+            ringbuf_output_va: self.interfaces.output_va.start,
+            priority: self.priority,
+            doorbell_id,
+        })
     }
 }
 

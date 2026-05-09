@@ -18,7 +18,7 @@ use crate::fw::{
         GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM, GROUP_STREAM_STRIDE,
         GROUP_SUSPEND_SIZE,
     },
-    MAX_CS,
+    CsDbMask, MAX_CS,
 };
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
@@ -210,7 +210,6 @@ impl CsgInterface {
         enabled.cs.get(index)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cs_mut(&mut self, index: usize) -> Option<&mut CsInterface> {
         let enabled = match &mut self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
@@ -400,6 +399,31 @@ impl CsgInterface {
         if let CsgInterfaceState::Enabled(enabled) = &self.state {
             enabled.csg_input.write(CSG_DB_REQ, req);
         }
+    }
+
+    /// Toggles the bits in `mask` of `CSG_DB_REQ` against the current
+    /// `CSG_DB_ACK`, requesting a per-CS doorbell ring on the next
+    /// global doorbell write.
+    ///
+    /// The flip is taken against `CSG_DB_ACK` (not the live
+    /// `CSG_DB_REQ` input) so the firmware always sees `req != ack`
+    /// for the toggled bits and is guaranteed to consume the event.
+    ///
+    /// Returns [`EINVAL`] if the interface is not enabled.
+    pub(crate) fn toggle_input_db_req(&self, mask: CsDbMask) -> Result {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let mask = mask.into_raw();
+        let cur_req = enabled.csg_input.read(CSG_DB_REQ).into_raw();
+        let cur_ack = enabled.csg_output.read(CSG_DB_ACK).into_raw();
+        let new = (cur_req & !mask) | ((cur_ack ^ mask) & mask);
+        enabled
+            .csg_input
+            .write(CSG_DB_REQ, CSG_DB_REQ::from_raw(new));
+        Ok(())
     }
 
     #[allow(dead_code)]
