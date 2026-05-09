@@ -110,9 +110,9 @@ macro_rules! build_scheduling_rules {
 /// Runs one scheduler tick step.
 ///
 /// Drives one [`Tick::tick`] cycle under the scheduler mutex. After
-/// the locked scope is dropped, the `Arc<Group>` references collected
-/// for evicted unhealthy groups go out of scope, releasing the groups
-/// without the scheduler mutex held.
+/// the locked scope is dropped, terminal teardown for evicted
+/// unhealthy groups runs without the scheduler mutex so
+/// [`Group::schedule_term`] does not need to take it.
 ///
 /// The firmware ack waits inside `Tick::tick` happen with the
 /// scheduler mutex held but with [`csg_slot_manager`] dropped; see
@@ -123,6 +123,7 @@ macro_rules! build_scheduling_rules {
 /// stays quiescent until something explicitly requests it via
 /// [`Scheduler::request_tick`].
 ///
+/// [`Group::schedule_term`]: crate::sched::group::Group::schedule_term
 /// [`Scheduler::apply_csg_updates`]: crate::sched::Scheduler::apply_csg_updates
 /// [`Scheduler::request_tick`]: crate::sched::Scheduler::request_tick
 /// [`csg_slot_manager`]: crate::driver::TyrDrmDeviceData::csg_slot_manager
@@ -133,7 +134,19 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
     let mut teardown_groups: [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE] =
         [const { None }; TEARDOWN_ARRAY_SIZE];
 
-    tdev.with_locked_scheduler(|sched| Tick::new(sched, &mut teardown_groups).tick(tdev))
+    let result =
+        tdev.with_locked_scheduler(|sched| Tick::new(sched, &mut teardown_groups).tick(tdev));
+
+    // schedule_term does not take the scheduler mutex; drain after
+    // releasing it.
+    for slot in teardown_groups.iter_mut() {
+        let Some(group) = slot.take() else {
+            break;
+        };
+        group.schedule_term();
+    }
+
+    result
 }
 
 /// Identifies a group selected during rule evaluation.
