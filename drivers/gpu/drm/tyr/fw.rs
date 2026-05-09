@@ -66,6 +66,17 @@ mod interfaces;
 pub(crate) mod irq;
 mod parser;
 
+// Re-exports of firmware-interface bitfield types and enums that the
+// scheduler needs to construct CSG_INPUT writes from outside the
+// firmware module. The bitfield definitions themselves stay private
+// to `crate::fw`; the apply path only depends on these typed views.
+pub(crate) use interfaces::{
+    CsgExecutionState,
+    CSG_CONFIG,
+    CSG_EP_REQ,
+    CSG_REQ, //
+};
+
 /// Maximum number of CSG interfaces supported by hardware.
 pub(crate) const MAX_CSG: usize = 16;
 
@@ -289,6 +300,41 @@ impl Firmware {
 
     pub(crate) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
         self.global_iface.ring_csg_doorbell(csg_idx)
+    }
+
+    /// Toggles the per-CSG doorbells for every slot set in `csg_mask`
+    /// and rings the global doorbell to make the firmware re-evaluate
+    /// the requested slots.
+    ///
+    /// See [`GlobalInterface::ring_csg_doorbells`] for the semantics.
+    pub(crate) fn ring_csg_doorbells(&self, csg_mask: u32) -> Result {
+        self.global_iface.ring_csg_doorbells(csg_mask)
+    }
+
+    /// Waits for the firmware to acknowledge every bit in `mask` for the
+    /// `CSG_REQ` word at `csg_idx`.
+    ///
+    /// Returns the bits that the firmware has actually acknowledged
+    /// (`!(req ^ ack) & mask`). The 3-bit `CSG_REQ::state` field is
+    /// reported atomically: a partial state ack is reported as
+    /// "not acked" and the corresponding bits are cleared from the
+    /// returned mask. Other CSG_REQ bits are independent and reported
+    /// per-bit.
+    ///
+    /// See [`GlobalInterface::wait_csg_acks`] for the locking
+    /// constraints. In short: the caller must not hold the
+    /// `csg_slot_manager` mutex (the per-slot IRQ path takes it via
+    /// `process_csg_irqs` and would otherwise be blocked behind this
+    /// wait), and the wait predicate must not re-take the firmware
+    /// `inner` mutex (the snapshot pattern inside the helper handles
+    /// this). The scheduler mutex may be held across the wait.
+    pub(crate) fn wait_csg_acks(
+        &self,
+        csg_idx: usize,
+        mask: CSG_REQ,
+        timeout_ms: u32,
+    ) -> Result<CSG_REQ> {
+        self.global_iface.wait_csg_acks(csg_idx, mask, timeout_ms)
     }
 
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).

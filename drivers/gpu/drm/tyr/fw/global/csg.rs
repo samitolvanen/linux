@@ -11,10 +11,12 @@ use kernel::{io::Io, prelude::*};
 use super::{cs::CsInterface, SharedSectionInfo};
 use crate::fw::{
     interfaces::{
-        FwInterface, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_DB_ACK, CSG_DB_REQ, CSG_INPUT_BLOCK_SIZE,
-        CSG_IRQ_ACK, CSG_IRQ_REQ, CSG_OUTPUT_BLOCK_SIZE, CSG_REQ, CS_CONTROL_BLOCK_SIZE,
-        GROUP_INPUT_VA, GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM,
-        GROUP_STREAM_STRIDE, GROUP_SUSPEND_SIZE,
+        FwInterface, CSG_ACK, CSG_ACK_IRQ_MASK, CSG_ALLOW_COMPUTE, CSG_ALLOW_FRAGMENT,
+        CSG_ALLOW_OTHER, CSG_CONFIG, CSG_CONTROL_BLOCK_SIZE, CSG_DB_ACK, CSG_DB_REQ, CSG_EP_REQ,
+        CSG_INPUT_BLOCK_SIZE, CSG_IRQ_ACK, CSG_IRQ_REQ, CSG_OUTPUT_BLOCK_SIZE,
+        CSG_PROTM_SUSPEND_BUF, CSG_REQ, CSG_SUSPEND_BUF, CS_CONTROL_BLOCK_SIZE, GROUP_INPUT_VA,
+        GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM, GROUP_STREAM_STRIDE,
+        GROUP_SUSPEND_SIZE,
     },
     MAX_CS,
 };
@@ -78,6 +80,20 @@ pub(crate) struct CsgInterface {
     state: CsgInterfaceState,
     #[expect(dead_code)]
     csg_idx: usize,
+}
+
+/// Inputs for [`CsgInterface::program_activate_inputs`].
+///
+/// All fields are written once per residency at `CSG_REQ.state = Start`
+/// and are not updated during the slot's lifetime.
+pub(crate) struct CsgActivateInputs {
+    pub(crate) allow_compute: u64,
+    pub(crate) allow_fragment: u64,
+    pub(crate) allow_other: u32,
+    pub(crate) ep_req: CSG_EP_REQ,
+    pub(crate) suspend_buf: u64,
+    pub(crate) protm_suspend_buf: u64,
+    pub(crate) config: CSG_CONFIG,
 }
 
 impl CsgInterface {
@@ -217,7 +233,6 @@ impl CsgInterface {
     /// Returns owned clones of the CSG input and output [`FwInterface`]s
     /// so the caller can poll `CSG_REQ` / `CSG_ACK` after dropping the
     /// inner mutex.
-    #[expect(dead_code)]
     pub(in super::super) fn clone_req_ack_io(
         &self,
     ) -> Result<(
@@ -237,6 +252,132 @@ impl CsgInterface {
         if let CsgInterfaceState::Enabled(enabled) = &self.state {
             enabled.csg_input.write(CSG_REQ, req);
         }
+    }
+
+    /// Read-modify-write `CSG_REQ`: sets the bits in `mask` to `value`,
+    /// preserving all other bits.
+    ///
+    /// Each call site owns a disjoint subset of the word and must not
+    /// race with the IRQ-side bits the firmware can flip concurrently.
+    ///
+    /// Returns [`EINVAL`] if the interface is not enabled.
+    #[expect(dead_code)]
+    pub(crate) fn update_input_req(&self, value: u32, mask: u32) -> Result {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let cur = enabled.csg_input.read(CSG_REQ).into_raw();
+        let new = (cur & !mask) | (value & mask);
+        enabled.csg_input.write(CSG_REQ, CSG_REQ::from_raw(new));
+        Ok(())
+    }
+
+    /// Writes the `CSG_EP_REQ` input register.
+    ///
+    /// Used by [`Scheduler::update_csg_slot_priority`] to re-prioritise a
+    /// bound slot between ticks.
+    ///
+    /// Returns [`EINVAL`] if the interface is not enabled.
+    ///
+    /// [`Scheduler::update_csg_slot_priority`]: crate::sched::Scheduler::update_csg_slot_priority
+    pub(crate) fn write_input_ep_req(&self, ep_req: CSG_EP_REQ) -> Result {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        enabled.csg_input.write(CSG_EP_REQ, ep_req);
+        Ok(())
+    }
+
+    /// Read-modify-write the CSG_REQ input register, performing one
+    /// "set" pass and one "toggle" pass in a single MMIO read-write
+    /// cycle.
+    ///
+    /// `set_mask` selects bits whose new value comes from `value`
+    /// (matching [`update_input_req`]).  `toggle_mask` selects bits
+    /// whose new value is the current `CSG_ACK` bit XOR'd with
+    /// `toggle_mask`; `value`'s contribution to the toggle bits is
+    /// ignored. The caller must ensure `set_mask` and `toggle_mask`
+    /// do not overlap.
+    ///
+    /// The SlotManager-driven scheduler's `apply_csg_updates` uses
+    /// this to land the per-tick CSG_REQ delta in one register write.
+    /// The toggle is computed against `CSG_ACK` (not the live `CSG_REQ`
+    /// input) so the firmware always sees `req != ack` for the toggled
+    /// bits and is guaranteed to consume the event; once it acks,
+    /// `req` and `ack` line up again, leaving the next call free to
+    /// flip the bits in the same direction. The pre-ack value picked
+    /// per bit is therefore the corresponding `CSG_ACK` bit (e.g.
+    /// `csg_output.ack ^ CSG_ENDPOINT_CONFIG`).
+    ///
+    /// Returns [`EINVAL`] if the interface is not enabled.
+    ///
+    /// [`update_input_req`]: Self::update_input_req
+    pub(crate) fn update_and_toggle_input_req(
+        &self,
+        value: u32,
+        set_mask: u32,
+        toggle_mask: u32,
+    ) -> Result {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let cur_req = enabled.csg_input.read(CSG_REQ).into_raw();
+        let cur_ack = enabled.csg_output.read(CSG_ACK).into_raw();
+        let new = (cur_req & !set_mask & !toggle_mask)
+            | (value & set_mask)
+            | ((cur_ack ^ toggle_mask) & toggle_mask);
+        enabled.csg_input.write(CSG_REQ, CSG_REQ::from_raw(new));
+        Ok(())
+    }
+
+    /// Programs the CSG-level static input registers before requesting
+    /// `CSG_REQ.state = Start`.
+    ///
+    /// Per-CS queue programming and CSG_REQ staging are the caller's
+    /// responsibility.
+    ///
+    /// Returns [`EINVAL`] if the interface is not enabled.
+    pub(crate) fn program_activate_inputs(&self, inputs: &CsgActivateInputs) -> Result {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        enabled.csg_input.write(
+            CSG_ALLOW_COMPUTE,
+            CSG_ALLOW_COMPUTE::zeroed().with_mask(inputs.allow_compute),
+        );
+        enabled.csg_input.write(
+            CSG_ALLOW_FRAGMENT,
+            CSG_ALLOW_FRAGMENT::zeroed().with_mask(inputs.allow_fragment),
+        );
+        enabled.csg_input.write(
+            CSG_ALLOW_OTHER,
+            CSG_ALLOW_OTHER::zeroed().with_mask(inputs.allow_other),
+        );
+        enabled.csg_input.write(CSG_EP_REQ, inputs.ep_req);
+        enabled.csg_input.write(
+            CSG_SUSPEND_BUF,
+            CSG_SUSPEND_BUF::zeroed().with_pointer(inputs.suspend_buf),
+        );
+        enabled.csg_input.write(
+            CSG_PROTM_SUSPEND_BUF,
+            CSG_PROTM_SUSPEND_BUF::zeroed().with_pointer(inputs.protm_suspend_buf),
+        );
+        enabled.csg_input.write(CSG_CONFIG, inputs.config);
+        // Set CSG_ACK_IRQ_MASK to ~0 so the firmware delivers every
+        // CSG_ACK bit transition. Writing the raw word reaches the
+        // bits the typed setters do not cover.
+        enabled
+            .csg_input
+            .write(CSG_ACK_IRQ_MASK, CSG_ACK_IRQ_MASK::from_raw(!0u32));
+        Ok(())
     }
 
     #[allow(dead_code)]

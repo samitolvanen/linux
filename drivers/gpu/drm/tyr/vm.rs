@@ -797,6 +797,15 @@ impl VmExec {
             })
     }
 
+    /// Returns the AS slot index this VM is currently bound to.
+    ///
+    /// Returns `None` while the VM has no resident AS slot. See
+    /// [`Mmu::vm_as_slot`](crate::mmu::Mmu::vm_as_slot) for the
+    /// stability rules around the returned value.
+    pub(crate) fn as_slot(&self) -> Option<u8> {
+        self.mmu.vm_as_slot(&self.as_data)
+    }
+
     pub(crate) fn is_unusable(&self) -> bool {
         self.unusable.load(Ordering::Relaxed)
     }

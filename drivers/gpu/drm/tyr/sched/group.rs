@@ -16,6 +16,7 @@ use kernel::{
     new_mutex,
     prelude::*,
     sync::{
+        aref::ARef,
         Arc,
         LockedBy,
         Mutex, //
@@ -540,7 +541,12 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        ddev.with_locked_scheduler(|sched| sched.bind(ddev, group.clone()))?;
+        let mut ctx = super::CsgUpdateContext::new();
+        let tdev: ARef<TyrDrmDevice> = ddev.into();
+        ddev.with_locked_scheduler(|sched| {
+            sched.bind(ddev, group.clone(), &mut ctx)?;
+            sched.apply_csg_updates(tdev, &mut ctx)
+        })?;
         group.submit(queue_submits, file)
     }
 
