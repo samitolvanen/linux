@@ -320,6 +320,18 @@ impl crate::slot::SlotOperations for CsgSlotOps {
 pub(crate) type CsgSlotManager = SlotManager<CsgSlotOps, MAX_CSGS>;
 
 /// Minimal scheduler shell.
+///
+/// # Lock order
+///
+/// The scheduler mutex sits above `gpuvm_unique` and `dma_resv_lock`.
+/// [`Self::sync_upd_step`] reaches [`gem::MappedUserBo::new`] (via
+/// [`Group::eval_syncwait`]), which takes `gpuvm_unique` and
+/// `dma_resv_lock` while the scheduler mutex is held. Any new path
+/// that takes the scheduler mutex from inside a `gpuvm_unique` or
+/// `dma_resv_lock` critical section would deadlock.
+///
+/// [`Group::eval_syncwait`]: crate::sched::group::Group::eval_syncwait
+/// [`gem::MappedUserBo::new`]: crate::gem::MappedUserBo::new
 pub(crate) struct Scheduler {
     /// Groups that have at least one queue that can be currently scheduled.
     pub(in crate::sched) runnable_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
@@ -853,6 +865,132 @@ impl Scheduler {
         } else {
             self.runnable_groups[priority].push_back(list_arc);
         }
+    }
+
+    /// Marks `group` as runnable, moving it onto the runnable list at
+    /// its priority if it is not already there.
+    ///
+    /// Idempotent: a group that is already on the runnable list, or
+    /// is currently bound to a CSG slot, is left in place. An idle
+    /// group is moved off [`Scheduler::idle_groups`] onto
+    /// [`Scheduler::runnable_groups`]. Only the id-0 lists are
+    /// manipulated; the wait-list (id-1) is owned elsewhere.
+    pub(crate) fn mark_group_runnable(&mut self, group: &Arc<Group>) {
+        let priority = group.priority as usize;
+
+        group.with_locked_inner(|inner| {
+            match inner.list_state {
+                group::GroupListState::Runnable => {}
+                group::GroupListState::None => {
+                    // Not on any id-0 list. Promote to runnable only
+                    // if the group is not currently bound. Bound
+                    // groups already get scheduled via the per-tick
+                    // `Keep` rules and don't need a runnable-list
+                    // entry.
+                    if inner.csg_id.is_none() {
+                        if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
+                            self.runnable_groups[priority].push_back(list_arc);
+                            inner.list_state = group::GroupListState::Runnable;
+                        }
+                    }
+                }
+                group::GroupListState::Idle => {
+                    if let Some(list_arc) =
+                        self.remove_group_from_list(group, priority, group::GroupListState::Idle)
+                    {
+                        self.runnable_groups[priority].push_back(list_arc);
+                        inner.list_state = group::GroupListState::Runnable;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Walks `waiting_groups` once, re-evaluating each blocked queue's
+    /// captured `SyncWait` and moving newly unblocked groups onto
+    /// `runnable_groups`.
+    ///
+    /// Returns `true` if an unbound RealTime-priority group was
+    /// promoted to `runnable_groups`, in which case the caller fires
+    /// an immediate tick so the rule engine binds it without waiting
+    /// for the periodic tick.
+    ///
+    /// May allocate inside `eval_syncwait`'s foreign-BO fast-miss
+    /// path, but that runs on `system_unbound()` (the `sync_upd`
+    /// worker) and is therefore permitted.
+    pub(crate) fn sync_upd_step(&mut self) -> bool {
+        let mut immediate_tick = false;
+
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            // Stage the wait-list links of groups that should move to
+            // the runnable list. A `List<Group, 1>` does not allocate
+            // and lets us release the wait-list cursor before
+            // re-borrowing `self` mutably for `mark_group_runnable`.
+            let mut make_runnable = List::<Group, 1>::new();
+
+            {
+                let mut cursor = self.waiting_groups[prio].cursor_front();
+                while let Some(peek) = cursor.peek_next() {
+                    let group: Arc<Group> = peek.arc().into();
+
+                    let blocked = group.with_locked_inner(|inner| inner.blocked_queues());
+
+                    let mut unblocked: u32 = 0;
+                    let mut tested = blocked;
+                    while tested != 0 {
+                        let cs_id = tested.trailing_zeros();
+                        tested &= !(1u32 << cs_id);
+                        match group.eval_syncwait(cs_id as usize) {
+                            Ok(true) => unblocked |= 1u32 << cs_id,
+                            Ok(false) => {}
+                            // Treat read errors as "unblock and let
+                            // the next tick surface any further
+                            // failure".
+                            Err(e) => {
+                                pr_err!("eval_syncwait failed: {}\n", e.to_errno());
+                                unblocked |= 1u32 << cs_id;
+                            }
+                        }
+                    }
+
+                    let (unblocked, move_to_runnable) = group.with_locked_inner(|inner| {
+                        if unblocked != 0 {
+                            let mut bits = unblocked;
+                            while bits != 0 {
+                                let cs_id = bits.trailing_zeros() as usize;
+                                bits &= !(1u32 << cs_id);
+                                inner.set_queue_blocked(cs_id, false);
+                            }
+                        }
+
+                        let unblocked = !inner.has_blocked_queues();
+                        let move_to_runnable = unblocked && inner.csg_id.is_none();
+                        (unblocked, move_to_runnable)
+                    });
+
+                    if unblocked {
+                        let list_arc = peek.remove();
+                        if move_to_runnable {
+                            if prio == Priority::RealTime as usize {
+                                immediate_tick = true;
+                            }
+                            make_runnable.push_back(list_arc);
+                        }
+                    } else {
+                        cursor.move_next();
+                    }
+                }
+            }
+
+            // The wait-list cursor borrow is dropped: now safe to
+            // re-borrow `self` mutably for `mark_group_runnable`.
+            while let Some(list_arc) = make_runnable.pop_front() {
+                let group: Arc<Group> = list_arc.into_arc();
+                self.mark_group_runnable(&group);
+            }
+        }
+
+        immediate_tick
     }
 
     /// Stages a `CSG_REQ.status_update` for every bound CSG slot and

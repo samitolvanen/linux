@@ -365,7 +365,16 @@ impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
 impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
-    fn run(_this: Self::Pointer) {}
+    /// Drives one pass of the `sync_upd` worker.
+    fn run(this: Self::Pointer) {
+        let immediate_tick = this
+            .with_locked_scheduler(|sched| Ok(sched.sync_upd_step()))
+            .unwrap_or(false);
+
+        if immediate_tick {
+            Self::schedule_tick(&this);
+        }
+    }
 }
 
 impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {

@@ -103,12 +103,10 @@ impl GroupInner {
             && self.fatal_error.is_none()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn blocked_queues(&self) -> u32 {
         self.blocked_queues
     }
 
-    #[expect(dead_code)]
     pub(crate) fn has_blocked_queues(&self) -> bool {
         self.blocked_queues != 0
     }
@@ -436,7 +434,6 @@ impl Group {
     ///
     /// [`Vm::get_bo_for_va`]: crate::vm::Vm::get_bo_for_va
     /// [`QueueData::cache_syncwait_bo`]: crate::sched::queue::QueueData::cache_syncwait_bo
-    #[expect(dead_code)]
     pub(crate) fn eval_syncwait(&self, queue_idx: usize) -> Result<bool> {
         let queue = self.queues.get(queue_idx).ok_or(EINVAL)?;
         let syncwait = queue.syncwait_snapshot();
