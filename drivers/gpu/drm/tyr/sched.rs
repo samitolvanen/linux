@@ -672,4 +672,23 @@ impl Scheduler {
     ) -> Result {
         Ok(())
     }
+
+    /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
+    /// applies the batch. The post-ack sync pass refreshes per-queue
+    /// firmware-status state.
+    #[expect(dead_code)]
+    pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
+        let mut context = CsgUpdateContext::new();
+
+        {
+            let csg_slot_manager = data.csg_slot_manager.lock();
+            for csg_idx in 0..csg_slot_manager.slot_count() {
+                if csg_slot_manager.slot_data(csg_idx).is_some() {
+                    context.toggle_reqs(csg_idx, CSG_REQ_STATUS_UPDATE);
+                }
+            }
+        }
+
+        self.apply_csg_updates(data, &mut context)
+    }
 }
