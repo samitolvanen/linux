@@ -16,6 +16,7 @@ use kernel::{
 use crate::{
     driver::TyrDrmDevice,
     file::TyrDrmFile,
+    fw::global::csg::Priority,
     gem, heap, pool,
     vm::{Vm, VmFlag, VmMapFlags},
 };
@@ -166,8 +167,8 @@ pub(crate) struct Group {
     pub(crate) queues: KVec<Queue>,
     #[allow(dead_code)]
     pub(super) vm: Arc<Vm>,
-    #[allow(dead_code)]
-    pub(super) priority: u8,
+    /// Software-visible scheduling priority.
+    pub(crate) priority: Priority,
     #[allow(dead_code)]
     pub(super) compute_core_mask: u64,
     #[allow(dead_code)]
@@ -205,6 +206,8 @@ impl Group {
         {
             return Err(EINVAL);
         }
+
+        let priority = Priority::try_from(group_args.priority)?;
 
         if (group_args.compute_core_mask & !ddev.gpu_info.shader_present) != 0
             || (group_args.fragment_core_mask & !ddev.gpu_info.shader_present) != 0
@@ -265,7 +268,7 @@ impl Group {
                 tiler_oom: AtomicU32::new(0),
                 queues,
                 vm,
-                priority: group_args.priority,
+                priority,
                 compute_core_mask: group_args.compute_core_mask,
                 fragment_core_mask: group_args.fragment_core_mask,
                 tiler_core_mask: group_args.tiler_core_mask,

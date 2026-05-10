@@ -22,6 +22,45 @@ use crate::fw::{
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
 const CSG_GROUP_CONTROL_OFFSET: usize = 0x1000;
 
+/// CSG software priority bands.
+///
+/// Mirrors `enum drm_panthor_group_priority` from the Panthor UAPI
+/// (Low / Medium / High / Realtime). The integer discriminants match
+/// the UAPI values so a `TryFrom<u8>` round-trips a UAPI integer
+/// directly. The scheduler walks priorities high-to-low and uses
+/// `Priority` as an array index, so the discriminant values must
+/// stay stable.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u8)]
+pub(crate) enum Priority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    RealTime = 3,
+}
+
+impl Priority {
+    /// Number of distinct software priority bands.
+    #[expect(dead_code)]
+    pub(crate) const fn num_priorities() -> usize {
+        4
+    }
+}
+
+impl TryFrom<u8> for Priority {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Priority::Low),
+            1 => Ok(Priority::Medium),
+            2 => Ok(Priority::High),
+            3 => Ok(Priority::RealTime),
+            _ => Err(EINVAL),
+        }
+    }
+}
+
 enum CsgInterfaceState {
     Disabled,
     Enabled(EnabledCsgInterface),
