@@ -54,6 +54,18 @@ pub(crate) enum GroupListState {
     Runnable,
 }
 
+/// A snapshot of the scheduler-visible state of a [`Group`].
+///
+/// Lets the rule engine and Tick lifecycle read `can_run`, `is_idle`,
+/// and `csg_id` together under a single `inner` lock acquisition.
+#[expect(dead_code)]
+pub(crate) struct GroupStatus {
+    pub(crate) can_run: bool,
+    pub(crate) is_idle: bool,
+    /// CSG slot id when the group is bound, otherwise `None`.
+    pub(crate) csg_id: Option<usize>,
+}
+
 /// The mutable scheduler-visible state for a [`Group`].
 ///
 /// Protected by the `inner` mutex on [`Group`]; access via
@@ -75,7 +87,6 @@ pub(crate) struct GroupInner {
 impl GroupInner {
     /// Returns false if the group is terminated, in an unknown state, or
     /// has a fatal error recorded.
-    #[expect(dead_code)]
     pub(crate) fn can_run(&self) -> bool {
         self.state != State::Terminated
             && self.state != State::Unknown
@@ -140,7 +151,6 @@ impl GroupInner {
     }
 
     /// Returns true when every queue is either blocked or idle.
-    #[expect(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         let inactive_queues = self.blocked_queues | self.idle_queues;
         inactive_queues.count_ones() == self.queue_count as u32
@@ -279,7 +289,6 @@ impl Group {
     }
 
     /// Caller must not already hold `inner`.
-    #[expect(dead_code)]
     pub(crate) fn with_locked_inner<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut GroupInner) -> R,
@@ -298,6 +307,38 @@ impl Group {
 
     pub(super) fn set_csg_id(&self, csg_id: Option<usize>) {
         self.inner.lock().csg_id = csg_id;
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn state(&self) -> State {
+        self.inner.lock().state
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn set_state(&self, new_state: State) {
+        self.with_locked_inner(|inner| {
+            inner.state = new_state;
+        });
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn can_run(&self) -> bool {
+        self.inner.lock().can_run()
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.inner.lock().is_idle()
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn status(&self) -> GroupStatus {
+        let inner = self.inner.lock();
+        GroupStatus {
+            can_run: inner.can_run(),
+            is_idle: inner.is_idle(),
+            csg_id: inner.csg_id,
+        }
     }
 
     pub(crate) fn queue_count(&self) -> usize {
