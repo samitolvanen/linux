@@ -8,7 +8,7 @@
 //! fw/interfaces.rs.
 
 mod cs;
-mod csg;
+pub(crate) mod csg;
 
 use core::ops::Range;
 
