@@ -8,6 +8,7 @@
 #![expect(dead_code)]
 
 use kernel::{
+    drm::gem::shmem,
     io::Io,
     prelude::*,
     sync::Arc, //
@@ -69,10 +70,52 @@ impl SyncRef {
     }
 }
 
+/// Common surface that the [`SyncObj32b`] / [`SyncObj64b`] readers and
+/// writers need from a mapped GPU buffer object: a CPU [`shmem::VMap`]
+/// onto the BO and a bounds/alignment check for `T` at a given offset.
+///
+/// Implemented for both kernel-owned ([`gem::MappedBo`]) and user-owned
+/// ([`gem::MappedUserBo`]) BO wrappers so the same macro-generated
+/// `read` / `write` accessors work against either.
+pub(super) trait BoMapping {
+    fn vmap(&self) -> &shmem::VMapOwned<gem::BoData>;
+    fn check_offset<T>(&self, offset: usize) -> Result;
+}
+
+impl BoMapping for gem::MappedBo {
+    fn vmap(&self) -> &shmem::VMapOwned<gem::BoData> {
+        gem::MappedBo::vmap(self)
+    }
+
+    fn check_offset<T>(&self, offset: usize) -> Result {
+        gem::MappedBo::check_offset::<T>(self, offset)
+    }
+}
+
+impl BoMapping for gem::MappedUserBo {
+    fn vmap(&self) -> &shmem::VMapOwned<gem::BoData> {
+        gem::MappedUserBo::vmap(self)
+    }
+
+    fn check_offset<T>(&self, offset: usize) -> Result {
+        gem::MappedUserBo::check_offset::<T>(self, offset)
+    }
+}
+
+impl<T: BoMapping> BoMapping for Arc<T> {
+    fn vmap(&self) -> &shmem::VMapOwned<gem::BoData> {
+        T::vmap(self)
+    }
+
+    fn check_offset<U>(&self, offset: usize) -> Result {
+        T::check_offset::<U>(self, offset)
+    }
+}
+
 macro_rules! impl_sync_rw {
     ($type:ty) => {
         impl $type {
-            pub(super) fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
+            pub(super) fn read<M: BoMapping>(mem: &M, offset: usize) -> Result<Self> {
                 mem.check_offset::<Self>(offset)?;
 
                 let vmap = mem.vmap();
@@ -83,7 +126,7 @@ macro_rules! impl_sync_rw {
                 Ok(unsafe { core::ptr::read_volatile(ptr) })
             }
 
-            pub(super) fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
+            pub(super) fn write<M: BoMapping>(mem: &M, offset: usize, value: Self) -> Result {
                 mem.check_offset::<Self>(offset)?;
 
                 let vmap = mem.vmap();

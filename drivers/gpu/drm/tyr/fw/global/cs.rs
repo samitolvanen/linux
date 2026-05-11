@@ -278,6 +278,10 @@ impl CsInterface {
 
     /// Reads the active `CS_STATUS_WAIT_SYNC_*` snapshot when the CS is
     /// blocked on a `SYNC_WAIT` instruction.
+    ///
+    /// Returns the decoded condition (Le/Gt), the size of the awaited
+    /// sync object, the GPU VA being polled and the reference value
+    /// (assembled from the low / high halves for 64-bit waits).
     pub(crate) fn read_status_wait_sync(&self) -> Result<CsStatusWait> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,

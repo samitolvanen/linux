@@ -814,6 +814,24 @@ impl VmExec {
         self.unusable.store(true, Ordering::Relaxed);
     }
 
+    /// Returns the buffer object mapped at `va` and its offset within
+    /// that buffer object, or `None` if no mapping covers `va`.
+    ///
+    /// The lookup is a snapshot taken under [`gpuvm_unique`]: the
+    /// returned `ARef<Bo>` keeps the BO alive, but a subsequent
+    /// unmap+remap at `va` will not invalidate it. Callers that need
+    /// the mapping to remain stable past the call must hold a lock
+    /// that serialises against [`unmap_range`](VmExec::unmap_range).
+    ///
+    /// [`gpuvm_unique`]: VmExec::gpuvm_unique
+    pub(crate) fn get_bo_for_va(&self, va: u64) -> Option<(ARef<Bo>, u64)> {
+        let guard = self.gpuvm_unique.lock();
+        let gpuva = guard.find_first(va, 1)?;
+        let bo = gpuva.obj();
+        let bo_offset = gpuva.gem_offset() + (va - gpuva.addr());
+        Some((ARef::from(bo), bo_offset))
+    }
+
     /// Deactivate the VM by evicting it from its address space slot.
     pub(crate) fn deactivate(&self) -> Result {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
