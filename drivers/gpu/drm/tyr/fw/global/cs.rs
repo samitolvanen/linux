@@ -176,10 +176,19 @@ pub(crate) struct HeapOutputState {
     pub(crate) frag_end: u32,
 }
 
+/// Snapshot of the per-CS sync-wait state captured from
+/// `CS_STATUS_WAIT` and the matching `CS_STATUS_WAIT_SYNC_*` words.
 pub(crate) struct CsStatusWait {
+    /// Wait condition (`Le` or `Gt`).
     pub(crate) condition: CsWaitCondition,
+    /// Whether the wait observes a 64-bit (`true`) or 32-bit (`false`)
+    /// sync object.
     pub(crate) sync64: bool,
+    /// GPU virtual address of the awaited sync object.
     pub(crate) sync_ptr: u64,
+    /// Reference value the wait compares against, assembled from the
+    /// low half (`CS_STATUS_WAIT_SYNC_VALUE`) and, for 64-bit waits,
+    /// the high half (`CS_STATUS_WAIT_SYNC_VALUE_HI`).
     pub(crate) ref_val: u64,
 }
 
@@ -332,6 +341,7 @@ impl CsInterface {
         })
     }
 
+    /// Decodes `CS_STATUS_BLOCKED_REASON.reason` into a [`CsBlockedReason`].
     pub(crate) fn read_status_blocked_reason(&self) -> Result<CsBlockedReason> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
@@ -360,6 +370,10 @@ impl CsInterface {
 
     /// Reads the active `CS_STATUS_WAIT_SYNC_*` snapshot when the CS is
     /// blocked on a `SYNC_WAIT` instruction.
+    ///
+    /// Returns the decoded condition (Le/Gt), the size of the awaited
+    /// sync object, the GPU VA being polled and the reference value
+    /// (assembled from the low / high halves for 64-bit waits).
     pub(crate) fn read_status_wait_sync(&self) -> Result<CsStatusWait> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,

@@ -111,6 +111,30 @@ struct PendingSubmitFence {
     fence: DriverDmaFence<QueueFenceData, Published>,
 }
 
+/// Per-queue snapshot of the active GPU sync-wait. Populated when the
+/// firmware reports `BlockedReason::SyncWait` for the queue's CS.
+///
+/// A `gpu_va` of `0` is the sentinel for "no active wait captured"
+/// and is the value the field holds at queue creation and after a
+/// successful unblock. The `bo` / `bo_offset` pair is a lazily-cached
+/// translation of `gpu_va`.
+#[derive(Default, Clone)]
+pub(crate) struct SyncWait {
+    /// GPU virtual address of the awaited sync object. `0` means no
+    /// active wait is currently captured.
+    pub(crate) gpu_va: u64,
+    /// Reference value the wait compares against.
+    pub(crate) ref_val: u64,
+    /// Whether the awaited sync object is 64-bit (`true`) or 32-bit.
+    pub(crate) sync64: bool,
+    /// Wait condition: `true` for `>` (Gt), `false` for `<=` (Le).
+    pub(crate) gt: bool,
+    /// Cached BO that backs `gpu_va`, if previously resolved.
+    pub(crate) bo: Option<Arc<gem::MappedBo>>,
+    /// Offset within `bo` corresponding to `gpu_va`.
+    pub(crate) bo_offset: usize,
+}
+
 pub(super) struct QueueJob {
     stream: KVec<u8>,
     completion_point: AtomicU64,
@@ -153,6 +177,10 @@ pub(crate) struct QueueData {
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
     pending_submit_fences: Mutex<KVec<PendingSubmitFence>>,
+    /// Active GPU sync-wait captured for this queue. The `Default`
+    /// value (`gpu_va == 0`) means no wait is currently active.
+    #[pin]
+    syncwait: Mutex<SyncWait>,
 }
 
 impl QueueData {
@@ -343,6 +371,53 @@ impl QueueData {
         }
         Ok(())
     }
+
+    /// Returns a clone of the active sync-wait snapshot.
+    #[expect(dead_code)]
+    pub(crate) fn syncwait_snapshot(&self) -> SyncWait {
+        self.syncwait.lock().clone()
+    }
+
+    /// Updates the firmware-reported fields of the active sync-wait
+    /// snapshot. Leaves the cached `(bo, bo_offset)` resolution intact;
+    /// a follow-on commit clears the cache explicitly when the wait is
+    /// satisfied so the drop of the cached BO runs outside the
+    /// dma-fence signalling annotation that wraps this caller.
+    pub(crate) fn set_syncwait(&self, gpu_va: u64, ref_val: u64, sync64: bool, gt: bool) {
+        let mut wait = self.syncwait.lock();
+        wait.gpu_va = gpu_va;
+        wait.ref_val = ref_val;
+        wait.sync64 = sync64;
+        wait.gt = gt;
+    }
+
+    /// Stores a resolved `(bo, bo_offset)` cache on the active
+    /// sync-wait snapshot, but only if `gpu_va` still matches the
+    /// currently captured wait. Returns `true` if the cache was
+    /// applied.
+    #[expect(dead_code)]
+    pub(crate) fn cache_syncwait_bo(
+        &self,
+        gpu_va: u64,
+        bo: Arc<gem::MappedBo>,
+        bo_offset: usize,
+    ) -> bool {
+        let mut wait = self.syncwait.lock();
+        if wait.gpu_va != gpu_va {
+            return false;
+        }
+        wait.bo = Some(bo);
+        wait.bo_offset = bo_offset;
+        true
+    }
+
+    /// Returns `true` if the firmware-visible ring buffer is currently
+    /// empty (`INSERT == EXTRACT`).
+    pub(crate) fn is_ringbuf_empty(&self) -> Result<bool> {
+        let input = self.interfaces.read_input()?;
+        let output = self.interfaces.read_output()?;
+        Ok(input.insert == output.extract)
+    }
 }
 
 pub(super) struct TyrQueueOps {
@@ -519,6 +594,7 @@ impl Queue {
                 next_seqno: AtomicU64::new(0),
                 iomem: tdev.iomem.clone(),
                 pending_submit_fences <- new_mutex!(KVec::new()),
+                syncwait <- new_mutex!(SyncWait::default()),
             }),
             GFP_KERNEL,
         )?;

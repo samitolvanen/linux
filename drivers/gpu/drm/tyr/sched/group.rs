@@ -43,7 +43,6 @@ use super::{
 
 /// Upper bound on queues per group, set by the width of the per-queue
 /// bitmasks (`blocked_queues`, `idle_queues`, `fatal_queues`).
-#[expect(dead_code)]
 pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 
 /// The group's lifecycle state.
@@ -128,7 +127,6 @@ impl GroupInner {
     }
 
     /// Sets a queue as blocked or unblocked.
-    #[expect(dead_code)]
     pub(crate) fn set_queue_blocked(&mut self, queue_idx: usize, blocked: bool) {
         let mask = 1 << queue_idx;
 
@@ -142,7 +140,6 @@ impl GroupInner {
     /// Sets a queue as idle or active.
     ///
     /// Returns true if the queue was previously idle.
-    #[expect(dead_code)]
     pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
         let mask = 1 << queue_idx;
         let was_idle = (self.idle_queues & mask) != 0;

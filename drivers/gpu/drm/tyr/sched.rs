@@ -33,6 +33,8 @@ use crate::{
             CsgActivateInputs,
             //
         },
+        CsBlockedReason,
+        CsWaitCondition,
         CsgExecutionState,
         CSG_CONFIG,
         CSG_EP_REQ,
@@ -703,12 +705,133 @@ impl Scheduler {
 
     /// Synchronises the per-CS in-memory state from the CSG output area
     /// after a `CSG_REQ.status_update` ack is observed.
+    ///
+    /// Walks every CS in the group to classify each queue's state from
+    /// `CS_STATUS_BLOCKED_REASON`, `CS_STATUS_WAIT`,
+    /// `CS_STATUS_SCOREBOARDS` and (for sync-wait blocked queues) the
+    /// `CS_STATUS_WAIT_SYNC_*` words:
+    ///
+    /// * `Unblocked` with empty ringbuffer (`INSERT == EXTRACT`) and
+    ///   no in-flight scoreboard entries -> mark queue idle.
+    /// * `SyncWait`: capture the active wait into [`QueueData::syncwait`]
+    ///   and, when no scoreboards are still in flight, mark the queue
+    ///   blocked. The group is then pushed onto
+    ///   [`Scheduler::waiting_groups`].
+    /// * Other reasons are not blocking and leave the queue in its
+    ///   current classification.
     fn sync_csg_slot_queues_state(
         &mut self,
-        _data: &TyrDrmDeviceData,
-        _csg_slot_manager: &CsgSlotManager,
-        _csg_idx: usize,
+        data: &TyrDrmDeviceData,
+        csg_slot_manager: &CsgSlotManager,
+        csg_idx: usize,
     ) -> Result {
+        let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
+            return Ok(());
+        };
+        let group = slot_data.group.clone();
+        let priority = group.priority as usize;
+
+        // Snapshot the per-CS firmware state under one
+        // `with_csg_mut`. The arrays are sized to
+        // [`MAX_CS_PER_GROUP`] (the width of the per-queue bitmasks
+        // in `GroupInner`) so this stays allocation-free; the loop
+        // bound is min(queue_count, MAX_CS_PER_GROUP) to avoid
+        // out-of-bounds access if a future caller created a larger
+        // group.
+        let queue_count = core::cmp::min(group.queue_count(), group::MAX_CS_PER_GROUP);
+        let mut blocked_reasons: [Option<CsBlockedReason>; group::MAX_CS_PER_GROUP] =
+            [const { None }; group::MAX_CS_PER_GROUP];
+        let mut scoreboards: [u32; group::MAX_CS_PER_GROUP] = [0; group::MAX_CS_PER_GROUP];
+        let mut sync_waits: [Option<(u64, u64, bool, bool)>; group::MAX_CS_PER_GROUP] =
+            [const { None }; group::MAX_CS_PER_GROUP];
+
+        data.fw.with_csg_mut(csg_idx, |csg| {
+            for cs_id in 0..queue_count {
+                let Some(cs) = csg.cs_mut(cs_id) else {
+                    continue;
+                };
+                let reason = cs.read_status_blocked_reason()?;
+                blocked_reasons[cs_id] = Some(reason);
+                scoreboards[cs_id] = cs.read_status_scoreboards()?;
+
+                if reason == CsBlockedReason::SyncWait {
+                    let wait = cs.read_status_wait_sync()?;
+                    let gt = matches!(wait.condition, CsWaitCondition::Gt);
+                    sync_waits[cs_id] = Some((wait.sync_ptr, wait.ref_val, wait.sync64, gt));
+                }
+            }
+
+            Ok::<_, Error>(())
+        })?;
+
+        // Publish each captured sync-wait onto its queue. Empty
+        // ringbuffer probes hit firmware-shared memory and don't take
+        // the firmware lock, so they go in this pre-pass too.
+        let mut empty_queues: u32 = 0;
+        for cs_id in 0..queue_count {
+            let queue = &group.queues[cs_id];
+            if let Some((gpu_va, ref_val, sync64, gt)) = sync_waits[cs_id].take() {
+                queue.set_syncwait(gpu_va, ref_val, sync64, gt);
+            }
+            if blocked_reasons[cs_id] == Some(CsBlockedReason::Unblocked)
+                && queue.is_ringbuf_empty().unwrap_or(false)
+            {
+                empty_queues |= 1u32 << cs_id;
+            }
+        }
+
+        // Apply the per-queue classification under the inner lock.
+        // Returns whether any queue ended up blocked on a sync object,
+        // which decides if the group needs to land on the wait list.
+        let has_sync_wait = group.with_locked_inner(|inner| {
+            let mut has_sync_wait = false;
+
+            for cs_id in 0..queue_count {
+                let mut idle = false;
+                let mut blocked = false;
+
+                match blocked_reasons[cs_id] {
+                    Some(CsBlockedReason::Unblocked)
+                        if (empty_queues & (1u32 << cs_id)) != 0 && scoreboards[cs_id] == 0 =>
+                    {
+                        idle = true;
+                    }
+                    Some(CsBlockedReason::Unblocked) => {}
+                    Some(CsBlockedReason::SyncWait) => {
+                        has_sync_wait = true;
+                        // Only blocked if there is no deferred work
+                        // still resolving on the scoreboards.
+                        if scoreboards[cs_id] == 0 {
+                            blocked = true;
+                        }
+                    }
+                    _ => {
+                        // Other reasons (`SbWait`, `ProgressWait`,
+                        // `Deferred`, `Resource`, `Flush`) do not
+                        // count as scheduler-visible blocks: the
+                        // queue is still considered runnable.
+                    }
+                }
+
+                inner.set_queue_idle(cs_id, idle);
+                inner.set_queue_blocked(cs_id, blocked);
+            }
+
+            has_sync_wait
+        });
+
+        // Push the group onto the per-priority wait list once any
+        // queue is blocked on a sync object. `try_from_arc` fails if
+        // a `ListArc<Group, 1>` is already outstanding for this
+        // group, which both prevents duplicate inserts and keeps the
+        // wait-list link single-owner so a list walker can iterate
+        // without racing concurrent inserts.
+        if has_sync_wait {
+            if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group) {
+                self.waiting_groups[priority].push_back(wait_arc);
+            }
+        }
+
         Ok(())
     }
 
