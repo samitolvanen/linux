@@ -285,8 +285,12 @@ impl Pool {
 
     pub(crate) fn destroy_heap_context(&self, context_id: usize) -> Result {
         let xa = self.xa.as_ref();
-        let mut guard = xa.lock();
-        guard.remove(context_id).ok_or(EINVAL)?;
+        let heap_ctx = {
+            let mut guard = xa.lock();
+            guard.remove(context_id).ok_or(EINVAL)?
+        };
+
+        drop(heap_ctx);
 
         Ok(())
     }
