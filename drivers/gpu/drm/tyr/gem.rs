@@ -207,6 +207,130 @@ impl Drop for MappedBo {
     }
 }
 
+/// A vmap of a user-mapped GPU buffer object.
+///
+/// Unlike `MappedBo` (which is kernel-only and carries the
+/// kernel-side VA allocation), `MappedUserBo` is for BOs whose GPU
+/// VA was allocated by userspace via the gpuvm ioctls. The wrapper
+/// exists so the scheduler's foreign-BO sync-wait evaluator can read
+/// sync values out of user BOs without those BOs being kernel-owned.
+///
+/// The BO must be pinned (i.e. it has at least one live GPU mapping)
+/// for the vmap to be safe. All current callers materialise the BO
+/// via `Vm::get_bo_for_va`, which only returns BOs reachable
+/// through a live `drm_gpuva`, satisfying that precondition.
+pub(crate) struct MappedUserBo {
+    #[expect(dead_code)]
+    bo: ARef<Bo>,
+    /// `Some` for the entire lifetime of the value; taken to `None`
+    /// only by `Drop` when shipping the vmap to the cleanup
+    /// workqueue.
+    vmap: Option<shmem::VMapOwned<BoData>>,
+    cleanup_wq: Arc<CleanupQueue>,
+}
+
+impl MappedUserBo {
+    pub(crate) fn new(bo: &Bo, cleanup_wq: Arc<CleanupQueue>) -> Result<Arc<Self>> {
+        let vmap = bo.owned_vmap::<0>()?;
+        Ok(Arc::new(
+            Self {
+                bo: bo.into(),
+                vmap: Some(vmap),
+                cleanup_wq,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
+        self.vmap
+            .as_ref()
+            .expect("MappedUserBo::vmap accessed after drop")
+    }
+
+    /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
+    /// mapping and that `offset` is aligned for `T`.
+    pub(crate) fn check_offset<T>(&self, offset: usize) -> Result {
+        if offset % core::mem::align_of::<T>() != 0 {
+            return Err(EINVAL);
+        }
+
+        let end = offset
+            .checked_add(core::mem::size_of::<T>())
+            .ok_or(EINVAL)?;
+        if end > self.size() {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.vmap().owner().size()
+    }
+}
+
+/// Send raw-pointer wrapper used to hand a heap-parked vmap to the
+/// cleanup closure. Single-consumer: only the closure (success) or
+/// this Drop body (failure) calls KBox::from_raw on the inner pointer.
+#[repr(transparent)]
+struct MappedUserBoCleanupPtr(*mut shmem::VMapOwned<BoData>);
+
+// SAFETY: The pointer is produced by KBox::into_raw and reclaimed by
+// KBox::from_raw exactly once, on whichever side observes it first
+// (closure on success, this Drop body on failure).
+unsafe impl Send for MappedUserBoCleanupPtr {}
+
+impl Drop for MappedUserBo {
+    fn drop(&mut self) {
+        let Some(vmap) = self.vmap.take() else {
+            return;
+        };
+        let cleanup_wq = self.cleanup_wq.clone();
+
+        let slot: KBox<MaybeUninit<shmem::VMapOwned<BoData>>> = match KBox::new_uninit(GFP_NOWAIT) {
+            Ok(s) => s,
+            Err(_) => {
+                pr_warn_once!(
+                    "tyr: MappedUserBo cleanup-state allocation failed; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
+                );
+                core::mem::forget(vmap);
+                return;
+            }
+        };
+        let boxed = KBox::write(slot, vmap);
+        let ptr = KBox::into_raw(boxed);
+        let send_ptr = MappedUserBoCleanupPtr(ptr);
+
+        let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            // Force `Send` capture of the wrapper, see `KernelBo`.
+            let send_ptr = send_ptr;
+            // SAFETY: `send_ptr.0` was produced by `KBox::into_raw`
+            // in the matching `MappedUserBo::drop` body and is only
+            // reclaimed by `KBox::from_raw` once: by this closure on
+            // the success path, or by the `Drop` body on the
+            // enqueue-failure path. The cleanup workqueue runs
+            // outside any dma-fence signalling section, so taking
+            // `dma_resv_lock` from the vmap destructor is safe here.
+            drop(unsafe { KBox::from_raw(send_ptr.0) });
+        });
+
+        if let Err(e) = res {
+            pr_warn_once!(
+                "tyr: MappedUserBo cleanup_wq enqueue failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
+            );
+            // SAFETY: `try_spawn` returned `Err`, so the closure was
+            // dropped without observing `ptr`; ownership remains
+            // here. Leak the box: dropping it would invoke the vmap
+            // destructor and take `dma_resv_lock` from the
+            // signalling section that prompted the deferral.
+            let boxed = unsafe { KBox::from_raw(ptr) };
+            core::mem::forget(KBox::into_inner(boxed));
+            pr_err!("Failed to enqueue MappedUserBo vmap cleanup: {:?}\n", e);
+        }
+    }
+}
+
 /// Returns whether a BO should be mapped write-combine given the device's
 /// DMA coherence.
 pub(crate) fn should_map_wc(coherent: bool) -> bool {
