@@ -192,18 +192,26 @@ impl<T: DriverObject> Object<T> {
         let this = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
 
         // SAFETY:
+        // - We verified above that `obj` is valid, which makes `this` valid.
+        // - This function is set in AllocOps, so we know that `this` is contained within an
+        //   `Object<T>`.
+        let rust_this = unsafe { container_of!(Opaque::cast_from(this), Self, obj) }.cast_mut();
+
+        // Drop any SGTableMap before calling drm_gem_shmem_release(). Otherwise the release path
+        // can clear `shmem->sgt` first, and the subsequent SGTableMap drop will try to free it a
+        // second time.
+        // SAFETY: `free_callback()` runs when the last GEM reference is dropped, so we have
+        // exclusive access to the object state while taking the optional devres out.
+        let sgt_res = unsafe { (*(*rust_this).sgt_res.get()).take() };
+        drop(sgt_res);
+
+        // SAFETY:
         // - We're in free_callback - so this function is safe to call.
         // - We won't be using the gem resources on `this` after this call.
         unsafe { bindings::drm_gem_shmem_release(this) };
 
-        // SAFETY:
-        // - We verified above that `obj` is valid, which makes `this` valid
-        // - This function is set in AllocOps, so we know that `this` is contained within a
-        //   `Object<T>`
-        let this = unsafe { container_of!(Opaque::cast_from(this), Self, obj) }.cast_mut();
-
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
-        let _ = unsafe { KBox::from_raw(this) };
+        let _ = unsafe { KBox::from_raw(rust_this) };
     }
 
     // If necessary, create an SGTable for the gem object and register a Devres for it to ensure
