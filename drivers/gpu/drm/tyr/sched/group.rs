@@ -693,7 +693,7 @@ impl Pool {
         groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
     ) -> Result {
-        if groupcreate.queues.count == 0 {
+        if groupcreate.queues.count == 0 || groupcreate.queues.count as usize > MAX_CS_PER_GROUP {
             return Err(EINVAL);
         }
 
