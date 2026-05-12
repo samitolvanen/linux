@@ -40,6 +40,7 @@ use crate::{
         CSG_EP_REQ,
         CSG_REQ, //
     },
+    gpu::UNPRESERVED_CS_REG_COUNT,
     sched::group::GroupListState,
     slot::SlotManager, //
 };
@@ -407,6 +408,7 @@ impl Scheduler {
             csif.cs_slot_count = cs_slot_count;
             csif.cs_reg_count = cs_reg_count;
             csif.scoreboard_slot_count = scoreboard_slot_count;
+            csif.unpreserved_cs_reg_count = UNPRESERVED_CS_REG_COUNT;
         }
 
         // The CSG slot manager is preallocated at TyrDrmDeviceData
