@@ -274,7 +274,8 @@ impl CsInterface {
             .cs_control
             .read(STREAM_FEATURES)
             .work_registers()
-            .get())
+            .get()
+            + 1)
     }
 
     pub(in super::super) fn scoreboards(&self) -> Result<u32> {
