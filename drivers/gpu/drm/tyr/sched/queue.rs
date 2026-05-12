@@ -251,8 +251,10 @@ impl QueueData {
         Ok(())
     }
 
-    pub(super) fn claim_seqno(&self) -> u64 {
-        self.next_seqno.fetch_add(1, Ordering::Relaxed) + 1
+    /// Claims `n` consecutive seqnos in a single atomic step and returns
+    /// the highest one claimed.
+    pub(super) fn claim_seqnos(&self, n: usize) -> u64 {
+        self.next_seqno.fetch_add(n as u64, Ordering::Relaxed) + n as u64
     }
 
     /// Returns the highest seqno claimed so far on this queue.
