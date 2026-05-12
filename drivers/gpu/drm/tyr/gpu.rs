@@ -29,6 +29,12 @@ use crate::{
     }, //
 };
 
+/// Number of CS work registers the kernel reserves at the top of the
+/// register file for its own wrapper prologue/epilogue. Matches
+/// Panthor's `CSF_UNPRESERVED_REG_COUNT`; constant across all current
+/// CSF chips per the CSF programming manual.
+pub(crate) const UNPRESERVED_CS_REG_COUNT: u32 = 4;
+
 /// CSIF (Command Stream Interface) information.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
