@@ -589,6 +589,26 @@ impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DriverDmaFence<T, V> {
 }
 
 impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {
+    /// Stage a terminal error on the fence, to be observed by waiters once it
+    /// is signaled.
+    ///
+    /// Per `include/linux/dma-fence.h`, the error must be set *before* the
+    /// fence transitions to the signaled state, so that the value is visible
+    /// before any waiter on the signal callback is woken. Calling this on a
+    /// fence that is already signaled triggers a kernel `WARN_ON` in the C
+    /// helper.
+    ///
+    /// Takes `&mut self`: the C helper writes `fence->error` without
+    /// synchronization, so the borrow checker must enforce a unique caller
+    /// per moment. The signalling step happens later through
+    /// [`Self::signal`], which consumes the handle.
+    pub fn set_error(&mut self, err: Error) {
+        // SAFETY: `self.inner.fence` is a valid `dma_fence` owned by this
+        // published handle; the `&mut self` borrow excludes any concurrent
+        // access to `fence->error`.
+        unsafe { bindings::dma_fence_set_error(self.inner.fence.get(), err.to_errno()) };
+    }
+
     /// Signal the fence with the given result.
     ///
     /// Consumes `self`, enforcing at the type level that a fence can only be
