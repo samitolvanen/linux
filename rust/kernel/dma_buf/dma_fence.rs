@@ -557,6 +557,18 @@ impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> DriverDmaFence<T, V> {
 }
 
 impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {
+    /// Stage a terminal error on the fence, to be observed by waiters once it
+    /// is signaled.
+    ///
+    /// The error must be set before the fence transitions to the signaled
+    /// state, so that waiters see it. Setting it on a fence that is already
+    /// signaled triggers a `WARN_ON`.
+    pub fn set_error(&mut self, err: Error) {
+        // SAFETY: `self.inner.fence` is a valid `dma_fence` for the
+        // lifetime of `self`.
+        unsafe { bindings::dma_fence_set_error(self.inner.fence.get(), err.to_errno()) };
+    }
+
     /// Signal the fence with the given result.
     ///
     /// Consumes `self`, enforcing at the type level that a fence can only be
