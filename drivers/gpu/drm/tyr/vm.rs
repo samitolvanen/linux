@@ -663,8 +663,8 @@ pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64
 /// Each VM can be mapped into a hardware address space slot.
 #[pin_data(PinnedDrop)]
 pub(crate) struct VmExec {
-    /// Data referenced by an AS when the VM is active
-    as_data: Arc<VmAsData>,
+    /// Data referenced by an AS when the VM is active.
+    pub(crate) as_data: Arc<VmAsData>,
     /// MMU manager.
     mmu: Arc<Mmu>,
     /// Parent device used for logging.

@@ -165,7 +165,6 @@ impl GroupInner {
         self.blocked_queues != 0
     }
 
-    #[expect(dead_code)]
     pub(crate) fn has_fatal_queues(&self) -> bool {
         self.fatal_queues != 0
     }

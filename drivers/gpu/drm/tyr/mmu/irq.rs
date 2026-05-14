@@ -18,6 +18,7 @@ use kernel::{
     sizes::SZ_2M,
     sync::{
         aref::ARef,
+        atomic::Relaxed,
         Arc, //
     }, //
 };
@@ -97,9 +98,41 @@ impl TyrIrqTrait for MmuIrq {
 
     fn handle(&self, tdev: &TyrDrmDevice, io: &IoMem<'_>, status: u32) {
         let fault_bits = status & u32::from(PAGE_FAULT_BITS);
-        if fault_bits != 0 {
-            let _ = decode_faults(tdev, fault_bits, io);
-            TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+        if fault_bits == 0 {
+            return;
         }
+
+        let _ = decode_faults(tdev, fault_bits, io);
+
+        // Flag the faulting AS slots and tear their MMU programming
+        // down before the scheduler tick runs, so any further GPU
+        // accesses to those VMs fault immediately instead of generating
+        // a fault storm while the scheduler evicts the owning groups.
+        if let Some(guard) = tdev.registration_guard() {
+            guard.registration_data_with(|reg_data| {
+                let mut as_manager = reg_data.mmu.as_manager.lock();
+                for as_idx in 0..MAX_AS {
+                    if fault_bits & (1u32 << as_idx) == 0 {
+                        continue;
+                    }
+                    // Clone, because slot_data borrows as_manager and
+                    // deactivate_vm takes &mut self.
+                    let Some(vm_as_data) = as_manager.slot_data(as_idx).cloned() else {
+                        continue;
+                    };
+                    vm_as_data.unhandled_fault.store(true, Relaxed);
+                    if let Err(e) = as_manager.deactivate_vm(&vm_as_data) {
+                        dev_err!(
+                            tdev.as_ref(),
+                            "mmu_irq: deactivate_vm({}) failed: {:?}\n",
+                            as_idx,
+                            e
+                        );
+                    }
+                }
+            });
+        }
+
+        TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
     }
 }
