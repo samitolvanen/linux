@@ -60,7 +60,7 @@ impl From<CacheMode> for Bounded<u32, 2> {
 }
 
 bitfield! {
-    struct SectionFlags(u32) {
+    pub(super) struct SectionFlags(u32) {
         0:0 read => bool;
         1:1 write => bool;
         2:2 exec => bool;
@@ -100,6 +100,8 @@ pub(super) struct ParsedSection {
     pub(super) va: Range<u32>,
     /// Memory protection and caching flags for the mapping.
     pub(super) vm_map_flags: VmMapFlags,
+    /// Raw section flags decoded from the firmware section header.
+    pub(super) section_flags: SectionFlags,
 }
 
 /// A bare-bones `std::io::Cursor<[u8]>` clone to keep track of the current position in the
@@ -481,6 +483,7 @@ impl<'a> FwParser<'a> {
             data,
             va: section_hdr.va,
             vm_map_flags,
+            section_flags: section_hdr.section_flags,
         }))
     }
 }
