@@ -6,6 +6,8 @@
 //! wires the generic Tyr IRQ wrapper to the MMU IRQ registers and delegates the
 //! human-readable fault reporting to `faults.rs`.
 
+use core::sync::atomic::Ordering;
+
 use kernel::{
     c_str,
     device::{Bound, Device},
@@ -97,9 +99,32 @@ impl TyrIrqTrait for MmuIrq {
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
         let fault_bits = status & u32::from(PAGE_FAULT_BITS);
-        if fault_bits != 0 {
-            let _ = decode_faults(fault_bits, &self.iomem);
-            TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+        if fault_bits == 0 {
+            return;
         }
+
+        let _ = decode_faults(fault_bits, &self.iomem);
+
+        // Flag the faulting AS slots and tear their MMU programming
+        // down before the scheduler tick runs, so any further GPU
+        // accesses to those VMs fault immediately instead of generating
+        // a fault storm while the scheduler evicts the owning groups.
+        let mut as_manager = tdev.mmu.as_manager.lock();
+        for as_idx in 0..usize::from(MAX_AS) {
+            if fault_bits & (1u32 << as_idx) == 0 {
+                continue;
+            }
+            // Must clone: slot_data borrows as_manager, and deactivate_vm takes &mut self.
+            let Some(vm_as_data) = as_manager.slot_data(as_idx).cloned() else {
+                continue;
+            };
+            vm_as_data.unhandled_fault.store(true, Ordering::Relaxed);
+            if let Err(e) = as_manager.deactivate_vm(&vm_as_data) {
+                pr_err!("mmu_irq: deactivate_vm({}) failed: {:?}\n", as_idx, e);
+            }
+        }
+        drop(as_manager);
+
+        TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
     }
 }
