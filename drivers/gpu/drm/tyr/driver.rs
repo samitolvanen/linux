@@ -77,8 +77,14 @@ use crate::{
         Firmware, //
     },
     gem::Bo,
-    gpu,
-    gpu::GpuInfo,
+    gpu::{
+        self,
+        irq::{
+            gpu_irq_init,
+            GpuIrq, //
+        },
+        GpuInfo, //
+    },
     irq::TyrIrq,
     mmap,
     mmu::{
@@ -464,6 +470,10 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// reported.
     _mmu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>>>,
 
+    /// GPU IRQ registration. Freed after the job and MMU registrations, so the GPU fault
+    /// handler outlives them.
+    _gpu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, GpuIrq>>>>,
+
     /// Workqueue for work items that may signal DMA fences.
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
@@ -591,6 +601,14 @@ impl platform::Driver for TyrPlatformDriver {
             coherent,
         )?;
 
+        // SAFETY: The registration is owned by `gpu_irq` and then by
+        // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
+        // is never forgotten.
+        let gpu_irq = KBox::pin_init(
+            unsafe { gpu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
+            GFP_KERNEL,
+        )?;
+
         // SAFETY: The registration is owned by `mmu_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
         // is never forgotten.
@@ -641,6 +659,7 @@ impl platform::Driver for TyrPlatformDriver {
                 fw: firmware,
                 _job_irq: job_irq,
                 _mmu_irq: mmu_irq,
+                _gpu_irq: gpu_irq,
                 wq,
                 sched_wq,
                 heap_wq,
