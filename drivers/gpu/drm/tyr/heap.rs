@@ -2,10 +2,7 @@
 
 //! Tiler heap management.
 
-use core::sync::atomic::{
-    AtomicUsize,
-    Ordering,
-};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel::{
     alloc::KVec,
@@ -15,10 +12,7 @@ use kernel::{
     prelude::*,
     sync::Arc,
     uapi,
-    uapi::{
-        SZ_128K,
-        SZ_8M,
-    },
+    uapi::{SZ_128K, SZ_8M},
     xarray,
     xarray::XArray,
 };
@@ -26,11 +20,7 @@ use kernel::{
 use crate::{
     driver::TyrDrmDevice,
     gem,
-    vm::{
-        Vm,
-        VmFlag,
-        VmMapFlags,
-    },
+    vm::{Vm, VmFlag, VmMapFlags},
 };
 
 const MAX_HEAPS_PER_POOL: u32 = 128;
@@ -112,7 +102,12 @@ impl Pools {
         Some(pool.into())
     }
 
-    fn get_or_create_pool(&self, tdev: &TyrDrmDevice, vm_id: usize, vm: Arc<Vm>) -> Result<Arc<Pool>> {
+    fn get_or_create_pool(
+        &self,
+        tdev: &TyrDrmDevice,
+        vm_id: usize,
+        vm: Arc<Vm>,
+    ) -> Result<Arc<Pool>> {
         if let Some(pool) = self.get_pool(vm_id) {
             return Ok(pool);
         }
@@ -120,7 +115,9 @@ impl Pools {
         let pool = Arc::new(Pool::create(tdev, vm)?, GFP_KERNEL)?;
         let xa = self.entries.as_ref();
         let mut guard = xa.lock();
-        guard.store(vm_id, pool.clone(), GFP_KERNEL).map_err(|_| EINVAL)?;
+        guard
+            .store(vm_id, pool.clone(), GFP_KERNEL)
+            .map_err(|_| EINVAL)?;
 
         Ok(pool)
     }
@@ -274,7 +271,9 @@ impl Pool {
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
-        guard.store(index, heap_ctx, GFP_KERNEL).map_err(|_| EINVAL)?;
+        guard
+            .store(index, heap_ctx, GFP_KERNEL)
+            .map_err(|_| EINVAL)?;
 
         Ok(CreatedContext {
             context_id: index,

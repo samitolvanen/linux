@@ -11,25 +11,16 @@ use core::sync::atomic::Ordering;
 use kernel::{
     alloc::KVec,
     prelude::*,
-    sync::{
-        aref::ARef,
-        Arc,
-    },
+    sync::{aref::ARef, Arc},
     workqueue::WorkItem,
 };
 
 use crate::{
-    driver::{
-        TyrDrmDevice,
-        TyrDrmDeviceData,
-    },
+    driver::{TyrDrmDevice, TyrDrmDeviceData},
     heap,
 };
 
-use super::{
-    group::Group,
-    Scheduler,
-};
+use super::{group::Group, Scheduler};
 
 struct PendingOom {
     group: Arc<Group>,
@@ -87,15 +78,24 @@ impl WorkItem<4> for TyrDrmDeviceData {
         }
 
         let _ = tdev
-            .with_locked_scheduler(|sched| sched.finish_pending_tiler_ooms(tdev, &pending, &chunk_vas))
+            .with_locked_scheduler(|sched| {
+                sched.finish_pending_tiler_ooms(tdev, &pending, &chunk_vas)
+            })
             .inspect_err(|err| {
-                pr_err!("tiler_oom_work: failed to complete OOM handling: {:?}\n", err);
+                pr_err!(
+                    "tiler_oom_work: failed to complete OOM handling: {:?}\n",
+                    err
+                );
             });
     }
 }
 
 impl Scheduler {
-    pub(crate) fn process_csg_irqs(&mut self, mut events: u32, tdev: &TyrDrmDevice) -> Result<bool> {
+    pub(crate) fn process_csg_irqs(
+        &mut self,
+        mut events: u32,
+        tdev: &TyrDrmDevice,
+    ) -> Result<bool> {
         let mut queued_tiler_oom = false;
 
         while events != 0 {

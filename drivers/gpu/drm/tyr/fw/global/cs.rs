@@ -6,30 +6,13 @@
 //! firmware global interface. Keeping it here lets the GLB-facing code stop
 //! carrying per-CS control-block details inline.
 
-use kernel::{
-    io::Io,
-    prelude::*,
-};
+use kernel::{io::Io, prelude::*};
 
 use super::SharedSectionInfo;
-use crate::fw::{
-    interfaces::{
-        CS_ACK,
-        CS_HEAP_ADDRESS,
-        CS_HEAP_FRAG_END,
-        CS_HEAP_VT_END,
-        CS_HEAP_VT_START,
-        FwInterface,
-        CS_REQ,
-        CS_TILER_HEAP_END,
-        CS_TILER_HEAP_START,
-        STREAM_FEATURES,
-        STREAM_INPUT_VA,
-        STREAM_OUTPUT_VA,
-        CS_CONTROL_BLOCK_SIZE,
-        CS_KERNEL_INPUT_BLOCK_SIZE,
-        CS_KERNEL_OUTPUT_BLOCK_SIZE,
-    },
+use crate::fw::interfaces::{
+    FwInterface, CS_ACK, CS_CONTROL_BLOCK_SIZE, CS_HEAP_ADDRESS, CS_HEAP_FRAG_END, CS_HEAP_VT_END,
+    CS_HEAP_VT_START, CS_KERNEL_INPUT_BLOCK_SIZE, CS_KERNEL_OUTPUT_BLOCK_SIZE, CS_REQ,
+    CS_TILER_HEAP_END, CS_TILER_HEAP_START, STREAM_FEATURES, STREAM_INPUT_VA, STREAM_OUTPUT_VA,
 };
 
 /// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
@@ -75,9 +58,8 @@ impl CsInterface {
         cs_stride: usize,
     ) -> Result {
         let cs_control_offset = CS_CONTROL_OFFSET + cs_idx * cs_stride;
-        let cs_control_va = shared_section.va_range.start
-            + csg_control_offset as u64
-            + cs_control_offset as u64;
+        let cs_control_va =
+            shared_section.va_range.start + csg_control_offset as u64 + cs_control_offset as u64;
 
         let cs_control = FwInterface::<CS_CONTROL_BLOCK_SIZE>::new(
             &shared_section.vmap,
@@ -114,7 +96,11 @@ impl CsInterface {
             CsInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        Ok(enabled.cs_control.read(STREAM_FEATURES).work_registers().get())
+        Ok(enabled
+            .cs_control
+            .read(STREAM_FEATURES)
+            .work_registers()
+            .get())
     }
 
     pub(in super::super) fn scoreboards(&self) -> Result<u32> {
@@ -150,17 +136,16 @@ impl CsInterface {
         end: CS_TILER_HEAP_END,
     ) {
         if let CsInterfaceState::Enabled(enabled) = &self.state {
-            enabled
-                .cs_input
-                .write(CS_TILER_HEAP_START, start);
-            enabled
-                .cs_input
-                .write(CS_TILER_HEAP_END, end);
+            enabled.cs_input.write(CS_TILER_HEAP_START, start);
+            enabled.cs_input.write(CS_TILER_HEAP_END, end);
         }
     }
 
     pub(crate) fn write_tiler_heap_raw(&self, start: u64, end: u64) {
-        self.write_tiler_heap(CS_TILER_HEAP_START::from_raw(start), CS_TILER_HEAP_END::from_raw(end));
+        self.write_tiler_heap(
+            CS_TILER_HEAP_START::from_raw(start),
+            CS_TILER_HEAP_END::from_raw(end),
+        );
     }
 
     #[allow(dead_code)]

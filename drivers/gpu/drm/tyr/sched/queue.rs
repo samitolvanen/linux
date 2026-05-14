@@ -1,76 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::{
-    ops::{
-        Deref,
-        Range,
-    },
-    sync::atomic::{
-        AtomicU64,
-        AtomicUsize,
-        Ordering,
-    },
+    ops::{Deref, Range},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use kernel::{
     alloc::KVec,
-    bindings,
-    c_str,
+    bindings, c_str,
     dma_buf::dma_fence::{
-        DmaFenceSignallingAnnotation,
-        DmaFenceWorkqueue,
-        DriverDmaFence,
-        DriverDmaFenceOps,
-        PublicDmaFence,
-        Published,
+        DmaFenceSignallingAnnotation, DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps,
+        PublicDmaFence, Published,
     },
     drm::{
         gem::BaseObject,
         job_queue::{
-            JobQueue,
-            JobQueueLockClasses,
-            JobRef,
-            PipelineBuilder,
-            PreparedJob,
-            QueueOps,
-            StageAdvance,
-            StageContext,
-            StageOps,
-            SubmitResult,
+            JobQueue, JobQueueLockClasses, JobRef, PipelineBuilder, PreparedJob, QueueOps,
+            StageAdvance, StageContext, StageOps, SubmitResult,
         },
     },
-    io::Io,
     io::register::Array,
+    io::Io,
     new_mutex,
     prelude::*,
     sizes::SZ_4K,
     sizes::SZ_64K,
-    sync::{
-        aref::ARef,
-        Arc,
-        LockClassKey,
-        Mutex,
-    },
-    time::{
-        Jiffies,
-        msecs_to_jiffies,
-    },
+    sync::{aref::ARef, Arc, LockClassKey, Mutex},
+    time::{msecs_to_jiffies, Jiffies},
     transmute::FromBytes,
     uapi,
 };
 
 use crate::{
-    driver::{
-        IoMem,
-        TyrDrmDevice,
-    },
+    driver::{IoMem, TyrDrmDevice},
     gem,
     regs::doorbell_block,
-    vm::{
-        Vm,
-        VmFlag,
-        VmMapFlags,
-    },
+    vm::{Vm, VmFlag, VmMapFlags},
 };
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
@@ -83,8 +48,7 @@ static TYR_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_stat
 static TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static TYR_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static TYR_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-static TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey =
-    unsafe { LockClassKey::new_static() };
+static TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 #[repr(transparent)]
 pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
@@ -481,14 +445,9 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    pub(crate) fn new(
-        tdev: &TyrDrmDevice,
-        queue_args: &QueueCreate,
-        vm: Arc<Vm>,
-    ) -> Result<Self> {
+    pub(crate) fn new(tdev: &TyrDrmDevice, queue_args: &QueueCreate, vm: Arc<Vm>) -> Result<Self> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
-        let ringbuf =
-            gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
+        let ringbuf = gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
 

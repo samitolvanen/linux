@@ -9,8 +9,8 @@ use core::ops::Range;
 use kernel::{
     drm::{
         gem,
-        gem::BaseObject,
         gem::shmem,
+        gem::BaseObject,
         DeviceContext, //
     },
     prelude::*,

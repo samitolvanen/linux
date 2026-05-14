@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::sync::atomic::{
-    AtomicU32,
-    AtomicUsize,
-    Ordering,
-};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use kernel::{
     alloc::KVec,
@@ -12,10 +8,7 @@ use kernel::{
     io::Io,
     new_mutex,
     prelude::*,
-    sync::{
-        Arc,
-        Mutex,
-    },
+    sync::{Arc, Mutex},
     uaccess::UserSlice,
     uapi,
 };
@@ -23,26 +16,13 @@ use kernel::{
 use crate::{
     driver::TyrDrmDevice,
     file::TyrDrmFile,
-    gem,
-    heap,
-    pool,
-    vm::{
-        Vm,
-        VmFlag,
-        VmMapFlags,
-    },
+    gem, heap, pool,
+    vm::{Vm, VmFlag, VmMapFlags},
 };
 
 use super::{
-    job::{
-        Job,
-        PreparedQueueSubmit,
-        QueueSubmit,
-    },
-    queue::{
-        Queue,
-        QueueCreate,
-    },
+    job::{Job, PreparedQueueSubmit, QueueSubmit},
+    queue::{Queue, QueueCreate},
     syncs,
 };
 
@@ -122,7 +102,8 @@ impl Group {
             .fw
             .alloc_suspend_buf(ddev, protm_suspend_buf_size as usize)?;
 
-        let num_syncs = group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
+        let num_syncs =
+            group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let syncobjs = gem::new_kernel_object(ddev, &vm, num_syncs, flags)?;
 
@@ -209,11 +190,7 @@ impl Group {
         self.heap_pool.lock().clone()
     }
 
-    pub(super) fn submit(
-        &self,
-        queue_submits: KVec<QueueSubmit>,
-        file: &TyrDrmFile,
-    ) -> Result {
+    pub(super) fn submit(&self, queue_submits: KVec<QueueSubmit>, file: &TyrDrmFile) -> Result {
         let jobs = Job::from_queue_submits(queue_submits)?;
         let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
 
@@ -312,7 +289,9 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        let group = self.group(groupsubmit.group_handle as usize).ok_or(EINVAL)?;
+        let group = self
+            .group(groupsubmit.group_handle as usize)
+            .ok_or(EINVAL)?;
 
         let mut queue_submits = KVec::new();
 
@@ -336,7 +315,9 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        let group = self.group(groupgetstate.group_handle as usize).ok_or(EINVAL)?;
+        let group = self
+            .group(groupgetstate.group_handle as usize)
+            .ok_or(EINVAL)?;
 
         groupgetstate.state = 0;
         groupgetstate.fatal_queues = group.fatal_queues();

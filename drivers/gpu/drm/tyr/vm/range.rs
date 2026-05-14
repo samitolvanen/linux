@@ -12,10 +12,7 @@ use kernel::{
     maple_tree::MapleTreeAlloc,
     new_mutex,
     prelude::*,
-    sync::{
-        Arc,
-        Mutex,
-    },
+    sync::{Arc, Mutex},
 };
 
 #[pin_data]

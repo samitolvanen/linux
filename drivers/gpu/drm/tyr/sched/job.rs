@@ -7,26 +7,14 @@
 //! group object focus on group state and scheduler coordination.
 
 use kernel::{
-    alloc::KVec,
-    dma_buf::dma_fence::PublicDmaFence,
-    prelude::*,
-    sync::aref::ARef,
-    transmute::FromBytes,
-    uaccess::UserSlice,
-    uapi,
+    alloc::KVec, dma_buf::dma_fence::PublicDmaFence, prelude::*, sync::aref::ARef,
+    transmute::FromBytes, uaccess::UserSlice, uapi,
 };
 
 use super::{
-    deps::{
-        self,
-        SyncOp,
-        SyncSignal,
-    },
+    deps::{self, SyncOp, SyncSignal},
     group::Group,
-    queue::{
-        PreparedQueueJob,
-        QueueJob,
-    },
+    queue::{PreparedQueueJob, QueueJob},
     syncs,
 };
 
@@ -52,9 +40,11 @@ impl QueueSubmit {
         if stream_size != 0 {
             stream.resize(stream_size, 0, GFP_KERNEL)?;
 
-            let mut reader =
-                UserSlice::new(UserPtr::from_addr(uapi_submit.stream_addr as usize), stream_size)
-                    .reader();
+            let mut reader = UserSlice::new(
+                UserPtr::from_addr(uapi_submit.stream_addr as usize),
+                stream_size,
+            )
+            .reader();
             reader.read_slice(&mut stream[..])?;
         }
 
@@ -118,9 +108,11 @@ pub(crate) fn append_queue_submits(
         return Err(ENOTSUPP);
     }
 
-    let mut reader =
-        UserSlice::new(UserPtr::from_addr(array as usize), stride as usize * count as usize)
-            .reader();
+    let mut reader = UserSlice::new(
+        UserPtr::from_addr(array as usize),
+        stride as usize * count as usize,
+    )
+    .reader();
 
     for _ in 0..count {
         let queue: RawQueueSubmit = reader.read()?;

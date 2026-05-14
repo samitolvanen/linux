@@ -12,11 +12,11 @@ use kernel::{
     },
     devres,
     devres::Devres,
-    dma_buf::dma_fence::DmaFenceWorkqueue,
     dma::{
         Device as DmaDevice,
         DmaMask, //
     },
+    dma_buf::dma_fence::DmaFenceWorkqueue,
     drm,
     drm::{
         driver::Registration,
@@ -40,10 +40,7 @@ use kernel::{
         Mutex, //
     },
     time, //
-    workqueue::{
-        Work,
-        WqFlags,
-    },
+    workqueue::{Work, WqFlags},
 };
 
 use crate::{
@@ -55,13 +52,10 @@ use crate::{
     gem::BoData,
     gpu,
     gpu::GpuInfo,
-    mmu::{
-        irq::mmu_irq_init,
-        Mmu,
-    },
+    mmu::{irq::mmu_irq_init, Mmu},
+    regs::gpu_control::*, //
     sched::Scheduler,
     sched::SchedulerState,
-    regs::gpu_control::*, //
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -78,11 +72,11 @@ pub(crate) struct TyrPlatformDriverData;
 pub(crate) struct TyrDrmDeviceData {
     pub(crate) pdev: ARef<platform::Device>,
 
-	pub(crate) mmu: Arc<Mmu>,
+    pub(crate) mmu: Arc<Mmu>,
 
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
-	pub(crate) mmio_phys_addr: u64,
+    pub(crate) mmio_phys_addr: u64,
 
     pub(crate) fw: Arc<Firmware>,
 
@@ -99,8 +93,8 @@ pub(crate) struct TyrDrmDeviceData {
     /// This is mainly queried by userspace, i.e.: Mesa.
     pub(crate) gpu_info: GpuInfo,
 
-	#[pin]
-	pub(crate) csif_info: Mutex<gpu::CsifInfo>,
+    #[pin]
+    pub(crate) csif_info: Mutex<gpu::CsifInfo>,
 
     /// The scheduler logic.
     #[pin]
@@ -176,7 +170,7 @@ impl platform::Driver for TyrPlatformDriverData {
         let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
-		let mmio_phys_addr = request.start();
+        let mmio_phys_addr = request.start();
         let iomem = Arc::pin_init(request.iomap_sized::<SZ_2M>(), GFP_KERNEL)?;
 
         issue_soft_reset(pdev.as_ref(), &iomem)?;
@@ -213,9 +207,9 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
-				mmu,
-				iomem: iomem.clone(),
-				mmio_phys_addr,
+                mmu,
+                iomem: iomem.clone(),
+                mmio_phys_addr,
                 fw: firmware,
                 wq,
                 clks <- new_mutex!(Clocks {
@@ -228,7 +222,7 @@ impl platform::Driver for TyrPlatformDriverData {
                     _sram: sram_regulator,
                 }),
                 gpu_info,
-				csif_info <- new_mutex!(gpu::CsifInfo::default()),
+                csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 sched <- new_mutex!(SchedulerState::Disabled),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
@@ -236,19 +230,10 @@ impl platform::Driver for TyrPlatformDriverData {
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
 
-        let mmu_irq = mmu_irq_init(
-            tdev.clone(),
-            pdev,
-            tdev.iomem.clone(),
-        )?;
+        let mmu_irq = mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
         devres::register(pdev.as_ref(), mmu_irq, GFP_KERNEL)?;
 
-        let job_irq = job_irq_init(
-            tdev.clone(),
-            pdev,
-            tdev.iomem.clone(),
-            tdev.fw.irq_state(),
-        )?;
+        let job_irq = job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?;
         devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
 
         tdev.fw.boot()?;
@@ -291,8 +276,8 @@ impl drm::Driver for TyrDrmDriver {
 
     kernel::declare_drm_ioctls! {
         (PANTHOR_DEV_QUERY, drm_panthor_dev_query, ioctl::RENDER_ALLOW, TyrDrmFileData::dev_query),
-		(PANTHOR_VM_CREATE, drm_panthor_vm_create, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_create),
-		(PANTHOR_VM_DESTROY, drm_panthor_vm_destroy, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_destroy),
+        (PANTHOR_VM_CREATE, drm_panthor_vm_create, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_create),
+        (PANTHOR_VM_DESTROY, drm_panthor_vm_destroy, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_destroy),
         (PANTHOR_VM_BIND, drm_panthor_vm_bind, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_bind),
         (PANTHOR_VM_GET_STATE, drm_panthor_vm_get_state, ioctl::RENDER_ALLOW, TyrDrmFileData::vm_get_state),
         (PANTHOR_BO_CREATE, drm_panthor_bo_create, ioctl::RENDER_ALLOW, TyrDrmFileData::bo_create),

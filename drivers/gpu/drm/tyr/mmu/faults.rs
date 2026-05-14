@@ -7,19 +7,9 @@
 //! path report faults without forcing the top-level MMU or driver code to know
 //! the raw register layout.
 
-use kernel::{
-    c_str,
-    devres::Devres,
-    io::Io,
-    io::register::Array,
-    prelude::*,
-    str::CStr,
-};
+use kernel::{c_str, devres::Devres, io::register::Array, io::Io, prelude::*, str::CStr};
 
-use crate::{
-    driver::IoMem,
-    regs::mmu_control::mmu_as_control,
-};
+use crate::{driver::IoMem, regs::mmu_control::mmu_as_control};
 
 const EXCEPTION_MAP: &[(u32, &CStr)] = &[
     (0x00, c_str!("OK")),
@@ -100,9 +90,12 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
         let as_index = (status | (status >> 16)).trailing_zeros();
         let mask = kernel::bits::bit_u32(as_index);
 
-        let fault_status_reg = mmu_as_control::FAULTSTATUS::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_lo_reg = mmu_as_control::FAULTADDRESS_LO::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_hi_reg = mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
+        let fault_status_reg =
+            mmu_as_control::FAULTSTATUS::try_at(as_index as usize).ok_or(EINVAL)?;
+        let fault_addr_lo_reg =
+            mmu_as_control::FAULTADDRESS_LO::try_at(as_index as usize).ok_or(EINVAL)?;
+        let fault_addr_hi_reg =
+            mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
 
         let fault_status_raw = io.read(fault_status_reg).into_raw();
         let addr_lo = io.read(fault_addr_lo_reg).into_raw();
