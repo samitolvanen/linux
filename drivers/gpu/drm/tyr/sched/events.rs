@@ -10,6 +10,7 @@ use core::sync::atomic::Ordering;
 
 use kernel::{
     alloc::KVec,
+    c_str,
     prelude::*,
     sync::{aref::ARef, Arc},
     workqueue::WorkItem,
@@ -25,7 +26,7 @@ use crate::{
         CsFaultExceptionType,
         CSG_REQ, //
     },
-    heap,
+    heap, trace,
 };
 
 use super::{group::Group, Scheduler};
@@ -49,6 +50,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("tiler_oom_work"));
         let tdev = &*this;
 
         let pending = tdev.with_locked_scheduler(|sched| sched.collect_pending_tiler_ooms(tdev));
@@ -134,9 +136,13 @@ impl Scheduler {
         let pending_mask =
             CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
 
+        let group_id = group.handle();
         let (idle_event, sync_event, progress_event) = tdev.fw.with_csg_mut(csg_id, |csg| {
             let req = csg.read_input_req()?.into_raw();
             let ack = csg.read_output_ack()?.into_raw();
+            let irq_req = csg.read_output_irq_req()?.into_raw();
+            let irq_ack = csg.read_input_irq_ack()?.into_raw();
+            trace::csg_irq(csg_id as u32, group_id, req, ack, irq_req, irq_ack);
             let pending = (req ^ ack) & pending_mask;
             if pending != 0 {
                 csg.update_input_req(ack & pending, pending)?;
@@ -147,6 +153,13 @@ impl Scheduler {
                 pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0,
             ))
         })?;
+
+        if idle_event {
+            trace::csg_slot_idle(csg_id as u32, group_id, true);
+        }
+        if progress_event {
+            trace::csg_slot_progress_timeout(csg_id as u32);
+        }
 
         if idle_event {
             // Tell the rule engine that at least one resident group may
@@ -164,6 +177,9 @@ impl Scheduler {
                     inner.fatal_error = Some(ETIMEDOUT);
                 }
             });
+            for (cs_idx, _queue) in group.queues.iter().enumerate() {
+                trace::queue_fatal_state(group_id, cs_idx as u32, true);
+            }
         }
         if sync_event {
             let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
@@ -195,6 +211,12 @@ impl Scheduler {
                 };
                 let input_req = cs.read_input_req()?;
                 let output_ack = cs.read_output_ack()?;
+                trace::cs_irq(
+                    csg_id as u32,
+                    cs_id,
+                    input_req.into_raw(),
+                    output_ack.into_raw(),
+                );
 
                 if input_req.tiler_oom() != output_ack.tiler_oom() && output_ack.tiler_oom() {
                     group.tiler_oom.fetch_or(1u32 << cs_id, Ordering::Relaxed);
@@ -235,6 +257,7 @@ impl Scheduler {
                     let cs_id = mask.trailing_zeros() as usize;
                     mask &= !(1u32 << cs_id);
                     inner.set_queue_fatal(cs_id);
+                    trace::queue_fatal_state(group_id, cs_id as u32, true);
                 }
             });
         }

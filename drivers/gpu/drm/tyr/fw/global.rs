@@ -43,6 +43,8 @@ use kernel::{
     time::arch_timer_get_rate,
 };
 
+use crate::trace;
+
 pub(crate) use self::cs::CsActivateInputs;
 pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 
@@ -108,6 +110,7 @@ impl<'a> GlobalInterfaceRequests<'a> {
         let new_val = toggled_bits | preserved_bits;
 
         self.input.write(GLB_REQ, GLB_REQ::from_raw(new_val));
+        trace::fw_glb_req(new_val, reqs_mask_val);
         Ok(())
     }
 }
@@ -521,6 +524,7 @@ impl InnerGlobalInterface {
         enabled
             .glb_input
             .write(GLB_DB_REQ, GLB_DB_REQ::from_raw(new_req));
+        trace::fw_glb_doorbell_req(new_req, csg_mask);
         Ok(())
     }
 
@@ -533,6 +537,7 @@ impl InnerGlobalInterface {
         let request_field = GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
         let req = enabled.glb_input.read(GLB_REQ);
         let ack = enabled.glb_output.read(GLB_ACK);
+        trace::glb_irq(req.into_raw(), ack.into_raw());
         let pending_idle = req.idle_event() ^ ack.idle_event();
 
         if pending_idle {

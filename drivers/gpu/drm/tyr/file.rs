@@ -20,6 +20,7 @@ use crate::{
     gem, heap,
     regs::{gpu_control, join_u64, read_u64_no_tearing},
     sched::{deps, group},
+    trace,
     vm::{self, VmMapFlags},
 };
 
@@ -240,9 +241,12 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let vm_id = vm.handle();
         for i in 0..count {
-            let res = {
-                let op: VmBindOp = reader.read()?;
+            let op: VmBindOp = reader.read()?;
+            trace::mmu_bind_start(vm_id, op.0.va, op.0.size);
+
+            let res: Result = (|| {
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -280,8 +284,14 @@ impl TyrDrmFileData {
                     _ => Err(ENOTSUPP)?,
                 }
 
-                Ok(0)
+                Ok(())
+            })();
+
+            let errno = match &res {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
             };
+            trace::mmu_bind_done(vm_id, op.0.va, op.0.size, errno);
 
             if let Err(e) = res {
                 vmbind.ops.count = i as u32;

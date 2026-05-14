@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     alloc::KVec,
@@ -43,6 +43,7 @@ use crate::{
     gem, heap, pool,
     sched::CsgSlotManager,
     slot::Seat,
+    trace,
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
@@ -58,22 +59,24 @@ pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 
 /// The group's lifecycle state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u32)]
 pub(crate) enum State {
-    Created,
-    Active,
+    Created = 0,
+    Active = 1,
     /// Suspended from a CSG slot; may resume.
-    Suspended,
-    Terminated,
+    Suspended = 2,
+    Terminated = 3,
     /// Unknown state, typically after a firmware error.
-    Unknown,
+    Unknown = 4,
 }
 
 /// Which scheduler list (idle / runnable / none) a group is currently on.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u32)]
 pub(crate) enum GroupListState {
-    None,
-    Idle,
-    Runnable,
+    None = 0,
+    Idle = 1,
+    Runnable = 2,
 }
 
 /// A snapshot of the scheduler-visible state of a [`Group`].
@@ -192,6 +195,13 @@ pub(crate) struct Group {
     #[pin]
     inner: Mutex<GroupInner>,
     pub(crate) tiler_oom: AtomicU32,
+    /// Pool handle assigned by [`Pool::create_group`] before the group
+    /// is published to any scheduler list or tracepoint path. Stable
+    /// after publish and used as the userspace-visible group identifier
+    /// in tracepoints. `0` until the insert completes, matching the
+    /// unallocated value of the underlying allocating XArray (whose
+    /// first allocated index is `1`).
+    handle: AtomicU64,
     /// Tyr DRM device that owns this group.
     ///
     /// # Invariants
@@ -365,8 +375,11 @@ impl Group {
 
         let mut queues = KVec::new();
 
-        for queue_arg in queue_args.iter() {
-            queues.push(Queue::new(ddev, queue_arg, vm.clone())?, GFP_KERNEL)?;
+        for (cs_id, queue_arg) in queue_args.iter().enumerate() {
+            queues.push(
+                Queue::new(ddev, queue_arg, vm.clone(), cs_id as u32)?,
+                GFP_KERNEL,
+            )?;
         }
 
         let queue_count = queues.len();
@@ -385,6 +398,7 @@ impl Group {
                     term_scheduled: false,
                 }),
                 tiler_oom: AtomicU32::new(0),
+                handle: AtomicU64::new(0),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
@@ -431,6 +445,7 @@ impl Group {
         self.with_locked_inner(|inner| {
             inner.state = new_state;
         });
+        trace::group_update(self.handle(), new_state as u32);
     }
 
     pub(crate) fn can_run(&self) -> bool {
@@ -502,6 +517,16 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    /// Pool handle assigned at insert time. Returns `0` if the group
+    /// has not yet been inserted into the [`Pool`].
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle.load(Ordering::Relaxed)
+    }
+
+    fn set_handle(&self, handle: u64) {
+        self.handle.store(handle, Ordering::Relaxed);
     }
 
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
@@ -680,6 +705,7 @@ impl WorkItem<1> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("term_work"));
         // Use the error captured at eviction time (fatal fault, user
         // destroy, or tick timeout); fall back to ECANCELED if none
         // was recorded.
@@ -729,9 +755,20 @@ impl Pool {
 
         let group = Group::create(ddev, file, groupcreate, queue_args)?;
 
+        // Publish the pool handle on the group and its queues before
+        // any code path that can emit a tracepoint. `add_group` below
+        // takes the scheduler lock and fires `trace::group_list`; the
+        // per-queue trace wrappers in `QueueData` read `group_id`
+        // unsynchronised, so the store has to happen first.
+        let handle = self.0.insert(group.clone())?;
+        group.set_handle(handle as u64);
+        for queue in group.queues.iter() {
+            queue.set_group_id(handle as u64);
+        }
+
         ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
 
-        groupcreate.group_handle = self.0.insert(group)? as u32;
+        groupcreate.group_handle = handle as u32;
         Ok(())
     }
 

@@ -391,6 +391,13 @@ impl Job {
         let signals = deps::signal_syncs(file, &self.syncs)?;
         let has_stream = !self.pieces.is_empty();
 
+        crate::trace::job_status(
+            queue.next_seqno(),
+            group.handle(),
+            self.queue_index as u32,
+            kernel::c_str!("prepared"),
+        );
+
         // Reserve a slot for the pending submit fence before
         // handing the job to the framework. The matching push from
         // `TyrQueueOps::submit` runs inside a dma-fence signalling

@@ -21,6 +21,7 @@ mod pool;
 mod regs;
 mod sched;
 mod slot;
+mod trace;
 mod vm;
 mod wait;
 

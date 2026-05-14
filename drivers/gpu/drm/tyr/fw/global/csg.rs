@@ -20,6 +20,7 @@ use crate::fw::{
     },
     MAX_CS,
 };
+use crate::trace;
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
 const CSG_GROUP_CONTROL_OFFSET: usize = 0x1000;
@@ -78,7 +79,6 @@ struct EnabledCsgInterface {
 
 pub(crate) struct CsgInterface {
     state: CsgInterfaceState,
-    #[expect(dead_code)]
     csg_idx: usize,
 }
 
@@ -172,7 +172,7 @@ impl CsgInterface {
         };
 
         for cs_idx in 0..enabled.cs_num {
-            let mut cs = CsInterface::new(cs_idx)?;
+            let mut cs = CsInterface::new()?;
             cs.enable(
                 shared_section,
                 csg_control_offset,
@@ -322,7 +322,8 @@ impl CsgInterface {
     /// per bit is therefore the corresponding `CSG_ACK` bit (e.g.
     /// `csg_output.ack ^ CSG_ENDPOINT_CONFIG`).
     ///
-    /// Returns [`EINVAL`] if the interface is not enabled.
+    /// Returns the new `CSG_REQ` value written, or [`EINVAL`] if the
+    /// interface is not enabled.
     ///
     /// [`update_input_req`]: Self::update_input_req
     pub(crate) fn update_and_toggle_input_req(
@@ -330,7 +331,7 @@ impl CsgInterface {
         value: u32,
         set_mask: u32,
         toggle_mask: u32,
-    ) -> Result {
+    ) -> Result<u32> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),
@@ -342,7 +343,7 @@ impl CsgInterface {
             | (value & set_mask)
             | ((cur_ack ^ toggle_mask) & toggle_mask);
         enabled.csg_input.write(CSG_REQ, CSG_REQ::from_raw(new));
-        Ok(())
+        Ok(new)
     }
 
     /// Programs the CSG-level static input registers before requesting
@@ -429,6 +430,7 @@ impl CsgInterface {
         enabled
             .csg_input
             .write(CSG_DB_REQ, CSG_DB_REQ::from_raw(new));
+        trace::fw_csg_doorbell_req(self.csg_idx as u32, new, 0, mask);
         Ok(())
     }
 

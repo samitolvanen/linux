@@ -52,6 +52,7 @@ use crate::{
     fw::global::CsActivateInputs,
     gem,
     regs::doorbell_block,
+    trace,
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
@@ -295,6 +296,16 @@ impl Default for SuspendState {
 #[pin_data]
 pub(crate) struct QueueData {
     priority: u8,
+    /// Index of this queue within its owning group's `queues` vec.
+    /// Used as the `cs_id` argument to per-queue tracepoints.
+    cs_id: u32,
+    /// Pool handle of the owning group, captured at queue-create time
+    /// for use in tracepoints emitted from contexts that do not have
+    /// a `&Group` handy.
+    ///
+    /// Set once by `set_group_id` before the queue is published to any
+    /// path that can emit a tracepoint; reads after publish are stable.
+    group_id: AtomicU64,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
     doorbell_id: AtomicUsize,
@@ -353,6 +364,18 @@ impl QueueData {
             doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID),
             Ordering::Relaxed,
         );
+    }
+
+    /// Records the owning group's pool handle. Must be called once
+    /// after [`Group::create`] inserts the group into the pool so
+    /// later tracepoints emitted from contexts without `&Group`
+    /// (e.g. [`TyrQueueOps::submit`]) can carry the correct identifier.
+    pub(crate) fn set_group_id(&self, group_id: u64) {
+        self.group_id.store(group_id, Ordering::Relaxed);
+    }
+
+    fn group_id(&self) -> u64 {
+        self.group_id.load(Ordering::Relaxed)
     }
 
     pub(super) fn can_append(&self, instr_count: usize) -> Result {
@@ -414,6 +437,12 @@ impl QueueData {
 
         self.interfaces.write_input(ringbuf_input)?;
         kernel::sync::barrier::smp_wmb();
+        trace::cs_ring_ptrs(
+            self.group_id(),
+            self.cs_id,
+            completion_point,
+            ringbuf_output.extract,
+        );
         Ok(())
     }
 
@@ -494,9 +523,27 @@ impl QueueData {
             drained
         };
 
+        let mut drained_count: u32 = 0;
+        let mut last_completion_point: u64 = 0;
         for pending_fence in drained.into_iter() {
+            last_completion_point = pending_fence.completion_point;
             let _annotation = DmaFenceSignallingAnnotation::new();
+            trace::submit_fence_signal(
+                self.group_id(),
+                self.cs_id,
+                pending_fence.completion_point,
+                0,
+            );
             pending_fence.fence.signal(Ok(()));
+            drained_count += 1;
+        }
+        if drained_count > 0 {
+            trace::sync_upd_drain(
+                self.group_id(),
+                self.cs_id,
+                last_completion_point,
+                drained_count,
+            );
         }
     }
 
@@ -520,6 +567,11 @@ impl QueueData {
         };
 
         let _annotation = DmaFenceSignallingAnnotation::new();
+        let result_errno = match result {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        };
+        trace::submit_fence_signal(self.group_id(), self.cs_id, completion_point, result_errno);
         pending_fence.fence.signal(result);
         true
     }
@@ -579,6 +631,8 @@ impl QueueData {
         wait.ref_val = ref_val;
         wait.sync64 = sync64;
         wait.gt = gt;
+        drop(wait);
+        trace::queue_state(self.group_id(), self.cs_id, gpu_va != 0);
     }
 
     /// Stores a resolved `(bo, bo_offset)` cache on the active
@@ -677,6 +731,8 @@ impl QueueData {
         if state.since.is_none() {
             state.since = Some(Instant::<Monotonic>::now());
         }
+        drop(state);
+        trace::queue_timeout_state(self.group_id(), self.cs_id, true);
     }
 
     /// Marks the queue as resumed onto its CSG slot.
@@ -690,6 +746,8 @@ impl QueueData {
             let elapsed = Instant::<Monotonic>::now() - start;
             state.accumulated += elapsed;
         }
+        drop(state);
+        trace::queue_timeout_state(self.group_id(), self.cs_id, false);
     }
 }
 
@@ -770,6 +828,13 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
+        trace::job_submit(
+            completion_point,
+            self.data.group_id(),
+            self.data.cs_id,
+            job.job.stream.len() as u32,
+        );
+
         // Decide bound-vs-unbound under the group's inner mutex and
         // ring the doorbell while still holding it. The publish side
         // (`CsgSlotOps::activate`) and the clear side
@@ -796,6 +861,9 @@ impl QueueOps for TyrQueueOps {
             if let Err(err) = kick_err {
                 self.data.signal_submit_fence(completion_point, Err(err));
                 return Err(err);
+            }
+            if let Some(doorbell) = self.data.doorbell_id() {
+                trace::queue_doorbell(self.data.group_id(), self.data.cs_id, doorbell as u32);
             }
             // The doorbell ring above puts the queue back in firmware
             // hands without going through a tick first. Record the
@@ -870,9 +938,20 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
 
         let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
         let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
+        let elapsed_ms = ctx.stage_elapsed().as_millis().max(0) as u32;
+        let allowance_ms = allowance.as_millis().max(0) as u32;
+        let faulted = adjusted_elapsed >= self.timeout;
+        trace::deadline_check(
+            self.data.group_id(),
+            self.data.cs_id,
+            elapsed_ms,
+            allowance_ms,
+            faulted,
+        );
 
         if adjusted_elapsed >= self.timeout {
             pr_err!("Tyr queue job {} timed out\n", ctx.counter);
+            trace::group_timedout(self.data.group_id());
             if let Some(completion_point) = ctx.job.completion_point() {
                 self.data
                     .signal_submit_fence(completion_point, Err(ETIMEDOUT));
@@ -906,7 +985,12 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    pub(crate) fn new(tdev: &TyrDrmDevice, queue_args: &QueueCreate, vm: Arc<Vm>) -> Result<Self> {
+    pub(crate) fn new(
+        tdev: &TyrDrmDevice,
+        queue_args: &QueueCreate,
+        vm: Arc<Vm>,
+        cs_id: u32,
+    ) -> Result<Self> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let ringbuf = gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
@@ -915,6 +999,8 @@ impl Queue {
         let data = Arc::pin_init(
             pin_init!(QueueData {
                 priority: queue_args.priority(),
+                cs_id,
+                group_id: AtomicU64::new(0),
                 ringbuf,
                 interfaces,
                 doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),

@@ -118,7 +118,8 @@ impl Pool {
             user_va_range,
         )?;
 
-        let index = self.entries.insert(vm)?;
+        let index = self.entries.insert(vm.clone())?;
+        vm.set_handle(index as u64);
 
         Ok((index, user_va_range))
     }
@@ -590,6 +591,13 @@ pub(crate) struct Vm {
     /// Kernel VA reservations that must live as long as the VM.
     #[pin]
     kernel_reservations: Mutex<KVec<range::LiveRange>>,
+    /// Pool handle assigned by [`Pool::create_vm_range`] before the VM
+    /// is published to any path that can emit a tracepoint. Stable
+    /// after publish and used as the userspace-visible VM identifier
+    /// in tracepoints. `0` until the insert completes, matching the
+    /// unallocated value of the underlying allocating XArray (whose
+    /// first allocated index is `1`).
+    handle: core::sync::atomic::AtomicU64,
 }
 
 impl Vm {
@@ -664,11 +672,23 @@ impl Vm {
                 va_range: total_range,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
+                handle: core::sync::atomic::AtomicU64::new(0),
             }),
             GFP_KERNEL,
         )?;
 
         Ok(vm)
+    }
+
+    /// Pool handle assigned at insert time. Returns `0` if the VM has
+    /// not yet been inserted into the [`Pool`].
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_handle(&self, handle: u64) {
+        self.handle
+            .store(handle, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Creates a new GPU virtual address space.

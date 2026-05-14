@@ -42,7 +42,8 @@ use crate::{
     },
     gpu::UNPRESERVED_CS_REG_COUNT,
     sched::group::GroupListState,
-    slot::SlotManager, //
+    slot::SlotManager,
+    trace, //
 };
 
 use group::Group;
@@ -307,16 +308,32 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         }
 
         let mut db_mask: u32 = 0;
+        let group_id = group.handle();
+        let mut cs_req_writes: [Option<(u32, u32)>; group::MAX_CS_PER_GROUP] =
+            [const { None }; group::MAX_CS_PER_GROUP];
         self.fw.with_csg_mut(slot_idx, |csg| {
             csg.program_activate_inputs(&inputs)?;
             for (cs_idx, cs_input) in cs_inputs.iter().enumerate() {
                 let Some(cs_input) = cs_input else { break };
                 let cs = csg.cs_mut(cs_idx).ok_or(EINVAL)?;
-                cs.program_activate_inputs(cs_input)?;
+                cs_req_writes[cs_idx] = Some(cs.program_activate_inputs(cs_input)?);
                 db_mask |= 1u32 << cs_idx;
             }
             Ok(())
         })?;
+        for (cs_idx, write) in cs_req_writes.iter().enumerate() {
+            let Some((new_req, update_mask)) = write else {
+                break;
+            };
+            trace::fw_cs_req(
+                slot_idx as u32,
+                cs_idx as u32,
+                group_id,
+                *new_req,
+                *update_mask,
+                0,
+            );
+        }
 
         // Publish the per-queue doorbell ids and the bound CSG slot
         // index together under the group's `inner` mutex. The two
@@ -342,6 +359,10 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             }
             inner.csg_id = Some(slot_idx);
         });
+        trace::group_bind(group.handle(), slot_idx as u32);
+        for (cs_idx, _) in group.queues.iter().enumerate() {
+            trace::queue_timeout_state(group.handle(), cs_idx as u32, false);
+        }
 
         ctx.set_state(slot_idx, CsgExecutionState::Start);
         // Stage the per-CS doorbell ring so `apply_csg_updates` flips
@@ -353,7 +374,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
 
     fn evict(
         &mut self,
-        _slot_idx: usize,
+        slot_idx: usize,
         slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
@@ -363,6 +384,10 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // the wait) before this callback runs. This callback only
         // tears the binding down: clear `csg_id` / per-queue
         // `doorbell_id`, release the AS slot.
+        trace::group_unbind(slot_data.group.handle(), slot_idx as u32);
+        for (cs_idx, _) in slot_data.group.queues.iter().enumerate() {
+            trace::queue_timeout_state(slot_data.group.handle(), cs_idx as u32, true);
+        }
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
@@ -504,6 +529,7 @@ impl Scheduler {
         group.with_locked_inner(|inner| {
             inner.list_state = GroupListState::Idle;
         });
+        trace::group_list(group.handle(), GroupListState::Idle as u32);
 
         self.idle_groups[priority].push_back(list_arc);
         Ok(())
@@ -557,13 +583,26 @@ impl Scheduler {
             let set_mask = req_mask & !CsgUpdateContext::TOGGLE_BITS;
             let toggle_mask = req_mask & CsgUpdateContext::TOGGLE_BITS;
             let req_value = context.req_value[csg_id] & !CsgUpdateContext::TOGGLE_BITS;
-            data.fw.with_csg_mut(csg_id, |csg| {
+            let group_id = data
+                .csg_slot_manager
+                .lock()
+                .slot_data(csg_id)
+                .map(|s| s.group.handle())
+                .unwrap_or(0);
+            let new_req = data.fw.with_csg_mut(csg_id, |csg| {
                 csg.update_and_toggle_input_req(
                     req_value.into_raw(),
                     set_mask.into_raw(),
                     toggle_mask.into_raw(),
                 )
             })?;
+            trace::fw_csg_req(
+                csg_id as u32,
+                group_id,
+                new_req,
+                set_mask.into_raw(),
+                toggle_mask.into_raw(),
+            );
         }
 
         // Flip CSG_DB_REQ for every slot with pending per-CS doorbell
@@ -716,6 +755,7 @@ impl Scheduler {
         let old_state = group.state();
 
         let ack = data.fw.with_csg_mut(csg_idx, |csg| csg.read_output_ack())?;
+        trace::fw_csg_status_update(csg_idx as u32, group.handle(), ack.into_raw());
 
         let new_state = match ack.state() {
             Ok(CsgExecutionState::Start) | Ok(CsgExecutionState::Resume) => group::State::Active,
@@ -801,12 +841,19 @@ impl Scheduler {
         let mut sync_waits: [Option<(u64, u64, bool, bool)>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
 
+        let group_handle = group.handle();
         data.fw.with_csg_mut(csg_idx, |csg| {
             for cs_id in 0..queue_count {
                 let Some(cs) = csg.cs_mut(cs_id) else {
                     continue;
                 };
                 let reason = cs.read_status_blocked_reason()?;
+                trace::fw_cs_status_update(
+                    csg_idx as u32,
+                    cs_id as u32,
+                    group_handle,
+                    reason as u32,
+                );
                 blocked_reasons[cs_id] = Some(reason);
                 scoreboards[cs_id] = cs.read_status_scoreboards()?;
 
@@ -871,6 +918,8 @@ impl Scheduler {
 
                 inner.set_queue_idle(cs_id, idle);
                 inner.set_queue_blocked(cs_id, blocked);
+                trace::queue_idle_state(group_handle, cs_id as u32, idle);
+                trace::queue_state(group_handle, cs_id as u32, blocked);
             }
 
             has_sync_wait
@@ -883,8 +932,10 @@ impl Scheduler {
         // wait-list link single-owner so a list walker can iterate
         // without racing concurrent inserts.
         if has_sync_wait {
+            let group_handle = group.handle();
             if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group) {
                 self.waiting_groups[priority].push_back(wait_arc);
+                trace::group_wait(group_handle, true);
             }
         }
 
@@ -896,13 +947,15 @@ impl Scheduler {
         let group_arc: Arc<Group> = list_arc.clone_arc();
         let priority = group_arc.priority as usize;
 
+        let new_state = if is_idle {
+            group::GroupListState::Idle
+        } else {
+            group::GroupListState::Runnable
+        };
         group_arc.with_locked_inner(|inner| {
-            inner.list_state = if is_idle {
-                group::GroupListState::Idle
-            } else {
-                group::GroupListState::Runnable
-            };
+            inner.list_state = new_state;
         });
+        trace::group_list(group_arc.handle(), new_state as u32);
 
         if is_idle {
             self.idle_groups[priority].push_back(list_arc);
@@ -935,6 +988,10 @@ impl Scheduler {
                         if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
                             self.runnable_groups[priority].push_back(list_arc);
                             inner.list_state = group::GroupListState::Runnable;
+                            trace::group_list(
+                                group.handle(),
+                                group::GroupListState::Runnable as u32,
+                            );
                         }
                     }
                 }
@@ -944,6 +1001,7 @@ impl Scheduler {
                     {
                         self.runnable_groups[priority].push_back(list_arc);
                         inner.list_state = group::GroupListState::Runnable;
+                        trace::group_list(group.handle(), group::GroupListState::Runnable as u32);
                     }
                 }
             }
@@ -1061,6 +1119,7 @@ impl Scheduler {
 
                     if unblocked {
                         let list_arc = peek.remove();
+                        trace::group_wait(group.handle(), false);
                         if move_to_runnable {
                             if prio == Priority::RealTime as usize {
                                 immediate_tick = true;
@@ -1123,6 +1182,7 @@ impl Scheduler {
                 }
                 for cs_id in 0..queue_count {
                     inner.set_queue_fatal(cs_id);
+                    trace::queue_fatal_state(group.handle(), cs_id as u32, true);
                 }
             });
         }

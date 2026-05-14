@@ -6,6 +6,7 @@ use core::sync::atomic::{
 };
 
 use kernel::{
+    c_str,
     clk::{
         Clk,
         OptionalClk, //
@@ -84,6 +85,7 @@ use crate::{
         MAX_CSGS, //
     },
     slot::SlotManager,
+    trace,
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -367,6 +369,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("fw_events_work"));
         let tdev = &*this;
 
         let events = tdev.fw_events_take();
@@ -403,6 +406,7 @@ impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("tick_work"));
         if let Err(err) = crate::sched::tick::tick_step(&this) {
             pr_err!("tick_step failed: {:?}\n", err);
         }
@@ -418,6 +422,7 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     /// because fence signalling cannot nest inside a wide driver
     /// lock.
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("sync_upd_work"));
         let tdev = &*this;
         Scheduler::drain_resident_queue_completions(tdev);
         let immediate_tick = tdev
@@ -434,6 +439,7 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("periodic_tick_work"));
         Self::schedule_tick(&this);
     }
 }

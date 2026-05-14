@@ -50,6 +50,7 @@ use crate::{
         MAX_CSGS,
         MAX_CSG_PRIO, //
     },
+    trace,
 };
 
 const TEARDOWN_ARRAY_SIZE: usize = MAX_CSGS;
@@ -385,6 +386,7 @@ impl SchedulingDecision {
             list_arc.with_locked_inner(|inner| {
                 inner.list_state = GroupListState::None;
             });
+            trace::group_list(list_arc.handle(), GroupListState::None as u32);
             groups[count] = Some(PendingBind {
                 list_arc,
                 prior_state,
@@ -580,6 +582,12 @@ impl<'a> Tick<'a> {
                     continue;
                 };
 
+                trace::sched_evict(
+                    i as u32,
+                    slot_data.group.handle(),
+                    slot_data.group.priority as u8,
+                );
+
                 context.set_state(
                     i,
                     if slot_data.group.can_run() {
@@ -666,7 +674,12 @@ impl<'a> Tick<'a> {
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
                 match selection {
-                    SelectedGroup::Kept(slot_idx, _sw_prio, cur_fw_prio) => {
+                    SelectedGroup::Kept(slot_idx, sw_prio, cur_fw_prio) => {
+                        let group_id = csg_slot_manager
+                            .slot_data(slot_idx)
+                            .map(|s| s.group.handle())
+                            .unwrap_or(0);
+                        trace::sched_keep(slot_idx as u32, group_id, sw_prio as u8, fw_prio);
                         if cur_fw_prio == fw_prio {
                             continue;
                         }
@@ -685,7 +698,7 @@ impl<'a> Tick<'a> {
                             );
                         }
                     }
-                    SelectedGroup::Pending(idx, _sw_prio) => {
+                    SelectedGroup::Pending(idx, sw_prio) => {
                         let Some(pending) = decision.pending_groups[idx].take() else {
                             continue;
                         };
@@ -711,6 +724,8 @@ impl<'a> Tick<'a> {
                             continue;
                         }
 
+                        let slot_idx = group.with_locked_inner(|inner| inner.csg_id).unwrap_or(0);
+                        trace::sched_bind(slot_idx as u32, group.handle(), sw_prio as u8, fw_prio);
                         drop(pending.list_arc);
                     }
                 }
@@ -735,6 +750,23 @@ impl<'a> Tick<'a> {
         self.sched.last_tick = Instant::<Monotonic>::now();
         self.sched.used_csg_slot_count = decision.num_selected as u32;
         self.sched.might_have_idle_groups = decision.idle_group_count > 0;
+
+        let runnable_remaining: usize = self
+            .sched
+            .runnable_groups
+            .iter()
+            .map(|l| l.iter().count())
+            .sum();
+        trace::tick_decision_summary(
+            self.sched
+                .used_csg_slot_count
+                .saturating_sub(decision.keep_mask.count_ones()),
+            decision.num_pending as u32,
+            decision.keep_mask.count_ones(),
+            runnable_remaining as u32,
+        );
+        let total_slots = data.csg_slot_manager.lock().slot_count() as u32;
+        trace::csg_slots_status(self.sched.used_csg_slot_count, total_slots);
 
         // We only need to time-slice (reschedule periodically) if
         // there is actual contention for the hardware.

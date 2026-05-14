@@ -165,8 +165,6 @@ struct EnabledCsInterface {
 
 pub(crate) struct CsInterface {
     state: CsInterfaceState,
-    #[expect(dead_code)]
-    cs_idx: usize,
 }
 
 pub(crate) struct HeapOutputState {
@@ -217,10 +215,9 @@ pub(crate) struct CsStatusWait {
 }
 
 impl CsInterface {
-    pub(super) fn new(cs_idx: usize) -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         Ok(Self {
             state: CsInterfaceState::Disabled,
-            cs_idx,
         })
     }
 
@@ -330,10 +327,11 @@ impl CsInterface {
     /// the CSG_IRQ idle event on a sync-wait stall or a drained
     /// ringbuf; the IRQ-driven scheduler relies on both.
     ///
-    /// Returns [`EINVAL`] if the interface is not enabled, or
-    /// [`EOVERFLOW`] if `priority` exceeds `CS_CONFIG.priority`'s
-    /// 4-bit range or `doorbell_id` exceeds the 8-bit field.
-    pub(crate) fn program_activate_inputs(&self, inputs: &CsActivateInputs) -> Result {
+    /// Returns the new `CS_REQ` value and the mask of bits it updates,
+    /// or [`EINVAL`] if the interface is not enabled, or [`EOVERFLOW`]
+    /// if `priority` exceeds `CS_CONFIG.priority`'s 4-bit range or
+    /// `doorbell_id` exceeds the 8-bit field.
+    pub(crate) fn program_activate_inputs(&self, inputs: &CsActivateInputs) -> Result<(u32, u32)> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
             CsInterfaceState::Disabled => return Err(EINVAL),
@@ -371,11 +369,9 @@ impl CsInterface {
             .with_idle_empty(true)
             .into_raw();
         let cur = enabled.cs_input.read(CS_REQ).into_raw();
-        enabled.cs_input.write(
-            CS_REQ,
-            CS_REQ::from_raw((cur & !ACTIVATE_MASK) | activate_val),
-        );
-        Ok(())
+        let new_req = (cur & !ACTIVATE_MASK) | activate_val;
+        enabled.cs_input.write(CS_REQ, CS_REQ::from_raw(new_req));
+        Ok((new_req, ACTIVATE_MASK))
     }
 
     #[allow(dead_code)]
