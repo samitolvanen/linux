@@ -59,3 +59,14 @@ pub fn smp_rmb() {
         barrier();
     }
 }
+
+/// A write-write memory barrier that also orders device-visible stores.
+///
+/// Like [`smp_wmb`], but additionally orders writes observed by external
+/// agents such as devices, regardless of `CONFIG_SMP`.
+#[inline(always)]
+pub fn wmb() {
+    // SAFETY: `wmb()` is a compiler and hardware barrier with no memory
+    // operands, so it has no validity requirements on the caller.
+    unsafe { bindings::wmb() };
+}
