@@ -590,6 +590,9 @@ impl platform::Driver for TyrPlatformDriverData {
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
 
+        let gpu_irq = gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
+        devres::register(pdev.as_ref(), gpu_irq, GFP_KERNEL)?;
+
         let mmu_irq = mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
         devres::register(pdev.as_ref(), mmu_irq, GFP_KERNEL)?;
 
