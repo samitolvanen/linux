@@ -35,6 +35,10 @@ use kernel::{
     },
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         LockedBy, //
@@ -83,6 +87,11 @@ pub(crate) struct VmAsData {
     /// Virtual address bits for this address space.
     va_bits: u8,
 
+    /// Set by the MMU IRQ handler when this AS slot took a page fault
+    /// the in-kernel handler could not service. The scheduler reads it
+    /// during the next tick to terminate any groups bound to this VM.
+    pub(crate) unhandled_fault: Atomic<bool>,
+
     /// The page table which maps GPU virtual addresses to physical addresses for this VM.
     #[pin]
     pub(crate) page_table: DevresIoPageTable<ARM64LPAES1>,
@@ -109,6 +118,7 @@ impl VmAsData {
         try_pin_init!(Self {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             va_bits: va_bits as u8,
+            unhandled_fault: Atomic::new(false),
             page_table <- page_table_init,
         }? Error)
     }
@@ -513,6 +523,7 @@ impl AsSlotManager {
     /// Activates a VM by assigning it to a hardware slot.
     pub(super) fn activate_vm(&mut self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
         self.activate(vm_as_data.into())?;
+        vm_as_data.unhandled_fault.store(false, Relaxed);
         Ok(())
     }
 
