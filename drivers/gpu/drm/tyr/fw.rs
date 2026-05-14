@@ -41,7 +41,9 @@ use crate::{
         global::GlobalInterface,
         parser::{
             FwParser,
-            ParsedSection, //
+            ParsedSection,
+            SectionFlag,
+            SectionFlags, //
         },
     },
     gem,
@@ -239,8 +241,10 @@ impl Firmware {
             })
     }
 
-    fn init_section_mem(mem: &mut KernelBo, data: &KVec<u8>) -> Result {
-        if data.is_empty() {
+    fn init_section_mem(mem: &mut KernelBo, data: &KVec<u8>, flags: SectionFlags) -> Result {
+        let zero_tail = flags.contains(SectionFlag::Zero);
+
+        if data.is_empty() && !zero_tail {
             return Ok(());
         }
 
@@ -254,6 +258,12 @@ impl Firmware {
 
         for (i, &byte) in data.iter().enumerate() {
             vmap.try_write8(byte, i)?;
+        }
+
+        if zero_tail {
+            for i in data.len()..size {
+                vmap.try_write8(0, i)?;
+            }
         }
 
         Ok(())
@@ -312,6 +322,7 @@ impl Firmware {
                 data,
                 va,
                 vm_map_flags,
+                section_flags,
             } = parsed;
             let size = (va.end - va.start) as usize;
             let va = u64::from(va.start);
@@ -333,7 +344,7 @@ impl Firmware {
                 vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
             }
 
-            Self::init_section_mem(&mut mem, &data)?;
+            Self::init_section_mem(&mut mem, &data, section_flags)?;
 
             sections.push(Section { data, mem }, GFP_KERNEL)?;
         }
