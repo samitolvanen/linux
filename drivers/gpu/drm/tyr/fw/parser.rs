@@ -31,10 +31,10 @@ use crate::{
 
 impl_flags!(
     #[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]
-    struct SectionFlags(u32);
+    pub(super) struct SectionFlags(u32);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SectionFlag {
+    pub(super) enum SectionFlag {
         Read = 1 << 0,
         Write = 1 << 1,
         Exec = 1 << 2,
@@ -87,6 +87,11 @@ pub(super) struct ParsedSection {
     pub(super) va: Range<u32>,
     /// Memory protection and caching flags for the mapping.
     pub(super) vm_map_flags: VmMapFlags,
+    /// Raw section flags decoded from the firmware section header.
+    ///
+    /// Carries loader directives such as [`SectionFlag::Zero`] that the
+    /// section header in `vm_map_flags` cannot represent.
+    pub(super) section_flags: SectionFlags,
 }
 
 /// A bare-bones `std::io::Cursor<[u8]>` clone to keep track of the current position in the firmware binary.
@@ -401,6 +406,7 @@ impl<'a> FwParser<'a> {
             data,
             va: section_hdr.va,
             vm_map_flags,
+            section_flags: section_hdr.section_flags,
         }))
     }
 }
