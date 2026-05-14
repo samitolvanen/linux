@@ -52,7 +52,8 @@ use crate::{
         global::GlobalInterface,
         parser::{
             FwParser,
-            ParsedSection, //
+            ParsedSection,
+            SectionFlags, //
         }, //
     },
     gem,
@@ -261,8 +262,15 @@ impl<'drm> Firmware<'drm> {
             })
     }
 
-    fn init_section_mem(dev: &Device, mem: &mut KernelBo, data: &KVec<u8>) -> Result {
-        if data.is_empty() {
+    fn init_section_mem(
+        dev: &Device,
+        mem: &mut KernelBo,
+        data: &KVec<u8>,
+        flags: SectionFlags,
+    ) -> Result {
+        let zero_tail = flags.zero();
+
+        if data.is_empty() && !zero_tail {
             return Ok(());
         }
 
@@ -279,6 +287,12 @@ impl<'drm> Firmware<'drm> {
         // `size` bytes, and the check above bounds `data.len()` by `size`.
         // `data` is a separate allocation.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+
+        if zero_tail {
+            // SAFETY: `dst` is valid for `size` bytes and the check above bounds
+            // `data.len()` by `size`, so the tail ends at `size`.
+            unsafe { core::ptr::write_bytes(dst.add(data.len()), 0, size - data.len()) };
+        }
 
         Ok(())
     }
@@ -331,6 +345,7 @@ impl<'drm> Firmware<'drm> {
                     data,
                     va,
                     vm_map_flags,
+                    section_flags,
                 } = parsed;
                 let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
 
@@ -353,7 +368,7 @@ impl<'drm> Firmware<'drm> {
                     vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
                 }
 
-                Self::init_section_mem(dev, &mut mem, &data)?;
+                Self::init_section_mem(dev, &mut mem, &data, section_flags)?;
 
                 sections.push(Section { data, mem }, GFP_KERNEL)?;
             }
