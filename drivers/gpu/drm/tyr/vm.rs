@@ -11,28 +11,18 @@ mod exec;
 pub(crate) mod range;
 
 use core::{
-    ops::{
-        Deref,
-        Range,
-    },
-    sync::atomic::{
-        AtomicBool,
-        Ordering,
-    },
+    ops::{Deref, Range},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use kernel::{
     c_str,
-    dma_buf::dma_fence::{
-        DmaFenceWorkqueue,
-        DriverDmaFence,
-        DriverDmaFenceOps,
-        Published,
-        PublicDmaFence,
-    },
     device::{
         Bound,
         Device, //
+    },
+    dma_buf::dma_fence::{
+        DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, PublicDmaFence, Published,
     },
     drm::{
         gpuvm::{
@@ -50,12 +40,7 @@ use kernel::{
             UniqueRefGpuVm, //
         },
         job_queue::{
-            JobQueue,
-            JobQueueLockClasses,
-            JobRef,
-            PipelineBuilder,
-            PreparedJob,
-            QueueOps,
+            JobQueue, JobQueueLockClasses, JobRef, PipelineBuilder, PreparedJob, QueueOps,
             SubmitResult,
         },
         DeviceContext, //
@@ -103,14 +88,10 @@ use crate::{
 static VM_BIND_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static VM_BIND_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static VM_BIND_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-static VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey =
-    unsafe { LockClassKey::new_static() };
-static VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey =
-    unsafe { LockClassKey::new_static() };
-static VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey =
-    unsafe { LockClassKey::new_static() };
-static VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey =
-    unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+static VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 pub(crate) struct Pool {
     entries: ObjectPool<Vm>,
@@ -314,17 +295,18 @@ impl VmBindJob {
         va: u64,
         flags: VmMapFlags,
     ) -> Result {
-        self.ops.push(
-            VmBindJobOp::Map {
-                bo,
-                bo_offset,
-                size,
-                va,
-                flags,
-            },
-            GFP_KERNEL,
-        )
-        .map_err(Error::from)
+        self.ops
+            .push(
+                VmBindJobOp::Map {
+                    bo,
+                    bo_offset,
+                    size,
+                    va,
+                    flags,
+                },
+                GFP_KERNEL,
+            )
+            .map_err(Error::from)
     }
 
     pub(crate) fn push_unmap(&mut self, va: u64, size: u64) -> Result {
@@ -369,7 +351,9 @@ impl QueueOps for VmBindQueueOps {
                         size,
                         va,
                         flags,
-                    } => self.exec.map_bo_range_inner(bo, *bo_offset, *size, *va, *flags)?,
+                    } => self
+                        .exec
+                        .map_bo_range_inner(bo, *bo_offset, *size, *va, *flags)?,
                     VmBindJobOp::Unmap { va, size } => self.exec.unmap_range_inner(*va, *size)?,
                 }
             }
@@ -558,7 +542,9 @@ impl Drop for PtUpdateContext<'_> {
 pub(crate) struct GpuVmData {}
 
 fn max_va_range(gpu_info: &GpuInfo) -> u64 {
-    1u64 << MMU_FEATURES::from_raw(gpu_info.mmu_features).va_bits().get()
+    1u64 << MMU_FEATURES::from_raw(gpu_info.mmu_features)
+        .va_bits()
+        .get()
 }
 
 pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64 {
@@ -980,7 +966,6 @@ impl VmExec {
         self.flush_deferred_cleanup();
         Ok(())
     }
-
 }
 
 impl DriverGpuVm for GpuVmData {

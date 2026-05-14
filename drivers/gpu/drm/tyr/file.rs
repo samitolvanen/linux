@@ -6,13 +6,8 @@ use kernel::{
     drm::gem::BaseObject,
     io::Io,
     prelude::*,
-    sync::{
-        aref::ARef,
-    },
-    transmute::{
-        AsBytes,
-        FromBytes,
-    },
+    sync::aref::ARef,
+    transmute::{AsBytes, FromBytes},
     uaccess::UserSlice,
     uapi,
 };
@@ -22,21 +17,10 @@ use crate::{
         TyrDrmDevice,
         TyrDrmDriver, //
     },
-    gem,
-    heap,
-    regs::{
-        gpu_control,
-        join_u64,
-        read_u64_no_tearing,
-    },
-    sched::{
-        deps,
-        group,
-    },
-    vm::{
-        self,
-        VmMapFlags,
-    },
+    gem, heap,
+    regs::{gpu_control, join_u64, read_u64_no_tearing},
+    sched::{deps, group},
+    vm::{self, VmMapFlags},
 };
 
 fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
@@ -45,7 +29,8 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
     let copy_size = usr_size.min(kern_size);
 
     // SAFETY: `obj` implements AsBytes, so viewing it as a byte slice is safe.
-    let bytes = unsafe { core::slice::from_raw_parts(core::ptr::from_ref(obj).cast::<u8>(), kern_size) };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(core::ptr::from_ref(obj).cast::<u8>(), kern_size) };
 
     let mut writer = UserSlice::new(UserPtr::from_addr(usr_ptr as usize), usr_size).writer();
     writer.write_slice(&bytes[..copy_size])?;
@@ -140,7 +125,8 @@ impl TyrDrmFileData {
                     Ok(0)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GROUP_PRIORITIES_INFO => {
-                    devquery.size = core::mem::size_of::<uapi::drm_panthor_group_priorities_info>() as u32;
+                    devquery.size =
+                        core::mem::size_of::<uapi::drm_panthor_group_priorities_info>() as u32;
                     Ok(0)
                 }
                 _ => Err(EINVAL),
@@ -203,7 +189,9 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
-        file.inner().vm_pool().create_vm(&ARef::from(ddev), vmcreate)?;
+        file.inner()
+            .vm_pool()
+            .create_vm(&ARef::from(ddev), vmcreate)?;
         Ok(0)
     }
 
@@ -252,12 +240,12 @@ impl TyrDrmFileData {
         for i in 0..count {
             let res = {
                 let op: VmBindOp = reader.read()?;
-                let type_mask =
-                    uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
-                let map_flags = (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
-                    | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
-                    | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
-                    as u32;
+                let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+                let map_flags =
+                    (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
+                        | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
+                        | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
+                        as u32;
 
                 if op.0.syncs.count != 0 || op.0.syncs.array != 0 {
                     Err(EINVAL)?;
@@ -414,7 +402,9 @@ impl TyrDrmFileData {
         groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner().group_pool().create_group(ddev, groupcreate, file)?;
+        file.inner()
+            .group_pool()
+            .create_group(ddev, groupcreate, file)?;
 
         Ok(0)
     }
@@ -424,7 +414,9 @@ impl TyrDrmFileData {
         groupdestroy: &mut uapi::drm_panthor_group_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner().group_pool().destroy_group(ddev, groupdestroy)?;
+        file.inner()
+            .group_pool()
+            .destroy_group(ddev, groupdestroy)?;
 
         Ok(0)
     }
@@ -463,9 +455,7 @@ impl TyrDrmFileData {
             .heap_pools()
             .create_context(ddev, vm_id, vm.clone(), heapcreate)?;
 
-        file.inner()
-            .group_pool()
-            .set_heap_pool_for_vm(&vm, pool)?;
+        file.inner().group_pool().set_heap_pool_for_vm(&vm, pool)?;
 
         Ok(0)
     }
@@ -598,7 +588,3 @@ impl VmBindOp {
         Ok((job, syncs))
     }
 }
-
-
-
-

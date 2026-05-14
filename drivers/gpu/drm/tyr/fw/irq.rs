@@ -5,10 +5,7 @@
 //! This module owns the Job IRQ registration plus the wait state used for
 //! firmware events and initial GLB readiness.
 
-use core::sync::atomic::{
-    AtomicBool,
-    Ordering,
-};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel::{
     c_str,
@@ -19,8 +16,7 @@ use kernel::{
     devres::Devres,
     io::Io,
     irq::ThreadedRegistration,
-    new_mutex,
-    platform,
+    new_mutex, platform,
     prelude::*,
     sync::{
         aref::ARef,
@@ -34,21 +30,15 @@ use crate::{
         IoMem,
         TyrDrmDevice, //
     },
-    irq::{
-        TyrIrq,
-        TyrIrqTrait,
-    },
+    irq::{TyrIrq, TyrIrqTrait},
+    new_wait,
     regs::job_control::{
         JOB_IRQ_CLEAR,
         JOB_IRQ_MASK,
         JOB_IRQ_RAWSTAT,
         JOB_IRQ_STATUS, //
     },
-    new_wait,
-    wait::{
-        Wait,
-        WaitResult,
-    },
+    wait::{Wait, WaitResult},
 };
 
 const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;

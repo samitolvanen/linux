@@ -9,17 +9,8 @@
 use core::marker::PhantomPinned;
 
 use kernel::{
-    device::{
-        Bound,
-        Device,
-    },
-    irq::{
-        Flags,
-        IrqReturn,
-        ThreadedHandler,
-        ThreadedIrqReturn,
-        ThreadedRegistration,
-    },
+    device::{Bound, Device},
+    irq::{Flags, IrqReturn, ThreadedHandler, ThreadedIrqReturn, ThreadedRegistration},
     platform,
     prelude::*,
     sync::aref::ARef,

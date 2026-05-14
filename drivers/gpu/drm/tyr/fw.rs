@@ -28,11 +28,7 @@ use kernel::{
     prelude::*,
     sizes::SZ_8K,
     str::CString,
-    sync::{
-        aref::ARef,
-        Arc,
-        ArcBorrow,
-    },
+    sync::{aref::ARef, Arc, ArcBorrow},
     time, //
 };
 
@@ -62,11 +58,7 @@ use crate::{
         MCU_CONTROL,
         MCU_STATUS, //
     },
-    vm::{
-        Vm,
-        VmFlag,
-        VmMapFlags,
-    }, //
+    vm::{Vm, VmFlag, VmMapFlags}, //
 };
 
 pub(crate) mod global;
@@ -224,13 +216,8 @@ impl Firmware {
 
         let irq_state = irq::JobIrqState::new()?;
         let shared_section = Self::find_shared_section(&sections)?;
-        let global_iface = GlobalInterface::new(
-            pdev,
-            iomem.clone(),
-            shared_section,
-            *gpu_info,
-            &irq_state,
-        )?;
+        let global_iface =
+            GlobalInterface::new(pdev, iomem.clone(), shared_section, *gpu_info, &irq_state)?;
 
         let firmware = Arc::pin_init(
             try_pin_init!(Firmware {
@@ -326,9 +313,7 @@ impl Firmware {
 pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
 
 impl<const N: usize> ModInfoBuilder<N> {
-    const FILES: &'static [&'static str] = &[
-        "arm/mali/arch10.8/mali_csffw.bin",
-    ];
+    const FILES: &'static [&'static str] = &["arm/mali/arch10.8/mali_csffw.bin"];
 
     pub(crate) const fn create(
         module_name: &'static kernel::str::CStr,

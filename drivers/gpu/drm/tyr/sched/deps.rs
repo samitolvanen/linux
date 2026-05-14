@@ -7,17 +7,14 @@
 //! UAPI parsing layer.
 
 use kernel::{
-	alloc::KVec,
-    dma_buf::dma_fence::{
-        FenceChain,
-        PublicDmaFence,
-    },
-	drm::syncobj::SyncObj,
-	prelude::*,
+    alloc::KVec,
+    dma_buf::dma_fence::{FenceChain, PublicDmaFence},
+    drm::syncobj::SyncObj,
+    prelude::*,
     sync::aref::ARef,
-	transmute::FromBytes,
-	uaccess::UserSlice,
-	uapi,
+    transmute::FromBytes,
+    uaccess::UserSlice,
+    uapi,
 };
 
 use crate::{driver::TyrDrmDriver, file::TyrDrmFile};
@@ -188,23 +185,25 @@ pub(crate) fn signal_syncs(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result<KVec
 }
 
 pub(crate) fn append_syncops(
-	syncops: &mut KVec<SyncOp>,
-	array: u64,
-	count: u32,
-	stride: u32,
+    syncops: &mut KVec<SyncOp>,
+    array: u64,
+    count: u32,
+    stride: u32,
 ) -> Result {
-	if stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
-		return Err(ENOTSUPP);
-	}
+    if stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
+        return Err(ENOTSUPP);
+    }
 
-	let mut reader =
-		UserSlice::new(UserPtr::from_addr(array as usize), stride as usize * count as usize)
-			.reader();
+    let mut reader = UserSlice::new(
+        UserPtr::from_addr(array as usize),
+        stride as usize * count as usize,
+    )
+    .reader();
 
-	for _ in 0..count {
-		let sync: RawSyncOp = reader.read()?;
-		syncops.push(SyncOp::try_from(&sync.0)?, GFP_KERNEL)?;
-	}
+    for _ in 0..count {
+        let sync: RawSyncOp = reader.read()?;
+        syncops.push(SyncOp::try_from(&sync.0)?, GFP_KERNEL)?;
+    }
 
-	Ok(())
+    Ok(())
 }
