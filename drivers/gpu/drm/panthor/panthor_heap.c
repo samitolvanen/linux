@@ -12,6 +12,7 @@
 #include "panthor_heap.h"
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
+#include "panthor_trace.h"
 
 /*
  * The GPU heap context is an opaque structure used by the GPU to track the
@@ -179,6 +180,9 @@ static int panthor_alloc_heap_chunk(struct panthor_heap_pool *pool,
 			    (heap->chunk_size >> 12);
 	}
 
+	trace_panthor_heap_chunk_init(panthor_kernel_bo_gpuva(chunk->bo),
+				      heap->chunk_size, hdr->next);
+
 	panthor_kernel_bo_vunmap(chunk->bo);
 
 	mutex_lock(&heap->lock);
@@ -337,6 +341,8 @@ int panthor_heap_create(struct panthor_heap_pool *pool,
 			memset(gpu_ctx, 0, panthor_heap_ctx_stride(pool->ptdev));
 			*heap_ctx_gpu_va = panthor_kernel_bo_gpuva(pool->gpu_contexts) +
 					   panthor_get_heap_ctx_offset(pool, id);
+			trace_panthor_heap_ctx_init(id, *heap_ctx_gpu_va,
+						    panthor_heap_ctx_stride(pool->ptdev));
 		}
 	}
 	up_write(&pool->lock);
@@ -629,4 +635,91 @@ size_t panthor_heap_pool_size(struct panthor_heap_pool *pool)
 		return 0;
 
 	return atomic_read(&pool->size);
+}
+
+/**
+ * panthor_heap_pool_dump_for_trace() - Dump every heap-context entry and
+ * chunk-header in this pool to the panthor_heap_context_dump /
+ * panthor_heap_chunk_dump tracepoints (and a matching pr_info fallback).
+ * @pool: Pool to dump. May be NULL.
+ * @group: Identifier to emit in the @group tracepoint field. The periodic
+ * trigger passes the owning VM's trace id; a fault-triggered caller would
+ * pass the faulting group id.
+ * @cs: Identifier to emit in the @cs tracepoint field. The periodic
+ * trigger passes 0; a fault-triggered caller would pass the faulting CS id.
+ *
+ * Best-effort, silently skipping any heap or chunk it can't sample without
+ * blocking (lock contention) or that it can't vmap. Downstream-only debug
+ * aid.
+ */
+void panthor_heap_pool_dump_for_trace(struct panthor_heap_pool *pool,
+				      u64 group, u32 cs)
+{
+	struct panthor_heap *heap;
+	unsigned long i;
+
+	if (!pool)
+		return;
+
+	if (!down_read_trylock(&pool->lock))
+		return;
+
+	if (IS_ERR_OR_NULL(pool->gpu_contexts) || !pool->gpu_contexts->kmap)
+		goto out_unlock;
+
+	xa_for_each(&pool->xa, i, heap) {
+		struct panthor_heap_chunk *chunk;
+		u8 content[HEAP_CONTEXT_SIZE];
+		u32 chunk_index = 0;
+		u32 chunk_count;
+		u64 heap_ctx_va;
+
+		memcpy(content, panthor_get_heap_ctx(pool, i), sizeof(content));
+		heap_ctx_va = panthor_kernel_bo_gpuva(pool->gpu_contexts) +
+			      panthor_get_heap_ctx_offset(pool, i);
+
+		if (!mutex_trylock(&heap->lock))
+			continue;
+
+		chunk_count = heap->chunk_count;
+		trace_panthor_heap_context_dump(group, cs, (u32)i, heap_ctx_va,
+						chunk_count, content);
+		pr_info("panthor DBG heap_context_dump: group=%llu cs=%u heap=%u va=0x%llx chunks=%u content=%*ph\n",
+			group, cs, (u32)i, heap_ctx_va, chunk_count,
+			(int)sizeof(content), content);
+
+		list_for_each_entry(chunk, &heap->chunks, node) {
+			struct iosys_map map;
+			u8 header[sizeof(struct panthor_heap_chunk_header)];
+			u64 chunk_va;
+
+			if (!chunk->bo ||
+			    panthor_kernel_bo_size(chunk->bo) < sizeof(header)) {
+				chunk_index++;
+				continue;
+			}
+
+			if (drm_gem_vmap(chunk->bo->obj, &map)) {
+				chunk_index++;
+				continue;
+			}
+
+			memcpy(header, map.vaddr, sizeof(header));
+			drm_gem_vunmap(chunk->bo->obj, &map);
+
+			chunk_va = panthor_kernel_bo_gpuva(chunk->bo);
+			trace_panthor_heap_chunk_dump(group, cs, (u32)i,
+						      chunk_index, chunk_va,
+						      header);
+			pr_info("panthor DBG heap_chunk_dump: group=%llu cs=%u heap=%u chunk=%u va=0x%llx header=%*ph\n",
+				group, cs, (u32)i, chunk_index, chunk_va,
+				(int)sizeof(header), header);
+			chunk_index++;
+		}
+
+		mutex_unlock(&heap->lock);
+	}
+
+out_unlock:
+	up_read(&pool->lock);
 }
