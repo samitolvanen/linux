@@ -332,13 +332,14 @@ impl SchedulingDecision {
         // and `take_unbound` does not access the slot manager, so
         // holding it for the full pass is safe.
         let csg_slot_manager = tdev.csg_slot_manager.lock();
+        let slot_count = csg_slot_manager.slot_count();
         for rule in rules {
             match rule.action {
                 Action::Keep => {
-                    decision.keep_bound(&csg_slot_manager, rule.priority, rule.is_idle);
+                    decision.keep_bound(&csg_slot_manager, slot_count, rule.priority, rule.is_idle);
                 }
                 Action::Take => {
-                    decision.take_unbound(sched, rule.priority, rule.is_idle)?;
+                    decision.take_unbound(sched, slot_count, rule.priority, rule.is_idle)?;
                 }
             }
         }
@@ -393,9 +394,13 @@ impl SchedulingDecision {
 
     /// Selects currently bound groups matching the priority and idle
     /// state to be retained.
-    fn keep_bound(&mut self, csg_slot_manager: &CsgSlotManager, priority: Priority, is_idle: bool) {
-        let slot_count = MAX_CSGS;
-
+    fn keep_bound(
+        &mut self,
+        csg_slot_manager: &CsgSlotManager,
+        slot_count: usize,
+        priority: Priority,
+        is_idle: bool,
+    ) {
         for i in 0..slot_count {
             if self.num_selected >= slot_count {
                 break;
@@ -440,10 +445,10 @@ impl SchedulingDecision {
     fn take_unbound(
         &mut self,
         sched: &mut Scheduler,
+        slot_count: usize,
         priority: Priority,
         is_idle: bool,
     ) -> Result<()> {
-        let slot_count = MAX_CSGS;
         if self.num_selected >= slot_count {
             return Ok(());
         }
