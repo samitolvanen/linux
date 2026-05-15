@@ -634,6 +634,10 @@ impl Group {
         queue_submits: KVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
+        if !self.can_run() {
+            return Err(EINVAL);
+        }
+
         let jobs = Job::from_queue_submits(queue_submits)?;
         let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
 
