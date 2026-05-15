@@ -38,4 +38,7 @@ int panthor_heap_return_chunk(struct panthor_heap_pool *pool,
 			      u64 heap_gpu_va,
 			      u64 chunk_gpu_va);
 
+void panthor_heap_pool_dump_for_trace(struct panthor_heap_pool *pool,
+				      u64 group, u32 cs);
+
 #endif
