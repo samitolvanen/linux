@@ -120,7 +120,7 @@ impl DriverDmaFenceOps for QueueFenceData {
 
 struct PendingSubmitFence {
     completion_point: u64,
-    fence: DriverDmaFence<QueueFenceData, Published>,
+    fence: Option<DriverDmaFence<QueueFenceData, Published>>,
 }
 
 /// State protected by the pending-submit-fences mutex.
@@ -137,8 +137,18 @@ struct PendingSubmitFence {
 /// vec would observe `capacity - len == 1` already, do nothing, and
 /// the matching second push would fail `push_within_capacity` from
 /// inside the dma-fence signalling section that wraps the submit path.
+///
+/// `head` is the cursor into `vec` past which entries are live: the
+/// prefix `vec[..head]` is drained but not yet truncated and every
+/// such entry has `fence == None`. The suffix `vec[head..]` is the
+/// live ordered list; an entry inside it may still have `fence ==
+/// None` if an error path already took the fence out, which is
+/// treated as a hole and skipped on drain.
+/// [`Queue::maybe_truncate_pending`] compacts the prefix away once
+/// `head` exceeds `max(len / 2, 16)`.
 struct PendingFences {
     vec: KVec<PendingSubmitFence>,
+    head: usize,
     outstanding: usize,
 }
 
@@ -164,7 +174,7 @@ impl PendingFenceReservation {
     ) -> Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
         let pending_fence = PendingSubmitFence {
             completion_point,
-            fence,
+            fence: Some(fence),
         };
 
         let mut pending = self.queue.pending_submit_fences.lock();
@@ -174,7 +184,14 @@ impl PendingFenceReservation {
                 self.consumed.store(true, Ordering::Relaxed);
                 Ok(())
             }
-            Err(err) => Err((EINVAL, err.0.fence)),
+            Err(err) => match err.0.fence {
+                Some(fence) => Err((EINVAL, fence)),
+                None => {
+                    pending.outstanding = pending.outstanding.saturating_sub(1);
+                    self.consumed.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+            },
         }
     }
 }
@@ -455,95 +472,95 @@ impl QueueData {
 
     fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
         loop {
-            let pending_fence = {
+            let fence = {
                 let mut pending = self.pending_submit_fences.lock();
-
-                match pending.vec.first() {
-                    Some(pending_fence) if pending_fence.completion_point <= completion_point => {
-                        pending.vec.remove(0).ok()
-                    }
-                    _ => None,
+                let head = pending.head;
+                let Some(entry) = pending.vec.get_mut(head) else {
+                    Self::maybe_truncate_pending(&mut pending);
+                    break;
+                };
+                if entry.completion_point > completion_point {
+                    Self::maybe_truncate_pending(&mut pending);
+                    break;
                 }
+                let fence = entry.fence.take();
+                pending.head = head + 1;
+                fence
             };
 
-            let Some(pending_fence) = pending_fence else {
-                break;
-            };
-
-            let _annotation = DmaFenceSignallingAnnotation::new();
-            pending_fence.fence.signal(result);
+            if let Some(fence) = fence {
+                let _annotation = DmaFenceSignallingAnnotation::new();
+                fence.signal(result);
+            }
         }
     }
 
-    /// Drains every leading entry of `pending_submit_fences` whose
-    /// `completion_point` is `<= up_to` into a local vec, then
-    /// signals each drained fence with `Ok(())` with no driver lock
-    /// held.
-    ///
     /// Per Documentation/driver-api/dma-buf.rst, no driver lock may
     /// be held across `dma_fence_signal()`.
     fn complete_pending_fences_up_to(&self, up_to: u64) {
-        let drained = {
-            let mut pending = self.pending_submit_fences.lock();
-
-            let mut k = 0usize;
-            for entry in pending.vec.iter() {
-                if entry.completion_point > up_to {
-                    break;
-                }
-                k += 1;
-            }
-
-            let mut drained = match KVec::with_capacity(k, GFP_KERNEL) {
-                Ok(v) => v,
-                Err(_) => {
-                    pr_err!("Tyr queue: drain allocation failed; deferring drain\n");
-                    return;
-                }
-            };
-
-            // Reverse once so the leading prefix is at the tail; pop
-            // returns the original head-first sequence in O(1) each.
-            // Reverse the surviving suffix back after the pop loop.
-            pending.vec.reverse();
-            for _ in 0..k {
-                let Some(entry) = pending.vec.pop() else {
+        loop {
+            let (_completion_point, fence) = {
+                let mut pending = self.pending_submit_fences.lock();
+                let head = pending.head;
+                let Some(entry) = pending.vec.get_mut(head) else {
+                    Self::maybe_truncate_pending(&mut pending);
                     break;
                 };
-                let _ = drained.push_within_capacity(entry);
+                if entry.completion_point > up_to {
+                    Self::maybe_truncate_pending(&mut pending);
+                    break;
+                }
+                let completion_point = entry.completion_point;
+                let fence = entry.fence.take();
+                pending.head = head + 1;
+                (completion_point, fence)
+            };
+
+            if let Some(fence) = fence {
+                let _annotation = DmaFenceSignallingAnnotation::new();
+                fence.signal(Ok(()));
             }
-            pending.vec.reverse();
-
-            drained
-        };
-
-        for pending_fence in drained.into_iter() {
-            let _annotation = DmaFenceSignallingAnnotation::new();
-            pending_fence.fence.signal(Ok(()));
         }
     }
 
-    fn signal_submit_fence(&self, completion_point: u64, result: Result) -> bool {
-        let pending_fence = {
-            let mut pending = self.pending_submit_fences.lock();
-            let mut position = None;
+    /// Compacts the drained prefix away once `head` has grown past
+    /// `max(len / 2, 16)`. Matches the 6.18 heuristic.
+    fn maybe_truncate_pending(pending: &mut PendingFences) {
+        let len = pending.vec.len();
+        let threshold = core::cmp::max(len / 2, 16);
+        if pending.head < threshold {
+            return;
+        }
+        let drop_count = pending.head;
+        let mut i = 0usize;
+        pending.vec.retain(|_| {
+            let keep = i >= drop_count;
+            i += 1;
+            keep
+        });
+        pending.head = 0;
+    }
 
-            for (index, pending_fence) in pending.vec.iter().enumerate() {
-                if pending_fence.completion_point == completion_point {
-                    position = Some(index);
+    fn signal_submit_fence(&self, completion_point: u64, result: Result) -> bool {
+        let fence = {
+            let mut pending = self.pending_submit_fences.lock();
+            let head = pending.head;
+            let mut position = None;
+            for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
+                if entry.completion_point == completion_point {
+                    position = Some(idx);
                     break;
                 }
             }
-
-            position.and_then(|index| pending.vec.remove(index).ok())
+            position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()))
         };
 
-        let Some(pending_fence) = pending_fence else {
+        let Some(fence) = fence else {
             return false;
         };
 
         let _annotation = DmaFenceSignallingAnnotation::new();
-        pending_fence.fence.signal(result);
+        fence.signal(result);
         true
     }
 
@@ -574,9 +591,12 @@ impl QueueData {
     pub(in crate::sched) fn fail_inflight_submit_fences(&self, err: Error) -> Result {
         let extract = self.interfaces.read_output()?.extract;
         let mut pending = self.pending_submit_fences.lock();
-        for entry in pending.vec.iter_mut() {
+        let head = pending.head;
+        for entry in pending.vec.iter_mut().skip(head) {
             if entry.completion_point > extract {
-                entry.fence.set_error(err);
+                if let Some(fence) = entry.fence.as_mut() {
+                    fence.set_error(err);
+                }
             }
         }
         Ok(())
@@ -940,6 +960,7 @@ impl Queue {
                 iomem: tdev.iomem.clone(),
                 pending_submit_fences <- new_mutex!(PendingFences {
                     vec: KVec::new(),
+                    head: 0,
                     outstanding: 0,
                 }),
                 syncwait <- new_mutex!(SyncWait::default()),
