@@ -152,6 +152,8 @@ pub(crate) struct GlobalInterface {
     shared_section: SharedSectionInfo,
     gpu_info: GpuInfo,
     event_wait: Arc<Wait>,
+    /// Number of AS slots available to user VMs.
+    user_as_slot_count: usize,
     #[pin]
     inner: Mutex<InnerGlobalInterface>,
 }
@@ -163,6 +165,7 @@ impl GlobalInterface {
         shared_section: &Section,
         gpu_info: GpuInfo,
         irq_state: &JobIrqState,
+        user_as_slot_count: usize,
     ) -> Result<impl PinInit<Self, Error>> {
         let inner = InnerGlobalInterface::new();
         let pdev: ARef<platform::Device> = pdev.into();
@@ -175,6 +178,7 @@ impl GlobalInterface {
             shared_section,
             gpu_info,
             event_wait,
+            user_as_slot_count,
             inner <- new_mutex!(inner),
         }))
     }
@@ -188,6 +192,7 @@ impl GlobalInterface {
             self.gpu_info,
             core_clk_rate,
             self.event_wait.as_ref(),
+            self.user_as_slot_count,
         )
     }
 
@@ -327,6 +332,7 @@ impl InnerGlobalInterface {
         gpu_info: GpuInfo,
         core_clk_rate: u64,
         event_wait: &Wait,
+        user_as_slot_count: usize,
     ) -> Result {
         let glb_control = FwInterface::<GLB_CONTROL_BLOCK_SIZE>::new(
             &shared_section.vmap,
@@ -375,7 +381,7 @@ impl InnerGlobalInterface {
             return Err(e);
         }
 
-        let csg_num = glb_control.read(GLB_GROUP_NUM).value().get();
+        let fw_csg_num = glb_control.read(GLB_GROUP_NUM).value().get() as usize;
         let csg_stride = glb_control.read(GLB_GROUP_STRIDE).value().get() as usize;
 
         if csg_stride < CSG_CONTROL_BLOCK_SIZE {
@@ -387,13 +393,26 @@ impl InnerGlobalInterface {
             return Err(EINVAL);
         }
 
-        if csg_num as usize > MAX_CSG {
+        if fw_csg_num > MAX_CSG {
             pr_err!(
                 "Too many CSGs: hardware reports {}, max supported {}\n",
-                csg_num,
+                fw_csg_num,
                 MAX_CSG
             );
             return Err(EINVAL);
+        }
+
+        let csg_num = fw_csg_num.min(user_as_slot_count);
+        if csg_num == 0 {
+            pr_err!("No CSG slots available (AS-slot constrained)\n");
+            return Err(EINVAL);
+        }
+        if csg_num != fw_csg_num {
+            pr_info!(
+                "Limiting CSG slots: firmware reports {}, AS-slot constrained to {}\n",
+                fw_csg_num,
+                csg_num
+            );
         }
 
         self.state = GlobalInterfaceState::Enabled(EnabledGlobalInterface {
@@ -401,8 +420,8 @@ impl InnerGlobalInterface {
             glb_input,
             glb_output,
             csg_stride,
-            csg_num: csg_num as usize,
-            csg: KVec::with_capacity(csg_num as usize, GFP_KERNEL)?,
+            csg_num,
+            csg: KVec::with_capacity(csg_num, GFP_KERNEL)?,
         });
 
         self.init_csg(shared_section)

@@ -349,8 +349,15 @@ impl Firmware {
 
         let irq_state = irq::JobIrqState::new()?;
         let shared_section = Self::find_shared_section(&sections)?;
-        let global_iface =
-            GlobalInterface::new(pdev, iomem.clone(), shared_section, *gpu_info, &irq_state)?;
+        let user_as_slot_count = mmu.as_slot_count().saturating_sub(1);
+        let global_iface = GlobalInterface::new(
+            pdev,
+            iomem.clone(),
+            shared_section,
+            *gpu_info,
+            &irq_state,
+            user_as_slot_count,
+        )?;
 
         let firmware = Arc::pin_init(
             try_pin_init!(Firmware {
