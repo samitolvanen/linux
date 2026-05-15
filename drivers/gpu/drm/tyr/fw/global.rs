@@ -210,6 +210,8 @@ pub(crate) struct GlobalInterface<'drm> {
     shared_section: SharedSectionInfo,
     gpu_info: GpuInfo,
     event_wait: Arc<Wait>,
+    /// Number of AS slots available to user VMs.
+    user_as_slot_count: usize,
     #[pin]
     inner: Mutex<InnerGlobalInterface>,
 }
@@ -222,6 +224,7 @@ impl<'drm> GlobalInterface<'drm> {
         shared_section: &Section,
         gpu_info: GpuInfo,
         irq_state: &JobIrqState,
+        user_as_slot_count: usize,
     ) -> Result<impl PinInit<Self, Error>> {
         let shared_section = SharedSectionInfo::new(shared_section)?;
         let event_wait = irq_state.event_wait_arc();
@@ -232,6 +235,7 @@ impl<'drm> GlobalInterface<'drm> {
             shared_section,
             gpu_info,
             event_wait,
+            user_as_slot_count,
             inner <- new_mutex!(InnerGlobalInterface::new()),
         }))
     }
@@ -245,6 +249,7 @@ impl<'drm> GlobalInterface<'drm> {
             self.gpu_info,
             core_clk,
             &self.event_wait,
+            self.user_as_slot_count,
         )
     }
 
@@ -298,6 +303,9 @@ impl InnerGlobalInterface {
     /// This reads the firmware's control block to set up the global input/output
     /// interfaces; it configures timers and shader core allocation; and it discovers
     /// available CSG interfaces.
+    // Enabling drives the firmware interface through the device and its MMIO
+    // mapping, both of which the caller owns.
+    #[expect(clippy::too_many_arguments)]
     fn enable(
         &mut self,
         dev: &Device,
@@ -306,6 +314,7 @@ impl InnerGlobalInterface {
         gpu_info: GpuInfo,
         core_clk: &Clk,
         event_wait: &Wait,
+        user_as_slot_count: usize,
     ) -> Result {
         let vmap = &shared_section.vmap;
         let va_range = &shared_section.va_range;
@@ -364,7 +373,7 @@ impl InnerGlobalInterface {
         }
 
         // Read how many CSG interfaces exist.
-        let csg_num = glb_control.read(GLB_GROUP_NUM).value().get();
+        let fw_csg_num = glb_control.read(GLB_GROUP_NUM).value().get() as usize;
 
         // Read the stride between CSG control blocks.
         let csg_stride = glb_control.read(GLB_GROUP_STRIDE).value().get() as usize;
@@ -380,14 +389,28 @@ impl InnerGlobalInterface {
         }
 
         // Validate the CSG number reported.
-        if csg_num as usize > super::MAX_CSG {
+        if fw_csg_num > super::MAX_CSG {
             dev_err!(
                 dev,
                 "Too many CSGs: hardware reports {}, max supported {}",
-                csg_num,
+                fw_csg_num,
                 super::MAX_CSG
             );
             return Err(EINVAL);
+        }
+
+        let csg_num = fw_csg_num.min(user_as_slot_count);
+        if csg_num == 0 {
+            dev_err!(dev, "No CSG slots available (AS-slot constrained)");
+            return Err(EINVAL);
+        }
+        if csg_num != fw_csg_num {
+            dev_info!(
+                dev,
+                "Limiting CSG slots: firmware reports {}, AS-slot constrained to {}",
+                fw_csg_num,
+                csg_num
+            );
         }
 
         let enabled = EnabledGlobalInterface {
@@ -395,8 +418,8 @@ impl InnerGlobalInterface {
             glb_input,
             glb_output,
             csg_stride,
-            csg_num: csg_num as usize,
-            csg: KVec::with_capacity(csg_num as usize, GFP_KERNEL)?,
+            csg_num,
+            csg: KVec::with_capacity(csg_num, GFP_KERNEL)?,
         };
 
         self.state = GlobalInterfaceState::Enabled(enabled);

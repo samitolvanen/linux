@@ -252,6 +252,7 @@ impl<'drm> Firmware<'drm> {
             }
 
             let irq_state = irq::JobIrqState::new()?;
+            let user_as_slot_count = mmu.as_slot_count().saturating_sub(1);
             let shared_section = Self::find_shared_section(dev, &sections)?;
             let global_iface = Arc::pin_init(
                 GlobalInterface::new(
@@ -260,6 +261,7 @@ impl<'drm> Firmware<'drm> {
                     shared_section,
                     *gpu_info,
                     &irq_state,
+                    user_as_slot_count,
                 )?,
                 GFP_KERNEL,
             )?;

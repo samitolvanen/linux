@@ -49,6 +49,9 @@ pub(crate) type AsSlotManager = SlotManager<AddressSpaceManager, MAX_AS>;
 /// Locked wrapper for carrying out virtual memory (VM) operations on the MMU.
 #[pin_data]
 pub(crate) struct Mmu {
+    /// Total number of hardware AS slots reported by the GPU.
+    as_slot_count: usize,
+
     /// Slot Manager instance used to allocate hardware slots and write to MMU registers.
     #[pin]
     pub(crate) as_manager: Mutex<AsSlotManager>,
@@ -62,7 +65,7 @@ impl Mmu {
         gpu_info: &GpuInfo,
     ) -> Result<Arc<Mmu>> {
         let present = AS_PRESENT::from_raw(gpu_info.as_present).present().get();
-        let slot_count = present.count_ones().try_into()?;
+        let slot_count: usize = present.count_ones().try_into()?;
 
         let address_space_manager = AddressSpaceManager::new(pdev, iomem, present)?;
         let as_slot_manager =
@@ -75,9 +78,18 @@ impl Mmu {
                 );
             })?;
         let mmu_init = try_pin_init!(Self{
+            as_slot_count: slot_count,
             as_manager <- new_mutex!(as_slot_manager),
         });
         Arc::pin_init(mmu_init, GFP_KERNEL)
+    }
+
+    /// Returns the total number of hardware AS slots present on the GPU.
+    ///
+    /// AS slot 0 is permanently reserved for the firmware MCU VM, so the
+    /// count of slots available to user VMs is `as_slot_count() - 1`.
+    pub(crate) fn as_slot_count(&self) -> usize {
+        self.as_slot_count
     }
 
     /// Assign a VM to an AS slot, provide a translation table,
