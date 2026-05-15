@@ -34,6 +34,16 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+#include "panthor_trace.h"
+
+#define panthor_group_trace_id(g) ((u64)(uintptr_t)(g))
+
+/*
+ * Reason tag matching PANTHOR_GROUP_STATE_REASONS in panthor_trace.h.
+ * Only FW_ACK is currently emitted, mirroring Tyr's single
+ * Group::set_state() invocation in drivers/gpu/drm/tyr/sched.rs.
+ */
+#define PANTHOR_GROUP_STATE_REASON_FW_ACK	9
 
 /**
  * DOC: Scheduler
@@ -706,6 +716,17 @@ struct panthor_group {
 	struct list_head wait_node;
 };
 
+static inline void panthor_group_set_state(struct panthor_group *group,
+					   enum panthor_group_state new_state,
+					   u32 reason)
+{
+	u32 old_state = group->state;
+
+	group->state = new_state;
+	trace_panthor_group_state_transition(panthor_group_trace_id(group),
+					     old_state, new_state, reason);
+}
+
 struct panthor_job_profiling_data {
 	struct {
 		u64 before;
@@ -1028,6 +1049,9 @@ group_bind_locked(struct panthor_group *group, u32 csg_id)
 
 	csg_slot->group = group;
 
+	trace_panthor_group_bind(panthor_group_trace_id(group), csg_id);
+	trace_panthor_csg_slot_assign(csg_id, panthor_group_trace_id(group), true);
+
 	return 0;
 }
 
@@ -1052,6 +1076,9 @@ group_unbind_locked(struct panthor_group *group)
 		return -EINVAL;
 
 	slot = &ptdev->scheduler->csg_slots[group->csg_id];
+	trace_panthor_group_unbind(panthor_group_trace_id(group), group->csg_id);
+	trace_panthor_csg_slot_assign(group->csg_id,
+				      panthor_group_trace_id(group), false);
 	panthor_vm_idle(group->vm);
 	group->csg_id = -1;
 
@@ -1186,8 +1213,10 @@ queue_resume_timeout(struct panthor_queue *queue)
 static void
 cs_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 {
-	struct panthor_queue *queue = ptdev->scheduler->csg_slots[csg_id].group->queues[cs_id];
+	struct panthor_group *group = ptdev->scheduler->csg_slots[csg_id].group;
+	struct panthor_queue *queue = group->queues[cs_id];
 	struct panthor_fw_cs_iface *cs_iface = panthor_fw_get_cs_iface(ptdev, csg_id, cs_id);
+	u64 group_id = panthor_group_trace_id(group);
 
 	lockdep_assert_held(&ptdev->scheduler->lock);
 
@@ -1201,6 +1230,20 @@ cs_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 	cs_iface->input->config = CS_CONFIG_PRIORITY(queue->priority) |
 				  CS_CONFIG_DOORBELL(queue->doorbell_id);
 	cs_iface->input->ack_irq_mask = ~0;
+
+	trace_panthor_fw_cs_activate_inputs(csg_id, cs_id,
+					    cs_iface->input->ringbuf_base,
+					    cs_iface->input->ringbuf_size,
+					    cs_iface->input->ringbuf_input,
+					    cs_iface->input->ringbuf_output,
+					    cs_iface->input->config);
+	trace_panthor_fw_cs_ringbuf_publish(group_id, cs_id,
+					    queue->iface.input->insert,
+					    queue->iface.input->extract);
+	trace_panthor_cs_ring_ptrs(group_id, cs_id,
+				   queue->iface.input->insert,
+				   queue->iface.input->extract);
+
 	panthor_fw_update_reqs(cs_iface, req,
 			       CS_IDLE_SYNC_WAIT |
 			       CS_IDLE_EMPTY |
@@ -1208,6 +1251,10 @@ cs_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 			       CS_IDLE_SYNC_WAIT |
 			       CS_IDLE_EMPTY |
 			       CS_STATE_MASK);
+	trace_panthor_fw_cs_req(csg_id, cs_id, group_id,
+				READ_ONCE(cs_iface->input->req),
+				CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY | CS_STATE_MASK,
+				0);
 	if (queue->iface.input->insert != queue->iface.input->extract)
 		queue_resume_timeout(queue);
 }
@@ -1235,6 +1282,9 @@ cs_slot_reset_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 	panthor_fw_update_reqs(cs_iface, req,
 			       CS_STATE_STOP,
 			       CS_STATE_MASK);
+	trace_panthor_fw_cs_req(csg_id, cs_id, panthor_group_trace_id(group),
+				READ_ONCE(cs_iface->input->req),
+				CS_STATE_MASK, 0);
 
 	queue_suspend_timeout(queue);
 
@@ -1282,24 +1332,43 @@ cs_slot_sync_queue_state_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs
 
 	u32 status_wait_cond;
 
+	trace_panthor_cs_status_snapshot(csg_id, cs_id,
+					 READ_ONCE(cs_iface->input->req),
+					 READ_ONCE(cs_iface->output->ack),
+					 cs_iface->output->status_wait,
+					 cs_iface->output->status_blocked_reason,
+					 cs_iface->output->status_scoreboards,
+					 cs_iface->output->status_wait_sync_ptr);
+	trace_panthor_fw_cs_status_update(csg_id, cs_id,
+					  panthor_group_trace_id(group),
+					  cs_iface->output->status_blocked_reason);
+
 	switch (cs_iface->output->status_blocked_reason) {
 	case CS_STATUS_BLOCKED_REASON_UNBLOCKED:
 		if (queue->iface.input->insert == queue->iface.output->extract &&
-		    cs_iface->output->status_scoreboards == 0)
+		    cs_iface->output->status_scoreboards == 0) {
 			group->idle_queues |= BIT(cs_id);
+			trace_panthor_queue_idle_state(panthor_group_trace_id(group),
+						       cs_id, true);
+		}
 		break;
 
 	case CS_STATUS_BLOCKED_REASON_SYNC_WAIT:
 		if (list_empty(&group->wait_node)) {
 			list_move_tail(&group->wait_node,
 				       &group->ptdev->scheduler->groups.waiting);
+			trace_panthor_group_wait(panthor_group_trace_id(group),
+						 true);
 		}
 
 		/* The queue is only blocked if there's no deferred operation
 		 * pending, which can be checked through the scoreboard status.
 		 */
-		if (!cs_iface->output->status_scoreboards)
+		if (!cs_iface->output->status_scoreboards) {
 			group->blocked_queues |= BIT(cs_id);
+			trace_panthor_queue_state(panthor_group_trace_id(group),
+						  cs_id, true);
+		}
 
 		queue->syncwait.gpu_va = cs_iface->output->status_wait_sync_ptr;
 		queue->syncwait.ref = cs_iface->output->status_wait_sync_value;
@@ -1387,6 +1456,15 @@ csg_slot_sync_state_locked(struct panthor_device *ptdev, u32 csg_id)
 	if (old_state == new_state)
 		return;
 
+	trace_panthor_fw_csg_dump_output(csg_id,
+					 READ_ONCE(csg_iface->output->ack),
+					 csg_iface->output->status_state,
+					 csg_iface->output->status_endpoint_current,
+					 csg_iface->output->status_endpoint_req,
+					 csg_iface->output->resource_dep);
+	trace_panthor_fw_csg_status_update(csg_id, panthor_group_trace_id(group),
+					   csg_iface->output->status_state);
+
 	/* The unknown state might be caused by a FW issue, reset the FW to
 	 * take a fresh start.
 	 */
@@ -1411,7 +1489,8 @@ csg_slot_sync_state_locked(struct panthor_device *ptdev, u32 csg_id)
 		}
 	}
 
-	group->state = new_state;
+	panthor_group_set_state(group, new_state, PANTHOR_GROUP_STATE_REASON_FW_ACK);
+	trace_panthor_group_update(panthor_group_trace_id(group), new_state);
 }
 
 static int
@@ -1453,6 +1532,7 @@ csg_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 priority)
 		       CSG_EP_REQ_TILER(group->max_tiler_cores) |
 		       CSG_EP_REQ_PRIORITY(priority);
 	panthor_fw_csg_endpoint_req_set(ptdev, csg_iface, endpoint_req);
+	trace_panthor_fw_csg_ep_req_write(csg_id, (u32)endpoint_req);
 
 	csg_iface->input->config = panthor_vm_as(group->vm);
 
@@ -1468,8 +1548,19 @@ csg_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 priority)
 		csg_iface->input->protm_suspend_buf = 0;
 	}
 
+	trace_panthor_fw_csg_activate_bufs(csg_id, csg_iface->input->suspend_buf,
+					   csg_iface->input->protm_suspend_buf);
+	trace_panthor_fw_csg_activate_config(csg_id, (u32)endpoint_req,
+					     csg_iface->input->config,
+					     csg_iface->input->allow_compute,
+					     csg_iface->input->allow_fragment,
+					     csg_iface->input->allow_other);
+
 	csg_iface->input->ack_irq_mask = ~0;
 	panthor_fw_toggle_reqs(csg_iface, doorbell_req, doorbell_ack, queue_mask);
+	trace_panthor_fw_csg_doorbell_req(csg_id,
+					  READ_ONCE(csg_iface->input->doorbell_req),
+					  0, queue_mask);
 	return 0;
 }
 
@@ -1495,6 +1586,8 @@ cs_slot_process_fatal_event_locked(struct panthor_device *ptdev,
 			 group->task_info.pid, group->task_info.comm);
 
 		group->fatal_queues |= BIT(cs_id);
+		trace_panthor_queue_fatal_state(panthor_group_trace_id(group),
+						cs_id, true);
 	}
 
 	if (CS_EXCEPTION_TYPE(fatal) == DRM_PANTHOR_EXCEPTION_CS_UNRECOVERABLE) {
@@ -1558,6 +1651,8 @@ cs_slot_process_fault_event_locked(struct panthor_device *ptdev,
 	if (group) {
 		drm_warn(&ptdev->base, "CS_FAULT: pid=%d, comm=%s\n",
 			 group->task_info.pid, group->task_info.comm);
+		trace_panthor_queue_fatal_state(panthor_group_trace_id(group),
+						cs_id, true);
 	}
 
 	drm_warn(&ptdev->base,
@@ -1639,7 +1734,13 @@ static int group_process_tiler_oom(struct panthor_group *group, u32 cs_id)
 		cs_iface->input->heap_start = new_chunk_va;
 		cs_iface->input->heap_end = new_chunk_va;
 		panthor_fw_update_reqs(cs_iface, req, cs_iface->output->ack, CS_TILER_OOM);
+		trace_panthor_fw_cs_req(csg_id, cs_id, panthor_group_trace_id(group),
+					READ_ONCE(cs_iface->input->req),
+					CS_TILER_OOM, 0);
 		panthor_fw_toggle_reqs(csg_iface, doorbell_req, doorbell_ack, BIT(cs_id));
+		trace_panthor_fw_csg_doorbell_req(csg_id,
+						  READ_ONCE(csg_iface->input->doorbell_req),
+						  0, BIT(cs_id));
 		panthor_fw_ring_csg_doorbells(ptdev, BIT(csg_id));
 	}
 	mutex_unlock(&sched->lock);
@@ -1710,6 +1811,8 @@ static bool cs_slot_process_irq_locked(struct panthor_device *ptdev,
 	ack = cs_iface->output->ack;
 	events = (req ^ ack) & CS_EVT_MASK;
 
+	trace_panthor_cs_irq(csg_id, cs_id, req, ack);
+
 	if (events & CS_FATAL)
 		cs_slot_process_fatal_event_locked(ptdev, csg_id, cs_id);
 
@@ -1723,6 +1826,14 @@ static bool cs_slot_process_irq_locked(struct panthor_device *ptdev,
 	 * deferred to a separate work.
 	 */
 	panthor_fw_update_reqs(cs_iface, req, ack, CS_FATAL | CS_FAULT);
+	{
+		struct panthor_group *_g = ptdev->scheduler->csg_slots[csg_id].group;
+
+		trace_panthor_fw_cs_req(csg_id, cs_id,
+					_g ? panthor_group_trace_id(_g) : 0,
+					READ_ONCE(cs_iface->input->req),
+					CS_FATAL | CS_FAULT, 0);
+	}
 
 	return (events & (CS_FAULT | CS_TILER_OOM)) != 0;
 }
@@ -1730,8 +1841,12 @@ static bool cs_slot_process_irq_locked(struct panthor_device *ptdev,
 static void csg_slot_process_idle_event_locked(struct panthor_device *ptdev, u32 csg_id)
 {
 	struct panthor_scheduler *sched = ptdev->scheduler;
+	struct panthor_group *group = sched->csg_slots[csg_id].group;
 
 	lockdep_assert_held(&sched->lock);
+
+	trace_panthor_csg_slot_idle(csg_id,
+				    group ? panthor_group_trace_id(group) : 0, true);
 
 	sched->might_have_idle_groups = true;
 
@@ -1750,8 +1865,12 @@ static void csg_slot_sync_update_locked(struct panthor_device *ptdev,
 
 	lockdep_assert_held(&ptdev->scheduler->lock);
 
-	if (group)
+	if (group) {
+		trace_panthor_fw_csg_status_update(csg_id,
+						   panthor_group_trace_id(group),
+						   0);
 		group_queue_work(group, sync_upd);
+	}
 
 	sched_queue_work(ptdev->scheduler, sync_upd);
 }
@@ -1771,8 +1890,10 @@ csg_slot_process_progress_timer_event_locked(struct panthor_device *ptdev, u32 c
 			 group->task_info.pid, group->task_info.comm);
 
 		group->timedout = true;
+		trace_panthor_group_timedout(panthor_group_trace_id(group));
 	}
 
+	trace_panthor_csg_slot_progress_timeout(csg_id);
 	drm_warn(&ptdev->base, "CSG slot %d progress timeout\n", csg_id);
 
 	sched_queue_delayed_work(sched, tick, 0);
@@ -1796,6 +1917,11 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 	cs_irq_ack = READ_ONCE(csg_iface->input->cs_irq_ack);
 	csg_events = (req ^ ack) & CSG_EVT_MASK;
 
+	trace_panthor_csg_irq(csg_id,
+			      ptdev->scheduler->csg_slots[csg_id].group ?
+			      panthor_group_trace_id(ptdev->scheduler->csg_slots[csg_id].group) : 0,
+			      req, ack, cs_irq_req, cs_irq_ack);
+
 	/* There may not be any pending CSG/CS interrupts to process */
 	if (req == ack && cs_irq_req == cs_irq_ack)
 		return;
@@ -1812,6 +1938,12 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 			       CSG_SYNC_UPDATE |
 			       CSG_IDLE |
 			       CSG_PROGRESS_TIMER_EVENT);
+	trace_panthor_fw_csg_req(csg_id,
+				 ptdev->scheduler->csg_slots[csg_id].group ?
+				 panthor_group_trace_id(ptdev->scheduler->csg_slots[csg_id].group) : 0,
+				 READ_ONCE(csg_iface->input->req),
+				 CSG_SYNC_UPDATE | CSG_IDLE | CSG_PROGRESS_TIMER_EVENT,
+				 0);
 
 	if (csg_events & CSG_IDLE)
 		csg_slot_process_idle_event_locked(ptdev, csg_id);
@@ -1832,8 +1964,12 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 	if (csg_events & CSG_SYNC_UPDATE)
 		csg_slot_sync_update_locked(ptdev, csg_id);
 
-	if (ring_cs_db_mask)
+	if (ring_cs_db_mask) {
 		panthor_fw_toggle_reqs(csg_iface, doorbell_req, doorbell_ack, ring_cs_db_mask);
+		trace_panthor_fw_csg_doorbell_req(csg_id,
+						  READ_ONCE(csg_iface->input->doorbell_req),
+						  0, ring_cs_db_mask);
+	}
 
 	panthor_fw_ring_csg_doorbells(ptdev, BIT(csg_id));
 }
@@ -1846,6 +1982,7 @@ static void sched_process_idle_event_locked(struct panthor_device *ptdev)
 
 	/* Acknowledge the idle event and schedule a tick. */
 	panthor_fw_update_reqs(glb_iface, req, glb_iface->output->ack, GLB_IDLE);
+	trace_panthor_fw_glb_req(READ_ONCE(glb_iface->input->req), 0);
 	sched_queue_delayed_work(ptdev->scheduler, tick, 0);
 }
 
@@ -1864,6 +2001,8 @@ static void sched_process_global_irq_locked(struct panthor_device *ptdev)
 	ack = READ_ONCE(glb_iface->output->ack);
 	evts = (req ^ ack) & GLB_EVT_MASK;
 
+	trace_panthor_glb_irq(req, ack);
+
 	if (evts & GLB_IDLE)
 		sched_process_idle_event_locked(ptdev);
 }
@@ -1874,6 +2013,8 @@ static void process_fw_events_work(struct work_struct *work)
 						      fw_events_work);
 	u32 events = atomic_xchg(&sched->fw_events, 0);
 	struct panthor_device *ptdev = sched->ptdev;
+
+	trace_panthor_work_run("fw_events");
 
 	mutex_lock(&sched->lock);
 
@@ -1966,6 +2107,11 @@ static int csgs_upd_ctx_apply_locked(struct panthor_device *ptdev,
 		panthor_fw_update_reqs(csg_iface, req,
 				       ctx->requests[csg_id].value,
 				       ctx->requests[csg_id].mask);
+		trace_panthor_fw_csg_req(csg_id,
+					 sched->csg_slots[csg_id].group ?
+					 panthor_group_trace_id(sched->csg_slots[csg_id].group) : 0,
+					 READ_ONCE(csg_iface->input->req),
+					 ctx->requests[csg_id].mask, 0);
 	}
 
 	panthor_fw_ring_csg_doorbells(ptdev, ctx->update_mask);
@@ -2186,6 +2332,12 @@ group_term_post_processing(struct panthor_group *group)
 			list_move_tail(&job->node, &faulty_jobs);
 			dma_fence_set_error(job->done_fence, err);
 			dma_fence_signal_locked(job->done_fence);
+			trace_panthor_submit_fence_signal(panthor_group_trace_id(group),
+							  job->queue_idx,
+							  job->done_fence->seqno, err);
+			trace_panthor_job_status(job->done_fence->seqno,
+						 panthor_group_trace_id(group),
+						 job->queue_idx, "fault");
 		}
 		spin_unlock(&queue->fence_ctx.lock);
 
@@ -2288,6 +2440,9 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 				continue;
 
 			csg_slot = &sched->csg_slots[csg_id];
+			trace_panthor_sched_evict(csg_id,
+						  panthor_group_trace_id(group),
+						  group->priority);
 			csgs_upd_ctx_queue_reqs(ptdev, &upd_ctx, csg_id,
 						term ? CSG_STATE_TERMINATE : CSG_STATE_SUSPEND,
 						CSG_STATE_MASK);
@@ -2307,6 +2462,10 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 			if (csg_slot->priority == new_csg_prio) {
 				new_csg_prio--;
+				trace_panthor_sched_keep(csg_id,
+							 panthor_group_trace_id(group),
+							 group->priority,
+							 csg_slot->priority);
 				continue;
 			}
 
@@ -2316,6 +2475,9 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			csgs_upd_ctx_queue_reqs(ptdev, &upd_ctx, csg_id,
 						csg_iface->output->ack ^ CSG_ENDPOINT_CONFIG,
 						CSG_ENDPOINT_CONFIG);
+			trace_panthor_sched_keep(csg_id,
+						 panthor_group_trace_id(group),
+						 group->priority, new_csg_prio);
 			new_csg_prio--;
 		}
 	}
@@ -2367,7 +2529,11 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 			csg_slot = &sched->csg_slots[csg_id];
 			group_bind_locked(group, csg_id);
-			csg_slot_prog_locked(ptdev, csg_id, new_csg_prio--);
+			csg_slot_prog_locked(ptdev, csg_id, new_csg_prio);
+			trace_panthor_sched_bind(csg_id,
+						 panthor_group_trace_id(group),
+						 group->priority, new_csg_prio);
+			new_csg_prio--;
 			csgs_upd_ctx_queue_reqs(ptdev, &upd_ctx, csg_id,
 						group->state == PANTHOR_CS_GROUP_SUSPENDED ?
 						CSG_STATE_RESUME : CSG_STATE_START,
@@ -2409,10 +2575,13 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			if (!group_can_run(group))
 				continue;
 
-			if (group_is_idle(group))
+			if (group_is_idle(group)) {
 				list_move_tail(&group->run_node, &sched->groups.idle[prio]);
-			else
+				trace_panthor_group_list(panthor_group_trace_id(group), 1);
+			} else {
 				list_move_tail(&group->run_node, &sched->groups.runnable[prio]);
+				trace_panthor_group_list(panthor_group_trace_id(group), 2);
+			}
 			group_put(group);
 		}
 	}
@@ -2454,6 +2623,9 @@ static void tick_work(struct work_struct *work)
 	u64 now = get_jiffies_64();
 	int prio, ret, cookie;
 	bool full_tick;
+	u32 evict_count = 0, bind_count = 0, keep_count = 0, runnable_remaining = 0;
+
+	trace_panthor_work_run("tick");
 
 	if (!drm_dev_enter(&ptdev->base, &cookie))
 		return;
@@ -2476,6 +2648,8 @@ static void tick_work(struct work_struct *work)
 		goto out_unlock;
 
 	tick_ctx_init(sched, &ctx);
+	trace_panthor_csg_slots_status(sched->used_csg_slot_count,
+				       sched->csg_slot_count);
 	if (ctx.csg_upd_failed_mask)
 		goto out_cleanup_ctx;
 
@@ -2562,6 +2736,12 @@ static void tick_work(struct work_struct *work)
 	if (resched_delay != U64_MAX)
 		sched_queue_delayed_work(sched, tick, resched_delay);
 
+	bind_count = ctx.group_count;
+	for (prio = 0; prio < PANTHOR_CSG_PRIORITY_COUNT; prio++)
+		runnable_remaining += !list_empty(&sched->groups.runnable[prio]);
+	trace_panthor_tick_decision_summary(evict_count, bind_count, keep_count,
+					    runnable_remaining);
+
 out_cleanup_ctx:
 	tick_ctx_cleanup(sched, &ctx);
 
@@ -2611,6 +2791,8 @@ static void sync_upd_work(struct work_struct *work)
 	struct panthor_group *group, *tmp;
 	bool immediate_tick = false;
 
+	trace_panthor_work_run("sync_upd");
+
 	mutex_lock(&sched->lock);
 	list_for_each_entry_safe(group, tmp, &sched->groups.waiting, wait_node) {
 		u32 tested_queues = group->blocked_queues;
@@ -2629,18 +2811,31 @@ static void sync_upd_work(struct work_struct *work)
 		}
 
 		if (unblocked_queues) {
+			u32 unblocked = unblocked_queues;
+
 			group->blocked_queues &= ~unblocked_queues;
+
+			while (unblocked) {
+				u32 cs_id = ffs(unblocked) - 1;
+
+				trace_panthor_queue_state(panthor_group_trace_id(group),
+							  cs_id, false);
+				unblocked &= ~BIT(cs_id);
+			}
 
 			if (group->csg_id < 0) {
 				list_move(&group->run_node,
 					  &sched->groups.runnable[group->priority]);
+				trace_panthor_group_list(panthor_group_trace_id(group), 2);
 				if (group->priority == PANTHOR_CSG_PRIORITY_RT)
 					immediate_tick = true;
 			}
 		}
 
-		if (!group->blocked_queues)
+		if (!group->blocked_queues) {
 			list_del_init(&group->wait_node);
+			trace_panthor_group_wait(panthor_group_trace_id(group), false);
+		}
 	}
 	mutex_unlock(&sched->lock);
 
@@ -3043,6 +3238,9 @@ static bool queue_check_job_completion(struct panthor_queue *queue)
 	struct panthor_syncobj_64b *syncobj = NULL;
 	struct panthor_job *job, *job_tmp;
 	bool cookie, progress = false;
+	u32 drained_count = 0;
+	u64 last_seqno = 0, group_id = 0;
+	u32 queue_idx = 0;
 	LIST_HEAD(done_jobs);
 
 	cookie = dma_fence_begin_signalling();
@@ -3053,6 +3251,8 @@ static bool queue_check_job_completion(struct panthor_queue *queue)
 
 			syncobj = group->syncobjs->kmap +
 				  (job->queue_idx * sizeof(*syncobj));
+			group_id = panthor_group_trace_id(group);
+			queue_idx = job->queue_idx;
 		}
 
 		if (syncobj->seqno < job->done_fence->seqno)
@@ -3060,7 +3260,20 @@ static bool queue_check_job_completion(struct panthor_queue *queue)
 
 		list_move_tail(&job->node, &done_jobs);
 		dma_fence_signal_locked(job->done_fence);
+		trace_panthor_submit_fence_signal(panthor_group_trace_id(job->group),
+						  job->queue_idx,
+						  job->done_fence->seqno,
+						  job->done_fence->error);
+		trace_panthor_job_status(job->done_fence->seqno,
+					 panthor_group_trace_id(job->group),
+					 job->queue_idx,
+					 job->done_fence->error ? "fault" : "done");
+		last_seqno = job->done_fence->seqno;
+		drained_count++;
 	}
+	if (drained_count)
+		trace_panthor_sync_upd_drain(group_id, queue_idx, last_seqno,
+					     drained_count);
 
 	if (list_empty(&queue->fence_ctx.in_flight_jobs)) {
 		/* If we have no job left, we cancel the timer, and reset remaining
@@ -3355,6 +3568,38 @@ queue_run_job(struct drm_sched_job *sched_job)
 	queue->iface.input->extract = queue->iface.output->extract;
 	queue->iface.input->insert = job->ringbuf.end;
 
+	trace_panthor_job_submit(job->done_fence->seqno,
+				 panthor_group_trace_id(group),
+				 job->queue_idx, job->call_info.size);
+	trace_panthor_job_status(job->done_fence->seqno,
+				 panthor_group_trace_id(group),
+				 job->queue_idx, "running");
+
+	{
+		u64 *ringbuf = queue->ringbuf->kmap;
+		u64 ringbuf_sz = panthor_kernel_bo_size(queue->ringbuf);
+		u64 start_off = job->ringbuf.start & (ringbuf_sz - 1);
+		u64 w[4] = {0};
+		u32 i;
+
+		for (i = 0; i < 4; i++) {
+			u64 off = (start_off + i * sizeof(u64)) & (ringbuf_sz - 1);
+
+			w[i] = ringbuf[off / sizeof(u64)];
+		}
+		trace_panthor_cs_ringbuf_dump(panthor_group_trace_id(group),
+					      job->queue_idx, job->ringbuf.start,
+					      w[0], w[1], w[2], w[3]);
+	}
+	trace_panthor_fw_cs_ringbuf_publish(panthor_group_trace_id(group),
+					    job->queue_idx,
+					    queue->iface.input->insert,
+					    queue->iface.input->extract);
+	trace_panthor_cs_ring_ptrs(panthor_group_trace_id(group),
+				   job->queue_idx,
+				   queue->iface.input->insert,
+				   queue->iface.input->extract);
+
 	if (group->csg_id < 0) {
 		group_schedule_locked(group, BIT(job->queue_idx));
 	} else {
@@ -3366,11 +3611,16 @@ queue_run_job(struct drm_sched_job *sched_job)
 
 		/* We just added something to the queue, so it's no longer idle. */
 		group->idle_queues &= ~queue_mask;
+		trace_panthor_queue_idle_state(panthor_group_trace_id(group),
+					       job->queue_idx, false);
 
 		if (resume_tick)
 			sched_resume_tick(ptdev);
 
 		gpu_write(ptdev, CSF_DOORBELL(queue->doorbell_id), 1);
+		trace_panthor_queue_doorbell(panthor_group_trace_id(group),
+					     job->queue_idx, queue->doorbell_id);
+		trace_panthor_fw_doorbell_ring(queue->doorbell_id);
 		if (!sched->pm.has_ref &&
 		    !(group->blocked_queues & BIT(job->queue_idx))) {
 			pm_runtime_get(ptdev->base.dev);
@@ -3406,12 +3656,16 @@ queue_timedout_job(struct drm_sched_job *sched_job)
 	drm_warn(&ptdev->base, "job timeout: pid=%d, comm=%s, seqno=%llu\n",
 		 group->task_info.pid, group->task_info.comm, job->done_fence->seqno);
 
+	trace_panthor_queue_timeout_state(panthor_group_trace_id(group),
+					  job->queue_idx, true);
+
 	drm_WARN_ON(&ptdev->base, atomic_read(&sched->reset.in_progress));
 
 	queue_stop(queue, job);
 
 	mutex_lock(&sched->lock);
 	group->timedout = true;
+	trace_panthor_group_timedout(panthor_group_trace_id(group));
 	if (group->csg_id >= 0) {
 		sched_queue_delayed_work(ptdev->scheduler, tick, 0);
 	} else {
@@ -3846,6 +4100,11 @@ int panthor_group_get_state(struct panthor_file *pfile,
 		get_state->state |= DRM_PANTHOR_GROUP_STATE_INNOCENT;
 	mutex_unlock(&sched->lock);
 
+	trace_panthor_group_state_query(panthor_vm_get_trace_id(group->vm),
+					panthor_group_trace_id(group),
+					get_state->state,
+					get_state->fatal_queues);
+
 	group_put(group);
 	return 0;
 }
@@ -3952,6 +4211,61 @@ struct panthor_vm *panthor_job_vm(struct drm_sched_job *sched_job)
 	return job->group->vm;
 }
 
+/*
+ * Snapshot the first 64-bit word of the user CS stream and emit a
+ * panthor_user_stream_head trace. Called from panthor_job_create() (ioctl
+ * context, no dma-fence signalling section active), so drm_gem_vmap()'s
+ * dma_resv_lock acquisition is safe here.
+ *
+ * Mirrors Tyr's read_user_stream_head() in drivers/gpu/drm/tyr/sched/job.rs,
+ * sharing PANTHOR_USER_STREAM_HEAD_STATUS values so traces diff cleanly.
+ */
+#define PANTHOR_USER_STREAM_HEAD_SENTINEL	0xDEADBEEFDEADBEEFULL
+
+static void panthor_job_trace_user_stream_head(struct panthor_job *job)
+{
+	struct panthor_group *group = job->group;
+	u64 stream_va = job->call_info.start;
+	u64 first_qword = PANTHOR_USER_STREAM_HEAD_SENTINEL;
+	u64 group_id = panthor_group_trace_id(group);
+	u32 cs_id = job->queue_idx;
+	struct panthor_gem_object *bo;
+	struct drm_gem_object *obj;
+	struct iosys_map map;
+	u64 bo_offset = 0;
+	u32 status = 1;
+	int ret;
+
+	bo = panthor_vm_get_bo_for_va(group->vm, stream_va, &bo_offset);
+	if (IS_ERR_OR_NULL(bo))
+		goto out_trace;
+
+	obj = &bo->base.base;
+
+	if (bo_offset + sizeof(u64) > obj->size) {
+		status = 2;
+		goto out_put;
+	}
+
+	ret = drm_gem_vmap(obj, &map);
+	if (ret) {
+		status = 2;
+		goto out_put;
+	}
+
+	first_qword = iosys_map_rd(&map, bo_offset, u64);
+	status = 0;
+
+	drm_gem_vunmap(obj, &map);
+
+out_put:
+	drm_gem_object_put(obj);
+
+out_trace:
+	trace_panthor_user_stream_head(group_id, cs_id, stream_va,
+				       first_qword, status);
+}
+
 struct drm_sched_job *
 panthor_job_create(struct panthor_file *pfile,
 		   u16 group_handle,
@@ -4031,6 +4345,9 @@ panthor_job_create(struct panthor_file *pfile,
 				 credits, job->group, drm_client_id);
 	if (ret)
 		goto err_put_job;
+
+	if (job->call_info.size)
+		panthor_job_trace_user_stream_head(job);
 
 	return &job->base;
 

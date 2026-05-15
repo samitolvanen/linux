@@ -1019,6 +1019,9 @@ static int panthor_fw_init_ifaces(struct panthor_device *ptdev)
 		 CSF_IFACE_VERSION_PATCH(glb_iface->control->version),
 		 glb_iface->control->features,
 		 panthor_get_instr_features(ptdev));
+	trace_panthor_fw_boot_complete(glb_iface->control->version,
+				       glb_iface->control->group_num,
+				       ptdev->fw->iface.groups[0].control->stream_num);
 	return 0;
 }
 
@@ -1051,8 +1054,14 @@ static void panthor_fw_init_global_iface(struct panthor_device *ptdev)
 			       GLB_CFG_ALLOC_EN |
 			       GLB_CFG_POWEROFF_TIMER |
 			       GLB_CFG_PROGRESS_TIMER);
+	trace_panthor_fw_glb_req(READ_ONCE(glb_iface->input->req),
+				 GLB_CFG_ALLOC_EN |
+				 GLB_CFG_POWEROFF_TIMER |
+				 GLB_CFG_PROGRESS_TIMER);
+	trace_panthor_fw_glb_alloc_en(glb_iface->input->core_en_mask);
 
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
+	trace_panthor_fw_doorbell_ring(CSF_GLB_DOORBELL_ID);
 
 	/* Kick the watchdog. */
 	mod_delayed_work(ptdev->reset.wq, &ptdev->fw->watchdog.ping_work,
@@ -1066,6 +1075,9 @@ static void panthor_job_irq_handler(struct panthor_device *ptdev, u32 status)
 
 	if (tracepoint_enabled(gpu_job_irq))
 		start = ktime_get_ns();
+
+	trace_panthor_fw_irq(status);
+	trace_panthor_job_irq_clear(status);
 
 	gpu_write(ptdev, JOB_INT_CLEAR, status);
 
@@ -1295,6 +1307,7 @@ void panthor_fw_unplug(struct panthor_device *ptdev)
 
 /**
  * panthor_fw_wait_acks() - Wait for requests to be acknowledged by the FW.
+ * @csg_id: CSG slot ID for tracing, or U32_MAX when waiting on the global iface.
  * @req_ptr: Pointer to the req register.
  * @ack_ptr: Pointer to the ack register.
  * @wq: Wait queue to use for the sleeping wait.
@@ -1305,13 +1318,16 @@ void panthor_fw_unplug(struct panthor_device *ptdev)
  *
  * Return: 0 on success, -ETIMEDOUT otherwise.
  */
-static int panthor_fw_wait_acks(const u32 *req_ptr, const u32 *ack_ptr,
+static int panthor_fw_wait_acks(u32 csg_id,
+				const u32 *req_ptr, const u32 *ack_ptr,
 				wait_queue_head_t *wq,
 				u32 req_mask, u32 *acked,
 				u32 timeout_ms)
 {
 	u32 ack, req = READ_ONCE(*req_ptr) & req_mask;
 	int ret;
+
+	trace_panthor_fw_csg_ack_poll(csg_id, req, READ_ONCE(*ack_ptr), req_mask);
 
 	/* Busy wait for a few µsecs before falling back to a sleeping wait. */
 	*acked = req_mask;
@@ -1328,6 +1344,7 @@ static int panthor_fw_wait_acks(const u32 *req_ptr, const u32 *ack_ptr,
 
 	/* Check one last time, in case we were not woken up for some reason. */
 	ack = READ_ONCE(*ack_ptr);
+	trace_panthor_fw_csg_ack_poll(csg_id, req, ack, req_mask);
 	if ((ack & req_mask) == req)
 		return 0;
 
@@ -1355,7 +1372,8 @@ int panthor_fw_glb_wait_acks(struct panthor_device *ptdev,
 	if (drm_WARN_ON(&ptdev->base, req_mask & (~GLB_REQ_MASK | GLB_HALT)))
 		return -EINVAL;
 
-	return panthor_fw_wait_acks(&glb_iface->input->req,
+	return panthor_fw_wait_acks(U32_MAX,
+				    &glb_iface->input->req,
 				    &glb_iface->output->ack,
 				    &ptdev->fw->req_waitqueue,
 				    req_mask, acked, timeout_ms);
@@ -1381,7 +1399,8 @@ int panthor_fw_csg_wait_acks(struct panthor_device *ptdev, u32 csg_slot,
 	if (drm_WARN_ON(&ptdev->base, req_mask & ~CSG_REQ_MASK))
 		return -EINVAL;
 
-	ret = panthor_fw_wait_acks(&csg_iface->input->req,
+	ret = panthor_fw_wait_acks(csg_slot,
+				   &csg_iface->input->req,
 				   &csg_iface->output->ack,
 				   &ptdev->fw->req_waitqueue,
 				   req_mask, acked, timeout_ms);
@@ -1412,7 +1431,10 @@ void panthor_fw_ring_csg_doorbells(struct panthor_device *ptdev, u32 csg_mask)
 	struct panthor_fw_global_iface *glb_iface = panthor_fw_get_glb_iface(ptdev);
 
 	panthor_fw_toggle_reqs(glb_iface, doorbell_req, doorbell_ack, csg_mask);
+	trace_panthor_fw_glb_doorbell_req(READ_ONCE(glb_iface->input->doorbell_req),
+					  csg_mask);
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
+	trace_panthor_fw_doorbell_ring(CSF_GLB_DOORBELL_ID);
 }
 
 static void panthor_fw_ping_work(struct work_struct *work)
@@ -1427,7 +1449,9 @@ static void panthor_fw_ping_work(struct work_struct *work)
 		return;
 
 	panthor_fw_toggle_reqs(glb_iface, req, ack, GLB_PING);
+	trace_panthor_fw_glb_req(READ_ONCE(glb_iface->input->req), GLB_PING);
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
+	trace_panthor_fw_doorbell_ring(CSF_GLB_DOORBELL_ID);
 
 	ret = panthor_fw_glb_wait_acks(ptdev, GLB_PING, &acked, 100);
 	if (ret) {

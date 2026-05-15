@@ -37,6 +37,7 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+#include "panthor_trace.h"
 
 /**
  * DOC: user <-> kernel object copy helpers.
@@ -311,6 +312,22 @@ struct panthor_submit_ctx {
 
 	/** @exec: drm_exec context used to acquire and prepare resv objects. */
 	struct drm_exec exec;
+
+	/**
+	 * @emit_vm_bind_traces: True when this submit context is driven by
+	 * %DRM_IOCTL_PANTHOR_VM_BIND with %DRM_PANTHOR_VM_BIND_ASYNC. Used to
+	 * gate the panthor_vm_bind_wait_fence tracepoint so it only fires on
+	 * the VM_BIND path, mirroring Tyr's eager-resolution emission point.
+	 * Kept separate from @vm_bind_trace_vm_id so the gate is independent
+	 * of the identifier value space.
+	 */
+	bool emit_vm_bind_traces;
+
+	/**
+	 * @vm_bind_trace_vm_id: panthor_vm_trace_id() of the targeted VM,
+	 * meaningful only when @emit_vm_bind_traces is true.
+	 */
+	u64 vm_bind_trace_vm_id;
 };
 
 #define PANTHOR_SYNC_OP_FLAGS_MASK \
@@ -636,6 +653,13 @@ panthor_submit_ctx_add_sync_deps_to_job(struct panthor_submit_ctx *ctx,
 				return ret;
 		}
 
+		if (ctx->emit_vm_bind_traces)
+			trace_panthor_vm_bind_wait_fence(ctx->vm_bind_trace_vm_id,
+							 job_idx, i,
+							 fence->context,
+							 fence->seqno,
+							 dma_fence_is_signaled(fence));
+
 		ret = drm_sched_job_add_dependency(job, fence);
 		if (ret)
 			return ret;
@@ -732,6 +756,8 @@ static int panthor_submit_ctx_init(struct panthor_submit_ctx *ctx,
 
 	ctx->file = file;
 	ctx->job_count = job_count;
+	ctx->emit_vm_bind_traces = false;
+	ctx->vm_bind_trace_vm_id = 0;
 	INIT_LIST_HEAD(&ctx->signals);
 	drm_exec_init(&ctx->exec,
 		      DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES,
@@ -1337,6 +1363,7 @@ static int panthor_ioctl_vm_bind_async(struct drm_device *ddev,
 	struct drm_panthor_vm_bind_op *jobs_args;
 	struct panthor_submit_ctx ctx;
 	struct panthor_vm *vm;
+	u64 vm_trace_id;
 	int ret = 0;
 
 	vm = panthor_vm_pool_get_vm(pfile->vms, args->vm_id);
@@ -1351,9 +1378,18 @@ static int panthor_ioctl_vm_bind_async(struct drm_device *ddev,
 	if (ret)
 		goto out_free_jobs_args;
 
+	vm_trace_id = panthor_vm_get_trace_id(vm);
+	ctx.emit_vm_bind_traces = true;
+	ctx.vm_bind_trace_vm_id = vm_trace_id;
+	trace_panthor_vm_bind_ioctl_entry(vm_trace_id, 1, args->ops.count,
+					  panthor_vm_get_inflight_bookkeep_fences(vm));
+
 	for (u32 i = 0; i < args->ops.count; i++) {
 		struct drm_panthor_vm_bind_op *op = &jobs_args[i];
+		const struct drm_panthor_sync_op *syncops;
 		struct drm_sched_job *job;
+		u32 op_kind = (op->flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) >> 28;
+		u32 n_waits = 0, n_signals = 0;
 
 		job = panthor_vm_bind_job_create(file, vm, op);
 		if (IS_ERR(job)) {
@@ -1364,6 +1400,24 @@ static int panthor_ioctl_vm_bind_async(struct drm_device *ddev,
 		ret = panthor_submit_ctx_add_job(&ctx, i, job, &op->syncs);
 		if (ret)
 			goto out_cleanup_submit_ctx;
+
+		syncops = ctx.jobs[i].syncops;
+		for (u32 j = 0; j < ctx.jobs[i].syncop_count; j++) {
+			bool is_signal = sync_op_is_signal(&syncops[j]);
+
+			if (is_signal)
+				n_signals++;
+			else
+				n_waits++;
+
+			trace_panthor_vm_bind_syncop(vm_trace_id, i, j,
+						     is_signal ? 1 : 0,
+						     syncops[j].handle,
+						     syncops[j].timeline_value);
+		}
+
+		trace_panthor_vm_bind_op(vm_trace_id, op_kind, op->va, op->size,
+					 n_waits, n_signals);
 	}
 
 	ret = panthor_submit_ctx_collect_jobs_signal_ops(&ctx);
@@ -1405,6 +1459,7 @@ static int panthor_ioctl_vm_bind_sync(struct drm_device *ddev,
 	struct panthor_file *pfile = file->driver_priv;
 	struct drm_panthor_vm_bind_op *jobs_args;
 	struct panthor_vm *vm;
+	u64 vm_trace_id;
 	int ret;
 
 	vm = panthor_vm_pool_get_vm(pfile->vms, args->vm_id);
@@ -1415,8 +1470,18 @@ static int panthor_ioctl_vm_bind_sync(struct drm_device *ddev,
 	if (ret)
 		goto out_put_vm;
 
+	vm_trace_id = panthor_vm_get_trace_id(vm);
+	trace_panthor_vm_bind_ioctl_entry(vm_trace_id, 0, args->ops.count,
+					  panthor_vm_get_inflight_bookkeep_fences(vm));
+
 	for (u32 i = 0; i < args->ops.count; i++) {
-		ret = panthor_vm_bind_exec_sync_op(file, vm, &jobs_args[i]);
+		struct drm_panthor_vm_bind_op *op = &jobs_args[i];
+		u32 op_kind = (op->flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) >> 28;
+
+		trace_panthor_vm_bind_op_sync(vm_trace_id, op_kind, op->va,
+					      op->size, 0, 0);
+
+		ret = panthor_vm_bind_exec_sync_op(file, vm, op);
 		if (ret) {
 			/* Update ops.count so the user knows where things failed. */
 			args->ops.count = i;

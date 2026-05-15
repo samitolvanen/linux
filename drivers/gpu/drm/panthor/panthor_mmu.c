@@ -35,6 +35,11 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+#include "panthor_trace.h"
+
+/* Returns 0 for the MCU VM to match Tyr's stable pool-handle convention. */
+#define panthor_vm_trace_id(vm) \
+	((vm)->for_mcu ? 0ULL : (u64)(uintptr_t)(vm))
 
 #define MAX_AS_SLOTS			32
 
@@ -574,12 +579,17 @@ PANTHOR_IRQ_HANDLER(mmu, MMU, panthor_mmu_irq_handler);
 static int panthor_mmu_as_enable(struct panthor_device *ptdev, u32 as_nr,
 				 u64 transtab, u64 transcfg, u64 memattr)
 {
+	struct panthor_vm *vm = ptdev->mmu->as.slots[as_nr].vm;
+
 	panthor_mmu_irq_enable_events(&ptdev->mmu->irq,
 				      panthor_mmu_as_fault_mask(ptdev, as_nr));
 
 	gpu_write64(ptdev, AS_TRANSTAB(as_nr), transtab);
 	gpu_write64(ptdev, AS_MEMATTR(as_nr), memattr);
 	gpu_write64(ptdev, AS_TRANSCFG(as_nr), transcfg);
+
+	trace_panthor_as_slot_assign(vm ? panthor_vm_trace_id(vm) : 0,
+				     as_nr, true);
 
 	return as_send_cmd_and_wait(ptdev, as_nr, AS_COMMAND_UPDATE);
 }
@@ -591,6 +601,9 @@ static int panthor_mmu_as_disable(struct panthor_device *ptdev, u32 as_nr,
 	int ret;
 
 	lockdep_assert_held(&ptdev->mmu->as.slots_lock);
+
+	trace_panthor_as_slot_assign(vm ? panthor_vm_trace_id(vm) : 0,
+				     as_nr, false);
 
 	panthor_mmu_irq_disable_events(&ptdev->mmu->irq,
 				       panthor_mmu_as_fault_mask(ptdev, as_nr));
@@ -2088,7 +2101,7 @@ static void panthor_vma_init(struct panthor_vma *vma, u32 flags)
 	vma->flags = flags;
 }
 
-#define PANTHOR_VM_MAP_FLAGS \
+#define PANTHOR_VMA_MAP_FLAGS \
 	(DRM_PANTHOR_VM_BIND_OP_MAP_READONLY | \
 	 DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC | \
 	 DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
@@ -2103,11 +2116,17 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 	if (!vma)
 		return -EINVAL;
 
-	panthor_vma_init(vma, op_ctx->flags & PANTHOR_VM_MAP_FLAGS);
+	panthor_vma_init(vma, op_ctx->flags & PANTHOR_VMA_MAP_FLAGS);
+
+	trace_panthor_gpuvm_node_op(panthor_vm_trace_id(vm), 0,
+				    op->map.va.addr, op->map.va.range);
 
 	ret = panthor_vm_map_pages(vm, op->map.va.addr, flags_to_prot(vma->flags),
 				   op_ctx->map.sgt, op->map.gem.offset,
 				   op->map.va.range);
+	trace_panthor_vm_map_bo(panthor_vm_trace_id(vm),
+				op->map.va.addr, op->map.va.range,
+				op_ctx->flags & PANTHOR_VMA_MAP_FLAGS, ret);
 	if (ret) {
 		panthor_vm_op_ctx_return_vma(op_ctx, vma);
 		return ret;
@@ -2185,6 +2204,9 @@ static int panthor_gpuva_sm_step_remap(struct drm_gpuva_op *op,
 	 */
 	unmap_hugepage_align(&op->remap, &unmap_start, &unmap_range);
 
+	trace_panthor_gpuvm_node_op(panthor_vm_trace_id(vm), 2,
+				    unmap_start, unmap_range);
+
 	/* If the range changed, we might have to lock a wider region to guarantee
 	 * atomicity. panthor_vm_lock_region() bails out early if the new region
 	 * is already part of the locked region, so no need to do this check here.
@@ -2247,8 +2269,15 @@ static int panthor_gpuva_sm_step_unmap(struct drm_gpuva_op *op,
 	struct panthor_vma *unmap_vma = container_of(op->unmap.va, struct panthor_vma, base);
 	struct panthor_vm *vm = priv;
 
+	trace_panthor_gpuvm_node_op(panthor_vm_trace_id(vm), 1,
+				    unmap_vma->base.va.addr,
+				    unmap_vma->base.va.range);
+
 	panthor_vm_unmap_pages(vm, unmap_vma->base.va.addr,
 			       unmap_vma->base.va.range);
+	trace_panthor_vm_unmap_bo(panthor_vm_trace_id(vm),
+				  unmap_vma->base.va.addr,
+				  unmap_vma->base.va.range, 0);
 	drm_gpuva_unmap(&op->unmap);
 	panthor_vma_unlink(unmap_vma);
 	return 0;
@@ -2279,6 +2308,55 @@ struct drm_gem_object *panthor_vm_root_gem(struct panthor_vm *vm)
 		return NULL;
 
 	return vm->base.r_obj;
+}
+
+/**
+ * panthor_vm_get_trace_id() - VM identifier used in tracepoints.
+ * @vm: VM to identify.
+ *
+ * Returns the same value the panthor_vm_trace_id() in-file macro produces,
+ * exposed so that tracepoint call sites outside panthor_mmu.c (notably
+ * panthor_drv.c) can label events with a stable handle. The MCU VM reports
+ * 0 to match Tyr's firmware-VM convention.
+ */
+u64 panthor_vm_get_trace_id(struct panthor_vm *vm)
+{
+	return panthor_vm_trace_id(vm);
+}
+
+/**
+ * panthor_vm_get_inflight_bookkeep_fences() - Count unsignalled BOOKKEEP
+ * fences currently attached to the VM resv.
+ * @vm: VM to inspect.
+ *
+ * Lock-free: uses the RCU-based unlocked dma_resv iterator so it is safe
+ * to call from any context, including a dma-fence signalling section.
+ * The unlocked iterator can restart if the resv is mutated concurrently;
+ * the accumulator is reset on each restart per dma_resv_iter_is_restarted().
+ *
+ * Used by the panthor_vm_bind_ioctl_entry / panthor_vm_bind_unmap_exec
+ * tracepoints to mirror Tyr's in_flight_fences field.
+ */
+u32 panthor_vm_get_inflight_bookkeep_fences(struct panthor_vm *vm)
+{
+	struct dma_resv *resv = panthor_vm_resv(vm);
+	struct dma_resv_iter cursor;
+	struct dma_fence *fence;
+	u32 count = 0;
+
+	if (!resv)
+		return 0;
+
+	dma_resv_iter_begin(&cursor, resv, DMA_RESV_USAGE_BOOKKEEP);
+	dma_resv_for_each_fence_unlocked(&cursor, fence) {
+		if (dma_resv_iter_is_restarted(&cursor))
+			count = 0;
+		if (!dma_fence_is_signaled(fence))
+			count++;
+	}
+	dma_resv_iter_end(&cursor);
+
+	return count;
 }
 
 static int
@@ -2341,8 +2419,18 @@ static struct dma_fence *
 panthor_vm_bind_run_job(struct drm_sched_job *sched_job)
 {
 	struct panthor_vm_bind_job *job = container_of(sched_job, struct panthor_vm_bind_job, base);
+	u64 vm_id = panthor_vm_trace_id(job->vm);
+	u64 va = job->ctx.va.addr;
+	u64 size = job->ctx.va.range;
 	bool cookie;
 	int ret;
+
+	trace_panthor_mmu_bind_start(vm_id, va, size);
+
+	if ((job->ctx.flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) ==
+	    DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP)
+		trace_panthor_vm_bind_unmap_exec(vm_id, va, size,
+			panthor_vm_get_inflight_bookkeep_fences(job->vm));
 
 	/* Not only we report an error whose result is propagated to the
 	 * drm_sched finished fence, but we also flag the VM as unusable, because
@@ -2352,6 +2440,8 @@ panthor_vm_bind_run_job(struct drm_sched_job *sched_job)
 	cookie = dma_fence_begin_signalling();
 	ret = panthor_vm_exec_op(job->vm, &job->ctx, true);
 	dma_fence_end_signalling(cookie);
+
+	trace_panthor_mmu_bind_done(vm_id, va, size, ret);
 
 	return ret ? ERR_PTR(ret) : NULL;
 }

@@ -12,6 +12,7 @@
 
 #include "panthor_devfreq.h"
 #include "panthor_device.h"
+#include "panthor_trace.h"
 
 /**
  * struct panthor_devfreq - Device frequency management
@@ -64,6 +65,7 @@ static int panthor_devfreq_target(struct device *dev, unsigned long *freq,
 				  u32 flags)
 {
 	struct dev_pm_opp *opp;
+	unsigned long prev_freq;
 	int err;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
@@ -71,7 +73,10 @@ static int panthor_devfreq_target(struct device *dev, unsigned long *freq,
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
 
+	prev_freq = clk_get_rate(((struct panthor_device *)dev_get_drvdata(dev))->clks.core);
 	err = dev_pm_opp_set_rate(dev, *freq);
+
+	trace_panthor_devfreq_target(prev_freq, *freq);
 
 	return err;
 }
@@ -104,6 +109,9 @@ static int panthor_devfreq_get_dev_status(struct device *dev,
 	panthor_devfreq_reset(pdevfreq);
 
 	spin_unlock_irqrestore(&pdevfreq->lock, irqflags);
+
+	trace_panthor_devfreq_status(status->busy_time, status->total_time,
+				     status->current_frequency);
 
 	drm_dbg(&ptdev->base, "busy %lu total %lu %lu %% freq %lu MHz\n",
 		status->busy_time, status->total_time,
@@ -289,6 +297,7 @@ void panthor_devfreq_record_busy(struct panthor_device *ptdev)
 {
 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
 	unsigned long irqflags;
+	u64 prev_busy_ns, prev_idle_ns;
 
 	if (!pdevfreq->devfreq)
 		return;
@@ -296,15 +305,20 @@ void panthor_devfreq_record_busy(struct panthor_device *ptdev)
 	spin_lock_irqsave(&pdevfreq->lock, irqflags);
 
 	panthor_devfreq_update_utilization(pdevfreq);
+	prev_busy_ns = ktime_to_ns(pdevfreq->busy_time);
+	prev_idle_ns = ktime_to_ns(pdevfreq->idle_time);
 	pdevfreq->last_busy_state = true;
 
 	spin_unlock_irqrestore(&pdevfreq->lock, irqflags);
+
+	trace_panthor_devfreq_mark(true, prev_busy_ns, prev_idle_ns);
 }
 
 void panthor_devfreq_record_idle(struct panthor_device *ptdev)
 {
 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
 	unsigned long irqflags;
+	u64 prev_busy_ns, prev_idle_ns;
 
 	if (!pdevfreq->devfreq)
 		return;
@@ -312,9 +326,13 @@ void panthor_devfreq_record_idle(struct panthor_device *ptdev)
 	spin_lock_irqsave(&pdevfreq->lock, irqflags);
 
 	panthor_devfreq_update_utilization(pdevfreq);
+	prev_busy_ns = ktime_to_ns(pdevfreq->busy_time);
+	prev_idle_ns = ktime_to_ns(pdevfreq->idle_time);
 	pdevfreq->last_busy_state = false;
 
 	spin_unlock_irqrestore(&pdevfreq->lock, irqflags);
+
+	trace_panthor_devfreq_mark(false, prev_busy_ns, prev_idle_ns);
 }
 
 unsigned long panthor_devfreq_get_freq(struct panthor_device *ptdev)
