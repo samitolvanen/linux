@@ -17,6 +17,7 @@
 #include "panthor_fw.h"
 #include "panthor_gem.h"
 #include "panthor_mmu.h"
+#include "panthor_trace.h"
 
 void panthor_gem_init(struct panthor_device *ptdev)
 {
@@ -223,6 +224,9 @@ panthor_kernel_bo_create(struct panthor_device *ptdev, struct panthor_vm *vm,
 		goto err_free_va;
 
 	kbo->vm = panthor_vm_get(vm);
+	trace_panthor_kernel_bo_create(name, kbo->va_node.start, size, bo_flags,
+				       vm_map_flags, vm == panthor_fw_vm(ptdev),
+				       0);
 	return kbo;
 
 err_free_va:
@@ -233,6 +237,8 @@ err_put_obj:
 
 err_free_bo:
 	kfree(kbo);
+	trace_panthor_kernel_bo_create(name, 0, size, bo_flags, vm_map_flags,
+				       vm == panthor_fw_vm(ptdev), ret);
 	return ERR_PTR(ret);
 }
 
