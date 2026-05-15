@@ -593,25 +593,18 @@ pub(crate) struct Vm {
 }
 
 impl Vm {
-    fn new_with_va_range<Ctx: DeviceContext>(
+    fn new_with_ranges<Ctx: DeviceContext>(
         pdev: &platform::Device,
         ddev: &TyrDrmDevice<Ctx>,
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
-        range: Range<u64>,
+        total_range: Range<u64>,
+        kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
         let pa_bits = mmu_features.pa_bits().get();
-
-        let total_va_end = if range.end >= max_va_range(gpu_info) {
-            max_va_range(gpu_info)
-        } else {
-            range.end + MIN_KERNEL_VA_SIZE
-        };
-        let total_range = range.start..total_va_end;
-        let kernel_range = (total_va_end - MIN_KERNEL_VA_SIZE)..total_va_end;
 
         let reserve_range = 0..0u64;
 
@@ -671,17 +664,23 @@ impl Vm {
         Ok(vm)
     }
 
-    /// Creates a new GPU virtual address space.
+    /// Creates the firmware MCU VM with an explicit kernel auto-VA window.
     ///
-    /// The VM is initialized with a page table configured according to the GPU's
-    /// address translation capabilities and registered with the GPUVM framework.
-    pub(crate) fn new<Ctx: DeviceContext>(
+    /// Callers must reserve any explicit-VA sections inside the window with
+    /// [`reserve_kernel_range`](Self::reserve_kernel_range) before
+    /// [`alloc_kernel_range`](Self::alloc_kernel_range) is called.
+    pub(crate) fn new_fw<Ctx: DeviceContext>(
         pdev: &platform::Device,
         ddev: &TyrDrmDevice<Ctx>,
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
+        auto_kernel_va_start: u64,
+        auto_kernel_va_size: u64,
     ) -> Result<Arc<Vm>> {
-        Self::new_with_va_range(pdev, ddev, mmu, gpu_info, 0..max_va_range(gpu_info), None)
+        let total_range = 0..max_va_range(gpu_info);
+        let kernel_range = auto_kernel_va_start..(auto_kernel_va_start + auto_kernel_va_size);
+
+        Self::new_with_ranges(pdev, ddev, mmu, gpu_info, total_range, kernel_range, None)
     }
 
     pub(crate) fn new_for_user(
@@ -693,12 +692,21 @@ impl Vm {
     ) -> Result<Arc<Vm>> {
         let user_va_range = normalize_user_va_range(gpu_info, user_va_range);
 
-        Self::new_with_va_range(
+        let total_va_end = if user_va_range >= max_va_range(gpu_info) {
+            max_va_range(gpu_info)
+        } else {
+            user_va_range + MIN_KERNEL_VA_SIZE
+        };
+        let total_range = 0..total_va_end;
+        let kernel_range = (total_va_end - MIN_KERNEL_VA_SIZE)..total_va_end;
+
+        Self::new_with_ranges(
             pdev,
             ddev,
             mmu,
             gpu_info,
-            0..user_va_range,
+            total_range,
+            kernel_range,
             Some(ddev.wq.clone()),
         )
     }
@@ -735,7 +743,10 @@ impl Vm {
         f(prepared_vm)
     }
 
-    #[expect(dead_code)]
+    /// Reserves `[start, end)` in the kernel auto-VA window so future
+    /// [`alloc_kernel_range`](Self::alloc_kernel_range) calls cannot hand
+    /// out an overlapping range. Used for explicit-VA mappings created
+    /// before the auto-allocator opens.
     pub(crate) fn reserve_kernel_range(&self, start: u64, end: u64) -> Result {
         let node = self.kernel_va.insert(start, end, GFP_KERNEL)?;
         self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
