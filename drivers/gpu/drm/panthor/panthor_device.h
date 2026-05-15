@@ -246,6 +246,14 @@ struct panthor_device {
 	/** @fast_rate: Maximum device clock frequency. Set by DVFS */
 	unsigned long fast_rate;
 
+	/**
+	 * @heap_dump_work: Periodic heap-state dump for the
+	 * panthor_heap_context_dump / panthor_heap_chunk_dump tracepoints.
+	 *
+	 * Downstream debug aid only, not for upstream.
+	 */
+	struct delayed_work heap_dump_work;
+
 #ifdef CONFIG_DEBUG_FS
 	/** @gems: Device-wide list of GEM objects owned by at least one file. */
 	struct {
