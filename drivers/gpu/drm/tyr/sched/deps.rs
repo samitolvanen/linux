@@ -190,6 +190,10 @@ pub(crate) fn append_syncops(
     count: u32,
     stride: u32,
 ) -> Result {
+    if count == 0 {
+        return Ok(());
+    }
+
     if stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
         return Err(ENOTSUPP);
     }
