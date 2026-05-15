@@ -22,10 +22,30 @@
 #include "panthor_fw_regs.h"
 #include "panthor_gem.h"
 #include "panthor_gpu.h"
+#include "panthor_heap.h"
 #include "panthor_hw.h"
 #include "panthor_mmu.h"
 #include "panthor_pwr.h"
 #include "panthor_sched.h"
+#include "panthor_trace.h"
+
+#define PANTHOR_HEAP_DUMP_INTERVAL_MS	1000
+
+static void panthor_heap_dump_work(struct work_struct *work)
+{
+	struct panthor_device *ptdev = container_of(work, struct panthor_device,
+						    heap_dump_work.work);
+
+	/* Walking the heap pools contends with the tiler-OOM grow path, so
+	 * stay a cheap re-arm unless a dump tracepoint is enabled, matching
+	 * the Tyr dump worker.
+	 */
+	if (trace_panthor_heap_context_dump_enabled() ||
+	    trace_panthor_heap_chunk_dump_enabled())
+		panthor_mmu_dump_heap_pools_for_trace(ptdev);
+	queue_delayed_work(system_long_wq, &ptdev->heap_dump_work,
+			   msecs_to_jiffies(PANTHOR_HEAP_DUMP_INTERVAL_MS));
+}
 
 static int panthor_clk_init(struct panthor_device *ptdev)
 {
@@ -90,6 +110,8 @@ void panthor_device_unplug(struct panthor_device *ptdev)
 	 * future callers will wait on ptdev->unplug.done anyway.
 	 */
 	mutex_unlock(&ptdev->unplug.lock);
+
+	cancel_delayed_work_sync(&ptdev->heap_dump_work);
 
 	/* Now, try to cleanly shutdown the GPU before the device resources
 	 * get reclaimed.
@@ -292,6 +314,10 @@ int panthor_device_init(struct panthor_device *ptdev)
 	/* Now that everything is initialized, we can enable the reset work. */
 	enable_work(&ptdev->reset.work);
 
+	INIT_DELAYED_WORK(&ptdev->heap_dump_work, panthor_heap_dump_work);
+	queue_delayed_work(system_long_wq, &ptdev->heap_dump_work,
+			   msecs_to_jiffies(PANTHOR_HEAP_DUMP_INTERVAL_MS));
+
 	/* ~3 frames */
 	pm_runtime_set_autosuspend_delay(ptdev->base.dev, 50);
 	pm_runtime_use_autosuspend(ptdev->base.dev);
@@ -304,6 +330,7 @@ int panthor_device_init(struct panthor_device *ptdev)
 	return 0;
 
 err_disable_autosuspend:
+	cancel_delayed_work_sync(&ptdev->heap_dump_work);
 	pm_runtime_dont_use_autosuspend(ptdev->base.dev);
 	panthor_sched_unplug(ptdev);
 
