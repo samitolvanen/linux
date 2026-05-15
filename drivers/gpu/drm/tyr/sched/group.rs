@@ -46,7 +46,8 @@ use crate::{
 };
 
 use super::{
-    job::{Job, PreparedQueueSubmit, QueueSubmit},
+    deps,
+    job::{Job, QueueSubmit},
     queue::{Queue, QueueCreate},
     syncs,
 };
@@ -639,16 +640,23 @@ impl Group {
         }
 
         let jobs = Job::from_queue_submits(queue_submits)?;
-        let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
+        let job_count = jobs.len();
+        let mut ctx = deps::Context::new(file);
 
-        for job in jobs.into_iter() {
-            prepared_jobs.push(job.prepare(self, file)?, GFP_KERNEL)?;
+        for (job, syncs) in jobs.into_iter() {
+            ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
+        }
+
+        ctx.collect_signal_ops()?;
+
+        for idx in 0..job_count {
+            ctx.prepare(idx, self)?;
         }
 
         self.vm
-            .with_prepared_vm(prepared_jobs.len() as u32, |mut prepared_vm| {
-                for prepared_job in prepared_jobs.into_iter() {
-                    let submit_fence = prepared_job.commit(self)?;
+            .with_prepared_vm(job_count as u32, |mut prepared_vm| {
+                for idx in 0..job_count {
+                    let submit_fence = ctx.commit(idx, self)?;
                     prepared_vm.resv_add_fence(
                         &submit_fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
@@ -658,6 +666,8 @@ impl Group {
 
                 Ok(())
             })?;
+
+        ctx.push_fences();
 
         Ok(())
     }

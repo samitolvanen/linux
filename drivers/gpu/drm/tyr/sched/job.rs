@@ -9,9 +9,7 @@
 use kernel::{
     alloc::KVec,
     bits::genmask_checked_u64,
-    dma_buf::dma_fence::PublicDmaFence,
     prelude::*,
-    sync::{aref::ARef, Arc},
     transmute::FromBytes,
     uaccess::UserSlice,
     uapi,
@@ -19,9 +17,8 @@ use kernel::{
 };
 
 use super::{
-    deps::{self, SyncOp, SyncSignal},
+    deps::{self, SyncOp},
     group::Group,
-    queue::{PreparedQueueJob, QueueJob},
     //
 };
 
@@ -226,46 +223,25 @@ pub(crate) struct Job {
     /// submits) are dropped at merge time, so every entry here
     /// corresponds to one wrapper the prepare path emits.
     pieces: KVec<StreamPiece>,
-    syncs: KVec<SyncOp>,
-}
-
-pub(crate) struct PreparedQueueSubmit {
-    queue_index: usize,
-    prepared: PreparedQueueJob,
-    signals: KVec<SyncSignal>,
-}
-
-impl PreparedQueueSubmit {
-    pub(crate) fn commit(self, group: &Group) -> Result<ARef<PublicDmaFence>> {
-        let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
-
-        // The per-queue syncobj is zeroed once at group creation and
-        // then advanced exclusively by the GPU through the per-wrapper
-        // `SYNC_ADD64`. Do not seed it from the CPU here: a back-to-
-        // back commit on the same queue would otherwise overwrite GPU
-        // progress for the previous Job that has not yet retired.
-
-        let submit_fence = queue.commit_job(self.prepared);
-
-        for signal in self.signals.into_iter() {
-            signal.publish(&submit_fence);
-        }
-
-        Ok(submit_fence)
-    }
 }
 
 impl Job {
-    fn new(queue_index: usize, pieces: KVec<StreamPiece>, syncs: KVec<SyncOp>) -> Self {
+    fn new(queue_index: usize, pieces: KVec<StreamPiece>) -> Self {
         Self {
             queue_index,
             pieces,
-            syncs,
         }
     }
 
-    pub(crate) fn from_queue_submits(queue_submits: KVec<QueueSubmit>) -> Result<KVec<Self>> {
-        let mut jobs = KVec::<Self>::new();
+    /// Merges `queue_submits` into one [`Job`] per queue index, paired
+    /// with the flattened sync-op stream for that queue. The
+    /// per-(queue, batch) merge invariant lets the rest of the submit
+    /// path assume there is exactly one pending-submit-fence
+    /// reservation and one wrapped-stream allocation per Job.
+    pub(crate) fn from_queue_submits(
+        queue_submits: KVec<QueueSubmit>,
+    ) -> Result<KVec<(Self, KVec<SyncOp>)>> {
+        let mut jobs = KVec::<(Self, KVec<SyncOp>)>::new();
 
         for queue_submit in queue_submits.into_iter() {
             let queue_index = queue_submit.queue_index();
@@ -278,7 +254,7 @@ impl Job {
             }
 
             let mut merged = false;
-            for job in jobs.iter_mut() {
+            for (job, job_syncs) in jobs.iter_mut() {
                 if job.queue_index == queue_index {
                     if has_stream {
                         job.pieces.push(piece, GFP_KERNEL)?;
@@ -287,7 +263,7 @@ impl Job {
                         return Err(EINVAL);
                     };
                     for sync in syncs.into_iter() {
-                        job.syncs.push(sync, GFP_KERNEL)?;
+                        job_syncs.push(sync, GFP_KERNEL)?;
                     }
                     merged = true;
                     break;
@@ -303,12 +279,24 @@ impl Job {
                 pieces.push(piece, GFP_KERNEL)?;
             }
             jobs.push(
-                Self::new(queue_index, pieces, syncs.take().ok_or(EINVAL)?),
+                (Self::new(queue_index, pieces), syncs.take().ok_or(EINVAL)?),
                 GFP_KERNEL,
             )?;
         }
 
         Ok(jobs)
+    }
+
+    pub(crate) fn queue_index(&self) -> usize {
+        self.queue_index
+    }
+
+    pub(crate) fn piece_count(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub(crate) fn has_stream(&self) -> bool {
+        !self.pieces.is_empty()
     }
 
     /// Builds the wrapped command-stream buffer for this Job.
@@ -321,7 +309,7 @@ impl Job {
     /// syncobj at `sync_va` by one. The concatenation is padded to a
     /// 64-byte boundary so the firmware prefetcher sees cacheline-
     /// aligned trailing storage.
-    fn build_wrapped_stream(&self, group: &Group, sync_va: u64) -> Result<KVec<u8>> {
+    pub(crate) fn build_wrapped_stream(&self, group: &Group, sync_va: u64) -> Result<KVec<u8>> {
         const INSTR_BYTES: usize = 8;
         const INSTRS_PER_WRAPPER: usize = 11;
         const WRAPPER_BYTES: usize = INSTR_BYTES * INSTRS_PER_WRAPPER;
@@ -381,61 +369,5 @@ impl Job {
         }
 
         Ok(buf)
-    }
-
-    pub(crate) fn prepare(
-        self,
-        group: &Arc<Group>,
-        file: &crate::file::TyrDrmFile,
-    ) -> Result<PreparedQueueSubmit> {
-        let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
-
-        let deps = deps::wait_fences(file, &self.syncs)?;
-        let signals = deps::signal_syncs(file, &self.syncs)?;
-        let has_stream = !self.pieces.is_empty();
-
-        // Reserve a slot for the pending submit fence before
-        // handing the job to the framework. The matching push from
-        // `TyrQueueOps::submit` runs inside a dma-fence signalling
-        // section where `GFP_KERNEL` allocation is forbidden; doing
-        // the reservation here keeps the submit path allocation-free.
-        // Stream-less jobs never reach the GPU and so never push a
-        // pending fence. The returned guard travels with the job
-        // through `QueueJob`, so any failure path between here and
-        // the final push rolls the reservation back through `Drop`.
-        let reservation = if has_stream {
-            Some(queue.reserve_pending_submit_fence()?)
-        } else {
-            None
-        };
-
-        // Build the wrapped command-stream buffer at prepare time so
-        // every `GFP_KERNEL` allocation it does happens outside the
-        // dma-fence signalling section that wraps `commit`.
-        let wrapped = if has_stream {
-            let sync_va = group.syncobj_va(self.queue_index)?;
-            self.build_wrapped_stream(group, sync_va)?
-        } else {
-            KVec::new()
-        };
-
-        let prepared =
-            queue.prepare_job(QueueJob::new(wrapped, group.clone(), reservation), &deps, 0)?;
-
-        // Claim one per-queue seqno per emitted wrapper, in a single
-        // atomic step, only after every fallible prepare step has
-        // succeeded. An earlier `claim_seqnos` followed by a failure
-        // in `prepare_job` would advance `next_seqno` without ever
-        // queueing the matching wrappers, leaving a gap that
-        // `cancel_queues` would then mark dead with the wrong upper
-        // bound. Stream-less jobs never reach the GPU and so do not
-        // consume a seqno.
-        queue.claim_seqnos(self.pieces.len());
-
-        Ok(PreparedQueueSubmit {
-            queue_index: self.queue_index,
-            prepared,
-            signals,
-        })
     }
 }
