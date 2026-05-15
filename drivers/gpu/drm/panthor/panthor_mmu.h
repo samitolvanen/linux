@@ -68,6 +68,9 @@ struct panthor_vm *panthor_vm_pool_get_vm(struct panthor_vm_pool *pool, u32 hand
 bool panthor_vm_has_unhandled_faults(struct panthor_vm *vm);
 bool panthor_vm_is_unusable(struct panthor_vm *vm);
 
+u64 panthor_vm_get_trace_id(struct panthor_vm *vm);
+u32 panthor_vm_get_inflight_bookkeep_fences(struct panthor_vm *vm);
+
 /*
  * PANTHOR_VM_KERNEL_AUTO_VA: Use this magic address when you want the GEM
  * logic to auto-allocate the virtual address in the reserved kernel VA range.
@@ -98,6 +101,8 @@ void panthor_vm_update_resvs(struct panthor_vm *vm, struct drm_exec *exec,
 
 int panthor_mmu_pt_cache_init(void);
 void panthor_mmu_pt_cache_fini(void);
+
+void panthor_mmu_dump_heap_pools_for_trace(struct panthor_device *ptdev);
 
 #ifdef CONFIG_DEBUG_FS
 void panthor_mmu_debugfs_init(struct drm_minor *minor);
