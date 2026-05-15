@@ -995,8 +995,10 @@ impl Queue {
         &self,
         job: QueueJob,
         deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
-        self.job_queue.prepare(job, deps, QueueFenceData)
+        self.job_queue
+            .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
 
     /// Reserves capacity for one pending submit fence and returns an

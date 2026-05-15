@@ -420,7 +420,7 @@ impl Job {
         };
 
         let prepared =
-            queue.prepare_job(QueueJob::new(wrapped, group.clone(), reservation), &deps)?;
+            queue.prepare_job(QueueJob::new(wrapped, group.clone(), reservation), &deps, 0)?;
 
         // Claim one per-queue seqno per emitted wrapper, in a single
         // atomic step, only after every fallible prepare step has

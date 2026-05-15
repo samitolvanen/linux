@@ -761,7 +761,7 @@ impl Vm {
         self.bind_queue
             .as_ref()
             .ok_or(EINVAL)?
-            .prepare(job, deps, VmBindFenceData)
+            .prepare(job, deps, 0, VmBindFenceData)
     }
 
     pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob) -> ARef<PublicDmaFence> {

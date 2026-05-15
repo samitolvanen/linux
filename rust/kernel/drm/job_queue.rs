@@ -1349,6 +1349,29 @@ pub struct PreparedJob<T: QueueOps> {
     xa_index: Option<ReservedIndex>,
 }
 
+impl<T: QueueOps> PreparedJob<T> {
+    /// Append `fence` to the dependency set of this prepared job.
+    ///
+    /// The capacity for this push must have been reserved at prepare time
+    /// via the `extra_dep_capacity` argument to [`JobQueue::prepare`]; the
+    /// push is allocation-free so that it is safe to call inside a
+    /// dma-fence signalling section.  Returns `ENOSPC` if the caller asked
+    /// for too few extra slots, and `EINVAL` if the job has already been
+    /// committed or dropped.
+    pub fn add_dep(&mut self, fence: ARef<PublicDmaFence>) -> Result {
+        let Some(idx) = self.xa_index.as_ref() else {
+            return Err(EINVAL);
+        };
+
+        let mut guard = self.inner.fifo.lock();
+        let Some(XaEntry::Reserved { deps, .. }) = guard.get_mut(idx.index()) else {
+            return Err(EINVAL);
+        };
+
+        deps.push_within_capacity(fence).map_err(|_| ENOSPC)
+    }
+}
+
 impl<T: QueueOps> Drop for PreparedJob<T> {
     fn drop(&mut self) {
         // Remove and drop XaEntry::Reserved if commit() did not consume it.
@@ -1440,12 +1463,19 @@ impl<T: QueueOps> JobQueue<T> {
 
     /// Prepare a job for submission, allocating all resources upfront.
     ///
+    /// `deps` is the fence set known at prepare time. `extra_dep_capacity`
+    /// reserves additional dep slots in the internal vector that the caller
+    /// may later fill via [`PreparedJob::add_dep`] without allocating, e.g.
+    /// to resolve intra-batch fences whose producers have not yet
+    /// committed.
+    ///
     /// Call [`commit`](Self::commit) to assign the seqno, insert the job into
     /// the pipeline, and receive the public fence.
     pub fn prepare(
         &self,
         job: T::Job,
         deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
         fence_data: T::FenceData,
     ) -> Result<PreparedJob<T>> {
         let lock_classes = T::lock_classes();
@@ -1455,7 +1485,11 @@ impl<T: QueueOps> JobQueue<T> {
         )?;
         let counter = self.inner.job_counter.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(job, GFP_KERNEL)?;
-        let mut dep_vec = KVec::with_capacity(deps.len(), GFP_KERNEL)?;
+        let dep_capacity = deps
+            .len()
+            .checked_add(extra_dep_capacity)
+            .ok_or(EOVERFLOW)?;
+        let mut dep_vec = KVec::with_capacity(dep_capacity, GFP_KERNEL)?;
         dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
 
         // Allocate the XaEntry::Reserved box *before* acquiring xa_lock:
