@@ -95,6 +95,9 @@ const MAX_CS: usize = 16;
 /// The firmware binary contains a section marked to be loaded at this address.
 pub(super) const CSF_MCU_SHARED_REGION_START: u32 = 0x04000000;
 
+/// Size of the MCU CSF shared memory region.
+pub(super) const CSF_MCU_SHARED_REGION_SIZE: u32 = 0x04000000;
+
 /// A parsed section of the firmware binary.
 pub(crate) struct Section {
     // Raw firmware section data for reset purposes
@@ -204,7 +207,14 @@ impl<'drm> Firmware<'drm> {
         gpu_info: &GpuInfo,
     ) -> Result<Firmware<'drm>> {
         let dev = pdev.as_ref();
-        let vm = Vm::new(pdev, ddev, mmu, gpu_info)?;
+        let vm = Vm::new_fw(
+            pdev,
+            ddev,
+            mmu,
+            gpu_info,
+            u64::from(CSF_MCU_SHARED_REGION_START),
+            u64::from(CSF_MCU_SHARED_REGION_SIZE),
+        )?;
         vm.activate()?;
 
         let result = (|| {
@@ -219,6 +229,7 @@ impl<'drm> Firmware<'drm> {
                 let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
 
                 let va = u64::from(va.start);
+                let end = va + size;
 
                 let mut mem = KernelBo::new(
                     dev,
@@ -228,6 +239,12 @@ impl<'drm> Firmware<'drm> {
                     KernelBoVaAlloc::Explicit(va),
                     vm_map_flags,
                 )?;
+
+                let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
+                let auto_va_end = auto_va_start + u64::from(CSF_MCU_SHARED_REGION_SIZE);
+                if end > auto_va_start && va < auto_va_end {
+                    vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
+                }
 
                 Self::init_section_mem(dev, &mut mem, &data)?;
 
