@@ -88,6 +88,8 @@ static void panthor_gpu_l2_config_set(struct panthor_device *ptdev)
 
 static void panthor_gpu_irq_handler(struct panthor_device *ptdev, u32 status)
 {
+	trace_panthor_gpu_irq(status);
+
 	struct panthor_gpu *gpu = ptdev->gpu;
 
 	gpu_write(gpu->irq.iomem, INT_CLEAR, status);
@@ -97,6 +99,11 @@ static void panthor_gpu_irq_handler(struct panthor_device *ptdev, u32 status)
 				       gpu_read64(gpu->iomem, SHADER_READY),
 				       gpu_read64(gpu->iomem, TILER_READY),
 				       gpu_read64(gpu->iomem, L2_READY));
+
+	if (status & GPU_POWER_INTERRUPTS_MASK)
+		trace_panthor_shader_power_state(gpu_read64(gpu->iomem, SHADER_READY),
+						 gpu_read64(gpu->iomem, SHADER_PWRTRANS),
+						 gpu_read64(gpu->iomem, SHADER_PWRACTIVE));
 
 	if (status & GPU_IRQ_FAULT) {
 		u32 fault_status = gpu_read(gpu->iomem, GPU_FAULT_STATUS);
@@ -295,6 +302,8 @@ void panthor_gpu_l2_power_off(struct panthor_device *ptdev)
  */
 int panthor_gpu_l2_power_on(struct panthor_device *ptdev)
 {
+	int ret;
+
 	if (ptdev->gpu_info.l2_present != 1) {
 		/*
 		 * Only support one core group now.
@@ -314,7 +323,9 @@ int panthor_gpu_l2_power_on(struct panthor_device *ptdev)
 	panthor_gpu_coherency_set(ptdev);
 	panthor_gpu_l2_config_set(ptdev);
 
-	return panthor_gpu_power_on(ptdev, L2, 1, 20000);
+	ret = panthor_gpu_power_on(ptdev, L2, 1, 20000);
+	trace_panthor_l2_power_on(ret);
+	return ret;
 }
 
 /**
