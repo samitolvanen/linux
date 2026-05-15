@@ -301,6 +301,13 @@ impl GlobalInterface {
         let dev = unsafe { self.pdev.as_ref().as_bound() };
         let io = self.iomem.access(dev)?;
         let doorbell = Array::try_at(doorbell_id).ok_or(EINVAL)?;
+        // Make sure prior writes to firmware-shared memory (CSG_REQ,
+        // GLB_DB_REQ, ring buffers) are visible to the firmware before
+        // we kick the doorbell. `smp_wmb()` only orders CPU-visible
+        // stores on coherent memory, whereas `wmb()` additionally drains
+        // write-combining buffers so the writes become visible to the
+        // external agent (the firmware MCU).
+        kernel::sync::barrier::wmb();
         io.try_write(doorbell, DOORBELL::zeroed().with_ring(true))
     }
 }

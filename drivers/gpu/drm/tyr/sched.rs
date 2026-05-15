@@ -749,6 +749,24 @@ impl Scheduler {
             })?;
         }
 
+        // On the bind-side `Start`/`Resume` ack, ring the per-CS user
+        // doorbell on every queue whose ringbuf already has commands.
+        // `CsgSlotOps::activate` publishes `doorbell_id` before this point.
+        if new_state == group::State::Active {
+            for queue in slot_data.group.queues.iter() {
+                if queue.is_ringbuf_empty().unwrap_or(true) {
+                    continue;
+                }
+                if let Err(e) = queue.kick() {
+                    pr_err!(
+                        "CSG {}: user-doorbell kick on bind failed: {}\n",
+                        csg_idx,
+                        e.to_errno()
+                    );
+                }
+            }
+        }
+
         group.set_state(new_state);
         Ok(())
     }
