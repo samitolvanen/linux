@@ -358,6 +358,48 @@ impl From<DataDirection> for bindings::dma_data_direction {
     }
 }
 
+/// Transfers ownership of a previously-mapped DMA region back to the CPU.
+///
+/// This wraps `dma_sync_single_for_cpu()`. It performs the cache synchronisation needed for the
+/// CPU to safely access `[addr, addr + size)` of a buffer that was previously DMA-mapped for
+/// `dev`. Before any further DMA operations, ownership must be transferred back to the device
+/// with [`sync_single_for_device`] (or by an unmap).
+pub fn sync_single_for_cpu(
+    dev: &device::Device<Bound>,
+    addr: DmaAddress,
+    size: usize,
+    dir: DataDirection,
+) {
+    // SAFETY:
+    // - `dev.as_raw()` is a valid pointer to a `struct device`.
+    // - `addr` and `size` describe a sub-range of a buffer that the caller has previously
+    //   DMA-mapped for `dev` and that remains live for the duration of this call.
+    // - `dir` originates from a `DataDirection`, whose underlying value is a valid
+    //   `enum dma_data_direction`.
+    unsafe { bindings::dma_sync_single_for_cpu(dev.as_raw(), addr, size, dir.into()) };
+}
+
+/// Transfers ownership of a previously-mapped DMA region to the device.
+///
+/// This wraps `dma_sync_single_for_device()`. It performs the cache synchronisation needed
+/// before the device may access `[addr, addr + size)` of a buffer that was previously
+/// DMA-mapped for `dev`. After the device is done, ownership must be transferred back to the
+/// CPU with [`sync_single_for_cpu`] (or by an unmap).
+pub fn sync_single_for_device(
+    dev: &device::Device<Bound>,
+    addr: DmaAddress,
+    size: usize,
+    dir: DataDirection,
+) {
+    // SAFETY:
+    // - `dev.as_raw()` is a valid pointer to a `struct device`.
+    // - `addr` and `size` describe a sub-range of a buffer that the caller has previously
+    //   DMA-mapped for `dev` and that remains live for the duration of this call.
+    // - `dir` originates from a `DataDirection`, whose underlying value is a valid
+    //   `enum dma_data_direction`.
+    unsafe { bindings::dma_sync_single_for_device(dev.as_raw(), addr, size, dir.into()) };
+}
+
 /// CPU-owned DMA allocation that can be converted into a device-shared [`Coherent`] object.
 ///
 /// Unlike [`Coherent`], a [`CoherentBox`] is guaranteed to be fully owned by the CPU -- its DMA
