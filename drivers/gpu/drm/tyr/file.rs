@@ -133,7 +133,7 @@ impl TyrDrmFileData {
         _ddev: &TyrDrmDevice<Registered>,
         reg_data: &TyrDrmRegistrationData<'_>,
         devquery: &mut uapi::drm_panthor_dev_query,
-        _file: &TyrDrmFile,
+        file: &TyrDrmFile,
     ) -> Result<u32> {
         if devquery.pointer == 0 {
             match devquery.type_ {
@@ -188,9 +188,14 @@ impl TyrDrmFileData {
                     Ok(0)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GROUP_PRIORITIES_INFO => {
-                    let mask = (1 << uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_LOW)
-                        | (1 << uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_MEDIUM);
-                    let data: [u8; 4] = [mask as u8, 0, 0, 0];
+                    let mut allowed_mask: u8 = 0;
+                    for prio in 0..=uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME
+                    {
+                        if group::priority_permit(file, prio as u8).is_ok() {
+                            allowed_mask |= 1 << prio;
+                        }
+                    }
+                    let data: [u8; 4] = [allowed_mask, 0, 0, 0];
 
                     set_uobj(devquery.pointer, devquery.size, &data)?;
 
