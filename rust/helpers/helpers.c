@@ -49,6 +49,7 @@
 #include "bug.c"
 #include "build_assert.c"
 #include "build_bug.c"
+#include "capability.c"
 #include "clk.c"
 #include "completion.c"
 #include "cpu.c"
