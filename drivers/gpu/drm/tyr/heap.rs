@@ -101,6 +101,7 @@ impl Context {
             self.chunk_size as usize,
             flags,
             ddev.coherent,
+            ddev.cleanup_wq.clone(),
         )?;
 
         let vmap = chunk_bo.vmap();
@@ -254,6 +255,7 @@ impl Pool {
             bo_size,
             flags,
             ddev.coherent,
+            ddev.cleanup_wq.clone(),
         )?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
 

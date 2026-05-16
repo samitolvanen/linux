@@ -519,6 +519,7 @@ impl Queue {
             queue_args.ringbuf_size() as usize,
             flags,
             tdev.coherent,
+            tdev.cleanup_wq.clone(),
         )?;
         let iface_mem = reg_data.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
