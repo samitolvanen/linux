@@ -99,6 +99,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
+#include <trace/events/rust_jq_debug.h>
 #include <trace/events/rust_sample.h>
 #include <trace/events/tyr.h>
 
