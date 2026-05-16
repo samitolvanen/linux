@@ -331,6 +331,19 @@ impl Device<Bound> {
         // - We've just checked that the type of the driver's private data is in fact `T`.
         Ok(unsafe { self.drvdata_unchecked() })
     }
+
+    /// Returns `true` if the device is reported as DMA-coherent by firmware.
+    ///
+    /// This wraps `device_get_dma_attr()` and only returns `true` for the
+    /// `DEV_DMA_COHERENT` attribute. Devices for which no DMA attribute is
+    /// reported (`DEV_DMA_NOT_SUPPORTED`) or which are explicitly flagged as
+    /// non-coherent (`DEV_DMA_NON_COHERENT`) are treated as non-coherent.
+    pub fn dma_coherent(&self) -> bool {
+        // SAFETY: By the type invariants, `self.as_raw()` is a valid pointer to a `struct device`
+        // and the device is bound, so its fwnode has been populated by the bus.
+        let attr = unsafe { bindings::device_get_dma_attr(self.as_raw()) };
+        attr == bindings::dev_dma_attr_DEV_DMA_COHERENT
+    }
 }
 
 impl<Ctx: DeviceContext> Device<Ctx> {
