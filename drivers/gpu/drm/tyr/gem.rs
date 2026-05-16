@@ -8,13 +8,23 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::Range;
 
 use kernel::{
+    device::{
+        self,
+        Bound, //
+    },
+    dma::{
+        sync_single_for_cpu,
+        sync_single_for_device,
+        DataDirection, //
+    },
     drm::{
         gem,
         gem::shmem,
         gem::BaseObject,
         DeviceContext, //
     },
-    new_mutex, pr_warn_once,
+    new_mutex,
+    pr_warn_once,
     prelude::*,
     str::CString,
     sync::{
@@ -23,6 +33,7 @@ use kernel::{
         ArcBorrow,
         Mutex, //
     },
+    uapi, //
 };
 
 use crate::{
@@ -441,6 +452,81 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
     shmem::Object::lookup_handle(file, handle)
+}
+
+/// Performs explicit CPU cache maintenance on a sub-range of `bo`.
+pub(crate) fn sync(
+    bo: &Bo,
+    dev: &device::Device<Bound>,
+    type_: u32,
+    offset: u64,
+    size: u64,
+) -> Result {
+    let bo_size = bo.size() as u64;
+    let end = offset.checked_add(size).ok_or(EINVAL)?;
+    if end > bo_size {
+        return Err(EINVAL);
+    }
+
+    if bo.is_imported() {
+        return Err(EINVAL);
+    }
+
+    match type_ {
+        uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH
+        | uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE => {}
+        _ => return Err(EINVAL),
+    }
+
+    if bo.map_wc() {
+        return Ok(());
+    }
+
+    if size == 0 {
+        return Ok(());
+    }
+
+    let sgt = bo.sg_table(dev)?;
+
+    let mut offset = offset;
+    let mut size = size;
+
+    for entry in sgt.iter() {
+        if size == 0 {
+            break;
+        }
+
+        let paddr = entry.dma_address();
+        let len: u64 = entry.dma_len();
+
+        if len <= offset {
+            offset -= len;
+            continue;
+        }
+
+        let paddr = paddr + offset;
+        let mut len = len - offset;
+        if len > size {
+            len = size;
+        }
+        size -= len;
+        offset = 0;
+
+        // A single bidirectional sync does not both flush and invalidate on arm64,
+        // so the invalidate case needs a second sync in the other direction.
+        // SAFETY: `paddr` and `len` describe a sub-range of `sgt`, DMA-mapped for `dev` as
+        // DMA_BIDIRECTIONAL by `bo.sg_table(dev)` and live for this call. DMA_TO_DEVICE and
+        // DMA_FROM_DEVICE are valid subsets of that direction.
+        unsafe { sync_single_for_device(dev, paddr, len as usize, DataDirection::ToDevice) };
+        if type_
+            == uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE
+        {
+            // SAFETY: As above.
+            unsafe { sync_single_for_cpu(dev, paddr, len as usize, DataDirection::FromDevice) };
+        }
+    }
+
+    Ok(())
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
