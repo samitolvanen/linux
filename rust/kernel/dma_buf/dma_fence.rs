@@ -48,6 +48,8 @@ use kernel::{
     time::Jiffies,
 };
 
+use super::dma_fence_trace as trace_dbg;
+
 /// VTable for dma_fence backend_ops callbacks.
 //
 // Mandatory dma_fence backend_ops are implemented implicitly through
@@ -397,9 +399,14 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
     ///
     /// This is only called by the dma_fence subsystem with valid pointers.
     unsafe extern "C" fn dma_fence_callback(
-        _fence: *mut bindings::dma_fence,
+        fence: *mut bindings::dma_fence,
         callback_foreign: *mut bindings::dma_fence_cb,
     ) {
+        // SAFETY: The dma_fence subsystem invokes this with a valid `fence`
+        // pointer; `context` and `seqno` are immutable for the fence's lifetime.
+        let (ctx, seqno) = unsafe { ((*fence).context, (*fence).seqno) };
+        trace_dbg::callback_fire(ctx, seqno);
+
         let ptr = Opaque::cast_from(callback_foreign).cast_mut();
 
         // SAFETY: All callbacks we can receive here have been created in such a way that they are
@@ -1064,7 +1071,18 @@ impl<'a, T: Send + Sync + FenceContextOps> DriverFence<'a, T> {
 
         // SAFETY: `fence` is valid because `self` is valid. The lock must be
         // held, which we acquired directly above.
-        if !unsafe { bindings::dma_fence_test_signaled_flag(fence.as_raw()) } {
+        let already_signaled = unsafe { bindings::dma_fence_test_signaled_flag(fence.as_raw()) };
+        trace_dbg::signal(
+            fence.context_id(),
+            fence.seqno(),
+            match res {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            },
+            already_signaled,
+        );
+
+        if !already_signaled {
             if let Err(err) = res {
                 // SAFETY: `fence` is valid because `self` is valid. The fence
                 // must not have been signaled yet, which we check directly above.
