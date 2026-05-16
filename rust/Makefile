@@ -31,6 +31,9 @@ endif
 
 obj-$(CONFIG_RUST) += exports.o
 
+# Downstream-only debug tracepoint backings consumed by rust/kernel/.
+obj-$(CONFIG_RUST) += job_queue_trace_events.o
+
 always-$(CONFIG_RUST) += libproc_macro2.rlib libquote.rlib libsyn.rlib
 
 always-$(CONFIG_RUST_KERNEL_DOCTESTS) += doctests_kernel_generated.rs
