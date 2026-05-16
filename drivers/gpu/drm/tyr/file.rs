@@ -732,10 +732,38 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn bo_sync(
-        _ddev: &TyrDrmDevice,
-        _args: &mut uapi::drm_panthor_bo_sync,
-        _file: &TyrDrmFile,
+        ddev: &TyrDrmDevice,
+        args: &mut uapi::drm_panthor_bo_sync,
+        file: &TyrDrmFile,
     ) -> Result<u32> {
+        if args.ops.count == 0 {
+            return Ok(0);
+        }
+
+        let op_size = size_of::<uapi::drm_panthor_bo_sync_op>();
+        let stride = args.ops.stride as usize;
+        if stride < op_size {
+            return Err(EINVAL);
+        }
+
+        let count = args.ops.count as usize;
+
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(args.ops.array as usize),
+            stride.checked_mul(count).ok_or(EINVAL)?,
+        )
+        .reader();
+
+        // SAFETY: `ddev` is a bound device in the ioctl path.
+        let dev = unsafe { ddev.as_ref().as_bound() };
+
+        for _ in 0..count {
+            let op: BoSyncOp = reader.read()?;
+            read_padding_zero(&mut reader, stride - op_size)?;
+            let bo = gem::lookup_handle(file, op.0.handle)?;
+            gem::sync(&bo, dev, op.0.type_, op.0.offset, op.0.size)?;
+        }
+
         Ok(0)
     }
 
@@ -759,6 +787,13 @@ struct VmBindOp(uapi::drm_panthor_vm_bind_op);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for VmBindOp {}
+
+#[repr(transparent)]
+struct BoSyncOp(uapi::drm_panthor_bo_sync_op);
+
+// SAFETY: `drm_panthor_bo_sync_op` is a C-repr POD with no padding holes
+// and no validity invariants on any field, so every bit pattern is valid.
+unsafe impl FromBytes for BoSyncOp {}
 
 impl VmBindOp {
     fn capture(
