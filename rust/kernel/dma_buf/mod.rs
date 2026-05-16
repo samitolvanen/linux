@@ -4,6 +4,7 @@
 
 pub mod dma_fence;
 pub mod dma_fence_chain;
+mod dma_fence_trace;
 pub mod fence_work;
 
 pub use self::dma_fence::{
