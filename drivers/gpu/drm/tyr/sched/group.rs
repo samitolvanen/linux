@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
+    capability::{
+        capable,
+        Capability, //
+    },
     dma_buf::dma_fence::{
         impl_has_dma_fence_work,
         new_dma_fence_work,
@@ -337,6 +341,27 @@ impl_list_item! {
     }
 }
 
+/// Returns whether `file` is allowed to request `priority`.
+///
+/// Medium and below are always allowed. High and realtime require
+/// `CAP_SYS_NICE` or DRM master. Anything beyond realtime is rejected
+/// as `EINVAL`.
+pub(crate) fn priority_permit(file: &TyrDrmFile, priority: u8) -> Result {
+    if priority > uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_REALTIME as u8 {
+        return Err(EINVAL);
+    }
+
+    if priority <= uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_MEDIUM as u8 {
+        return Ok(());
+    }
+
+    if capable(Capability::SYS_NICE) || file.is_current_master() {
+        return Ok(());
+    }
+
+    Err(EACCES)
+}
+
 impl Group {
     fn create(
         ddev: &TyrDrmDevice,
@@ -349,11 +374,7 @@ impl Group {
             return Err(EINVAL);
         }
 
-        if group_args.priority
-            > uapi::drm_panthor_group_priority_PANTHOR_GROUP_PRIORITY_MEDIUM as u8
-        {
-            return Err(EINVAL);
-        }
+        priority_permit(file, group_args.priority)?;
 
         let priority = Priority::try_from(group_args.priority)?;
 
