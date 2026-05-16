@@ -159,8 +159,14 @@ struct Context {
 impl Context {
     fn alloc_chunk_bo(&mut self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec);
-        let chunk_bo =
-            gem::new_kernel_object(tdev, &self.vm, self.chunk_size as usize, flags, tdev.coherent)?;
+        let chunk_bo = gem::new_kernel_object(
+            tdev,
+            &self.vm,
+            self.chunk_size as usize,
+            flags,
+            tdev.coherent,
+            tdev.cleanup_wq.clone(),
+        )?;
 
         let vmap = chunk_bo.vmap();
         let size = vmap.owner().size();
@@ -218,7 +224,14 @@ impl Pool {
         let bo_size = (MAX_HEAPS_PER_POOL * stride).next_multiple_of(4096) as usize;
 
         let flags = VmMapFlags::from(VmFlag::Noexec);
-        let gpu_contexts = gem::new_kernel_object(tdev, &vm, bo_size, flags, tdev.coherent)?;
+        let gpu_contexts = gem::new_kernel_object(
+            tdev,
+            &vm,
+            bo_size,
+            flags,
+            tdev.coherent,
+            tdev.cleanup_wq.clone(),
+        )?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
 
         Ok(Self {

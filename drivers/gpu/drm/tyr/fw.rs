@@ -188,6 +188,7 @@ impl Firmware {
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
         coherent: bool,
+        cleanup_wq: Arc<crate::driver::CleanupQueue>,
     ) -> Result<Arc<Firmware>> {
         let vm = Vm::new_fw(
             pdev,
@@ -221,6 +222,7 @@ impl Firmware {
                 KernelBoVaAlloc::Explicit(va),
                 vm_map_flags,
                 coherent,
+                cleanup_wq.clone(),
             )?;
 
             let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
@@ -322,7 +324,14 @@ impl Firmware {
     pub(crate) fn alloc_queue_mem(&self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
 
-        gem::new_kernel_object(tdev, &self.vm, SZ_8K, flags, tdev.coherent)
+        gem::new_kernel_object(
+            tdev,
+            &self.vm,
+            SZ_8K,
+            flags,
+            tdev.coherent,
+            tdev.cleanup_wq.clone(),
+        )
     }
 
     pub(crate) fn alloc_suspend_buf(
@@ -332,7 +341,14 @@ impl Firmware {
     ) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
-        gem::new_kernel_object(tdev, &self.vm, suspend_size, flags, tdev.coherent)
+        gem::new_kernel_object(
+            tdev,
+            &self.vm,
+            suspend_size,
+            flags,
+            tdev.coherent,
+            tdev.cleanup_wq.clone(),
+        )
     }
 }
 
