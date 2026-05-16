@@ -553,6 +553,11 @@ struct JobDependencies<T: QueueOps> {
     current_idx: usize,
     /// The currently active dependency callback (at most one at a time).
     active_cb: Option<Pin<KBox<FenceCallbackRegistration<DepCallback<T>>>>>,
+    /// Pre-allocated uninitialised storage for the per-dep callback
+    /// registrations.  Sized at `prepare()` time to match the total dep
+    /// capacity, so `process_deps()` can register a callback with no
+    /// allocation under the pipeline state mutex.
+    prealloc_cbs: KVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
 }
 
 /// A single per-job allocation stored in the XArray.
@@ -593,6 +598,20 @@ struct JobEntry<T: QueueOps> {
     /// Optional callback registered when a stage returns [`StageAdvance::WaitOn`].
     stage_wake_cb: Option<Pin<KBox<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
 
+    /// Pre-allocated uninitialised storage for the progress callback registered
+    /// in [`process_exec`](JobQueueInner::process_exec).  Consumed on the
+    /// first `Submitted` transition, after which any re-registration falls
+    /// back to `GFP_NOWAIT`.
+    prealloc_progress_cb:
+        Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<ProgressCallback<T>>>>>,
+
+    /// Pre-allocated uninitialised storage for the stage-wake callback
+    /// registered in [`process_stage`](JobQueueInner::process_stage) on
+    /// [`StageAdvance::WaitOn`].  Consumed once; subsequent `WaitOn`
+    /// registrations for the same entry fall back to `GFP_NOWAIT`.
+    prealloc_stage_cb:
+        Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
+
     /// Set when a stage returns [`StageAdvance::TimedOut`].
     ///
     /// Instead of jumping directly to `done_range` (which would corrupt the
@@ -620,6 +639,13 @@ enum XaEntry<T: QueueOps> {
         /// `&mut` reference returned by `Guard::get_mut`.
         uninit_fence: Option<UninitDmaFence<T::FenceData>>,
         deps: KVec<ARef<PublicDmaFence>>,
+        /// Pre-allocated callback storage stashed alongside `deps` until
+        /// [`commit()`] moves it into the `Live` entry.
+        prealloc_cbs: KVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
+        prealloc_progress_cb:
+            Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<ProgressCallback<T>>>>>,
+        prealloc_stage_cb:
+            Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<StageWakeCallback<T>>>>>,
         counter: u64,
     },
     /// Fully initialised pipeline entry, present from commit until do_cleanup.
@@ -987,13 +1013,26 @@ impl<T: QueueOps> JobQueueInner<T> {
                     // Continue loop: process the new front of this stage.
                 }
                 StageAdvance::WaitOn(fence) => {
+                    let uninit_box = {
+                        let mut guard = self.fifo.lock();
+                        guard
+                            .get_mut(entry_idx as usize)
+                            .and_then(|e| e.as_live_mut())
+                            .and_then(|e| e.prealloc_stage_cb.take())
+                    };
                     let cb = FenceCallbackRegistration::new(
                         &fence,
                         StageWakeCallback {
                             inner: self.clone(),
                         },
                     );
-                    match KBox::try_pin_init(cb, GFP_KERNEL) {
+                    // Prealloc on the first WaitOn; GFP_NOWAIT fallback for
+                    // re-registration, never GFP_KERNEL under the state mutex.
+                    let result = match uninit_box {
+                        Some(uninit_box) => uninit_box.write_pin_init(cb),
+                        None => KBox::try_pin_init(cb, GFP_NOWAIT),
+                    };
+                    match result {
                         Ok(registration) => {
                             let mut guard = self.fifo.lock();
                             if let Some(XaEntry::Live(entry)) =
@@ -1057,13 +1096,52 @@ impl<T: QueueOps> JobQueueInner<T> {
                 return StageAdvance::Advance;
             };
 
+            // If the fence is already signaled, drop the previous active_cb
+            // (if any), advance, and try the next dep without consuming a
+            // prealloc slot.
+            if dep_fence.is_signaled() {
+                let mut guard = self.fifo.lock();
+                if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                    entry.deps.active_cb = None;
+                    entry.deps.current_idx += 1;
+                }
+                continue;
+            }
+
+            // If a callback is already registered for this dep (re-entrant
+            // tick on the same unsignaled fence), wait for it to fire rather
+            // than popping another prealloc slot.
+            let is_waiting = {
+                let guard = self.fifo.lock();
+                guard
+                    .get(entry_idx as usize)
+                    .and_then(|e| e.as_live())
+                    .is_some_and(|e| e.deps.active_cb.is_some())
+            };
+            if is_waiting {
+                return self.pipeline_wait_or_timeout(entry_idx);
+            }
+
             let callback = DepCallback {
                 inner: self.clone(),
             };
-            match KBox::try_pin_init(
-                FenceCallbackRegistration::new(&dep_fence, callback),
-                GFP_KERNEL,
-            ) {
+            // One prealloc slot per dep callback registration.  prepare()
+            // sized prealloc_cbs to dep_capacity so this is the steady-state
+            // path; GFP_NOWAIT is a safety net for any accounting drift and
+            // stays out of direct reclaim.
+            let uninit_box = {
+                let mut guard = self.fifo.lock();
+                guard
+                    .get_mut(entry_idx as usize)
+                    .and_then(|e| e.as_live_mut())
+                    .and_then(|e| e.deps.prealloc_cbs.pop())
+            };
+            let cb_init = FenceCallbackRegistration::new(&dep_fence, callback);
+            let result = match uninit_box {
+                Some(uninit_box) => uninit_box.write_pin_init(cb_init),
+                None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
+            };
+            match result {
                 Ok(registration) => {
                     {
                         let mut guard = self.fifo.lock();
@@ -1141,15 +1219,23 @@ impl<T: QueueOps> JobQueueInner<T> {
             Ok(SubmitResult::Submitted) => {
                 // Register a callback on the public submit fence so that the
                 // HW-wait stage wakes up promptly when the driver signals it.
-                let cb_result = KBox::try_pin_init(
-                    FenceCallbackRegistration::new(
-                        &submit_fence,
-                        ProgressCallback {
-                            inner: self.clone(),
-                        },
-                    ),
-                    GFP_KERNEL,
+                let uninit_box = {
+                    let mut guard = self.fifo.lock();
+                    guard
+                        .get_mut(entry_idx as usize)
+                        .and_then(|e| e.as_live_mut())
+                        .and_then(|e| e.prealloc_progress_cb.take())
+                };
+                let cb_init = FenceCallbackRegistration::new(
+                    &submit_fence,
+                    ProgressCallback {
+                        inner: self.clone(),
+                    },
                 );
+                let cb_result = match uninit_box {
+                    Some(uninit_box) => uninit_box.write_pin_init(cb_init),
+                    None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
+                };
                 match cb_result {
                     Ok(registration) => {
                         let mut guard = self.fifo.lock();
@@ -1492,6 +1578,17 @@ impl<T: QueueOps> JobQueue<T> {
         let mut dep_vec = KVec::with_capacity(dep_capacity, GFP_KERNEL)?;
         dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
 
+        // One uninitialised callback slot per dep slot, so that
+        // process_deps() can register a callback without allocating under
+        // the pipeline state mutex (which would close the
+        // state -> dma_fence_map -> fs_reclaim lockdep cycle).
+        let mut prealloc_cbs = KVec::with_capacity(dep_capacity, GFP_KERNEL)?;
+        for _ in 0..dep_capacity {
+            prealloc_cbs.push(KBox::new_uninit(GFP_KERNEL)?, GFP_KERNEL)?;
+        }
+        let prealloc_progress_cb = Some(KBox::new_uninit(GFP_KERNEL)?);
+        let prealloc_stage_cb = Some(KBox::new_uninit(GFP_KERNEL)?);
+
         // Allocate the XaEntry::Reserved box *before* acquiring xa_lock:
         // KBox::new with GFP_KERNEL may sleep, which is forbidden under the
         // XArray spinlock.  commit() transitions this to Live in-place with
@@ -1501,6 +1598,9 @@ impl<T: QueueOps> JobQueue<T> {
                 job: job.clone(),
                 uninit_fence: Some(uninit_fence),
                 deps: dep_vec,
+                prealloc_cbs,
+                prealloc_progress_cb,
+                prealloc_stage_cb,
                 counter,
             },
             GFP_KERNEL,
@@ -1545,19 +1645,25 @@ impl<T: QueueOps> JobQueue<T> {
         let (ctx, seqno) = self.inner.fence_ctx.next_seqno();
 
         // Phase 1: extract Reserved fields under the XArray lock.
-        let (job, uninit_fence, deps, counter) = {
+        let (job, uninit_fence, deps, prealloc_cbs, prealloc_progress_cb, prealloc_stage_cb, counter) = {
             let mut guard = self.inner.fifo.lock();
             match guard.get_mut(xa_index.index()) {
                 Some(XaEntry::Reserved {
                     ref job,
                     ref mut uninit_fence,
                     ref mut deps,
+                    ref mut prealloc_cbs,
+                    ref mut prealloc_progress_cb,
+                    ref mut prealloc_stage_cb,
                     counter,
                 }) => {
                     let j = job.clone();
                     let uf = uninit_fence.take().expect("BUG: double commit");
                     let d = core::mem::take(deps);
-                    (j, uf, d, *counter)
+                    let pc = core::mem::take(prealloc_cbs);
+                    let pp = prealloc_progress_cb.take();
+                    let ps = prealloc_stage_cb.take();
+                    (j, uf, d, pc, pp, ps, *counter)
                 }
                 _ => {
                     panic!(
@@ -1588,11 +1694,14 @@ impl<T: QueueOps> JobQueue<T> {
                     fences: deps,
                     current_idx: 0,
                     active_cb: None,
+                    prealloc_cbs,
                 },
                 progress_cb: None,
                 stage_entered_at: Instant::now(),
                 pipeline_entered_at: Instant::now(),
                 stage_wake_cb: None,
+                prealloc_progress_cb,
+                prealloc_stage_cb,
                 timed_out: false,
             });
         }
