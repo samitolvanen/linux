@@ -66,6 +66,8 @@ use crate::{
     },
 };
 
+use super::dma_fence_trace as trace_dbg;
+
 /// The return type of [`PublicDmaFence::wait_timeout`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum FenceWaitResult {
@@ -617,6 +619,18 @@ impl<T: DriverDmaFenceOps> DriverDmaFence<T, Published> {
     /// - `Err(e)` sets the error on the fence before signaling.
     pub fn signal(self, result: Result) {
         let raw_fence = self.inner.fence.get();
+
+        // SAFETY: `raw_fence` is owned by this handle; `context` and `seqno`
+        // are immutable for the lifetime of the fence.
+        let (ctx, seqno) = unsafe { ((*raw_fence).context, (*raw_fence).seqno) };
+        trace_dbg::signal(
+            ctx,
+            seqno,
+            match result {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            },
+        );
 
 		// SAFETY: `raw_fence` is owned by this handle and remains valid for the
 		// duration of the signaling sequence.
@@ -1460,9 +1474,14 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
     ///
     /// This is only called by the dma_fence subsystem with valid pointers.
     unsafe extern "C" fn dma_fence_callback(
-        _fence: *mut bindings::dma_fence,
+        fence: *mut bindings::dma_fence,
         cb: *mut bindings::dma_fence_cb,
     ) {
+        // SAFETY: The dma_fence subsystem invokes this with a valid `fence`
+        // pointer; `context` and `seqno` are immutable for the fence's lifetime.
+        let (ctx, seqno) = unsafe { ((*fence).context, (*fence).seqno) };
+        trace_dbg::callback_fire(ctx, seqno);
+
 		// SAFETY: The dma_fence subsystem invokes this with a valid callback
 		// pointer that was registered from a live `FenceCallbackRegistration`.
         unsafe {
