@@ -976,7 +976,10 @@ impl Queue {
                     outstanding: 0,
                 }),
                 syncwait <- new_mutex!(SyncWait::default()),
-                suspend_state <- new_mutex!(SuspendState::default()),
+                suspend_state <- new_mutex!(SuspendState {
+                    since: Some(Instant::<Monotonic>::now()),
+                    accumulated: Delta::ZERO,
+                }),
             }),
             GFP_KERNEL,
         )?;
