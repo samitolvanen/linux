@@ -325,7 +325,7 @@ impl TyrDrmFileData {
         .reader();
 
         for i in 0..count {
-            let res = {
+            let res: Result = (|| {
                 let op: VmBindOp = reader.read()?;
                 let (job, syncs) = op.capture(file, true)?;
                 let deps = deps::wait_fences(file, &syncs)?;
@@ -347,8 +347,8 @@ impl TyrDrmFileData {
                     Ok(())
                 })?;
 
-                Ok(0)
-            };
+                Ok(())
+            })();
 
             if let Err(e) = res {
                 vmbind.ops.count = i as u32;
