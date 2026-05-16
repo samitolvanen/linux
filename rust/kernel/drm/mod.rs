@@ -12,6 +12,7 @@ pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
 pub mod job_queue;
+mod job_queue_trace;
 pub mod printer;
 pub mod syncobj;
 
