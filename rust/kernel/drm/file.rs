@@ -57,6 +57,13 @@ impl<T: DriverFile> File<T> {
         unsafe { Pin::new_unchecked(&*(self.driver_priv())) }
     }
 
+    /// Returns whether this file is the current DRM master.
+    pub fn is_current_master(&self) -> bool {
+        // SAFETY: By the type invariant, `self.as_raw()` points to a valid `struct drm_file`
+        // that remains live for the duration of this borrow.
+        unsafe { bindings::drm_is_current_master(self.as_raw()) }
+    }
+
     /// The open callback of a `struct drm_file`.
     pub(crate) extern "C" fn open_callback(
         raw_dev: *mut bindings::drm_device,
