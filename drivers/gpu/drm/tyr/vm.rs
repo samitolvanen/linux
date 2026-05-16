@@ -593,6 +593,7 @@ pub(crate) struct Vm {
 }
 
 impl Vm {
+    #[allow(clippy::too_many_arguments)]
     fn new_with_ranges<Ctx: DeviceContext>(
         pdev: &platform::Device,
         ddev: &TyrDrmDevice<Ctx>,
@@ -601,6 +602,7 @@ impl Vm {
         total_range: Range<u64>,
         kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
+        coherent: bool,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
@@ -609,7 +611,7 @@ impl Vm {
         let reserve_range = 0..0u64;
 
         // dummy_obj is used to initialize the GPUVM tree.
-        let dummy_obj = gem::new_dummy_object(ddev).inspect_err(|e| {
+        let dummy_obj = gem::new_dummy_object(ddev, coherent).inspect_err(|e| {
             pr_err!("Failed to create dummy GEM object: {:?}\n", e);
         })?;
 
@@ -676,11 +678,21 @@ impl Vm {
         gpu_info: &GpuInfo,
         auto_kernel_va_start: u64,
         auto_kernel_va_size: u64,
+        coherent: bool,
     ) -> Result<Arc<Vm>> {
         let total_range = 0..max_va_range(gpu_info);
         let kernel_range = auto_kernel_va_start..(auto_kernel_va_start + auto_kernel_va_size);
 
-        Self::new_with_ranges(pdev, ddev, mmu, gpu_info, total_range, kernel_range, None)
+        Self::new_with_ranges(
+            pdev,
+            ddev,
+            mmu,
+            gpu_info,
+            total_range,
+            kernel_range,
+            None,
+            coherent,
+        )
     }
 
     pub(crate) fn new_for_user(
@@ -708,6 +720,7 @@ impl Vm {
             total_range,
             kernel_range,
             Some(ddev.wq.clone()),
+            ddev.coherent,
         )
     }
 

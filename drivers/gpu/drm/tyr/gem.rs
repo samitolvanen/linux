@@ -19,6 +19,7 @@ use kernel::{
         Arc,
         ArcBorrow, //
     },
+    uapi, //
 };
 
 use crate::{
@@ -193,13 +194,38 @@ impl MappedUserBo {
     }
 }
 
+/// Returns whether a BO should be mapped write-combine given the device's
+/// DMA coherence and the user-supplied BO creation flags.
+///
+/// FIXME: Note that this problem is going to pop up again when we decide to
+/// support mapping buffers with the NO_MMAP flag as non-shareable (AKA
+/// buffers accessed only by the GPU), because we need the same CPU flush to
+/// happen after page allocation, otherwise there's a risk of data leak or
+/// late corruption caused by a dirty cacheline being evicted. At this point
+/// we'll need a way to force CPU cache maintenance regardless of whether the
+/// device is coherent or not.
+pub(crate) fn should_map_wc(coherent: bool, flags: u32) -> bool {
+    if coherent {
+        return false;
+    }
+
+    if flags & uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_WB_MMAP != 0 {
+        return false;
+    }
+
+    true
+}
+
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
-pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> Result<ARef<Bo>> {
+pub(crate) fn new_dummy_object<Ctx: DeviceContext>(
+    ddev: &TyrDrmDevice<Ctx>,
+    coherent: bool,
+) -> Result<ARef<Bo>> {
     let bo = gem::shmem::Object::<BoData>::new(
         ddev,
         4096,
         shmem::ObjectConfig {
-            map_wc: true,
+            map_wc: should_map_wc(coherent, 0),
             parent_resv_obj: None,
         },
         BoCreateArgs { flags: 0 },
@@ -212,6 +238,7 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
     ddev: &TyrDrmDevice<Ctx>,
     size: usize,
     flags: u32,
+    coherent: bool,
 ) -> Result<ARef<Bo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
 
@@ -219,15 +246,25 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
         return Err(EINVAL);
     }
 
-    Bo::new(
+    let map_wc = should_map_wc(coherent, flags);
+    let bo = Bo::new(
         ddev,
         aligned_size,
         shmem::ObjectConfig {
-            map_wc: true,
+            map_wc,
             parent_resv_obj: None,
         },
         BoCreateArgs { flags },
-    )
+    )?;
+
+    if map_wc {
+        // SAFETY: `ddev` is bound for the duration of the ioctl path that
+        // reaches this function.
+        let dev = unsafe { ddev.as_ref().as_bound() };
+        bo.sg_table(dev)?;
+    }
+
+    Ok(bo)
 }
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
@@ -240,6 +277,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
     vm: &Arc<Vm>,
     size: usize,
     flags: VmMapFlags,
+    coherent: bool,
 ) -> Result<Arc<MappedBo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -251,6 +289,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
         aligned_size as u64,
         KernelBoVaAlloc::Explicit(va),
         flags,
+        coherent,
     )?;
 
     MappedBo::new(kernel_bo, node)
@@ -293,6 +332,7 @@ impl KernelBo {
         size: u64,
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
+        coherent: bool,
     ) -> Result<Self> {
         if size == 0 {
             pr_err!("Cannot create KernelBo with size 0\n");
@@ -305,7 +345,7 @@ impl KernelBo {
             ddev,
             size as usize,
             shmem::ObjectConfig {
-                map_wc: true,
+                map_wc: should_map_wc(coherent, 0),
                 parent_resv_obj: None,
             },
             BoCreateArgs { flags: 0 },

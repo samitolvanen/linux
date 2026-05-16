@@ -952,7 +952,13 @@ pub(crate) struct Queue {
 impl Queue {
     pub(crate) fn new(tdev: &TyrDrmDevice, queue_args: &QueueCreate, vm: Arc<Vm>) -> Result<Self> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
-        let ringbuf = gem::new_kernel_object(tdev, &vm, queue_args.ringbuf_size() as usize, flags)?;
+        let ringbuf = gem::new_kernel_object(
+            tdev,
+            &vm,
+            queue_args.ringbuf_size() as usize,
+            flags,
+            tdev.coherent,
+        )?;
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
 

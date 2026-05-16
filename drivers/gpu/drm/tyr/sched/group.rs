@@ -347,7 +347,7 @@ impl Group {
         let num_syncs =
             group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
-        let syncobjs = gem::new_kernel_object(ddev, &vm, num_syncs, flags)?;
+        let syncobjs = gem::new_kernel_object(ddev, &vm, num_syncs, flags, ddev.coherent)?;
 
         let vmap = syncobjs.vmap();
         let size = vmap.owner().size();

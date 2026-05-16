@@ -125,6 +125,12 @@ pub(crate) struct TyrDrmDeviceData {
 
     pub(crate) mmio_phys_addr: u64,
 
+    /// Whether the device is reported as DMA-coherent by firmware.
+    ///
+    /// Cached at probe via `device_get_dma_attr()`. Drives the BO
+    /// cacheability policy in [`crate::gem::should_map_wc`].
+    pub(crate) coherent: bool,
+
     pub(crate) fw: Arc<Firmware>,
 
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
@@ -453,6 +459,8 @@ impl platform::Driver for TyrPlatformDriverData {
         // other threads of execution.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)? };
 
+        let coherent = pdev.as_ref().dma_coherent();
+
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
         let platform: ARef<platform::Device> = pdev.into();
 
@@ -464,6 +472,7 @@ impl platform::Driver for TyrPlatformDriverData {
             &uninit_ddev,
             mmu.as_arc_borrow(),
             &gpu_info,
+            coherent,
         )?;
 
         let wq = Arc::new(
@@ -484,6 +493,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmu,
                 iomem: iomem.clone(),
                 mmio_phys_addr,
+                coherent,
                 fw: firmware,
                 wq,
                 sched_wq,

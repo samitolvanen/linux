@@ -369,7 +369,10 @@ impl TyrDrmFileData {
         bocreate: &mut uapi::drm_panthor_bo_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if bocreate.flags & !uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
+        let valid_flags = uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP
+            | uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_WB_MMAP;
+
+        if bocreate.flags & !valid_flags != 0 {
             dev_err!(
                 ddev.as_ref(),
                 "bo_create: invalid flags {}\n",
@@ -379,7 +382,7 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
-        let bo = gem::new_bo(ddev, bocreate.size as usize, bocreate.flags)?;
+        let bo = gem::new_bo(ddev, bocreate.size as usize, bocreate.flags, ddev.coherent)?;
         let handle = bo.create_handle(file)?;
 
         bocreate.handle = handle;
