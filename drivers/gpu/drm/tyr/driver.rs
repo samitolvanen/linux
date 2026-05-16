@@ -58,6 +58,7 @@ use kernel::{
         self,
         impl_has_delayed_work,
         DelayedWork,
+        OwnedQueue,
         Work,
         WorkItem,
         WqFlags, //
@@ -112,6 +113,30 @@ pub(crate) mod work_id {
     pub(crate) const TILER_OOM: u64 = 5;
 }
 
+/// `Send + Sync` newtype around [`OwnedQueue`] so the cleanup
+/// workqueue can be shared as `Arc<CleanupQueue>` between the device
+/// and the [`KernelBo`](crate::gem::KernelBo)s that enqueue deferred
+/// drops on it. The wrapped [`Queue`](kernel::workqueue::Queue) is
+/// already `Send + Sync`; this mirrors the equivalent wrapper that
+/// [`DmaFenceWorkqueue`] applies.
+#[repr(transparent)]
+pub(crate) struct CleanupQueue(OwnedQueue);
+
+// SAFETY: The wrapped `OwnedQueue` exposes a `Queue` which is itself
+// `Send`, and `destroy_workqueue` (run from `OwnedQueue::drop`) is
+// safe to invoke from any thread.
+unsafe impl Send for CleanupQueue {}
+// SAFETY: As for `Send`; `Queue`'s operations are documented as
+// thread-safe by the C workqueue API.
+unsafe impl Sync for CleanupQueue {}
+
+impl core::ops::Deref for CleanupQueue {
+    type Target = OwnedQueue;
+    fn deref(&self) -> &OwnedQueue {
+        &self.0
+    }
+}
+
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData;
 
@@ -140,6 +165,17 @@ pub(crate) struct TyrDrmDeviceData {
     /// [`DmaFenceWorkqueue::new`]) so the scheduler can keep up with
     /// firmware acks under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
+
+    /// Per-device cleanup workqueue.
+    ///
+    /// Carries deferred drops from objects whose [`Drop`] would
+    /// otherwise run inside a dma-fence signalling section. The queue
+    /// is deliberately **not** a [`DmaFenceWorkqueue`]: its purpose
+    /// is to provide an execution context that does not hold the
+    /// `dma_fence_map` lockdep token, so the cleanup work is free to
+    /// take `dma_resv_lock`, the per-VM gpuvm mutex, and allocate
+    /// with `GFP_KERNEL`.
+    pub(crate) cleanup_wq: Arc<CleanupQueue>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -466,6 +502,11 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
 
+        let cleanup_wq = Arc::new(
+            CleanupQueue(OwnedQueue::new(c"tyr-cleanup", WqFlags::UNBOUND, 0)?),
+            GFP_KERNEL,
+        )?;
+
         let firmware = Firmware::new(
             pdev,
             iomem.clone(),
@@ -473,6 +514,7 @@ impl platform::Driver for TyrPlatformDriverData {
             mmu.as_arc_borrow(),
             &gpu_info,
             coherent,
+            cleanup_wq.clone(),
         )?;
 
         let wq = Arc::new(
@@ -497,6 +539,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 fw: firmware,
                 wq,
                 sched_wq,
+                cleanup_wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,

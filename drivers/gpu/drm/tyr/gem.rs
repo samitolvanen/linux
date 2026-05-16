@@ -34,6 +34,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        CleanupQueue,
         TyrDrmDevice,
         TyrDrmDriver, //
     },
@@ -367,6 +368,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
     size: usize,
     flags: VmMapFlags,
     coherent: bool,
+    cleanup_wq: Arc<CleanupQueue>,
 ) -> Result<Arc<MappedBo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -379,6 +381,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
         KernelBoVaAlloc::Explicit(va),
         flags,
         coherent,
+        cleanup_wq,
     )?;
 
     MappedBo::new(kernel_bo, node)
@@ -407,6 +410,9 @@ pub(crate) struct KernelBo {
     vm: Arc<Vm>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
+    /// Cleanup workqueue used by [`Drop`] to defer the GPU unmap out
+    /// of any dma-fence signalling section the drop may run under.
+    cleanup_wq: Arc<CleanupQueue>,
 }
 
 impl KernelBo {
@@ -422,6 +428,7 @@ impl KernelBo {
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
         coherent: bool,
+        cleanup_wq: Arc<CleanupQueue>,
     ) -> Result<Self> {
         if size == 0 {
             pr_err!("Cannot create KernelBo with size 0\n");
@@ -446,6 +453,7 @@ impl KernelBo {
             bo,
             vm: vm.into(),
             va_range: va..(va + size),
+            cleanup_wq,
         })
     }
 
@@ -459,13 +467,30 @@ impl Drop for KernelBo {
     fn drop(&mut self) {
         let va = self.va_range.start;
         let size = self.va_range.end - self.va_range.start;
+        let vm = self.vm.clone();
+        let bo = self.bo.clone();
 
-        if let Err(e) = self.vm.unmap_range(va, size) {
+        let res = self.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            if let Err(e) = vm.unmap_range(va, size) {
+                pr_err!(
+                    "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
+                    va,
+                    va + size,
+                    e
+                );
+            }
+            // Force the closure to capture `bo` so its drop runs on
+            // the cleanup workqueue, not back here on the dma-fence
+            // signalling path.
+            drop(bo);
+        });
+
+        if let Err(e) = res {
             pr_err!(
-                "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-                self.va_range.start,
-                self.va_range.end,
-                e
+                "Failed to enqueue KernelBo cleanup for {:#x}..{:#x}: {:?}; leaking range\n",
+                va,
+                va + size,
+                e,
             );
         }
     }
