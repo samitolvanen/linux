@@ -184,8 +184,7 @@ impl GlobalInterface {
     }
 
     pub(crate) fn enable(&self, core_clk_rate: u64) -> Result {
-        let mut inner = self.inner.lock();
-        inner.enable(
+        let enabled = InnerGlobalInterface::build_enabled(
             &self.pdev,
             self.iomem.as_ref(),
             &self.shared_section,
@@ -193,7 +192,10 @@ impl GlobalInterface {
             core_clk_rate,
             self.event_wait.as_ref(),
             self.user_as_slot_count,
-        )
+        )?;
+
+        let mut inner = self.inner.lock();
+        inner.install_enabled(enabled)
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
@@ -324,8 +326,7 @@ impl InnerGlobalInterface {
         }
     }
 
-    fn enable(
-        &mut self,
+    fn build_enabled(
         pdev: &platform::Device,
         iomem: &Devres<IoMem>,
         shared_section: &SharedSectionInfo,
@@ -333,7 +334,7 @@ impl InnerGlobalInterface {
         core_clk_rate: u64,
         event_wait: &Wait,
         user_as_slot_count: usize,
-    ) -> Result {
+    ) -> Result<EnabledGlobalInterface> {
         let glb_control = FwInterface::<GLB_CONTROL_BLOCK_SIZE>::new(
             &shared_section.vmap,
             &shared_section.va_range,
@@ -415,16 +416,26 @@ impl InnerGlobalInterface {
             );
         }
 
-        self.state = GlobalInterfaceState::Enabled(EnabledGlobalInterface {
+        let mut csg = KVec::with_capacity(csg_num, GFP_KERNEL)?;
+        for csg_idx in 0..csg_num {
+            let mut entry = CsgInterface::new(csg_idx)?;
+            entry.enable(shared_section, csg_idx, csg_stride)?;
+            csg.push(entry, GFP_KERNEL)?;
+        }
+
+        Ok(EnabledGlobalInterface {
             glb_control,
             glb_input,
             glb_output,
             csg_stride,
             csg_num,
-            csg: KVec::with_capacity(csg_num, GFP_KERNEL)?,
-        });
+            csg,
+        })
+    }
 
-        self.init_csg(shared_section)
+    fn install_enabled(&mut self, enabled: EnabledGlobalInterface) -> Result {
+        self.state = GlobalInterfaceState::Enabled(enabled);
+        Ok(())
     }
 
     fn configure_glb_input(
@@ -502,21 +513,6 @@ impl InnerGlobalInterface {
             .with_cfg_pwroff_timer(true)
             .with_idle_enable(true)
             .with_counter_enable(true))
-    }
-
-    fn init_csg(&mut self, shared_section: &SharedSectionInfo) -> Result {
-        let enabled = match &mut self.state {
-            GlobalInterfaceState::Enabled(enabled) => enabled,
-            GlobalInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        for csg_idx in 0..enabled.csg_num {
-            let mut csg = CsgInterface::new(csg_idx)?;
-            csg.enable(shared_section, csg_idx, enabled.csg_stride)?;
-            enabled.csg.push(csg, GFP_KERNEL)?;
-        }
-
-        Ok(())
     }
 
     fn csg(&self, index: usize) -> Option<&CsgInterface> {
