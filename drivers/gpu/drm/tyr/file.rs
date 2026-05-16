@@ -491,10 +491,33 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn bo_sync(
-        _ddev: &TyrDrmDevice,
-        _args: &mut uapi::drm_panthor_bo_sync,
-        _file: &TyrDrmFile,
+        ddev: &TyrDrmDevice,
+        args: &mut uapi::drm_panthor_bo_sync,
+        file: &TyrDrmFile,
     ) -> Result<u32> {
+        if args.ops.count == 0 {
+            return Ok(0);
+        }
+
+        if args.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_bo_sync_op>() {
+            return Err(ENOTSUPP);
+        }
+
+        let count = args.ops.count as usize;
+        let stride = args.ops.stride as usize;
+
+        let mut reader =
+            UserSlice::new(UserPtr::from_addr(args.ops.array as usize), stride * count).reader();
+
+        // SAFETY: `ddev` is a bound device in the ioctl path.
+        let dev = unsafe { ddev.as_ref().as_bound() };
+
+        for _ in 0..count {
+            let op: BoSyncOp = reader.read()?;
+            let bo = gem::lookup_handle(file, op.0.handle)?;
+            gem::sync(&bo, dev, op.0.type_, op.0.offset, op.0.size, ddev.coherent)?;
+        }
+
         Ok(0)
     }
 
@@ -518,6 +541,12 @@ struct VmBindOp(uapi::drm_panthor_vm_bind_op);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for VmBindOp {}
+
+#[repr(transparent)]
+struct BoSyncOp(uapi::drm_panthor_bo_sync_op);
+
+// SAFETY: this struct is safe to be transmuted from a byte slice.
+unsafe impl FromBytes for BoSyncOp {}
 
 impl VmBindOp {
     fn capture(

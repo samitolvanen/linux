@@ -7,10 +7,20 @@
 use core::ops::Range;
 
 use kernel::{
+    device::{
+        self,
+        Bound, //
+    },
+    dma::{
+        sync_single_for_cpu,
+        sync_single_for_device,
+        DataDirection, //
+    },
     drm::{
         gem,
         gem::shmem,
         gem::BaseObject,
+        gem::IntoGEMObject,
         DeviceContext, //
     },
     prelude::*,
@@ -269,6 +279,85 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
     shmem::Object::lookup_handle(file, handle)
+}
+
+/// Performs explicit CPU cache maintenance on a sub-range of `bo`.
+///
+/// Mirrors `panthor_gem_sync()`: a no-op for WC-mapped or imported buffers,
+/// otherwise walks the BO's scatter-gather table and synchronises the
+/// intersecting segments using `dma_sync_single_for_{device,cpu}` for the
+/// FLUSH and FLUSH_AND_INVALIDATE op types respectively.
+pub(crate) fn sync(
+    bo: &Bo,
+    dev: &device::Device<Bound>,
+    type_: u32,
+    offset: u64,
+    size: u64,
+    coherent: bool,
+) -> Result {
+    let bo_size = bo.size() as u64;
+    let end = offset.checked_add(size).ok_or(EINVAL)?;
+    if end > bo_size {
+        return Err(EINVAL);
+    }
+
+    // SAFETY: `bo.as_raw()` is a valid pointer to a `drm_gem_object` for the
+    // lifetime of `bo`. `import_attach` is set at most once at gem creation
+    // and never cleared, so a plain read is sound.
+    let imported = unsafe { !(*bo.as_raw()).import_attach.is_null() };
+    if imported {
+        return Err(EINVAL);
+    }
+
+    match type_ {
+        uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH
+        | uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE => {}
+        _ => return Err(EINVAL),
+    }
+
+    if should_map_wc(coherent, bo.create_flags()) {
+        return Ok(());
+    }
+
+    if size == 0 {
+        return Ok(());
+    }
+
+    let sgt = bo.sg_table(dev)?;
+
+    let mut offset = offset;
+    let mut size = size;
+
+    for entry in sgt.iter() {
+        if size == 0 {
+            break;
+        }
+
+        let paddr = entry.dma_address();
+        let len: u64 = entry.dma_len();
+
+        if len <= offset {
+            offset -= len;
+            continue;
+        }
+
+        let paddr = paddr + offset;
+        let mut len = len - offset;
+        if len > size {
+            len = size;
+        }
+        size -= len;
+        offset = 0;
+
+        sync_single_for_device(dev, paddr, len as usize, DataDirection::ToDevice);
+        if type_
+            == uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE
+        {
+            sync_single_for_cpu(dev, paddr, len as usize, DataDirection::FromDevice);
+        }
+    }
+
+    Ok(())
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
