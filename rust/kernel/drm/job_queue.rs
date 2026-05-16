@@ -204,6 +204,8 @@ use crate::{
     },
 };
 
+use super::job_queue_trace as trace_dbg;
+
 #[derive(Clone, Copy)]
 /// Lock classes used by a [`JobQueue`] instance.
 pub struct JobQueueLockClasses {
@@ -900,7 +902,9 @@ struct DepCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for DepCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+    fn signaled(self, fence: &ARef<PublicDmaFence>) {
+        let (ctx, seqno) = trace_dbg::fence_key(fence);
+        trace_dbg::cb_fire(trace_dbg::CB_KIND_DEP, ctx, seqno);
         self.inner.maybe_check_progress();
     }
 }
@@ -911,7 +915,9 @@ struct ProgressCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for ProgressCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+    fn signaled(self, fence: &ARef<PublicDmaFence>) {
+        let (ctx, seqno) = trace_dbg::fence_key(fence);
+        trace_dbg::cb_fire(trace_dbg::CB_KIND_PROGRESS, ctx, seqno);
         self.inner.maybe_check_progress();
     }
 }
@@ -922,7 +928,9 @@ struct StageWakeCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for StageWakeCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+    fn signaled(self, fence: &ARef<PublicDmaFence>) {
+        let (ctx, seqno) = trace_dbg::fence_key(fence);
+        trace_dbg::cb_fire(trace_dbg::CB_KIND_STAGE, ctx, seqno);
         self.inner.maybe_check_progress();
     }
 }
@@ -992,6 +1000,8 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// [`step_stage`](Self::step_stage); helpers only return a [`StageAdvance`]
     /// without touching `PipelineState` themselves.
     fn check_progress(self: &Arc<Self>) {
+        trace_dbg::check_progress(trace_dbg::CHECK_REASON_UNKNOWN);
+
         let mut state = self.state.lock();
 
         // Drain newly submitted jobs into stage_ranges[0] (DepsStage).
@@ -1056,6 +1066,13 @@ impl<T: QueueOps> JobQueueInner<T> {
             return false;
         }
         let entry_idx = state.stage_ranges[stage_i].start;
+        let stage_kind = match &self.stages[stage_i] {
+            StageKind::WaitingForDeps => trace_dbg::STAGE_KIND_WAITING_FOR_DEPS,
+            StageKind::WaitingForExec => trace_dbg::STAGE_KIND_WAITING_FOR_EXEC,
+            StageKind::Executing => trace_dbg::STAGE_KIND_EXECUTING,
+            StageKind::Driver(_) => trace_dbg::STAGE_KIND_DRIVER,
+        };
+        trace_dbg::process_stage_enter(entry_idx, stage_i as u32, stage_kind);
 
         let mut reset_stage_clock = false;
         let advance = {
@@ -1101,6 +1118,12 @@ impl<T: QueueOps> JobQueueInner<T> {
 
         match advance {
             StageAdvance::Advance => {
+                trace_dbg::stage_advance(
+                    entry_idx,
+                    stage_i as u32,
+                    trace_dbg::ADVANCE_KIND_ADVANCE,
+                    0,
+                );
                 state.stage_ranges[stage_i].pop_front();
                 if stage_i + 1 < self.stages.len() {
                     state.stage_ranges[stage_i + 1].push_back();
@@ -1117,7 +1140,13 @@ impl<T: QueueOps> JobQueueInner<T> {
                 }
                 true
             }
-            StageAdvance::TimedOut(_) => {
+            StageAdvance::TimedOut(e) => {
+                trace_dbg::stage_advance(
+                    entry_idx,
+                    stage_i as u32,
+                    trace_dbg::ADVANCE_KIND_TIMED_OUT,
+                    i64::from(e.to_errno()),
+                );
                 // Set the timed_out flag and advance to the next stage
                 // normally. This preserves the contiguous WrapRange
                 // invariant: every cursor move is a front-of-stage pop,
@@ -1139,6 +1168,13 @@ impl<T: QueueOps> JobQueueInner<T> {
                 true
             }
             StageAdvance::WaitOn(fence) => {
+                trace_dbg::stage_advance(
+                    entry_idx,
+                    stage_i as u32,
+                    trace_dbg::ADVANCE_KIND_WAIT_ON,
+                    0,
+                );
+                let (fence_ctx, fence_seqno) = trace_dbg::fence_key(&fence);
                 let uninit_box = {
                     let mut guard = self.fifo.lock();
                     guard
@@ -1160,6 +1196,12 @@ impl<T: QueueOps> JobQueueInner<T> {
                 };
                 match result {
                     Ok(registration) => {
+                        trace_dbg::register_cb(
+                            entry_idx,
+                            trace_dbg::CB_KIND_STAGE,
+                            fence_ctx,
+                            fence_seqno,
+                        );
                         let mut guard = self.fifo.lock();
                         if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                             entry.stage_wake_cb = Some(registration);
@@ -1179,13 +1221,27 @@ impl<T: QueueOps> JobQueueInner<T> {
                 false
             }
             StageAdvance::WaitFor(delay) => {
+                trace_dbg::stage_advance(
+                    entry_idx,
+                    stage_i as u32,
+                    trace_dbg::ADVANCE_KIND_WAIT_FOR,
+                    delay as i64,
+                );
                 // SAFETY: The pending work item is an `Arc<Self>` and `self.wq` is an owning
                 // `Arc<DmaFenceWorkqueue>` field of `Self`, so the workqueue stays alive while
                 // the item is pending.
                 let _ = unsafe { self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay) };
                 false
             }
-            StageAdvance::Wait => false,
+            StageAdvance::Wait => {
+                trace_dbg::stage_advance(
+                    entry_idx,
+                    stage_i as u32,
+                    trace_dbg::ADVANCE_KIND_WAIT,
+                    0,
+                );
+                false
+            }
         }
     }
 
@@ -1271,6 +1327,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 .and_then(|e| e.as_live_mut())
                 .and_then(|e| e.deps.prealloc_cbs.pop())
         };
+        let (dep_fence_ctx, dep_fence_seqno) = trace_dbg::fence_key(&dep_fence);
         let cb_init = FenceCallbackRegistration::new(&dep_fence, callback);
         let result = match uninit_box {
             Some(uninit_box) => uninit_box.write_pin_init(cb_init),
@@ -1278,6 +1335,12 @@ impl<T: QueueOps> JobQueueInner<T> {
         };
         match result {
             Ok(registration) => {
+                trace_dbg::register_cb(
+                    entry_idx,
+                    trace_dbg::CB_KIND_DEP,
+                    dep_fence_ctx,
+                    dep_fence_seqno,
+                );
                 {
                     let mut guard = self.fifo.lock();
                     if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
@@ -1345,7 +1408,16 @@ impl<T: QueueOps> JobQueueInner<T> {
                     None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
                 };
                 let registration = match cb_result {
-                    Ok(registration) => Some(registration),
+                    Ok(registration) => {
+                        let (fence_ctx, fence_seqno) = trace_dbg::fence_key(&submit_fence);
+                        trace_dbg::register_cb(
+                            entry_idx,
+                            trace_dbg::CB_KIND_PROGRESS,
+                            fence_ctx,
+                            fence_seqno,
+                        );
+                        Some(registration)
+                    }
                     Err(CallbackError::AlreadySignaled(cb)) => {
                         cb.inner.maybe_check_progress();
                         None
@@ -1465,6 +1537,13 @@ impl<T: QueueOps> JobQueueInner<T> {
             entered_at: stage_entered_at,
             pipeline_entered_at,
         };
+        let (fence_ctx, fence_seqno) = trace_dbg::fence_key(&submit_fence);
+        trace_dbg::fence_state(
+            entry_idx,
+            fence_ctx,
+            fence_seqno,
+            submit_fence.is_signaled(),
+        );
         stage.process(&ctx)
     }
 
@@ -1873,6 +1952,22 @@ impl<T: QueueOps> JobQueue<T> {
             }
             idx
         };
+
+        // Emit before the store so `is_signaled()` runs outside the XArray lock.
+        if let XaEntry::Reserved { deps, .. } = &*entry {
+            let dep_count = deps.len() as u32;
+            for (dep_index, dep) in deps.iter().enumerate() {
+                let (fence_ctx, fence_seqno) = trace_dbg::fence_key(dep);
+                trace_dbg::prepare_dep(
+                    xa_index.index() as u32,
+                    dep_index as u32,
+                    dep_count,
+                    fence_ctx,
+                    fence_seqno,
+                    dep.is_signaled(),
+                );
+            }
+        }
 
         // Store the entry and publish the cursor together, so `drain_inbox`
         // never sees an index before its entry is there. Hand the index back
