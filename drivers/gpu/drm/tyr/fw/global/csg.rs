@@ -32,6 +32,7 @@ use crate::fw::{
         CSG_OUTPUT_BLOCK_SIZE,
         CSG_REQ,
         CS_CONTROL_BLOCK_SIZE,
+        GROUP_FEATURES,
         GROUP_INPUT_VA,
         GROUP_OUTPUT_VA,
         GROUP_PROTM_SUSPEND_SIZE,
@@ -40,7 +41,8 @@ use crate::fw::{
         GROUP_SUSPEND_SIZE, //
     },
     region::FwRegion,
-    MAX_CS, //
+    MAX_CS,
+    MIN_CS, //
 };
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
@@ -62,6 +64,8 @@ struct EnabledCsgInterface {
     csg_input: FwInterface<FwRegion<CSG_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes CSG acknowledgements here.
     csg_output: FwInterface<Region<CSG_OUTPUT_BLOCK_SIZE>>,
+    /// CSG features (read from GROUP_FEATURES).
+    features: GROUP_FEATURES,
     /// Runtime stride between CS control blocks (read from GROUP_STREAM_STRIDE).
     cs_stride: usize,
     /// Number of CS interfaces reported by hardware for this CSG.
@@ -77,7 +81,6 @@ pub(crate) struct CsgInterface {
     /// Current interface state (Disabled or Enabled).
     state: CsgInterfaceState,
     /// CSG identifier/index number.
-    #[expect(dead_code)]
     csg_idx: usize,
 }
 
@@ -101,6 +104,7 @@ impl CsgInterface {
         shared_section: &SharedSectionInfo,
         csg_idx: usize,
         csg_stride: usize,
+        first_cs: Option<&CsInterface>,
     ) -> Result {
         let vmap = &shared_section.vmap;
         let va_range = &shared_section.va_range;
@@ -165,17 +169,29 @@ impl CsgInterface {
             return Err(EINVAL);
         }
 
+        if (cs_num as usize) < MIN_CS {
+            dev_err!(
+                dev,
+                "Too few CS: hardware reports {}, min required {}\n",
+                cs_num,
+                MIN_CS
+            );
+            return Err(EINVAL);
+        }
+
+        let features = csg_control.read(GROUP_FEATURES);
         let enabled = EnabledCsgInterface {
             csg_control,
             csg_input,
             csg_output,
+            features,
             cs_stride,
             cs_num: cs_num as usize,
             cs: KVec::with_capacity(cs_num as usize, GFP_KERNEL)?,
         };
 
         self.state = CsgInterfaceState::Enabled(enabled);
-        self.init_cs(dev, shared_section, csg_control_offset)?;
+        self.init_cs(dev, shared_section, csg_control_offset, first_cs)?;
         Ok(())
     }
 
@@ -187,6 +203,7 @@ impl CsgInterface {
         dev: &Device,
         shared_section: &SharedSectionInfo,
         csg_control_offset: usize,
+        first_cs: Option<&CsInterface>,
     ) -> Result {
         let enabled = match &mut self.state {
             CsgInterfaceState::Enabled(e) => e,
@@ -204,10 +221,39 @@ impl CsgInterface {
                 enabled.cs_stride,
             )?;
 
+            if first_cs
+                .or(enabled.cs.first())
+                .is_some_and(|first| !cs.matches(first))
+            {
+                dev_err!(
+                    dev,
+                    "CSG {} CS {} does not match CSG 0 CS 0\n",
+                    self.csg_idx,
+                    cs_idx
+                );
+                return Err(EINVAL);
+            }
+
             enabled.cs.push(cs, GFP_KERNEL)?;
         }
 
         Ok(())
+    }
+
+    /// Returns whether `other` reports the same features, suspend buffer
+    /// sizes and CS count.
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (CsgInterfaceState::Enabled(a), CsgInterfaceState::Enabled(b)) => {
+                a.features == b.features
+                    && a.csg_control.read(GROUP_SUSPEND_SIZE)
+                        == b.csg_control.read(GROUP_SUSPEND_SIZE)
+                    && a.csg_control.read(GROUP_PROTM_SUSPEND_SIZE)
+                        == b.csg_control.read(GROUP_PROTM_SUSPEND_SIZE)
+                    && a.cs_num == b.cs_num
+            }
+            _ => false,
+        }
     }
 
     pub(in super::super) fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {

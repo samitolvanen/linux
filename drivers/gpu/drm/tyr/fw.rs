@@ -85,8 +85,14 @@ mod region;
 /// Maximum number of CSG interfaces supported by hardware.
 const MAX_CSG: usize = 16;
 
+/// Minimum number of CSG interfaces the firmware must report.
+const MIN_CSG: usize = 3;
+
 /// Maximum number of CS interfaces supported by hardware.
 const MAX_CS: usize = 16;
+
+/// Minimum number of CS interfaces a CSG must report.
+const MIN_CS: usize = 8;
 
 /// MCU virtual address where the CSF shared memory region starts.
 ///
