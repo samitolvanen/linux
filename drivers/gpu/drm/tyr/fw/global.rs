@@ -241,8 +241,7 @@ impl<'drm> GlobalInterface<'drm> {
     }
 
     pub(crate) fn enable(&self, core_clk: &Clk, io: &IoMem<'_>) -> Result {
-        let mut inner = self.inner.lock();
-        inner.enable(
+        let enabled = InnerGlobalInterface::build_enabled(
             self.dev,
             io,
             &self.shared_section,
@@ -250,7 +249,11 @@ impl<'drm> GlobalInterface<'drm> {
             core_clk,
             &self.event_wait,
             self.user_as_slot_count,
-        )
+        )?;
+
+        let mut inner = self.inner.lock();
+        inner.install_enabled(enabled);
+        Ok(())
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
@@ -298,24 +301,20 @@ impl InnerGlobalInterface {
         }
     }
 
-    /// Enables the global interface and discovers the CSG interfaces.
+    /// Enables the global interface and its CSG interfaces.
     ///
     /// This reads the firmware's control block to set up the global input/output
-    /// interfaces; it configures timers and shader core allocation; and it discovers
-    /// available CSG interfaces.
-    // Enabling drives the firmware interface through the device and its MMIO
-    // mapping, both of which the caller owns.
-    #[expect(clippy::too_many_arguments)]
-    fn enable(
-        &mut self,
+    /// interfaces, configures timers and shader core allocation, and creates
+    /// and enables each CSG interface the firmware reports.
+    fn build_enabled(
         dev: &Device,
-        iomem: &IoMem<'_>,
+        io: &IoMem<'_>,
         shared_section: &SharedSectionInfo,
         gpu_info: GpuInfo,
         core_clk: &Clk,
         event_wait: &Wait,
         user_as_slot_count: usize,
-    ) -> Result {
+    ) -> Result<EnabledGlobalInterface> {
         let vmap = &shared_section.vmap;
         let va_range = &shared_section.va_range;
 
@@ -362,7 +361,7 @@ impl InnerGlobalInterface {
         let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
 
         // Ring the global doorbell to notify the MCU.
-        iomem.write(DOORBELL::at(0), DOORBELL::zeroed().with_ring(true));
+        io.write(DOORBELL::at(0), DOORBELL::zeroed().with_ring(true));
 
         // Wait for the firmware to acknowledge the initial global configuration.
         let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
@@ -413,18 +412,26 @@ impl InnerGlobalInterface {
             );
         }
 
-        let enabled = EnabledGlobalInterface {
+        let mut csg = KVec::with_capacity(csg_num, GFP_KERNEL)?;
+        for csg_idx in 0..csg_num {
+            let mut entry = CsgInterface::new(csg_idx)?;
+            entry.enable(dev, shared_section, csg_idx, csg_stride)?;
+
+            csg.push(entry, GFP_KERNEL)?;
+        }
+
+        Ok(EnabledGlobalInterface {
             glb_control,
             glb_input,
             glb_output,
             csg_stride,
             csg_num,
-            csg: KVec::with_capacity(csg_num, GFP_KERNEL)?,
-        };
+            csg,
+        })
+    }
 
+    fn install_enabled(&mut self, enabled: EnabledGlobalInterface) {
         self.state = GlobalInterfaceState::Enabled(enabled);
-        self.init_csg(dev, shared_section)?;
-        Ok(())
     }
 
     /// Programs GLB input-block configuration registers.
@@ -536,26 +543,6 @@ impl InnerGlobalInterface {
             .with_counter_enable(true);
 
         Ok(ack_mask)
-    }
-
-    /// Initialize CSG interfaces.
-    ///
-    /// This uses the previously read CSG count to create and enable each CSG interface.
-    fn init_csg(&mut self, dev: &Device, shared_section: &SharedSectionInfo) -> Result {
-        let enabled = match &mut self.state {
-            GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return Err(EINVAL),
-        };
-
-        for csg_idx in 0..enabled.csg_num {
-            // Create and enable the CSG interface.
-            let mut csg = CsgInterface::new(csg_idx)?;
-            csg.enable(dev, shared_section, csg_idx, enabled.csg_stride)?;
-
-            enabled.csg.push(csg, GFP_KERNEL)?;
-        }
-
-        Ok(())
     }
 
     fn csg(&self, index: usize) -> Option<&CsgInterface> {
