@@ -81,6 +81,20 @@ pub(crate) struct TyrDrmDriver;
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type TyrDrmDevice<Ctx = drm::Normal> = drm::Device<TyrDrmDriver, Ctx>;
 
+/// Newtype that keeps the cleanup workqueue type-distinct from
+/// `DmaFenceWorkqueue`. A drop path that has to take `dma_resv_lock`
+/// or allocate with `GFP_KERNEL` cannot then be handed the
+/// fence-annotated queue by mistake.
+#[repr(transparent)]
+pub(crate) struct CleanupQueue(OwnedQueue);
+
+impl core::ops::Deref for CleanupQueue {
+    type Target = OwnedQueue;
+    fn deref(&self) -> &OwnedQueue {
+        &self.0
+    }
+}
+
 /// Data owned by the DRM device.
 ///
 /// Driver callbacks that cannot take a registration guard, such as the mmap hook, reach the
@@ -95,6 +109,17 @@ pub(crate) struct TyrDrmDeviceData {
     /// Cached at probe via `device_get_dma_attr()`. Drives the BO
     /// cacheability policy in `crate::gem::should_map_wc`.
     pub(crate) coherent: bool,
+
+    /// Per-device cleanup workqueue.
+    ///
+    /// Carries deferred drops from objects whose `Drop` would
+    /// otherwise run inside a dma-fence signalling section. The queue
+    /// is deliberately not a `DmaFenceWorkqueue`. It provides an
+    /// execution context that does not hold the `dma_fence_map`
+    /// lockdep token, so the cleanup work is free to take
+    /// `dma_resv_lock`, the per-VM gpuvm mutex, and allocate with
+    /// `GFP_KERNEL`.
+    pub(crate) cleanup_wq: Arc<CleanupQueue>,
 
     /// The scheduler logic.
     #[pin]
@@ -234,11 +259,18 @@ impl platform::Driver for TyrPlatformDriver {
 
         let coherent = pdev.as_ref().dma_coherent();
 
+        let cleanup_wq = Arc::new(
+            CleanupQueue(Queue::new_unbound().build(c"tyr-cleanup")?),
+            GFP_KERNEL,
+        )?;
+        let device_cleanup_wq = cleanup_wq.clone();
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
                 mmio_phys_addr,
                 coherent,
+                cleanup_wq: device_cleanup_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
             }? Error),
@@ -253,6 +285,7 @@ impl platform::Driver for TyrPlatformDriver {
             mmu.as_arc_borrow(),
             &gpu_info,
             coherent,
+            cleanup_wq.clone(),
         )?;
 
         // SAFETY: The registration is owned by `mmu_irq` and then by
