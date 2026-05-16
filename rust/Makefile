@@ -38,6 +38,7 @@ obj-$(CONFIG_RUST) += exports.o
 
 # Downstream-only debug tracepoint backings consumed by rust/kernel/.
 obj-$(CONFIG_RUST) += job_queue_trace_events.o
+obj-$(CONFIG_RUST) += dma_fence_trace_events.o
 
 always-$(CONFIG_RUST) += host/libproc_macro2.rlib host/libquote.rlib host/libsyn.rlib
 
