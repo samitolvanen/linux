@@ -60,6 +60,15 @@ use super::group::Group;
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
 const JOB_TIMEOUT_MS: u32 = 5000;
 
+/// Smallest ringbuffer byte count one wrapped job stream consumes.
+///
+/// `sched::job::build_wrapped_stream` emits 11 8-byte instructions per
+/// piece and pads the concatenation up to a 64-byte boundary, so the
+/// minimum is `next_multiple_of(88, 64) == 128`. Used to size the
+/// pre-allocated pending-fence vec so [`Queue::reserve_pending_submit_fence`]
+/// never needs to allocate under the lock.
+const WRAPPER_RINGBUF_BYTES: usize = 128;
+
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static TYR_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static TYR_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -525,6 +534,11 @@ impl QueueData {
 
     /// Compacts the drained prefix away once `head` has grown past
     /// `max(len / 2, 16)`. Matches the 6.18 heuristic.
+    ///
+    /// Must preserve `vec.capacity()` so [`Queue::reserve_pending_submit_fence`]
+    /// never needs to grow the vec. `KVec::retain` shifts surviving
+    /// entries in place and only adjusts `len`, leaving the underlying
+    /// allocation intact.
     fn maybe_truncate_pending(pending: &mut PendingFences) {
         let len = pending.vec.len();
         let threshold = core::cmp::max(len / 2, 16);
@@ -962,6 +976,9 @@ impl Queue {
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
 
+        let max_jobs = queue_args.ringbuf_size() as usize / WRAPPER_RINGBUF_BYTES;
+        let pending_fence_vec = KVec::with_capacity(max_jobs, GFP_KERNEL)?;
+
         let data = Arc::pin_init(
             pin_init!(QueueData {
                 priority: queue_args.priority(),
@@ -971,7 +988,7 @@ impl Queue {
                 next_seqno: AtomicU64::new(0),
                 iomem: tdev.iomem.clone(),
                 pending_submit_fences <- new_mutex!(PendingFences {
-                    vec: KVec::new(),
+                    vec: pending_fence_vec,
                     head: 0,
                     outstanding: 0,
                 }),
@@ -1012,15 +1029,20 @@ impl Queue {
 
     /// Reserves capacity for one pending submit fence and returns an
     /// RAII guard for the reservation.
+    ///
+    /// The pending-fence vec is pre-sized at queue creation to the
+    /// maximum number of wrappers the ringbuf can hold, so this
+    /// performs no allocation: it only checks that the new reservation
+    /// still fits within `capacity`. Keeping the lock allocation-free
+    /// breaks the lockdep cycle through `fs_reclaim` that would
+    /// otherwise close via `JobQueue::state` → `dma_fence_map` →
+    /// `mmu_notifier` → `fs_reclaim` → `pending_submit_fences`.
     pub(in crate::sched) fn reserve_pending_submit_fence(&self) -> Result<PendingFenceReservation> {
         let mut pending = self.data.pending_submit_fences.lock();
-        // Keeps `capacity - len >= outstanding` true once the new
-        // reservation is counted.
         let additional = pending.outstanding.checked_add(1).ok_or(EOVERFLOW)?;
-        pending
-            .vec
-            .reserve(additional, GFP_KERNEL)
-            .map_err(Error::from)?;
+        if pending.vec.len() + additional > pending.vec.capacity() {
+            return Err(ENOSPC);
+        }
         pending.outstanding = additional;
         Ok(PendingFenceReservation::new(self.data.clone()))
     }
