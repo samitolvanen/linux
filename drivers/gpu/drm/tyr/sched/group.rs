@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::cell::Cell;
 use core::mem::offset_of;
+use core::sync::atomic::{
+    AtomicU32,
+    AtomicU64,
+    Ordering, //
+};
 
 use kernel::{
     alloc::KVec,
+    c_str,
     capability::{
         capable,
         Capability, //
@@ -73,9 +80,10 @@ use crate::{
         global::csg::Priority,
         CsWaitCondition, //
     },
-    gem, pool,
+    gem, heap, pool,
     sched::CsgSlotManager,
     slot::Seat,
+    trace,
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
@@ -107,24 +115,34 @@ pub(crate) type QueueIdx = MaskIdx<5>;
 
 static_assert!(MAX_CS_PER_GROUP == 1 << 5);
 
+/// Monotonic source for [`Group::uid`]. The pool handle stored in
+/// `Group::handle` is reused once a group is destroyed, so a tracepoint
+/// keyed on it cannot distinguish two group instances that happened to
+/// reuse the same slot. This counter never repeats for the lifetime of
+/// the driver, giving each group instance a stable, unambiguous identity
+/// across the trace.
+static GROUP_UID: AtomicU64 = AtomicU64::new(0);
+
 /// The group's lifecycle state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u32)]
 pub(crate) enum State {
-    Created,
-    Active,
+    Created = 0,
+    Active = 1,
     /// Suspended from a CSG slot; may resume.
-    Suspended,
-    Terminated,
+    Suspended = 2,
+    Terminated = 3,
     /// Unknown state, typically after a firmware error.
-    Unknown,
+    Unknown = 4,
 }
 
 /// Which scheduler list (idle / runnable / none) a group is currently on.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u32)]
 pub(crate) enum GroupListState {
-    None,
-    Idle,
-    Runnable,
+    None = 0,
+    Idle = 1,
+    Runnable = 2,
 }
 
 /// A snapshot of the scheduler-visible state of a `Group`.
@@ -289,6 +307,20 @@ pub(crate) struct Group {
     #[pin]
     submit_lock: Mutex<()>,
     pub(crate) tiler_oom: Atomic<u32>,
+    /// Number of scheduler ticks the group has been kept on its
+    /// current CSG slot. Reset to 0 when the rule engine binds the
+    /// group and incremented when it keeps the binding for another
+    /// tick. Frozen at the value seen when the group is evicted; not
+    /// reset until the next bind. Used by the
+    /// `tyr_tick_decision_per_group` tracepoint as a residency proxy.
+    pub(crate) bound_tick_counter: AtomicU32,
+    /// Pool handle used as the stable group identifier in tracepoints.
+    /// Zero until the group's pool index is reserved.
+    handle: AtomicU64,
+    /// Reuse-proof per-instance identity, assigned from [`GROUP_UID`] at
+    /// creation. Unlike `handle`, it is never reused, so group-keyed
+    /// tracepoints can tell two instances apart across handle reuse.
+    uid: u64,
     /// CSG slot manager seat for this group.
     ///
     /// The owner is the per-device `CsgSlotManager` mutex. Callers
@@ -518,8 +550,11 @@ impl Group {
 
         let mut queues = KVec::new();
 
-        for queue_arg in queue_args.iter() {
-            queues.push(Queue::new(ddev, queue_arg, vm.clone())?, GFP_KERNEL)?;
+        for (cs_id, queue_arg) in queue_args.iter().enumerate() {
+            queues.push(
+                Queue::new(ddev, queue_arg, vm.clone(), cs_id as u32)?,
+                GFP_KERNEL,
+            )?;
         }
 
         let queues_handoff = cleanup::Handoff::new(())?;
@@ -552,6 +587,9 @@ impl Group {
                 }),
                 submit_lock <- new_mutex!(()),
                 tiler_oom: Atomic::new(0),
+                bound_tick_counter: AtomicU32::new(0),
+                handle: AtomicU64::new(0),
+                uid: GROUP_UID.fetch_add(1, Ordering::Relaxed),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
@@ -596,10 +634,20 @@ impl Group {
         self.inner.lock().state
     }
 
-    pub(crate) fn set_state(&self, new_state: State) {
-        self.with_locked_inner(|inner| {
+    pub(crate) fn set_state(&self, new_state: State, reason: trace::StateChangeReason) {
+        let old_state = self.with_locked_inner(|inner| {
+            let old = inner.state;
             inner.state = new_state;
+            old
         });
+        trace::group_update(self.handle(), self.uid(), new_state as u32);
+        trace::group_state_transition(
+            self.handle(),
+            self.uid(),
+            old_state as u32,
+            new_state as u32,
+            reason,
+        );
     }
 
     pub(crate) fn can_run(&self) -> bool {
@@ -810,6 +858,22 @@ impl Group {
         &self.task_info.comm
     }
 
+    /// Pool handle assigned when the group's pool index is reserved.
+    /// Returns `0` before that.
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle.load(Ordering::Relaxed)
+    }
+
+    /// Reuse-proof per-instance identity assigned at creation. Fixed for
+    /// the group's lifetime and never reused.
+    pub(crate) fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    fn set_handle(&self, handle: u64) {
+        self.handle.store(handle, Ordering::Relaxed);
+    }
+
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
     /// is satisfied.
     ///
@@ -978,13 +1042,33 @@ impl Group {
         self.active.store(active, Relaxed);
     }
 
+    /// Non-blocking variant of `Vm::heap_pool` for use from dma-fence
+    /// signalling sections.
+    pub(super) fn try_get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
+        self.vm.try_heap_pool()
+    }
+
     pub(super) fn submit(
         self: &Arc<Self>,
         dev: &Device<Bound>,
         queue_submits: KVVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
-        if !self.can_run() {
+        let cant_run = self.with_locked_inner(|inner| {
+            if inner.can_run() {
+                None
+            } else {
+                Some((inner.state, inner.fatal, inner.csg_id))
+            }
+        });
+        if let Some((state, has_fatal, csg_id)) = cant_run {
+            kernel::pr_warn!(
+                "group_submit: can_run() == false on group {}: state={:?} fatal={} csg_id={:?}\n",
+                self.handle(),
+                state,
+                has_fatal,
+                csg_id,
+            );
             return Err(EINVAL);
         }
 
@@ -1033,6 +1117,9 @@ struct PreparedSubmit {
     queue_index: usize,
     queue_job: PreparedQueueJob,
     has_stream: bool,
+    /// Queue seqno the job completes at, carried so the per-dep tracepoints
+    /// can name the job. Downstream-only debug aid.
+    job_counter: u64,
 }
 
 /// Runs the jobs of a group submit through `deps::Context`.
@@ -1041,6 +1128,9 @@ struct SubmitOps {
     /// Device profile mask snapshotted at submit time and baked into
     /// every wrapped stream this batch prepares.
     profile_mask: u32,
+    /// Stream jobs prepared so far on each queue, so `prepare` can name a
+    /// job by the seqno it completes at. Downstream-only debug aid.
+    prepared_streams: [Cell<u64>; MAX_CS_PER_GROUP],
 }
 
 impl SubmitOps {
@@ -1048,6 +1138,7 @@ impl SubmitOps {
         Self {
             group,
             profile_mask,
+            prepared_streams: Default::default(),
         }
     }
 }
@@ -1066,6 +1157,18 @@ impl deps::BatchOps for SubmitOps {
         let queue_index = QueueIdx::new(job.queue_index()).ok_or(EINVAL)?;
         let queue = self.group.queues.get(queue_index.get()).ok_or(EINVAL)?;
         let has_stream = job.has_stream();
+        let prepared_streams = self.prepared_streams.get(queue_index.get()).ok_or(EINVAL)?;
+        if has_stream {
+            prepared_streams.set(prepared_streams.get() + 1);
+        }
+        let job_counter = queue.next_seqno() + prepared_streams.get();
+
+        trace::job_status(
+            job_counter,
+            self.group.handle(),
+            queue_index.get() as u32,
+            c_str!("prepared"),
+        );
 
         // The wrapped stream samples into slot 0, and the exec stage points its
         // ring copy at the job's slot. A stream-less job emits no GPU work and
@@ -1077,8 +1180,13 @@ impl deps::BatchOps for SubmitOps {
             } else {
                 0
             };
-            let (wrapped, relocs) =
-                job.build_wrapped_stream(&self.group, sync_va, profiling_va, self.profile_mask)?;
+            let (wrapped, relocs) = job.build_wrapped_stream(
+                &self.group,
+                sync_va,
+                profiling_va,
+                self.profile_mask,
+                job_counter,
+            )?;
             (wrapped, relocs, self.profile_mask)
         } else {
             (KVec::new(), KVec::new(), 0)
@@ -1100,6 +1208,7 @@ impl deps::BatchOps for SubmitOps {
             queue_index: queue_index.get(),
             queue_job: prepared,
             has_stream,
+            job_counter,
         })
     }
 
@@ -1112,6 +1221,7 @@ impl deps::BatchOps for SubmitOps {
             queue_index,
             queue_job,
             has_stream,
+            job_counter: _,
         } = prepared;
 
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
@@ -1125,6 +1235,49 @@ impl deps::BatchOps for SubmitOps {
         job.set_done_seqno(done_seqno);
 
         Ok(queue.commit_job(queue_job))
+    }
+
+    fn trace_dep(&self, _job_idx: usize, prepared: &PreparedSubmit, dep: &deps::ResolvedDep<'_>) {
+        // SAFETY: `dep.fence.raw()` is a valid `struct dma_fence` pointer
+        // for the lifetime of the borrow.
+        let (dep_ctx, dep_seqno) =
+            unsafe { ((*dep.fence.raw()).context, (*dep.fence.raw()).seqno) };
+        let group_id = self.group.handle();
+        let queue_index = prepared.queue_index as u32;
+
+        match dep.source {
+            trace::JobDepSource::External => trace::syncobj_wait(
+                group_id,
+                queue_index,
+                prepared.job_counter,
+                dep.key.handle,
+                dep.key.point,
+                dep_ctx,
+                dep_seqno,
+                dep.fence.is_signaled(),
+            ),
+            trace::JobDepSource::IntraBatch => trace::intra_batch_dep_resolved(
+                group_id,
+                queue_index,
+                prepared.job_counter,
+                dep.key.handle,
+                dep.key.point,
+                dep_ctx,
+                dep_seqno,
+                dep.fence.is_signaled(),
+            ),
+        }
+
+        trace::job_dep_added(
+            group_id,
+            queue_index,
+            prepared.job_counter,
+            dep.source,
+            dep.key.handle,
+            dep.key.point,
+            dep_ctx,
+            dep_seqno,
+        );
     }
 }
 
@@ -1157,6 +1310,7 @@ impl DmaFenceWorkItem<1> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("term_work"));
         this.cancel_queues();
 
         // The `term_scheduled` latch makes this the only enqueue of
@@ -1229,6 +1383,17 @@ impl Pool {
 
         let group = Group::create(ddev, file, groupcreate, queue_args)?;
         let reservation = self.0.reserve()?;
+
+        // Publish the pool handle on the group and its queues before
+        // any code path that can emit a tracepoint. `add_group` below
+        // takes the scheduler lock and fires `trace::group_list`; the
+        // per-queue trace wrappers in `QueueData` read `group_id`
+        // unsynchronized.
+        let handle = reservation.index();
+        group.set_handle(handle as u64);
+        for queue in group.queues.iter() {
+            queue.set_group_id(handle as u64, group.uid());
+        }
 
         if let Err(e) = ddev.with_locked_scheduler(|sched| {
             if ddev.is_unusable() {
@@ -1332,6 +1497,13 @@ impl Pool {
             groupgetstate.state |=
                 uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_INNOCENT;
         }
+
+        trace::group_state_query(
+            group.vm.handle(),
+            group.handle(),
+            groupgetstate.state,
+            groupgetstate.fatal_queues,
+        );
 
         Ok(())
     }

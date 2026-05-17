@@ -118,6 +118,11 @@ pub(crate) struct Reservation<'a, T: 'static> {
 }
 
 impl<T: 'static> Reservation<'_, T> {
+    /// Returns the reserved index.
+    pub(crate) fn index(&self) -> usize {
+        self.index.index()
+    }
+
     /// Stores `value` at the reserved index and returns that index.
     ///
     /// The reservation already allocated the slot, so the store does not
