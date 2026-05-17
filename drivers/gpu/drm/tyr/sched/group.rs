@@ -875,16 +875,17 @@ impl Pool {
 
         self.0.remove(index)?;
 
+        let _ = ddev.with_locked_scheduler(|sched| {
+            sched.detach_destroyed_group(&group);
+            Ok(())
+        });
+
         if csg_id.is_some() {
             // Bound: the tick observes `can_run() == false`, stages
             // terminate, evicts, and routes the group through
             // `schedule_term`.
             TyrDrmDeviceData::schedule_tick(&ARef::from(ddev));
         } else {
-            let _ = ddev.with_locked_scheduler(|sched| {
-                sched.detach_destroyed_group(&group);
-                Ok(())
-            });
             group.schedule_term();
         }
 
