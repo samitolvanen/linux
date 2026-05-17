@@ -199,8 +199,8 @@ impl Scheduler {
                     queued_tiler_oom = true;
                 }
 
-                let fatal_event = input_req.fatal() != output_ack.fatal() && output_ack.fatal();
-                let fault_event = input_req.fault() != output_ack.fault() && output_ack.fault();
+                let fatal_event = input_req.fatal() != output_ack.fatal();
+                let fault_event = input_req.fault() != output_ack.fault();
 
                 if fatal_event {
                     let _ = cs.decode_fatal(csg_id, cs_id)?;
