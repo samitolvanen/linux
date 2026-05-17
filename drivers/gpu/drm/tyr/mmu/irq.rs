@@ -191,7 +191,7 @@ impl TyrIrqTrait for MmuIrq {
             return;
         }
 
-        let _ = decode_faults(fault_bits, &self.iomem);
+        let _ = decode_faults(fault_bits, &self.iomem, tdev);
         let mut mcu_vm_fault = false;
 
         // Flag the faulting AS slots and tear their MMU programming

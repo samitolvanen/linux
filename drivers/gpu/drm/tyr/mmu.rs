@@ -252,9 +252,12 @@ impl Mmu {
     /// Used on suspend so that firmware-written state (CSG suspend
     /// buffers) is in memory before the GPU loses power.
     pub(crate) fn flush_caches(&self) -> Result {
-        self.as_manager
-            .lock()
-            .gpu_flush_caches(FlushMode::Clean, FlushMode::Clean, FlushMode::None)
+        self.as_manager.lock().gpu_flush_caches(
+            MAX_AS,
+            FlushMode::Clean,
+            FlushMode::Clean,
+            FlushMode::None,
+        )
     }
 
     /// Flags the start of a VM update.
@@ -310,6 +313,18 @@ impl Mmu {
             core::mem::take(&mut as_manager.removed)
         };
         removed.release();
+    }
+
+    /// Reads the `(group_id, group_uid, csg_id)` back-pointer recorded on
+    /// the VM resident in AS slot `as_slot`. Returns
+    /// `(u64::MAX, u64::MAX, u32::MAX)` when no VM is bound there or no
+    /// group is currently bound to the VM's CSG slot.
+    pub(crate) fn bound_group_for_as_slot(&self, as_slot: usize) -> (u64, u64, u32) {
+        let as_manager = self.as_manager.lock();
+        match as_manager.slot_data(as_slot) {
+            Some(vm_as_data) => vm_as_data.bound_group(),
+            None => (u64::MAX, u64::MAX, u32::MAX),
+        }
     }
 }
 
