@@ -24,6 +24,7 @@ use kernel::{
         gem,
         gem::shmem,
         gem::BaseObject,
+        gem::IntoGEMObject,
         gem::ResvGuard,
         DeviceContext, //
     },
@@ -57,6 +58,7 @@ use crate::{
         ReclaimState,
         VmReclaim, //
     },
+    trace,
     vm::{
         range,
         Vm,
@@ -262,7 +264,7 @@ pub(crate) struct MappedBo {
     vmap: ManuallyDrop<shmem::VMapOwned<BoData>>,
     /// Ships the vmap to the cleanup workqueue and keeps the device alive
     /// for its final GEM put. Taken by `Drop` with `vmap`.
-    handoff: ManuallyDrop<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
+    handoff: ManuallyDrop<cleanup::Handoff<MappedBoRelease, ARef<TyrDrmDevice>>>,
 }
 
 impl MappedBo {
@@ -323,9 +325,23 @@ impl Drop for MappedBo {
                 ManuallyDrop::take(&mut self.handoff),
             )
         };
+        let range = self.kernel_bo.va_range();
+        let va = range.start;
+        let size = range.end - range.start;
 
-        handoff.spawn(vmap, drop);
+        trace::cleanup_wq_enqueue(trace::CleanupWqKind::MappedBoVmap, va, size);
+        handoff.spawn((vmap, va, size), mapped_bo_vmap_drop);
     }
+}
+
+/// The vmap and GPU VA range that `MappedBo::drop` hands to
+/// `mapped_bo_vmap_drop`.
+type MappedBoRelease = (shmem::VMapOwned<BoData>, u64, u64);
+
+/// Drops a `MappedBo` vmap on the cleanup workqueue.
+fn mapped_bo_vmap_drop((vmap, va, size): MappedBoRelease) {
+    trace::cleanup_wq_exec(trace::CleanupWqKind::MappedBoVmap, va, size);
+    drop(vmap);
 }
 
 /// A vmap of a user-mapped GPU buffer object.
@@ -565,6 +581,13 @@ pub(crate) fn sync(
     }
 
     Ok(())
+}
+
+/// Returns the address of the underlying `struct drm_gem_object` as a
+/// file-independent debug identity for the BO. Used only to correlate a
+/// BO's mapping lifecycle in tracepoints; never dereferenced.
+pub(crate) fn debug_id(bo: &Bo) -> u64 {
+    bo.as_raw() as u64
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
@@ -822,10 +845,28 @@ impl Drop for KernelBo {
         // Firmware sections have no hand-off. They are dropped only by probe
         // and the device release, outside any signalling section.
         match self.handoff.take() {
-            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap),
+            Some(handoff) => {
+                trace::cleanup_wq_enqueue(
+                    trace::CleanupWqKind::KernelBo,
+                    captures.va_range.start,
+                    size,
+                );
+                handoff.spawn(captures, kernel_bo_unmap_deferred);
+            }
             None => kernel_bo_unmap(captures),
         }
     }
+}
+
+/// Adds the exec trace to the hand-off path. A firmware section calls
+/// `kernel_bo_unmap` without it.
+fn kernel_bo_unmap_deferred(captures: KernelBoCleanup) {
+    trace::cleanup_wq_exec(
+        trace::CleanupWqKind::KernelBo,
+        captures.va_range.start,
+        captures.size,
+    );
+    kernel_bo_unmap(captures);
 }
 
 /// Tears down a `KernelBo` mapping and then releases the VA
