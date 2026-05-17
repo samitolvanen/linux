@@ -188,23 +188,30 @@ impl Drop for MappedBo {
 pub(crate) struct MappedUserBo {
     #[expect(dead_code)]
     bo: ARef<Bo>,
-    vmap: shmem::VMapOwned<BoData>,
+    /// `Some` for the entire lifetime of the value; taken to `None`
+    /// only by [`Drop`] when shipping the vmap to the cleanup
+    /// workqueue.
+    vmap: Option<shmem::VMapOwned<BoData>>,
+    cleanup_wq: Arc<CleanupQueue>,
 }
 
 impl MappedUserBo {
-    pub(crate) fn new(bo: &Bo) -> Result<Arc<Self>> {
+    pub(crate) fn new(bo: &Bo, cleanup_wq: Arc<CleanupQueue>) -> Result<Arc<Self>> {
         let vmap = bo.owned_vmap::<0>()?;
         Ok(Arc::new(
             Self {
                 bo: bo.into(),
-                vmap,
+                vmap: Some(vmap),
+                cleanup_wq,
             },
             GFP_KERNEL,
         )?)
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        &self.vmap
+        self.vmap
+            .as_ref()
+            .expect("MappedUserBo::vmap accessed after drop")
     }
 
     /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
@@ -225,7 +232,27 @@ impl MappedUserBo {
     }
 
     pub(crate) fn size(&self) -> usize {
-        self.vmap.owner().size()
+        self.vmap().owner().size()
+    }
+}
+
+impl Drop for MappedUserBo {
+    fn drop(&mut self) {
+        let Some(vmap) = self.vmap.take() else {
+            return;
+        };
+        let cleanup_wq = self.cleanup_wq.clone();
+
+        let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            drop(vmap);
+        });
+
+        if let Err(e) = res {
+            pr_err!(
+                "Failed to enqueue MappedUserBo vmap cleanup: {:?}; dropping inline\n",
+                e,
+            );
+        }
     }
 }
 

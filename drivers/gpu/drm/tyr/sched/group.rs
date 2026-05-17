@@ -608,7 +608,7 @@ impl Group {
             }
         } else {
             let (bo, bo_offset) = self.vm.get_bo_for_va(syncwait.gpu_va).ok_or(EINVAL)?;
-            let mapped_bo = gem::MappedUserBo::new(&bo)?;
+            let mapped_bo = gem::MappedUserBo::new(&bo, self.tdev.cleanup_wq.clone())?;
             let bo_offset = bo_offset as usize;
 
             // Memoise the resolved BO so subsequent re-evaluations
