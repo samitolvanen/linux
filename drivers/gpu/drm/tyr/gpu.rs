@@ -34,8 +34,10 @@ use crate::{
     regs::{
         gpu_control::*,
         join_u64,
-        pwr_control, //
-    }, //
+        pwr_control,
+        read_u64_no_tearing, //
+    },
+    trace, //
 };
 
 /// Number of CS work registers the kernel reserves at the top of the
@@ -458,7 +460,7 @@ fn l2_power_on(
         io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
     }
 
-    poll::read_poll_timeout(
+    let r = poll::read_poll_timeout(
         || {
             let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(io.read(L2_READY_LO))
@@ -467,7 +469,16 @@ fn l2_power_on(
         Delta::from_millis(1),
         Delta::from_millis(100),
     )
-    .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."))?;
+    .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."));
+
+    let errno = match &r {
+        Ok(_) => 0,
+        Err(e) => e.to_errno(),
+    };
+    trace::l2_power_on(errno);
+    r?;
+
+    trace_shader_power_state(iomem);
 
     Ok(())
 }
@@ -525,4 +536,30 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     irq::gpu_irq_enable(io);
     tdev.hw_ops
         .l2_power_on(bound, &tdev.iomem, tdev.coherency, tdev.soc_data)
+}
+
+/// Snapshots shader-domain power state for tracing. Used to diagnose
+/// firmware allocation failures that stem from cores not being powered
+/// on.
+///
+/// Read errors are silently swallowed, because this helper is purely
+/// observational and must not derail callers on a transient [`Devres`]
+/// failure.
+pub(crate) fn trace_shader_power_state(iomem: &Devres<IoMem>) {
+    let Some(io) = iomem.try_access() else {
+        return;
+    };
+    let ready = read_u64_no_tearing(
+        || io.read(SHADER_READY_LO).into_raw(),
+        || io.read(SHADER_READY_HI).into_raw(),
+    );
+    let pwrtrans = read_u64_no_tearing(
+        || io.read(SHADER_PWRTRANS_LO).into_raw(),
+        || io.read(SHADER_PWRTRANS_HI).into_raw(),
+    );
+    let pwractive = read_u64_no_tearing(
+        || io.read(SHADER_PWRACTIVE_LO).into_raw(),
+        || io.read(SHADER_PWRACTIVE_HI).into_raw(),
+    );
+    trace::shader_power_state(ready, pwrtrans, pwractive);
 }

@@ -1223,6 +1223,11 @@ cs_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs_id)
 	queue->iface.input->extract = queue->iface.output->extract;
 	drm_WARN_ON(&ptdev->base, queue->iface.input->insert < queue->iface.input->extract);
 
+	trace_panthor_cs_activate_ringbuf_state(group_id, cs_id,
+						queue->iface.input->insert,
+						queue->iface.output->extract,
+						queue->iface.input->extract);
+
 	cs_iface->input->ringbuf_base = panthor_kernel_bo_gpuva(queue->ringbuf);
 	cs_iface->input->ringbuf_size = panthor_kernel_bo_size(queue->ringbuf);
 	cs_iface->input->ringbuf_input = queue->iface.input_fw_va;
