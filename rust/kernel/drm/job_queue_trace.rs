@@ -100,6 +100,18 @@ declare_trace! {
     ///
     /// Always safe to call.
     unsafe fn rust_jq_check_progress(reason: u32);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn rust_jq_prepare_dep(
+        entry_idx: u32,
+        dep_index: u32,
+        dep_count: u32,
+        fence_ctx: u64,
+        fence_seqno: u64,
+        signaled: u8,
+    );
 }
 
 /// Emit on entry to `step_stage`.
@@ -150,6 +162,35 @@ pub(crate) fn check_progress(reason: u32) {
     // SAFETY: The C tracepoint takes plain scalars and is safe to call from
     // any context.
     unsafe { rust_jq_check_progress(reason) }
+}
+
+/// Emit once per dependency fence that a job waits on, as recorded at
+/// [`JobQueue::prepare`](crate::drm::job_queue::JobQueue::prepare). Under
+/// serial execution, these exclude the queue's own fences, and the other
+/// unsignaled fences of a short chain replace the chain. A job with zero deps
+/// emits nothing here. The absence of `rust_jq_prepare_dep` lines for an
+/// `entry_idx` means the job entered the pipeline un-gated. `signaled`
+/// reflects `dma_fence_is_signaled()` at prepare time.
+pub(crate) fn prepare_dep(
+    entry_idx: u32,
+    dep_index: u32,
+    dep_count: u32,
+    fence_ctx: u64,
+    fence_seqno: u64,
+    signaled: bool,
+) {
+    // SAFETY: The C tracepoint takes plain scalars and is safe to call from
+    // any context.
+    unsafe {
+        rust_jq_prepare_dep(
+            entry_idx,
+            dep_index,
+            dep_count,
+            fence_ctx,
+            fence_seqno,
+            u8::from(signaled),
+        )
+    }
 }
 
 /// Return `(context, seqno)` for `fence`, the correlation key used across

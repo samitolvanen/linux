@@ -9,6 +9,7 @@ use core::sync::atomic::{
 
 use kernel::{
     bindings,
+    c_str,
     clk::{
         Clk,
         OptionalClk, //
@@ -163,6 +164,7 @@ use crate::{
         MAX_CSGS, //
     },
     slot::SlotManager,
+    trace,
     vm::VmExec, //
 };
 
@@ -177,6 +179,17 @@ use crate::debugfs::{
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
+
+/// Period of the downstream-debug heap-state dump worker.
+const HEAP_DUMP_INTERVAL_MS: u32 = 1000;
+
+/// Upper bound on the number of groups snapshotted per heap-dump pass.
+///
+/// The snapshot buffer is preallocated outside the scheduler and
+/// slot-manager mutexes so the under-lock walk stays allocation-free.
+/// Groups beyond this bound are skipped; this is a debug aid, so a
+/// best-effort snapshot is fine.
+const HEAP_DUMP_MAX_GROUPS: usize = 64;
 
 pub(crate) struct TyrDrmDriver;
 
@@ -219,6 +232,8 @@ pub(crate) mod work_id {
     pub(crate) const SYNCWAIT_POLL: u64 = 6;
     /// Retry of the dead mappings.
     pub(crate) const DEAD_MAPPINGS: u64 = 7;
+    /// Periodic 1Hz heap-state dump (downstream debug only).
+    pub(crate) const HEAP_DUMP: u64 = 8;
 }
 
 /// Work left by an unmap, retried after a reset, resume or unbind.
@@ -558,6 +573,14 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
 
+    /// Periodic 1Hz heap-state dump for the `tyr_heap_context_dump` /
+    /// `tyr_heap_chunk_dump` tracepoints, which are off by default. While
+    /// one is enabled, the tick arms the dump and each run re-arms it.
+    ///
+    /// Downstream-only debug aid; not for upstream.
+    #[pin]
+    heap_dump_work: DelayedWork<TyrDrmDevice, { work_id::HEAP_DUMP }>,
+
     /// Device-wide registry of live BOs backing the `gems` debugfs file.
     ///
     /// Declare after every field that owns BOs, so drop order keeps the
@@ -861,6 +884,23 @@ impl TyrDrmDeviceData {
             self.unbind_halted.wait_for_completion();
         }
     }
+
+    /// Cancels the periodic heap-state dump and waits for an in-flight run.
+    ///
+    /// Must run in process context, after `stop_system_work` has stopped the
+    /// tick that arms the dump. Downstream-only debug aid; not for upstream.
+    fn cancel_heap_dump(&self) {
+        let _ = self.heap_dump_work.cancel_sync();
+    }
+
+    /// Arms the periodic heap-state dump `delay` jiffies from now. A pending
+    /// dump keeps its deadline.
+    ///
+    /// Downstream-only debug aid; not for upstream.
+    fn schedule_heap_dump(tdev: &ARef<TyrDrmDevice>, delay: Jiffies) {
+        let _ = workqueue::system_unbound()
+            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::HEAP_DUMP }>(tdev.clone(), delay);
+    }
 }
 
 impl_has_dma_fence_work! {
@@ -887,10 +927,19 @@ impl_has_delayed_work! {
     impl HasDelayedWork<TyrDrmDevice, { work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData { self.syncwait_poll_work }
 }
 
+impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::HEAP_DUMP }> for TyrDrmDeviceData { self.heap_dump_work }
+}
+
 impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("tick_work"));
+        if trace::heap_dump_enabled() {
+            Self::schedule_heap_dump(&this, msecs_to_jiffies(HEAP_DUMP_INTERVAL_MS));
+        }
+
         if let Err(err) = crate::sched::tick::tick_step(&this) {
             pr_err!("tick_step failed: {:?}\n", err);
         }
@@ -905,6 +954,7 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     /// gpuvm_unique and dma_resv_lock stay outside the mutex), then apply,
     /// re-validating against the live wait list before promoting groups.
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("sync_upd_work"));
         let tdev = &*this;
 
         // Reset the dedup gate before reading any state so a
@@ -953,6 +1003,7 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("periodic_tick_work"));
         Self::schedule_tick(&this);
     }
 }
@@ -974,6 +1025,37 @@ impl WorkItem<{ work_id::DEAD_MAPPINGS }> for TyrDrmDeviceData {
     }
 }
 
+impl WorkItem<{ work_id::HEAP_DUMP }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("heap_dump_work"));
+        let tdev = &*this;
+
+        if !trace::heap_dump_enabled() {
+            return;
+        }
+
+        // Preallocate the snapshot buffer before taking any lock so the
+        // under-lock walk in `collect_heap_pools_for_trace` only bumps
+        // refcounts and never reclaims. The scheduler mutex is also held
+        // inside the tick worker's dma-fence signalling section, so an
+        // allocation under it would close a circular lock dependency.
+        let Ok(mut groups) = KVec::with_capacity(HEAP_DUMP_MAX_GROUPS, GFP_KERNEL) else {
+            Self::schedule_heap_dump(&this, msecs_to_jiffies(HEAP_DUMP_INTERVAL_MS));
+            return;
+        };
+
+        let _ = tdev.with_locked_scheduler(|sched| {
+            sched.collect_heap_pools_for_trace(tdev, &mut groups);
+            Ok(())
+        });
+
+        Scheduler::dump_heap_pools_for_trace(&groups);
+
+        Self::schedule_heap_dump(&this, msecs_to_jiffies(HEAP_DUMP_INTERVAL_MS));
+    }
+}
 impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
@@ -1129,6 +1211,8 @@ impl TyrPlatformDriverData {
             pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)?;
         }
 
+        dev_info!(pdev, "dma_coherent = {}\n", coherent);
+
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
 
         let platform: ARef<platform::Device> = pdev.into();
@@ -1221,6 +1305,7 @@ impl TyrPlatformDriverData {
                 unusable: Atomic::new(false),
                 probe_gate,
                 user_mmio <- new_mutex!(user_mmio),
+                heap_dump_work <- kernel::new_delayed_work!("TyrDrmDeviceData::heap_dump_work"),
                 #[cfg(CONFIG_DEBUG_FS)]
                 gem_registry <- GemRegistry::new(),
                 #[cfg(CONFIG_DEBUG_FS)]
@@ -1251,6 +1336,7 @@ impl TyrPlatformDriverData {
 
         let hw_guard = ScopeGuard::new(|| {
             tdev.stop_system_work();
+            tdev.cancel_heap_dump();
             halt_failed_probe(pdev.as_ref(), &tdev);
             tdev.unbind_dead_mappings();
             tdev.unbind_halted.complete_all();
@@ -1401,6 +1487,7 @@ impl platform::Driver for TyrPlatformDriverData {
         // the teardown.
         this.device.set_unbinding();
         this.device.stop_system_work();
+        this.device.cancel_heap_dump();
         this.device.reset.unbind();
         drop(this.devfreq_registration.lock().take());
         Self::suspend_at_unbind(pdev, this);
