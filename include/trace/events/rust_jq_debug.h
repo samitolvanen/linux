@@ -153,6 +153,41 @@ TRACE_EVENT(rust_jq_check_progress,
 		  __print_symbolic(__entry->reason, RUST_JQ_CHECK_REASON))
 );
 
+/*
+ * Emitted once per dependency fence recorded for a job in
+ * JobQueue::prepare(), before the job enters the pipeline. `dep_index`
+ * runs 0..dep_count. `signaled` is dma_fence_is_signaled() at prepare
+ * time. A consumer whose producer dep is already `signaled=1` here will
+ * not block on it. A job with zero deps emits no rust_jq_prepare_dep
+ * line, so an un-gated job is visible by its absence.
+ */
+TRACE_EVENT(rust_jq_prepare_dep,
+	TP_PROTO(u32 entry_idx, u32 dep_index, u32 dep_count, u64 fence_ctx,
+		 u64 fence_seqno, u8 signaled),
+	TP_ARGS(entry_idx, dep_index, dep_count, fence_ctx, fence_seqno,
+		signaled),
+	TP_STRUCT__entry(
+		__field(u32, entry_idx)
+		__field(u32, dep_index)
+		__field(u32, dep_count)
+		__field(u64, fence_ctx)
+		__field(u64, fence_seqno)
+		__field(u8, signaled)
+	),
+	TP_fast_assign(
+		__entry->entry_idx = entry_idx;
+		__entry->dep_index = dep_index;
+		__entry->dep_count = dep_count;
+		__entry->fence_ctx = fence_ctx;
+		__entry->fence_seqno = fence_seqno;
+		__entry->signaled = signaled;
+	),
+	TP_printk("entry=%u dep=%u/%u fence=%llu/%llu signaled=%u",
+		  __entry->entry_idx, __entry->dep_index, __entry->dep_count,
+		  __entry->fence_ctx, __entry->fence_seqno,
+		  __entry->signaled)
+);
+
 #endif /* _RUST_JQ_DEBUG_TRACE_H */
 
 /* This part must be outside protection. */
