@@ -96,6 +96,7 @@ use crate::{
     regs::gpu_control::MMU_FEATURES,
     reset::hw_gate::HwReadGuard,
     sched::deps,
+    trace, //
 };
 
 // SAFETY: todo
@@ -141,7 +142,8 @@ impl Pool {
             kernel_range,
         )?;
 
-        let index = self.entries.insert(vm)?;
+        let index = self.entries.insert(vm.clone())?;
+        vm.set_handle(index as u64);
 
         Ok((index, user_va_limit))
     }
@@ -387,6 +389,26 @@ pub(crate) struct VmBindQueueOps {
     exec: Arc<VmExec>,
 }
 
+/// Classifies a VM_BIND batch by op kind for the
+/// [`trace::vm_bind_fence_signal`] tracepoint, returning `Map` / `Unmap` when
+/// every op is the same kind and `Mixed` otherwise. Returns `Mixed` for an
+/// empty batch (the count is then `0` and the kind is unused).
+fn batch_op_kind(ops: &[VmBindJobOp]) -> trace::VmBindFenceOpKind {
+    let mut seen_map = false;
+    let mut seen_unmap = false;
+    for op in ops.iter() {
+        match op {
+            VmBindJobOp::Map { .. } => seen_map = true,
+            VmBindJobOp::Unmap { .. } => seen_unmap = true,
+        }
+    }
+    match (seen_map, seen_unmap) {
+        (true, false) => trace::VmBindFenceOpKind::Map,
+        (false, true) => trace::VmBindFenceOpKind::Unmap,
+        _ => trace::VmBindFenceOpKind::Mixed,
+    }
+}
+
 impl QueueOps for VmBindQueueOps {
     type Job = VmBindJob;
     type FenceData = VmBindFenceData;
@@ -409,7 +431,11 @@ impl QueueOps for VmBindQueueOps {
         fence: DriverDmaFence<Self::FenceData, Published>,
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
-        let result = (|| {
+        let vm_id = self.exec.handle();
+        let op_count = job.job.ops.len() as u32;
+        let op_kind = batch_op_kind(&job.job.ops);
+
+        let result: Result = (|| {
             for op in job.job.ops.iter() {
                 match op {
                     VmBindJobOp::Map {
@@ -419,6 +445,13 @@ impl QueueOps for VmBindQueueOps {
                         flags,
                         resources,
                     } => {
+                        trace::vm_bind_op_run(
+                            vm_id,
+                            trace::VmBindOpRunKind::Map,
+                            *va,
+                            *size,
+                            *bo_offset,
+                        );
                         let mut resources = resources.lock().take().ok_or(EINVAL)?;
                         self.exec.map_bo_range_inner(
                             *bo_offset,
@@ -433,6 +466,9 @@ impl QueueOps for VmBindQueueOps {
                         size,
                         resources,
                     } => {
+                        let in_flight = self.exec.count_inflight_bookkeep_fences();
+                        trace::vm_bind_unmap_exec(vm_id, *va, *size, in_flight);
+                        trace::vm_bind_op_run(vm_id, trace::VmBindOpRunKind::Unmap, *va, *size, 0);
                         let mut resources = resources.lock().take().ok_or(EINVAL)?;
                         self.exec.unmap_range_inner(*va, *size, &mut resources)?
                     }
@@ -442,13 +478,32 @@ impl QueueOps for VmBindQueueOps {
             Ok(())
         })();
 
+        // SAFETY: `submit_fence` is a valid `struct dma_fence` pointer
+        // owned by the job-queue framework for the duration of this
+        // call; reading `context` and `seqno` is a plain field load.
+        let (fence_ctx, fence_seqno) = unsafe {
+            (
+                (*job.submit_fence.raw()).context,
+                (*job.submit_fence.raw()).seqno,
+            )
+        };
+
         let submitted = match result {
             Ok(()) => {
+                trace::vm_bind_fence_signal(vm_id, fence_ctx, fence_seqno, op_kind, op_count, 0);
                 fence.signal(Ok(()));
                 Ok(SubmitResult::Submitted)
             }
             Err(err) => {
                 self.exec.mark_unusable();
+                trace::vm_bind_fence_signal(
+                    vm_id,
+                    fence_ctx,
+                    fence_seqno,
+                    op_kind,
+                    op_count,
+                    err.to_errno(),
+                );
                 fence.signal(Err(err));
                 Err(err)
             }
@@ -501,6 +556,28 @@ impl deps::BatchOps for BindOps {
 
     fn commit(&self, prepared: PreparedVmBindJob) -> Result<ARef<PublicDmaFence>> {
         Ok(self.vm.commit_bind_job(prepared))
+    }
+
+    fn trace_dep(
+        &self,
+        job_idx: usize,
+        _prepared: &PreparedVmBindJob,
+        dep: &deps::ResolvedDep<'_>,
+    ) {
+        // SAFETY: `dep.fence.raw()` is a valid `struct dma_fence` pointer
+        // for the lifetime of the borrow.
+        let (ctx, seqno) = unsafe { ((*dep.fence.raw()).context, (*dep.fence.raw()).seqno) };
+
+        // The batch holds one job per bind op, so `job_idx` is the op
+        // index the `vm_bind_syncop` events are keyed by.
+        trace::vm_bind_wait_fence(
+            self.vm.handle(),
+            job_idx as u32,
+            dep.key.syncop_index as u32,
+            ctx,
+            seqno,
+            dep.fence.is_signaled(),
+        );
     }
 }
 
@@ -618,6 +695,9 @@ pub(crate) struct PtUpdateContext<'ctx> {
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
 
+    /// VM pool handle, propagated into gpuvm step-callback tracepoints.
+    vm_id: u64,
+
     /// Held for the whole update, so the reset worker drains it before
     /// wiping the hardware that the flush on drop polls.
     _hw: HwReadGuard<'ctx>,
@@ -634,6 +714,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
     /// This prepares the MMU for a page table update.
     /// The context will automatically flush the TLB and
     /// complete the update when dropped.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pt: &'ctx pt_alloc::PageTable,
         mmu: &'ctx Mmu,
@@ -641,6 +722,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
         region: Range<u64>,
         op_type: PtOpType,
         resources: &'ctx mut VmOpResources,
+        vm_id: u64,
     ) -> Result<PtUpdateContext<'ctx>> {
         let _op_lock = as_data.lock_ops();
         let _hw = mmu.begin_hw_access();
@@ -656,6 +738,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
             region,
             op_type,
             resources,
+            vm_id,
             _hw,
             _op_lock,
         })
@@ -799,6 +882,14 @@ pub(crate) struct VmExec {
     /// `drm_gpuvm_put` out of any dma-fence signalling section the drop
     /// may run under.
     cleanup_wq: Arc<CleanupQueue>,
+    /// Pool handle assigned by [`Pool::create_vm_range`] before the VM
+    /// is published to any path that can emit a tracepoint. Stable
+    /// after publish and used as the userspace-visible VM identifier
+    /// in tracepoints. `0` for the firmware VM and until a user VM
+    /// insert completes, matching the unallocated value of the
+    /// underlying allocating XArray (whose first allocated index is
+    /// `1`).
+    handle: core::sync::atomic::AtomicU64,
 }
 
 #[pinned_drop]
@@ -912,6 +1003,7 @@ impl Vm {
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: AtomicBool::new(false),
                 cleanup_wq,
+                handle: core::sync::atomic::AtomicU64::new(0),
             }),
             GFP_KERNEL,
         )?;
@@ -939,6 +1031,13 @@ impl Vm {
         )?;
 
         Ok(vm)
+    }
+
+    fn set_handle(&self, handle: u64) {
+        self.exec
+            .handle
+            .store(handle, core::sync::atomic::Ordering::Relaxed);
+        self.exec.as_data.set_vm_id(handle);
     }
 
     /// Creates the firmware MCU VM with an explicit kernel auto-VA window.
@@ -1121,13 +1220,25 @@ impl PreparedVm<'_> {
 }
 
 impl VmExec {
+    /// Pool handle assigned at insert time. Returns `0` if this is the
+    /// firmware VM, or if a user VM has not yet been inserted into the
+    /// [`Pool`].
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Activate the VM in a hardware address space slot.
     pub(crate) fn activate(&self) -> Result {
+        let vm_id = self.handle();
         self.mmu
             .activate_vm(self.as_data.as_arc_borrow())
             .inspect_err(|e| {
                 pr_err!("Failed to activate VM: {:?}\n", e);
-            })
+            })?;
+        if let Some(as_slot) = self.as_slot() {
+            trace::as_slot_assign(vm_id, u32::from(as_slot), true);
+        }
+        Ok(())
     }
 
     /// Returns the AS slot index this VM is currently bound to.
@@ -1173,11 +1284,100 @@ impl VmExec {
         })
     }
 
+    /// Non-blocking variant of [`get_bo_for_va`].
+    ///
+    /// Returns `Err(())` when `gpuvm_unique` is currently held by
+    /// another thread, `Ok(None)` when no mapping covers `va`, and
+    /// `Ok(Some((bo, offset)))` on a hit.
+    ///
+    /// `get_bo_for_va` is unsafe to call from a dma-fence signalling section,
+    /// because `gpuvm_unique` composes with `GFP_KERNEL` allocation on the
+    /// `vm_bind_ioctl` paths, which creates a `dma_fence_map ->
+    /// fs_reclaim` edge. Tracing helpers that fire from such sections
+    /// (e.g. the CS_FAULT / CS_FATAL paths under `fw_events_work`)
+    /// must use this variant and treat `Err(())` as a transient
+    /// best-effort miss.
+    ///
+    /// [`get_bo_for_va`]: Self::get_bo_for_va
+    pub(crate) fn try_get_bo_for_va(&self, va: u64) -> Result<Option<(ARef<Bo>, u64)>, ()> {
+        let guard = self.gpuvm_unique.try_lock().ok_or(())?;
+        let Some(gpuva) = guard.as_ref().and_then(|g| g.find_first(va, 1)) else {
+            return Ok(None);
+        };
+        let bo = gpuva.obj();
+        let bo_offset = gpuva.gem_offset() + (va - gpuva.addr());
+        Ok(Some((ARef::from(bo), bo_offset)))
+    }
+
+    /// Counts unsignalled fences currently attached to the VM's reservation
+    /// object at `BOOKKEEP` usage class. It is lock-free, using the RCU-based
+    /// `dma_resv_iter_*_unlocked` cursor, so it is safe to call from a
+    /// dma-fence signalling section (no
+    /// `dma_resv_lock`, no `GFP_KERNEL` allocation). The unlocked
+    /// iterator can restart if the resv is mutated concurrently;
+    /// per `dma_resv_iter_is_restarted` the accumulator is reset on
+    /// each restart.
+    pub(crate) fn count_inflight_bookkeep_fences(&self) -> u32 {
+        // SAFETY: `self.gpuvm` is a valid `GpuVm` for the lifetime of
+        // `self`; `(*r_obj).resv` is initialised for the lifetime of
+        // the GEM object embedded in the gpuvm and is the documented
+        // way to reach the gpuvm's reservation object.
+        let resv = unsafe { (*(*self.gpuvm.as_raw()).r_obj).resv };
+        if resv.is_null() {
+            return 0;
+        }
+
+        let mut cursor = kernel::bindings::dma_resv_iter {
+            obj: resv,
+            usage: kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+            fence: core::ptr::null_mut(),
+            fence_usage: kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+            index: 0,
+            fences: core::ptr::null_mut(),
+            num_fences: 0,
+            is_restarted: false,
+        };
+
+        let mut count: u32 = 0;
+        // SAFETY: `cursor` is a stack-local, freshly initialised
+        // `dma_resv_iter`; `dma_resv_iter_first_unlocked` reads the
+        // resv pointer it was seeded with under RCU and returns
+        // either a refcounted fence pointer or NULL.
+        let mut fence = unsafe { kernel::bindings::dma_resv_iter_first_unlocked(&mut cursor) };
+        while !fence.is_null() {
+            if cursor.is_restarted {
+                count = 0;
+            }
+            // SAFETY: `fence` was returned by the iterator and the
+            // iterator holds a reference for the caller until the
+            // next iter call or `dma_fence_put`.
+            if !unsafe { kernel::bindings::dma_fence_is_signaled(fence) } {
+                count = count.saturating_add(1);
+            }
+            // SAFETY: same justification as the `_first_` call; the
+            // iterator drops its reference to the previously returned
+            // fence as part of fetching the next one.
+            fence = unsafe { kernel::bindings::dma_resv_iter_next_unlocked(&mut cursor) };
+        }
+
+        // SAFETY: `cursor.fence` is either NULL (no remaining
+        // reference) or a refcounted fence pointer the iterator
+        // handed us; `dma_fence_put` accepts both.
+        unsafe { kernel::bindings::dma_fence_put(cursor.fence) };
+
+        count
+    }
+
     /// Deactivate the VM by evicting it from its address space slot.
     pub(crate) fn deactivate(&self) -> Result {
+        let pre_slot = self.as_slot();
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
             pr_err!("Failed to deactivate VM: {:?}\n", e);
-        })
+        })?;
+        if let Some(as_slot) = pre_slot {
+            trace::as_slot_assign(self.handle(), u32::from(as_slot), false);
+        }
+        Ok(())
     }
 
     /// Executes a virtual memory operation.
@@ -1208,6 +1408,7 @@ impl VmExec {
                         prot: args.flags.to_prot(),
                     }),
                     resources,
+                    self.handle(),
                 )?;
 
                 gpuvm_unique.sm_map(OpMapRequest {
@@ -1227,6 +1428,7 @@ impl VmExec {
                     req.region,
                     PtOpType::Unmap,
                     resources,
+                    self.handle(),
                 )?;
 
                 gpuvm_unique.sm_unmap(
@@ -1253,27 +1455,35 @@ impl VmExec {
         flags: VmMapFlags,
         resources: &mut VmOpResources,
     ) -> Result {
-        let end = va.checked_add(size).ok_or(EINVAL)?;
-        let vm_bo = resources.vm_bo.take().ok_or(EINVAL)?;
-        let req = VmOpRequest {
-            op_type: VmOpType::Map(VmMapArgs {
-                vm_bo,
-                flags,
-                bo_offset,
-            }),
-            region: va..end,
+        let r = (|| -> Result {
+            let end = va.checked_add(size).ok_or(EINVAL)?;
+            let vm_bo = resources.vm_bo.take().ok_or(EINVAL)?;
+            let req = VmOpRequest {
+                op_type: VmOpType::Map(VmMapArgs {
+                    vm_bo,
+                    flags,
+                    bo_offset,
+                }),
+                region: va..end,
+            };
+            let mut gpuvm_unique = self.gpuvm_unique.lock();
+
+            // kill() marks the VM unusable under gpuvm_unique before
+            // unmapping, so this check under the same lock cannot race with
+            // teardown.
+            if self.is_unusable() {
+                return Err(EINVAL);
+            }
+
+            self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)
+        })();
+
+        let errno = match &r {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
         };
-        let mut gpuvm_unique = self.gpuvm_unique.lock();
-
-        // kill() marks the VM unusable under gpuvm_unique before unmapping,
-        // so this check under the same lock cannot race with teardown.
-        if self.is_unusable() {
-            return Err(EINVAL);
-        }
-
-        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)?;
-
-        Ok(())
+        trace::vm_map_bo(self.handle(), va, size, u32::from(flags), errno);
+        r
     }
 
     pub(crate) fn flush_deferred_cleanup(&self) {
@@ -1313,16 +1523,22 @@ impl VmExec {
     /// This removes any existing mappings in the specified range, freeing the
     /// virtual address space for reuse.
     fn unmap_range_inner(&self, va: u64, size: u64, resources: &mut VmOpResources) -> Result {
-        let end = va.checked_add(size).ok_or(EINVAL)?;
-        let req = VmOpRequest {
-            op_type: VmOpType::Unmap,
-            region: va..end,
+        let r = (|| -> Result {
+            let end = va.checked_add(size).ok_or(EINVAL)?;
+            let req = VmOpRequest {
+                op_type: VmOpType::Unmap,
+                region: va..end,
+            };
+            let mut gpuvm_unique = self.gpuvm_unique.lock();
+            self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)
+        })();
+
+        let errno = match &r {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
         };
-        let mut gpuvm_unique = self.gpuvm_unique.lock();
-
-        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)?;
-
-        Ok(())
+        trace::vm_unmap_bo(self.handle(), va, size, errno);
+        r
     }
 
     pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
@@ -1362,6 +1578,12 @@ impl DriverGpuVm for GpuVmData {
         let mut iova = start_iova;
         let mut bytes_left_to_map = op.length();
         let mut gem_offset = op.gem_offset();
+        trace::gpuvm_node_op(
+            context.vm_id,
+            trace::GpuVmNodeOp::Map,
+            start_iova,
+            bytes_left_to_map,
+        );
         let map_sgt = context.resources.map_sgt.as_ref().ok_or(EINVAL)?;
         let prot = match &context.op_type {
             PtOpType::Map(args) => args.prot,
@@ -1393,7 +1615,7 @@ impl DriverGpuVm for GpuVmData {
             }
             let len = sgt_entry_length.min(bytes_left_to_map);
 
-            let segment_mapped = match pt_map(context.pt, iova, paddr, len, prot) {
+            let segment_mapped = match pt_map(context.pt, context.vm_id, iova, paddr, len, prot) {
                 Ok(segment_mapped) => segment_mapped,
                 Err(e) => {
                     // clean up any successful mappings from previous SGT entries.
@@ -1424,6 +1646,7 @@ impl DriverGpuVm for GpuVmData {
     ) -> Result<OpUnmapped<'op, Self>, Error> {
         let start_iova = op.va().addr();
         let length = op.va().length();
+        trace::gpuvm_node_op(context.vm_id, trace::GpuVmNodeOp::Unmap, start_iova, length);
 
         let region = start_iova..(start_iova + length);
         pt_unmap(context.pt, region.clone()).inspect_err(|e| {
@@ -1457,6 +1680,13 @@ impl DriverGpuVm for GpuVmData {
         } else {
             op.va_to_unmap().addr() + op.va_to_unmap().length()
         };
+
+        trace::gpuvm_node_op(
+            context.vm_id,
+            trace::GpuVmNodeOp::Remap,
+            unmap_start,
+            unmap_end - unmap_start,
+        );
 
         // The surviving fragments inherit the protection of the mapping being
         // split.
@@ -1512,6 +1742,7 @@ impl DriverGpuVm for GpuVmData {
         if let Some(head_paddr) = head_paddr {
             pt_map(
                 context.pt,
+                context.vm_id,
                 aligned_start,
                 head_paddr,
                 unmap_start - aligned_start,
@@ -1521,6 +1752,7 @@ impl DriverGpuVm for GpuVmData {
         if let Some(tail_paddr) = tail_paddr {
             pt_map(
                 context.pt,
+                context.vm_id,
                 unmap_end,
                 tail_paddr,
                 aligned_end - unmap_end,
@@ -1628,7 +1860,14 @@ fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(PhysAddr, u64
 /// unmapped before returning an error.
 ///
 /// Returns the number of bytes successfully mapped.
-fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) -> Result<u64> {
+fn pt_map(
+    pt: &pt_alloc::PageTable,
+    vm_id: u64,
+    iova: u64,
+    paddr: u64,
+    len: u64,
+    prot: u32,
+) -> Result<u64> {
     let mut segment_mapped = 0u64;
     while segment_mapped < len {
         let remaining = len - segment_mapped;
@@ -1636,6 +1875,8 @@ fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) 
         let curr_paddr = paddr + segment_mapped;
 
         let (pgsize, pgcount) = get_pgsize(curr_iova | curr_paddr, remaining);
+
+        trace::mmu_map_segment(vm_id, curr_iova, curr_paddr, pgsize * pgcount);
 
         // The page tables for this map come from the reserve. The flags only
         // reach the fallback path, which runs in the VM_BIND dma-fence

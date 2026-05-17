@@ -212,6 +212,8 @@
 
 #include "drm_internal.h"
 
+#include <trace/events/drm_syncobj_debug.h>
+
 struct syncobj_wait_entry {
 	struct list_head node;
 	struct task_struct *task;
@@ -375,6 +377,8 @@ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
 	struct dma_fence *old_fence;
 	struct syncobj_wait_entry *wait_cur, *wait_tmp;
 	struct syncobj_eventfd_entry *ev_fd_cur, *ev_fd_tmp;
+
+	trace_drm_syncobj_replace_fence(syncobj, fence);
 
 	if (fence)
 		dma_fence_get(fence);

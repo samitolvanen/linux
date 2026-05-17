@@ -1795,6 +1795,19 @@ impl<T: QueueOps> JobQueue<T> {
             inbox.cyclic_next = next;
         }
 
+        let dep_count = deps.len() as u32;
+        for (dep_index, dep) in deps.iter().enumerate() {
+            let (fence_ctx, fence_seqno) = trace_dbg::fence_key(dep);
+            trace_dbg::prepare_dep(
+                xa_index.index() as u32,
+                dep_index as u32,
+                dep_count,
+                fence_ctx,
+                fence_seqno,
+                dep.is_signaled(),
+            );
+        }
+
         Ok(PreparedJob {
             inner: self.inner.clone(),
             xa_index: Some(xa_index),

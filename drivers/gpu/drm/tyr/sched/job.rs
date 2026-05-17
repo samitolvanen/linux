@@ -15,6 +15,8 @@ use kernel::{
         genmask_u32,
         //
     },
+    drm::gem::shmem,
+    io::Io,
     prelude::*,
     transmute::FromBytes,
     uaccess::UserSlice,
@@ -32,6 +34,16 @@ use super::{
     group::Group,
     //
 };
+
+use crate::{
+    gem,
+    trace, //
+};
+
+/// Sentinel placed in the `first_qword` field of [`tyr_user_stream_head`]
+/// when the read could not be performed (BO lookup failed or kernel vmap
+/// allocation failed).
+const USER_STREAM_HEAD_SENTINEL: u64 = 0xDEADBEEFDEADBEEF;
 
 /// Encoder for Mali CSF command-stream instructions. Opcodes match the
 /// Mali CSF programming manual, and value operands are masked to their
@@ -334,7 +346,12 @@ impl Job {
     /// syncobj at `sync_va` by one. The concatenation is padded to a
     /// 64-byte boundary so the firmware prefetcher sees cacheline-
     /// aligned trailing storage.
-    pub(crate) fn build_wrapped_stream(&self, group: &Group, sync_va: u64) -> Result<KVec<u8>> {
+    pub(crate) fn build_wrapped_stream(
+        &self,
+        group: &Group,
+        sync_va: u64,
+        job_counter: u64,
+    ) -> Result<KVec<u8>> {
         const INSTR_BYTES: usize = 8;
         const INSTRS_PER_WRAPPER: usize = 11;
         const WRAPPER_BYTES: usize = INSTR_BYTES * INSTRS_PER_WRAPPER;
@@ -364,6 +381,22 @@ impl Job {
         let mut buf = KVec::<u8>::with_capacity(padded, GFP_KERNEL)?;
 
         for piece in self.pieces.iter() {
+            let (first_qword, status) = read_user_stream_head(group, piece.stream_addr);
+            trace::user_stream_head(
+                group.handle(),
+                self.queue_index as u32,
+                piece.stream_addr,
+                first_qword,
+                status,
+            );
+            trace::wrapper_call(
+                group.handle(),
+                self.queue_index as u32,
+                job_counter,
+                piece.stream_addr,
+                piece.stream_size,
+            );
+
             for word in [
                 Instr::mov32(val_reg, piece.latest_flush.into()),
                 Instr::flush_cache2(val_reg),
@@ -392,4 +425,55 @@ impl Job {
 
         Ok(buf)
     }
+}
+
+/// Reads the first 64-bit word at the user command-stream's GPU VA.
+///
+/// Returns the value read and an `Ok` status on success, or the
+/// [`USER_STREAM_HEAD_SENTINEL`] paired with a status describing why
+/// the read could not be performed. The GPU VA is resolved via
+/// [`crate::vm::Vm::get_bo_for_va`], so foreign BOs and stream
+/// addresses that no longer have a backing mapping report
+/// `LookupFailed` without blocking the submit-prepare path.
+///
+/// Must be called from a non-signalling context, because the underlying
+/// `MappedUserBo::new` takes `dma_resv_lock` and a `GFP_KERNEL` vmap.
+/// `build_wrapped_stream` runs at submit-prepare time, which already
+/// satisfies that.
+fn read_user_stream_head(group: &Group, stream_va: u64) -> (u64, trace::UserStreamHeadStatus) {
+    let Some((bo, bo_offset)) = group.vm.get_bo_for_va(stream_va) else {
+        return (
+            USER_STREAM_HEAD_SENTINEL,
+            trace::UserStreamHeadStatus::LookupFailed,
+        );
+    };
+
+    let mapped_bo = match gem::MappedUserBo::new(&bo, group.tdev.cleanup_wq.clone()) {
+        Ok(mapped) => mapped,
+        Err(_) => {
+            return (
+                USER_STREAM_HEAD_SENTINEL,
+                trace::UserStreamHeadStatus::VmapFailed,
+            );
+        }
+    };
+
+    let offset = bo_offset as usize;
+    if gem::MappedUserBo::check_offset::<u64>(&mapped_bo, offset).is_err() {
+        return (
+            USER_STREAM_HEAD_SENTINEL,
+            trace::UserStreamHeadStatus::VmapFailed,
+        );
+    }
+
+    let vmap: &shmem::VMapOwned<gem::BoData> = mapped_bo.vmap();
+    // SAFETY: `check_offset::<u64>` above verified that
+    // `offset..offset + 8` is in bounds of the vmap and that `offset`
+    // is 8-byte aligned for `u64`.
+    let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<u64>() };
+    // SAFETY: `ptr` is aligned and in-bounds (see above) and the
+    // mapping is shared with the GPU, so a volatile read matches the
+    // semantics used by `syncs::SyncObj{32,64}b::read`.
+    let value = unsafe { core::ptr::read_volatile(ptr) };
+    (value, trace::UserStreamHeadStatus::Ok)
 }

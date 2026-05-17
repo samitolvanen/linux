@@ -59,6 +59,7 @@ use crate::{
         deps,
         group, //
     },
+    trace,
     vm::{
         self,
         VmMapFlags, //
@@ -505,10 +506,33 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let vm_id = vm.handle();
+        trace::vm_bind_ioctl_entry(
+            vm_id,
+            trace::VmBindIoctlKind::Sync,
+            count as u32,
+            vm.count_inflight_bookkeep_fences(),
+        );
         for i in 0..count {
+            let op: VmBindOp = reader.read()?;
+            read_padding_zero(&mut reader, stride - min_size)?;
+            trace::mmu_bind_start(vm_id, op.0.va, op.0.size);
+            let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+            let op_kind = ((op.0.flags as i32 & type_mask) >> 28) as u32;
+            let bo_id = if op.0.flags as i32 & type_mask
+                == uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP
+            {
+                gem::lookup_handle(file, op.0.bo_handle)
+                    .map(|bo| gem::debug_id(&bo))
+                    .unwrap_or(0)
+            } else {
+                vm.get_bo_for_va(op.0.va)
+                    .map(|(bo, _)| gem::debug_id(&bo))
+                    .unwrap_or(0)
+            };
+            trace::vm_bind_op_sync(vm_id, op_kind, op.0.va, op.0.size, 0, 0, bo_id);
+
             let res: Result = (|| {
-                let op: VmBindOp = reader.read()?;
-                read_padding_zero(&mut reader, stride - min_size)?;
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -556,6 +580,12 @@ impl TyrDrmFileData {
                 Ok(())
             })();
 
+            let errno = match &res {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            };
+            trace::mmu_bind_done(vm_id, op.0.va, op.0.size, errno);
+
             if let Err(e) = res {
                 vmbind.ops.count = i as u32;
                 return Err(e);
@@ -594,20 +624,58 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let vm_id = vm.handle();
+        trace::vm_bind_ioctl_entry(
+            vm_id,
+            trace::VmBindIoctlKind::Async,
+            count as u32,
+            vm.count_inflight_bookkeep_fences(),
+        );
+
         // `count` is unbounded, so the arrays come from kvmalloc.
         let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
         ctx.reserve_jobs(count)?;
 
         let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL)?;
 
-        for _ in 0..count {
+        for i in 0..count {
             let op: VmBindOp = reader.read()?;
             read_padding_zero(&mut reader, stride - min_size)?;
-            let validated_bo = validate_bind_op(&op, file, &vm)?;
-            let (job, syncs) = op.capture(&vm, true, validated_bo.clone())?;
+            let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+            let op_kind = ((op.0.flags as i32 & type_mask) >> 28) as u32;
+            (|| -> Result {
+                let validated_bo = validate_bind_op(&op, file, &vm)?;
+                let (job, syncs) = op.capture(&vm, true, validated_bo.clone())?;
+                let n_waits = syncs.iter().filter(|s| s.is_wait()).count() as u32;
+                let n_signals = syncs.iter().filter(|s| s.is_signal()).count() as u32;
+                trace::vm_bind_op(vm_id, op_kind, op.0.va, op.0.size, n_waits, n_signals);
+                for (syncop_index, sync) in syncs.iter().enumerate() {
+                    let kind = if sync.is_signal() {
+                        trace::VmBindSyncopKind::Signal
+                    } else {
+                        trace::VmBindSyncopKind::Wait
+                    };
+                    trace::vm_bind_syncop(
+                        vm_id,
+                        i as u32,
+                        syncop_index as u32,
+                        kind,
+                        sync.handle.handle(),
+                        sync.handle.timeline_value(),
+                    );
+                }
 
-            ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
-            op_bos.push(validated_bo, GFP_KERNEL)?;
+                ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
+                op_bos.push(validated_bo, GFP_KERNEL)?;
+                Ok(())
+            })()
+            .inspect_err(|e| {
+                let va = op.0.va;
+                let size = op.0.size;
+                pr_info!(
+                    "vm_bind_async vm={vm_id:#x} op[{i}] kind={op_kind} va={va:#x} size={size:#x} failed: {e:?}\n"
+                );
+            })?;
         }
 
         if op_bos.is_empty() {

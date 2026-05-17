@@ -21,6 +21,7 @@ use kernel::{
         gem,
         gem::shmem,
         gem::BaseObject,
+        gem::IntoGEMObject,
         DeviceContext, //
     },
     new_mutex,
@@ -43,6 +44,7 @@ use crate::{
         TyrDrmDriver, //
     },
     file::TyrDrmFile,
+    trace,
     vm::{
         range,
         Vm,
@@ -214,6 +216,9 @@ impl Drop for MappedBo {
             return;
         };
         let cleanup_wq = self.kernel_bo.cleanup_wq.clone();
+        let range = self.kernel_bo.va_range();
+        let va = range.start;
+        let size = range.end - range.start;
 
         let slot: KBox<MaybeUninit<shmem::VMapOwned<BoData>>> = match KBox::new_uninit(GFP_NOWAIT) {
             Ok(s) => s,
@@ -229,7 +234,9 @@ impl Drop for MappedBo {
         let ptr = KBox::into_raw(boxed);
         let send_ptr = MappedBoCleanupPtr(ptr);
 
+        trace::cleanup_wq_enqueue(trace::CleanupWqKind::MappedBoVmap, va, size);
         let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            trace::cleanup_wq_exec(trace::CleanupWqKind::MappedBoVmap, va, size);
             // Force `Send` capture of the wrapper, see `KernelBo`.
             let send_ptr = send_ptr;
             // SAFETY: `send_ptr.0` was produced by `KBox::into_raw`
@@ -447,7 +454,13 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
         // SAFETY: `ddev` is bound for the duration of the ioctl path that
         // reaches this function.
         let dev = unsafe { ddev.as_ref().as_bound() };
-        bo.sg_table(dev)?;
+        if let Err(e) = bo.sg_table(dev) {
+            dev_err!(
+                ddev.as_ref(),
+                "tyr: eager sg_table fetch failed for WC BO (size={aligned_size}): {e:?}\n"
+            );
+            return Err(e);
+        }
     }
 
     Ok(bo)
@@ -530,6 +543,13 @@ pub(crate) fn sync(
     }
 
     Ok(())
+}
+
+/// Returns the address of the underlying `struct drm_gem_object` as a
+/// file-independent debug identity for the BO. Used only to correlate a
+/// BO's mapping lifecycle in tracepoints; never dereferenced.
+pub(crate) fn debug_id(bo: &Bo) -> u64 {
+    bo.as_raw() as u64
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
@@ -784,7 +804,9 @@ impl Drop for KernelBo {
         let ptr = KBox::into_raw(boxed);
         let send_ptr = KernelBoCleanupPtr(ptr);
 
+        trace::cleanup_wq_enqueue(trace::CleanupWqKind::KernelBo, va, size);
         let res = self.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            trace::cleanup_wq_exec(trace::CleanupWqKind::KernelBo, va, size);
             // Force the closure to capture the whole `Send` wrapper
             // by value rather than disjointly capturing the `*mut`
             // field; capturing just the field would make the closure

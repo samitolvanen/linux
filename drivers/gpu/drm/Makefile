@@ -67,6 +67,7 @@ drm-y := \
 	drm_property.o \
 	drm_rect.o \
 	drm_syncobj.o \
+	drm_syncobj_trace_points.o \
 	drm_sysfs.o \
 	drm_trace_points.o \
 	drm_vblank.o \

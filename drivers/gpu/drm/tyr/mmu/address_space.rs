@@ -13,7 +13,12 @@
 //! [`SlotOperations`]: crate::slot::SlotOperations
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{
+    AtomicBool,
+    AtomicU32,
+    AtomicU64,
+    Ordering, //
+};
 
 use kernel::{
     device::{
@@ -71,6 +76,7 @@ use crate::{
         Seat,
         SlotOperations, //
     },
+    trace,
     vm::pt_alloc::{
         PageTable,
         PtAllocator, //
@@ -140,6 +146,31 @@ pub(crate) struct VmAsData {
     /// Provides the memory backing the page tables of this VM.
     pub(crate) pt_allocator: Arc<PtAllocator>,
 
+    /// Pool handle of the group currently bound to a CSG slot whose VM
+    /// is this one, or [`u64::MAX`] when no such group is bound.
+    /// Updated by the scheduler at CSG slot activate / evict so the
+    /// MMU IRQ handler can resolve the faulting AS slot back to a
+    /// group without taking any scheduler lock.
+    pub(crate) bound_group_id: AtomicU64,
+
+    /// Reuse-proof uid of the bound group, or [`u64::MAX`] when no group
+    /// is bound. Paired with [`Self::bound_group_id`] and updated at the
+    /// same sites, so the MMU fault tracepoint can name the exact group
+    /// instance even after the pool handle has been reused.
+    pub(crate) bound_group_uid: AtomicU64,
+
+    /// CSG slot index the bound group occupies, or [`u32::MAX`] when
+    /// no group is bound. Paired with [`Self::bound_group_id`] and
+    /// updated at the same sites.
+    pub(crate) bound_csg_id: AtomicU32,
+
+    /// Pool handle of the VM owning this address-space data, or `0`
+    /// before the owning VM has been inserted into the pool. Mirrors
+    /// `VmExec::handle` so the AS-lifecycle tracepoints can correlate
+    /// with the `as_slot_assign` / `vm_bind` events. Downstream-only
+    /// debug aid.
+    vm_id: AtomicU64,
+
     /// Page table.
     ///
     /// Managed by devres to ensure proper cleanup. The page table maps
@@ -179,6 +210,10 @@ impl VmAsData {
             unhandled_fault: AtomicBool::new(false),
             op_lock <- new_mutex!(()),
             pt_allocator,
+            bound_group_id: AtomicU64::new(u64::MAX),
+            bound_group_uid: AtomicU64::new(u64::MAX),
+            bound_csg_id: AtomicU32::new(u32::MAX),
+            vm_id: AtomicU64::new(0),
             page_table <- page_table_init,
         }? Error))
     }
@@ -190,6 +225,42 @@ impl VmAsData {
     /// hw_gate read > as_manager`.
     pub(crate) fn lock_ops(&self) -> MutexGuard<'_, ()> {
         self.op_lock.lock()
+    }
+
+    /// Records the owning VM's pool handle for trace correlation.
+    pub(crate) fn set_vm_id(&self, vm_id: u64) {
+        self.vm_id.store(vm_id, Ordering::Relaxed);
+    }
+
+    /// Returns the owning VM's pool handle, or `0` if not yet set.
+    fn vm_id(&self) -> u64 {
+        self.vm_id.load(Ordering::Relaxed)
+    }
+
+    /// Records that the group with `group_id` / `group_uid` is now bound
+    /// on `csg_id` for this VM.
+    pub(crate) fn set_bound_group(&self, group_id: u64, group_uid: u64, csg_id: u32) {
+        self.bound_group_id.store(group_id, Ordering::Relaxed);
+        self.bound_group_uid.store(group_uid, Ordering::Relaxed);
+        self.bound_csg_id.store(csg_id, Ordering::Relaxed);
+    }
+
+    /// Clears the bound-group back-pointer set by [`Self::set_bound_group`].
+    pub(crate) fn clear_bound_group(&self) {
+        self.bound_group_id.store(u64::MAX, Ordering::Relaxed);
+        self.bound_group_uid.store(u64::MAX, Ordering::Relaxed);
+        self.bound_csg_id.store(u32::MAX, Ordering::Relaxed);
+    }
+
+    /// Returns the currently bound `(group_id, group_uid, csg_id)`
+    /// snapshot, or `(u64::MAX, u64::MAX, u32::MAX)` if no group is
+    /// bound.
+    pub(crate) fn bound_group(&self) -> (u64, u64, u32) {
+        (
+            self.bound_group_id.load(Ordering::Relaxed),
+            self.bound_group_uid.load(Ordering::Relaxed),
+            self.bound_csg_id.load(Ordering::Relaxed),
+        )
     }
 
     /// Computes the hardware configuration for this address space.
@@ -301,14 +372,14 @@ impl SlotOperations for AddressSpaceManager {
         _ctx: &mut Self::Context,
     ) -> Result {
         let as_config = slot_data.as_config(self.dev())?;
-        self.as_enable(slot_idx, &as_config)
+        self.as_enable(slot_idx, &as_config, slot_data.vm_id())
     }
 
     /// Evicts an address space from a hardware slot.
     fn evict(
         &mut self,
         slot_idx: usize,
-        _slot_data: &Self::SlotData,
+        slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
         // The reset may have been scheduled for a stuck AS command, and it
@@ -317,7 +388,7 @@ impl SlotOperations for AddressSpaceManager {
             return Ok(());
         }
         if self.iomem.try_access().is_some() {
-            self.as_disable(slot_idx)?;
+            self.as_disable(slot_idx, slot_data.vm_id())?;
         }
         Ok(())
     }
@@ -430,13 +501,14 @@ impl AddressSpaceManager {
     /// Enables an AS slot with the provided configuration.
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
-    fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
+    fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig, vm_id: u64) -> Result {
         self.validate_as_slot(as_nr)?;
 
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
 
         let transtab = as_config.transtab;
+        trace::as_enable(vm_id, as_nr as u32, transtab);
         io.write(
             TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
             TRANSTAB_LO::from_raw(transtab as u32),
@@ -478,10 +550,13 @@ impl AddressSpaceManager {
     /// Disables an AS slot and clears its configuration.
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
-    fn as_disable(&mut self, as_nr: usize) -> Result {
+    fn as_disable(&mut self, as_nr: usize, vm_id: u64) -> Result {
         self.validate_as_slot(as_nr)?;
 
+        trace::as_disable(vm_id, as_nr as u32);
+
         self.gpu_flush_caches(
+            as_nr,
             FlushMode::CleanInvalidate,
             FlushMode::CleanInvalidate,
             FlushMode::Invalidate,
@@ -540,7 +615,7 @@ impl AddressSpaceManager {
     /// power-of-two region aligned to its size.
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
-    fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>) -> Result {
+    fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>, vm_id: u64) -> Result {
         self.validate_as_slot(as_nr)?;
 
         // An empty region locks nothing. `region.end - 1` below would
@@ -548,6 +623,8 @@ impl AddressSpaceManager {
         if region.is_empty() {
             return Ok(());
         }
+
+        trace::as_update_start(vm_id, as_nr as u32, region.start, region.end - region.start);
 
         // The lock operates on full 64-byte cache lines of translation table entries.
         // Since each translation table entry (TTE) is 8 bytes, a cache line has 8 TTEs.
@@ -611,13 +688,15 @@ impl AddressSpaceManager {
     ///
     /// The flush must complete before the Unlock so the GPU never resumes
     /// against stale translations.
-    fn as_end_update(&mut self, as_nr: usize) -> Result {
+    fn as_end_update(&mut self, as_nr: usize, vm_id: u64) -> Result {
         self.validate_as_slot(as_nr)?;
         self.gpu_flush_caches(
+            as_nr,
             FlushMode::CleanInvalidate,
             FlushMode::CleanInvalidate,
             FlushMode::Invalidate,
         )?;
+        trace::as_update_end(vm_id, as_nr as u32);
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
         self.lock_pending[as_nr] = false;
         Ok(())
@@ -630,12 +709,15 @@ impl AddressSpaceManager {
     /// globally. It does not touch MMU AS lock state.
     pub(super) fn gpu_flush_caches(
         &self,
+        as_nr: usize,
         l2: FlushMode,
         lsc: FlushMode,
         other: FlushMode,
     ) -> Result {
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
+
+        trace::gpu_flush_caches(as_nr as u32, l2 as u32, lsc as u32, other as u32);
 
         let gpu_cmd = GPU_COMMAND::flush_caches(l2, lsc, other);
 
@@ -686,8 +768,9 @@ impl AsSlotManager {
             return Ok(());
         }
 
+        let vm_id = vm.vm_id();
         match self.resident_slot(&vm.as_seat) {
-            Some(slot) => self.as_start_update(slot as usize, region),
+            Some(slot) => self.as_start_update(slot as usize, region, vm_id),
             None => Ok(()),
         }
     }
@@ -710,8 +793,9 @@ impl AsSlotManager {
             return Ok(());
         }
 
+        let vm_id = vm.vm_id();
         match self.resident_slot(&vm.as_seat) {
-            Some(slot) => self.as_start_update(slot as usize, region),
+            Some(slot) => self.as_start_update(slot as usize, region, vm_id),
             None => Ok(()),
         }
     }
@@ -732,8 +816,9 @@ impl AsSlotManager {
             return Ok(());
         }
 
+        let vm_id = vm.vm_id();
         match self.resident_slot(&vm.as_seat) {
-            Some(slot) => self.as_end_update(slot as usize),
+            Some(slot) => self.as_end_update(slot as usize, vm_id),
             None => Ok(()),
         }
     }
@@ -821,7 +906,7 @@ impl AsSlotManager {
         // Set the flag before disabling, so a disable that fails on a
         // wedged address space is not retried on every repeat fault.
         self.faulty[slot] = true;
-        self.as_disable(slot)
+        self.as_disable(slot, vm.vm_id())
     }
 
     /// Returns the AS slot index `vm` is currently assigned to, or `None`

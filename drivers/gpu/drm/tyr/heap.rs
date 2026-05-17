@@ -28,7 +28,7 @@ use kernel::{
 
 use crate::{
     driver::TyrDrmDevice,
-    gem,
+    gem, trace,
     vm::{
         Vm,
         VmFlag,
@@ -493,5 +493,101 @@ impl Pool {
         drop(removed);
 
         Ok(())
+    }
+
+    /// Best-effort dump of every heap-context entry and chunk-header in
+    /// this pool to the `tyr_heap_context_dump` / `tyr_heap_chunk_dump`
+    /// tracepoints. Called from the CS_FAULT / CS_FATAL event path in
+    /// dma-fence signalling context and from the periodic 1Hz heap-dump
+    /// worker (which passes `cs_id = 0`). The dump only runs while a
+    /// heap-dump tracepoint is enabled; it is disabled by default and is
+    /// enabled at runtime with `echo 1 > .../tyr_heap_chunk_dump/enable`.
+    /// When enabled, the walk:
+    ///
+    /// * uses `try_lock` on the heap XArray (a spinlock-backed lock)
+    ///   and silently skips the dump when the lock is contended;
+    /// * does no allocation;
+    /// * touches only already-mapped kernel vmaps via raw byte reads;
+    /// * is bounded by [`MAX_HEAPS_PER_POOL`] and by each heap's chunk
+    ///   chain length.
+    ///
+    /// This is a downstream-only debug aid and never returns an error.
+    pub(crate) fn dump_for_trace(&self, tdev: &TyrDrmDevice, group_id: u64, cs_id: u32) {
+        if !trace::heap_dump_enabled() {
+            return;
+        }
+
+        let stride = tdev.gpu_info.heap_context_stride() as usize;
+        let Some(ctx_base) = self.gpu_contexts.kernel_va().map(|r| r.start) else {
+            return;
+        };
+        let ctx_vmap = self.gpu_contexts.vmap();
+        let ctx_size = ctx_vmap.owner().size();
+        let ctx_addr = ctx_vmap.addr() as *const u8;
+
+        let xa = self.xa.as_ref();
+        let Some(guard) = xa.try_lock() else {
+            return;
+        };
+
+        for index in 0..MAX_HEAPS_PER_POOL as usize {
+            let Some(heap_ctx) = guard.get(index) else {
+                continue;
+            };
+
+            let ctx_off = index.saturating_mul(stride);
+            if ctx_off.saturating_add(32) > ctx_size {
+                continue;
+            }
+            let mut content = [0u8; 32];
+            // SAFETY: `ctx_addr` is the base of the heap-context BO's
+            // CPU mapping (size `ctx_size`); the bounds check above
+            // confirms `ctx_off..ctx_off + 32` is in-bounds, the bytes
+            // are aligned for `u8`, and the mapping is shared with the
+            // GPU (volatile read).
+            unsafe {
+                let src = ctx_addr.add(ctx_off);
+                for (i, slot) in content.iter_mut().enumerate() {
+                    *slot = core::ptr::read_volatile(src.add(i));
+                }
+            }
+
+            let ctx_va = ctx_base + (index as u64) * (stride as u64);
+            let chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
+            trace::heap_context_dump(group_id, cs_id, index as u32, ctx_va, chunk_count, &content);
+
+            for (chunk_index, chunk_bo) in heap_ctx.chunks.iter().enumerate() {
+                let chunk_vmap = chunk_bo.vmap();
+                let chunk_size = chunk_vmap.owner().size();
+                if chunk_size < 64 {
+                    continue;
+                }
+                let chunk_va = match chunk_bo.kernel_va() {
+                    Some(r) => r.start,
+                    None => continue,
+                };
+
+                let mut header = [0u8; 64];
+                // SAFETY: `chunk_vmap.addr()` is the base of the chunk
+                // BO's CPU mapping of size `chunk_size >= 64`; reads
+                // are within bounds, aligned for `u8`, and the mapping
+                // is shared with the GPU (volatile read).
+                unsafe {
+                    let src = chunk_vmap.addr() as *const u8;
+                    for (i, slot) in header.iter_mut().enumerate() {
+                        *slot = core::ptr::read_volatile(src.add(i));
+                    }
+                }
+
+                trace::heap_chunk_dump(
+                    group_id,
+                    cs_id,
+                    index as u32,
+                    chunk_index as u32,
+                    chunk_va,
+                    &header,
+                );
+            }
+        }
     }
 }

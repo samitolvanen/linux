@@ -13,6 +13,7 @@ pub mod ioctl;
 pub mod job_queue;
 mod job_queue_trace;
 pub mod syncobj;
+mod syncobj_trace;
 
 pub use self::device::Device;
 pub use self::device::DeviceContext;

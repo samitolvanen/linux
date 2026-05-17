@@ -15,6 +15,7 @@ use crate::{
     sync::aref::ARef,
 };
 
+use super::syncobj_trace as trace_dbg;
 use super::Driver;
 
 /// A DRM Sync Object
@@ -41,6 +42,13 @@ impl<T: drm::Driver> SyncObj<T> {
                 phantom: PhantomData,
             })
         }
+    }
+
+    /// Returns the kernel `struct drm_syncobj *` address as a file-independent
+    /// debug identity. Used only as a tracepoint correlation key; never
+    /// dereferenced.
+    fn debug_id(&self) -> u64 {
+        self.ptr as u64
     }
 
     /// Returns the DMA fence associated with this sync object, if any.
@@ -72,17 +80,47 @@ impl<T: drm::Driver> SyncObj<T> {
 
         if ret != 0 {
             Err(Error::from_errno(ret))
-        } else if fence.is_null() {
-            Ok(None)
         } else {
-            // SAFETY: The pointer is non-NULL and `drm_syncobj_find_fence`
-            // acquired an additional reference.
-            Ok(Some(unsafe { PublicDmaFence::from_raw(fence) }))
+            let result = if fence.is_null() {
+                None
+            } else {
+                // SAFETY: The pointer is non-NULL and `drm_syncobj_find_fence`
+                // acquired an additional reference.
+                Some(unsafe { PublicDmaFence::from_raw(fence) })
+            };
+
+            let syncobj_ptr = Self::lookup_handle(file, handle).map_or(0, |s| s.debug_id());
+            let (fence_ctx, fence_seqno, signaled) = match &result {
+                Some(fence) => {
+                    let raw = fence.raw();
+                    // SAFETY: `raw` is a valid `dma_fence` pointer obtained from
+                    // the live `PublicDmaFence` above; `context` and `seqno` are
+                    // immutable for the lifetime of the fence.
+                    let (ctx, seqno) = unsafe { ((*raw).context, (*raw).seqno) };
+                    (ctx, seqno, fence.is_signaled())
+                }
+                None => (0, 0, false),
+            };
+            trace_dbg::find_fence(syncobj_ptr, point, fence_ctx, fence_seqno, signaled);
+
+            Ok(result)
         }
     }
 
     /// Replaces the DMA fence with a new one, or removes it if `fence` is `None`.
     pub fn replace_fence(&self, fence: Option<&PublicDmaFence>) {
+        let (fence_ctx, fence_seqno) = match fence {
+            Some(fence) => {
+                let raw = fence.raw();
+                // SAFETY: `raw` is a valid `dma_fence` pointer obtained from the
+                // live `PublicDmaFence` reference; `context` and `seqno` are
+                // immutable for the lifetime of the fence.
+                unsafe { ((*raw).context, (*raw).seqno) }
+            }
+            None => (0, 0),
+        };
+        trace_dbg::replace_fence(self.debug_id(), fence_ctx, fence_seqno);
+
         // SAFETY: The arguments are valid per the respective type invariants.
         unsafe {
             bindings::drm_syncobj_replace_fence(
@@ -94,6 +132,13 @@ impl<T: drm::Driver> SyncObj<T> {
 
     /// Adds a new timeline point to the sync object.
     pub fn add_point(&self, chain: FenceChain, fence: &PublicDmaFence, point: u64) {
+        let raw = fence.raw();
+        // SAFETY: `raw` is a valid `dma_fence` pointer obtained from the live
+        // `PublicDmaFence` reference; `context` and `seqno` are immutable for
+        // the lifetime of the fence.
+        let (fence_ctx, fence_seqno) = unsafe { ((*raw).context, (*raw).seqno) };
+        trace_dbg::add_point(self.debug_id(), point, fence_ctx, fence_seqno);
+
         // SAFETY: The arguments are valid per the respective type invariants, and
         // this transfers ownership of `chain` to the DRM core.
         unsafe { bindings::drm_syncobj_add_point(self.ptr, chain.into_raw(), fence.raw(), point) };

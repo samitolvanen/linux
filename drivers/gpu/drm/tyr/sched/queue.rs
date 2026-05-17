@@ -52,6 +52,7 @@ use crate::{
     fw::global::CsActivateInputs,
     gem,
     regs::doorbell_block,
+    trace,
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
@@ -359,6 +360,19 @@ impl Default for SuspendState {
 #[pin_data]
 pub(crate) struct QueueData {
     priority: u8,
+    /// Index of this queue within its owning group's `queues` vec.
+    cs_id: u32,
+    /// Owning group's pool handle, captured at queue-create time so
+    /// tracepoints emitted without a `&Group` can carry a stable
+    /// identifier.
+    ///
+    /// Set once by `set_group_id` before the queue is published to any
+    /// path that can emit a tracepoint; reads after publish are stable.
+    group_id: AtomicU64,
+    /// Owning group's reuse-proof uid, captured alongside `group_id` so
+    /// tracepoints emitted without a `&Group` can carry a handle-reuse
+    /// proof identity. Published once by `set_group_id`.
+    group_uid: AtomicU64,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
     doorbell_id: AtomicUsize,
@@ -420,6 +434,22 @@ impl QueueData {
             doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID),
             Ordering::Relaxed,
         );
+    }
+
+    /// Sets the owning group's pool handle and reuse-proof uid. Must be
+    /// called once after the group is inserted into the pool, before any
+    /// path that can emit a tracepoint runs.
+    pub(crate) fn set_group_id(&self, group_id: u64, group_uid: u64) {
+        self.group_id.store(group_id, Ordering::Relaxed);
+        self.group_uid.store(group_uid, Ordering::Relaxed);
+    }
+
+    fn group_id(&self) -> u64 {
+        self.group_id.load(Ordering::Relaxed)
+    }
+
+    fn group_uid(&self) -> u64 {
+        self.group_uid.load(Ordering::Relaxed)
     }
 
     pub(super) fn can_append(&self, instr_count: usize) -> Result {
@@ -486,12 +516,62 @@ impl QueueData {
     /// written before the leading `wmb()`, so they land before `insert`. The
     /// trailing `wmb()` orders `insert` before the doorbell ring.
     pub(super) fn commit_ringbuf_range(&self, completion_point: u64) -> Result {
+        let prev_insert = self.interfaces.read_input()?.insert;
         let ringbuf_output = self.interfaces.read_output()?;
         self.interfaces.write_extract_init(ringbuf_output.extract)?;
 
         kernel::sync::barrier::wmb();
         self.interfaces.write_insert(completion_point)?;
+        trace::fw_cs_ringbuf_publish(
+            self.group_id(),
+            self.cs_id,
+            completion_point,
+            ringbuf_output.extract,
+        );
+
+        // Dump the first 32 bytes of the just-committed range so the
+        // Mali prologue can be inspected from trace alone. Wraparound
+        // is handled by masking each 8-byte offset into the ringbuf.
+        let ringbuf_sz = self.ringbuf.size() as u64;
+        if ringbuf_sz != 0 && completion_point > prev_insert {
+            let ringbuf = self.ringbuf.vmap();
+            let size = ringbuf.owner().size();
+            // SAFETY: `ringbuf` owns a readable CPU mapping for the
+            // queue ring buffer and `size` matches the mapped object
+            // size; the previously-written bytes at `prev_insert` are
+            // already ordered-before by the leading `wmb()`.
+            let bytes = unsafe { core::slice::from_raw_parts(ringbuf.addr() as *const u8, size) };
+            let mut words = [0u64; 4];
+            let payload = completion_point - prev_insert;
+            for (i, word) in words.iter_mut().enumerate() {
+                let off = prev_insert + (i as u64) * 8;
+                if off + 8 > prev_insert + payload {
+                    break;
+                }
+                let cs_off = (off & (ringbuf_sz - 1)) as usize;
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes[cs_off..cs_off + 8]);
+                *word = u64::from_le_bytes(buf);
+            }
+            trace::cs_ringbuf_dump(
+                self.group_id(),
+                self.cs_id,
+                prev_insert,
+                words[0],
+                words[1],
+                words[2],
+                words[3],
+            );
+        }
+
         kernel::sync::barrier::wmb();
+        trace::cs_ring_ptrs(
+            self.group_id(),
+            self.group_uid(),
+            self.cs_id,
+            completion_point,
+            ringbuf_output.extract,
+        );
         Ok(())
     }
 
@@ -534,9 +614,16 @@ impl QueueData {
     /// Signals each leading pending submit fence whose `done_seqno` is
     /// `<= up_to_seqno`, dropping the queue lock before each
     /// `dma_fence_signal()` so no driver lock is held across the signal.
-    fn complete_pending_fences_up_to(&self, up_to_seqno: u64) {
+    ///
+    /// `up_to_seqno` is the raw `SyncObj64b::seqno` read from the
+    /// per-queue syncobj and `raw_status` its `SyncObj64b::status`;
+    /// both are recorded in the `sync_upd_drain` trace.
+    fn complete_pending_fences_up_to(&self, up_to_seqno: u64, raw_status: u32) {
+        let mut drained_count: u32 = 0;
+        let mut last_done_seqno: u64 = 0;
+
         loop {
-            let (_done_seqno, fence) = {
+            let (done_seqno, fence) = {
                 let mut pending = self.pending_submit_fences.lock();
                 let head = pending.head;
                 let Some(entry) = pending.vec.get_mut(head) else {
@@ -555,8 +642,28 @@ impl QueueData {
 
             if let Some(fence) = fence {
                 let _annotation = DmaFenceSignallingAnnotation::new();
+                trace::submit_fence_signal(
+                    self.group_id(),
+                    self.group_uid(),
+                    self.cs_id,
+                    done_seqno,
+                    0,
+                );
                 fence.signal(Ok(()));
+                drained_count += 1;
+                last_done_seqno = done_seqno;
             }
+        }
+
+        if drained_count > 0 {
+            trace::sync_upd_drain(
+                self.group_id(),
+                self.cs_id,
+                last_done_seqno,
+                drained_count,
+                up_to_seqno,
+                raw_status,
+            );
         }
     }
 
@@ -602,6 +709,17 @@ impl QueueData {
         };
 
         let _annotation = DmaFenceSignallingAnnotation::new();
+        let result_errno = match result {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        };
+        trace::submit_fence_signal(
+            self.group_id(),
+            self.group_uid(),
+            self.cs_id,
+            done_seqno,
+            result_errno,
+        );
         fence.signal(result);
         true
     }
@@ -609,8 +727,9 @@ impl QueueData {
     /// Signals every leading pending submit fence whose stored
     /// `done_seqno` is at or below `syncobj_seqno`.
     ///
-    /// The caller is expected to pass the value of the per-queue
-    /// syncobj, read with `Group::read_syncobj`. The wrapped command
+    /// The caller is expected to pass the `seqno` and `status` of the
+    /// per-queue syncobj, read with `Group::read_syncobj`; `status` is
+    /// carried only into the `sync_upd_drain` trace. The wrapped command
     /// stream emitted by
     /// `Job::build_wrapped_stream`
     /// ends each piece with `WAIT(all scoreboards) ; SYNC_ADD64(+1)`, so
@@ -624,8 +743,8 @@ impl QueueData {
     /// Called from both the IRQ-driven completion path on the scheduler
     /// side and from `QueueCompletionStage::process` as a defensive
     /// backstop in case a sync-update IRQ was missed.
-    pub(in crate::sched) fn complete_submit_fences(&self, syncobj_seqno: u64) {
-        self.complete_pending_fences_up_to(syncobj_seqno);
+    pub(in crate::sched) fn complete_submit_fences(&self, syncobj_seqno: u64, syncobj_status: u32) {
+        self.complete_pending_fences_up_to(syncobj_seqno, syncobj_status);
     }
 
     /// Stages `err` on every pending submit fence whose `done_seqno`
@@ -667,6 +786,8 @@ impl QueueData {
         wait.ref_val = ref_val;
         wait.sync64 = sync64;
         wait.gt = gt;
+        drop(wait);
+        trace::queue_state(self.group_id(), self.cs_id, gpu_va != 0);
     }
 
     /// Stores a resolved BO cache on the active sync-wait snapshot if
@@ -712,6 +833,210 @@ impl QueueData {
         Ok(input.insert == output.extract)
     }
 
+    /// Returns the current `(insert, extract)` ringbuffer cursor pair
+    /// read from the kernel-visible mailbox pages. Used by the MMU
+    /// fault path to capture the GPU's view of the queue without
+    /// going through the firmware interface.
+    pub(crate) fn ringbuf_ptrs(&self) -> Result<(u64, u64)> {
+        let input = self.interfaces.read_input()?;
+        let output = self.interfaces.read_output()?;
+        Ok((input.insert, output.extract))
+    }
+
+    /// Reads up to 256 bytes from the BO that contains the GPU VA
+    /// derived from `cs_extract`, centred on that VA. Used by the
+    /// CS_FAULT / CS_FATAL trace path to capture the bytes the
+    /// firmware was actually decoding at the moment of the fault.
+    ///
+    /// Per the CSF architecture spec, `cs_extract` is a monotonic byte
+    /// counter relative to the per-queue ring buffer base, so the GPU
+    /// VA used for the lookup is `ringbuf_base + (cs_extract %
+    /// ringbuf_size)`.
+    ///
+    /// This is best-effort tracing. The GPU VA lookup uses
+    /// [`Vm::try_get_bo_for_va`], which takes `gpuvm_unique` via
+    /// `try_lock()` to keep the helper safe from the dma-fence
+    /// signalling section that wraps `fw_events_work`, because that mutex
+    /// composes with `GFP_KERNEL` allocation on the `vm_bind_ioctl`
+    /// paths, so a blocking acquisition would create a
+    /// `dma_fence_map -> fs_reclaim` edge. If the lock is held
+    /// elsewhere the helper returns a `LockContended` sentinel
+    /// rather than waiting. The read goes through the queue's
+    /// existing kernel vmap; no allocation, no `dma_resv_lock`, no
+    /// `mmu_notifier` callback.
+    ///
+    /// [`Vm::try_get_bo_for_va`]: crate::vm::Vm::try_get_bo_for_va
+    pub(crate) fn user_stream_window_around(
+        &self,
+        cs_extract: u64,
+        vm: &Vm,
+    ) -> trace::CsUserStreamDump {
+        let ringbuf_size = self.ringbuf.size() as u64;
+        if ringbuf_size == 0 || !ringbuf_size.is_power_of_two() {
+            return trace::CsUserStreamDump::default();
+        }
+        let Some(ringbuf_base) = self.ringbuf.kernel_va().map(|r| r.start) else {
+            return trace::CsUserStreamDump::default();
+        };
+        let gpu_va = ringbuf_base.wrapping_add(cs_extract & (ringbuf_size - 1));
+
+        let (bo, bo_offset) = match vm.try_get_bo_for_va(gpu_va) {
+            Ok(Some(hit)) => hit,
+            Ok(None) => return trace::CsUserStreamDump::default(),
+            Err(()) => {
+                return trace::CsUserStreamDump {
+                    status: trace::CsUserStreamDumpStatus::LockContended,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let bo_raw = kernel::drm::gem::IntoGEMObject::as_raw(&*bo);
+        // SAFETY: `bo_raw` is a valid pointer to a `drm_gem_object`
+        // for the lifetime of the `ARef<Bo>` held in `bo`.
+        // `import_attach` is set at most once at gem creation and
+        // never cleared, so a plain read is sound. The same idiom is
+        // used in `gem::sync`.
+        let imported = unsafe { !(*bo_raw).import_attach.is_null() };
+        let bo_va_base = gpu_va.saturating_sub(bo_offset);
+        if imported {
+            return trace::CsUserStreamDump {
+                bo_va_base,
+                bo_offset,
+                status: trace::CsUserStreamDumpStatus::BoImported,
+                ..Default::default()
+            };
+        }
+
+        // The only BO we know is guaranteed to have a stable kernel
+        // vmap in this dma-fence signalling section is the queue's
+        // own ring buffer, which is held vmapped by `MappedBo` for
+        // the queue's lifetime. For any other BO (e.g. a Mesa-owned
+        // user CS BO) `MappedUserBo::new` would have to take
+        // `dma_resv_lock` and a `GFP_KERNEL` vmap, both forbidden
+        // here. Report those cases via `BoNotVmapped` so the trace
+        // consumer can see that we located the BO but could not read.
+        let ringbuf_obj = core::ptr::eq(
+            kernel::drm::gem::IntoGEMObject::as_raw(&**self.ringbuf),
+            bo_raw,
+        );
+        if !ringbuf_obj {
+            return trace::CsUserStreamDump {
+                bo_va_base,
+                bo_offset,
+                status: trace::CsUserStreamDumpStatus::BoNotVmapped,
+                ..Default::default()
+            };
+        }
+
+        let vmap = self.ringbuf.vmap();
+        let bo_size = vmap.owner().size();
+        let offset = bo_offset as usize;
+        if offset > bo_size {
+            return trace::CsUserStreamDump {
+                bo_va_base,
+                bo_offset,
+                status: trace::CsUserStreamDumpStatus::WindowClamped,
+                ..Default::default()
+            };
+        }
+
+        let start = offset.saturating_sub(128);
+        let end = offset.saturating_add(128).min(bo_size);
+        let len = end - start;
+        let mut bytes = [0u8; 256];
+        // SAFETY: `vmap` owns a CPU mapping of the queue ringbuffer
+        // and `bo_size` matches the mapped object size; `start..end`
+        // is in bounds of that mapping by construction above.
+        let src =
+            unsafe { core::slice::from_raw_parts((vmap.addr() as *const u8).add(start), len) };
+        bytes[..len].copy_from_slice(src);
+
+        let status = if len < 256 {
+            trace::CsUserStreamDumpStatus::WindowClamped
+        } else {
+            trace::CsUserStreamDumpStatus::Ok
+        };
+        trace::CsUserStreamDump {
+            bo_va_base,
+            bo_offset,
+            payload_offset: start as u64,
+            status,
+            bytes,
+            len: len as u32,
+        }
+    }
+
+    /// Reads the 64 bytes (eight Mali CSF instructions) starting at
+    /// the firmware's execution pointer `cs_extract`, taken from the
+    /// queue's ringbuffer vmap with the standard `extract % size`
+    /// wrap. Returns `(ringbuf_va, bytes, len)` where `ringbuf_va`
+    /// is the GPU VA the first byte was read from. `len` is the
+    /// number of valid bytes in `bytes` (always 64 on a clean read;
+    /// 0 if the ringbuf has no vmap or no GPU VA). Used by the
+    /// CS_FAULT / CS_FATAL trace path to feed
+    /// [`crate::trace::cs_fault_instruction_decode`].
+    pub(crate) fn ringbuf_instructions_at_extract(&self, cs_extract: u64) -> (u64, [u8; 64], u32) {
+        let vmap = self.ringbuf.vmap();
+        let size = vmap.owner().size();
+        if size == 0 || !size.is_power_of_two() {
+            return (0, [0u8; 64], 0);
+        }
+        let Some(ringbuf_base) = self.ringbuf.kernel_va().map(|r| r.start) else {
+            return (0, [0u8; 64], 0);
+        };
+
+        let mask = (size as u64).wrapping_sub(1);
+        let start = (cs_extract & mask) as usize;
+        let ringbuf_va = ringbuf_base.wrapping_add(cs_extract & mask);
+
+        let mut bytes = [0u8; 64];
+        // SAFETY: `vmap` owns a CPU mapping of the queue ringbuffer
+        // of `size` bytes. Reads are masked into `0..size` via the
+        // power-of-two wrap, aligned for `u8`, and the mapping is
+        // shared with the GPU (volatile read).
+        unsafe {
+            let base = vmap.addr() as *const u8;
+            for (i, slot) in bytes.iter_mut().enumerate() {
+                let pos = ((start + i) as u64 & mask) as usize;
+                *slot = core::ptr::read_volatile(base.add(pos));
+            }
+        }
+        (ringbuf_va, bytes, 64)
+    }
+
+    /// Reads eight u64 ringbuffer words around `extract`, the four words
+    /// immediately before the firmware's decode pointer (at offsets -32, -24,
+    /// -16, -8 from `extract`) followed by the four words at and ahead of
+    /// `extract` (offsets 0, +8, +16, +24). All offsets are taken modulo the
+    /// ringbuffer size so the window wraps correctly. Used by the MMU fault
+    /// path to attach a ringbuf snapshot covering the actively-decoded
+    /// instruction to the fault trace.
+    pub(crate) fn ringbuf_window_around_extract(&self, extract: u64) -> [u64; 8] {
+        let vmap = self.ringbuf.vmap();
+        let size = vmap.owner().size();
+        if size == 0 || !size.is_power_of_two() {
+            return [0u64; 8];
+        }
+        // SAFETY: `vmap` owns a CPU mapping of the queue ringbuffer
+        // and `size` matches the mapped object size.
+        let bytes = unsafe { core::slice::from_raw_parts(vmap.addr() as *const u8, size) };
+
+        let mask = (size as u64).wrapping_sub(1);
+        let offsets: [i64; 8] = [-32, -24, -16, -8, 0, 8, 16, 24];
+        let mut words = [0u64; 8];
+        for (i, off) in offsets.iter().enumerate() {
+            let start = ((extract as i64).wrapping_add(*off) as u64) & mask;
+            let mut buf = [0u8; 8];
+            for j in 0..8 {
+                let pos = ((start + j) & mask) as usize;
+                buf[j as usize] = bytes[pos];
+            }
+            words[i] = u64::from_le_bytes(buf);
+        }
+        words
+    }
+
     /// Synchronises the queue's `input.extract_init` from the firmware's
     /// current `output.extract` value.
     ///
@@ -721,6 +1046,17 @@ impl QueueData {
     pub(crate) fn sync_extract_init(&self) -> Result {
         let ringbuf_output = self.interfaces.read_output()?;
         self.interfaces.write_extract_init(ringbuf_output.extract)
+    }
+
+    /// Reads back the firmware-visible ringbuf mailbox pointers for tracing.
+    /// Returns `(insert, extract, extract_init)` sampled from the queue
+    /// interface BO. Intended to be called at CSG-bind time,
+    /// after `sync_extract_init`, so `extract_init` reflects the value
+    /// the firmware will sample when it starts reading the ringbuf.
+    pub(crate) fn ringbuf_state_for_trace(&self) -> Result<(u64, u64, u64)> {
+        let input = self.interfaces.read_input()?;
+        let output = self.interfaces.read_output()?;
+        Ok((input.insert, output.extract, input.extract_init))
     }
 
     /// Builds the `CsActivateInputs` needed to program this queue's
@@ -757,8 +1093,13 @@ impl QueueData {
     /// restarting the interval.
     pub(super) fn suspend_timeout(&self) {
         let mut state = self.suspend_state.lock();
-        if state.since.is_none() {
+        let opened = state.since.is_none();
+        if opened {
             state.since = Some(Instant::<Monotonic>::now());
+        }
+        drop(state);
+        if opened {
+            trace::queue_timeout_state(self.group_id(), self.cs_id, true);
         }
     }
 
@@ -769,9 +1110,16 @@ impl QueueData {
     /// currently suspended.
     pub(super) fn resume_timeout(&self) {
         let mut state = self.suspend_state.lock();
-        if let Some(start) = state.since.take() {
+        let closed = if let Some(start) = state.since.take() {
             let elapsed = Instant::<Monotonic>::now() - start;
             state.accumulated += elapsed;
+            true
+        } else {
+            false
+        };
+        drop(state);
+        if closed {
+            trace::queue_timeout_state(self.group_id(), self.cs_id, false);
         }
     }
 }
@@ -802,6 +1150,8 @@ impl QueueOps for TyrQueueOps {
         fence: DriverDmaFence<Self::FenceData, Published>,
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
+        trace::job_deps_satisfied(self.data.group_id(), self.data.cs_id, job.counter, 0);
+
         if job.job.stream.is_empty() {
             fence.signal(Ok(()));
             return Ok(SubmitResult::Submitted);
@@ -862,6 +1212,14 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
+        trace::job_submit(
+            done_seqno,
+            self.data.group_id(),
+            self.data.group_uid(),
+            self.data.cs_id,
+            job.job.stream.len() as u32,
+        );
+
         // `CsgSlotOps::activate` and `CsgSlotOps::evict` update `csg_id` and
         // the per-queue `doorbell_id` together under this lock, so a bound
         // group observed here keeps its doorbell for the whole kick. Ringing
@@ -894,6 +1252,9 @@ impl QueueOps for TyrQueueOps {
             if let Err(err) = kick_err {
                 self.data.signal_submit_fence(done_seqno, Err(err));
                 return Err(err);
+            }
+            if let Some(doorbell) = self.data.doorbell_id() {
+                trace::queue_doorbell(self.data.group_id(), self.data.cs_id, doorbell as u32);
             }
             // This path does not always schedule a tick, so record the busy
             // edge here.
@@ -956,7 +1317,9 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
         }
 
         match ctx.job.group.read_syncobj(ctx.job.queue_index) {
-            Ok(syncobj) => self.data.complete_submit_fences(syncobj.seqno),
+            Ok(syncobj) => self
+                .data
+                .complete_submit_fences(syncobj.seqno, syncobj.status),
             Err(err) => {
                 if let Some(done_seqno) = ctx.job.done_seqno() {
                     self.data.signal_submit_fence(done_seqno, Err(err));
@@ -981,9 +1344,27 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
 
         let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
         let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
+        let elapsed_ms = ctx.stage_elapsed().as_millis().max(0) as u32;
+        let allowance_ms = allowance.as_millis().max(0) as u32;
+        let faulted = adjusted_elapsed >= self.timeout;
+        trace::deadline_check(
+            self.data.group_id(),
+            self.data.cs_id,
+            elapsed_ms,
+            allowance_ms,
+            faulted,
+        );
 
         if adjusted_elapsed >= self.timeout {
-            pr_err!("Tyr queue job {} timed out\n", ctx.counter);
+            let done_seqno = ctx.job.done_seqno().unwrap_or(0);
+            pr_warn!(
+                "queue job timed out: group={} cs={} done_seqno={} elapsed_ms={}\n",
+                self.data.group_id(),
+                self.data.cs_id,
+                done_seqno,
+                elapsed_ms,
+            );
+            trace::group_timedout(self.data.group_id());
             ctx.job
                 .group
                 .with_locked_inner(|inner| inner.mark_timedout());
@@ -1019,7 +1400,12 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    pub(crate) fn new(tdev: &TyrDrmDevice, queue_args: &QueueCreate, vm: Arc<Vm>) -> Result<Self> {
+    pub(crate) fn new(
+        tdev: &TyrDrmDevice,
+        queue_args: &QueueCreate,
+        vm: Arc<Vm>,
+        cs_id: u32,
+    ) -> Result<Self> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let ringbuf = gem::new_kernel_object(
             tdev,
@@ -1038,6 +1424,9 @@ impl Queue {
         let data = Arc::pin_init(
             pin_init!(QueueData {
                 priority: queue_args.priority(),
+                cs_id,
+                group_id: AtomicU64::new(0),
+                group_uid: AtomicU64::new(0),
                 ringbuf,
                 interfaces,
                 doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
