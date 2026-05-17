@@ -23,6 +23,8 @@ use kernel::{
     types::ForeignOwnable, //
 };
 
+use crate::trace;
+
 /// Tracks GPU utilization to inform devfreq scaling decisions.
 pub(crate) struct DevfreqState {
     /// Busy time since the last `get_dev_status` call.
@@ -65,13 +67,19 @@ impl DevfreqState {
     }
 
     pub(crate) fn mark_busy(&mut self) {
+        let prev_busy_ns = self.busy_time.as_nanos() as u64;
+        let prev_idle_ns = self.idle_time.as_nanos() as u64;
         self.update_utilization();
         self.last_busy_state = true;
+        trace::devfreq_mark(true, prev_busy_ns, prev_idle_ns);
     }
 
     pub(crate) fn mark_idle(&mut self) {
+        let prev_busy_ns = self.busy_time.as_nanos() as u64;
+        let prev_idle_ns = self.idle_time.as_nanos() as u64;
         self.update_utilization();
         self.last_busy_state = false;
+        trace::devfreq_mark(false, prev_busy_ns, prev_idle_ns);
     }
 }
 
@@ -102,10 +110,11 @@ unsafe impl devfreq::Callbacks for TyrDevfreqCallbacks {
 
         *freq = recommended_freq;
 
-        driver.tdev.current_frequency.swap(
+        let prev_freq = driver.tdev.current_frequency.swap(
             recommended_freq.as_hz(),
             core::sync::atomic::Ordering::Relaxed,
         );
+        trace::devfreq_target(prev_freq as u64, recommended_freq.as_hz() as u64);
 
         Ok(())
     }
@@ -139,6 +148,12 @@ unsafe impl devfreq::Callbacks for TyrDevfreqCallbacks {
             total_time,
             utilization,
             current_frequency.as_hz() / 1_000_000,
+        );
+
+        trace::devfreq_status(
+            busy_time as u64,
+            total_time as u64,
+            current_frequency.as_hz() as u64,
         );
 
         Ok(devfreq::Status {

@@ -399,6 +399,13 @@ impl<'a> Context<'a> {
         let (external_deps, intra_batch_deps) = self.collect_job_deps(job_idx)?;
         let has_stream = job.has_stream();
 
+        crate::trace::job_status(
+            queue.next_seqno(),
+            group.handle(),
+            queue_index as u32,
+            kernel::c_str!("prepared"),
+        );
+
         let reservation = if has_stream {
             Some(queue.reserve_pending_submit_fence()?)
         } else {
@@ -483,7 +490,14 @@ impl<'a> Context<'a> {
             return Ok(());
         }
 
-        let syncobj = SyncObj::<TyrDrmDriver>::lookup_handle(self.file, handle)?;
+        let syncobj =
+            SyncObj::<TyrDrmDriver>::lookup_handle(self.file, handle).inspect_err(|e| {
+                kernel::pr_warn_once!(
+                    "group_submit: lookup_handle failed for syncobj={} err={}\n",
+                    handle,
+                    e.to_errno(),
+                );
+            })?;
         let signal = if point > 0 {
             PendingSignal::Timeline {
                 syncobj,
@@ -521,8 +535,15 @@ impl<'a> Context<'a> {
                 continue;
             }
 
-            let fence =
-                SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)?.ok_or(EINVAL)?;
+            let fence = SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)?
+                .ok_or_else(|| {
+                    kernel::pr_warn_once!(
+                        "group_submit: wait fence missing for syncobj={} point={}\n",
+                        handle,
+                        point,
+                    );
+                    EINVAL
+                })?;
             external.push(fence, GFP_KERNEL)?;
         }
 

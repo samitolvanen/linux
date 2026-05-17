@@ -9,7 +9,11 @@
 
 use kernel::{c_str, devres::Devres, io::register::Array, io::Io, prelude::*, str::CStr};
 
-use crate::{driver::IoMem, regs::mmu_control::mmu_as_control};
+use crate::{
+    driver::{IoMem, TyrDrmDevice},
+    regs::mmu_control::mmu_as_control,
+    trace,
+};
 
 const EXCEPTION_MAP: &[(u32, &CStr)] = &[
     (0x00, c_str!("OK")),
@@ -83,7 +87,54 @@ fn access_type_name(fault_status: u32) -> &'static str {
     }
 }
 
-pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
+/// Snapshot of the kernel-visible ringbuffer state for both command
+/// streams of the group bound to a faulting AS slot, returned by
+/// [`read_cs_ringbuf_ptrs`].
+struct CsRingbufSnapshot {
+    cs0_insert: u64,
+    cs0_extract: u64,
+    cs1_insert: u64,
+    cs1_extract: u64,
+    /// Eight u64 ringbuffer words around `cs0_extract`, all zero when
+    /// no kernel mapping for the cs0 ringbuf was available. See
+    /// [`crate::sched::queue::Queue::ringbuf_window_around_extract`].
+    ringbuf_words: [u64; 8],
+}
+
+/// Returns the ringbuffer cursors and an EXTRACT-centred ringbuf
+/// snapshot for the group currently bound to `csg_id`, or all zeros
+/// when the slot is not bound or its queues cannot be read.
+fn read_cs_ringbuf_ptrs(tdev: &TyrDrmDevice, csg_id: usize) -> CsRingbufSnapshot {
+    let csg_slot_manager = tdev.csg_slot_manager.lock();
+    let Some(slot_data) = csg_slot_manager.slot_data(csg_id) else {
+        return CsRingbufSnapshot {
+            cs0_insert: 0,
+            cs0_extract: 0,
+            cs1_insert: 0,
+            cs1_extract: 0,
+            ringbuf_words: [0u64; 8],
+        };
+    };
+    let queues = &slot_data.group().queues;
+    let cs0 = queues.first();
+    let (cs0_insert, cs0_extract) = cs0.and_then(|q| q.ringbuf_ptrs().ok()).unwrap_or((0, 0));
+    let (cs1_insert, cs1_extract) = queues
+        .get(1)
+        .and_then(|q| q.ringbuf_ptrs().ok())
+        .unwrap_or((0, 0));
+    let ringbuf_words = cs0
+        .map(|q| q.ringbuf_window_around_extract(cs0_extract))
+        .unwrap_or([0u64; 8]);
+    CsRingbufSnapshot {
+        cs0_insert,
+        cs0_extract,
+        cs1_insert,
+        cs1_extract,
+        ringbuf_words,
+    }
+}
+
+pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDrmDevice) -> Result {
     while status != 0 {
         let as_index = (status | (status >> 16)).trailing_zeros();
         let mask = kernel::bits::bit_u32(as_index);
@@ -109,6 +160,35 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
         let exception_type = fault_status_raw & 0xff;
         let access_type = (fault_status_raw >> 8) & 0x3;
         let source_id = fault_status_raw >> 16;
+
+        let (group_id, csg_id) = tdev.mmu.bound_group_for_as_slot(as_index as usize);
+        let snapshot = if csg_id == u32::MAX {
+            CsRingbufSnapshot {
+                cs0_insert: 0,
+                cs0_extract: 0,
+                cs1_insert: 0,
+                cs1_extract: 0,
+                ringbuf_words: [0u64; 8],
+            }
+        } else {
+            read_cs_ringbuf_ptrs(tdev, csg_id as usize)
+        };
+
+        trace::mmu_fault(
+            as_index,
+            addr,
+            fault_status_raw,
+            exception_type,
+            access_type,
+            source_id,
+            group_id,
+            csg_id,
+            snapshot.cs0_insert,
+            snapshot.cs0_extract,
+            snapshot.cs1_insert,
+            snapshot.cs1_extract,
+            snapshot.ringbuf_words,
+        );
 
         let decoded_status = if fault_status_raw & (1 << 10) != 0 {
             "DECODER FAULT"

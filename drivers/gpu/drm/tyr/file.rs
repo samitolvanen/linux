@@ -20,6 +20,7 @@ use crate::{
     gem, heap,
     regs::{gpu_control, join_u64, read_u64_no_tearing},
     sched::{deps, group},
+    trace,
     vm::{self, VmMapFlags},
 };
 
@@ -245,9 +246,21 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let vm_id = vm.handle();
+        trace::vm_bind_ioctl_entry(
+            vm_id,
+            trace::VmBindIoctlKind::Sync,
+            count as u32,
+            vm.count_inflight_bookkeep_fences(),
+        );
         for i in 0..count {
-            let res = {
-                let op: VmBindOp = reader.read()?;
+            let op: VmBindOp = reader.read()?;
+            trace::mmu_bind_start(vm_id, op.0.va, op.0.size);
+            let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+            let op_kind = ((op.0.flags as i32 & type_mask) >> 28) as u32;
+            trace::vm_bind_op_sync(vm_id, op_kind, op.0.va, op.0.size, 0, 0);
+
+            let res: Result = (|| {
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -285,8 +298,14 @@ impl TyrDrmFileData {
                     _ => Err(ENOTSUPP)?,
                 }
 
-                Ok(0)
+                Ok(())
+            })();
+
+            let errno = match &res {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
             };
+            trace::mmu_bind_done(vm_id, op.0.va, op.0.size, errno);
 
             if let Err(e) = res {
                 vmbind.ops.count = i as u32;
@@ -324,11 +343,62 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let vm_id = vm.handle();
+        trace::vm_bind_ioctl_entry(
+            vm_id,
+            trace::VmBindIoctlKind::Async,
+            count as u32,
+            vm.count_inflight_bookkeep_fences(),
+        );
         for i in 0..count {
+            let op: VmBindOp = reader.read()?;
+            let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+            let op_kind = ((op.0.flags as i32 & type_mask) >> 28) as u32;
             let res: Result = (|| {
-                let op: VmBindOp = reader.read()?;
                 let (job, syncs) = op.capture(file, true)?;
+                let n_waits = syncs.iter().filter(|s| s.is_wait()).count() as u32;
+                let n_signals = syncs.iter().filter(|s| s.is_signal()).count() as u32;
+                trace::vm_bind_op(vm_id, op_kind, op.0.va, op.0.size, n_waits, n_signals);
+                for (syncop_index, sync) in syncs.iter().enumerate() {
+                    let kind = if sync.is_signal() {
+                        trace::VmBindSyncopKind::Signal
+                    } else {
+                        trace::VmBindSyncopKind::Wait
+                    };
+                    trace::vm_bind_syncop(
+                        vm_id,
+                        i as u32,
+                        syncop_index as u32,
+                        kind,
+                        sync.handle.handle(),
+                        sync.handle.timeline_value(),
+                    );
+                }
                 let deps = deps::wait_fences(file, &syncs)?;
+                {
+                    let mut dep_iter = deps.iter();
+                    for (syncop_index, sync) in syncs.iter().enumerate() {
+                        if !sync.is_wait() {
+                            continue;
+                        }
+                        let fence = match dep_iter.next() {
+                            Some(fence) => fence,
+                            None => break,
+                        };
+                        // SAFETY: `fence.raw()` is a valid `struct dma_fence`
+                        // pointer for the lifetime of the borrow.
+                        let (ctx, seqno) =
+                            unsafe { ((*fence.raw()).context, (*fence.raw()).seqno) };
+                        trace::vm_bind_wait_fence(
+                            vm_id,
+                            i as u32,
+                            syncop_index as u32,
+                            ctx,
+                            seqno,
+                            fence.is_signaled(),
+                        );
+                    }
+                }
                 let signals = deps::signal_syncs(file, &syncs)?;
                 let prepared = vm.prepare_bind_job(job, &deps)?;
 
@@ -351,6 +421,11 @@ impl TyrDrmFileData {
             })();
 
             if let Err(e) = res {
+                let va = op.0.va;
+                let size = op.0.size;
+                pr_info!(
+                    "vm_bind_async vm={vm_id:#x} op[{i}] kind={op_kind} va={va:#x} size={size:#x} failed: {e:?}\n"
+                );
                 vmbind.ops.count = i as u32;
                 return Err(e);
             }

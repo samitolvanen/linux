@@ -27,8 +27,10 @@ use crate::{
     driver::IoMem,
     regs::{
         gpu_control::*,
-        join_u64, //
-    }, //
+        join_u64,
+        read_u64_no_tearing, //
+    },
+    trace, //
 };
 
 /// Number of CS work registers the kernel reserves at the top of the
@@ -197,7 +199,7 @@ pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result 
     let io = (*iomem).access(dev)?;
     io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
 
-    poll::read_poll_timeout(
+    let r = poll::read_poll_timeout(
         || {
             let io = (*iomem).access(dev)?;
             Ok(io.read(L2_READY_LO))
@@ -206,7 +208,42 @@ pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result 
         Delta::from_millis(1),
         Delta::from_millis(100),
     )
-    .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."))?;
+    .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."));
+
+    let errno = match &r {
+        Ok(_) => 0,
+        Err(e) => e.to_errno(),
+    };
+    trace::l2_power_on(errno);
+    r?;
+
+    trace_shader_power_state(dev, iomem);
 
     Ok(())
+}
+
+/// Snapshots shader-domain power state for tracing. Used to diagnose
+/// firmware allocation failures that stem from cores not being powered
+/// on.
+///
+/// Read errors are silently swallowed: this helper is purely
+/// observational and must not derail callers on a transient
+/// [`Devres`] failure.
+pub(crate) fn trace_shader_power_state(dev: &Device<Bound>, iomem: &Devres<IoMem>) {
+    let Ok(io) = (*iomem).access(dev) else {
+        return;
+    };
+    let ready = read_u64_no_tearing(
+        || io.read(SHADER_READY_LO).into_raw(),
+        || io.read(SHADER_READY_HI).into_raw(),
+    );
+    let pwrtrans = read_u64_no_tearing(
+        || io.read(SHADER_PWRTRANS_LO).into_raw(),
+        || io.read(SHADER_PWRTRANS_HI).into_raw(),
+    );
+    let pwractive = read_u64_no_tearing(
+        || io.read(SHADER_PWRACTIVE_LO).into_raw(),
+        || io.read(SHADER_PWRACTIVE_HI).into_raw(),
+    );
+    trace::shader_power_state(ready, pwrtrans, pwractive);
 }

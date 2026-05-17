@@ -38,6 +38,7 @@ use crate::{
         JOB_IRQ_RAWSTAT,
         JOB_IRQ_STATUS, //
     },
+    trace,
     wait::{Wait, WaitResult},
 };
 
@@ -145,6 +146,7 @@ impl TyrIrqTrait for JobIrq {
     fn clear_status(&self, dev: &Device<Bound>, status: u32) {
         if let Ok(io) = self.iomem.access(dev) {
             io.write_reg(JOB_IRQ_CLEAR::from_raw(status));
+            trace::job_irq_clear(status);
         }
     }
 
@@ -156,6 +158,8 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
+        trace::fw_irq(status);
+
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
             let _ = tdev.fw.process_global_irq().inspect_err(|err| {
                 pr_err!("Failed to process firmware global IRQ: {:?}\n", err);

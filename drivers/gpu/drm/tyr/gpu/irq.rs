@@ -36,6 +36,7 @@ use crate::{
         gpu_control,
         join_u64, //
     },
+    trace,
     wait::Wait, //
 };
 
@@ -122,6 +123,8 @@ impl TyrIrqTrait for GpuIrq {
     }
 
     fn handle(&self, _tdev: &TyrDrmDevice, status: u32) {
+        trace::gpu_irq(status);
+
         let status_reg = gpu_control::GPU_IRQ_STATUS::from_raw(status);
 
         if status_reg.gpu_fault() || status_reg.gpu_protected_fault() {

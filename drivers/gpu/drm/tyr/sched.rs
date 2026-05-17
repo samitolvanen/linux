@@ -42,9 +42,11 @@ use crate::{
         CSG_EP_REQ,
         CSG_REQ, //
     },
+    gpu,
     gpu::UNPRESERVED_CS_REG_COUNT,
     sched::group::GroupListState,
-    slot::SlotManager, //
+    slot::SlotManager,
+    trace, //
 };
 
 use group::Group;
@@ -96,6 +98,13 @@ pub(crate) struct CsgSlotData {
     pub(in crate::sched) group: Arc<Group>,
     /// CSG firmware priority programmed into `CSG_EP_REQ.priority`.
     pub(in crate::sched) fw_priority: u32,
+}
+
+impl CsgSlotData {
+    /// Returns a reference to the group bound to this CSG slot.
+    pub(crate) fn group(&self) -> &Arc<Group> {
+        &self.group
+    }
 }
 
 /// Per-tick accumulator for CSG slot programming.
@@ -301,16 +310,43 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         }
 
         let mut db_mask = CsDbMask::empty();
+        let group_id = group.handle();
+        let mut cs_req_writes: [Option<(u32, u32)>; group::MAX_CS_PER_GROUP] =
+            [const { None }; group::MAX_CS_PER_GROUP];
         self.fw.with_csg_mut(slot_idx, |csg| {
             csg.program_activate_inputs(&inputs)?;
             for (cs_idx, cs_input) in cs_inputs.iter().enumerate() {
                 let Some(cs_input) = cs_input else { break };
                 let cs = csg.cs_mut(cs_idx).ok_or(EINVAL)?;
-                cs.program_activate_inputs(cs_input)?;
+                let config_raw =
+                    (u32::from(cs_input.priority) & 0xf) | ((cs_input.doorbell_id & 0xff) << 8);
+                trace::fw_cs_activate_inputs(
+                    slot_idx as u32,
+                    cs_idx as u32,
+                    cs_input.ringbuf_base,
+                    cs_input.ringbuf_size,
+                    cs_input.ringbuf_input_va,
+                    cs_input.ringbuf_output_va,
+                    config_raw,
+                );
+                cs_req_writes[cs_idx] = Some(cs.program_activate_inputs(cs_input)?);
                 db_mask.insert(cs_idx);
             }
             Ok(())
         })?;
+        for (cs_idx, write) in cs_req_writes.iter().enumerate() {
+            let Some((new_req, update_mask)) = write else {
+                break;
+            };
+            trace::fw_cs_req(
+                slot_idx as u32,
+                cs_idx as u32,
+                group_id,
+                *new_req,
+                *update_mask,
+                0,
+            );
+        }
 
         // Publish the per-queue doorbell ids and the bound CSG slot
         // index together under the group's `inner` mutex. The two
@@ -336,6 +372,15 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             }
             inner.csg_id = Some(slot_idx);
         });
+        group
+            .vm
+            .as_data
+            .set_bound_group(group.handle(), slot_idx as u32);
+        trace::group_bind(group.handle(), slot_idx as u32);
+        trace::csg_slot_assign(slot_idx as u32, group.handle(), true);
+        for (cs_idx, _) in group.queues.iter().enumerate() {
+            trace::queue_timeout_state(group.handle(), cs_idx as u32, false);
+        }
 
         let state = match group.state() {
             group::State::Suspended => CsgExecutionState::Resume,
@@ -350,7 +395,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
 
     fn evict(
         &mut self,
-        _slot_idx: usize,
+        slot_idx: usize,
         slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
@@ -360,6 +405,11 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // the wait) before this callback runs. This callback only
         // tears the binding down: clear `csg_id` / per-queue
         // `doorbell_id`, release the AS slot.
+        trace::group_unbind(slot_data.group.handle(), slot_idx as u32);
+        trace::csg_slot_assign(slot_idx as u32, slot_data.group.handle(), false);
+        for (cs_idx, _) in slot_data.group.queues.iter().enumerate() {
+            trace::queue_timeout_state(slot_data.group.handle(), cs_idx as u32, true);
+        }
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
@@ -367,6 +417,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             }
             inner.csg_id = None;
         });
+        slot_data.group.vm.as_data.clear_bound_group();
         slot_data.group.vm.deactivate()?;
         Ok(())
     }
@@ -522,6 +573,7 @@ impl Scheduler {
         group.with_locked_inner(|inner| {
             inner.list_state = GroupListState::Idle;
         });
+        trace::group_list(group.handle(), GroupListState::Idle as u32);
 
         self.idle_groups[priority].push_back(list_arc);
         Ok(())
@@ -562,6 +614,11 @@ impl Scheduler {
             return Ok(());
         }
 
+        // SAFETY: `apply_csg_updates` runs from the scheduler workers,
+        // which only execute while the platform device is bound.
+        let dev = unsafe { data.pdev.as_ref().as_bound() };
+        gpu::trace_shader_power_state(dev, &data.iomem);
+
         const CSG_REQ_ACK_TIMEOUT_MS: u32 = 100;
 
         for csg_id in 0..MAX_CSGS {
@@ -575,9 +632,22 @@ impl Scheduler {
             let set_mask = req_mask & !CsgUpdateContext::TOGGLE_BITS;
             let toggle_mask = req_mask & CsgUpdateContext::TOGGLE_BITS;
             let req_value = context.req_value[csg_id] & !CsgUpdateContext::TOGGLE_BITS;
-            data.fw.with_csg_mut(csg_id, |csg| {
+            let group_id = data
+                .csg_slot_manager
+                .lock()
+                .slot_data(csg_id)
+                .map(|s| s.group.handle())
+                .unwrap_or(0);
+            let new_req = data.fw.with_csg_mut(csg_id, |csg| {
                 csg.update_and_toggle_input_req(req_value, set_mask, toggle_mask)
             })?;
+            trace::fw_csg_req(
+                csg_id as u32,
+                group_id,
+                new_req.into_raw(),
+                set_mask.into_raw(),
+                toggle_mask.into_raw(),
+            );
         }
 
         for csg_id in 0..MAX_CSGS {
@@ -645,6 +715,50 @@ impl Scheduler {
         }
 
         if !context.timedout_mask.is_empty() {
+            // `sync_csg_slot_queues_state` is unreachable when STATUS_UPDATE
+            // times out, so snapshot the per-CS status registers directly
+            // here.
+            gpu::trace_shader_power_state(dev, &data.iomem);
+            for csg_id in 0..MAX_CSGS {
+                if !context.timedout_mask.contains(csg_id) {
+                    continue;
+                }
+                if let Ok((ack, state, ep_cur, ep_req, rdep)) = data
+                    .fw
+                    .with_csg_mut(csg_id, |csg| csg.read_output_dump_raw())
+                {
+                    trace::fw_csg_dump_output(csg_id as u32, ack, state, ep_cur, ep_req, rdep);
+                }
+
+                let queue_count = csg_slot_manager
+                    .slot_data(csg_id)
+                    .map(|s| core::cmp::min(s.group.queue_count(), group::MAX_CS_PER_GROUP))
+                    .unwrap_or(0);
+                let _ = data.fw.with_csg_mut(csg_id, |csg| {
+                    for cs_id in 0..queue_count {
+                        let Some(cs) = csg.cs_mut(cs_id) else {
+                            continue;
+                        };
+                        let req = cs.read_input_req_raw()?;
+                        let ack = cs.read_output_ack_raw()?;
+                        let status_wait = cs.read_status_wait_raw()?;
+                        let reason = cs.read_status_blocked_reason()? as u32;
+                        let scoreboards = cs.read_status_scoreboards()?;
+                        let sync_ptr = cs.read_status_wait_sync_pointer_raw()?;
+                        trace::cs_status_snapshot(
+                            csg_id as u32,
+                            cs_id as u32,
+                            req,
+                            ack,
+                            status_wait,
+                            reason,
+                            scoreboards,
+                            sync_ptr,
+                        );
+                    }
+                    Ok::<_, Error>(())
+                });
+            }
             return Err(ETIMEDOUT);
         }
 
@@ -727,6 +841,7 @@ impl Scheduler {
         let old_state = group.state();
 
         let ack = data.fw.with_csg_mut(csg_idx, |csg| csg.read_output_ack())?;
+        trace::fw_csg_status_update(csg_idx as u32, group.handle(), ack.into_raw());
 
         let new_state = match ack.state() {
             Ok(CsgExecutionState::Start) | Ok(CsgExecutionState::Resume) => group::State::Active,
@@ -784,7 +899,7 @@ impl Scheduler {
             }
         }
 
-        group.set_state(new_state);
+        group.set_state(new_state, trace::StateChangeReason::FwAck);
         Ok(())
     }
 
@@ -830,18 +945,54 @@ impl Scheduler {
         let mut sync_waits: [Option<(u64, u64, bool, bool)>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
 
+        let group_handle = group.handle();
+        if let Ok((ack, state, ep_cur, ep_req, rdep)) = data
+            .fw
+            .with_csg_mut(csg_idx, |csg| csg.read_output_dump_raw())
+        {
+            trace::fw_csg_dump_output(csg_idx as u32, ack, state, ep_cur, ep_req, rdep);
+        }
         data.fw.with_csg_mut(csg_idx, |csg| {
             for cs_id in 0..queue_count {
                 let Some(cs) = csg.cs_mut(cs_id) else {
                     continue;
                 };
                 let reason = cs.read_status_blocked_reason()?;
+                trace::fw_cs_status_update(
+                    csg_idx as u32,
+                    cs_id as u32,
+                    group_handle,
+                    reason as u32,
+                );
                 blocked_reasons[cs_id] = Some(reason);
                 scoreboards[cs_id] = cs.read_status_scoreboards()?;
+
+                let cs_req_raw = cs.read_input_req_raw()?;
+                let cs_ack_raw = cs.read_output_ack_raw()?;
+                let status_wait_raw = cs.read_status_wait_raw()?;
+                let sync_pointer = cs.read_status_wait_sync_pointer_raw()?;
+                trace::cs_status_snapshot(
+                    csg_idx as u32,
+                    cs_id as u32,
+                    cs_req_raw,
+                    cs_ack_raw,
+                    status_wait_raw,
+                    reason as u32,
+                    scoreboards[cs_id],
+                    sync_pointer,
+                );
 
                 if reason == CsBlockedReason::SyncWait {
                     let wait = cs.read_status_wait_sync()?;
                     let gt = matches!(wait.condition, CsWaitCondition::Gt);
+                    let sync_size = if wait.sync64 { 8u32 } else { 4u32 };
+                    trace::cs_sync_wait_operand(
+                        group_handle,
+                        cs_id as u32,
+                        wait.sync_ptr,
+                        wait.ref_val,
+                        sync_size,
+                    );
                     sync_waits[cs_id] = Some((wait.sync_ptr, wait.ref_val, wait.sync64, gt));
                 }
             }
@@ -856,6 +1007,15 @@ impl Scheduler {
         for cs_id in 0..queue_count {
             let queue = &group.queues[cs_id];
             if let Some((gpu_va, ref_val, sync64, gt)) = sync_waits[cs_id].take() {
+                trace::syncwait_capture(
+                    group.vm.handle(),
+                    group_handle,
+                    cs_id as u32,
+                    gpu_va,
+                    ref_val,
+                    sync64,
+                    gt,
+                );
                 queue.set_syncwait(gpu_va, ref_val, sync64, gt);
             }
             if blocked_reasons[cs_id] == Some(CsBlockedReason::Unblocked)
@@ -900,6 +1060,14 @@ impl Scheduler {
 
                 inner.set_queue_idle(cs_id, idle);
                 inner.set_queue_blocked(cs_id, blocked);
+                trace::queue_blocked_state_change(
+                    group_handle,
+                    cs_id as u32,
+                    blocked,
+                    trace::QueueBlockedCaller::SyncSlotApply,
+                );
+                trace::queue_idle_state(group_handle, cs_id as u32, idle);
+                trace::queue_state(group_handle, cs_id as u32, blocked);
             }
 
             has_sync_wait
@@ -912,8 +1080,10 @@ impl Scheduler {
         // wait-list link single-owner so a list walker can iterate
         // without racing concurrent inserts.
         if has_sync_wait {
+            let group_handle = group.handle();
             if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group) {
                 self.waiting_groups[priority].push_back(wait_arc);
+                trace::group_wait(group_handle, true);
             }
         }
 
@@ -925,13 +1095,15 @@ impl Scheduler {
         let group_arc: Arc<Group> = list_arc.clone_arc();
         let priority = group_arc.priority as usize;
 
+        let new_state = if is_idle {
+            group::GroupListState::Idle
+        } else {
+            group::GroupListState::Runnable
+        };
         group_arc.with_locked_inner(|inner| {
-            inner.list_state = if is_idle {
-                group::GroupListState::Idle
-            } else {
-                group::GroupListState::Runnable
-            };
+            inner.list_state = new_state;
         });
+        trace::group_list(group_arc.handle(), new_state as u32);
 
         if is_idle {
             self.idle_groups[priority].push_back(list_arc);
@@ -964,6 +1136,10 @@ impl Scheduler {
                         if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
                             self.runnable_groups[priority].push_back(list_arc);
                             inner.list_state = group::GroupListState::Runnable;
+                            trace::group_list(
+                                group.handle(),
+                                group::GroupListState::Runnable as u32,
+                            );
                         }
                     }
                 }
@@ -973,6 +1149,7 @@ impl Scheduler {
                     {
                         self.runnable_groups[priority].push_back(list_arc);
                         inner.list_state = group::GroupListState::Runnable;
+                        trace::group_list(group.handle(), group::GroupListState::Runnable as u32);
                     }
                 }
             }
@@ -1089,7 +1266,19 @@ impl Scheduler {
                     Ok(true) => unblocked |= 1u32 << cs_id,
                     Ok(false) => {}
                     Err(e) => {
-                        pr_err!("eval_syncwait failed: {}\n", e.to_errno());
+                        let gpu_va = candidate
+                            .group
+                            .queues
+                            .get(cs_id as usize)
+                            .map(|q| q.syncwait_snapshot().gpu_va)
+                            .unwrap_or(0);
+                        pr_err!(
+                            "eval_syncwait failed: group={} cs={} gpu_va={:#x}: {:?}\n",
+                            candidate.group.handle(),
+                            cs_id,
+                            gpu_va,
+                            e,
+                        );
                         unblocked |= 1u32 << cs_id;
                     }
                 }
@@ -1152,12 +1341,19 @@ impl Scheduler {
                         continue;
                     };
 
+                    let group_handle = result.group.handle();
                     let (unblocked, move_to_runnable) = result.group.with_locked_inner(|inner| {
                         let mut bits = result.unblocked;
                         while bits != 0 {
                             let cs_id = bits.trailing_zeros() as usize;
                             bits &= !(1u32 << cs_id);
                             inner.set_queue_blocked(cs_id, false);
+                            trace::queue_blocked_state_change(
+                                group_handle,
+                                cs_id as u32,
+                                false,
+                                trace::QueueBlockedCaller::ApplyResults,
+                            );
                         }
 
                         let unblocked = !inner.has_blocked_queues();
@@ -1167,6 +1363,7 @@ impl Scheduler {
 
                     if unblocked {
                         let list_arc = peek.remove();
+                        trace::group_wait(result.group.handle(), false);
                         if move_to_runnable {
                             if prio == Priority::RealTime as usize {
                                 immediate_tick = true;
@@ -1231,6 +1428,7 @@ impl Scheduler {
                 }
                 for cs_id in 0..queue_count {
                     inner.set_queue_fatal(cs_id);
+                    trace::queue_fatal_state(group.handle(), cs_id as u32, true);
                 }
             });
         }

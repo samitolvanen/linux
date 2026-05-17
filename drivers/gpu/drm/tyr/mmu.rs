@@ -141,4 +141,16 @@ impl Mmu {
     pub(crate) fn end_vm_update(&self, vm: &VmAsData) -> Result {
         self.as_manager.lock().end_vm_update(vm)
     }
+
+    /// Reads the `(group_id, csg_id)` back-pointer recorded on the
+    /// VM resident in AS slot `as_slot`. Returns `(u64::MAX, u32::MAX)`
+    /// when no VM is bound there or no group is currently bound to the
+    /// VM's CSG slot.
+    pub(crate) fn bound_group_for_as_slot(&self, as_slot: usize) -> (u64, u32) {
+        let as_manager = self.as_manager.lock();
+        match as_manager.slot_data(as_slot) {
+            Some(vm_as_data) => vm_as_data.bound_group(),
+            None => (u64::MAX, u32::MAX),
+        }
+    }
 }

@@ -52,6 +52,7 @@ use crate::{
         MAX_CSGS,
         MAX_CSG_PRIO, //
     },
+    trace,
 };
 
 const TEARDOWN_ARRAY_SIZE: usize = MAX_CSGS;
@@ -370,6 +371,7 @@ impl SchedulingDecision {
     fn collect_groups(
         list: &mut List<Group>,
         prior_state: GroupListState,
+        priority: Priority,
         groups: &mut [Option<PendingBind>],
     ) -> Result<usize> {
         let mut count = 0;
@@ -380,9 +382,23 @@ impl SchedulingDecision {
                 break;
             }
 
-            let status = group.arc().status();
+            let arc = group.arc();
+            let status = arc.status();
 
             if !status.can_run || status.csg_id.is_some() {
+                let reason = if !status.can_run {
+                    trace::TickDecisionReason::NotRunnable
+                } else {
+                    trace::TickDecisionReason::AlreadyBound
+                };
+                trace::tick_decision_per_group(
+                    arc.handle(),
+                    trace::TickDecision::Skip,
+                    reason,
+                    priority as u8,
+                    0,
+                    arc.bound_tick_counter.load(Ordering::Relaxed),
+                );
                 cursor.move_next();
                 continue;
             }
@@ -398,6 +414,7 @@ impl SchedulingDecision {
             list_arc.with_locked_inner(|inner| {
                 inner.list_state = GroupListState::None;
             });
+            trace::group_list(list_arc.handle(), GroupListState::None as u32);
             groups[count] = Some(PendingBind {
                 list_arc,
                 prior_state,
@@ -574,7 +591,7 @@ impl SchedulingDecision {
         };
 
         // Collect available groups.
-        let count = Self::collect_groups(queue, prior_state, target)?;
+        let count = Self::collect_groups(queue, prior_state, priority, target)?;
         if count > 0 {
             if !is_idle {
                 self.all_idle = false;
@@ -687,9 +704,29 @@ impl<'a> Tick<'a> {
                     continue;
                 };
 
+                trace::sched_evict(
+                    i as u32,
+                    slot_data.group.handle(),
+                    slot_data.group.priority as u8,
+                );
+
+                let can_run = slot_data.group.can_run();
+                trace::tick_decision_per_group(
+                    slot_data.group.handle(),
+                    trace::TickDecision::Evict,
+                    if can_run {
+                        trace::TickDecisionReason::Preempted
+                    } else {
+                        trace::TickDecisionReason::Faulted
+                    },
+                    slot_data.group.priority as u8,
+                    slot_data.fw_priority,
+                    slot_data.group.bound_tick_counter.load(Ordering::Relaxed),
+                );
+
                 context.set_state(
                     i,
-                    if slot_data.group.can_run() {
+                    if can_run {
                         CsgExecutionState::Suspend
                     } else {
                         CsgExecutionState::Terminate
@@ -771,13 +808,29 @@ impl<'a> Tick<'a> {
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
                 match selection {
-                    SelectedGroup::Kept(slot_idx, _sw_prio, cur_fw_prio) => {
-                        if let Some(slot_data) = csg_slot_manager.slot_data(slot_idx) {
-                            slot_data
-                                .group
-                                .bound_tick_counter
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
+                    SelectedGroup::Kept(slot_idx, sw_prio, cur_fw_prio) => {
+                        let (group_id, is_idle, bound_ticks) = csg_slot_manager
+                            .slot_data(slot_idx)
+                            .map(|s| {
+                                let is_idle = s.group.status().is_idle;
+                                let bound_ticks =
+                                    s.group.bound_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                (s.group.handle(), is_idle, bound_ticks)
+                            })
+                            .unwrap_or((0, false, 0));
+                        trace::sched_keep(slot_idx as u32, group_id, sw_prio as u8, fw_prio);
+                        trace::tick_decision_per_group(
+                            group_id,
+                            trace::TickDecision::Keep,
+                            if is_idle {
+                                trace::TickDecisionReason::Idle
+                            } else {
+                                trace::TickDecisionReason::Runnable
+                            },
+                            sw_prio as u8,
+                            fw_prio,
+                            bound_ticks,
+                        );
                         if cur_fw_prio == fw_prio {
                             continue;
                         }
@@ -796,12 +849,13 @@ impl<'a> Tick<'a> {
                             );
                         }
                     }
-                    SelectedGroup::Pending(idx, _sw_prio) => {
+                    SelectedGroup::Pending(idx, sw_prio) => {
                         let Some(pending) = decision.pending_groups[idx].take() else {
                             continue;
                         };
 
                         let group: Arc<Group> = pending.list_arc.clone_arc();
+                        let pending_is_idle = matches!(pending.prior_state, GroupListState::Idle);
                         if let Err(e) = csg_slot_manager.activate(
                             &group.csg_seat,
                             CsgSlotData {
@@ -811,6 +865,14 @@ impl<'a> Tick<'a> {
                             &mut context,
                         ) {
                             pr_err!("activate (pending) failed: {}\n", e.to_errno());
+                            trace::tick_decision_per_group(
+                                group.handle(),
+                                trace::TickDecision::Skip,
+                                trace::TickDecisionReason::ActivateFailed,
+                                sw_prio as u8,
+                                fw_prio,
+                                group.bound_tick_counter.load(Ordering::Relaxed),
+                            );
                             // Activate failed; restore the list_arc to
                             // the list `take_unbound` sourced it from
                             // (recorded in `prior_state`) so the next
@@ -823,6 +885,20 @@ impl<'a> Tick<'a> {
                         }
 
                         group.bound_tick_counter.store(0, Ordering::Relaxed);
+                        let slot_idx = group.with_locked_inner(|inner| inner.csg_id).unwrap_or(0);
+                        trace::sched_bind(slot_idx as u32, group.handle(), sw_prio as u8, fw_prio);
+                        trace::tick_decision_per_group(
+                            group.handle(),
+                            trace::TickDecision::Take,
+                            if pending_is_idle {
+                                trace::TickDecisionReason::Idle
+                            } else {
+                                trace::TickDecisionReason::Runnable
+                            },
+                            sw_prio as u8,
+                            fw_prio,
+                            0,
+                        );
                         drop(pending.list_arc);
                     }
                 }
@@ -847,6 +923,23 @@ impl<'a> Tick<'a> {
         self.sched.last_tick = Instant::<Monotonic>::now();
         self.sched.used_csg_slot_count = decision.num_selected as u32;
         self.sched.might_have_idle_groups = decision.idle_group_count > 0;
+
+        let runnable_remaining: usize = self
+            .sched
+            .runnable_groups
+            .iter()
+            .map(|l| l.iter().count())
+            .sum();
+        trace::tick_decision_summary(
+            self.sched
+                .used_csg_slot_count
+                .saturating_sub(decision.keep_mask.count_ones()),
+            decision.num_pending as u32,
+            decision.keep_mask.count_ones(),
+            runnable_remaining as u32,
+        );
+        let total_slots = data.csg_slot_manager.lock().slot_count() as u32;
+        trace::csg_slots_status(self.sched.used_csg_slot_count, total_slots);
 
         // We only need to time-slice (reschedule periodically) if
         // there is actual contention for the hardware.

@@ -13,7 +13,7 @@
 //! [`SlotOperations`]: crate::slot::SlotOperations
 
 use core::ops::Range;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     device::{
@@ -118,6 +118,18 @@ pub(crate) struct VmAsData {
     /// during the next tick to terminate any groups bound to this VM.
     pub(crate) unhandled_fault: AtomicBool,
 
+    /// Pool handle of the group currently bound to a CSG slot whose VM
+    /// is this one, or [`u64::MAX`] when no such group is bound.
+    /// Updated by the scheduler at CSG slot activate / evict so the
+    /// MMU IRQ handler can resolve the faulting AS slot back to a
+    /// group without taking any scheduler lock.
+    pub(crate) bound_group_id: AtomicU64,
+
+    /// CSG slot index the bound group occupies, or [`u32::MAX`] when
+    /// no group is bound. Paired with [`Self::bound_group_id`] and
+    /// updated at the same sites.
+    pub(crate) bound_csg_id: AtomicU32,
+
     /// Page table.
     ///
     /// Managed by devres to ensure proper cleanup. The page table maps
@@ -153,8 +165,31 @@ impl VmAsData {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             va_bits: va_bits as u8,
             unhandled_fault: AtomicBool::new(false),
+            bound_group_id: AtomicU64::new(u64::MAX),
+            bound_csg_id: AtomicU32::new(u32::MAX),
             page_table <- page_table_init,
         }? Error)
+    }
+
+    /// Records that `group_id` is now bound on `csg_id` for this VM.
+    pub(crate) fn set_bound_group(&self, group_id: u64, csg_id: u32) {
+        self.bound_group_id.store(group_id, Ordering::Relaxed);
+        self.bound_csg_id.store(csg_id, Ordering::Relaxed);
+    }
+
+    /// Clears the bound-group back-pointer set by [`Self::set_bound_group`].
+    pub(crate) fn clear_bound_group(&self) {
+        self.bound_group_id.store(u64::MAX, Ordering::Relaxed);
+        self.bound_csg_id.store(u32::MAX, Ordering::Relaxed);
+    }
+
+    /// Returns the currently bound `(group_id, csg_id)` snapshot, or
+    /// `(u64::MAX, u32::MAX)` if no group is bound.
+    pub(crate) fn bound_group(&self) -> (u64, u32) {
+        (
+            self.bound_group_id.load(Ordering::Relaxed),
+            self.bound_csg_id.load(Ordering::Relaxed),
+        )
     }
 
     /// Computes the hardware configuration for this address space.

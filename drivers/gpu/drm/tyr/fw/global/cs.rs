@@ -74,8 +74,6 @@ struct EnabledCsInterface {
 
 pub(crate) struct CsInterface {
     state: CsInterfaceState,
-    #[expect(dead_code)]
-    cs_idx: usize,
 }
 
 pub(crate) struct HeapOutputState {
@@ -126,10 +124,9 @@ pub(crate) struct CsStatusWait {
 }
 
 impl CsInterface {
-    pub(super) fn new(cs_idx: usize) -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         Ok(Self {
             state: CsInterfaceState::Disabled,
-            cs_idx,
         })
     }
 
@@ -239,10 +236,11 @@ impl CsInterface {
     /// the CSG_IRQ idle event on a sync-wait stall or a drained
     /// ringbuf; the IRQ-driven scheduler relies on both.
     ///
-    /// Returns [`EINVAL`] if the interface is not enabled, or
-    /// [`EOVERFLOW`] if `priority` exceeds `CS_CONFIG.priority`'s
-    /// 4-bit range or `doorbell_id` exceeds the 8-bit field.
-    pub(crate) fn program_activate_inputs(&self, inputs: &CsActivateInputs) -> Result {
+    /// Returns the new `CS_REQ` value and the mask of bits it updates,
+    /// or [`EINVAL`] if the interface is not enabled, or [`EOVERFLOW`]
+    /// if `priority` exceeds `CS_CONFIG.priority`'s 4-bit range or
+    /// `doorbell_id` exceeds the 8-bit field.
+    pub(crate) fn program_activate_inputs(&self, inputs: &CsActivateInputs) -> Result<(u32, u32)> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
             CsInterfaceState::Disabled => return Err(EINVAL),
@@ -280,11 +278,9 @@ impl CsInterface {
             .with_idle_empty(true)
             .into_raw();
         let cur = enabled.cs_input.read(CS_REQ).into_raw();
-        enabled.cs_input.write(
-            CS_REQ,
-            CS_REQ::from_raw((cur & !ACTIVATE_MASK) | activate_val),
-        );
-        Ok(())
+        let new_req = (cur & !ACTIVATE_MASK) | activate_val;
+        enabled.cs_input.write(CS_REQ, CS_REQ::from_raw(new_req));
+        Ok((new_req, ACTIVATE_MASK))
     }
 
     #[allow(dead_code)]
@@ -356,6 +352,50 @@ impl CsInterface {
             .get())
     }
 
+    /// Reads the raw `CS_REQ` input register value.
+    pub(crate) fn read_input_req_raw(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_input.read(CS_REQ).into_raw())
+    }
+
+    /// Reads the raw `CS_ACK` output register value.
+    pub(crate) fn read_output_ack_raw(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_output.read(CS_ACK).into_raw())
+    }
+
+    /// Reads the raw `CS_STATUS_WAIT` output register value.
+    pub(crate) fn read_status_wait_raw(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_output.read(CS_STATUS_WAIT).into_raw())
+    }
+
+    /// Reads the raw `CS_STATUS_WAIT_SYNC_POINTER` output register value.
+    pub(crate) fn read_status_wait_sync_pointer_raw(&self) -> Result<u64> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled
+            .cs_output
+            .read(CS_STATUS_WAIT_SYNC_POINTER)
+            .pointer()
+            .get())
+    }
+
     /// Reads the active `CS_STATUS_WAIT_SYNC_*` snapshot when the CS is
     /// blocked on a `SYNC_WAIT` instruction.
     ///
@@ -402,10 +442,11 @@ impl CsInterface {
     }
 
     /// Logs the contents of `CS_FATAL` / `CS_FATAL_INFO` and returns the
-    /// raw exception-type code from `CS_FATAL.exception_type`.
+    /// decoded `exception_type`, `exception_data` and raw info word so
+    /// callers can also surface them in a tracepoint.
     ///
     /// Returns [`EINVAL`] if the interface is not enabled.
-    pub(crate) fn decode_fatal(&self, csg_id: usize, cs_id: u32) -> Result<u32> {
+    pub(crate) fn decode_fatal(&self, csg_id: usize, cs_id: u32) -> Result<CsExceptionInfo> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
             CsInterfaceState::Disabled => return Err(EINVAL),
@@ -430,14 +471,19 @@ impl CsInterface {
             info,
         );
 
-        Ok(exception_type)
+        Ok(CsExceptionInfo {
+            exception_type,
+            exception_data,
+            info,
+        })
     }
 
     /// Logs the contents of `CS_FAULT` / `CS_FAULT_INFO` and returns the
-    /// raw exception-type code from `CS_FAULT.exception_type`.
+    /// decoded `exception_type`, `exception_data` and raw info word so
+    /// callers can also surface them in a tracepoint.
     ///
     /// Returns [`EINVAL`] if the interface is not enabled.
-    pub(crate) fn decode_fault(&self, csg_id: usize, cs_id: u32) -> Result<u32> {
+    pub(crate) fn decode_fault(&self, csg_id: usize, cs_id: u32) -> Result<CsExceptionInfo> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(enabled) => enabled,
             CsInterfaceState::Disabled => return Err(EINVAL),
@@ -462,6 +508,18 @@ impl CsInterface {
             info,
         );
 
-        Ok(exception_type)
+        Ok(CsExceptionInfo {
+            exception_type,
+            exception_data,
+            info,
+        })
     }
+}
+
+/// Decoded contents of a `CS_FAULT` or `CS_FATAL` ack. Returned by
+/// [`CsInterface::decode_fault`] and [`CsInterface::decode_fatal`].
+pub(crate) struct CsExceptionInfo {
+    pub(crate) exception_type: u32,
+    pub(crate) exception_data: u32,
+    pub(crate) info: u64,
 }

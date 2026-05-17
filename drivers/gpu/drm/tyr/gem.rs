@@ -39,6 +39,7 @@ use crate::{
         TyrDrmDriver, //
     },
     file::TyrDrmFile,
+    trace,
     vm::{
         range,
         Vm,
@@ -163,8 +164,13 @@ impl Drop for MappedBo {
             return;
         };
         let cleanup_wq = self.kernel_bo.cleanup_wq.clone();
+        let range = self.kernel_node.range();
+        let va = range.start;
+        let size = range.end - range.start;
 
+        trace::cleanup_wq_enqueue(trace::CleanupWqKind::MappedBoVmap, va, size);
         let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            trace::cleanup_wq_exec(trace::CleanupWqKind::MappedBoVmap, va, size);
             drop(vmap);
         });
 
@@ -327,7 +333,13 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
         // SAFETY: `ddev` is bound for the duration of the ioctl path that
         // reaches this function.
         let dev = unsafe { ddev.as_ref().as_bound() };
-        bo.sg_table(dev)?;
+        if let Err(e) = bo.sg_table(dev) {
+            dev_err!(
+                ddev.as_ref(),
+                "tyr: eager sg_table fetch failed for WC BO (size={aligned_size}): {e:?}\n"
+            );
+            return Err(e);
+        }
     }
 
     Ok(bo)
@@ -525,7 +537,9 @@ impl Drop for KernelBo {
         let vm = self.vm.clone();
         let bo = self.bo.clone();
 
+        trace::cleanup_wq_enqueue(trace::CleanupWqKind::KernelBo, va, size);
         let res = self.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            trace::cleanup_wq_exec(trace::CleanupWqKind::KernelBo, va, size);
             if let Err(e) = vm.unmap_range(va, size) {
                 pr_err!(
                     "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",

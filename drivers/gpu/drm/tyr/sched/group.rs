@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     alloc::KVec,
+    c_str,
     capability::{
         capable,
         Capability, //
@@ -49,6 +50,7 @@ use crate::{
     gem, heap, pool,
     sched::CsgSlotManager,
     slot::Seat,
+    trace,
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
@@ -65,22 +67,24 @@ pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 
 /// The group's lifecycle state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u32)]
 pub(crate) enum State {
-    Created,
-    Active,
+    Created = 0,
+    Active = 1,
     /// Suspended from a CSG slot; may resume.
-    Suspended,
-    Terminated,
+    Suspended = 2,
+    Terminated = 3,
     /// Unknown state, typically after a firmware error.
-    Unknown,
+    Unknown = 4,
 }
 
 /// Which scheduler list (idle / runnable / none) a group is currently on.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u32)]
 pub(crate) enum GroupListState {
-    None,
-    Idle,
-    Runnable,
+    None = 0,
+    Idle = 1,
+    Runnable = 2,
 }
 
 /// A snapshot of the scheduler-visible state of a [`Group`].
@@ -190,12 +194,16 @@ pub(crate) struct Group {
     #[pin]
     inner: Mutex<GroupInner>,
     pub(crate) tiler_oom: AtomicU32,
-    /// Number of consecutive ticks the group has remained bound to a
-    /// hardware slot. Reset to zero when the group is bound and
-    /// incremented when the group is retained on a slot at the start
-    /// of a tick. Read by the full-tick rule engine to pick the
-    /// longest-resident group for rotation.
+    /// Number of scheduler ticks the group has been kept on its
+    /// current CSG slot. Reset to 0 when the rule engine binds the
+    /// group and incremented when it keeps the binding for another
+    /// tick. Frozen at the value seen when the group is evicted; not
+    /// reset until the next bind. Used by the
+    /// `tyr_tick_decision_per_group` tracepoint as a residency proxy.
     pub(crate) bound_tick_counter: AtomicU32,
+    /// Pool handle used as the stable group identifier in tracepoints.
+    /// Zero until the group is inserted into the pool.
+    handle: AtomicU64,
     /// Tyr DRM device that owns this group.
     ///
     /// # Invariants
@@ -393,8 +401,11 @@ impl Group {
 
         let mut queues = KVec::new();
 
-        for queue_arg in queue_args.iter() {
-            queues.push(Queue::new(ddev, queue_arg, vm.clone())?, GFP_KERNEL)?;
+        for (cs_id, queue_arg) in queue_args.iter().enumerate() {
+            queues.push(
+                Queue::new(ddev, queue_arg, vm.clone(), cs_id as u32)?,
+                GFP_KERNEL,
+            )?;
         }
 
         let queue_count = queues.len();
@@ -414,6 +425,7 @@ impl Group {
                 }),
                 tiler_oom: AtomicU32::new(0),
                 bound_tick_counter: AtomicU32::new(0),
+                handle: AtomicU64::new(0),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
@@ -456,10 +468,14 @@ impl Group {
         self.inner.lock().state
     }
 
-    pub(crate) fn set_state(&self, new_state: State) {
-        self.with_locked_inner(|inner| {
+    pub(crate) fn set_state(&self, new_state: State, reason: trace::StateChangeReason) {
+        let old_state = self.with_locked_inner(|inner| {
+            let old = inner.state;
             inner.state = new_state;
+            old
         });
+        trace::group_update(self.handle(), new_state as u32);
+        trace::group_state_transition(self.handle(), old_state as u32, new_state as u32, reason);
     }
 
     pub(crate) fn can_run(&self) -> bool {
@@ -529,6 +545,16 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    /// Pool handle assigned at insert time. Returns `0` if the group
+    /// has not yet been inserted into the [`Pool`].
+    pub(crate) fn handle(&self) -> u64 {
+        self.handle.load(Ordering::Relaxed)
+    }
+
+    fn set_handle(&self, handle: u64) {
+        self.handle.store(handle, Ordering::Relaxed);
     }
 
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
@@ -695,7 +721,21 @@ impl Group {
         queue_submits: KVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
-        if !self.can_run() {
+        let cant_run = self.with_locked_inner(|inner| {
+            if inner.can_run() {
+                None
+            } else {
+                Some((inner.state, inner.fatal_error.is_some(), inner.csg_id))
+            }
+        });
+        if let Some((state, has_fatal, csg_id)) = cant_run {
+            kernel::pr_warn!(
+                "group_submit: can_run() == false on group {}: state={:?} fatal={} csg_id={:?}\n",
+                self.handle(),
+                state,
+                has_fatal,
+                csg_id,
+            );
             return Err(EINVAL);
         }
 
@@ -743,6 +783,7 @@ impl WorkItem<1> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("term_work"));
         // Use the error captured at eviction time (fatal fault, user
         // destroy, or tick timeout); fall back to ECANCELED if none
         // was recorded.
@@ -792,9 +833,20 @@ impl Pool {
 
         let group = Group::create(ddev, file, groupcreate, queue_args)?;
 
+        // Publish the pool handle on the group and its queues before
+        // any code path that can emit a tracepoint. `add_group` below
+        // takes the scheduler lock and fires `trace::group_list`; the
+        // per-queue trace wrappers in `QueueData` read `group_id`
+        // unsynchronised, so the store has to happen first.
+        let handle = self.0.insert(group.clone())?;
+        group.set_handle(handle as u64);
+        for queue in group.queues.iter() {
+            queue.set_group_id(handle as u64);
+        }
+
         ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
 
-        groupcreate.group_handle = self.0.insert(group)? as u32;
+        groupcreate.group_handle = handle as u32;
         Ok(())
     }
 
@@ -861,6 +913,13 @@ impl Pool {
             groupgetstate.state |=
                 uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
         }
+
+        trace::group_state_query(
+            group.vm.handle(),
+            group.handle(),
+            groupgetstate.state,
+            groupgetstate.fatal_queues,
+        );
 
         Ok(())
     }
