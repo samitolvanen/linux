@@ -1985,6 +1985,22 @@ impl<T: QueueOps> JobQueue<T> {
             idx
         };
 
+        // Emit before the store so `is_signaled()` runs outside the XArray lock.
+        if let XaEntry::Reserved { deps, .. } = &*entry {
+            let dep_count = deps.len() as u32;
+            for (dep_index, dep) in deps.iter().enumerate() {
+                let (fence_ctx, fence_seqno) = trace_dbg::fence_key(dep);
+                trace_dbg::prepare_dep(
+                    xa_index.index() as u32,
+                    dep_index as u32,
+                    dep_count,
+                    fence_ctx,
+                    fence_seqno,
+                    dep.is_signaled(),
+                );
+            }
+        }
+
         // Store the entry and publish the cursor together, so `drain_inbox`
         // never sees an index before its entry is there. Hand the index back
         // when another call already advanced the cursor.

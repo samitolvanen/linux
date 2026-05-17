@@ -700,6 +700,29 @@ TRACE_EVENT(panthor_cs_ring_ptrs,
 		  __entry->extract)
 );
 
+TRACE_EVENT(panthor_cs_activate_ringbuf_state,
+	TP_PROTO(u64 group_id, u32 cs_id, u64 insert, u64 extract,
+		 u64 extract_init),
+	TP_ARGS(group_id, cs_id, insert, extract, extract_init),
+	TP_STRUCT__entry(
+		__field(u64, group_id)
+		__field(u32, cs_id)
+		__field(u64, insert)
+		__field(u64, extract)
+		__field(u64, extract_init)
+	),
+	TP_fast_assign(
+		__entry->group_id = group_id;
+		__entry->cs_id = cs_id;
+		__entry->insert = insert;
+		__entry->extract = extract;
+		__entry->extract_init = extract_init;
+	),
+	TP_printk("group=%llu cs=%u insert=0x%llx extract=0x%llx extract_init=0x%llx",
+		  __entry->group_id, __entry->cs_id, __entry->insert,
+		  __entry->extract, __entry->extract_init)
+);
+
 TRACE_EVENT(panthor_job_submit,
 	TP_PROTO(u64 completion_point, u64 group_id, u32 cs_id,
 		 u32 user_stream_size),
