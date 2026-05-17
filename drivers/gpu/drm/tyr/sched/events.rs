@@ -168,7 +168,7 @@ impl Scheduler {
                 let input_req = cs.read_input_req()?;
                 let output_ack = cs.read_output_ack()?;
 
-                if input_req.tiler_oom() != output_ack.tiler_oom() && output_ack.tiler_oom() {
+                if input_req.tiler_oom() != output_ack.tiler_oom() {
                     group.set_tiler_oom(cs_id);
                     queued_tiler_oom = true;
                 }
