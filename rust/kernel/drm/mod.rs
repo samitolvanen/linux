@@ -15,6 +15,7 @@ pub mod job_queue;
 mod job_queue_trace;
 pub mod printer;
 pub mod syncobj;
+mod syncobj_trace;
 
 pub use self::device::Device;
 pub use self::device::DeviceContext;
