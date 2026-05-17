@@ -150,6 +150,16 @@ impl<'a> GlobalInterfaceRequests<'a> {
         self.input.write(GLB_REQ, GLB_REQ::from_raw(new_val));
         Ok(())
     }
+
+    fn sync_requests_with_ack(&self, reqs_mask: GLB_REQ) -> Result {
+        let mask = reqs_mask.into_raw();
+        let cur_req = self.input.read(GLB_REQ).into_raw();
+        let cur_ack = self.output.read(GLB_ACK).into_raw();
+        let new_val = (cur_req & !mask) | (cur_ack & mask);
+
+        self.input.write(GLB_REQ, GLB_REQ::from_raw(new_val));
+        Ok(())
+    }
 }
 
 /// State of the global interface.
@@ -268,7 +278,7 @@ impl<'drm> GlobalInterface<'drm> {
 
     pub(super) fn process_global_irq(&self) -> Result {
         let mut inner = self.inner.lock();
-        inner.process_global_irq(&self.event_wait)
+        inner.process_global_irq()
     }
 
     pub(crate) fn with_csg_mut<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
@@ -563,7 +573,7 @@ impl InnerGlobalInterface {
         enabled.csg.get_mut(index)
     }
 
-    fn process_global_irq(&mut self, event_wait: &Wait) -> Result {
+    fn process_global_irq(&mut self) -> Result {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
             GlobalInterfaceState::Disabled => return Ok(()),
@@ -576,8 +586,7 @@ impl InnerGlobalInterface {
 
         if pending_idle {
             let idle_mask = GLB_REQ::zeroed().with_idle_event(true);
-            request_field.toggle_requests(idle_mask)?;
-            request_field.wait_acks(idle_mask, event_wait, 1000)?;
+            request_field.sync_requests_with_ack(idle_mask)?;
         }
 
         Ok(())
