@@ -1806,6 +1806,64 @@ impl<T: QueueOps> JobQueue<T> {
         // First, drain inbox so all submitted jobs become visible.
         self.inner.drain_inbox(&mut state);
 
+        // Collect submit fences for entries past the exec stage so we can
+        // wait on them without holding `state`. `check_progress` signals
+        // fences with `state` held, so `state` is a lock acquired in a
+        // dma-fence signalling section; waiting on a fence while holding
+        // such a lock violates the rules in
+        // Documentation/driver-api/dma-buf.rst and forms a lockdep cycle
+        // against dma_fence_map.
+        let mut in_flight: KVec<ARef<PublicDmaFence>> = KVec::new();
+        let mut collect_failed = false;
+        'collect: for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
+            let range = state.stage_ranges[stage_i];
+            let mut cur = range.start;
+            while cur != range.end {
+                let fence = self
+                    .inner
+                    .fifo
+                    .lock()
+                    .get(cur as usize)
+                    .and_then(|e| e.as_live())
+                    .map(|e| e.submit_fence.clone());
+                if let Some(f) = fence {
+                    if in_flight.push(f, GFP_KERNEL).is_err() {
+                        collect_failed = true;
+                        break 'collect;
+                    }
+                }
+                cur = cur.wrapping_add(1);
+            }
+        }
+        drop(state);
+
+        if collect_failed {
+            pr_err!(
+                "JobQueue: out of memory collecting HW fences during teardown; skipping wait\n"
+            );
+        } else {
+            for f in in_flight.iter() {
+                match self.inner.cancel_timeout {
+                    None => {
+                        let _ = f.wait();
+                    }
+                    Some(t) => {
+                        if let Ok(FenceWaitResult::TimedOut) = f.wait_timeout(t) {
+                            pr_warn!(
+                                "JobQueue: timed out waiting for HW fence during teardown\n"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        drop(in_flight);
+
+        let mut state = self.inner.state.lock();
+        // Re-drain in case new jobs were submitted while the lock was
+        // dropped.
+        self.inner.drain_inbox(&mut state);
+
         for stage_i in 0..state.stage_ranges.len() {
             while let Some(idx) = state.stage_ranges[stage_i].pop_front() {
                 let Some(mut xa_entry) =
@@ -1817,26 +1875,6 @@ impl<T: QueueOps> JobQueue<T> {
                 let Some(entry) = xa_entry.as_live_mut() else {
                     continue;
                 };
-                // For entries already handed to hardware, wait for the
-                // firmware fence before cancelling. state.lock() is a mutex
-                // so sleeping here is fine; check_progress() will unblock
-                // once we release it.
-                if stage_i > EXEC_STAGE_IDX {
-                    match self.inner.cancel_timeout {
-                        None => {
-                            let _ = entry.submit_fence.wait();
-                        }
-                        Some(t) => {
-                            if let Ok(FenceWaitResult::TimedOut) =
-                                entry.submit_fence.wait_timeout(t)
-                            {
-                                pr_warn!(
-                                    "JobQueue: timed out waiting for HW fence during teardown\n"
-                                );
-                            }
-                        }
-                    }
-                }
                 drop(entry.deps.active_cb.take());
                 drop(entry.progress_cb.take());
                 drop(entry.stage_wake_cb.take());
