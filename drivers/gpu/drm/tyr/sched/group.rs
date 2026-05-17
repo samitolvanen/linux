@@ -190,6 +190,12 @@ pub(crate) struct Group {
     #[pin]
     inner: Mutex<GroupInner>,
     pub(crate) tiler_oom: AtomicU32,
+    /// Number of consecutive ticks the group has remained bound to a
+    /// hardware slot. Reset to zero when the group is bound and
+    /// incremented when the group is retained on a slot at the start
+    /// of a tick. Read by the full-tick rule engine to pick the
+    /// longest-resident group for rotation.
+    pub(crate) bound_tick_counter: AtomicU32,
     /// Tyr DRM device that owns this group.
     ///
     /// # Invariants
@@ -407,6 +413,7 @@ impl Group {
                     term_scheduled: false,
                 }),
                 tiler_oom: AtomicU32::new(0),
+                bound_tick_counter: AtomicU32::new(0),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,

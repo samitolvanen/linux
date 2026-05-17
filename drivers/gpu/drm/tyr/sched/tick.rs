@@ -12,6 +12,8 @@
 //! [`Scheduler::request_tick`]: crate::sched::Scheduler::request_tick
 //! [`TyrDrmDeviceData::tick_work`]: crate::driver::TyrDrmDeviceData
 
+use core::sync::atomic::Ordering;
+
 use kernel::{
     list::{
         List,
@@ -66,6 +68,12 @@ pub(crate) const TICK_PERIOD_MS: u32 = 10;
 enum Action {
     /// Retain currently bound groups that match the rule criteria.
     Keep,
+    /// Retain currently bound groups that match the rule criteria,
+    /// except for the one with the highest `bound_tick_counter` at
+    /// this priority. Used on full ticks to rotate at most one
+    /// bound group per priority and leave a single slot for a
+    /// subsequent `Take`.
+    KeepExceptOldest,
     /// Bind new, unbound groups from the software queues that match
     /// the rule criteria.
     Take,
@@ -98,12 +106,12 @@ macro_rules! build_scheduling_rules {
         else => [ $( $f_a:ident $f_p:ident ),* $(,)? ]
     ) => {{
         const IDLE: [Rule; 8] = [ $( Rule { action: Action::$i_a, priority: Priority::$i_p, is_idle: true } ),* ];
-        let active = if $cond {
-            [ $( Rule { action: Action::$t_a, priority: Priority::$t_p, is_idle: false } ),* ]
+        let active: &[Rule] = if $cond {
+            &[ $( Rule { action: Action::$t_a, priority: Priority::$t_p, is_idle: false } ),* ]
         } else {
-            [ $( Rule { action: Action::$f_a, priority: Priority::$f_p, is_idle: false } ),* ]
+            &[ $( Rule { action: Action::$f_a, priority: Priority::$f_p, is_idle: false } ),* ]
         };
-        core::iter::Iterator::chain(active.into_iter(), IDLE)
+        core::iter::Iterator::chain(active.iter().copied(), IDLE)
     }};
 }
 
@@ -338,6 +346,14 @@ impl SchedulingDecision {
                 Action::Keep => {
                     decision.keep_bound(&csg_slot_manager, slot_count, rule.priority, rule.is_idle);
                 }
+                Action::KeepExceptOldest => {
+                    decision.keep_bound_except_oldest(
+                        &csg_slot_manager,
+                        slot_count,
+                        rule.priority,
+                        rule.is_idle,
+                    );
+                }
                 Action::Take => {
                     decision.take_unbound(sched, slot_count, rule.priority, rule.is_idle)?;
                 }
@@ -402,6 +418,94 @@ impl SchedulingDecision {
         is_idle: bool,
     ) {
         for i in 0..slot_count {
+            if self.num_selected >= slot_count {
+                break;
+            }
+
+            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                continue;
+            };
+
+            let status = slot_data.group.status();
+            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
+            {
+                continue;
+            }
+
+            if (self.keep_mask & (1u32 << i)) != 0 {
+                continue;
+            }
+
+            self.keep_mask |= 1u32 << i;
+
+            let fw_priority = slot_data.fw_priority;
+            self.selections[self.num_selected] =
+                Some(SelectedGroup::Kept(i, priority, fw_priority));
+
+            self.num_selected += 1;
+
+            if !is_idle {
+                self.all_idle = false;
+            } else {
+                self.idle_group_count += 1;
+            }
+
+            if (self.min_priority as u8) > (priority as u8) {
+                self.min_priority = priority;
+            }
+        }
+    }
+
+    /// Like [`Self::keep_bound`], but excludes the longest-resident
+    /// eligible group at `priority` so a subsequent `Take` can rotate
+    /// it out.
+    ///
+    /// Among bound groups matching `(priority, is_idle)` whose status
+    /// allows them to run, the one with the highest
+    /// `bound_tick_counter` is left unselected; ties resolve to the
+    /// lowest slot index. All other eligible groups are retained
+    /// with the same bookkeeping as `keep_bound`. If there is only
+    /// one eligible group, none are retained here; the trailing
+    /// `Keep` re-adds it when `Take` did not consume the freed slot.
+    fn keep_bound_except_oldest(
+        &mut self,
+        csg_slot_manager: &CsgSlotManager,
+        slot_count: usize,
+        priority: Priority,
+        is_idle: bool,
+    ) {
+        let mut oldest_slot: Option<usize> = None;
+        let mut oldest_counter: u32 = 0;
+        for i in 0..slot_count {
+            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                continue;
+            };
+
+            let status = slot_data.group.status();
+            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
+            {
+                continue;
+            }
+
+            if (self.keep_mask & (1u32 << i)) != 0 {
+                continue;
+            }
+
+            let counter = slot_data.group.bound_tick_counter.load(Ordering::Relaxed);
+            if oldest_slot.is_none() || counter > oldest_counter {
+                oldest_slot = Some(i);
+                oldest_counter = counter;
+            }
+        }
+
+        let Some(skip) = oldest_slot else {
+            return;
+        };
+
+        for i in 0..slot_count {
+            if i == skip {
+                continue;
+            }
             if self.num_selected >= slot_count {
                 break;
             }
@@ -531,16 +635,19 @@ impl<'a> Tick<'a> {
                 Keep Medium,   Take Medium,
                 Keep Low,      Take Low,
             ],
-            // A full tick forces a re-evaluation of currently bound
-            // active groups to ensure fairness. Issuing `Take` before
-            // `Keep` at each priority lets pending groups preempt
-            // currently bound groups of the same priority,
-            // time-slicing the hardware.
+            // A full tick rotates at most one bound group per
+            // priority. `KeepExceptOldest` retains every eligible
+            // bound group except the longest-resident one, freeing a
+            // single slot for the subsequent `Take` to fill from the
+            // runnable queue. The trailing `Keep` re-admits the
+            // excluded group when no runnable group claimed the
+            // slot, so a steady-state set still time-slices fairly
+            // without evicting groups that have nowhere else to go.
             if full_tick => [
-                Take RealTime, Keep RealTime,
-                Take High,     Keep High,
-                Take Medium,   Keep Medium,
-                Take Low,      Keep Low,
+                KeepExceptOldest RealTime, Take RealTime, Keep RealTime,
+                KeepExceptOldest High,     Take High,     Keep High,
+                KeepExceptOldest Medium,   Take Medium,   Keep Medium,
+                KeepExceptOldest Low,      Take Low,      Keep Low,
             ],
             // A normal tick prefers to keep currently bound active
             // groups running to minimise context-switching overhead.
@@ -665,6 +772,12 @@ impl<'a> Tick<'a> {
 
                 match selection {
                     SelectedGroup::Kept(slot_idx, _sw_prio, cur_fw_prio) => {
+                        if let Some(slot_data) = csg_slot_manager.slot_data(slot_idx) {
+                            slot_data
+                                .group
+                                .bound_tick_counter
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         if cur_fw_prio == fw_prio {
                             continue;
                         }
@@ -709,6 +822,7 @@ impl<'a> Tick<'a> {
                             continue;
                         }
 
+                        group.bound_tick_counter.store(0, Ordering::Relaxed);
                         drop(pending.list_arc);
                     }
                 }
