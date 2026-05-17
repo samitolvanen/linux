@@ -42,7 +42,10 @@ use crate::{
         TyrDrmDeviceData, //
     },
     file::TyrDrmFile,
-    fw::global::csg::Priority,
+    fw::{
+        self,
+        global::csg::Priority, //
+    },
     gem, heap, pool,
     sched::CsgSlotManager,
     slot::Seat,
@@ -552,6 +555,28 @@ impl Group {
 
         if syncwait.gpu_va == 0 {
             return Ok(false);
+        }
+
+        // The firmware preserves CS_STATUS_WAIT_SYNC_POINTER across
+        // CS state transitions, so the snapshot captured by an
+        // earlier sync_csg_slot_queues_state pass can outlive the
+        // wait itself. Re-read the firmware's current
+        // CS_STATUS_BLOCKED_REASON to confirm the wait is still live
+        // before resolving the awaited address.
+        let csg_id = self.with_locked_inner(|inner| inner.csg_id);
+        if let Some(csg_id) = csg_id {
+            let still_waiting =
+                self.tdev
+                    .fw
+                    .with_csg_mut(csg_id, |csg| match csg.cs_mut(queue_idx) {
+                        Some(cs) => {
+                            Ok(cs.read_status_blocked_reason()? == fw::CsBlockedReason::SyncWait)
+                        }
+                        None => Ok(true),
+                    });
+            if matches!(still_waiting, Ok(false)) {
+                return Ok(true);
+            }
         }
 
         let syncobjs_va = self._syncobjs.kernel_va().ok_or(EINVAL)?;
