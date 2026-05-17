@@ -194,7 +194,7 @@ impl Scheduler {
                 let input_req = cs.read_input_req()?;
                 let output_ack = cs.read_output_ack()?;
 
-                if input_req.tiler_oom() != output_ack.tiler_oom() && output_ack.tiler_oom() {
+                if input_req.tiler_oom() != output_ack.tiler_oom() {
                     group.tiler_oom.fetch_or(1u32 << cs_id, Ordering::Relaxed);
                     queued_tiler_oom = true;
                 }
