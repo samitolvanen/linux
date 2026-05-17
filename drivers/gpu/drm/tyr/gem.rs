@@ -94,12 +94,14 @@ impl gem::DriverObject for BoData {
 /// Type alias for Tyr GEM buffer objects.
 pub(crate) type Bo = gem::shmem::Object<BoData>;
 
-#[expect(dead_code)]
 /// A mapped kernel-owned buffer object with an always-valid kernel mapping.
 pub(crate) struct MappedBo {
     kernel_bo: KernelBo,
     kernel_node: range::LiveRange,
-    vmap: shmem::VMapOwned<BoData>,
+    /// `Some` for the entire lifetime of the value; taken to `None`
+    /// only by [`Drop`] when shipping the vmap to the cleanup
+    /// workqueue.
+    vmap: Option<shmem::VMapOwned<BoData>>,
 }
 
 impl MappedBo {
@@ -109,14 +111,16 @@ impl MappedBo {
             Self {
                 kernel_bo,
                 kernel_node,
-                vmap,
+                vmap: Some(vmap),
             },
             GFP_KERNEL,
         )?)
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        &self.vmap
+        self.vmap
+            .as_ref()
+            .expect("MappedBo::vmap accessed after drop")
     }
 
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
@@ -145,7 +149,27 @@ impl core::ops::Deref for MappedBo {
     type Target = Bo;
 
     fn deref(&self) -> &Bo {
-        self.vmap.owner()
+        self.vmap().owner()
+    }
+}
+
+impl Drop for MappedBo {
+    fn drop(&mut self) {
+        let Some(vmap) = self.vmap.take() else {
+            return;
+        };
+        let cleanup_wq = self.kernel_bo.cleanup_wq.clone();
+
+        let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            drop(vmap);
+        });
+
+        if let Err(e) = res {
+            pr_err!(
+                "Failed to enqueue MappedBo vmap cleanup: {:?}; dropping inline\n",
+                e,
+            );
+        }
     }
 }
 
