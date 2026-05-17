@@ -71,7 +71,10 @@ pub(in crate::fw) use self::{
             CSG_ACK_IRQ_MASK, CSG_ALLOW_COMPUTE, CSG_ALLOW_FRAGMENT, CSG_ALLOW_OTHER, CSG_DB_REQ,
             CSG_IRQ_ACK, CSG_PROTM_SUSPEND_BUF, CSG_SUSPEND_BUF,
         },
-        output::{CSG_ACK, CSG_DB_ACK, CSG_IRQ_REQ},
+        output::{
+            CSG_ACK, CSG_DB_ACK, CSG_IRQ_REQ, CSG_RESOURCE_DEP, CSG_STATUS_EP_CURRENT,
+            CSG_STATUS_EP_REQ, CSG_STATUS_STATE,
+        },
         CSG_CONTROL_BLOCK_SIZE, CSG_INPUT_BLOCK_SIZE, CSG_OUTPUT_BLOCK_SIZE,
     },
     glb::{

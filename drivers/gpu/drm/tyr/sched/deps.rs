@@ -28,6 +28,7 @@ use crate::{
         read_padding_zero,
         TyrDrmFile, //
     },
+    trace, //
 };
 
 #[repr(transparent)]
@@ -121,19 +122,47 @@ impl PendingSignal {
 
     fn publish(self) {
         match self {
-            Self::Binary { syncobj, fence, .. } => {
+            Self::Binary {
+                syncobj,
+                handle,
+                fence,
+                ..
+            } => {
                 if let Some(fence) = fence {
+                    // SAFETY: `fence.raw()` is a valid `struct dma_fence`
+                    // pointer for the lifetime of the borrow.
+                    let (fence_ctx, fence_seqno) =
+                        unsafe { ((*fence.raw()).context, (*fence.raw()).seqno) };
+                    crate::trace::syncobj_publish(
+                        handle,
+                        0,
+                        fence_ctx,
+                        fence_seqno,
+                        crate::trace::SyncobjPublishKind::Binary,
+                    );
                     syncobj.replace_fence(Some(&fence));
                 }
             }
             Self::Timeline {
                 syncobj,
+                handle,
                 point,
                 chain,
                 fence,
                 ..
             } => {
                 if let Some(fence) = fence {
+                    // SAFETY: `fence.raw()` is a valid `struct dma_fence`
+                    // pointer for the lifetime of the borrow.
+                    let (fence_ctx, fence_seqno) =
+                        unsafe { ((*fence.raw()).context, (*fence.raw()).seqno) };
+                    crate::trace::syncobj_publish(
+                        handle,
+                        point,
+                        fence_ctx,
+                        fence_seqno,
+                        crate::trace::SyncobjPublishKind::Timeline,
+                    );
                     syncobj.add_point(chain, &fence, point);
                 }
             }
@@ -278,6 +307,36 @@ pub(crate) trait BatchOps {
     /// completion. Must not allocate, for the same reason as
     /// `Self::add_dep`.
     fn commit(&self, prepared: Self::Prepared) -> Result<ARef<PublicDmaFence>>;
+
+    /// Emits the implementor's debug tracepoints for one resolved WAIT
+    /// syncop of the job at `job_idx`. The context knows the syncop and
+    /// the fence it resolved to, and the implementor knows the job
+    /// identity the tracepoints record. Called from `Context::commit`
+    /// for intra-batch deps, so it must not allocate. Downstream-only
+    /// debug aid.
+    fn trace_dep(&self, job_idx: usize, prepared: &Self::Prepared, dep: &ResolvedDep<'_>);
+}
+
+/// Names one WAIT syncop of a job.
+#[derive(Clone, Copy)]
+pub(crate) struct DepKey {
+    /// Position of the syncop in its job's syncop list.
+    pub(crate) syncop_index: usize,
+    /// Syncobj handle the WAIT names.
+    pub(crate) handle: u32,
+    /// Timeline point the WAIT names, `0` for a binary syncobj.
+    pub(crate) point: u64,
+}
+
+/// One WAIT syncop and the fence it resolved to, passed to
+/// `BatchOps::trace_dep`. Downstream-only debug aid.
+pub(crate) struct ResolvedDep<'a> {
+    /// The WAIT syncop that produced this dependency.
+    pub(crate) key: DepKey,
+    /// Whether the fence came from the batch or from outside it.
+    pub(crate) source: trace::JobDepSource,
+    /// The fence the WAIT resolved to.
+    pub(crate) fence: &'a PublicDmaFence,
 }
 
 /// Dependencies collected for one job's WAIT syncops.
@@ -285,9 +344,10 @@ struct CollectedDeps {
     /// Fences that already exist when the job is prepared, passed to
     /// `BatchOps::prepare`.
     external: KVec<ARef<PublicDmaFence>>,
-    /// (handle, point) keys of WAITs met by a producer earlier in the
-    /// batch.
-    intra_batch: KVec<(u32, u64)>,
+    /// Keys of the WAITs `external` was resolved from, in the same order.
+    external_keys: KVec<DepKey>,
+    /// Keys of WAITs met by a producer earlier in the batch.
+    intra_batch: KVec<DepKey>,
 }
 
 /// One SIGNAL syncop held by `Context::collect_signal_ops` while the job
@@ -304,11 +364,11 @@ enum JobState<T: BatchOps> {
     Pending(T::Job),
     Prepared {
         prepared: T::Prepared,
-        /// (handle, point) pairs of WAIT syncops resolved at prepare time
-        /// to a SIGNAL produced earlier in the same batch. The producer's
-        /// fence is looked up from `Context::signals` at commit time and
-        /// pushed into `prepared` via `BatchOps::add_dep`.
-        intra_batch_deps: KVec<(u32, u64)>,
+        /// WAIT syncops resolved at prepare time to a SIGNAL produced
+        /// earlier in the same batch. The producer's fence is looked up
+        /// from `Context::signals` at commit time and pushed into
+        /// `prepared` via `BatchOps::add_dep`.
+        intra_batch_deps: KVec<DepKey>,
     },
 }
 
@@ -417,12 +477,25 @@ impl<'a, T: BatchOps> Context<'a, T> {
 
         let CollectedDeps {
             external: external_deps,
+            external_keys,
             intra_batch: intra_batch_deps,
         } = self.collect_job_deps(job_idx)?;
 
         let prepared = self
             .ops
             .prepare(job, &external_deps, intra_batch_deps.len())?;
+
+        for (key, fence) in external_keys.iter().zip(external_deps.iter()) {
+            self.ops.trace_dep(
+                job_idx,
+                &prepared,
+                &ResolvedDep {
+                    key: *key,
+                    source: trace::JobDepSource::External,
+                    fence,
+                },
+            );
+        }
 
         self.jobs[job_idx].state = Some(JobState::Prepared {
             prepared,
@@ -457,12 +530,21 @@ impl<'a, T: BatchOps> Context<'a, T> {
             _ => return Err(EINVAL),
         };
 
-        for (handle, point) in intra_batch_deps.iter() {
+        for key in intra_batch_deps.iter() {
             let fence = self
-                .search_sync_signal(*handle, *point)
+                .search_sync_signal(key.handle, key.point)
                 .and_then(PendingSignal::fence)
                 .ok_or(EINVAL)?
                 .clone();
+            self.ops.trace_dep(
+                job_idx,
+                &prepared,
+                &ResolvedDep {
+                    key: *key,
+                    source: trace::JobDepSource::IntraBatch,
+                    fence: &fence,
+                },
+            );
             self.ops.add_dep(&mut prepared, fence)?;
         }
 
@@ -491,7 +573,14 @@ impl<'a, T: BatchOps> Context<'a, T> {
             return Ok(());
         }
 
-        let syncobj = SyncObj::<TyrDrmDriver>::lookup_handle(self.file, handle)?;
+        let syncobj =
+            SyncObj::<TyrDrmDriver>::lookup_handle(self.file, handle).inspect_err(|e| {
+                kernel::pr_warn_once!(
+                    "group_submit: lookup_handle failed for syncobj={} err={}\n",
+                    handle,
+                    e.to_errno(),
+                );
+            })?;
 
         // A syncobj the batch signals often carries no fence yet, so a
         // failed lookup is expected and leaves the slot empty.
@@ -523,19 +612,25 @@ impl<'a, T: BatchOps> Context<'a, T> {
 
     fn collect_job_deps(&self, job_idx: usize) -> Result<CollectedDeps> {
         let mut external = KVec::new();
+        let mut external_keys = KVec::new();
         let mut intra_batch = KVec::new();
 
-        for syncop in self.jobs[job_idx].syncops.iter() {
+        for (syncop_index, syncop) in self.jobs[job_idx].syncops.iter().enumerate() {
             if !syncop.is_wait() {
                 continue;
             }
 
             let handle = syncop.handle.handle();
             let point = syncop.handle.timeline_value();
+            let key = DepKey {
+                syncop_index,
+                handle,
+                point,
+            };
 
             if let Some(signal) = self.search_sync_signal(handle, point) {
                 if signal.job_idx() < job_idx {
-                    intra_batch.push((handle, point), GFP_KERNEL)?;
+                    intra_batch.push(key, GFP_KERNEL)?;
                     continue;
                 }
 
@@ -543,16 +638,26 @@ impl<'a, T: BatchOps> Context<'a, T> {
                 // fence the syncobj carried at registration can meet
                 // the wait.
                 external.push(signal.fence().ok_or(EINVAL)?.clone(), GFP_KERNEL)?;
+                external_keys.push(key, GFP_KERNEL)?;
                 continue;
             }
 
-            let fence =
-                SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)?.ok_or(EINVAL)?;
+            let fence = SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)?
+                .ok_or_else(|| {
+                    kernel::pr_warn_once!(
+                        "group_submit: wait fence missing for syncobj={} point={}\n",
+                        handle,
+                        point,
+                    );
+                    EINVAL
+                })?;
             external.push(fence, GFP_KERNEL)?;
+            external_keys.push(key, GFP_KERNEL)?;
         }
 
         Ok(CollectedDeps {
             external,
+            external_keys,
             intra_batch,
         })
     }
