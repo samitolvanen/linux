@@ -89,21 +89,31 @@ impl gem::DriverObject for BoData {
 /// Type alias for Tyr GEM buffer objects.
 pub(crate) type Bo = gem::shmem::Object<BoData>;
 
-#[expect(dead_code)]
 /// A mapped kernel-owned buffer object with an always-valid kernel mapping.
 pub(crate) struct MappedBo {
     kernel_bo: KernelBo,
-    vmap: shmem::VMapOwned<BoData>,
+    /// `Some` for the entire lifetime of the value; taken to `None`
+    /// only by `Drop` when shipping the vmap to the cleanup
+    /// workqueue.
+    vmap: Option<shmem::VMapOwned<BoData>>,
 }
 
 impl MappedBo {
     pub(crate) fn new(kernel_bo: KernelBo) -> Result<Arc<Self>> {
         let vmap = kernel_bo.bo.owned_vmap::<0>()?;
-        Ok(Arc::new(Self { kernel_bo, vmap }, GFP_KERNEL)?)
+        Ok(Arc::new(
+            Self {
+                kernel_bo,
+                vmap: Some(vmap),
+            },
+            GFP_KERNEL,
+        )?)
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        &self.vmap
+        self.vmap
+            .as_ref()
+            .expect("MappedBo::vmap accessed after drop")
     }
 
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
@@ -132,7 +142,68 @@ impl core::ops::Deref for MappedBo {
     type Target = Bo;
 
     fn deref(&self) -> &Bo {
-        self.vmap.owner()
+        self.vmap().owner()
+    }
+}
+
+/// Send raw-pointer wrapper used to hand a heap-parked vmap to the
+/// cleanup closure. Single-consumer: only the closure (success) or
+/// this Drop body (failure) calls KBox::from_raw on the inner pointer.
+#[repr(transparent)]
+struct MappedBoCleanupPtr(*mut shmem::VMapOwned<BoData>);
+
+// SAFETY: The pointer is produced by KBox::into_raw and reclaimed by
+// KBox::from_raw exactly once, on whichever side observes it first
+// (closure on success, this Drop body on failure).
+unsafe impl Send for MappedBoCleanupPtr {}
+
+impl Drop for MappedBo {
+    fn drop(&mut self) {
+        let Some(vmap) = self.vmap.take() else {
+            return;
+        };
+        let cleanup_wq = self.kernel_bo.cleanup_wq.clone();
+
+        let slot: KBox<MaybeUninit<shmem::VMapOwned<BoData>>> = match KBox::new_uninit(GFP_NOWAIT) {
+            Ok(s) => s,
+            Err(_) => {
+                pr_warn_once!(
+                    "tyr: MappedBo cleanup-state allocation failed; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
+                );
+                core::mem::forget(vmap);
+                return;
+            }
+        };
+        let boxed = KBox::write(slot, vmap);
+        let ptr = KBox::into_raw(boxed);
+        let send_ptr = MappedBoCleanupPtr(ptr);
+
+        let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            // Force `Send` capture of the wrapper, see `KernelBo`.
+            let send_ptr = send_ptr;
+            // SAFETY: `send_ptr.0` was produced by `KBox::into_raw`
+            // in the matching `MappedBo::drop` body and is only
+            // reclaimed by `KBox::from_raw` once: by this closure on
+            // the success path, or by the `Drop` body on the
+            // enqueue-failure path. The cleanup workqueue runs
+            // outside any dma-fence signalling section, so taking
+            // `dma_resv_lock` from the vmap destructor is safe here.
+            drop(unsafe { KBox::from_raw(send_ptr.0) });
+        });
+
+        if let Err(e) = res {
+            pr_warn_once!(
+                "tyr: MappedBo cleanup_wq enqueue failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
+            );
+            // SAFETY: `try_spawn` returned `Err`, so the closure was
+            // dropped without observing `ptr`; ownership remains
+            // here. Leak the box: dropping it would invoke the vmap
+            // destructor and take `dma_resv_lock` from the
+            // signalling section that prompted the deferral.
+            let boxed = unsafe { KBox::from_raw(ptr) };
+            core::mem::forget(KBox::into_inner(boxed));
+            pr_err!("Failed to enqueue MappedBo vmap cleanup: {:?}\n", e);
+        }
     }
 }
 
