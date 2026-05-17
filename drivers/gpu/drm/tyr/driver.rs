@@ -408,12 +408,23 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
     /// The submit-fence drain runs outside the scheduler mutex
     /// because fence signalling cannot nest inside a wide driver
-    /// lock.
+    /// lock. The wait-list re-evaluation is split into a snapshot
+    /// phase under the mutex, an evaluation phase without it (so
+    /// `gpuvm_unique` and `dma_resv_lock` are taken outside the
+    /// scheduler mutex), and an apply phase that re-validates the
+    /// snapshot against the live wait list before promoting groups.
     fn run(this: Self::Pointer) {
         let tdev = &*this;
         Scheduler::drain_resident_queue_completions(tdev);
+
+        let snapshot = tdev
+            .with_locked_scheduler(|sched| Ok(sched.collect_syncwait_candidates()))
+            .unwrap_or_default();
+
+        let results = Scheduler::evaluate_syncwait_candidates(snapshot);
+
         let immediate_tick = tdev
-            .with_locked_scheduler(|sched| Ok(sched.sync_upd_step()))
+            .with_locked_scheduler(|sched| Ok(sched.apply_syncwait_results(results)))
             .unwrap_or(false);
 
         if immediate_tick {

@@ -375,16 +375,33 @@ impl crate::slot::SlotOperations for CsgSlotOps {
 /// Type alias for the SlotManager parameterised for CSG slots.
 pub(crate) type CsgSlotManager = SlotManager<CsgSlotOps, MAX_CSGS>;
 
+/// One wait-list entry captured by [`Scheduler::collect_syncwait_candidates`].
+pub(crate) struct SyncwaitCandidate {
+    group: Arc<Group>,
+    prio: usize,
+    blocked: u32,
+}
+
+/// Per-group result of [`Scheduler::evaluate_syncwait_candidates`].
+pub(crate) struct SyncwaitResult {
+    group: Arc<Group>,
+    prio: usize,
+    unblocked: u32,
+}
+
 /// Minimal scheduler shell.
 ///
 /// # Lock order
 ///
-/// The scheduler mutex sits above `gpuvm_unique` and `dma_resv_lock`.
-/// [`Self::sync_upd_step`] reaches [`gem::MappedUserBo::new`] (via
-/// [`Group::eval_syncwait`]), which takes `gpuvm_unique` and
-/// `dma_resv_lock` while the scheduler mutex is held. Any new path
-/// that takes the scheduler mutex from inside a `gpuvm_unique` or
-/// `dma_resv_lock` critical section would deadlock.
+/// The scheduler mutex is the wide bottom-half lock and may not be
+/// held across paths that take `gpuvm_unique` or `dma_resv_lock`.
+/// [`Group::eval_syncwait`] reaches [`gem::MappedUserBo::new`] and
+/// must therefore run outside the scheduler mutex; the sync_upd
+/// path snapshots the wait list, evaluates without the mutex held,
+/// and re-acquires it to apply the results (see
+/// [`Self::collect_syncwait_candidates`],
+/// [`Self::evaluate_syncwait_candidates`], and
+/// [`Self::apply_syncwait_results`]).
 ///
 /// [`Group::eval_syncwait`]: crate::sched::group::Group::eval_syncwait
 /// [`gem::MappedUserBo::new`]: crate::gem::MappedUserBo::new
@@ -1003,25 +1020,116 @@ impl Scheduler {
         }
     }
 
-    /// Walks `waiting_groups` once, re-evaluating each blocked queue's
-    /// captured `SyncWait` and moving newly unblocked groups onto
-    /// `runnable_groups`.
+    /// Snapshots the wait list under the scheduler mutex.
     ///
-    /// The companion submit-fence drain runs from the `sync_upd`
-    /// worker before the scheduler lock is taken (see
-    /// [`Self::drain_resident_queue_completions`]), so this routine
-    /// itself does no fence signalling and can run with the scheduler
-    /// mutex held.
+    /// Walks `waiting_groups` and records `(Arc<Group>, prio,
+    /// blocked_bitmap)` for every group with at least one blocked
+    /// queue. Allocates with `GFP_NOWAIT` so the caller can hold the
+    /// scheduler mutex without recording an `fs_reclaim` edge against
+    /// it; allocation failure aborts the walk and the next sync_upd
+    /// or periodic tick will revisit.
+    ///
+    /// Pair with [`evaluate_syncwait_candidates`] and
+    /// [`apply_syncwait_results`].
+    ///
+    /// [`evaluate_syncwait_candidates`]: Self::evaluate_syncwait_candidates
+    /// [`apply_syncwait_results`]: Self::apply_syncwait_results
+    pub(crate) fn collect_syncwait_candidates(&mut self) -> KVec<SyncwaitCandidate> {
+        let mut snapshot = KVec::new();
+
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            let mut cursor = self.waiting_groups[prio].cursor_front();
+            while let Some(peek) = cursor.peek_next() {
+                let group: Arc<Group> = peek.arc().into();
+                let blocked = group.with_locked_inner(|inner| inner.blocked_queues());
+                if snapshot
+                    .push(
+                        SyncwaitCandidate {
+                            group,
+                            prio,
+                            blocked,
+                        },
+                        GFP_NOWAIT,
+                    )
+                    .is_err()
+                {
+                    pr_err!("sync_upd: out of memory snapshotting wait list\n");
+                    return snapshot;
+                }
+                cursor.move_next();
+            }
+        }
+
+        snapshot
+    }
+
+    /// Evaluates each candidate's blocked queues without holding the
+    /// scheduler mutex.
+    ///
+    /// [`Group::eval_syncwait`] takes the per-VM gpuvm mutex and may
+    /// `GFP_KERNEL`-vmap a foreign BO, both of which would close a
+    /// lockdep cycle through `dma_fence_map` if the scheduler mutex
+    /// were held. Read errors are logged and treated as "unblock and
+    /// let the next tick surface any further failure", matching the
+    /// pre-split behaviour. Allocation failure on the results vector
+    /// drops the remaining candidates; the periodic tick will
+    /// revisit.
+    pub(crate) fn evaluate_syncwait_candidates(
+        snapshot: KVec<SyncwaitCandidate>,
+    ) -> KVec<SyncwaitResult> {
+        let mut results = KVec::new();
+
+        for candidate in snapshot {
+            let mut unblocked: u32 = 0;
+            let mut tested = candidate.blocked;
+            while tested != 0 {
+                let cs_id = tested.trailing_zeros();
+                tested &= !(1u32 << cs_id);
+                match candidate.group.eval_syncwait(cs_id as usize) {
+                    Ok(true) => unblocked |= 1u32 << cs_id,
+                    Ok(false) => {}
+                    Err(e) => {
+                        pr_err!("eval_syncwait failed: {}\n", e.to_errno());
+                        unblocked |= 1u32 << cs_id;
+                    }
+                }
+            }
+
+            if results
+                .push(
+                    SyncwaitResult {
+                        group: candidate.group,
+                        prio: candidate.prio,
+                        unblocked,
+                    },
+                    GFP_KERNEL,
+                )
+                .is_err()
+            {
+                pr_err!("sync_upd: out of memory recording results\n");
+                return results;
+            }
+        }
+
+        results
+    }
+
+    /// Applies the results from [`evaluate_syncwait_candidates`]
+    /// under the scheduler mutex.
+    ///
+    /// Walks `waiting_groups` per priority once and, for each peeked
+    /// group that has a matching result, clears the newly unblocked
+    /// queue bits, then removes the group from the wait list and
+    /// marks it runnable if it has no other blocked queues and is
+    /// not currently bound to a CSG slot. Re-validation against the
+    /// live wait list handles groups that another path (e.g.
+    /// destroy) removed between the snapshot and apply phases.
     ///
     /// Returns `true` if an unbound RealTime-priority group was
     /// promoted to `runnable_groups`, in which case the caller fires
     /// an immediate tick so the rule engine binds it without waiting
     /// for the periodic tick.
-    ///
-    /// May allocate inside `eval_syncwait`'s foreign-BO fast-miss
-    /// path, but that runs on `system_unbound()` (the `sync_upd`
-    /// worker) and is therefore permitted.
-    pub(crate) fn sync_upd_step(&mut self) -> bool {
+    pub(crate) fn apply_syncwait_results(&mut self, results: KVec<SyncwaitResult>) -> bool {
         let mut immediate_tick = false;
 
         for prio in 0..GROUP_PRIORITY_COUNT {
@@ -1034,36 +1142,22 @@ impl Scheduler {
             {
                 let mut cursor = self.waiting_groups[prio].cursor_front();
                 while let Some(peek) = cursor.peek_next() {
-                    let group: Arc<Group> = peek.arc().into();
+                    let group_ptr: *const Group = &*peek.arc();
+                    let result = results
+                        .iter()
+                        .find(|r| r.prio == prio && core::ptr::eq(&*r.group, group_ptr));
 
-                    let blocked = group.with_locked_inner(|inner| inner.blocked_queues());
+                    let Some(result) = result else {
+                        cursor.move_next();
+                        continue;
+                    };
 
-                    let mut unblocked: u32 = 0;
-                    let mut tested = blocked;
-                    while tested != 0 {
-                        let cs_id = tested.trailing_zeros();
-                        tested &= !(1u32 << cs_id);
-                        match group.eval_syncwait(cs_id as usize) {
-                            Ok(true) => unblocked |= 1u32 << cs_id,
-                            Ok(false) => {}
-                            // Treat read errors as "unblock and let
-                            // the next tick surface any further
-                            // failure".
-                            Err(e) => {
-                                pr_err!("eval_syncwait failed: {}\n", e.to_errno());
-                                unblocked |= 1u32 << cs_id;
-                            }
-                        }
-                    }
-
-                    let (unblocked, move_to_runnable) = group.with_locked_inner(|inner| {
-                        if unblocked != 0 {
-                            let mut bits = unblocked;
-                            while bits != 0 {
-                                let cs_id = bits.trailing_zeros() as usize;
-                                bits &= !(1u32 << cs_id);
-                                inner.set_queue_blocked(cs_id, false);
-                            }
+                    let (unblocked, move_to_runnable) = result.group.with_locked_inner(|inner| {
+                        let mut bits = result.unblocked;
+                        while bits != 0 {
+                            let cs_id = bits.trailing_zeros() as usize;
+                            bits &= !(1u32 << cs_id);
+                            inner.set_queue_blocked(cs_id, false);
                         }
 
                         let unblocked = !inner.has_blocked_queues();
