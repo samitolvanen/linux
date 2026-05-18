@@ -707,6 +707,11 @@ pub(crate) struct Vm {
     /// Kernel VA reservations that must live as long as the VM.
     #[pin]
     kernel_reservations: Mutex<KVec<range::LiveRange>>,
+    /// Dummy GEM object that anchors the VM's `dma_resv`.
+    ///
+    /// Every kernel-owned BO in this VM aliases this `dma_resv`, so a
+    /// fence on one blocks operations on the others.
+    root_gem: ARef<Bo>,
 }
 
 impl Vm {
@@ -728,7 +733,7 @@ impl Vm {
 
         let reserve_range = 0..0u64;
 
-        // dummy_obj is used to initialize the GPUVM tree.
+        // Initializes the GPUVM tree and is kept as the VM's root_gem.
         let dummy_obj = gem::new_dummy_object(ddev, coherent).inspect_err(|e| {
             pr_err!("Failed to create dummy GEM object: {:?}\n", e);
         })?;
@@ -778,6 +783,7 @@ impl Vm {
                 va_range: total_range,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
+                root_gem: dummy_obj,
             }),
             GFP_KERNEL,
         )?;
@@ -863,6 +869,11 @@ impl Vm {
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
         self.kernel_va.allocate(size, GFP_KERNEL)
+    }
+
+    /// Returns the dummy GEM object whose `dma_resv` anchors this VM.
+    pub(crate) fn root_gem(&self) -> &Bo {
+        &self.root_gem
     }
 
     pub(crate) fn with_prepared_vm<R>(
