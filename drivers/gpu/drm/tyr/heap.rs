@@ -289,8 +289,24 @@ impl Pool {
             .start;
 
         let index = self.free_index.fetch_add(1, Ordering::Relaxed);
-        let context_gpu_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start
-            + index as u64 * u64::from(tdev.gpu_info.heap_context_stride());
+        let stride = tdev.gpu_info.heap_context_stride() as usize;
+        let offset = index.checked_mul(stride).ok_or(EINVAL)?;
+        let end = offset.checked_add(stride).ok_or(EINVAL)?;
+        let vmap = self.gpu_contexts.vmap();
+        if end > vmap.owner().size() {
+            return Err(EINVAL);
+        }
+        // SAFETY: `offset..offset + stride` is within the mapping
+        // (`end <= vmap.owner().size()` checked above). `free_index` is
+        // incremented once per slot, so no other concurrent path aliases
+        // this range. The vmap outlives this write: `self.gpu_contexts`
+        // holds the `Arc<MappedBo>`.
+        let slot = unsafe {
+            core::slice::from_raw_parts_mut((vmap.addr() as *mut u8).add(offset), stride)
+        };
+        slot.fill(0);
+
+        let context_gpu_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start + offset as u64;
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
