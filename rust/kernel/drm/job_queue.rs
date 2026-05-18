@@ -1801,20 +1801,39 @@ impl<T: QueueOps> JobQueue<T> {
         // handed to hardware and need their fences waited on before cancel.
         const EXEC_STAGE_IDX: usize = 1;
 
+        // Compute an upper bound on the number of in-flight fences while
+        // briefly holding `state`, then drop the lock before allocating.
+        // `state` is also acquired by `check_progress` inside a dma-fence
+        // signalling section, so any allocation while holding it would
+        // introduce an `fs_reclaim -> JobQueue::state` edge that closes a
+        // lockdep cycle against dma_fence_map. See
+        // Documentation/driver-api/dma-buf.rst.
         let mut state = self.inner.state.lock();
+        self.inner.drain_inbox(&mut state);
+        let mut bound: usize = 0;
+        for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
+            let range = state.stage_ranges[stage_i];
+            bound = bound.saturating_add(range.end.wrapping_sub(range.start) as usize);
+        }
+        drop(state);
 
-        // First, drain inbox so all submitted jobs become visible.
+        // Pre-allocate outside the lock. On OOM, fall through to the same
+        // best-effort path as before: skip the wait but still drain.
+        let (mut in_flight, mut collect_failed): (KVec<ARef<PublicDmaFence>>, bool) =
+            match KVec::with_capacity(bound, GFP_KERNEL) {
+                Ok(v) => (v, false),
+                Err(_) => (KVec::new(), true),
+            };
+
+        let mut state = self.inner.state.lock();
+        // Re-drain in case new jobs landed between releasing and reacquiring.
         self.inner.drain_inbox(&mut state);
 
-        // Collect submit fences for entries past the exec stage so we can
-        // wait on them without holding `state`. `check_progress` signals
-        // fences with `state` held, so `state` is a lock acquired in a
-        // dma-fence signalling section; waiting on a fence while holding
-        // such a lock violates the rules in
-        // Documentation/driver-api/dma-buf.rst and forms a lockdep cycle
-        // against dma_fence_map.
-        let mut in_flight: KVec<ARef<PublicDmaFence>> = KVec::new();
-        let mut collect_failed = false;
+        // Collect submit fences for entries past the exec stage. Capacity is
+        // already reserved; `push_within_capacity` never reallocates, so this
+        // loop performs no allocation while `state` is held. If new entries
+        // appeared beyond our reserved bound, treat it as a collection
+        // failure and proceed to the teardown drain without waiting.
         'collect: for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
             let range = state.stage_ranges[stage_i];
             let mut cur = range.start;
@@ -1827,7 +1846,7 @@ impl<T: QueueOps> JobQueue<T> {
                     .and_then(|e| e.as_live())
                     .map(|e| e.submit_fence.clone());
                 if let Some(f) = fence {
-                    if in_flight.push(f, GFP_KERNEL).is_err() {
+                    if in_flight.push_within_capacity(f).is_err() {
                         collect_failed = true;
                         break 'collect;
                     }
