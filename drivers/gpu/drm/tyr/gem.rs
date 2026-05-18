@@ -396,6 +396,9 @@ pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> 
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
+///
+/// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
+/// VM BO blocks operations on the others.
 pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
     dev: &TyrDrmDevice<Ctx>,
     vm: &Arc<Vm>,
@@ -450,7 +453,11 @@ pub(crate) struct KernelBo {
     /// that may be dropping this `KernelBo`.
     pub(crate) bo: ManuallyDrop<ARef<Bo>>,
     /// The GPU VM this buffer is mapped into.
-    vm: Arc<Vm>,
+    ///
+    /// `ManuallyDrop` so the final `Arc<Vm>` release runs from the
+    /// deferred cleanup rather than inline on the dma-fence signalling
+    /// path.
+    vm: ManuallyDrop<Arc<Vm>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`, for BOs whose
@@ -492,7 +499,7 @@ impl KernelBo {
             size as usize,
             shmem::ObjectConfig {
                 map_wc: should_map_wc(coherent),
-                parent_resv_obj: None,
+                parent_resv_obj: Some(vm.root_gem()),
             },
             BoCreateArgs { flags: 0 },
         )?;
@@ -501,7 +508,7 @@ impl KernelBo {
 
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
-            vm: vm.into(),
+            vm: ManuallyDrop::new(vm.into()),
             va_range: va..(va + size),
             kernel_node: None,
             cleanup_wq,
@@ -571,7 +578,10 @@ impl Drop for KernelBo {
     fn drop(&mut self) {
         let va = self.va_range.start;
         let size = self.va_range.end - self.va_range.start;
-        let vm = self.vm.clone();
+        // SAFETY: `drop` runs once, this is the only take of `self.vm`,
+        // and the field is not read afterwards. Moving the reference out
+        // keeps the final `Arc<Vm>` release off the inline drop path.
+        let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
         // SAFETY: `Drop::drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `self.bo`; the field is never read
         // again afterwards. Moving out the single owning reference here
