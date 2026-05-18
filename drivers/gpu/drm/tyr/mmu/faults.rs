@@ -84,8 +84,6 @@ fn access_type_name(fault_status: u32) -> &'static str {
 }
 
 pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
-    let io = iomem.try_access().ok_or(EINVAL)?;
-
     while status != 0 {
         let as_index = (status | (status >> 16)).trailing_zeros();
         let mask = kernel::bits::bit_u32(as_index);
@@ -97,9 +95,15 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
         let fault_addr_hi_reg =
             mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
 
-        let fault_status_raw = io.read(fault_status_reg).into_raw();
-        let addr_lo = io.read(fault_addr_lo_reg).into_raw();
-        let addr_hi = io.read(fault_addr_hi_reg).into_raw();
+        // Drop the IO guard before doing anything that may sleep.
+        let (fault_status_raw, addr_lo, addr_hi) = {
+            let io = iomem.try_access().ok_or(EINVAL)?;
+            (
+                io.read(fault_status_reg).into_raw(),
+                io.read(fault_addr_lo_reg).into_raw(),
+                io.read(fault_addr_hi_reg).into_raw(),
+            )
+        };
         let addr = u64::from(addr_lo) | (u64::from(addr_hi) << 32);
 
         let exception_type = fault_status_raw & 0xff;
