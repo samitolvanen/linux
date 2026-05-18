@@ -26,6 +26,7 @@ use crate::{
 const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
 
+#[repr(C)]
 pub(crate) struct ChunkHeader {
     // Written to GPU-visible memory through `write`; never read back.
     #[allow(dead_code)]
