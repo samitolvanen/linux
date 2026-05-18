@@ -84,13 +84,20 @@ pub struct ObjectConfig<'a, T: DriverObject> {
 #[repr(C)]
 #[pin_data]
 pub struct Object<T: DriverObject> {
-    /// Devres object for unmapping any SGTable on driver-unbind.
+    /// Embedded `drm_gem_shmem_object`.
     ///
-    /// This is protected by the object's dma_resv lock. It needs to be before `obj` to ensure that
-    /// it is destroyed before `obj` on `Drop`.
-    sgt_res: UnsafeCell<Option<Devres<SGTableMap<T>>>>,
+    /// Must remain the first field so the allocation address coincides with the embedded
+    /// `drm_gem_shmem_object`. The DRM shmem helper's `__drm_gem_shmem_create()` error path calls
+    /// `kfree()` on the returned `drm_gem_object` pointer, which is only sound when it points at
+    /// the start of the allocation.
     #[pin]
     obj: Opaque<bindings::drm_gem_shmem_object>,
+    /// Devres object for unmapping any SGTable on driver-unbind.
+    ///
+    /// This is protected by the object's dma_resv lock. `Opaque<drm_gem_shmem_object>` has no
+    /// `Drop`, so declaring `obj` first does not affect the SGTable teardown order: the
+    /// underlying memory remains valid until the whole [`Object`] allocation is freed.
+    sgt_res: UnsafeCell<Option<Devres<SGTableMap<T>>>>,
     /// Parent object that owns this object's DMA reservation object.
     parent_resv_obj: Option<ARef<Object<T>>>,
     #[pin]
@@ -182,6 +189,49 @@ impl<T: DriverObject> Object<T> {
     pub fn dev(&self) -> &Device<T::Driver> {
         // SAFETY: `dev` will have been initialized in `Self::new()` by `drm_gem_shmem_init()`.
         unsafe { Device::from_raw((*self.as_raw()).dev) }
+    }
+
+    /// Allocates the full [`Object<T>`] wrapper and zero-initialises the embedded shmem object;
+    /// the helper's `__drm_gem_shmem_init` fills it in after we return.
+    extern "C" fn gem_create_object_callback(
+        raw_dev: *mut bindings::drm_device,
+        size: usize,
+    ) -> *mut bindings::drm_gem_object {
+        const_assert!(
+            core::mem::offset_of!(Self, obj) == 0,
+            "Object<T>::obj must be at offset 0 so drm_gem_shmem_helper's kfree(obj) error path \
+             frees the wrapper allocation, not the middle of it"
+        );
+
+        // SAFETY: The DRM shmem helper only invokes this callback for a registered DRM device of
+        // type `T::Driver`, which is `Self`'s driver per the `AllocImpl` impl below.
+        let dev: &Device<T::Driver> = unsafe { Device::from_raw(raw_dev) };
+
+        let new: Pin<KBox<Self>> = match KBox::try_pin_init(
+            try_pin_init!(Self {
+                obj <- Opaque::init_zeroed(),
+                parent_resv_obj: None,
+                sgt_res: UnsafeCell::new(None),
+                inner <- T::create_imported(dev, size),
+            }),
+            GFP_KERNEL,
+        ) {
+            Ok(new) => new,
+            Err(e) => return e.to_ptr(),
+        };
+
+        // SAFETY: `new.as_raw()` is guaranteed to be valid by the initialization above.
+        unsafe { (*new.as_raw()).funcs = &Self::VTABLE };
+
+        // SAFETY: We never move out of `self`; ownership of the allocation is transferred to the
+        // C side, which will run `__drm_gem_shmem_init()` next and later free us via
+        // `free_callback` (or `kfree()` on the `__drm_gem_shmem_init()` error path, matching the
+        // C kzalloc fallback contract).
+        let new = KBox::into_raw(unsafe { Pin::into_inner_unchecked(new) });
+
+        // SAFETY: `new` was just produced by `KBox::into_raw` and so is a valid pointer to an
+        // initialized `Self`; `obj.base` is the embedded `drm_gem_object` the caller expects.
+        unsafe { &raw mut (*(*new).obj.get()).base }
     }
 
     extern "C" fn free_callback(obj: *mut bindings::drm_gem_object) {
@@ -426,7 +476,7 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
     type Driver = T::Driver;
 
     const ALLOC_OPS: driver::AllocOps = driver::AllocOps {
-        gem_create_object: None,
+        gem_create_object: Some(Self::gem_create_object_callback),
         prime_handle_to_fd: None,
         prime_fd_to_handle: None,
         gem_prime_import: None,
@@ -702,6 +752,13 @@ mod tests {
             _dev: &drm::Device<KunitDriver, Ctx>,
             _size: usize,
             _args: Self::Args,
+        ) -> impl PinInit<Self, Error> {
+            try_pin_init!(KunitObject {})
+        }
+
+        fn create_imported(
+            _dev: &drm::Device<KunitDriver>,
+            _size: usize,
         ) -> impl PinInit<Self, Error> {
             try_pin_init!(KunitObject {})
         }
