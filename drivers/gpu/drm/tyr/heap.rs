@@ -303,8 +303,20 @@ impl Pool {
             .start;
 
         let index = self.free_index.fetch_add(1, Relaxed);
-        let context_gpu_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start
-            + index as u64 * u64::from(reg_data.gpu_info.heap_context_stride());
+        let stride = reg_data.gpu_info.heap_context_stride() as usize;
+        let offset = index.checked_mul(stride).ok_or(EINVAL)?;
+        let end = offset.checked_add(stride).ok_or(EINVAL)?;
+        let vmap = self.gpu_contexts.vmap();
+        if end > vmap.owner().size() {
+            return Err(EINVAL);
+        }
+        let base = vmap.as_view().as_ptr().cast::<u8>();
+        // SAFETY: `offset..offset + stride` is within the mapping
+        // (`end <= vmap.owner().size()` checked above). The vmap outlives
+        // this write, because `self.gpu_contexts` holds the `Arc<MappedBo>`.
+        unsafe { core::ptr::write_bytes(base.add(offset), 0, stride) };
+
+        let context_gpu_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start + offset as u64;
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
