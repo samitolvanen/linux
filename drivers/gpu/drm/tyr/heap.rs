@@ -88,33 +88,52 @@ struct Context {
 }
 
 impl Context {
-    fn alloc_chunk(&mut self, dev: &Device<Bound>, ddev: &TyrDrmDevice) -> Result {
-        let chunk_bo = {
-            let flags = VmMapFlags::from(VmFlag::Noexec);
-            let chunk_bo =
-                gem::new_kernel_object(dev, ddev, &self.vm, self.chunk_size as usize, flags)?;
+    fn alloc_chunk_bo(
+        &mut self,
+        dev: &Device<Bound>,
+        ddev: &TyrDrmDevice,
+    ) -> Result<Arc<gem::MappedBo>> {
+        let flags = VmMapFlags::from(VmFlag::Noexec);
+        let chunk_bo =
+            gem::new_kernel_object(dev, ddev, &self.vm, self.chunk_size as usize, flags)?;
 
-            let vmap = chunk_bo.vmap();
-            let size = vmap.owner().size();
-            let base = SysMemBackend::as_ptr(vmap.as_view()).cast::<u8>();
-            // SAFETY: `base` and `size` describe the same vmap'd GEM object, so the range is
-            // valid for reads and writes, and `u8` has no alignment requirement. The object
-            // was just created and its `Arc` has not left this function, so no other
-            // reference into the mapping exists.
-            let mem = unsafe { core::slice::from_raw_parts_mut(base, size) };
-            mem.fill(0);
+        let vmap = chunk_bo.vmap();
+        let size = vmap.owner().size();
+        let base = SysMemBackend::as_ptr(vmap.as_view()).cast::<u8>();
+        // SAFETY: `base` and `size` describe the same vmap'd GEM object, so the range is
+        // valid for reads and writes, and `u8` has no alignment requirement. The object
+        // was just created and its `Arc` has not left this function, so no other
+        // reference into the mapping exists.
+        let mem = unsafe { core::slice::from_raw_parts_mut(base, size) };
+        mem.fill(0);
 
-            chunk_bo
-        };
+        Ok(chunk_bo)
+    }
 
-        if let Some(last) = self.chunks.last() {
-            let next = (chunk_bo.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
-                | (chunk_bo.size() as u64 >> 12);
-            ChunkHeader::write_next(last, next)?;
+    fn push_chunk(&mut self, chunk_bo: Arc<gem::MappedBo>) -> Result {
+        self.chunks.reserve(1, GFP_KERNEL)?;
+        self.chunks
+            .insert_within_capacity(0, chunk_bo)
+            .map_err(|_| ENOMEM)?;
+        Ok(())
+    }
+
+    fn alloc_initial_chunk(&mut self, dev: &Device<Bound>, ddev: &TyrDrmDevice) -> Result {
+        let chunk_bo = self.alloc_chunk_bo(dev, ddev)?;
+
+        if let Some(prev) = self.chunks.first() {
+            let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
+                | (u64::from(self.chunk_size) >> 12);
+            ChunkHeader::write_next(&chunk_bo, next)?;
         }
 
-        self.chunks.push(chunk_bo, GFP_KERNEL)?;
-        Ok(())
+        self.push_chunk(chunk_bo)
+    }
+
+    fn alloc_grow_chunk(&mut self, dev: &Device<Bound>, ddev: &TyrDrmDevice) -> Result {
+        let chunk_bo = self.alloc_chunk_bo(dev, ddev)?;
+
+        self.push_chunk(chunk_bo)
     }
 }
 
@@ -268,9 +287,11 @@ impl Pool {
         )?;
 
         for _ in 0..args.initial_chunk_count {
-            heap_ctx.alloc_chunk(reg_data.pdev.as_ref(), ddev)?;
+            heap_ctx.alloc_initial_chunk(reg_data.pdev.as_ref(), ddev)?;
         }
 
+        // `alloc_initial_chunk` prepends, so `chunks.first()` is the
+        // most-recently allocated chunk and the head of the chain.
         let first_chunk_gpu_va = heap_ctx
             .chunks
             .first()
@@ -317,9 +338,9 @@ impl Pool {
             return Err(ENOMEM);
         }
 
-        heap_ctx.alloc_chunk(reg_data.pdev.as_ref(), ddev)?;
+        heap_ctx.alloc_grow_chunk(reg_data.pdev.as_ref(), ddev)?;
 
-        let chunk_bo = heap_ctx.chunks.last().ok_or(EINVAL)?;
+        let chunk_bo = heap_ctx.chunks.first().ok_or(EINVAL)?;
         let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
 
         Ok((chunk_start & CHUNK_SIZE_MASK) | (chunk_bo.size() as u64 >> 12))
