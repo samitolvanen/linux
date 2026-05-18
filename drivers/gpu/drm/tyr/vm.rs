@@ -31,6 +31,7 @@ use kernel::{
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
+            GpuVmBoAlloc,
             OpMap,
             OpMapRequest,
             OpMapped,
@@ -269,7 +270,6 @@ impl DriverDmaFenceOps for VmBindFenceData {
 
 pub(crate) enum VmBindJobOp {
     Map {
-        bo: ARef<Bo>,
         bo_offset: u64,
         size: u64,
         va: u64,
@@ -294,6 +294,7 @@ impl VmBindJob {
 
     pub(crate) fn push_map(
         &mut self,
+        vm: &Vm,
         bo: ARef<Bo>,
         bo_offset: u64,
         size: u64,
@@ -306,12 +307,12 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
+            vm_bo: Some(GpuVmBoAlloc::<GpuVmData>::new(&vm.exec.gpuvm, &bo, ())?.obtain()),
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
             .push(
                 VmBindJobOp::Map {
-                    bo,
                     bo_offset,
                     size,
                     va,
@@ -330,6 +331,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 None,
             ],
+            vm_bo: None,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -375,7 +377,6 @@ impl QueueOps for VmBindQueueOps {
             for op in job.job.ops.iter() {
                 match op {
                     VmBindJobOp::Map {
-                        bo,
                         bo_offset,
                         size,
                         va,
@@ -384,7 +385,6 @@ impl QueueOps for VmBindQueueOps {
                     } => {
                         let mut resources = resources.lock().take().ok_or(EINVAL)?;
                         self.exec.map_bo_range_inner(
-                            bo,
                             *bo_offset,
                             *size,
                             *va,
@@ -469,14 +469,22 @@ pub(crate) struct VmOpResources {
     /// objects (one for the new mapping, and two for the previous and next
     /// mappings).
     preallocated_gpuvas: [Option<GpuVaAlloc<GpuVmData>>; 3],
+    /// The `drm_gpuvm_bo` for the Map path, obtained outside the VM_BIND
+    /// signalling section so its external-object `dma_resv_lock`
+    /// registration does not run on the path to `dma_fence_signal()`.
+    /// `None` for Unmap.
+    vm_bo: Option<ARef<GpuVmBo<GpuVmData>>>,
 }
 
-// SAFETY: `VmOpResources` only holds `GpuVaAlloc` instances, each of which
-// wraps a `KBox<MaybeUninit<GpuVa<GpuVmData>>>` of uninitialised slab memory.
-// The allocation carries no thread-bound state; `GpuVaAlloc` is `!Send` only
-// because its `Opaque<drm_gpuva>` field transitively inherits `!Send` from the
-// C bindings. Handing the uninitialised allocations off to the VM_BIND worker
-// thread that consumes them via `prepare()` is therefore sound.
+// SAFETY: `VmOpResources` holds `GpuVaAlloc` instances and an obtained
+// `ARef<GpuVmBo<GpuVmData>>`. `GpuVaAlloc` wraps a
+// `KBox<MaybeUninit<GpuVa<GpuVmData>>>` of uninitialised slab memory and is
+// `!Send` only because its `Opaque<drm_gpuva>` field transitively inherits
+// `!Send` from the C bindings; the allocation carries no thread-bound state.
+// `GpuVmBo<GpuVmData>` is `!Send` for the same reason, but its `drm_gpuvm_bo`
+// refcount is not thread-bound and the only thread-bound state it could carry
+// is its `VmBoData = ()` payload, which is `Send`. Handing the resources off to
+// the VM_BIND worker thread that consumes them is therefore sound.
 unsafe impl Send for VmOpResources {}
 
 /// Request to execute a virtual memory operation.
@@ -1013,16 +1021,16 @@ impl VmExec {
     /// caching behavior specified in `flags`.
     fn map_bo_range_inner(
         &self,
-        bo: &Bo,
         bo_offset: u64,
         size: u64,
         va: u64,
         flags: VmMapFlags,
         resources: &mut VmOpResources,
     ) -> Result {
+        let vm_bo = resources.vm_bo.take().ok_or(EINVAL)?;
         let req = VmOpRequest {
             op_type: VmOpType::Map(VmMapArgs {
-                vm_bo: self.gpuvm.obtain(bo, ())?,
+                vm_bo,
                 flags,
                 bo_offset,
             }),
@@ -1053,8 +1061,9 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
+            vm_bo: Some(GpuVmBoAlloc::<GpuVmData>::new(&self.gpuvm, bo, ())?.obtain()),
         };
-        self.map_bo_range_inner(bo, bo_offset, size, va, flags, &mut resources)?;
+        self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)?;
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
@@ -1086,6 +1095,7 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 None,
             ],
+            vm_bo: None,
         };
         self.unmap_range_inner(va, size, &mut resources)?;
 

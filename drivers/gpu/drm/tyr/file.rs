@@ -322,7 +322,7 @@ impl TyrDrmFileData {
         for i in 0..count {
             let res = {
                 let op: VmBindOp = reader.read()?;
-                let (job, syncs) = op.capture(file, true)?;
+                let (job, syncs) = op.capture(file, &vm, true)?;
                 let deps = deps::wait_fences(file, &syncs)?;
                 let signals = deps::signal_syncs(file, &syncs)?;
                 let prepared = vm.prepare_bind_job(job, &deps)?;
@@ -522,6 +522,7 @@ impl VmBindOp {
     fn capture(
         &self,
         file: &TyrDrmFile,
+        vm: &vm::Vm,
         is_async: bool,
     ) -> Result<(vm::VmBindJob, KVec<deps::SyncOp>)> {
         let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
@@ -553,6 +554,7 @@ impl VmBindOp {
                 }
 
                 job.push_map(
+                    vm,
                     bo,
                     self.0.bo_offset,
                     self.0.size,
