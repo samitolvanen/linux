@@ -466,14 +466,23 @@ impl Firmware {
     pub(crate) fn alloc_queue_mem(&self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
 
-        gem::new_kernel_object(
+        let mem = gem::new_kernel_object(
             tdev,
             &self.vm,
             SZ_8K,
             flags,
             tdev.coherent,
             tdev.cleanup_wq.clone(),
-        )
+        )?;
+
+        let vmap = mem.vmap();
+        let size = vmap.owner().size();
+        // SAFETY: `vmap` owns a writable CPU mapping for the BO and `size`
+        // matches the mapped object size.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(vmap.addr() as *mut u8, size) };
+        bytes.fill(0);
+
+        Ok(mem)
     }
 
     pub(crate) fn alloc_suspend_buf(
