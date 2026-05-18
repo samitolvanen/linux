@@ -300,10 +300,12 @@ pub(crate) enum VmBindJobOp {
         size: u64,
         va: u64,
         flags: VmMapFlags,
+        resources: Pin<KBox<Mutex<Option<VmOpResources>>>>,
     },
     Unmap {
         va: u64,
         size: u64,
+        resources: Pin<KBox<Mutex<Option<VmOpResources>>>>,
     },
 }
 
@@ -324,6 +326,14 @@ impl VmBindJob {
         va: u64,
         flags: VmMapFlags,
     ) -> Result {
+        let resources = VmOpResources {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+            ],
+        };
+        let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
             .push(
                 VmBindJobOp::Map {
@@ -332,6 +342,7 @@ impl VmBindJob {
                     size,
                     va,
                     flags,
+                    resources,
                 },
                 GFP_KERNEL,
             )
@@ -339,8 +350,23 @@ impl VmBindJob {
     }
 
     pub(crate) fn push_unmap(&mut self, va: u64, size: u64) -> Result {
+        let resources = VmOpResources {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+            ],
+        };
+        let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
-            .push(VmBindJobOp::Unmap { va, size }, GFP_KERNEL)
+            .push(
+                VmBindJobOp::Unmap {
+                    va,
+                    size,
+                    resources,
+                },
+                GFP_KERNEL,
+            )
             .map_err(Error::from)
     }
 }
@@ -386,15 +412,27 @@ impl QueueOps for VmBindQueueOps {
                         size,
                         va,
                         flags,
-                    } => self.exec.map_bo_range_inner(
-                        reg_data.pdev.as_ref(),
-                        bo,
-                        *bo_offset,
-                        *size,
-                        *va,
-                        *flags,
-                    )?,
-                    VmBindJobOp::Unmap { va, size } => self.exec.unmap_range_inner(*va, *size)?,
+                        resources,
+                    } => {
+                        let mut resources = resources.lock().take().ok_or(EINVAL)?;
+                        self.exec.map_bo_range_inner(
+                            reg_data.pdev.as_ref(),
+                            bo,
+                            *bo_offset,
+                            *size,
+                            *va,
+                            *flags,
+                            &mut resources,
+                        )?
+                    }
+                    VmBindJobOp::Unmap {
+                        va,
+                        size,
+                        resources,
+                    } => {
+                        let mut resources = resources.lock().take().ok_or(EINVAL)?;
+                        self.exec.unmap_range_inner(*va, *size, &mut resources)?
+                    }
                 }
             }
 
@@ -454,7 +492,7 @@ enum VmOpType<'a> {
 /// VM operations may require allocating new GPUVA objects to track mappings.
 /// To avoid allocation failures during the operation, preallocate the
 /// maximum number of GPUVAs that might be needed.
-struct VmOpResources {
+pub(crate) struct VmOpResources {
     /// Preallocated GPUVA objects for remap operations.
     ///
     /// Partial unmap requests or map requests overlapping existing mappings
@@ -1031,6 +1069,7 @@ impl VmExec {
     /// backing the GEM object, starting at `bo_offset` bytes into the object and
     /// spanning `map_size` bytes. The mapping respects the access permissions and
     /// caching behavior specified in `flags`.
+    #[expect(clippy::too_many_arguments)]
     fn map_bo_range_inner(
         &self,
         dev: &Device<Bound>,
@@ -1039,6 +1078,7 @@ impl VmExec {
         map_size: u64,
         va: u64,
         flags: VmMapFlags,
+        resources: &mut VmOpResources,
     ) -> Result {
         if map_size == 0
             || va % SZ_4K as u64 != 0
@@ -1073,15 +1113,8 @@ impl VmExec {
             }),
             region: va..va_end,
         };
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-            ],
-        };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
-        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, &mut resources)
+        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)
     }
 
     pub(crate) fn flush_deferred_cleanup(&self) {
@@ -1097,7 +1130,15 @@ impl VmExec {
         va: u64,
         flags: VmMapFlags,
     ) -> Result {
-        let result = self.map_bo_range_inner(dev, bo, bo_offset, map_size, va, flags);
+        let mut resources = VmOpResources {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+            ],
+        };
+        let result =
+            self.map_bo_range_inner(dev, bo, bo_offset, map_size, va, flags, &mut resources);
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
@@ -1110,7 +1151,7 @@ impl VmExec {
     ///
     /// This removes any existing mappings in the specified range, freeing the
     /// virtual address space for reuse.
-    fn unmap_range_inner(&self, va: u64, size: u64) -> Result {
+    fn unmap_range_inner(&self, va: u64, size: u64, resources: &mut VmOpResources) -> Result {
         if size == 0 || va % SZ_4K as u64 != 0 || size % SZ_4K as u64 != 0 {
             return Err(EINVAL);
         }
@@ -1134,6 +1175,12 @@ impl VmExec {
             region: va..end,
         };
 
+        let mut gpuvm_unique = self.gpuvm_unique.lock();
+        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)
+    }
+
+    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+        let end = va.checked_add(size).ok_or(EINVAL)?;
         let full_vm = va == self.va_range.start && end == self.va_range.end;
 
         let mut resources = VmOpResources {
@@ -1149,12 +1196,7 @@ impl VmExec {
                 ]
             },
         };
-        let mut gpuvm_unique = self.gpuvm_unique.lock();
-        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, &mut resources)
-    }
-
-    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
-        let result = self.unmap_range_inner(va, size);
+        let result = self.unmap_range_inner(va, size, &mut resources);
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
