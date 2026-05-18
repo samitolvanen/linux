@@ -279,13 +279,26 @@ impl<T: DriverObject> Object<T> {
         let sgt_res = unsafe { (*sgt_res_ptr).as_ref() };
 
         let ret = if let Some(sgt_res) = sgt_res {
+            pr_err!("shmem DBG get_sg_table: CACHED path\n");
             // We already have a Devres object for this sg table, return it
             Ok(sgt_res)
         } else {
+            pr_err!(
+                "shmem DBG get_sg_table: COLD path -> calling drm_gem_shmem_get_pages_sgt_locked\n"
+            );
             // SAFETY: We grabbed the lock required for calling this function above */
             let sgt = from_err_ptr(unsafe {
                 bindings::drm_gem_shmem_get_pages_sgt_locked(self.as_raw_shmem())
             });
+
+            if let Err(e) = &sgt {
+                pr_err!(
+                    "shmem DBG get_sg_table: COLD path get_pages_sgt_locked FAIL err={:?}\n",
+                    e,
+                );
+            } else {
+                pr_err!("shmem DBG get_sg_table: COLD path get_pages_sgt_locked OK\n");
+            }
 
             if let Err(e) = sgt {
                 Err(e)
@@ -299,6 +312,7 @@ impl<T: DriverObject> Object<T> {
                 let devres = Devres::new(dev, init!(SGTableMap { obj: self.into() }));
                 match devres {
                     Ok(devres) => {
+                        pr_err!("shmem DBG get_sg_table: COLD path Devres::new OK\n");
                         // SAFETY: We acquired the lock protecting this data above, making it safe
                         // to write into here
                         unsafe { (*sgt_res_ptr) = Some(devres) };
@@ -307,6 +321,10 @@ impl<T: DriverObject> Object<T> {
                         Ok(unsafe { (&*sgt_res_ptr).as_ref().unwrap_unchecked() })
                     }
                     Err(e) => {
+                        pr_err!(
+                            "shmem DBG get_sg_table: COLD path Devres::new FAIL err={:?}\n",
+                            e,
+                        );
                         // We can't make sure that the pages for this object are unmapped on
                         // driver-unbind, so we need to release the sgt
                         // SAFETY:
@@ -337,7 +355,19 @@ impl<T: DriverObject> Object<T> {
     ) -> Result<&'a scatterlist::SGTable> {
         let sgt = self.get_sg_table(dev)?;
 
-        Ok(sgt.access(dev)?.deref())
+        match sgt.access(dev) {
+            Ok(guard) => {
+                pr_err!("shmem DBG sg_table: access OK\n");
+                Ok(guard.deref())
+            }
+            Err(e) => {
+                pr_err!(
+                    "shmem DBG sg_table: access FAIL err={:?} (Devres dev mismatch?)\n",
+                    e,
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Creates (if necessary) and returns an owned reference to a scatter-gather table of DMA pages

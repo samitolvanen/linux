@@ -318,6 +318,11 @@ impl<T: Send> Devres<T> {
     /// ```
     pub fn access<'a>(&'a self, dev: &'a Device<Bound>) -> Result<&'a T> {
         if self.dev.as_raw() != dev.as_raw() {
+            pr_err!(
+                "devres DBG access mismatch: self.dev={:p} dev={:p}\n",
+                self.dev.as_raw(),
+                dev.as_raw(),
+            );
             return Err(EINVAL);
         }
 

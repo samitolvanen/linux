@@ -25,6 +25,7 @@ use kernel::{
         DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, PublicDmaFence, Published,
     },
     drm::{
+        gem::BaseObject,
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
@@ -1180,7 +1181,15 @@ impl DriverGpuVm for GpuVmData {
             start_iova,
             bytes_left_to_map,
         );
-        let sgt = op.obj().sg_table(context.dev).inspect_err(|e| {
+        let bo = op.obj();
+        pr_err!(
+            "tyr DBG step_map: va={:#x} len={:#x} bo_size={} create_flags={:#x}\n",
+            start_iova,
+            bytes_left_to_map,
+            bo.size(),
+            bo.create_flags(),
+        );
+        let sgt = bo.sg_table(context.dev).inspect_err(|e| {
             pr_err!("Failed to get sg_table: {:?}\n", e);
         })?;
         let prot = match &context.op_type {

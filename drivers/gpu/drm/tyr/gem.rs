@@ -319,6 +319,14 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
     }
 
     let map_wc = should_map_wc(coherent, flags);
+    pr_err!(
+        "tyr DBG new_bo: size={} aligned_size={} flags={:#x} coherent={} map_wc={}\n",
+        size,
+        aligned_size,
+        flags,
+        coherent,
+        map_wc,
+    );
     let bo = Bo::new(
         ddev,
         aligned_size,
@@ -333,13 +341,34 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
         // SAFETY: `ddev` is bound for the duration of the ioctl path that
         // reaches this function.
         let dev = unsafe { ddev.as_ref().as_bound() };
-        if let Err(e) = bo.sg_table(dev) {
-            dev_err!(
-                ddev.as_ref(),
-                "tyr: eager sg_table fetch failed for WC BO (size={aligned_size}): {e:?}\n"
-            );
-            return Err(e);
+        match bo.sg_table(dev) {
+            Ok(_) => {
+                pr_err!(
+                    "tyr DBG new_bo: eager sg_table OK size={} flags={:#x}\n",
+                    aligned_size,
+                    flags,
+                );
+            }
+            Err(e) => {
+                pr_err!(
+                    "tyr DBG new_bo: eager sg_table FAIL size={} flags={:#x} err={:?}\n",
+                    aligned_size,
+                    flags,
+                    e,
+                );
+                dev_err!(
+                    ddev.as_ref(),
+                    "tyr: eager sg_table fetch failed for WC BO (size={aligned_size}): {e:?}\n"
+                );
+                return Err(e);
+            }
         }
+    } else {
+        pr_err!(
+            "tyr DBG new_bo: SKIPPED eager fetch (map_wc=false) size={} flags={:#x}\n",
+            aligned_size,
+            flags,
+        );
     }
 
     Ok(bo)
