@@ -27,22 +27,13 @@ const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
 
 pub(crate) struct ChunkHeader {
+    // Written to GPU-visible memory through `write`; never read back.
+    #[allow(dead_code)]
     next: u64,
     _unknown: [u32; 14],
 }
 
 impl ChunkHeader {
-    fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
-        mem.check_offset::<Self>(offset)?;
-
-        let vmap = mem.vmap();
-        // SAFETY: `check_offset` verified bounds and alignment for `Self` at `offset`.
-        let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
-
-        // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
-        Ok(unsafe { core::ptr::read_volatile(ptr) })
-    }
-
     fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
         mem.check_offset::<Self>(offset)?;
 
@@ -165,30 +156,50 @@ struct Context {
 }
 
 impl Context {
-    fn alloc_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
-        let chunk_bo = {
-            let flags = VmMapFlags::from(VmFlag::Noexec);
-            let chunk_bo = gem::new_kernel_object(tdev, &self.vm, self.chunk_size as usize, flags)?;
+    fn alloc_chunk_bo(&mut self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
+        let flags = VmMapFlags::from(VmFlag::Noexec);
+        let chunk_bo = gem::new_kernel_object(tdev, &self.vm, self.chunk_size as usize, flags)?;
 
-            let vmap = chunk_bo.vmap();
-            let size = vmap.owner().size();
-            // SAFETY: `vmap` owns a writable CPU mapping for the BO and `size`
-            // matches the mapped object size.
-            let mem = unsafe { core::slice::from_raw_parts_mut(vmap.addr() as *mut u8, size) };
-            mem.fill(0);
+        let vmap = chunk_bo.vmap();
+        let size = vmap.owner().size();
+        // SAFETY: `vmap` owns a writable CPU mapping for the BO and `size`
+        // matches the mapped object size.
+        let mem = unsafe { core::slice::from_raw_parts_mut(vmap.addr() as *mut u8, size) };
+        mem.fill(0);
 
-            chunk_bo
-        };
+        Ok(chunk_bo)
+    }
 
-        if let Some(last) = self.chunks.last() {
-            let mut last_hdr = ChunkHeader::read(last, 0)?;
-            last_hdr.next = (chunk_bo.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
-                | (chunk_bo.size() as u64 >> 12);
-            ChunkHeader::write(last, 0, last_hdr)?;
+    fn push_chunk(&mut self, chunk_bo: Arc<gem::MappedBo>) -> Result {
+        self.chunks.reserve(1, GFP_KERNEL)?;
+        self.chunks
+            .insert_within_capacity(0, chunk_bo)
+            .map_err(|_| ENOMEM)?;
+        Ok(())
+    }
+
+    fn alloc_initial_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
+        let chunk_bo = self.alloc_chunk_bo(tdev)?;
+
+        if let Some(prev) = self.chunks.first() {
+            let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
+                | (u64::from(self.chunk_size) >> 12);
+            ChunkHeader::write(
+                &chunk_bo,
+                0,
+                ChunkHeader {
+                    next,
+                    _unknown: [0; 14],
+                },
+            )?;
         }
 
-        self.chunks.push(chunk_bo, GFP_KERNEL)?;
-        Ok(())
+        self.push_chunk(chunk_bo)
+    }
+
+    fn alloc_grow_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
+        let chunk_bo = self.alloc_chunk_bo(tdev)?;
+        self.push_chunk(chunk_bo)
     }
 }
 
@@ -249,9 +260,11 @@ impl Pool {
         )?;
 
         for _ in 0..args.initial_chunk_count {
-            heap_ctx.alloc_chunk(tdev)?;
+            heap_ctx.alloc_initial_chunk(tdev)?;
         }
 
+        // `alloc_initial_chunk` prepends, so `chunks.first()` is the
+        // most-recently allocated chunk and the head of the chain.
         let first_chunk_gpu_va = heap_ctx
             .chunks
             .first()
@@ -310,9 +323,9 @@ impl Pool {
             return Err(ENOMEM);
         }
 
-        heap_ctx.alloc_chunk(tdev)?;
+        heap_ctx.alloc_grow_chunk(tdev)?;
 
-        let chunk_bo = heap_ctx.chunks.last().ok_or(EINVAL)?;
+        let chunk_bo = heap_ctx.chunks.first().ok_or(EINVAL)?;
         let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
 
         Ok((chunk_start & CHUNK_SIZE_MASK) | (chunk_bo.size() as u64 >> 12))
