@@ -510,7 +510,15 @@ impl<'drm> Firmware<'drm> {
         let dev = self.dev.as_ref();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
 
-        gem::new_kernel_object(dev, ddev, &self.vm, SZ_8K, flags, ddev.coherent)
+        let mem = gem::new_kernel_object(dev, ddev, &self.vm, SZ_8K, flags, ddev.coherent)?;
+
+        let vmap = mem.vmap();
+        let size = vmap.owner().size();
+        // SAFETY: `vmap` owns a writable CPU mapping for the BO and `size`
+        // matches the mapped object size.
+        unsafe { core::ptr::write_bytes(vmap.as_view().as_ptr().cast::<u8>(), 0, size) };
+
+        Ok(mem)
     }
 
     pub(crate) fn alloc_suspend_buf(
