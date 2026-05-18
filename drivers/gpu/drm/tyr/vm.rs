@@ -26,6 +26,7 @@ use kernel::{
     },
     drm::{
         gem::BaseObject,
+        gem::IntoGEMObject,
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
@@ -1183,11 +1184,13 @@ impl DriverGpuVm for GpuVmData {
         );
         let bo = op.obj();
         pr_err!(
-            "tyr DBG step_map: va={:#x} len={:#x} bo_size={} create_flags={:#x}\n",
+            "tyr DBG step_map: caller=STEP_MAP self_obj={:p} va={:#x} len={:#x} bo_size={} create_flags={:#x} dev={:p}\n",
+            bo.as_raw(),
             start_iova,
             bytes_left_to_map,
             bo.size(),
             bo.create_flags(),
+            core::ptr::from_ref(context.dev),
         );
         let sgt = bo.sg_table(context.dev).inspect_err(|e| {
             pr_err!("Failed to get sg_table: {:?}\n", e);

@@ -341,6 +341,11 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
         // SAFETY: `ddev` is bound for the duration of the ioctl path that
         // reaches this function.
         let dev = unsafe { ddev.as_ref().as_bound() };
+        pr_err!(
+            "tyr DBG new_bo: caller=EAGER self_obj={:p} dev={:p}\n",
+            bo.as_raw(),
+            core::ptr::from_ref(dev),
+        );
         match bo.sg_table(dev) {
             Ok(_) => {
                 pr_err!(
@@ -420,6 +425,11 @@ pub(crate) fn sync(
         return Ok(());
     }
 
+    pr_err!(
+        "tyr DBG sync: caller=BO_SYNC self_obj={:p} dev={:p}\n",
+        bo.as_raw(),
+        core::ptr::from_ref(dev),
+    );
     let sgt = bo.sg_table(dev)?;
 
     let mut offset = offset;

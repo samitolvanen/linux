@@ -182,6 +182,12 @@ impl<T: DriverObject> Object<T> {
         let shmem = unsafe { &mut *obj.as_raw_shmem() };
         shmem.set_map_wc(config.map_wc);
 
+        pr_err!(
+            "shmem DBG Object::new: self_obj={:p} size={}\n",
+            obj.as_raw(),
+            size,
+        );
+
         Ok(obj)
     }
 
@@ -270,6 +276,21 @@ impl<T: DriverObject> Object<T> {
         &'a self,
         dev: &'a device::Device<Bound>,
     ) -> Result<&'a Devres<SGTableMap<T>>> {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`.
+        // `import_attach` is set at most once at gem creation and never cleared, so a plain read is
+        // sound.
+        let (bo_size, import) = unsafe {
+            let raw = self.as_raw();
+            ((*raw).size, !(*raw).import_attach.is_null())
+        };
+        pr_err!(
+            "shmem DBG get_sg_table: entry self_obj={:p} bo_size={} imported={} dev={:p}\n",
+            self.as_raw(),
+            bo_size,
+            import,
+            dev.as_raw(),
+        );
+
         let sgt_res_ptr = self.sgt_res.get();
 
         // SAFETY: This lock is initialized throughout the lifetime of the gem object
@@ -312,7 +333,10 @@ impl<T: DriverObject> Object<T> {
                 let devres = Devres::new(dev, init!(SGTableMap { obj: self.into() }));
                 match devres {
                     Ok(devres) => {
-                        pr_err!("shmem DBG get_sg_table: COLD path Devres::new OK\n");
+                        pr_err!(
+                            "shmem DBG get_sg_table: COLD path Devres::new OK stored_dev={:p}\n",
+                            dev.as_raw(),
+                        );
                         // SAFETY: We acquired the lock protecting this data above, making it safe
                         // to write into here
                         unsafe { (*sgt_res_ptr) = Some(devres) };
@@ -353,6 +377,11 @@ impl<T: DriverObject> Object<T> {
         &'a self,
         dev: &'a device::Device<Bound>,
     ) -> Result<&'a scatterlist::SGTable> {
+        pr_err!(
+            "shmem DBG sg_table: entry self_obj={:p} dev={:p}\n",
+            self.as_raw(),
+            dev.as_raw(),
+        );
         let sgt = self.get_sg_table(dev)?;
 
         match sgt.access(dev) {
