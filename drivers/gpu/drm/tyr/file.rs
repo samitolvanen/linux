@@ -74,12 +74,17 @@ fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
 /// Validate a single `drm_panthor_vm_bind_op` at the ioctl entry, before any
 /// state is mutated or any job is queued. Rejects `EINVAL` if `va`, `size`,
 /// or `bo_offset` is not GPU-page-aligned, if `va + size` overflows, and for
-/// `MAP` ops if `bo_handle` is invalid or `bo_offset + size` is out of
-/// bounds for the target BO.
+/// `MAP` ops if `bo_handle` is invalid, if `bo_offset + size` is out of
+/// bounds for the target BO, or if the BO is exclusive to a VM other than
+/// `vm`.
 ///
 /// For `MAP` ops, returns the looked-up `Bo` so the caller can perform the
 /// bind against the same BO that was validated, avoiding a TOCTOU window.
-fn validate_bind_op(op: &VmBindOp, file: &TyrDrmFile) -> Result<Option<ARef<gem::Bo>>> {
+fn validate_bind_op(
+    op: &VmBindOp,
+    file: &TyrDrmFile,
+    vm: &vm::Vm,
+) -> Result<Option<ARef<gem::Bo>>> {
     if (op.0.va | op.0.size | op.0.bo_offset) & GPU_PAGE_MASK != 0 {
         return Err(EINVAL);
     }
@@ -95,6 +100,11 @@ fn validate_bind_op(op: &VmBindOp, file: &TyrDrmFile) -> Result<Option<ARef<gem:
         // Check size first to avoid underflow in the subtraction.
         if op.0.size > bo_size || op.0.bo_offset > bo_size - op.0.size {
             return Err(EINVAL);
+        }
+        if let Some(root) = bo.exclusive_vm_root_gem() {
+            if !core::ptr::eq(root, vm.root_gem()) {
+                return Err(EINVAL);
+            }
         }
         return Ok(Some(bo));
     }
@@ -318,7 +328,7 @@ impl TyrDrmFileData {
                     return Ok(());
                 }
 
-                let validated_bo = validate_bind_op(&op, file)?;
+                let validated_bo = validate_bind_op(&op, file, &vm)?;
 
                 match op.0.flags as i32 & type_mask {
                     uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP => {
@@ -389,7 +399,7 @@ impl TyrDrmFileData {
         for _ in 0..count {
             let op: VmBindOp = reader.read()?;
             read_padding_zero(&mut reader, stride - op_size)?;
-            let validated_bo = validate_bind_op(&op, file)?;
+            let validated_bo = validate_bind_op(&op, file, &vm)?;
             let (job, syncs) = op.capture(&vm, true, validated_bo)?;
             let deps = deps::wait_fences(file, &syncs)?;
             let signals = deps::signal_syncs(file, &syncs)?;
@@ -443,7 +453,24 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
-        let bo = gem::new_bo(ddev, bocreate.size as usize, bocreate.flags, ddev.coherent)?;
+        let exclusive_vm = if bocreate.exclusive_vm_id != 0 {
+            Some(
+                file.inner()
+                    .vm_pool()
+                    .get_vm(bocreate.exclusive_vm_id as usize)
+                    .ok_or(EINVAL)?,
+            )
+        } else {
+            None
+        };
+
+        let bo = gem::new_bo(
+            ddev,
+            bocreate.size as usize,
+            bocreate.flags,
+            ddev.coherent,
+            exclusive_vm.as_deref(),
+        )?;
         let handle = bo.create_handle(file)?;
 
         bocreate.handle = handle;
