@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/mm.h>
+#include <linux/pgtable.h>
 #include <linux/sched/mm.h>
+
+__rust_helper pgprot_t rust_helper_pgprot_noncached(pgprot_t prot)
+{
+	return pgprot_noncached(prot);
+}
 
 __rust_helper void rust_helper_mmgrab(struct mm_struct *mm)
 {

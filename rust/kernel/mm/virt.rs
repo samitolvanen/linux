@@ -152,6 +152,34 @@ impl VmaRef {
             None
         }
     }
+
+    /// Returns the page protection flags currently set on this VMA.
+    #[inline]
+    pub fn vm_page_prot(&self) -> Pgprot {
+        // SAFETY: By the type invariants, the caller holds at least the mmap read lock, so this
+        // access is not a data race.
+        Pgprot(unsafe { (*self.as_ptr()).vm_page_prot })
+    }
+
+    /// Insert a single PFN into this VMA at `address` using the given page protection.
+    ///
+    /// Wraps `vmf_insert_pfn_prot`, intended for use from an `f_ops->fault` callback. The VMA
+    /// must have either [`VM_PFNMAP`] or [`VM_MIXEDMAP`] set (but not both), as required by the
+    /// underlying C function.
+    ///
+    /// `pfn` must reference a page that the driver owns for the lifetime of the mapping; for
+    /// device MMIO this is the physical page frame backing the register window.
+    ///
+    /// [`VM_PFNMAP`]: flags::PFNMAP
+    /// [`VM_MIXEDMAP`]: flags::MIXEDMAP
+    #[inline]
+    pub fn vmf_insert_pfn_prot(&self, address: usize, pfn: usize, pgprot: Pgprot) -> vm_fault_t {
+        // SAFETY: By the type invariants, `self.as_ptr()` is a valid `vm_area_struct` and the
+        // caller holds at least the mmap read lock, satisfying the locking requirements of
+        // `vmf_insert_pfn_prot`. The PFN and pgprot values are plain integers; their validity is
+        // the caller's responsibility, as documented above.
+        unsafe { bindings::vmf_insert_pfn_prot(self.as_ptr(), address, pfn, pgprot.0) }
+    }
 }
 
 /// A wrapper for the kernel's `struct vm_area_struct` with read access and [`VM_MIXEDMAP`] set.
@@ -394,6 +422,32 @@ impl VmaNew {
 /// The integer type used for vma flags.
 #[doc(inline)]
 pub use bindings::vm_flags_t;
+
+/// The integer type returned from `f_ops->fault` and `vmf_insert_*` callbacks.
+#[doc(inline)]
+pub use bindings::vm_fault_t;
+
+/// Page protection flags for a virtual memory area.
+///
+/// Wraps the kernel's `pgprot_t`. The contents are architecture-defined and treated as opaque;
+/// drivers obtain a `Pgprot` from a VMA via [`VmaRef::vm_page_prot`] and adjust it through the
+/// methods below before handing it back to the VM layer.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct Pgprot(bindings::pgprot_t);
+
+impl Pgprot {
+    /// Returns a noncached variant of this page protection.
+    ///
+    /// Equivalent to the C `pgprot_noncached()` macro. Use this for mappings of device MMIO that
+    /// must bypass the CPU caches.
+    #[inline]
+    pub fn noncached(self) -> Self {
+        // SAFETY: `pgprot_noncached` is a pure function of its argument with no preconditions;
+        // any `pgprot_t` value is a valid input.
+        Pgprot(unsafe { bindings::pgprot_noncached(self.0) })
+    }
+}
 
 /// All possible flags for [`VmaRef`].
 pub mod flags {
