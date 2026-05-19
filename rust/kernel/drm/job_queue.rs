@@ -1658,9 +1658,74 @@ impl<T: QueueOps> JobQueue<T> {
         // handed to hardware and need their fences waited on before cancel.
         const EXEC_STAGE_IDX: usize = 1;
 
+        // check_progress() takes state from a signalling section, so don't
+        // allocate or wait on fences while holding it.
         let mut state = self.inner.state.lock();
+        self.inner.drain_inbox(&mut state);
+        let mut bound: usize = 0;
+        for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
+            let range = state.stage_ranges[stage_i];
+            bound = bound.saturating_add(range.end.wrapping_sub(range.start) as usize);
+        }
+        drop(state);
 
-        // First, drain inbox so all submitted jobs become visible.
+        // Allocate outside the lock; on OOM, skip the wait but still drain.
+        let (mut in_flight, mut collect_failed): (KVec<ARef<PublicDmaFence>>, bool) =
+            match KVec::with_capacity(bound, GFP_KERNEL) {
+                Ok(v) => (v, false),
+                Err(_) => (KVec::new(), true),
+            };
+
+        let mut state = self.inner.state.lock();
+        // Re-drain: jobs may have landed while the lock was dropped.
+        self.inner.drain_inbox(&mut state);
+
+        // Capacity is reserved, so push_within_capacity() won't allocate under
+        // state. Overflow past the bound is a collection failure.
+        'collect: for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
+            let range = state.stage_ranges[stage_i];
+            let mut cur = range.start;
+            while cur != range.end {
+                let fence = self
+                    .inner
+                    .fifo
+                    .lock()
+                    .get(cur as usize)
+                    .and_then(|e| e.as_live())
+                    .map(|e| e.submit_fence.clone());
+                if let Some(f) = fence {
+                    if in_flight.push_within_capacity(f).is_err() {
+                        collect_failed = true;
+                        break 'collect;
+                    }
+                }
+                cur = cur.wrapping_add(1);
+            }
+        }
+        drop(state);
+
+        if collect_failed {
+            pr_err!(
+                "JobQueue: out of memory collecting HW fences during teardown; skipping wait\n"
+            );
+        } else {
+            for f in in_flight.iter() {
+                match self.inner.cancel_timeout {
+                    None => {
+                        let _ = f.wait();
+                    }
+                    Some(t) => {
+                        if let Ok(FenceWaitResult::TimedOut) = f.wait_timeout(t) {
+                            pr_warn!("JobQueue: timed out waiting for HW fence during teardown\n");
+                        }
+                    }
+                }
+            }
+        }
+        drop(in_flight);
+
+        let mut state = self.inner.state.lock();
+        // Re-drain: jobs may have been submitted while the lock was dropped.
         self.inner.drain_inbox(&mut state);
 
         for stage_i in 0..state.stage_ranges.len() {
@@ -1674,26 +1739,6 @@ impl<T: QueueOps> JobQueue<T> {
                 let Some(entry) = xa_entry.as_live_mut() else {
                     continue;
                 };
-                // For entries already handed to hardware, wait for the
-                // firmware fence before cancelling. state.lock() is a mutex
-                // so sleeping here is fine; check_progress() will unblock
-                // once we release it.
-                if stage_i > EXEC_STAGE_IDX {
-                    match self.inner.cancel_timeout {
-                        None => {
-                            let _ = entry.submit_fence.wait();
-                        }
-                        Some(t) => {
-                            if let Ok(FenceWaitResult::TimedOut) =
-                                entry.submit_fence.wait_timeout(t)
-                            {
-                                pr_warn!(
-                                    "JobQueue: timed out waiting for HW fence during teardown\n"
-                                );
-                            }
-                        }
-                    }
-                }
                 drop(entry.deps.active_cb.take());
                 drop(entry.progress_cb.take());
                 drop(entry.stage_wake_cb.take());
