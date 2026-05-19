@@ -432,6 +432,7 @@ impl QueueOps for VmBindQueueOps {
                 Ok(SubmitResult::Submitted)
             }
             Err(err) => {
+                self.exec.mark_unusable();
                 fence.signal(Err(err));
                 Err(err)
             }
@@ -1077,6 +1078,12 @@ impl VmExec {
             region: va..end,
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
+
+        // kill() marks the VM unusable under gpuvm_unique before unmapping,
+        // so this check under the same lock cannot race with teardown.
+        if self.is_unusable() {
+            return Err(EINVAL);
+        }
 
         self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)?;
 
