@@ -852,15 +852,15 @@ impl Vm {
     /// Activate the VM in a hardware address space slot.
     pub(crate) fn kill(&self) {
         self.exec.mark_unusable();
-        let _ = self.exec.deactivate().inspect_err(|e| {
-            pr_err!("Failed to deactivate VM: {:?}\n", e);
-        });
         let _ = self
             .exec
             .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
             .inspect_err(|e| {
-                pr_err!("Failed to unmap range during deactivate: {:?}\n", e);
+                pr_err!("Failed to unmap range in kill(): {:?}\n", e);
             });
+        let _ = self.exec.deactivate().inspect_err(|e| {
+            pr_err!("Failed to deactivate VM: {:?}\n", e);
+        });
     }
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
