@@ -3,7 +3,11 @@
 use kernel::{
     bindings,
     error::code::EINVAL,
-    mm::virt::{flags as vma_flags, VmaNew},
+    mm::virt::{
+        flags as vma_flags,
+        VmaNew,
+        VmaRef, //
+    },
     page::{PAGE_SHIFT, PAGE_SIZE},
     prelude::*,
 };
@@ -101,9 +105,9 @@ unsafe extern "C" fn vm_fault_handler(vmf: *mut bindings::vm_fault) -> bindings:
     let phys_addr = tdev.mmio_phys_addr + CSF_GPU_LATEST_FLUSH_ID_OFFSET;
     let pfn = (phys_addr >> PAGE_SHIFT) as usize;
 
-    // SAFETY: `vma` and `address` describe the active fault and `pfn` points to
-    // the device MMIO page we expose through this special mapping.
-    let ret = unsafe { bindings::vmf_insert_pfn(vma, address, pfn) };
-
-    ret as bindings::vm_fault_t
+    // SAFETY: `vma` is the active VMA for this fault; the kernel holds the
+    // mmap read lock for the duration of the callback.
+    let vma_ref = unsafe { VmaRef::from_raw(vma) };
+    let pgprot = vma_ref.vm_page_prot().noncached();
+    vma_ref.vmf_insert_pfn_prot(address, pfn, pgprot)
 }
