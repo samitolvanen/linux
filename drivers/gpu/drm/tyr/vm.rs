@@ -898,17 +898,13 @@ impl Vm {
     /// Kills the VM by deactivating it and unmapping all regions.
     pub(crate) fn kill(&self) {
         self.exec.mark_unusable();
-        let _ = self.exec.deactivate();
         let _ = self
             .exec
             .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
             .inspect_err(|e| {
-                dev_err!(
-                    self.dev(),
-                    "Failed to unmap range during deactivate: {:?}",
-                    e
-                );
+                dev_err!(self.dev(), "Failed to unmap range in kill(): {:?}", e);
             });
+        let _ = self.exec.deactivate();
     }
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
