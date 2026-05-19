@@ -187,6 +187,7 @@ const GPU_MODELS: [GpuModels; 1] = [GpuModels {
 /// Powers on the l2 block.
 pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     let io = (*iomem).access(dev)?;
+    io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(CoherencyMode::None));
     io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
 
     poll::read_poll_timeout(
