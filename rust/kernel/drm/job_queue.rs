@@ -146,6 +146,7 @@ use crate::{
         DmaFenceContext,
         DmaFenceDelayedWork,
         DmaFenceDelayedWorkItem,
+        DmaFenceSignallingAnnotation,
         DmaFenceWork,
         DmaFenceWorkItem,
         DmaFenceWorkqueue,
@@ -332,6 +333,9 @@ pub trait StageOps<T: QueueOps>: Send + Sync + 'static {
     /// [`JobQueue::cancel_all`]) without completing the stage normally.
     /// The implementation should release any per-stage resources that were
     /// allocated when the job entered this stage.  The default does nothing.
+    ///
+    /// Runs inside a dma-fence signalling section. It must not take
+    /// `dma_resv_lock`, allocate with `GFP_KERNEL`, or wait on a fence.
     fn teardown(&self, _job: &T::Job, _counter: u64) {}
 }
 
@@ -510,6 +514,10 @@ impl WrapRange {
 
     fn is_empty(&self) -> bool {
         self.start == self.end
+    }
+
+    fn contains(&self, idx: u32) -> bool {
+        idx.wrapping_sub(self.start) < self.end.wrapping_sub(self.start)
     }
 
     fn pop_front(&mut self) -> Option<u32> {
@@ -1620,16 +1628,50 @@ impl<T: QueueOps> JobQueue<T> {
 
     /// Cancel all pending and running jobs. Waits for HW jobs to drain.
     ///
-    /// Must be called from process context (it may sleep while waiting for
-    /// hardware fences).
+    /// Must be called from process context, since it may sleep while waiting
+    /// for hardware fences. It allocates nothing, so a dma-fence signalling
+    /// section may call it when [`PipelineBuilder::set_cancel_timeout`] bounds
+    /// each wait. Such a caller must also keep [`StageOps::teardown`] and the
+    /// [`QueueOps::Job`] destructor free of anything the section forbids.
     pub fn cancel_all(&self) {
         // WaitingForExec is always at index 1; stages beyond it have been
         // handed to hardware and need their fences waited on before cancel.
         const EXEC_STAGE_IDX: usize = 1;
 
-        let mut state = self.inner.state.lock();
+        let stage_count = self.inner.state.lock().stage_ranges.len();
 
-        // First, drain inbox so all submitted jobs become visible.
+        // check_progress() takes state from a signalling section, so don't
+        // wait on fences while holding it. The range is re-read after each
+        // wait, since check_progress() may have advanced the front past `cur`.
+        for stage_i in (EXEC_STAGE_IDX + 1)..stage_count {
+            let mut cur = self.inner.state.lock().stage_ranges[stage_i].start;
+            loop {
+                let fence = {
+                    let state = self.inner.state.lock();
+                    let range = state.stage_ranges[stage_i];
+                    if !range.contains(cur) && cur != range.end {
+                        cur = range.start;
+                    }
+                    if cur == range.end {
+                        break;
+                    }
+                    let idx = cur;
+                    cur = cur.wrapping_add(1);
+                    self.inner
+                        .fifo
+                        .lock()
+                        .get(idx as usize)
+                        .and_then(|e| e.as_live())
+                        .map(|e| e.submit_fence.clone())
+                };
+                if let Some(fence) = fence {
+                    self.wait_for_hw_fence(&fence);
+                }
+            }
+        }
+
+        let mut state = self.inner.state.lock();
+        // Jobs may have been submitted while the lock was dropped, so drain again.
         self.inner.drain_inbox(&mut state);
 
         for stage_i in 0..state.stage_ranges.len() {
@@ -1641,33 +1683,15 @@ impl<T: QueueOps> JobQueue<T> {
                 let Some(entry) = xa_entry.as_live_mut() else {
                     continue;
                 };
-                // For entries already handed to hardware, wait for the
-                // firmware fence before cancelling. state.lock() is a mutex
-                // so sleeping here is fine; check_progress() will unblock
-                // once we release it.
-                if stage_i > EXEC_STAGE_IDX {
-                    match self.inner.cancel_timeout {
-                        None => {
-                            let _ = entry.submit_fence.wait();
-                        }
-                        Some(t) => {
-                            if let Ok(FenceWaitResult::TimedOut) =
-                                entry.submit_fence.wait_timeout(t)
-                            {
-                                pr_warn!(
-                                    "JobQueue: timed out waiting for HW fence during teardown\n"
-                                );
-                            }
-                        }
-                    }
-                }
                 drop(entry.deps.active_cb.take());
                 drop(entry.progress_cb.take());
                 drop(entry.stage_wake_cb.take());
                 if let StageKind::Driver(s) = &self.inner.stages[stage_i] {
+                    let _annotation = DmaFenceSignallingAnnotation::new();
                     s.teardown(&*entry.job, entry.counter);
                 }
                 if let Some(f) = entry.submit_fence_drv.take() {
+                    let _annotation = DmaFenceSignallingAnnotation::new();
                     f.signal(Err(Error::from_errno(-(bindings::ECANCELED as i32))));
                 }
             }
@@ -1675,6 +1699,21 @@ impl<T: QueueOps> JobQueue<T> {
 
         while let Some(idx) = state.done_range.pop_front() {
             drop(self.inner.fifo.lock().remove(idx as usize));
+        }
+    }
+
+    /// Waits for one in-flight hardware fence, bounded by the cancel timeout
+    /// when one is set.
+    fn wait_for_hw_fence(&self, fence: &PublicDmaFence) {
+        match self.inner.cancel_timeout {
+            None => {
+                let _ = fence.wait();
+            }
+            Some(timeout) => {
+                if let Ok(FenceWaitResult::TimedOut) = fence.wait_timeout(timeout) {
+                    pr_warn!("JobQueue: timed out waiting for HW fence during teardown\n");
+                }
+            }
         }
     }
 }
