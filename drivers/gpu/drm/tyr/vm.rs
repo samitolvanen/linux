@@ -1474,6 +1474,11 @@ fn pt_map(
             }
         };
 
+        // TODO: GFP_NOWAIT because this runs in the VM_BIND dma-fence
+        // signalling section. The proper fix is to preallocate the
+        // page-table pages in the prepare phase so this path does not
+        // allocate.
+        //
         // SAFETY:
         // No other io-pgtable operation can currently access this range because Tyr holds
         // the gpuvm_unique mutex for the entire sm_map() operation.
@@ -1487,7 +1492,7 @@ fn pt_map(
                 pgsize as usize,
                 pgcount as usize,
                 prot,
-                GFP_KERNEL,
+                GFP_NOWAIT,
             )
         };
 
