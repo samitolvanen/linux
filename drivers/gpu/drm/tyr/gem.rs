@@ -141,13 +141,26 @@ impl core::ops::Deref for MappedBo {
     }
 }
 
+/// Returns whether a BO should be mapped write-combine given the device's
+/// DMA coherence.
+pub(crate) fn should_map_wc(coherent: bool) -> bool {
+    if coherent {
+        return false;
+    }
+
+    true
+}
+
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
-pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> Result<ARef<Bo>> {
+pub(crate) fn new_dummy_object<Ctx: DeviceContext>(
+    ddev: &TyrDrmDevice<Ctx>,
+    coherent: bool,
+) -> Result<ARef<Bo>> {
     let bo = gem::shmem::Object::<BoData>::new(
         ddev,
         4096,
         shmem::ObjectConfig {
-            map_wc: true,
+            map_wc: should_map_wc(coherent),
             parent_resv_obj: None,
         },
         BoCreateArgs { flags: 0 },
@@ -160,6 +173,7 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
     ddev: &TyrDrmDevice<Ctx>,
     size: usize,
     flags: u32,
+    coherent: bool,
 ) -> Result<ARef<Bo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
 
@@ -167,15 +181,25 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
         return Err(EINVAL);
     }
 
-    Bo::new(
+    let map_wc = should_map_wc(coherent);
+    let bo = Bo::new(
         ddev,
         aligned_size,
         shmem::ObjectConfig {
-            map_wc: true,
+            map_wc,
             parent_resv_obj: None,
         },
         BoCreateArgs { flags },
-    )
+    )?;
+
+    if map_wc {
+        // SAFETY: `ddev` is bound for the duration of the ioctl path that
+        // reaches this function.
+        let dev = unsafe { ddev.as_ref().as_bound() };
+        bo.sg_table(dev)?;
+    }
+
+    Ok(bo)
 }
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
@@ -188,6 +212,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
     vm: &Arc<Vm>,
     size: usize,
     flags: VmMapFlags,
+    coherent: bool,
 ) -> Result<Arc<MappedBo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -199,6 +224,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
         aligned_size as u64,
         KernelBoVaAlloc::Explicit(va),
         flags,
+        coherent,
     )?;
 
     MappedBo::new(kernel_bo, node)
@@ -241,6 +267,7 @@ impl KernelBo {
         size: u64,
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
+        coherent: bool,
     ) -> Result<Self> {
         if size == 0 {
             pr_err!("Cannot create KernelBo with size 0\n");
@@ -253,7 +280,7 @@ impl KernelBo {
             ddev,
             size as usize,
             shmem::ObjectConfig {
-                map_wc: true,
+                map_wc: should_map_wc(coherent),
                 parent_resv_obj: None,
             },
             BoCreateArgs { flags: 0 },
