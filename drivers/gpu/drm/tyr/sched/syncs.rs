@@ -6,8 +6,14 @@
 //! dependency handling needs typed accessors for those shared slots.
 
 use kernel::{
+    device::{
+        Bound,
+        Device, //
+    },
+    drm::gem::BaseObject,
     io::Io,
-    prelude::*, //
+    prelude::*,
+    uapi, //
 };
 
 use crate::gem;
@@ -52,4 +58,32 @@ impl SyncObj64b {
         vmap.try_write32(value.status, offset + Self::STATUS)?;
         vmap.try_write64(value.seqno, offset + Self::SEQNO)
     }
+}
+
+/// Makes the GPU's last write to the seqno of the sync object at `offset`
+/// visible to a CPU read through a cached mapping of `mem`.
+/// Does nothing for an imported BO.
+pub(super) fn sync_seqno_for_cpu(
+    dev: &Device<Bound>,
+    mem: &gem::BoVmap,
+    offset: usize,
+    sync64: bool,
+) -> Result {
+    if mem.is_imported() {
+        return Ok(());
+    }
+
+    let (seqno, size) = if sync64 {
+        (SyncObj64b::SEQNO, core::mem::size_of::<u64>())
+    } else {
+        (SyncObj32b::SEQNO, core::mem::size_of::<u32>())
+    };
+
+    gem::sync(
+        mem,
+        dev,
+        uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE,
+        (offset + seqno) as u64,
+        size as u64,
+    )
 }
