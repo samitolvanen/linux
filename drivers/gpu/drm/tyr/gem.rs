@@ -108,13 +108,23 @@ impl core::ops::Deref for MappedBo {
     }
 }
 
+/// Returns whether a BO should be mapped write-combine given the device's
+/// DMA coherence.
+pub(crate) fn should_map_wc(coherent: bool) -> bool {
+    if coherent {
+        return false;
+    }
+
+    true
+}
+
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
-pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice) -> Result<ARef<Bo>> {
+pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice, coherent: bool) -> Result<ARef<Bo>> {
     let bo = Bo::new(
         ddev,
         4096,
         shmem::ObjectConfig {
-            map_wc: true,
+            map_wc: should_map_wc(coherent),
             parent_resv_obj: None,
         },
         BoCreateArgs { flags: 0 },
@@ -123,22 +133,35 @@ pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice) -> Result<ARef<Bo>> {
     Ok(bo)
 }
 
-pub(crate) fn new_bo(ddev: &TyrDrmDevice, size: usize, flags: u32) -> Result<ARef<Bo>> {
+pub(crate) fn new_bo(
+    dev: &Device<Bound>,
+    ddev: &TyrDrmDevice,
+    size: usize,
+    flags: u32,
+    coherent: bool,
+) -> Result<ARef<Bo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
 
     if size == 0 || size > aligned_size {
         return Err(EINVAL);
     }
 
-    Bo::new(
+    let map_wc = should_map_wc(coherent);
+    let bo = Bo::new(
         ddev,
         aligned_size,
         shmem::ObjectConfig {
-            map_wc: true,
+            map_wc,
             parent_resv_obj: None,
         },
         BoCreateArgs { flags },
-    )
+    )?;
+
+    if map_wc {
+        bo.sg_table(dev)?;
+    }
+
+    Ok(bo)
 }
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
@@ -152,6 +175,7 @@ pub(crate) fn new_kernel_object(
     vm: &Arc<Vm>,
     size: usize,
     flags: VmMapFlags,
+    coherent: bool,
 ) -> Result<Arc<MappedBo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -164,6 +188,7 @@ pub(crate) fn new_kernel_object(
         aligned_size as u64,
         KernelBoVaAlloc::Explicit(va),
         flags,
+        coherent,
     )?;
 
     MappedBo::new(kernel_bo, node)
@@ -205,6 +230,7 @@ impl KernelBo {
         size: u64,
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
+        coherent: bool,
     ) -> Result<Self> {
         if size == 0 {
             dev_err!(dev, "Cannot create KernelBo with size 0");
@@ -220,7 +246,7 @@ impl KernelBo {
             ddev,
             bo_size,
             shmem::ObjectConfig {
-                map_wc: true,
+                map_wc: should_map_wc(coherent),
                 parent_resv_obj: None,
             },
             BoCreateArgs { flags: 0 },
