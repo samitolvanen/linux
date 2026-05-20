@@ -556,13 +556,22 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
-        if bocreate.flags & !uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
+        let valid_flags = uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP
+            | uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_WB_MMAP;
+
+        if bocreate.flags & !valid_flags != 0 {
             dev_err!(
                 ddev.as_ref(),
                 "bo_create: invalid flags {}\n",
                 bocreate.flags
             );
 
+            return Err(EINVAL);
+        }
+
+        let no_mmap = uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP;
+        let wb_mmap = uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_WB_MMAP;
+        if bocreate.flags & no_mmap != 0 && bocreate.flags & wb_mmap != 0 {
             return Err(EINVAL);
         }
 
