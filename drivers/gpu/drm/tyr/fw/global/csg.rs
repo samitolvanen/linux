@@ -227,8 +227,7 @@ impl CsgInterface {
         Ok(enabled.csg_output.read(CSG_ACK))
     }
 
-    #[allow(dead_code)]
-    pub(in super::super) fn read_output_db_ack(&self) -> Result<CSG_DB_ACK> {
+    pub(crate) fn read_output_db_ack(&self) -> Result<CSG_DB_ACK> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),
