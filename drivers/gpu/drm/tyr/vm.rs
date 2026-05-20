@@ -1300,6 +1300,11 @@ fn pt_map(
 
         let (pgsize, pgcount) = get_pgsize(curr_iova | curr_paddr, remaining);
 
+        // TODO: GFP_NOWAIT because this runs in the VM_BIND dma-fence
+        // signalling section. The proper fix is to preallocate page-table
+        // pages in the prepare phase (like Panthor's rsvd_page_tables +
+        // custom io-pgtable allocator) so this path does not allocate.
+        //
         // SAFETY: Exclusive access to the page table is ensured because
         // the pt reference comes from PtUpdateContext, which is created
         // during a VM update operation, ensuring the driver does not concurrently
@@ -1311,7 +1316,7 @@ fn pt_map(
                 pgsize as usize,
                 pgcount as usize,
                 prot,
-                GFP_KERNEL,
+                GFP_NOWAIT,
             )
         };
 
