@@ -2,6 +2,10 @@
 
 use kernel::{
     alloc::KVec,
+    device::{
+        Bound,
+        Device, //
+    },
     drm::{
         self,
         gem::BaseObject,
@@ -234,7 +238,7 @@ impl TyrDrmFileData {
         }
 
         if vmbind.flags & async_flag != 0 {
-            return Self::vm_bind_async(ddev, vmbind, file);
+            return Self::vm_bind_async(ddev, reg_data, vmbind, file);
         }
 
         if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
@@ -320,6 +324,7 @@ impl TyrDrmFileData {
 
     fn vm_bind_async(
         _ddev: &TyrDrmDevice<Registered>,
+        reg_data: &TyrDrmRegistrationData<'_>,
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
@@ -353,7 +358,7 @@ impl TyrDrmFileData {
                     Err(EINVAL)?;
                 }
 
-                let (job, syncs) = op.capture(file, &vm, true)?;
+                let (job, syncs) = op.capture(reg_data.pdev.as_ref(), file, &vm, true)?;
                 let deps = deps::wait_fences(file, &syncs)?;
                 let signals = deps::signal_syncs(file, &syncs)?;
                 let prepared = vm.prepare_bind_job(job, &deps)?;
@@ -575,6 +580,7 @@ unsafe impl FromBytes for VmBindOp {}
 impl VmBindOp {
     fn capture(
         &self,
+        dev: &Device<Bound>,
         file: &TyrDrmFile,
         vm: &vm::Vm,
         is_async: bool,
@@ -608,6 +614,7 @@ impl VmBindOp {
                 }
 
                 job.push_map(
+                    dev,
                     vm,
                     bo,
                     self.0.bo_offset,

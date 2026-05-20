@@ -21,6 +21,7 @@ use kernel::{
         Bound,
         Device, //
     },
+    dma::DmaAddress,
     dma_buf::dma_fence::{
         DmaFenceWorkqueue,
         DriverDmaFence,
@@ -317,8 +318,10 @@ impl VmBindJob {
         Self { ops: KVec::new() }
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn push_map(
         &mut self,
+        dev: &Device<Bound>,
         vm: &Vm,
         bo: ARef<Bo>,
         bo_offset: u64,
@@ -333,6 +336,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
+            map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -357,6 +361,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: None,
+            map_sgt: None,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -504,6 +509,11 @@ pub(crate) struct VmOpResources {
     /// registration does not run on the path to `dma_fence_signal()`.
     /// `None` for Unmap.
     vm_bo: Option<ARef<GpuVmBo<GpuVmData>>>,
+    /// SG-table segments of the BO being mapped, prefetched outside the
+    /// VM_BIND dma-fence signalling section. Each entry is a
+    /// `(dma_address, dma_len)` pair, in the order yielded by the BO's
+    /// scatter-gather table. `None` for Unmap.
+    map_sgt: Option<KVVec<(DmaAddress, u64)>>,
 }
 
 /// Request to execute a virtual memory operation.
@@ -1141,6 +1151,7 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: Some(self.gpuvm.obtain(bo, ())?),
+            map_sgt: Some(prefetch_map_sgt(bo, dev)?),
         };
         let result = self.map_bo_range_inner(dev, bo_offset, map_size, va, flags, &mut resources);
 
@@ -1200,6 +1211,7 @@ impl VmExec {
                 ]
             },
             vm_bo: None,
+            map_sgt: None,
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
 
@@ -1253,16 +1265,12 @@ impl DriverGpuVm for GpuVmData {
             }
         };
 
-        let sgt = op.obj().sg_table(dev).inspect_err(|e| {
-            dev_err!(context.dev, "Failed to get sg_table: {:?}", e);
-        })?;
+        let map_sgt = context.resources.map_sgt.as_ref().ok_or(EINVAL)?;
 
-        for sgt_entry in sgt.iter() {
+        for &(paddr, mut sgt_entry_length) in map_sgt.iter() {
             // Expressly convert to u64 to work with arm 32-bit builds.
             #[allow(clippy::useless_conversion)]
-            let mut paddr = u64::from(sgt_entry.dma_address());
-            #[allow(clippy::useless_conversion)]
-            let mut sgt_entry_length = u64::from(sgt_entry.dma_len());
+            let mut paddr = u64::from(paddr);
 
             if bytes_left_to_map == 0 {
                 break;
@@ -1430,6 +1438,30 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
     let pgcount = u64::min(blk_offset, size) / SZ_2M as u64;
 
     (SZ_2M as u64, pgcount)
+}
+
+/// Collects the BO's scatter-gather segments outside the VM_BIND
+/// signalling section.
+///
+/// The first call for a buffer populates the cached SG table under
+/// `dma_resv_lock`, which must not be taken on the path to
+/// `dma_fence_signal()`. Later calls are lock-free. The segments are
+/// consumed lock-free inside the signalling section.
+fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(DmaAddress, u64)>> {
+    let sgt = bo.sg_table(dev).inspect_err(|e| {
+        dev_err!(dev, "Failed to get sg_table: {:?}", e);
+    })?;
+
+    let mut segments = KVVec::new();
+    for sgt_entry in sgt.iter() {
+        // Expressly convert to u64 to work with arm 32-bit builds.
+        #[allow(clippy::useless_conversion)]
+        let len = u64::from(sgt_entry.dma_len());
+
+        segments.push((sgt_entry.dma_address(), len), GFP_KERNEL)?;
+    }
+
+    Ok(segments)
 }
 
 /// Maps a physical address range into the page table at the specified virtual address.
