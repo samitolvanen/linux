@@ -90,6 +90,12 @@ pub(crate) struct TyrDrmDeviceData {
     /// Physical address of the GPU MMIO window.
     pub(crate) mmio_phys_addr: u64,
 
+    /// Whether the device is reported as DMA-coherent by firmware.
+    ///
+    /// Cached at probe via `device_get_dma_attr()`. Drives the BO
+    /// cacheability policy in `crate::gem::should_map_wc`.
+    pub(crate) coherent: bool,
+
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
@@ -226,10 +232,13 @@ impl platform::Driver for TyrPlatformDriver {
         // other threads of execution.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)? };
 
+        let coherent = pdev.as_ref().dma_coherent();
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
                 mmio_phys_addr,
+                coherent,
                 sched <- new_mutex!(SchedulerState::Disabled),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
             }? Error),
@@ -243,6 +252,7 @@ impl platform::Driver for TyrPlatformDriver {
             &unreg_dev,
             mmu.as_arc_borrow(),
             &gpu_info,
+            coherent,
         )?;
 
         // SAFETY: The registration is owned by `mmu_irq` and then by

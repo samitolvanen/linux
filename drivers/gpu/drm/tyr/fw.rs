@@ -205,6 +205,7 @@ impl<'drm> Firmware<'drm> {
         ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
+        coherent: bool,
     ) -> Result<Firmware<'drm>> {
         let dev = pdev.as_ref();
         let vm = Vm::new_fw(
@@ -214,6 +215,7 @@ impl<'drm> Firmware<'drm> {
             gpu_info,
             u64::from(CSF_MCU_SHARED_REGION_START),
             u64::from(CSF_MCU_SHARED_REGION_SIZE),
+            coherent,
         )?;
         vm.activate()?;
 
@@ -238,6 +240,7 @@ impl<'drm> Firmware<'drm> {
                     size,
                     KernelBoVaAlloc::Explicit(va),
                     vm_map_flags,
+                    coherent,
                 )?;
 
                 let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
@@ -359,7 +362,7 @@ impl<'drm> Firmware<'drm> {
         let dev = self.dev.as_ref();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
 
-        gem::new_kernel_object(dev, ddev, &self.vm, SZ_8K, flags)
+        gem::new_kernel_object(dev, ddev, &self.vm, SZ_8K, flags, ddev.coherent)
     }
 
     pub(crate) fn alloc_suspend_buf(
@@ -370,7 +373,7 @@ impl<'drm> Firmware<'drm> {
         let dev = self.dev.as_ref();
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
-        gem::new_kernel_object(dev, ddev, &self.vm, suspend_size, flags)
+        gem::new_kernel_object(dev, ddev, &self.vm, suspend_size, flags, ddev.coherent)
     }
 }
 
