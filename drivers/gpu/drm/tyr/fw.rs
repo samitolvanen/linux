@@ -198,6 +198,7 @@ impl Firmware {
             u64::from(CSF_MCU_SHARED_REGION_START),
             u64::from(CSF_MCU_SHARED_REGION_SIZE),
             coherent,
+            cleanup_wq.clone(),
         )?;
 
         let parsed_sections = Self::load(ddev, gpu_info)?;
