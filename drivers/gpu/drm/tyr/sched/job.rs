@@ -99,7 +99,7 @@ impl Instr {
     }
 
     /// `ERROR_BARRIER`: terminate any pending error propagation so a
-    /// later [`sync_add64`](Self::sync_add64) does not inherit a stale
+    /// later `sync_add64` does not inherit a stale
     /// error state.
     fn error_barrier() -> u64 {
         Self::ERROR_BARRIER << 56
@@ -123,10 +123,10 @@ unsafe impl FromBytes for RawQueueSubmit {}
 struct StreamPiece {
     /// GPU virtual address of the userspace command stream the wrapper
     /// `CALL`s into. Validated as 64-byte aligned by
-    /// [`RawQueueSubmit::validate`].
+    /// `RawQueueSubmit::validate`.
     stream_addr: u64,
     /// Length of the userspace command stream in bytes. Validated as
-    /// 8-byte aligned by [`RawQueueSubmit::validate`].
+    /// 8-byte aligned by `RawQueueSubmit::validate`.
     stream_size: u32,
     /// FLUSH_ID counter snapshot the userspace ABI passes through so the
     /// wrapper's `FLUSH_CACHE2` is conditional on the GPU not having
@@ -404,17 +404,24 @@ impl Job {
             KVec::new()
         };
 
-        let prepared = queue.prepare_job(QueueJob::new(wrapped, group.clone()), &deps)?;
-
         // Claim one per-queue seqno per emitted wrapper, in a single
-        // atomic step, only after every fallible prepare step has
-        // succeeded. An earlier `claim_seqnos` followed by a failure
-        // in `prepare_job` would advance `next_seqno` without ever
-        // queueing the matching wrappers, leaving a gap that
-        // `cancel_queues` would then mark dead with the wrong upper
-        // bound. Stream-less jobs never reach the GPU and so do not
-        // consume a seqno.
-        queue.claim_seqnos(self.pieces.len());
+        // atomic step, only after every fallible prepare step that can
+        // still run before `prepare_job` has succeeded. An earlier
+        // `claim_seqnos` followed by a failure would advance
+        // `next_seqno` without ever queueing the matching wrappers,
+        // leaving a gap that `cancel_queues` would then mark dead with
+        // the wrong upper bound. Stream-less jobs never reach the GPU
+        // and so do not consume a seqno.
+        let done_seqno = if has_stream {
+            Some(queue.claim_seqnos(self.pieces.len()))
+        } else {
+            None
+        };
+
+        let prepared = queue.prepare_job(
+            QueueJob::new(wrapped, done_seqno, group.clone(), self.queue_index),
+            &deps,
+        )?;
 
         Ok(PreparedQueueSubmit {
             queue_index: self.queue_index,

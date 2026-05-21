@@ -968,6 +968,47 @@ impl Scheduler {
         });
     }
 
+    /// Drains every resident queue's pending submit fences whose
+    /// `done_seqno` is at or below the per-queue syncobj value.
+    ///
+    /// Must be called *outside* `TyrDrmDeviceData::with_locked_scheduler`:
+    /// the per-queue `complete_submit_fences` opens a
+    /// `DmaFenceSignallingAnnotation` and signals user-visible
+    /// dma-fences, and signalling-section code may not nest inside a
+    /// wide driver lock like the scheduler mutex.
+    ///
+    /// Snapshots the bound groups under the slot-manager lock and
+    /// drops it before touching firmware-shared memory; the snapshot
+    /// is a fixed-capacity `[Option<Arc<Group>>; MAX_CSGS]` so this
+    /// stays allocation-free. Per-queue read errors are logged and
+    /// skipped.
+    pub(crate) fn drain_resident_queue_completions(tdev: &TyrDrmDevice) {
+        let mut snapshot: [Option<Arc<Group>>; MAX_CSGS] = [const { None }; MAX_CSGS];
+        {
+            let csg_slot_manager = tdev.csg_slot_manager.lock();
+            for (csg_idx, slot) in snapshot.iter_mut().enumerate() {
+                if let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) {
+                    *slot = Some(slot_data.group.clone());
+                }
+            }
+        }
+
+        for entry in snapshot.iter() {
+            let Some(group) = entry else {
+                continue;
+            };
+            for (queue_idx, queue) in group.queues.iter().enumerate() {
+                match group.read_syncobj(queue_idx) {
+                    Ok(syncobj) => queue.complete_submit_fences(syncobj.seqno),
+                    Err(err) => pr_err!(
+                        "sync_upd: queue completion drain failed: {}\n",
+                        err.to_errno()
+                    ),
+                }
+            }
+        }
+    }
+
     /// Snapshots the wait list under the scheduler mutex.
     ///
     /// Walks `waiting_groups` and records `(Arc<Group>, prio,

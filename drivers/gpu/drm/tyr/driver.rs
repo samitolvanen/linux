@@ -388,14 +388,21 @@ impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
 impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
+    /// After draining completions, re-evaluate the wait list in three
+    /// phases: snapshot under the scheduler mutex, evaluate without it (so
+    /// gpuvm_unique and dma_resv_lock stay outside the mutex), then apply,
+    /// re-validating against the live wait list before promoting groups.
     fn run(this: Self::Pointer) {
-        let snapshot = this
+        let tdev = &*this;
+        Scheduler::drain_resident_queue_completions(tdev);
+
+        let snapshot = tdev
             .with_locked_scheduler(|sched| Ok(sched.collect_syncwait_candidates()))
             .unwrap_or_default();
 
         let results = Scheduler::evaluate_syncwait_candidates(snapshot);
 
-        let immediate_tick = this
+        let immediate_tick = tdev
             .with_locked_scheduler(|sched| Ok(sched.apply_syncwait_results(results)))
             .unwrap_or(false);
 
