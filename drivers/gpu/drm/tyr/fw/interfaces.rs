@@ -44,8 +44,22 @@
 pub(in crate::fw) use self::{
     cs::{
         control::{STREAM_FEATURES, STREAM_INPUT_VA, STREAM_OUTPUT_VA},
-        input::{CS_REQ, CS_TILER_HEAP_END, CS_TILER_HEAP_START},
-        output::{CS_ACK, CS_HEAP_ADDRESS, CS_HEAP_FRAG_END, CS_HEAP_VT_END, CS_HEAP_VT_START},
+        input::{
+            CS_ACK_IRQ_MASK,
+            CS_BASE,
+            CS_CONFIG,
+            CS_REQ,
+            CS_SIZE,
+            CS_TILER_HEAP_END,
+            CS_TILER_HEAP_START,
+            CS_USER_INPUT,
+            CS_USER_OUTPUT, //
+        },
+        output::{
+            CS_ACK, CS_HEAP_ADDRESS, CS_HEAP_FRAG_END, CS_HEAP_VT_END, CS_HEAP_VT_START,
+            CS_STATUS_BLOCKED_REASON, CS_STATUS_SCOREBOARDS, CS_STATUS_WAIT,
+            CS_STATUS_WAIT_SYNC_POINTER, CS_STATUS_WAIT_SYNC_VALUE, CS_STATUS_WAIT_SYNC_VALUE_HI,
+        },
         CS_CONTROL_BLOCK_SIZE, CS_KERNEL_INPUT_BLOCK_SIZE, CS_KERNEL_OUTPUT_BLOCK_SIZE,
     },
     csg::{
@@ -89,6 +103,11 @@ pub(crate) use self::csg::{
     },
     CsgExecutionState, //
 };
+
+pub(crate) use self::cs::output::{
+    CsBlockedReason, CsWaitCondition, CS_FATAL, CS_FATAL_INFO, CS_FAULT, CS_FAULT_INFO,
+};
+pub(crate) use self::cs::CsFaultExceptionType;
 
 /// Generic firmware interface infrastructure.
 ///
@@ -1143,7 +1162,7 @@ mod csg {
 ///
 /// This module contains the register definitions and types for CS interfaces,
 /// including control, input, and output blocks.
-mod cs {
+pub(super) mod cs {
     use core::convert::TryFrom;
 
     use kernel::{
@@ -1259,7 +1278,7 @@ mod cs {
     /// CS wait condition (csf_wait_condition_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsWaitCondition {
+    pub(crate) enum CsWaitCondition {
         /// Sync Object <= Comparison Register.
         Le = 0,
         /// Sync Object > Comparison Register.
@@ -1287,7 +1306,7 @@ mod cs {
     /// CS blocked reason (cs_blocked_reason_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsBlockedReason {
+    pub(crate) enum CsBlockedReason {
         /// The command stream is not blocked.
         Unblocked = 0,
         /// Blocked on scoreboards in some way.
@@ -1334,7 +1353,7 @@ mod cs {
     /// CS_FAULT exception type (restricted subset of exception_type_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsFaultExceptionType {
+    pub(crate) enum CsFaultExceptionType {
         /// No error.
         Ok = 0x00,
         /// Shader program executed a KABOOM instruction.
@@ -1400,6 +1419,8 @@ mod cs {
         Ok = 0x00,
         /// Command stream config invalid.
         CsConfigFault = 0x40,
+        /// Command stream marked as unrecoverable; firmware will not resume it.
+        CsUnrecoverable = 0x41,
         /// No endpoints available.
         CsEndpointFault = 0x44,
         /// Command stream bus error.
@@ -1419,6 +1440,7 @@ mod cs {
             match val.get() {
                 0x00 => Ok(CsFatalExceptionType::Ok),
                 0x40 => Ok(CsFatalExceptionType::CsConfigFault),
+                0x41 => Ok(CsFatalExceptionType::CsUnrecoverable),
                 0x44 => Ok(CsFatalExceptionType::CsEndpointFault),
                 0x48 => Ok(CsFatalExceptionType::CsBusFault),
                 0x49 => Ok(CsFatalExceptionType::CsInvalidInstruction),
@@ -1580,13 +1602,15 @@ mod cs {
 
     /// CS_KERNEL_OUTPUT_BLOCK.
     pub(super) mod output {
-        use super::{
+        pub(crate) use super::{
             CsBlockedReason,
+            CsWaitCondition, //
+        };
+        use super::{
             CsFatalExceptionType,
             CsFaultExceptionType,
             CsSbWaitSource,
-            CsState,
-            CsWaitCondition, //
+            CsState, //
         };
         use kernel::register;
 
