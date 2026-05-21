@@ -47,7 +47,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
     fn run(this: Self::Pointer) {
         let tdev = &*this;
 
-        let pending = tdev.with_locked_scheduler(|sched| sched.collect_pending_tiler_ooms(tdev));
+        let pending = Scheduler::collect_pending_tiler_ooms(tdev);
 
         let pending = match pending {
             Ok(pending) => pending,
@@ -161,19 +161,23 @@ impl Scheduler {
         Ok(queued_tiler_oom)
     }
 
-    fn collect_pending_tiler_ooms(&mut self, tdev: &TyrDrmDevice) -> Result<KVec<PendingOom>> {
+    fn collect_pending_tiler_ooms(tdev: &TyrDrmDevice) -> Result<KVec<PendingOom>> {
         let mut pending = KVec::new();
 
-        // Snapshot the (csg_id, group) pairs that have a pending
+        // Snapshot the (group, oom_mask) pairs that have a pending
         // tiler-OOM bit set, then drop the slot-manager lock before
         // we read the per-CS OOM state from the firmware. Holding
         // slot-manager across with_csg_mut() would order it ahead of
         // fw.inner, but other paths take fw.inner standalone;
-        // introducing that order would risk ABBA.
-        let mut to_visit: KVec<(usize, Arc<Group>, u32)> = KVec::new();
+        // introducing that order would risk ABBA. The snapshot is a
+        // fixed-capacity array so this stays allocation-free under the
+        // lock; the pending KVec is built afterwards with no scheduler
+        // or slot-manager lock held.
+        let mut to_visit: [Option<(Arc<Group>, u32)>; super::MAX_CSGS] =
+            [const { None }; super::MAX_CSGS];
         {
             let slot_manager = tdev.csg_slot_manager.lock();
-            for csg_id in 0..super::MAX_CSGS {
+            for (csg_id, slot) in to_visit.iter_mut().enumerate() {
                 let data = match slot_manager.slot_data(csg_id) {
                     Some(data) => data,
                     None => continue,
@@ -184,11 +188,14 @@ impl Scheduler {
                     continue;
                 }
 
-                to_visit.push((csg_id, data.group.clone(), oom_mask), GFP_KERNEL)?;
+                *slot = Some((data.group.clone(), oom_mask));
             }
         }
 
-        for (csg_id, group, oom_mask) in to_visit.into_iter() {
+        for (csg_id, entry) in to_visit.into_iter().enumerate() {
+            let Some((group, oom_mask)) = entry else {
+                continue;
+            };
             for cs_id in 0u32..32 {
                 if oom_mask & (1u32 << cs_id) == 0 {
                     continue;
