@@ -10,6 +10,7 @@
 mod exec;
 pub(crate) mod range;
 
+use core::mem::ManuallyDrop;
 use core::ops::{
     Deref,
     Range, //
@@ -63,6 +64,7 @@ use kernel::{
     },
     new_mutex,
     platform,
+    pr_warn_once,
     prelude::*,
     sizes::{
         SZ_1G,
@@ -85,6 +87,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        CleanupQueue,
         TyrDrmDevice,
         TyrDrmDriver,
         TyrDrmRegistrationData, //
@@ -606,7 +609,7 @@ pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64
 /// GPU virtual address space.
 ///
 /// Each VM can be mapped into a hardware address space slot.
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct VmExec {
     /// Data referenced by an AS when the VM is active
     as_data: Arc<VmAsData>,
@@ -615,15 +618,60 @@ pub(crate) struct VmExec {
     /// Parent device used for logging.
     pdev: ARef<platform::Device>,
     /// DRM GPUVM core for managing virtual address space.
+    ///
+    /// `Some` for the entire lifetime of the value; taken to `None`
+    /// only by `Drop` when handing the gpuvm reference to the cleanup
+    /// workqueue.
     #[pin]
-    gpuvm_unique: Mutex<UniqueRefGpuVm<GpuVmData>>,
+    gpuvm_unique: Mutex<Option<UniqueRefGpuVm<GpuVmData>>>,
     /// Non-core part of the GPUVM. Can be used for stuff that doesn't modify the
     /// internal mapping tree, like GpuVm::obtain()
-    gpuvm: ARef<GpuVm<GpuVmData>>,
+    ///
+    /// Wrapped in `ManuallyDrop` so `Drop` can move this reference into
+    /// the cleanup workqueue closure rather than dropping it inline.
+    gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
     /// VA range for this VM.
     va_range: Range<u64>,
+    /// Cleanup workqueue used by `Drop` to defer the final
+    /// `drm_gpuvm_put` out of any dma-fence signalling section the drop
+    /// may run under.
+    cleanup_wq: Arc<CleanupQueue>,
+}
+
+#[pinned_drop]
+impl PinnedDrop for VmExec {
+    fn drop(self: Pin<&mut Self>) {
+        // SAFETY: We do not move out of any structurally pinned field.
+        // The `Mutex` is only accessed through `try_lock` in place, and
+        // the only field moved out is `gpuvm`, which is not `#[pin]`.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        // SAFETY: `Drop` runs at most once, and this is the only
+        // `ManuallyDrop::take` of `gpuvm`. The field is never read again
+        // afterwards. Moving out the reference here (rather than dropping
+        // it inline) keeps the final `drm_gpuvm_put`, which frees the
+        // GPUVM's r_obj GEM under `dma_resv_lock`, off the dma-fence
+        // signalling section this drop may run under.
+        let gpuvm = unsafe { ManuallyDrop::take(&mut this.gpuvm) };
+        // The last `VmExec` reference is dropping, so nothing else can
+        // hold the lock and `try_lock` cannot block here on the
+        // signalling path. `None` only on the impossible contended case,
+        // in which the inner reference drops inline with the mutex.
+        let gpuvm_unique = this.gpuvm_unique.try_lock().and_then(|mut g| g.take());
+
+        let res = this.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            drop(gpuvm);
+            drop(gpuvm_unique);
+        });
+
+        if res.is_err() {
+            pr_warn_once!(
+                "VmExec cleanup_wq enqueue failed under memory pressure; performing inline gpuvm teardown (lockdep cycle may fire)\n",
+            );
+        }
+    }
 }
 
 /// GPU virtual address space.
@@ -655,6 +703,7 @@ impl Vm {
         kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
         coherent: bool,
+        cleanup_wq: Arc<CleanupQueue>,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
@@ -691,10 +740,11 @@ impl Vm {
                 as_data,
                 pdev: pdev.into(),
                 mmu: mmu.into(),
-                gpuvm,
-                gpuvm_unique <- new_mutex!(gpuvm_unique),
+                gpuvm: ManuallyDrop::new(gpuvm),
+                gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: Atomic::new(false),
                 va_range: total_range,
+                cleanup_wq,
             }),
             GFP_KERNEL,
         )?;
@@ -731,6 +781,7 @@ impl Vm {
     /// Callers must reserve any explicit-VA sections inside the window with
     /// `reserve_kernel_range` before
     /// `alloc_kernel_range` is called.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_fw(
         pdev: &platform::Device<Bound>,
         ddev: &TyrDrmDevice,
@@ -739,6 +790,7 @@ impl Vm {
         auto_kernel_va_start: u64,
         auto_kernel_va_size: u64,
         coherent: bool,
+        cleanup_wq: Arc<CleanupQueue>,
     ) -> Result<Arc<Vm>> {
         let total_range = 0..max_va_range(gpu_info);
         let kernel_range = auto_kernel_va_start..(auto_kernel_va_start + auto_kernel_va_size);
@@ -752,6 +804,7 @@ impl Vm {
             kernel_range,
             None,
             coherent,
+            cleanup_wq,
         )
     }
 
@@ -782,6 +835,7 @@ impl Vm {
             kernel_range,
             Some(bind_wq),
             ddev.coherent,
+            ddev.cleanup_wq.clone(),
         )
     }
 
@@ -1027,7 +1081,7 @@ impl VmExec {
             ],
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
-        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)
+        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, &mut resources)
     }
 
     pub(crate) fn flush_deferred_cleanup(&self) {
@@ -1096,7 +1150,7 @@ impl VmExec {
             },
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
-        self.exec_op(gpuvm_unique.as_mut().get_mut(), req, &mut resources)
+        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, &mut resources)
     }
 
     pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
