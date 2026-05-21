@@ -72,6 +72,14 @@ pub(crate) struct TyrDrmDriver;
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, Ctx>;
 
+/// Per-device work-slot identifiers used as the `WORK_ID` const
+/// generic on this device's work-item fields and their `HasWork` /
+/// `HasDelayedWork` impls.
+pub(crate) mod work_id {
+    /// Tiler heap out-of-memory growth worker.
+    pub(crate) const TILER_OOM: u64 = 5;
+}
+
 /// `Send + Sync` newtype around `OwnedQueue` so the cleanup
 /// workqueue can be shared as `Arc<CleanupQueue>` between the device
 /// and the `KernelBo`s that enqueue deferred
@@ -119,6 +127,12 @@ pub(crate) struct TyrDrmDeviceData {
 
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
+    /// Dedicated DMA-fence-constrained workqueue for the scheduler
+    /// bottom half. Created `WQ_HIGHPRI` (`MEM_RECLAIM` is added by
+    /// `DmaFenceWorkqueue::new`) so the scheduler can keep up with
+    /// firmware acks under memory pressure.
+    pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
+
     /// Per-device cleanup workqueue.
     ///
     /// Carries deferred drops from objects whose `Drop` would
@@ -149,7 +163,7 @@ pub(crate) struct TyrDrmDeviceData {
     sched: Mutex<SchedulerState>,
 
     #[pin]
-    pub(crate) tiler_oom_work: Work<TyrDrmDevice, 4>,
+    pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 }
 
 impl TyrDrmDeviceData {
@@ -262,6 +276,11 @@ impl platform::Driver for TyrPlatformDriverData {
             GFP_KERNEL,
         )?;
 
+        let sched_wq = Arc::new(
+            DmaFenceWorkqueue::new(c"tyr-sched", WqFlags::HIGHPRI, 0)?,
+            GFP_KERNEL,
+        )?;
+
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
                 mmu,
@@ -270,6 +289,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 coherent,
                 fw: firmware,
                 wq,
+                sched_wq,
                 cleanup_wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,

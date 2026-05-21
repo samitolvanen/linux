@@ -27,6 +27,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        work_id,
         IoMem,
         TyrDrmDevice, //
     },
@@ -172,7 +173,8 @@ impl TyrIrqTrait for JobIrq {
                 .unwrap_or(false);
 
             if queued_tiler_oom {
-                let _ = workqueue::system().enqueue::<ARef<TyrDrmDevice>, 4>(ARef::from(tdev));
+                let _ = workqueue::system()
+                    .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(ARef::from(tdev));
             }
         }
 
