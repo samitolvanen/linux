@@ -110,12 +110,10 @@ impl GroupInner {
             && self.fatal_error.is_none()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn blocked_queues(&self) -> u32 {
         self.blocked_queues
     }
 
-    #[expect(dead_code)]
     pub(crate) fn has_blocked_queues(&self) -> bool {
         self.blocked_queues != 0
     }
@@ -450,7 +448,6 @@ impl Group {
     ///
     /// Must not be called from a dma-fence signalling section:
     /// the foreign-BO path takes `dma_resv_lock` and `GFP_KERNEL`-vmaps.
-    #[expect(dead_code)]
     pub(crate) fn eval_syncwait(&self, queue_idx: usize) -> Result<bool> {
         let queue = self.queues.get(queue_idx).ok_or(EINVAL)?;
         let syncwait = queue.syncwait_snapshot();
