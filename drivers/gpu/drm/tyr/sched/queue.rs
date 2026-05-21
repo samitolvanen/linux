@@ -159,6 +159,11 @@ pub(crate) struct QueueData {
     iomem: Arc<DevresIoMem<SZ_2M>>,
     #[pin]
     pending_submit_fences: Mutex<PendingFences>,
+    /// Submit fence of the most-recently committed command-stream job
+    /// on this queue, in FIFO submit order. A stream-less job emits no
+    /// GPU work of its own, so it waits on this fence. Its own submit
+    /// fence then signals only once the prior command stream's GPU work
+    /// retires. `None` until the first command-stream job is committed.
     #[pin]
     last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
     /// Active GPU sync-wait captured for this queue. The `Default`
@@ -223,6 +228,20 @@ impl QueueData {
     /// Returns the highest seqno claimed so far on this queue.
     pub(crate) fn next_seqno(&self) -> u64 {
         self.next_seqno.load(Relaxed)
+    }
+
+    /// Records `fence` as the queue's last command-stream submit fence,
+    /// dropping the previously stored one. Called in FIFO submit order
+    /// from `Context::commit` so a later stream-less job waits on the
+    /// immediately-FIFO-earlier command stream.
+    pub(in crate::sched) fn set_last_submit_fence(&self, fence: ARef<PublicDmaFence>) {
+        *self.last_submit_fence.lock() = Some(fence);
+    }
+
+    /// Returns a clone of the queue's last command-stream submit fence,
+    /// or `None` if no command-stream job has been committed yet.
+    pub(in crate::sched) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
+        self.last_submit_fence.lock().clone()
     }
 
     /// Copies `instrs` into the ringbuffer at the current `INSERT`. The
@@ -521,10 +540,6 @@ impl QueueData {
         })
     }
 
-    pub(super) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
-        self.last_submit_fence.lock().clone()
-    }
-
     /// Atomic snapshot of `(accumulated, in_flight_since)` for the
     /// timeout stage. The returned `since` is `Some(t)` when the queue
     /// is currently suspended off its CSG slot. `t` is the monotonic
@@ -782,12 +797,13 @@ impl DriverDmaFenceOps for QueueFenceData {
 pub(super) struct QueueJob {
     stream: KVec<u8>,
     /// Per-queue syncobj seqno value at which this job is complete.
-    /// `Some(v)` for stream-bearing jobs; `None` for sync-only jobs
-    /// that emit no `SYNC_ADD64` and thus do not advance the syncobj.
-    /// Set at prepare time from `QueueData::claim_seqnos` so the
-    /// submit and timeout paths can look up the matching pending
-    /// fence by the same key the firmware's `SYNC_ADD64` will produce.
-    done_seqno: Option<u64>,
+    /// Non-zero for stream-bearing jobs; zero for sync-only jobs that
+    /// emit no `SYNC_ADD64` and thus do not advance the syncobj. Set
+    /// from `QueueData::claim_seqnos` only after every fallible
+    /// prepare step has succeeded, so the submit and timeout paths can
+    /// look up the matching pending fence by the same key the
+    /// firmware's `SYNC_ADD64` will produce.
+    done_seqno: Atomic<u64>,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
     /// from the queue's current accumulator by the timeout stage so a
@@ -809,14 +825,13 @@ pub(super) struct QueueJob {
 impl QueueJob {
     pub(super) fn new(
         stream: KVec<u8>,
-        done_seqno: Option<u64>,
         group: Arc<Group>,
         queue_index: usize,
         reservation: Option<PendingFenceReservation>,
     ) -> Self {
         Self {
             stream,
-            done_seqno,
+            done_seqno: Atomic::new(0),
             baseline_suspend_nanos: Atomic::new(0),
             group,
             queue_index,
@@ -825,7 +840,14 @@ impl QueueJob {
     }
 
     fn done_seqno(&self) -> Option<u64> {
-        self.done_seqno
+        match self.done_seqno.load(Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    pub(super) fn set_done_seqno(&self, done_seqno: u64) {
+        self.done_seqno.store(done_seqno, Relaxed);
     }
 
     pub(super) fn baseline_suspend(&self) -> Delta {
@@ -1091,9 +1113,7 @@ impl Queue {
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
-        let submit_fence = self.job_queue.commit(prepared);
-        *self.data.last_submit_fence.lock() = Some(submit_fence.clone());
-        submit_fence
+        self.job_queue.commit(prepared)
     }
 
     /// Cancels every job tracked by this queue and signals all

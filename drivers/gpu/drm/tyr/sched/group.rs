@@ -65,9 +65,9 @@ use crate::{
 };
 
 use super::{
+    deps,
     job::{
         Job,
-        PreparedQueueSubmit,
         QueueSubmit, //
     },
     queue::{
@@ -223,10 +223,10 @@ pub(crate) struct Group {
     /// every queue claims its pipeline slots and fence seqnos in the
     /// same order.
     ///
-    /// Lock order `submit_lock > job queue`, with nothing else held
-    /// when it is taken. The window allocates, so the lock is off limits
-    /// to dma-fence signalling sections and must not cover a userspace
-    /// copy.
+    /// Lock order `submit_lock > {drm_exec, job queue}`, with nothing
+    /// else held when it is taken. The window allocates and holds the VM
+    /// reservation lock, so the lock is off limits to dma-fence
+    /// signalling sections and must not cover a userspace copy.
     #[pin]
     submit_lock: Mutex<()>,
     pub(crate) tiler_oom: Atomic<u32>,
@@ -726,20 +726,27 @@ impl Group {
         }
 
         let jobs = Job::from_queue_submits(queue_submits)?;
-        let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
+        let job_count = jobs.len();
+        let mut ctx = deps::Context::new(file);
+
+        for (job, syncs) in jobs.into_iter() {
+            ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
+        }
+
+        ctx.collect_signal_ops()?;
 
         let _submit_lock = self.submit_lock.lock();
 
-        for job in jobs.into_iter() {
-            prepared_jobs.push(job.prepare(self, csif, file)?, GFP_KERNEL)?;
+        for idx in 0..job_count {
+            ctx.prepare(idx, self, csif)?;
         }
 
         self.vm
-            .with_prepared_vm(prepared_jobs.len() as u32, |mut prepared_vm| {
-                for prepared_job in prepared_jobs.into_iter() {
-                    let submit_fence = prepared_job.commit(self)?;
+            .with_prepared_vm(job_count as u32, |mut prepared_vm| {
+                for idx in 0..job_count {
+                    let signal_fence = ctx.commit(idx, self)?;
                     prepared_vm.resv_add_fence(
-                        &submit_fence,
+                        &signal_fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     );
@@ -747,6 +754,8 @@ impl Group {
 
                 Ok(())
             })?;
+
+        ctx.push_fences();
 
         Ok(())
     }
