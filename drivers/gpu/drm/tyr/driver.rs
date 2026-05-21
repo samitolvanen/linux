@@ -95,6 +95,14 @@ impl core::ops::Deref for CleanupQueue {
     }
 }
 
+/// Per-device work-slot identifiers used as the `WORK_ID` const
+/// generic on this device's work-item fields and their `HasWork` /
+/// `HasDelayedWork` impls.
+pub(crate) mod work_id {
+    /// Tiler heap out-of-memory growth worker.
+    pub(crate) const TILER_OOM: u64 = 5;
+}
+
 /// Data owned by the DRM device.
 ///
 /// Driver callbacks that cannot take a registration guard, such as the mmap hook, reach the
@@ -127,7 +135,7 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Deferred tiler heap growth for CS TILER_OOM events.
     #[pin]
-    pub(crate) tiler_oom_work: Work<TyrDrmDevice, 4>,
+    pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 }
 
 impl TyrDrmDeviceData {
@@ -172,6 +180,11 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Workqueue for work items that may signal DMA fences.
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
+
+    /// Dedicated DMA-fence-constrained workqueue for the scheduler bottom half.
+    /// `DmaFenceWorkqueue::new_highpri` builds it as a per-cpu, high-priority, mem-reclaim
+    /// queue so the scheduler can keep up with firmware acks under memory pressure.
+    pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
     /// Workqueue for deferred tiler heap growth.
     ///
@@ -328,6 +341,8 @@ impl platform::Driver for TyrPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
+
         let heap_wq = Queue::new_unbound().build(c"tyr-heap")?;
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
@@ -337,6 +352,7 @@ impl platform::Driver for TyrPlatformDriver {
                 _job_irq: job_irq,
                 _mmu_irq: mmu_irq,
                 wq,
+                sched_wq,
                 heap_wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,

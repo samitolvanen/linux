@@ -29,6 +29,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        work_id,
         IoMem,
         TyrDrmDevice, //
     },
@@ -189,7 +190,9 @@ impl TyrIrqTrait for JobIrq<'_> {
                     guard.registration_data_with(|reg_data| {
                         let _ = reg_data
                             .heap_wq
-                            .enqueue::<ARef<TyrDrmDevice>, 4>(ARef::from(tdev));
+                            .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(ARef::from(
+                                tdev,
+                            ));
                     });
                 }
             }
