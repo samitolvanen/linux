@@ -361,8 +361,6 @@ impl QueueOps for VmBindQueueOps {
             Ok(())
         })();
 
-        self.exec.flush_deferred_cleanup();
-
         match result {
             Ok(()) => {
                 fence.signal(Ok(()));
@@ -751,6 +749,8 @@ impl Vm {
         job: VmBindJob,
         deps: &[ARef<PublicDmaFence>],
     ) -> Result<PreparedVmBindJob> {
+        self.flush_deferred_cleanup();
+
         self.bind_queue
             .as_ref()
             .ok_or(EINVAL)?
