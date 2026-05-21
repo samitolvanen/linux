@@ -271,12 +271,13 @@ pub(crate) struct CachedBo {
 pub(super) struct QueueJob {
     stream: KVec<u8>,
     /// Per-queue syncobj seqno value at which this job is complete.
-    /// `Some(v)` for stream-bearing jobs; `None` for sync-only jobs
-    /// that emit no `SYNC_ADD64` and thus do not advance the syncobj.
-    /// Set at prepare time from `QueueData::claim_seqnos` so the
-    /// submit and timeout paths can look up the matching pending
-    /// fence by the same key the firmware's `SYNC_ADD64` will produce.
-    done_seqno: Option<u64>,
+    /// Non-zero for stream-bearing jobs; zero for sync-only jobs that
+    /// emit no `SYNC_ADD64` and thus do not advance the syncobj. Set
+    /// from `QueueData::claim_seqnos` only after every fallible
+    /// prepare step has succeeded, so the submit and timeout paths can
+    /// look up the matching pending fence by the same key the
+    /// firmware's `SYNC_ADD64` will produce.
+    done_seqno: AtomicU64,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
     /// from the queue's current accumulator by the timeout stage so a
@@ -298,14 +299,13 @@ pub(super) struct QueueJob {
 impl QueueJob {
     pub(super) fn new(
         stream: KVec<u8>,
-        done_seqno: Option<u64>,
         group: Arc<Group>,
         queue_index: usize,
         reservation: Option<PendingFenceReservation>,
     ) -> Self {
         Self {
             stream,
-            done_seqno,
+            done_seqno: AtomicU64::new(0),
             baseline_suspend_nanos: AtomicI64::new(0),
             group,
             queue_index,
@@ -314,7 +314,14 @@ impl QueueJob {
     }
 
     fn done_seqno(&self) -> Option<u64> {
-        self.done_seqno
+        match self.done_seqno.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    pub(super) fn set_done_seqno(&self, done_seqno: u64) {
+        self.done_seqno.store(done_seqno, Ordering::Relaxed);
     }
 
     pub(super) fn baseline_suspend(&self) -> Delta {
