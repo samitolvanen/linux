@@ -224,6 +224,7 @@ impl<'drm> Firmware<'drm> {
             u64::from(CSF_MCU_SHARED_REGION_START),
             u64::from(CSF_MCU_SHARED_REGION_SIZE),
             coherent,
+            cleanup_wq.clone(),
         )?;
 
         let result = (|| {
