@@ -19,6 +19,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        work_id,
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
@@ -46,10 +47,10 @@ struct PendingOom {
 }
 
 kernel::impl_has_work! {
-    impl HasWork<TyrDrmDevice, 4> for TyrDrmDeviceData { self.tiler_oom_work }
+    impl HasWork<TyrDrmDevice, { work_id::TILER_OOM }> for TyrDrmDeviceData { self.tiler_oom_work }
 }
 
-impl WorkItem<4> for TyrDrmDeviceData {
+impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
