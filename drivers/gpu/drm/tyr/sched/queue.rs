@@ -2,7 +2,13 @@
 
 use core::{
     ops::{Deref, Range},
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{
+        AtomicBool,
+        AtomicI64,
+        AtomicU64,
+        AtomicUsize,
+        Ordering, //
+    },
 };
 
 use kernel::{
@@ -26,7 +32,13 @@ use kernel::{
     sizes::SZ_4K,
     sizes::SZ_64K,
     sync::{aref::ARef, Arc, LockClassKey, Mutex},
-    time::{msecs_to_jiffies, Jiffies},
+    time::{
+        msecs_to_jiffies,
+        Delta,
+        Instant,
+        Jiffies,
+        Monotonic, //
+    },
     transmute::FromBytes,
     uapi,
 };
@@ -46,8 +58,16 @@ use crate::{
 use super::group::Group;
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
-const JOB_POLL_INTERVAL_MS: u32 = 1;
 const JOB_TIMEOUT_MS: u32 = 5000;
+
+/// Smallest ringbuffer byte count one wrapped job stream consumes.
+///
+/// `sched::job::build_wrapped_stream` emits 11 8-byte instructions per
+/// piece and pads the concatenation up to a 64-byte boundary, so the
+/// minimum is `next_multiple_of(88, 64) == 128`. Used to size the
+/// pre-allocated pending-fence vec so `Queue::reserve_pending_submit_fence`
+/// never needs to allocate under the lock.
+const WRAPPER_RINGBUF_BYTES: usize = 128;
 
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 static TYR_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -115,7 +135,90 @@ struct PendingSubmitFence {
     /// so the syncobj only reaches this value once every dispatched
     /// async sub-job has landed in memory.
     done_seqno: u64,
-    fence: DriverDmaFence<QueueFenceData, Published>,
+    fence: Option<DriverDmaFence<QueueFenceData, Published>>,
+}
+
+/// State protected by the pending-submit-fences mutex.
+///
+/// `vec` carries the live ordered list of in-flight per-job fences.
+/// `outstanding` counts reservations made by
+/// `Queue::reserve_pending_submit_fence` whose `PendingFenceReservation`
+/// guard has not yet been consumed or dropped.
+///
+/// Tracking `outstanding` separately is what makes multiple consecutive
+/// reserves accumulate space. `KVec::reserve(additional)` only ensures
+/// `capacity - len >= additional` at the moment of the call, so without
+/// `outstanding` the second of two back-to-back reserves on an empty
+/// vec would observe `capacity - len == 1` already, do nothing, and
+/// the matching second push would fail `push_within_capacity` from
+/// inside the dma-fence signalling section that wraps the submit path.
+///
+/// `head` is the cursor into `vec` past which entries are live: the
+/// prefix `vec[..head]` is drained but not yet truncated and every
+/// such entry has `fence == None`. The suffix `vec[head..]` is the
+/// live ordered list; an entry inside it may still have `fence ==
+/// None` if an error path already took the fence out, which is
+/// treated as a hole and skipped on drain.
+/// `Queue::maybe_truncate_pending` compacts the prefix away once
+/// `head` exceeds `max(len / 2, 16)`.
+struct PendingFences {
+    vec: KVec<PendingSubmitFence>,
+    head: usize,
+    outstanding: usize,
+}
+
+/// RAII guard for a pending-submit-fence reservation.
+pub(in crate::sched) struct PendingFenceReservation {
+    queue: Arc<QueueData>,
+    consumed: AtomicBool,
+}
+
+impl PendingFenceReservation {
+    fn new(queue: Arc<QueueData>) -> Self {
+        Self {
+            queue,
+            consumed: AtomicBool::new(false),
+        }
+    }
+
+    /// Pushes `fence` into the queue's pending list, consuming this reservation.
+    fn consume(
+        &self,
+        done_seqno: u64,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
+        let pending_fence = PendingSubmitFence {
+            done_seqno,
+            fence: Some(fence),
+        };
+
+        let mut pending = self.queue.pending_submit_fences.lock();
+        match pending.vec.push_within_capacity(pending_fence) {
+            Ok(()) => {
+                pending.outstanding = pending.outstanding.saturating_sub(1);
+                self.consumed.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => match err.0.fence {
+                Some(fence) => Err((EINVAL, fence)),
+                None => {
+                    pending.outstanding = pending.outstanding.saturating_sub(1);
+                    self.consumed.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+            },
+        }
+    }
+}
+
+impl Drop for PendingFenceReservation {
+    fn drop(&mut self) {
+        if *self.consumed.get_mut() {
+            return;
+        }
+        let mut pending = self.queue.pending_submit_fences.lock();
+        pending.outstanding = pending.outstanding.saturating_sub(1);
+    }
 }
 
 /// Per-queue snapshot of the active GPU sync-wait. Populated when the
@@ -174,6 +277,12 @@ pub(super) struct QueueJob {
     /// submit and timeout paths can look up the matching pending
     /// fence by the same key the firmware's `SYNC_ADD64` will produce.
     done_seqno: Option<u64>,
+    /// Snapshot of `QueueData::suspend_snapshot` taken at submit
+    /// time, folded with any in-flight suspend interval; subtracted
+    /// from the queue's current accumulator by the timeout stage so a
+    /// job is not faulted for time the queue spent suspended off its
+    /// CSG slot before this job was submitted.
+    baseline_suspend_nanos: AtomicI64,
     /// Back-reference to the owning group; used by
     /// `TyrQueueOps::submit` to reach the scheduler workqueue when
     /// no CSG doorbell has been assigned to the queue yet.
@@ -182,6 +291,8 @@ pub(super) struct QueueJob {
     /// at prepare time so the timeout stage can read the per-queue
     /// syncobj without an extra lookup.
     queue_index: usize,
+    /// Reserved at prepare time, consumed in submit, rolled back on drop.
+    reservation: Option<PendingFenceReservation>,
 }
 
 impl QueueJob {
@@ -190,17 +301,48 @@ impl QueueJob {
         done_seqno: Option<u64>,
         group: Arc<Group>,
         queue_index: usize,
+        reservation: Option<PendingFenceReservation>,
     ) -> Self {
         Self {
             stream,
             done_seqno,
+            baseline_suspend_nanos: AtomicI64::new(0),
             group,
             queue_index,
+            reservation,
         }
     }
 
     fn done_seqno(&self) -> Option<u64> {
         self.done_seqno
+    }
+
+    pub(super) fn baseline_suspend(&self) -> Delta {
+        Delta::from_nanos(self.baseline_suspend_nanos.load(Ordering::Relaxed))
+    }
+
+    fn set_baseline_suspend(&self, baseline: Delta) {
+        self.baseline_suspend_nanos
+            .store(baseline.as_nanos(), Ordering::Relaxed);
+    }
+}
+
+/// Per-queue accounting of time spent off the CSG slot.
+struct SuspendState {
+    /// `Some(t)` when the queue is currently suspended off its CSG
+    /// slot; `t` is the monotonic instant at which the suspend began.
+    since: Option<Instant<Monotonic>>,
+    /// Total time the queue has spent suspended off its CSG slot
+    /// since creation.
+    accumulated: Delta,
+}
+
+impl Default for SuspendState {
+    fn default() -> Self {
+        Self {
+            since: None,
+            accumulated: Delta::ZERO,
+        }
     }
 }
 
@@ -213,11 +355,17 @@ pub(crate) struct QueueData {
     next_seqno: AtomicU64,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
-    pending_submit_fences: Mutex<KVec<PendingSubmitFence>>,
+    pending_submit_fences: Mutex<PendingFences>,
     /// Active GPU sync-wait captured for this queue. The `Default`
     /// value (`gpu_va == 0`) means no wait is currently active.
     #[pin]
     syncwait: Mutex<SyncWait>,
+    /// Per-queue accounting of off-slot suspend time; advanced by
+    /// `Self::suspend_timeout` / `Self::resume_timeout` from
+    /// `CsgSlotOps::evict` / `CsgSlotOps::activate` and snapshotted
+    /// by `TyrQueueOps::submit` for the per-job baseline.
+    #[pin]
+    suspend_state: Mutex<SuspendState>,
 }
 
 impl QueueData {
@@ -331,118 +479,103 @@ impl QueueData {
         )
     }
 
-    fn reserve_pending_submit_fence(&self) -> Result {
-        self.pending_submit_fences
-            .lock()
-            .reserve(1, GFP_KERNEL)
-            .map_err(Error::from)
-    }
-
-    fn add_pending_submit_fence(
-        &self,
-        done_seqno: u64,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> core::result::Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
-        let pending_fence = PendingSubmitFence { done_seqno, fence };
-
-        match self
-            .pending_submit_fences
-            .lock()
-            .push_within_capacity(pending_fence)
-        {
-            Ok(()) => Ok(()),
-            Err(err) => Err((EINVAL, err.0.fence)),
-        }
-    }
-
     fn signal_submit_fences_up_to(&self, up_to_seqno: u64, result: Result) {
         loop {
-            let pending_fence = {
+            let fence = {
                 let mut pending = self.pending_submit_fences.lock();
-
-                match pending.first() {
-                    Some(pending_fence) if pending_fence.done_seqno <= up_to_seqno => {
-                        pending.remove(0).ok()
-                    }
-                    _ => None,
+                let head = pending.head;
+                let Some(entry) = pending.vec.get_mut(head) else {
+                    Self::maybe_truncate_pending(&mut pending);
+                    break;
+                };
+                if entry.done_seqno > up_to_seqno {
+                    Self::maybe_truncate_pending(&mut pending);
+                    break;
                 }
+                let fence = entry.fence.take();
+                pending.head = head + 1;
+                fence
             };
 
-            let Some(pending_fence) = pending_fence else {
-                break;
-            };
-
-            let _annotation = DmaFenceSignallingAnnotation::new();
-            pending_fence.fence.signal(result);
+            if let Some(fence) = fence {
+                let _annotation = DmaFenceSignallingAnnotation::new();
+                fence.signal(result);
+            }
         }
     }
 
-    /// Drains every leading entry of `pending_submit_fences` whose
-    /// `done_seqno` is `<= up_to_seqno` into a local vec, then
-    /// signals each drained fence with `Ok(())` with no driver lock
-    /// held.
+    /// Signals each leading pending submit fence whose `done_seqno` is
+    /// `<= up_to_seqno`, dropping the queue lock before each
+    /// `dma_fence_signal()` so no driver lock is held across the signal.
     fn complete_pending_fences_up_to(&self, up_to_seqno: u64) {
-        let drained = {
-            let mut pending = self.pending_submit_fences.lock();
-
-            let mut k = 0usize;
-            for entry in pending.iter() {
-                if entry.done_seqno > up_to_seqno {
-                    break;
-                }
-                k += 1;
-            }
-
-            let mut drained = match KVec::with_capacity(k, GFP_KERNEL) {
-                Ok(v) => v,
-                Err(_) => {
-                    pr_err!("Tyr queue: drain allocation failed; deferring drain\n");
-                    return;
-                }
-            };
-
-            // Reverse once so the leading prefix is at the tail; pop
-            // returns the original head-first sequence in O(1) each.
-            // Reverse the surviving suffix back after the pop loop.
-            pending.reverse();
-            for _ in 0..k {
-                let Some(entry) = pending.pop() else {
+        loop {
+            let (_done_seqno, fence) = {
+                let mut pending = self.pending_submit_fences.lock();
+                let head = pending.head;
+                let Some(entry) = pending.vec.get_mut(head) else {
+                    Self::maybe_truncate_pending(&mut pending);
                     break;
                 };
-                let _ = drained.push_within_capacity(entry);
+                if entry.done_seqno > up_to_seqno {
+                    Self::maybe_truncate_pending(&mut pending);
+                    break;
+                }
+                let done_seqno = entry.done_seqno;
+                let fence = entry.fence.take();
+                pending.head = head + 1;
+                (done_seqno, fence)
+            };
+
+            if let Some(fence) = fence {
+                let _annotation = DmaFenceSignallingAnnotation::new();
+                fence.signal(Ok(()));
             }
-            pending.reverse();
-
-            drained
-        };
-
-        for pending_fence in drained.into_iter() {
-            let _annotation = DmaFenceSignallingAnnotation::new();
-            pending_fence.fence.signal(Ok(()));
         }
+    }
+
+    /// Compacts the drained prefix away once `head` has grown past
+    /// `max(len / 2, 16)`.
+    ///
+    /// Must preserve `vec.capacity()` so `Queue::reserve_pending_submit_fence`
+    /// never needs to grow the vec. `KVec::retain` shifts surviving
+    /// entries in place and only adjusts `len`, leaving the underlying
+    /// allocation intact.
+    fn maybe_truncate_pending(pending: &mut PendingFences) {
+        let len = pending.vec.len();
+        let threshold = core::cmp::max(len / 2, 16);
+        if pending.head < threshold {
+            return;
+        }
+        let drop_count = pending.head;
+        let mut i = 0usize;
+        pending.vec.retain(|_| {
+            let keep = i >= drop_count;
+            i += 1;
+            keep
+        });
+        pending.head = 0;
     }
 
     fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
-        let pending_fence = {
+        let fence = {
             let mut pending = self.pending_submit_fences.lock();
+            let head = pending.head;
             let mut position = None;
-
-            for (index, pending_fence) in pending.iter().enumerate() {
-                if pending_fence.done_seqno == done_seqno {
-                    position = Some(index);
+            for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
+                if entry.done_seqno == done_seqno {
+                    position = Some(idx);
                     break;
                 }
             }
-
-            position.and_then(|index| pending.remove(index).ok())
+            position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()))
         };
 
-        let Some(pending_fence) = pending_fence else {
+        let Some(fence) = fence else {
             return false;
         };
 
         let _annotation = DmaFenceSignallingAnnotation::new();
-        pending_fence.fence.signal(result);
+        fence.signal(result);
         true
     }
 
@@ -461,9 +594,9 @@ impl QueueData {
     /// gating on the firmware's `EXTRACT` decode pointer would race the
     /// dispatched work.
     ///
-    /// Used by both `HwTimeoutStage::process` (its progress-poll
-    /// path) and the IRQ-driven completion path on the scheduler
-    /// side.
+    /// Called from both the IRQ-driven completion path on the scheduler
+    /// side and from `QueueCompletionStage::process` as a defensive
+    /// backstop in case a sync-update IRQ was missed.
     pub(in crate::sched) fn complete_submit_fences(&self, syncobj_seqno: u64) {
         self.complete_pending_fences_up_to(syncobj_seqno);
     }
@@ -482,9 +615,12 @@ impl QueueData {
     /// Safe to call from inside a `DmaFenceSignallingAnnotation` section.
     pub(in crate::sched) fn fail_inflight_submit_fences(&self, syncobj_seqno: u64, err: Error) {
         let mut pending = self.pending_submit_fences.lock();
-        for entry in pending.iter_mut() {
+        let head = pending.head;
+        for entry in pending.vec.iter_mut().skip(head) {
             if entry.done_seqno > syncobj_seqno {
-                entry.fence.set_error(err);
+                if let Some(fence) = entry.fence.as_mut() {
+                    fence.set_error(err);
+                }
             }
         }
     }
@@ -591,6 +727,42 @@ impl QueueData {
             doorbell_id,
         })
     }
+
+    /// Atomic snapshot of `(accumulated, in_flight_since)` for the
+    /// timeout stage. The returned `since` is `Some(t)` when the queue
+    /// is currently suspended off its CSG slot; `t` is the monotonic
+    /// instant at which that suspend interval began.
+    fn suspend_snapshot(&self) -> (Delta, Option<Instant<Monotonic>>) {
+        let state = self.suspend_state.lock();
+        (state.accumulated, state.since)
+    }
+
+    /// Marks the queue as suspended off its CSG slot.
+    ///
+    /// Records the current monotonic instant so a later
+    /// `Self::resume_timeout` can fold the interval into
+    /// `SuspendState::accumulated`. No-op when the queue is already
+    /// suspended; this preserves the existing start time rather than
+    /// restarting the interval.
+    pub(super) fn suspend_timeout(&self) {
+        let mut state = self.suspend_state.lock();
+        if state.since.is_none() {
+            state.since = Some(Instant::<Monotonic>::now());
+        }
+    }
+
+    /// Marks the queue as resumed onto its CSG slot.
+    ///
+    /// Adds the time since the matching `Self::suspend_timeout` to
+    /// `SuspendState::accumulated`. No-op if the queue is not
+    /// currently suspended.
+    pub(super) fn resume_timeout(&self) {
+        let mut state = self.suspend_state.lock();
+        if let Some(start) = state.since.take() {
+            let elapsed = Instant::<Monotonic>::now() - start;
+            state.accumulated += elapsed;
+        }
+    }
 }
 
 pub(super) struct TyrQueueOps {
@@ -638,10 +810,15 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
-        if let Err(err) = self.data.reserve_pending_submit_fence() {
-            fence.signal(Err(err));
-            return Err(err);
-        }
+        // Fold any in-flight suspend interval into the baseline so it
+        // matches the shape the timeout stage uses on the consumer
+        // side; subtraction is exact only when both sides fold.
+        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
+        let baseline = match in_flight_since {
+            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
+            None => accumulated,
+        };
+        job.job.set_baseline_suspend(baseline);
 
         let ringbuf_completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(completion_point) => completion_point,
@@ -651,12 +828,14 @@ impl QueueOps for TyrQueueOps {
             }
         };
 
-        let Some(done_seqno) = job.job.done_seqno() else {
+        let (Some(reservation), Some(done_seqno)) =
+            (job.job.reservation.as_ref(), job.job.done_seqno())
+        else {
             fence.signal(Err(EINVAL));
             return Err(EINVAL);
         };
 
-        if let Err((err, fence)) = self.data.add_pending_submit_fence(done_seqno, fence) {
+        if let Err((err, fence)) = reservation.consume(done_seqno, fence) {
             fence.signal(Err(err));
             return Err(err);
         }
@@ -710,9 +889,13 @@ impl QueueOps for TyrQueueOps {
     }
 }
 
+/// Bounds an in-flight job by `JOB_TIMEOUT_MS` of on-slot time.
+///
+/// "Suspend-adjusted" means the time the queue spent evicted off
+/// its CSG slot for higher-priority work is credited back against
+/// the per-job deadline.
 struct QueueCompletionStage {
     data: Arc<QueueData>,
-    poll_interval: Jiffies,
     timeout: Jiffies,
 }
 
@@ -736,16 +919,40 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::Advance;
         }
 
+        // Compute the suspend allowance under one lock acquire so the
+        // in-flight interval and the accumulator are read atomically.
+        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
+        let mut suspended = accumulated;
+        if let Some(start) = in_flight_since {
+            suspended += Instant::<Monotonic>::now() - start;
+        }
+        let allowance = suspended - ctx.job.baseline_suspend();
+        let allowance_jiffies = msecs_to_jiffies(allowance.as_millis().max(0) as u32);
+
         let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
-        if elapsed >= self.timeout {
+        let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
+
+        if adjusted_elapsed >= self.timeout {
             pr_err!("Tyr queue job {} timed out\n", ctx.counter);
+            ctx.job.group.with_locked_inner(|inner| {
+                if inner.fatal_error.is_none() {
+                    inner.fatal_error = Some(ETIMEDOUT);
+                }
+            });
+            TyrDrmDeviceData::schedule_tick(&ctx.job.group.tdev);
             if let Some(done_seqno) = ctx.job.done_seqno() {
                 self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));
             }
             return StageAdvance::TimedOut(ETIMEDOUT);
         }
 
-        StageAdvance::WaitFor(self.poll_interval)
+        // Wake at the remaining deadline. The submit fence's
+        // progress callback (registered by the framework's
+        // `process_exec`) will wake the pipeline earlier when
+        // `Scheduler::sync_upd_step` signals the fence in response
+        // to a sync-update IRQ; this `WaitFor` is just the
+        // worst-case bound for actually faulting the job.
+        StageAdvance::WaitFor(self.timeout - adjusted_elapsed)
     }
 
     fn teardown(&self, job: &QueueJob, _counter: u64) {
@@ -777,6 +984,9 @@ impl Queue {
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
 
+        let max_jobs = queue_args.ringbuf_size() as usize / WRAPPER_RINGBUF_BYTES;
+        let pending_fence_vec = KVec::with_capacity(max_jobs, GFP_KERNEL)?;
+
         let data = Arc::pin_init(
             pin_init!(QueueData {
                 priority: queue_args.priority(),
@@ -785,8 +995,16 @@ impl Queue {
                 doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
                 next_seqno: AtomicU64::new(0),
                 iomem: tdev.iomem.clone(),
-                pending_submit_fences <- new_mutex!(KVec::new()),
+                pending_submit_fences <- new_mutex!(PendingFences {
+                    vec: pending_fence_vec,
+                    head: 0,
+                    outstanding: 0,
+                }),
                 syncwait <- new_mutex!(SyncWait::default()),
+                suspend_state <- new_mutex!(SuspendState {
+                    since: Some(Instant::<Monotonic>::now()),
+                    accumulated: Delta::ZERO,
+                }),
             }),
             GFP_KERNEL,
         )?;
@@ -795,7 +1013,6 @@ impl Queue {
             .set_cancel_timeout(msecs_to_jiffies(JOB_TIMEOUT_MS))
             .add_stage(QueueCompletionStage {
                 data: data.clone(),
-                poll_interval: msecs_to_jiffies(JOB_POLL_INTERVAL_MS),
                 timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
             })?;
         let job_queue = JobQueue::new(
@@ -814,6 +1031,26 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
     ) -> Result<PreparedQueueJob> {
         self.job_queue.prepare(job, deps, QueueFenceData)
+    }
+
+    /// Reserves capacity for one pending submit fence and returns an
+    /// RAII guard for the reservation.
+    ///
+    /// The pending-fence vec is pre-sized at queue creation to the
+    /// maximum number of wrappers the ringbuf can hold, so this
+    /// performs no allocation: it only checks that the new reservation
+    /// still fits within `capacity`. Keeping the lock allocation-free
+    /// breaks the lockdep cycle through `fs_reclaim` that would
+    /// otherwise close via `JobQueue::state` -> `dma_fence_map` ->
+    /// `mmu_notifier` -> `fs_reclaim` -> `pending_submit_fences`.
+    pub(in crate::sched) fn reserve_pending_submit_fence(&self) -> Result<PendingFenceReservation> {
+        let mut pending = self.data.pending_submit_fences.lock();
+        let additional = pending.outstanding.checked_add(1).ok_or(EOVERFLOW)?;
+        if pending.vec.len() + additional > pending.vec.capacity() {
+            return Err(ENOSPC);
+        }
+        pending.outstanding = additional;
+        Ok(PendingFenceReservation::new(self.data.clone()))
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
