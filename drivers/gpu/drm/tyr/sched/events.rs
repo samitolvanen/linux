@@ -132,24 +132,39 @@ impl Scheduler {
         let pending_mask =
             CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
 
-        let progress_event = tdev.fw.with_csg_mut(csg_id, |csg| {
+        let (idle_event, sync_event, progress_event) = tdev.fw.with_csg_mut(csg_id, |csg| {
             let req = csg.read_input_req()?.into_raw();
             let ack = csg.read_output_ack()?.into_raw();
             let pending = (req ^ ack) & pending_mask;
             if pending != 0 {
                 csg.update_input_req(CSG_REQ::from_raw(ack & pending), CSG_REQ::from_raw(pending))?;
             }
-            Ok(pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0)
+            Ok((
+                pending & CSG_REQ::IDLE_MASK != 0,
+                pending & CSG_REQ::SYNC_UPDATE_MASK != 0,
+                pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0,
+            ))
         })?;
 
+        let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
+
+        if idle_event {
+            // At least one resident group may now be idle.
+            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+        }
         if progress_event {
             // Progress-timer expiry: the firmware-imposed forward-progress
             // window elapsed without the group advancing.
+            pr_warn!("CSG slot {} progress timeout\n", csg_id);
             group.with_locked_inner(|inner| {
                 if inner.fatal_error.is_none() {
                     inner.fatal_error = Some(ETIMEDOUT);
                 }
             });
+            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+        }
+        if sync_event {
+            TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
         let mut queued_tiler_oom = false;
@@ -230,9 +245,10 @@ impl Scheduler {
         }
 
         if cs_fatal_mask != 0 {
-            let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
+
+        tdev.fw.ring_csg_doorbell(csg_id)?;
 
         Ok(queued_tiler_oom)
     }
