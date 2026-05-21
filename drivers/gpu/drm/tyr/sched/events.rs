@@ -241,7 +241,8 @@ impl Scheduler {
             let cs_id = mask.trailing_zeros() as usize;
             mask &= !(1u32 << cs_id);
             if let Some(queue) = group.queues.get(cs_id) {
-                queue.fail_inflight_submit_fences(EINVAL)?;
+                let syncobj_seqno = group.read_syncobj(cs_id)?.seqno;
+                queue.fail_inflight_submit_fences(syncobj_seqno, EINVAL);
             }
         }
 
