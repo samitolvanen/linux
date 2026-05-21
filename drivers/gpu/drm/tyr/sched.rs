@@ -311,7 +311,34 @@ impl crate::slot::SlotOperations for CsgSlotOps {
 /// Type alias for the SlotManager parameterised for CSG slots.
 pub(crate) type CsgSlotManager = SlotManager<CsgSlotOps, MAX_CSGS>;
 
+/// One wait-list entry captured by `Scheduler::collect_syncwait_candidates`.
+pub(crate) struct SyncwaitCandidate {
+    group: Arc<Group>,
+    prio: usize,
+    blocked: u32,
+}
+
+/// Per-group result of `Scheduler::evaluate_syncwait_candidates`.
+pub(crate) struct SyncwaitResult {
+    group: Arc<Group>,
+    prio: usize,
+    unblocked: u32,
+}
+
 /// Minimal scheduler shell.
+///
+/// # Lock order
+///
+/// scheduler > csg_slot_manager > {group.inner, fw.inner}. fw.inner is
+/// also taken standalone, so never before csg_slot_manager.
+///
+/// The scheduler mutex must not be held across gpuvm_unique,
+/// dma_resv_lock, or GFP_KERNEL. eval_syncwait reaches MappedUserBo::new,
+/// so the sync_upd path snapshots the wait list, evaluates without the
+/// mutex, then re-acquires it to apply.
+///
+/// The firmware ack wait holds the scheduler mutex but drops the
+/// slot-manager mutex around the wait.
 pub(crate) struct Scheduler {
     /// Groups that have at least one queue that can be currently scheduled.
     pub(in crate::sched) runnable_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
@@ -842,6 +869,212 @@ impl Scheduler {
         } else {
             self.runnable_groups[priority].push_back(list_arc);
         }
+    }
+
+    /// Marks `group` as runnable, moving it onto the runnable list at
+    /// its priority if it is not already there.
+    ///
+    /// Idempotent: a group that is already on the runnable list, or
+    /// is currently bound to a CSG slot, is left in place. An idle
+    /// group is moved off `Scheduler::idle_groups` onto
+    /// `Scheduler::runnable_groups`. Only the id-0 lists are
+    /// manipulated; the wait-list (id-1) is owned elsewhere.
+    pub(crate) fn mark_group_runnable(&mut self, group: &Arc<Group>) {
+        let priority = group.priority as usize;
+
+        group.with_locked_inner(|inner| {
+            match inner.list_state {
+                group::GroupListState::Runnable => {}
+                group::GroupListState::None => {
+                    // Not on any id-0 list. Promote to runnable only
+                    // if the group is not currently bound. Bound
+                    // groups already get scheduled via the per-tick
+                    // `Keep` rules and don't need a runnable-list
+                    // entry.
+                    if inner.csg_id.is_none() {
+                        if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
+                            self.runnable_groups[priority].push_back(list_arc);
+                            inner.list_state = group::GroupListState::Runnable;
+                        }
+                    }
+                }
+                group::GroupListState::Idle => {
+                    if let Some(list_arc) =
+                        self.remove_group_from_list(group, priority, group::GroupListState::Idle)
+                    {
+                        self.runnable_groups[priority].push_back(list_arc);
+                        inner.list_state = group::GroupListState::Runnable;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Snapshots the wait list under the scheduler mutex.
+    ///
+    /// Walks `waiting_groups` and records `(Arc<Group>, prio,
+    /// blocked_bitmap)` for every group with at least one blocked
+    /// queue. Allocates with `GFP_NOWAIT` so the caller can hold the
+    /// scheduler mutex without recording an `fs_reclaim` edge against
+    /// it; allocation failure aborts the walk and the next sync_upd
+    /// or periodic tick will revisit.
+    ///
+    /// Pair with `evaluate_syncwait_candidates` and
+    /// `apply_syncwait_results`.
+    pub(crate) fn collect_syncwait_candidates(&mut self) -> KVec<SyncwaitCandidate> {
+        let mut snapshot = KVec::new();
+
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            let mut cursor = self.waiting_groups[prio].cursor_front();
+            while let Some(peek) = cursor.peek_next() {
+                let group: Arc<Group> = peek.arc().into();
+                let blocked = group.with_locked_inner(|inner| inner.blocked_queues());
+                if snapshot
+                    .push(
+                        SyncwaitCandidate {
+                            group,
+                            prio,
+                            blocked,
+                        },
+                        GFP_NOWAIT,
+                    )
+                    .is_err()
+                {
+                    pr_err!("sync_upd: out of memory snapshotting wait list\n");
+                    return snapshot;
+                }
+                cursor.move_next();
+            }
+        }
+
+        snapshot
+    }
+
+    /// Evaluates each candidate's blocked queues without holding the
+    /// scheduler mutex.
+    ///
+    /// `Group::eval_syncwait` takes the per-VM gpuvm mutex and may
+    /// `GFP_KERNEL`-vmap a foreign BO, both of which would close a
+    /// lockdep cycle through `dma_fence_map` if the scheduler mutex
+    /// were held. Read errors are logged and treated as "unblock and
+    /// let the next tick surface any further failure", matching the
+    /// pre-split behaviour. Allocation failure on the results vector
+    /// drops the remaining candidates; the periodic tick will
+    /// revisit.
+    pub(crate) fn evaluate_syncwait_candidates(
+        snapshot: KVec<SyncwaitCandidate>,
+    ) -> KVec<SyncwaitResult> {
+        let mut results = KVec::new();
+
+        for candidate in snapshot {
+            let mut unblocked: u32 = 0;
+            let mut tested = candidate.blocked;
+            while tested != 0 {
+                let cs_id = tested.trailing_zeros();
+                tested &= !(1u32 << cs_id);
+                match candidate.group.eval_syncwait(cs_id as usize) {
+                    Ok(true) => unblocked |= 1u32 << cs_id,
+                    Ok(false) => {}
+                    Err(e) => {
+                        pr_err!("eval_syncwait failed: {}\n", e.to_errno());
+                        unblocked |= 1u32 << cs_id;
+                    }
+                }
+            }
+
+            if results
+                .push(
+                    SyncwaitResult {
+                        group: candidate.group,
+                        prio: candidate.prio,
+                        unblocked,
+                    },
+                    GFP_KERNEL,
+                )
+                .is_err()
+            {
+                pr_err!("sync_upd: out of memory recording results\n");
+                return results;
+            }
+        }
+
+        results
+    }
+
+    /// Applies the results from `evaluate_syncwait_candidates`
+    /// under the scheduler mutex.
+    ///
+    /// Walks `waiting_groups` per priority once and, for each peeked
+    /// group that has a matching result, clears the newly unblocked
+    /// queue bits, then removes the group from the wait list and
+    /// marks it runnable if it has no other blocked queues and is
+    /// not currently bound to a CSG slot. Re-validation against the
+    /// live wait list handles groups that another path (e.g.
+    /// destroy) removed between the snapshot and apply phases.
+    ///
+    /// Returns `true` if an unbound RealTime-priority group was
+    /// promoted to `runnable_groups`, in which case the caller fires
+    /// an immediate tick so the rule engine binds it without waiting
+    /// for the periodic tick.
+    pub(crate) fn apply_syncwait_results(&mut self, results: KVec<SyncwaitResult>) -> bool {
+        let mut immediate_tick = false;
+
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            // Stage the wait-list links of groups that should move to
+            // the runnable list. A `List<Group, 1>` does not allocate
+            // and lets us release the wait-list cursor before
+            // re-borrowing `self` mutably for `mark_group_runnable`.
+            let mut make_runnable = List::<Group, 1>::new();
+
+            {
+                let mut cursor = self.waiting_groups[prio].cursor_front();
+                while let Some(peek) = cursor.peek_next() {
+                    let group_ptr: *const Group = &*peek.arc();
+                    let result = results
+                        .iter()
+                        .find(|r| r.prio == prio && core::ptr::eq(&*r.group, group_ptr));
+
+                    let Some(result) = result else {
+                        cursor.move_next();
+                        continue;
+                    };
+
+                    let (unblocked, move_to_runnable) = result.group.with_locked_inner(|inner| {
+                        let mut bits = result.unblocked;
+                        while bits != 0 {
+                            let cs_id = bits.trailing_zeros() as usize;
+                            bits &= !(1u32 << cs_id);
+                            inner.set_queue_blocked(cs_id, false);
+                        }
+
+                        let unblocked = !inner.has_blocked_queues();
+                        let move_to_runnable = unblocked && inner.csg_id.is_none();
+                        (unblocked, move_to_runnable)
+                    });
+
+                    if unblocked {
+                        let list_arc = peek.remove();
+                        if move_to_runnable {
+                            if prio == Priority::RealTime as usize {
+                                immediate_tick = true;
+                            }
+                            make_runnable.push_back(list_arc);
+                        }
+                    } else {
+                        cursor.move_next();
+                    }
+                }
+            }
+
+            // The wait-list cursor borrow is dropped: now safe to
+            // re-borrow `self` mutably for `mark_group_runnable`.
+            while let Some(list_arc) = make_runnable.pop_front() {
+                let group: Arc<Group> = list_arc.into_arc();
+                self.mark_group_runnable(&group);
+            }
+        }
+
+        immediate_tick
     }
 
     /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
