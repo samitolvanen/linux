@@ -240,7 +240,9 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
         // assumption about firmware state. Only
         // `Tick::halt_and_unbind_evicted_groups` stages a halt and waits
         // for the ack before evicting. The bind rollback evicts without
-        // staging one.
+        // staging one. The suspend interval is opened at the staging
+        // point, not here, so the firmware-save latency counts as
+        // off-slot time.
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
@@ -754,6 +756,7 @@ impl Scheduler {
         // before this point.
         if new_state == group::State::Active {
             for queue in slot_data.group.queues.iter() {
+                queue.resume_timeout();
                 if queue.is_ringbuf_empty().unwrap_or(true) {
                     continue;
                 }

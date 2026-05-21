@@ -413,6 +413,21 @@ impl Job {
         let signals = deps::signal_syncs(file, &self.syncs)?;
         let has_stream = !self.pieces.is_empty();
 
+        // Reserve a slot for the pending submit fence before
+        // handing the job to the framework. The matching push from
+        // `TyrQueueOps::submit` runs inside a dma-fence signalling
+        // section where `GFP_KERNEL` allocation is forbidden. Doing
+        // the reservation here keeps the submit path allocation-free.
+        // Stream-less jobs never reach the GPU and so never push a
+        // pending fence. The returned guard travels with the job
+        // through `QueueJob`, so any failure path between here and
+        // the final push rolls the reservation back through `Drop`.
+        let reservation = if has_stream {
+            Some(queue.reserve_pending_submit_fence()?)
+        } else {
+            None
+        };
+
         // Build the wrapped command-stream buffer at prepare time so
         // every `GFP_KERNEL` allocation it does happens outside the
         // dma-fence signalling section that wraps `commit`.
@@ -440,7 +455,13 @@ impl Job {
         // The extra slot holds the prior-work dependency that commit adds.
         let extra_dep_capacity = usize::from(!has_stream);
         let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, done_seqno, group.clone(), self.queue_index),
+            QueueJob::new(
+                wrapped,
+                done_seqno,
+                group.clone(),
+                self.queue_index,
+                reservation,
+            ),
             &deps,
             extra_dep_capacity,
         )?;
