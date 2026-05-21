@@ -87,36 +87,37 @@ struct Context {
     target_in_flight: u32,
 }
 
+fn alloc_chunk_bo(
+    dev: &Device<Bound>,
+    ddev: &TyrDrmDevice,
+    vm: &Arc<Vm>,
+    chunk_size: u32,
+) -> Result<Arc<gem::MappedBo>> {
+    let flags = VmMapFlags::from(VmFlag::Noexec);
+    let chunk_bo = gem::new_kernel_object(
+        dev,
+        ddev,
+        vm,
+        chunk_size as usize,
+        flags,
+        ddev.coherent,
+        ddev.cleanup_wq.clone(),
+    )?;
+
+    let vmap = chunk_bo.vmap();
+    let size = vmap.owner().size();
+    let base = SysMemBackend::as_ptr(vmap.as_view()).cast::<u8>();
+    // SAFETY: `base` and `size` describe the same vmap'd GEM object, so the range is
+    // valid for reads and writes, and `u8` has no alignment requirement. The object
+    // was just created and its `Arc` has not left this function, so no other
+    // reference into the mapping exists.
+    let mem = unsafe { core::slice::from_raw_parts_mut(base, size) };
+    mem.fill(0);
+
+    Ok(chunk_bo)
+}
+
 impl Context {
-    fn alloc_chunk_bo(
-        &mut self,
-        dev: &Device<Bound>,
-        ddev: &TyrDrmDevice,
-    ) -> Result<Arc<gem::MappedBo>> {
-        let flags = VmMapFlags::from(VmFlag::Noexec);
-        let chunk_bo = gem::new_kernel_object(
-            dev,
-            ddev,
-            &self.vm,
-            self.chunk_size as usize,
-            flags,
-            ddev.coherent,
-            ddev.cleanup_wq.clone(),
-        )?;
-
-        let vmap = chunk_bo.vmap();
-        let size = vmap.owner().size();
-        let base = SysMemBackend::as_ptr(vmap.as_view()).cast::<u8>();
-        // SAFETY: `base` and `size` describe the same vmap'd GEM object, so the range is
-        // valid for reads and writes, and `u8` has no alignment requirement. The object
-        // was just created and its `Arc` has not left this function, so no other
-        // reference into the mapping exists.
-        let mem = unsafe { core::slice::from_raw_parts_mut(base, size) };
-        mem.fill(0);
-
-        Ok(chunk_bo)
-    }
-
     fn push_chunk(&mut self, chunk_bo: Arc<gem::MappedBo>) -> Result {
         self.chunks.reserve(1, GFP_KERNEL)?;
         self.chunks
@@ -126,19 +127,13 @@ impl Context {
     }
 
     fn alloc_initial_chunk(&mut self, dev: &Device<Bound>, ddev: &TyrDrmDevice) -> Result {
-        let chunk_bo = self.alloc_chunk_bo(dev, ddev)?;
+        let chunk_bo = alloc_chunk_bo(dev, ddev, &self.vm, self.chunk_size)?;
 
         if let Some(prev) = self.chunks.first() {
             let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
                 | (u64::from(self.chunk_size) >> 12);
             ChunkHeader::write_next(&chunk_bo, next)?;
         }
-
-        self.push_chunk(chunk_bo)
-    }
-
-    fn alloc_grow_chunk(&mut self, dev: &Device<Bound>, ddev: &TyrDrmDevice) -> Result {
-        let chunk_bo = self.alloc_chunk_bo(dev, ddev)?;
 
         self.push_chunk(chunk_bo)
     }
@@ -343,16 +338,46 @@ impl Pool {
         let index = offset / reg_data.gpu_info.heap_context_stride();
 
         let xa = self.xa.as_ref();
+
+        // TODO: holding each Context behind its own mutex (XArray<Arc<Mutex<Context>>>)
+        // would let the whole grow run under one sleeping lock and drop this
+        // snapshot-then-recheck dance. The XArray spinlock would only guard the lookup.
+        let (vm, chunk_size, max_chunks) = {
+            let guard = xa.lock();
+            let heap_ctx = guard.get(index as usize).ok_or(EINVAL)?;
+
+            if args.renderpasses_in_flight > heap_ctx.target_in_flight
+                || heap_ctx.chunks.len() >= heap_ctx.max_chunks as usize
+            {
+                return Err(ENOMEM);
+            }
+
+            (
+                heap_ctx.vm.clone(),
+                heap_ctx.chunk_size,
+                heap_ctx.max_chunks,
+            )
+        };
+
+        // Allocate outside the XArray spinlock. The BO allocation takes the
+        // kernel-VA range mutex and uses GFP_KERNEL, neither of which is
+        // permitted while holding a spinlock.
+        let chunk_bo = alloc_chunk_bo(reg_data.pdev.as_ref(), ddev, &vm, chunk_size)?;
+
         let mut guard = xa.lock();
         let heap_ctx = guard.get_mut(index as usize).ok_or(EINVAL)?;
 
-        if args.renderpasses_in_flight > heap_ctx.target_in_flight
-            || heap_ctx.chunks.len() >= heap_ctx.max_chunks as usize
-        {
+        if heap_ctx.chunks.len() >= max_chunks as usize {
             return Err(ENOMEM);
         }
 
-        heap_ctx.alloc_grow_chunk(reg_data.pdev.as_ref(), ddev)?;
+        // Grow under the XArray spinlock with GFP_NOWAIT. A sleeping
+        // GFP_KERNEL reclaim is not allowed here.
+        heap_ctx.chunks.reserve(1, GFP_NOWAIT)?;
+        heap_ctx
+            .chunks
+            .insert_within_capacity(0, chunk_bo)
+            .map_err(|_| ENOMEM)?;
 
         let chunk_bo = heap_ctx.chunks.first().ok_or(EINVAL)?;
         let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
