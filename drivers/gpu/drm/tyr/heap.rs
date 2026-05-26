@@ -254,7 +254,11 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        if args.chunk_size != args.chunk_size.next_multiple_of(4096) {
+        let aligned = args
+            .chunk_size
+            .checked_next_multiple_of(4096)
+            .ok_or(EINVAL)?;
+        if args.chunk_size != aligned {
             return Err(EINVAL);
         }
 

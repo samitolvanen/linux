@@ -365,11 +365,10 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
     flags: u32,
     coherent: bool,
 ) -> Result<ARef<Bo>> {
-    let aligned_size = size.next_multiple_of(1 << 12);
-
-    if size == 0 || size > aligned_size {
+    if size == 0 {
         return Err(EINVAL);
     }
+    let aligned_size = size.checked_next_multiple_of(1 << 12).ok_or(EINVAL)?;
 
     let map_wc = should_map_wc(coherent);
     let bo = Bo::new(
