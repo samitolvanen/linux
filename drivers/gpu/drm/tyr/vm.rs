@@ -1059,6 +1059,7 @@ impl VmExec {
         flags: VmMapFlags,
         resources: &mut VmOpResources,
     ) -> Result {
+        let end = va.checked_add(size).ok_or(EINVAL)?;
         let vm_bo = resources.vm_bo.take().ok_or(EINVAL)?;
         let req = VmOpRequest {
             op_type: VmOpType::Map(VmMapArgs {
@@ -1066,7 +1067,7 @@ impl VmExec {
                 flags,
                 bo_offset,
             }),
-            region: va..(va + size),
+            region: va..end,
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
 
@@ -1112,9 +1113,10 @@ impl VmExec {
     /// This removes any existing mappings in the specified range, freeing the
     /// virtual address space for reuse.
     fn unmap_range_inner(&self, va: u64, size: u64, resources: &mut VmOpResources) -> Result {
+        let end = va.checked_add(size).ok_or(EINVAL)?;
         let req = VmOpRequest {
             op_type: VmOpType::Unmap,
-            region: va..(va + size),
+            region: va..end,
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
 
