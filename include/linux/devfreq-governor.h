@@ -97,6 +97,7 @@ static inline int devfreq_update_stats(struct devfreq *df)
 	if (!df->profile->get_dev_status)
 		return -EINVAL;
 
-	return df->profile->get_dev_status(df->dev.parent, &df->last_status);
+	return df->profile->get_dev_status(df->dev.parent, df->driver_data,
+					   &df->last_status);
 }
 #endif /* __LINUX_DEVFREQ_DEVFREQ_H__ */

@@ -20,7 +20,7 @@ struct imx_bus {
 };
 
 static int imx_bus_target(struct device *dev,
-		unsigned long *freq, u32 flags)
+		void *data, unsigned long *freq, u32 flags)
 {
 	struct dev_pm_opp *new_opp;
 	int ret;
@@ -36,7 +36,8 @@ static int imx_bus_target(struct device *dev,
 	return dev_pm_opp_set_rate(dev, *freq);
 }
 
-static int imx_bus_get_cur_freq(struct device *dev, unsigned long *freq)
+static int imx_bus_get_cur_freq(struct device *dev, void *data,
+				unsigned long *freq)
 {
 	struct imx_bus *priv = dev_get_drvdata(dev);
 

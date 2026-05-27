@@ -92,6 +92,8 @@ struct devfreq_dev_status {
  *			devfreq.last_status.
  * @get_cur_freq:	The device should provide the current frequency
  *			at which it is operating.
+ *			For all three callbacks, @data is the per-instance
+ *			driver_data set at devfreq_add_device() time.
  * @exit:		An optional callback that is called when devfreq
  *			is removing the devfreq object due to error or
  *			from devfreq_remove_device() call. If the user
@@ -111,10 +113,12 @@ struct devfreq_dev_profile {
 	unsigned int polling_ms;
 	enum devfreq_timer timer;
 
-	int (*target)(struct device *dev, unsigned long *freq, u32 flags);
-	int (*get_dev_status)(struct device *dev,
+	int (*target)(struct device *dev, void *data,
+		      unsigned long *freq, u32 flags);
+	int (*get_dev_status)(struct device *dev, void *data,
 			      struct devfreq_dev_status *stat);
-	int (*get_cur_freq)(struct device *dev, unsigned long *freq);
+	int (*get_cur_freq)(struct device *dev, void *data,
+			    unsigned long *freq);
 	void (*exit)(struct device *dev);
 
 	unsigned long *freq_table;
@@ -159,6 +163,8 @@ struct devfreq_stats {
  * @last_status:	devfreq user device info, performance statistics
  * @data:	devfreq driver pass to governors, governor should not change it.
  * @governor_data:	private data for governors, devfreq core doesn't touch it.
+ * @driver_data:	private data for the devfreq driver, the devfreq core does
+ *			not modify it.
  * @user_min_freq_req:	PM QoS minimum frequency request from user (via sysfs)
  * @user_max_freq_req:	PM QoS maximum frequency request from user (via sysfs)
  * @scaling_min_freq:	Limit minimum frequency requested by OPP interface
@@ -200,6 +206,7 @@ struct devfreq {
 
 	void *data;
 	void *governor_data;
+	void *driver_data;
 
 	struct dev_pm_qos_request user_min_freq_req;
 	struct dev_pm_qos_request user_max_freq_req;
@@ -232,12 +239,12 @@ struct devfreq_freqs {
 struct devfreq *devfreq_add_device(struct device *dev,
 				struct devfreq_dev_profile *profile,
 				const char *governor_name,
-				void *data);
+				void *governor_data, void *driver_data);
 int devfreq_remove_device(struct devfreq *devfreq);
 struct devfreq *devm_devfreq_add_device(struct device *dev,
 				struct devfreq_dev_profile *profile,
 				const char *governor_name,
-				void *data);
+				void *governor_data);
 void devm_devfreq_remove_device(struct device *dev, struct devfreq *devfreq);
 
 /* Supposed to be called by PM callbacks */
@@ -345,7 +352,7 @@ struct devfreq_passive_data {
 static inline struct devfreq *devfreq_add_device(struct device *dev,
 					struct devfreq_dev_profile *profile,
 					const char *governor_name,
-					void *data)
+					void *governor_data, void *driver_data)
 {
 	return ERR_PTR(-ENOSYS);
 }
@@ -358,7 +365,7 @@ static inline int devfreq_remove_device(struct devfreq *devfreq)
 static inline struct devfreq *devm_devfreq_add_device(struct device *dev,
 					struct devfreq_dev_profile *profile,
 					const char *governor_name,
-					void *data)
+					void *governor_data)
 {
 	return ERR_PTR(-ENOSYS);
 }

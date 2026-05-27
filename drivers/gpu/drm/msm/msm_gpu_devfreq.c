@@ -16,8 +16,9 @@
  * Power Management:
  */
 
-static int msm_devfreq_target(struct device *dev, unsigned long *freq,
-		u32 flags)
+static int msm_devfreq_target(struct device *dev, void *data,
+			      unsigned long *freq,
+			      u32 flags)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
 	struct msm_gpu_devfreq *df = &gpu->devfreq;
@@ -75,7 +76,7 @@ static unsigned long get_freq(struct msm_gpu *gpu)
 }
 
 static int msm_devfreq_get_dev_status(struct device *dev,
-		struct devfreq_dev_status *status)
+		void *data, struct devfreq_dev_status *status)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
 	struct msm_gpu_devfreq *df = &gpu->devfreq;
@@ -112,7 +113,8 @@ static int msm_devfreq_get_dev_status(struct device *dev,
 	return 0;
 }
 
-static int msm_devfreq_get_cur_freq(struct device *dev, unsigned long *freq)
+static int msm_devfreq_get_cur_freq(struct device *dev, void *data,
+				    unsigned long *freq)
 {
 	*freq = get_freq(dev_to_gpu(dev));
 
@@ -323,7 +325,7 @@ void msm_devfreq_active(struct msm_gpu *gpu)
 	 * still been zero.  In this case, no need to change freq.
 	 */
 	if (target_freq)
-		msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
+		msm_devfreq_target(&gpu->pdev->dev, NULL, &target_freq, 0);
 
 	mutex_unlock(&df->devfreq->lock);
 
@@ -355,7 +357,7 @@ static void msm_devfreq_idle_work(struct kthread_work *work)
 	idle_freq = get_freq(gpu);
 
 	if (priv->gpu_clamp_to_idle)
-		msm_devfreq_target(&gpu->pdev->dev, &target_freq, 0);
+		msm_devfreq_target(&gpu->pdev->dev, NULL, &target_freq, 0);
 
 	df->idle_time = ktime_get();
 	df->idle_freq = idle_freq;

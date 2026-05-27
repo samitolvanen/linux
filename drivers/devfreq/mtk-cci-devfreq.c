@@ -122,7 +122,8 @@ static int mtk_ccifreq_set_voltage(struct mtk_ccifreq_drv *drv, int new_voltage)
 	return 0;
 }
 
-static int mtk_ccifreq_target(struct device *dev, unsigned long *freq,
+static int mtk_ccifreq_target(struct device *dev, void *data,
+			      unsigned long *freq,
 			      u32 flags)
 {
 	struct mtk_ccifreq_drv *drv = dev_get_drvdata(dev);

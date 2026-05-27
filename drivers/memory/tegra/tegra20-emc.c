@@ -1000,7 +1000,8 @@ static int tegra20_emc_init_clk(struct tegra_emc *emc)
 	return 0;
 }
 
-static int tegra20_emc_devfreq_target(struct device *dev, unsigned long *freq,
+static int tegra20_emc_devfreq_target(struct device *dev, void *data,
+				      unsigned long *freq,
 				      u32 flags)
 {
 	struct tegra_emc *emc = dev_get_drvdata(dev);
@@ -1020,6 +1021,7 @@ static int tegra20_emc_devfreq_target(struct device *dev, unsigned long *freq,
 }
 
 static int tegra20_emc_devfreq_get_dev_status(struct device *dev,
+					      void *data,
 					      struct devfreq_dev_status *stat)
 {
 	struct tegra_emc *emc = dev_get_drvdata(dev);

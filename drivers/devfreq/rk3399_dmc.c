@@ -67,7 +67,8 @@ struct rk3399_dmcfreq {
 	unsigned int standby_idle_dis_freq;
 };
 
-static int rk3399_dmcfreq_target(struct device *dev, unsigned long *freq,
+static int rk3399_dmcfreq_target(struct device *dev, void *data,
+				 unsigned long *freq,
 				 u32 flags)
 {
 	struct rk3399_dmcfreq *dmcfreq = dev_get_drvdata(dev);
@@ -217,6 +218,7 @@ out_unlock:
 }
 
 static int rk3399_dmcfreq_get_dev_status(struct device *dev,
+					 void *data,
 					 struct devfreq_dev_status *stat)
 {
 	struct rk3399_dmcfreq *dmcfreq = dev_get_drvdata(dev);
@@ -234,7 +236,8 @@ static int rk3399_dmcfreq_get_dev_status(struct device *dev,
 	return ret;
 }
 
-static int rk3399_dmcfreq_get_cur_freq(struct device *dev, unsigned long *freq)
+static int rk3399_dmcfreq_get_cur_freq(struct device *dev, void *data,
+				       unsigned long *freq)
 {
 	struct rk3399_dmcfreq *dmcfreq = dev_get_drvdata(dev);
 
