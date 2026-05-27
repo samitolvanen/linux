@@ -213,7 +213,8 @@ static int sun8i_a33_mbus_set_dram_freq(struct sun8i_a33_mbus *priv,
 }
 
 static int sun8i_a33_mbus_set_dram_target(struct device *dev,
-					  unsigned long *freq, u32 flags)
+					  void *data, unsigned long *freq,
+					  u32 flags)
 {
 	struct sun8i_a33_mbus *priv = dev_get_drvdata(dev);
 	struct devfreq *devfreq = priv->devfreq_dram;
@@ -239,6 +240,7 @@ static int sun8i_a33_mbus_set_dram_target(struct device *dev,
 }
 
 static int sun8i_a33_mbus_get_dram_status(struct device *dev,
+					  void *data,
 					  struct devfreq_dev_status *stat)
 {
 	struct sun8i_a33_mbus *priv = dev_get_drvdata(dev);
@@ -420,7 +422,7 @@ static int sun8i_a33_mbus_probe(struct platform_device *pdev)
 
 	priv->devfreq_dram = devfreq_add_device(dev, &priv->profile,
 						DEVFREQ_GOV_SIMPLE_ONDEMAND,
-						&priv->gov_data);
+						&priv->gov_data, NULL);
 	if (IS_ERR(priv->devfreq_dram)) {
 		ret = PTR_ERR(priv->devfreq_dram);
 		err = "failed to add devfreq device\n";

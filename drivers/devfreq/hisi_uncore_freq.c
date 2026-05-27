@@ -249,7 +249,8 @@ static int hisi_uncore_cmd_send(struct hisi_uncore_freq *uncore,
 	return rc;
 }
 
-static int hisi_uncore_target(struct device *dev, unsigned long *freq,
+static int hisi_uncore_target(struct device *dev, void *driver_data,
+			      unsigned long *freq,
 			      u32 flags)
 {
 	struct hisi_uncore_freq *uncore = dev_get_drvdata(dev);
@@ -273,13 +274,15 @@ static int hisi_uncore_target(struct device *dev, unsigned long *freq,
 }
 
 static int hisi_uncore_get_dev_status(struct device *dev,
+				      void *driver_data,
 				      struct devfreq_dev_status *stat)
 {
 	/* Not used */
 	return 0;
 }
 
-static int hisi_uncore_get_cur_freq(struct device *dev, unsigned long *freq)
+static int hisi_uncore_get_cur_freq(struct device *dev, void *driver_data,
+				    unsigned long *freq)
 {
 	struct hisi_uncore_freq *uncore = dev_get_drvdata(dev);
 	u32 data = 0;
@@ -560,7 +563,7 @@ static int hisi_uncore_devfreq_register(struct hisi_uncore_freq *uncore)
 	u32 data;
 	int rc;
 
-	rc = hisi_uncore_get_cur_freq(dev, &freq);
+	rc = hisi_uncore_get_cur_freq(dev, NULL, &freq);
 	if (rc)
 		return dev_err_probe(dev, rc, "Failed to get plat init freq\n");
 

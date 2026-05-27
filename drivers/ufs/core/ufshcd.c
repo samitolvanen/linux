@@ -1596,7 +1596,7 @@ static void ufshcd_clk_scaling_resume_work(struct work_struct *work)
 }
 
 static int ufshcd_devfreq_target(struct device *dev,
-				unsigned long *freq, u32 flags)
+				void *data, unsigned long *freq, u32 flags)
 {
 	int ret = 0;
 	struct ufs_hba *hba = dev_get_drvdata(dev);
@@ -1676,7 +1676,7 @@ out:
 }
 
 static int ufshcd_devfreq_get_dev_status(struct device *dev,
-		struct devfreq_dev_status *stat)
+		void *data, struct devfreq_dev_status *stat)
 {
 	struct ufs_hba *hba = dev_get_drvdata(dev);
 	struct ufs_clk_scaling *scaling = &hba->clk_scaling;
@@ -1750,7 +1750,7 @@ static int ufshcd_devfreq_init(struct ufs_hba *hba)
 	devfreq = devfreq_add_device(hba->dev,
 			&hba->vps->devfreq_profile,
 			DEVFREQ_GOV_SIMPLE_ONDEMAND,
-			&hba->vps->ondemand_data);
+			&hba->vps->ondemand_data, NULL);
 	if (IS_ERR(devfreq)) {
 		ret = PTR_ERR(devfreq);
 		dev_err(hba->dev, "Unable to register with devfreq %d\n", ret);

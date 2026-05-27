@@ -681,7 +681,8 @@ static int exynos5_dmc_get_volt_freq(struct exynos5_dmc *dmc,
  * frequency and voltage change. In case of failure, does not set 'curr_rate'
  * and returns error value to the framework.
  */
-static int exynos5_dmc_target(struct device *dev, unsigned long *freq,
+static int exynos5_dmc_target(struct device *dev, void *data,
+			      unsigned long *freq,
 			      u32 flags)
 {
 	struct exynos5_dmc *dmc = dev_get_drvdata(dev);
@@ -930,7 +931,7 @@ static void exynos5_dmc_disable_perf_events(struct exynos5_dmc *dmc)
  * by 10. After read out the counters are setup to count again.
  */
 static int exynos5_dmc_get_status(struct device *dev,
-				  struct devfreq_dev_status *stat)
+				  void *data, struct devfreq_dev_status *stat)
 {
 	struct exynos5_dmc *dmc = dev_get_drvdata(dev);
 	unsigned long load, total;
@@ -971,7 +972,8 @@ static int exynos5_dmc_get_status(struct device *dev,
  * frequency might be lower when the clock source value could not be divided
  * to the requested value.
  */
-static int exynos5_dmc_get_cur_freq(struct device *dev, unsigned long *freq)
+static int exynos5_dmc_get_cur_freq(struct device *dev, void *data,
+				    unsigned long *freq)
 {
 	struct exynos5_dmc *dmc = dev_get_drvdata(dev);
 

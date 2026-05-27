@@ -227,7 +227,8 @@ out:
 	return ret;
 }
 
-static int imx8m_ddrc_target(struct device *dev, unsigned long *freq, u32 flags)
+static int imx8m_ddrc_target(struct device *dev, void *data,
+			     unsigned long *freq, u32 flags)
 {
 	struct imx8m_ddrc *priv = dev_get_drvdata(dev);
 	struct imx8m_ddrc_freq *freq_info;
@@ -271,7 +272,8 @@ static int imx8m_ddrc_target(struct device *dev, unsigned long *freq, u32 flags)
 	return ret;
 }
 
-static int imx8m_ddrc_get_cur_freq(struct device *dev, unsigned long *freq)
+static int imx8m_ddrc_get_cur_freq(struct device *dev, void *data,
+				   unsigned long *freq)
 {
 	struct imx8m_ddrc *priv = dev_get_drvdata(dev);
 
