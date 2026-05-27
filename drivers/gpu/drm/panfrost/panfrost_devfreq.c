@@ -28,7 +28,8 @@ static void panfrost_devfreq_update_utilization(struct panfrost_devfreq *pfdevfr
 	pfdevfreq->time_last_update = now;
 }
 
-static int panfrost_devfreq_target(struct device *dev, unsigned long *freq,
+static int panfrost_devfreq_target(struct device *dev, void *data,
+				   unsigned long *freq,
 				   u32 flags)
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
@@ -55,6 +56,7 @@ static void panfrost_devfreq_reset(struct panfrost_devfreq *pfdevfreq)
 }
 
 static int panfrost_devfreq_get_dev_status(struct device *dev,
+					   void *data,
 					   struct devfreq_dev_status *status)
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
