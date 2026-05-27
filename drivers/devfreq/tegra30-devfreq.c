@@ -629,7 +629,8 @@ static void tegra_actmon_stop(struct tegra_devfreq *tegra)
 	tegra->started = false;
 }
 
-static int tegra_devfreq_target(struct device *dev, unsigned long *freq,
+static int tegra_devfreq_target(struct device *dev, void *data,
+				unsigned long *freq,
 				u32 flags)
 {
 	struct dev_pm_opp *opp;
@@ -648,6 +649,7 @@ static int tegra_devfreq_target(struct device *dev, unsigned long *freq,
 }
 
 static int tegra_devfreq_get_dev_status(struct device *dev,
+					void *data,
 					struct devfreq_dev_status *stat)
 {
 	struct tegra_devfreq *tegra = dev_get_drvdata(dev);

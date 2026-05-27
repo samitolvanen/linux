@@ -90,7 +90,8 @@ static int exynos_bus_get_event(struct exynos_bus *bus,
 /*
  * devfreq function for both simple-ondemand and passive governor
  */
-static int exynos_bus_target(struct device *dev, unsigned long *freq, u32 flags)
+static int exynos_bus_target(struct device *dev, void *data,
+			     unsigned long *freq, u32 flags)
 {
 	struct exynos_bus *bus = dev_get_drvdata(dev);
 	struct dev_pm_opp *new_opp;
@@ -117,6 +118,7 @@ static int exynos_bus_target(struct device *dev, unsigned long *freq, u32 flags)
 }
 
 static int exynos_bus_get_dev_status(struct device *dev,
+				     void *data,
 				     struct devfreq_dev_status *stat)
 {
 	struct exynos_bus *bus = dev_get_drvdata(dev);

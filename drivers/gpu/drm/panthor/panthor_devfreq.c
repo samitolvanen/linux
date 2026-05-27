@@ -60,7 +60,8 @@ static void panthor_devfreq_update_utilization(struct panthor_devfreq *pdevfreq)
 	pdevfreq->time_last_update = now;
 }
 
-static int panthor_devfreq_target(struct device *dev, unsigned long *freq,
+static int panthor_devfreq_target(struct device *dev, void *data,
+				  unsigned long *freq,
 				  u32 flags)
 {
 	struct dev_pm_opp *opp;
@@ -84,6 +85,7 @@ static void panthor_devfreq_reset(struct panthor_devfreq *pdevfreq)
 }
 
 static int panthor_devfreq_get_dev_status(struct device *dev,
+					  void *data,
 					  struct devfreq_dev_status *status)
 {
 	struct panthor_device *ptdev = dev_get_drvdata(dev);
@@ -113,7 +115,8 @@ static int panthor_devfreq_get_dev_status(struct device *dev,
 	return 0;
 }
 
-static int panthor_devfreq_get_cur_freq(struct device *dev, unsigned long *freq)
+static int panthor_devfreq_get_cur_freq(struct device *dev, void *data,
+					unsigned long *freq)
 {
 	struct panthor_device *ptdev = dev_get_drvdata(dev);
 
@@ -326,7 +329,9 @@ unsigned long panthor_devfreq_get_freq(struct panthor_device *ptdev)
 	if (!pdevfreq->devfreq)
 		return 0;
 
-	ret = pdevfreq->devfreq->profile->get_cur_freq(ptdev->base.dev, &freq);
+	ret = pdevfreq->devfreq->profile->get_cur_freq(ptdev->base.dev,
+						       pdevfreq->devfreq->driver_data,
+						       &freq);
 	if (ret)
 		return 0;
 

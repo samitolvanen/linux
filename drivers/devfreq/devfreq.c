@@ -349,7 +349,8 @@ static int devfreq_set_target(struct devfreq *devfreq, unsigned long new_freq,
 	int err = 0;
 
 	if (devfreq->profile->get_cur_freq)
-		devfreq->profile->get_cur_freq(devfreq->dev.parent, &cur_freq);
+		devfreq->profile->get_cur_freq(devfreq->dev.parent,
+					       devfreq->driver_data, &cur_freq);
 	else
 		cur_freq = devfreq->previous_freq;
 
@@ -357,7 +358,8 @@ static int devfreq_set_target(struct devfreq *devfreq, unsigned long new_freq,
 	freqs.new = new_freq;
 	devfreq_notify_transition(devfreq, &freqs, DEVFREQ_PRECHANGE);
 
-	err = devfreq->profile->target(devfreq->dev.parent, &new_freq, flags);
+	err = devfreq->profile->target(devfreq->dev.parent,
+				       devfreq->driver_data, &new_freq, flags);
 	if (err) {
 		freqs.new = cur_freq;
 		devfreq_notify_transition(devfreq, &freqs, DEVFREQ_POSTCHANGE);
@@ -595,7 +597,8 @@ out_update:
 	devfreq->stop_polling = false;
 
 	if (devfreq->profile->get_cur_freq &&
-		!devfreq->profile->get_cur_freq(devfreq->dev.parent, &freq))
+		!devfreq->profile->get_cur_freq(devfreq->dev.parent,
+						devfreq->driver_data, &freq))
 		devfreq->previous_freq = freq;
 
 out:
@@ -790,12 +793,16 @@ static void devfreq_dev_release(struct device *dev)
  * @dev:	the device to add devfreq feature.
  * @profile:	device-specific profile to run devfreq.
  * @governor_name:	name of the policy to choose frequency.
- * @data:	devfreq driver pass to governors, governor should not change it.
+ * @governor_data:	devfreq driver pass to governors, governor should not
+ *			change it.
+ * @driver_data:	private data for the devfreq driver, assigned to the
+ *			resulting struct devfreq before the governor starts so
+ *			profile callbacks can read it immediately.
  */
 struct devfreq *devfreq_add_device(struct device *dev,
 				   struct devfreq_dev_profile *profile,
 				   const char *governor_name,
-				   void *data)
+				   void *governor_data, void *driver_data)
 {
 	struct devfreq *devfreq;
 	struct devfreq_governor *governor;
@@ -832,7 +839,8 @@ struct devfreq *devfreq_add_device(struct device *dev,
 	devfreq->profile = profile;
 	devfreq->previous_freq = profile->initial_freq;
 	devfreq->last_status.current_frequency = profile->initial_freq;
-	devfreq->data = data;
+	devfreq->data = governor_data;
+	devfreq->driver_data = driver_data;
 	devfreq->nb.notifier_call = devfreq_notifier_call;
 
 	if (devfreq->profile->timer < 0
@@ -1022,16 +1030,20 @@ static void devm_devfreq_dev_release(struct device *dev, void *res)
  * @dev:	the device to add devfreq feature.
  * @profile:	device-specific profile to run devfreq.
  * @governor_name:	name of the policy to choose frequency.
- * @data:	 devfreq driver pass to governors, governor should not change it.
+ * @governor_data:	devfreq driver pass to governors, governor should not change it.
  *
  * This function manages automatically the memory of devfreq device using device
  * resource management and simplify the free operation for memory of devfreq
  * device.
+ *
+ * This wrapper does not support per-instance driver_data and always passes
+ * NULL for that argument. Drivers needing per-instance data should use
+ * devfreq_add_device() directly.
  */
 struct devfreq *devm_devfreq_add_device(struct device *dev,
 					struct devfreq_dev_profile *profile,
 					const char *governor_name,
-					void *data)
+					void *governor_data)
 {
 	struct devfreq **ptr, *devfreq;
 
@@ -1039,7 +1051,7 @@ struct devfreq *devm_devfreq_add_device(struct device *dev,
 	if (!ptr)
 		return ERR_PTR(-ENOMEM);
 
-	devfreq = devfreq_add_device(dev, profile, governor_name, data);
+	devfreq = devfreq_add_device(dev, profile, governor_name, governor_data, NULL);
 	if (IS_ERR(devfreq)) {
 		devres_free(ptr);
 		return devfreq;
@@ -1550,7 +1562,8 @@ static ssize_t cur_freq_show(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 
 	if (df->profile->get_cur_freq &&
-		!df->profile->get_cur_freq(df->dev.parent, &freq))
+		!df->profile->get_cur_freq(df->dev.parent, df->driver_data,
+					   &freq))
 		return sprintf(buf, "%lu\n", freq);
 
 	return sprintf(buf, "%lu\n", df->previous_freq);

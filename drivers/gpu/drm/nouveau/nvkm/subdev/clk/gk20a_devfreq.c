@@ -179,7 +179,8 @@ static void gk20a_devfreq_update_utilization(struct gk20a_devfreq *gdevfreq)
 	gdevfreq->time_last_update = now;
 }
 
-static int gk20a_devfreq_target(struct device *dev, unsigned long *freq,
+static int gk20a_devfreq_target(struct device *dev, void *data,
+				unsigned long *freq,
 				u32 flags)
 {
 	struct nouveau_drm *drm = dev_get_drvdata(dev);
@@ -205,7 +206,8 @@ static int gk20a_devfreq_target(struct device *dev, unsigned long *freq,
 	return 0;
 }
 
-static int gk20a_devfreq_get_cur_freq(struct device *dev, unsigned long *freq)
+static int gk20a_devfreq_get_cur_freq(struct device *dev, void *data,
+				      unsigned long *freq)
 {
 	struct nouveau_drm *drm = dev_get_drvdata(dev);
 	struct nvkm_subdev *subdev = nvkm_device_subdev(drm->nvkm, NVKM_SUBDEV_CLK, 0);
@@ -228,12 +230,13 @@ static void gk20a_devfreq_reset(struct gk20a_devfreq *gdevfreq)
 }
 
 static int gk20a_devfreq_get_dev_status(struct device *dev,
+					void *data,
 					struct devfreq_dev_status *status)
 {
 	struct nouveau_drm *drm = dev_get_drvdata(dev);
 	struct gk20a_devfreq *gdevfreq = dev_to_gk20a_devfreq(dev);
 
-	gk20a_devfreq_get_cur_freq(dev, &status->current_frequency);
+	gk20a_devfreq_get_cur_freq(dev, NULL, &status->current_frequency);
 
 	gk20a_devfreq_update_utilization(gdevfreq);
 
