@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::sync::atomic::{
+    AtomicBool,
     AtomicU32,
     Ordering, //
 };
@@ -239,6 +240,14 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sync_upd_work: Work<TyrDrmDevice, { work_id::SYNC_UPD }>,
 
+    /// Dedup gate paired with `sync_upd_work`. The IRQ side flips it
+    /// false -> true under cmpxchg before enqueuing the worker, and
+    /// the worker flips it back to false at the start of its run.
+    /// Coalesces a burst of CSG SYNC_UPDATE acks into a single
+    /// re-evaluation pass while leaving any IRQ that races the
+    /// snapshot free to schedule the next one.
+    sync_upd_pending: AtomicBool,
+
     /// Periodic re-arm worker for `tick_work`.
     ///
     /// Enqueued on `system_unbound()` rather than `sched_wq`
@@ -293,8 +302,19 @@ impl TyrDrmDeviceData {
             .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
     }
 
-    /// Schedules the sync-update worker. Safe from any context; calls coalesce.
+    /// Schedules the sync-update worker. Safe from any context.
+    ///
+    /// `sync_upd_pending` short-circuits a SYNC_UPDATE storm before it
+    /// reaches `queue_work`'s per-pool spinlock, coalescing the burst into
+    /// one re-evaluation pass.
     pub(crate) fn schedule_sync_upd(tdev: &ARef<TyrDrmDevice>) {
+        if tdev
+            .sync_upd_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let _ = workqueue::system_unbound()
             .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());
     }
@@ -402,6 +422,13 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     /// re-validating against the live wait list before promoting groups.
     fn run(this: Self::Pointer) {
         let tdev = &*this;
+
+        // Reset the dedup gate before reading any state so a
+        // SYNC_UPDATE that fires after the snapshot re-arms the worker
+        // for the next pass; clearing at the end would silently drop
+        // IRQs racing the snapshot.
+        tdev.sync_upd_pending.store(false, Ordering::Release);
+
         Scheduler::drain_resident_queue_completions(tdev);
 
         let snapshot = tdev
@@ -555,6 +582,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
+                sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
         });
