@@ -89,10 +89,15 @@ pub(crate) enum GroupListState {
 /// A snapshot of the scheduler-visible state of a `Group`.
 ///
 /// Lets the rule engine and Tick lifecycle read `can_run`, `is_idle`,
-/// and `csg_id` together under a single `inner` lock acquisition.
+/// `has_blocked_queues`, and `csg_id` together under a single `inner`
+/// lock acquisition.
 pub(crate) struct GroupStatus {
     pub(crate) can_run: bool,
     pub(crate) is_idle: bool,
+    /// At least one CS in the group is classified as blocked on a sync
+    /// object by `sync_csg_slot_queues_state`, so the group reports idle
+    /// but cannot make progress until the wait resolves.
+    pub(crate) has_blocked_queues: bool,
     /// CSG slot id when the group is bound, otherwise `None`.
     pub(crate) csg_id: Option<usize>,
 }
@@ -477,6 +482,7 @@ impl Group {
         GroupStatus {
             can_run: !self.vm.is_unusable() && inner.can_run(),
             is_idle: inner.is_idle(),
+            has_blocked_queues: inner.has_blocked_queues(),
             csg_id: inner.csg_id,
         }
     }

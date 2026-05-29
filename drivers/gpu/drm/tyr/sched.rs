@@ -1064,10 +1064,9 @@ impl Scheduler {
     /// `GFP_KERNEL`-vmap a foreign BO, both of which would close a
     /// lockdep cycle through `dma_fence_map` if the scheduler mutex
     /// were held. Read errors are logged and treated as "unblock and
-    /// let the next tick surface any further failure", matching the
-    /// pre-split behaviour. Allocation failure on the results vector
-    /// drops the remaining candidates; the periodic tick will
-    /// revisit.
+    /// let the next tick surface any further failure". Allocation
+    /// failure on the results vector drops the remaining candidates;
+    /// the periodic tick will revisit.
     pub(crate) fn evaluate_syncwait_candidates(
         snapshot: KVec<SyncwaitCandidate>,
     ) -> KVec<SyncwaitResult> {
