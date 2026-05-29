@@ -322,18 +322,13 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // `UNASSIGNED` doorbell from being observed alongside an
         // already-bound `csg_id` on weakly-ordered architectures. The
         // per-CS doorbells wired here remain stable for as long as
-        // the slot is active. Pair the doorbell publish with
-        // `resume_timeout()` so the suspend interval that started when
-        // the queue was last evicted (if any) is folded into the
-        // queue's accumulated suspend time. The matching clear lives
-        // in `evict` below. The `csg_slot_manager > inner` lock
+        // the slot is active. The `csg_slot_manager > inner` lock
         // ordering matches the rest of the scheduler: callers already
         // hold the slot-manager mutex when they reach the activate
         // callback.
         group.with_locked_inner(|inner| {
             for queue in group.queues.iter() {
                 queue.set_doorbell_id(Some(slot_idx + 1));
-                queue.resume_timeout();
             }
             inner.csg_id = Some(slot_idx);
         });
@@ -361,11 +356,12 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // around the firmware ack wait while the scheduler mutex
         // stays held) before this callback runs. This callback only
         // tears the binding down: clear `csg_id` / per-queue
-        // `doorbell_id`, release the AS slot.
+        // `doorbell_id`, release the AS slot. The suspend interval is
+        // opened at the staging point, not here, so the firmware-save
+        // latency counts as off-slot time.
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
-                queue.suspend_timeout();
             }
             inner.csg_id = None;
         });
@@ -768,6 +764,7 @@ impl Scheduler {
         // `CsgSlotOps::activate` publishes `doorbell_id` before this point.
         if new_state == group::State::Active {
             for queue in slot_data.group.queues.iter() {
+                queue.resume_timeout();
                 if queue.is_ringbuf_empty().unwrap_or(true) {
                     continue;
                 }
