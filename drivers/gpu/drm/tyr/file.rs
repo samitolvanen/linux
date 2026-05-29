@@ -110,7 +110,7 @@ impl PinnedDrop for TyrDrmFileData {
             );
         }
 
-        if let Err(e) = self.as_ref().vm_pool().destroy_all() {
+        if let Err(e) = self.as_ref().vm_pool().destroy_all(&self.tdev) {
             dev_err!(self.tdev.as_ref(), "Failed to destroy all VMs: {:?}\n", e);
         }
     }
@@ -221,12 +221,12 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn vm_destroy(
-        _ddev: &TyrDrmDevice<Registered>,
+        ddev: &TyrDrmDevice<Registered>,
         _reg_data: &TyrDrmRegistrationData<'_>,
         vmdestroy: &mut uapi::drm_panthor_vm_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner().vm_pool().destroy_vm(vmdestroy)?;
+        file.inner().vm_pool().destroy_vm(ddev, vmdestroy)?;
         Ok(0)
     }
 
