@@ -778,6 +778,32 @@ impl_has_work! {
     impl{T} HasWork<Self> for ClosureWork<T> { self.work }
 }
 
+/// Waits for the given work item to finish executing.
+///
+/// If the work item is queued or currently running, this blocks until it has finished. It returns
+/// `true` if it had to wait for the work item, and `false` if the work item was idle.
+///
+/// `owner` is a reference to the struct that embeds the [`Work<T, ID>`] field, identified via its
+/// [`HasWork<T, ID>`] implementation. The work item is not modified, so a shared reference is
+/// sufficient.
+///
+/// This wraps the C `flush_work` function and may sleep, so it must not be called from atomic
+/// context.
+pub fn flush_work<T, U, const ID: u64>(owner: &U) -> bool
+where
+    U: HasWork<T, ID>,
+{
+    // SAFETY: `owner` is a live reference, so the pointer derived from it is valid and points at a
+    // struct of type `U`, which `HasWork::raw_get_work` requires.
+    let work = unsafe { U::raw_get_work(core::ptr::from_ref(owner).cast_mut()) };
+
+    // SAFETY: `raw_get_work` returns a pointer to a `Work<T, ID>` field embedded in the live
+    // `owner`, so it is non-dangling and aligned. A `Work<T, ID>` can only be created initialised
+    // (via `Work::new`), so the `work_struct` that `Work::raw_get` points at is initialised and
+    // valid for this call.
+    unsafe { bindings::flush_work(Work::raw_get(work)) }
+}
+
 /// Links for a delayed work item.
 ///
 /// This struct contains a function pointer to the [`run`] function from the [`WorkItemPointer`]
