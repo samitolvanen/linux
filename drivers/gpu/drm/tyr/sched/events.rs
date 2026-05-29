@@ -24,6 +24,7 @@ use crate::{
     fw::{
         CsDbMask,
         CsFaultExceptionType,
+        CsgSlotMask,
         CSG_REQ, //
     },
     heap,
@@ -249,7 +250,9 @@ impl Scheduler {
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
 
-        tdev.fw.ring_csg_doorbell(csg_id)?;
+        let mut mask = CsgSlotMask::empty();
+        mask.insert(csg_id);
+        tdev.fw.ring_csg_doorbells(mask)?;
 
         Ok(queued_tiler_oom)
     }
@@ -362,7 +365,9 @@ impl Scheduler {
                 csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
             })?;
 
-            tdev.fw.ring_csg_doorbell(oom.csg_id)?;
+            let mut mask = CsgSlotMask::empty();
+            mask.insert(oom.csg_id);
+            tdev.fw.ring_csg_doorbells(mask)?;
         }
 
         Ok(())
