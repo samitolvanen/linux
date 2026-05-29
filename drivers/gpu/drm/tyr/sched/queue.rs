@@ -69,12 +69,19 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 /// never needs to allocate under the lock.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
 
+// SAFETY: todo
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: todo
 static TYR_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: todo
 static TYR_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: todo
 static TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: todo
 static TYR_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: todo
 static TYR_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
+// SAFETY: todo
 static TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 #[repr(transparent)]
