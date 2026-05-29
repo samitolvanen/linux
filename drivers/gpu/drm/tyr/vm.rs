@@ -31,7 +31,6 @@ use kernel::{
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
-            GpuVmBoAlloc,
             OpMap,
             OpMapRequest,
             OpMapped,
@@ -317,7 +316,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
-            vm_bo: Some(GpuVmBoAlloc::<GpuVmData>::new(&vm.exec.gpuvm, &bo, ())?.obtain()),
+            vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
             map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
@@ -1098,7 +1097,7 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
-            vm_bo: Some(GpuVmBoAlloc::<GpuVmData>::new(&self.gpuvm, bo, ())?.obtain()),
+            vm_bo: Some(self.gpuvm.obtain(bo, ())?),
             map_sgt: Some(prefetch_map_sgt(bo, dev)?),
         };
         self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)?;
