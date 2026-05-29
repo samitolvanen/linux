@@ -378,6 +378,14 @@ impl SchedulingDecision {
                 continue;
             }
 
+            // Don't re-bind a syncwait group from the idle list; it
+            // sits on `waiting_groups` waiting for sync_upd to promote
+            // it back to runnable.
+            if matches!(prior_state, GroupListState::Idle) && status.has_blocked_queues {
+                cursor.move_next();
+                continue;
+            }
+
             // `peek.remove(self)` advances the cursor to the next
             // element internally, so no separate `move_next` is
             // needed. The returned `ListArc` is the authoritative
@@ -619,7 +627,12 @@ impl<'a> Tick<'a> {
         let rules = build_scheduling_rules! {
             // Idle groups are processed identically in both normal and
             // full ticks. Prefer keeping them bound unless a hardware
-            // slot is needed, walking priorities high to low.
+            // slot is needed, walking priorities high to low. This
+            // includes idle-because-syncwait groups: while on-slot, the
+            // firmware keeps polling the wait and the job deadline keeps
+            // running. The runnable rules above run first and fill every
+            // slot under genuine overcommit, so these idle keeps become
+            // no-ops and the blocked group is evicted to make room.
             shared_idle: [
                 Keep RealTime, Take RealTime,
                 Keep High,     Take High,
