@@ -44,6 +44,8 @@ use kernel::{
         atomic::{
             Acquire,
             Atomic,
+            AtomicFlag,
+            Full,
             Relaxed,
             Release, //
         },
@@ -194,6 +196,14 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sync_upd_work: Work<TyrDrmDevice, { work_id::SYNC_UPD }>,
 
+    /// Dedup gate paired with `sync_upd_work`. The IRQ side claims it
+    /// with xchg and enqueues the worker only if it was false, and the
+    /// worker flips it back to false at the start of its run.
+    /// Coalesces a burst of CSG SYNC_UPDATE acks into a single
+    /// re-evaluation pass while leaving any IRQ that races the
+    /// snapshot free to schedule the next one.
+    sync_upd_pending: AtomicFlag,
+
     /// Periodic re-arm worker for `tick_work`.
     ///
     /// Enqueued on `system_dfl()` rather than `sched_wq`
@@ -268,9 +278,15 @@ impl TyrDrmDeviceData {
         });
     }
 
-    /// Schedules the sync-update worker. Safe from any context, and repeated
-    /// calls coalesce.
+    /// Schedules the sync-update worker. Safe from any context.
+    ///
+    /// `sync_upd_pending` short-circuits a SYNC_UPDATE storm before it
+    /// reaches `queue_work`'s per-pool spinlock, coalescing the burst into
+    /// one re-evaluation pass.
     pub(crate) fn schedule_sync_upd(tdev: &ARef<TyrDrmDevice>) {
+        if tdev.sync_upd_pending.xchg(true, Full) {
+            return;
+        }
         let _ = workqueue::system_dfl()
             .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());
     }
@@ -377,6 +393,12 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     /// gpuvm_unique and dma_resv_lock stay outside the mutex), then apply,
     /// re-validating against the live wait list before promoting groups.
     fn run(this: Self::Pointer) {
+        // Reset the dedup gate before reading any state so a
+        // SYNC_UPDATE that fires after the snapshot re-arms the worker
+        // for the next pass. Clearing at the end would silently drop
+        // IRQs racing the snapshot.
+        this.sync_upd_pending.store(false, Release);
+
         // The drain runs before the guard so an unplug racing this worker
         // cannot strand pending submit fences. It touches no
         // registration-owned state.
@@ -552,6 +574,7 @@ impl platform::Driver for TyrPlatformDriver {
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
+                sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
             }? Error),
