@@ -375,9 +375,9 @@ pub(crate) struct QueueData {
     #[pin]
     syncwait: Mutex<SyncWait>,
     /// Per-queue accounting of off-slot suspend time; advanced by
-    /// `Self::suspend_timeout` / `Self::resume_timeout` from
-    /// `CsgSlotOps::evict` / `CsgSlotOps::activate` and snapshotted
-    /// by `TyrQueueOps::submit` for the per-job baseline.
+    /// `Self::suspend_timeout` from `halt_and_unbind_evicted_groups`
+    /// and `Self::resume_timeout` from `sync_csg_slot_state`, and
+    /// snapshotted by `TyrQueueOps::submit` for the per-job baseline.
     #[pin]
     suspend_state: Mutex<SuspendState>,
 }

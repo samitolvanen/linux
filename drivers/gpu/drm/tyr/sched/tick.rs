@@ -691,14 +691,17 @@ impl<'a> Tick<'a> {
                     continue;
                 };
 
-                context.set_state(
-                    i,
-                    if slot_data.group.can_run() {
-                        CsgExecutionState::Suspend
-                    } else {
-                        CsgExecutionState::Terminate
-                    },
-                );
+                if slot_data.group.can_run() {
+                    // The firmware saves CS state during the ack wait; opening the
+                    // interval here credits that latency as off-slot time. Only
+                    // suspended groups resume, so only they need the interval.
+                    for queue in slot_data.group.queues.iter() {
+                        queue.suspend_timeout();
+                    }
+                    context.set_state(i, CsgExecutionState::Suspend);
+                } else {
+                    context.set_state(i, CsgExecutionState::Terminate);
+                }
             }
         }
 
