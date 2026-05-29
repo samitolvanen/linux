@@ -298,11 +298,6 @@ impl GlobalInterface {
         Ok(acked)
     }
 
-    #[allow(dead_code)]
-    pub(super) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
-        self.ring_doorbell(csg_idx + 1)
-    }
-
     /// Toggles the `GLB_DB_REQ` bits that differ from `GLB_DB_ACK` for
     /// each slot in `csg_mask`, then writes the global doorbell so the
     /// firmware re-evaluates the global input block. Toggling against
