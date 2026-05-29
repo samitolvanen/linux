@@ -311,6 +311,14 @@ impl TyrDrmDeviceData {
             .enqueue::<ARef<TyrDrmDevice>, { work_id::TICK }>(tdev.clone());
     }
 
+    /// Waits for any in-flight scheduler tick to finish.
+    ///
+    /// Must not be called while holding the scheduler mutex: the tick
+    /// worker takes it, so flushing under the lock would deadlock.
+    pub(crate) fn flush_tick(&self) {
+        let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
+    }
+
     /// Re-arms the scheduler tick `delay` jiffies from now.
     ///
     /// If a periodic tick is already pending, `delay` is ignored:

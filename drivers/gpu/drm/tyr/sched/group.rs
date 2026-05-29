@@ -465,7 +465,7 @@ impl Group {
     }
 
     pub(crate) fn can_run(&self) -> bool {
-        self.inner.lock().can_run()
+        !self.vm.is_unusable() && self.inner.lock().can_run()
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -475,7 +475,7 @@ impl Group {
     pub(crate) fn status(&self) -> GroupStatus {
         let inner = self.inner.lock();
         GroupStatus {
-            can_run: inner.can_run(),
+            can_run: !self.vm.is_unusable() && inner.can_run(),
             is_idle: inner.is_idle(),
             csg_id: inner.csg_id,
         }
