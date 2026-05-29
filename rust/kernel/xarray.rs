@@ -412,11 +412,7 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
     /// new ones, so `__xa_store` cannot return `-ENOMEM` here.
     ///
     /// On failure the element is returned inside [`StoreError`].
-    pub fn store_reserved(
-        &mut self,
-        index: ReservedIndex,
-        value: T,
-    ) -> Result<(), StoreError<T>> {
+    pub fn store_reserved(&mut self, index: ReservedIndex, value: T) -> Result<(), StoreError<T>> {
         build_assert!(
             T::FOREIGN_ALIGN >= 4,
             "pointers stored in XArray must be 4-byte aligned"
@@ -429,9 +425,7 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
         // - `new` came from `T::into_foreign`.
         // - Passing 0 for GFP: no allocation occurs when storing into a
         //   reserved slot, so GFP flags are irrelevant.
-        let old = unsafe {
-            bindings::__xa_store(self.xa.xa.get(), index.index(), new.cast(), 0)
-        };
+        let old = unsafe { bindings::__xa_store(self.xa.xa.get(), index.index(), new.cast(), 0) };
 
         // SAFETY: `__xa_store` returns `xa_err(…)` on error, 0 on success.
         let errno = unsafe { bindings::xa_err(old) };
