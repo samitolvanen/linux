@@ -585,7 +585,7 @@ impl PinnedDrop for TyrPlatformDriverData {
 // the C driver in the userspace stack.
 const INFO: drm::DriverInfo = drm::DriverInfo {
     major: 1,
-    minor: 5,
+    minor: 0,
     patchlevel: 0,
     name: c"panthor",
     desc: c"ARM Mali Tyr DRM driver",
