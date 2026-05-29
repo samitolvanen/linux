@@ -160,14 +160,7 @@ impl<T: DriverGpuVm> GpuVmBo<T> {
 ///
 /// Points at a `drm_gpuvm_bo` that contains a valid `T::VmBoData`, has a refcount of one, and is
 /// absent from any gem, extobj, or evict lists.
-pub struct GpuVmBoAlloc<T: DriverGpuVm>(NonNull<GpuVmBo<T>>);
-
-// SAFETY: `GpuVmBoAlloc` owns a refcounted `drm_gpuvm_bo` allocation that is
-// not yet attached to any GPUVM list and whose `T::VmBoData` is initialised.
-// The C-side refcount and `drm_gpuvm_bo_put_deferred` are safe to manipulate
-// from any thread; the only thread-bound state reachable from here is the
-// `T::VmBoData` payload, which is gated on `T::VmBoData: Send`.
-unsafe impl<T: DriverGpuVm> Send for GpuVmBoAlloc<T> where T::VmBoData: Send {}
+pub(super) struct GpuVmBoAlloc<T: DriverGpuVm>(NonNull<GpuVmBo<T>>);
 
 impl<T: DriverGpuVm> GpuVmBoAlloc<T> {
     /// Create a new pre-allocated [`GpuVmBo`].
@@ -175,7 +168,7 @@ impl<T: DriverGpuVm> GpuVmBoAlloc<T> {
     /// It's intentional that the initializer is infallible because `drm_gpuvm_bo_put` will call
     /// drop on the data, so we don't have a way to free it when the data is missing.
     #[inline]
-    pub fn new(
+    pub(super) fn new(
         gpuvm: &GpuVm<T>,
         gem: &T::Object,
         value: impl PinInit<T::VmBoData>,
@@ -201,13 +194,11 @@ impl<T: DriverGpuVm> GpuVmBoAlloc<T> {
         unsafe { (*self.0.as_ptr()).inner.get() }
     }
 
-    /// Install this pre-allocated [`GpuVmBo`], or return the existing entry for
-    /// `(gpuvm, obj)`. For external objects this takes the GPUVM's `dma_resv`
-    /// lock and may sleep.
+    /// Look up whether there is an existing [`GpuVmBo`] for this gem object.
     ///
     /// The caller should not hold the GEM mutex or DMA resv lock.
     #[inline]
-    pub fn obtain(self) -> ARef<GpuVmBo<T>> {
+    pub(super) fn obtain(self) -> ARef<GpuVmBo<T>> {
         let me = ManuallyDrop::new(self);
         // SAFETY: Valid `drm_gpuvm_bo` not already in the lists. We do not access `me` after this
         // call.
