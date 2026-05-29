@@ -137,11 +137,7 @@
 //! the [`QueueOps`] handler, any `Arc`s inside it) stay alive until drop
 //! completes normally.
 
-use core::sync::atomic::{
-    AtomicBool,
-    AtomicU64,
-    Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{
     c_str,
@@ -163,22 +159,11 @@ use crate::{
         UninitDmaFence,
     },
     error::Result,
-    impl_has_dma_fence_delayed_work,
-    impl_has_dma_fence_work,
+    impl_has_dma_fence_delayed_work, impl_has_dma_fence_work,
     prelude::*,
-    sync::{
-        aref::ARef,
-        Arc,
-        LockClassKey,
-        Mutex,
-    },
+    sync::{aref::ARef, Arc, LockClassKey, Mutex},
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
-    xarray::{
-        AllocKind,
-        ReservedIndex,
-        XArray,
-        XaLimit,
-    },
+    xarray::{AllocKind, ReservedIndex, XArray, XaLimit},
 };
 
 #[derive(Clone, Copy)]
@@ -962,9 +947,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     StageKind::WaitingForDeps => self.process_deps(entry_idx),
                     StageKind::WaitingForExec => self.process_exec(entry_idx),
                     StageKind::Executing => self.process_default_hw_wait(entry_idx),
-                    StageKind::Driver(stage) => {
-                        self.process_driver_stage(stage.clone(), entry_idx)
-                    }
+                    StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
                 }
             };
 
@@ -978,9 +961,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                         // entries draining through).
                         if !is_timed_out {
                             let mut guard = self.fifo.lock();
-                            if let Some(XaEntry::Live(entry)) =
-                                guard.get_mut(entry_idx as usize)
-                            {
+                            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                                 entry.stage_entered_at = Instant::now();
                             }
                         }
@@ -998,9 +979,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     // stages via the is_timed_out fast-path above.
                     {
                         let mut guard = self.fifo.lock();
-                        if let Some(XaEntry::Live(entry)) =
-                            guard.get_mut(entry_idx as usize)
-                        {
+                        if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                             entry.timed_out = true;
                         }
                     }
@@ -1035,9 +1014,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     match result {
                         Ok(registration) => {
                             let mut guard = self.fifo.lock();
-                            if let Some(XaEntry::Live(entry)) =
-                                guard.get_mut(entry_idx as usize)
-                            {
+                            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                                 entry.stage_wake_cb = Some(registration);
                             }
                         }
@@ -1055,8 +1032,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     return;
                 }
                 StageAdvance::WaitFor(delay) => {
-                    let _ =
-                        self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay);
+                    let _ = self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay);
                     return;
                 }
                 StageAdvance::Wait => return,
@@ -1145,9 +1121,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 Ok(registration) => {
                     {
                         let mut guard = self.fifo.lock();
-                        if let Some(XaEntry::Live(entry)) =
-                            guard.get_mut(entry_idx as usize)
-                        {
+                        if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                             entry.deps.active_cb = Some(registration);
                         }
                     }
@@ -1239,9 +1213,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 match cb_result {
                     Ok(registration) => {
                         let mut guard = self.fifo.lock();
-                        if let Some(XaEntry::Live(entry)) =
-                            guard.get_mut(entry_idx as usize)
-                        {
+                        if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                             entry.progress_cb = Some(registration);
                         }
                     }
@@ -1312,9 +1284,7 @@ impl<T: QueueOps> JobQueueInner<T> {
             let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
                 return StageAdvance::Wait;
             };
-            msecs_to_jiffies(
-                entry.pipeline_entered_at.elapsed().as_millis().max(0) as u32
-            )
+            msecs_to_jiffies(entry.pipeline_entered_at.elapsed().as_millis().max(0) as u32)
         };
         if elapsed >= timeout {
             StageAdvance::TimedOut(ETIMEDOUT)
@@ -1325,11 +1295,7 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// Driver-stage helper: build a [`StageContext`] and delegate to the
     /// driver's [`StageOps::process`].
-    fn process_driver_stage(
-        &self,
-        stage: Arc<dyn StageOps<T>>,
-        entry_idx: u32,
-    ) -> StageAdvance {
+    fn process_driver_stage(&self, stage: Arc<dyn StageOps<T>>, entry_idx: u32) -> StageAdvance {
         // Clear any stale wake callback before re-evaluating; the callback
         // may have already fired and triggered this check.
         {
@@ -1896,9 +1862,7 @@ impl<T: QueueOps> JobQueue<T> {
 
         for stage_i in 0..state.stage_ranges.len() {
             while let Some(idx) = state.stage_ranges[stage_i].pop_front() {
-                let Some(mut xa_entry) =
-                    self.inner.fifo.lock().remove(idx as usize)
-                else {
+                let Some(mut xa_entry) = self.inner.fifo.lock().remove(idx as usize) else {
                     continue;
                 };
                 // Reserved entries were never committed; just drop them.
