@@ -162,26 +162,35 @@ impl Pool {
         Ok(())
     }
 
-    fn destroy_vm_index(&self, index: usize) -> Result {
+    fn destroy_vm_index(&self, tdev: &TyrDrmDevice, index: usize) -> Result {
         let vm = self.entries.remove(index)?;
+
+        vm.mark_unusable();
+        if vm.as_slot().is_some() {
+            tdev.flush_tick();
+        }
 
         vm.kill();
         Ok(())
     }
 
-    pub(crate) fn destroy_vm(&self, vmdestroy: &uapi::drm_panthor_vm_destroy) -> Result {
+    pub(crate) fn destroy_vm(
+        &self,
+        tdev: &TyrDrmDevice,
+        vmdestroy: &uapi::drm_panthor_vm_destroy,
+    ) -> Result {
         if vmdestroy.pad != 0 {
             return Err(EINVAL);
         }
 
-        self.destroy_vm_index(vmdestroy.id as usize)
+        self.destroy_vm_index(tdev, vmdestroy.id as usize)
     }
 
-    pub(crate) fn destroy_all(&self) -> Result {
+    pub(crate) fn destroy_all(&self, tdev: &TyrDrmDevice) -> Result {
         let max_index = self.entries.index_upper_bound();
 
         for index in 1..max_index {
-            let _ = self.destroy_vm_index(index);
+            let _ = self.destroy_vm_index(tdev, index);
         }
 
         Ok(())
@@ -950,7 +959,7 @@ impl VmExec {
         self.unusable.load(Ordering::Relaxed)
     }
 
-    fn mark_unusable(&self) {
+    pub(crate) fn mark_unusable(&self) {
         self.unusable.store(true, Ordering::Relaxed);
     }
 
