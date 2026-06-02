@@ -720,9 +720,9 @@ impl Group {
         self.vm
             .with_prepared_vm(job_count as u32, |mut prepared_vm| {
                 for idx in 0..job_count {
-                    let submit_fence = ctx.commit(idx, self)?;
+                    let signal_fence = ctx.commit(idx, self)?;
                     prepared_vm.resv_add_fence(
-                        &submit_fence,
+                        &signal_fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     );

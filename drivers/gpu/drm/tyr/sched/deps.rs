@@ -301,6 +301,7 @@ enum JobState {
     Prepared {
         queue_index: usize,
         prepared: PreparedQueueJob,
+        has_stream: bool,
         /// (handle, point) pairs of WAIT syncops resolved at prepare time
         /// to a SIGNAL produced earlier in the same batch. The producer's
         /// submit fence is looked up from `Context::signals` at commit
@@ -447,13 +448,18 @@ impl<'a> Context<'a> {
         self.jobs[job_idx].state = Some(JobState::Prepared {
             queue_index,
             prepared,
+            has_stream,
             intra_batch_deps,
         });
 
         Ok(())
     }
 
-    /// Commits the Job at `job_idx` and returns its submit fence.
+    /// Commits the Job at `job_idx` and returns the fence that gates its
+    /// completion: the job's own submit fence for a command-stream job,
+    /// or the adopted prior command-stream fence for a stream-less job.
+    /// This is the same fence wired to the job's signal syncobjs, so the
+    /// caller can add it to the VM resv in agreement with the syncobjs.
     ///
     /// Runs inside the caller's dma-fence signalling section. The path
     /// is allocation-free: intra-batch fences are appended via
@@ -462,14 +468,16 @@ impl<'a> Context<'a> {
     /// and `Self::update_job_syncs` only writes into a pre-allocated
     /// slot.
     pub(crate) fn commit(&mut self, job_idx: usize, group: &Group) -> Result<ARef<PublicDmaFence>> {
-        let (queue_index, mut prepared, intra_batch_deps) = match self.jobs[job_idx].state.take() {
-            Some(JobState::Prepared {
-                queue_index,
-                prepared,
-                intra_batch_deps,
-            }) => (queue_index, prepared, intra_batch_deps),
-            _ => return Err(EINVAL),
-        };
+        let (queue_index, mut prepared, has_stream, intra_batch_deps) =
+            match self.jobs[job_idx].state.take() {
+                Some(JobState::Prepared {
+                    queue_index,
+                    prepared,
+                    has_stream,
+                    intra_batch_deps,
+                }) => (queue_index, prepared, has_stream, intra_batch_deps),
+                _ => return Err(EINVAL),
+            };
 
         for (handle, point) in intra_batch_deps.iter() {
             let fence = self
@@ -483,8 +491,17 @@ impl<'a> Context<'a> {
         let queue = group.queues.get(queue_index).ok_or(EINVAL)?;
         let submit_fence = queue.commit_job(prepared);
 
-        self.update_job_syncs(job_idx, submit_fence.clone())?;
-        Ok(submit_fence)
+        let signal_fence = if has_stream {
+            queue.set_last_submit_fence(submit_fence.clone());
+            submit_fence.clone()
+        } else {
+            queue
+                .last_submit_fence()
+                .unwrap_or_else(|| submit_fence.clone())
+        };
+
+        self.update_job_syncs(job_idx, signal_fence.clone())?;
+        Ok(signal_fence)
     }
 
     /// Publishes each registered producer fence to its syncobj.

@@ -370,6 +370,14 @@ pub(crate) struct QueueData {
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
     pending_submit_fences: Mutex<PendingFences>,
+    /// Submit fence of the most-recently committed command-stream job
+    /// on this queue, in FIFO submit order. A stream-less job emits no
+    /// GPU work of its own, so it adopts this fence as the producer for
+    /// its signal syncobjs: the syncobj only advances once the prior
+    /// command stream's GPU work retires. `None` until the first
+    /// command-stream job is committed.
+    #[pin]
+    last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
     /// Active GPU sync-wait captured for this queue. The `Default`
     /// value (`gpu_va == 0`) means no wait is currently active.
     #[pin]
@@ -434,6 +442,20 @@ impl QueueData {
     /// Returns the highest seqno claimed so far on this queue.
     pub(crate) fn next_seqno(&self) -> u64 {
         self.next_seqno.load(Ordering::Relaxed)
+    }
+
+    /// Records `fence` as the queue's last command-stream submit fence,
+    /// dropping the previously stored one. Called in FIFO submit order
+    /// from `Context::commit` so a later stream-less job adopts the
+    /// fence of the immediately-FIFO-earlier command stream.
+    pub(in crate::sched) fn set_last_submit_fence(&self, fence: ARef<PublicDmaFence>) {
+        *self.last_submit_fence.lock() = Some(fence);
+    }
+
+    /// Returns a clone of the queue's last command-stream submit fence,
+    /// or `None` if no command-stream job has been committed yet.
+    pub(in crate::sched) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
+        self.last_submit_fence.lock().clone()
     }
 
     /// Copies `instrs` into the ringbuffer at the current `INSERT`. The
@@ -1014,6 +1036,7 @@ impl Queue {
                     head: 0,
                     outstanding: 0,
                 }),
+                last_submit_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
                 suspend_state <- new_mutex!(SuspendState {
                     since: Some(Instant::<Monotonic>::now()),
