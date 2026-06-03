@@ -899,7 +899,7 @@ impl Pool {
         }
 
         if groupsubmit.queue_submits.count == 0 {
-            return Err(EINVAL);
+            return Ok(());
         }
 
         let group = self
