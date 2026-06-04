@@ -492,17 +492,6 @@ pub(crate) struct VmOpResources {
     map_sgt: Option<KVec<(PhysAddr, u64)>>,
 }
 
-// SAFETY: `VmOpResources` holds `GpuVaAlloc` instances and an obtained
-// `ARef<GpuVmBo<GpuVmData>>`. `GpuVaAlloc` wraps a
-// `KBox<MaybeUninit<GpuVa<GpuVmData>>>` of uninitialised slab memory and is
-// `!Send` only because its `Opaque<drm_gpuva>` field transitively inherits
-// `!Send` from the C bindings; the allocation carries no thread-bound state.
-// `GpuVmBo<GpuVmData>` is `!Send` for the same reason, but its `drm_gpuvm_bo`
-// refcount is not thread-bound and the only thread-bound state it could carry
-// is its `VmBoData = ()` payload, which is `Send`. Handing the resources off to
-// the VM_BIND worker thread that consumes them is therefore sound.
-unsafe impl Send for VmOpResources {}
-
 /// Request to execute a virtual memory operation.
 struct VmOpRequest {
     /// Request type.
