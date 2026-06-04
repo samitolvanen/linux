@@ -19,6 +19,21 @@ pub struct GpuVmBo<T: DriverGpuVm> {
     data: T::VmBoData,
 }
 
+// SAFETY: The refcount in `self.inner` is atomic, so `dec_ref`'s deferred put is sound from any
+// thread. `data` is dropped later by `drm_gpuvm_bo_deferred_cleanup`, on whichever thread drains
+// the queue, hence the `T::VmBoData: Send` bound.
+unsafe impl<T: DriverGpuVm> Send for GpuVmBo<T> where T::VmBoData: Send {}
+
+// SAFETY: The fields of `inner` read by shared-reference methods are immutable after construction.
+// [`Self::data`] hands out `&T::VmBoData` and [`Self::obj`] hands out `&T::Object`, so sharing
+// `&Self` across threads requires both to be `Sync`.
+unsafe impl<T: DriverGpuVm> Sync for GpuVmBo<T>
+where
+    T::VmBoData: Sync,
+    T::Object: Sync,
+{
+}
+
 // SAFETY: By type invariants, the allocation is managed by the refcount in `self.inner`.
 unsafe impl<T: DriverGpuVm> AlwaysRefCounted for GpuVmBo<T> {
     fn inc_ref(&self) {
