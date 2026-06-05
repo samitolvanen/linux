@@ -19,6 +19,28 @@ pub struct GpuVmBo<T: DriverGpuVm> {
     data: T::VmBoData,
 }
 
+// SAFETY: It is safe to send a `GpuVmBo<T>` to another thread when `T::VmBoData` and `T::Object`
+// are `Sync` because `data()` and `obj()` share `&T::VmBoData` and `&T::Object`; they must also be
+// `Send` because the last reference drop runs their destructors on whichever thread drains the
+// deferred-cleanup queue.
+unsafe impl<T: DriverGpuVm> Send for GpuVmBo<T>
+where
+    T::VmBoData: Send + Sync,
+    T::Object: Send + Sync,
+{
+}
+
+// SAFETY: It is safe to send `&GpuVmBo<T>` to another thread when `T::VmBoData` and `T::Object` are
+// `Sync` because `data()` and `obj()` share `&T::VmBoData` and `&T::Object`; they must also be
+// `Send` because any thread with a `&GpuVmBo<T>` can clone it via `ARef::from`, whose last drop
+// runs their destructors on whichever thread drains the deferred-cleanup queue.
+unsafe impl<T: DriverGpuVm> Sync for GpuVmBo<T>
+where
+    T::VmBoData: Send + Sync,
+    T::Object: Send + Sync,
+{
+}
+
 // SAFETY: By type invariants, the allocation is managed by the refcount in `self.inner`.
 unsafe impl<T: DriverGpuVm> AlwaysRefCounted for GpuVmBo<T> {
     fn inc_ref(&self) {
