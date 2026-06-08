@@ -72,11 +72,25 @@ pub struct GpuVm<T: DriverGpuVm> {
     data: UnsafeCell<T>,
 }
 
-// SAFETY: The GPUVM api does not assume that it is tied to a specific thread. The destructor will
-// drop the `data` field, which is okay because it is guaranteed `Send` by the `DriverGpuVm` trait.
-unsafe impl<T: DriverGpuVm> Send for GpuVm<T> {}
-// SAFETY: The GPUVM api is designed to allow &self methods to be called in parallel.
-unsafe impl<T: DriverGpuVm> Sync for GpuVm<T> {}
+// SAFETY: The GPUVM api does not assume that it is tied to a specific thread. `obtain()` called
+// from several threads can return `ARef`s to the same bo, aliasing `T::VmBoData` and `T::Object`,
+// and `deferred_cleanup()` can drop them from any thread, so both must be `Send + Sync`.
+unsafe impl<T: DriverGpuVm> Send for GpuVm<T>
+where
+    T::VmBoData: Send + Sync,
+    T::Object: Send + Sync,
+{
+}
+// SAFETY: The GPUVM api is designed to allow &self methods to be called in parallel. `obtain()`
+// called from several threads can return `ARef`s to the same bo, aliasing `T::VmBoData` and
+// `T::Object`, and `deferred_cleanup()` can drop them from any thread, so both must be
+// `Send + Sync`.
+unsafe impl<T: DriverGpuVm> Sync for GpuVm<T>
+where
+    T::VmBoData: Send + Sync,
+    T::Object: Send + Sync,
+{
+}
 
 // SAFETY: By type invariants, the allocation is managed by the refcount in `self.vm`.
 unsafe impl<T: DriverGpuVm> AlwaysRefCounted for GpuVm<T> {
