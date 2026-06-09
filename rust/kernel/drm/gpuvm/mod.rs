@@ -175,7 +175,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
             )))
         };
         // INVARIANT: This reference is unique.
-        Ok(UniqueRefGpuVm(aref))
+        Ok(UniqueRefGpuVm(aref, PhantomData))
     }
 
     /// Access this [`GpuVm`] from a raw pointer.
@@ -310,11 +310,28 @@ pub trait DriverGpuVm: Sized + Send {
 /// # Invariants
 ///
 /// Each `GpuVm` instance has at most one `UniqueRefGpuVm` reference.
-pub struct UniqueRefGpuVm<T: DriverGpuVm>(ARef<GpuVm<T>>);
+pub struct UniqueRefGpuVm<T: DriverGpuVm>(ARef<GpuVm<T>>, PhantomData<*const T::VaData>);
 
-// SAFETY: The GPUVM api is designed to allow &self methods to be called in parallel, and
-// concurrent access to `data` is safe due to the `T: Sync` requirement.
-unsafe impl<T: DriverGpuVm + Sync> Sync for UniqueRefGpuVm<T> {}
+// SAFETY: `obtain()`, reachable via `Deref`, aliases `T::VmBoData` and `T::Object` across threads
+// and the deferred put drops them, so both must be `Send + Sync`. The VA-mutating api drops
+// `T::VaData` on whichever thread holds the handle, so it must be `Send`.
+unsafe impl<T: DriverGpuVm> Send for UniqueRefGpuVm<T>
+where
+    T::VmBoData: Send + Sync,
+    T::Object: Send + Sync,
+    T::VaData: Send,
+{
+}
+// SAFETY: `obtain()`, reachable via `Deref`, aliases `T::VmBoData` and `T::Object` across threads
+// and the deferred put drops them, so both must be `Send + Sync`. `data_ref()` exposes `&T`, so
+// `T` must be `Sync`.
+unsafe impl<T: DriverGpuVm> Sync for UniqueRefGpuVm<T>
+where
+    T: Sync,
+    T::VmBoData: Send + Sync,
+    T::Object: Send + Sync,
+{
+}
 
 impl<T: DriverGpuVm> UniqueRefGpuVm<T> {
     /// Access the data owned by this `UniqueRefGpuVm` immutably.
