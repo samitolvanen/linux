@@ -122,19 +122,24 @@ int drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 	if (unlikely(!type))
 		return -EOPNOTSUPP;
 	fc = fs_context_for_mount(type, SB_KERNMOUNT);
+	put_filesystem(type);
 	if (IS_ERR(fc))
 		return PTR_ERR(fc);
 	ret = vfs_parse_fs_string(fc, "source", "tmpfs");
 	if (unlikely(ret))
-		return -ENOPARAM;
+		goto err;
 	ret = vfs_parse_fs_string(fc, "huge", value);
 	if (unlikely(ret))
-		return -ENOPARAM;
+		goto err;
 
 	dev->huge_mnt = fc_mount_longterm(fc);
 	put_fs_context(fc);
 
 	return drmm_add_action_or_reset(dev, drm_gem_huge_mnt_free, NULL);
+
+err:
+	put_fs_context(fc);
+	return -ENOPARAM;
 }
 EXPORT_SYMBOL_GPL(drm_gem_huge_mnt_create);
 #endif
