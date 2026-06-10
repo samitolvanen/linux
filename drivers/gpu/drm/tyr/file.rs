@@ -313,6 +313,11 @@ impl TyrDrmFileData {
                     Err(EINVAL)?;
                 }
 
+                // A zero-size op carries no work, so treat it as a no-op.
+                if op.0.size == 0 {
+                    return Ok(());
+                }
+
                 let validated_bo = validate_bind_op(&op, file)?;
 
                 match op.0.flags as i32 & type_mask {
@@ -338,7 +343,7 @@ impl TyrDrmFileData {
 
                         vm.unmap_range(op.0.va, op.0.size)?;
                     }
-                    _ => Err(ENOTSUPP)?,
+                    _ => Err(EINVAL)?,
                 }
 
                 Ok(())
@@ -652,7 +657,7 @@ impl VmBindOp {
                     return Err(EINVAL);
                 }
             }
-            _ => return Err(ENOTSUPP),
+            _ => return Err(EINVAL),
         }
 
         Ok((job, syncs))
