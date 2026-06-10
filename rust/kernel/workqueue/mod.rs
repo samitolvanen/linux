@@ -589,6 +589,22 @@ impl<T: ?Sized, const ID: u64> Work<T, ID> {
         // the compiler does not complain that the `work` field is unused.
         unsafe { Opaque::cast_into(core::ptr::addr_of!((*ptr).work)) }
     }
+
+    /// Waits for this work item to finish executing.
+    ///
+    /// If the work item is queued or currently running, this blocks until it has finished. It
+    /// returns `true` if it had to wait for the work item, and `false` if the work item was idle.
+    ///
+    /// This wraps the C `flush_work` function and may sleep, so it must not be called from atomic
+    /// context. Flushing from the work item itself deadlocks, as does flushing another item on the
+    /// same ordered or `WQ_MEM_RECLAIM` queue. An item on a `WQ_MEM_RECLAIM` queue must also not
+    /// flush an item on a queue without it, which breaks the forward-progress guarantee.
+    #[inline]
+    pub fn flush(&self) -> bool {
+        // SAFETY: A `Work` only exists initialized, through `Work::new`, and `&self` keeps the
+        // embedded `work_struct` alive for the duration of the call.
+        unsafe { bindings::flush_work(self.work.get()) }
+    }
 }
 
 /// Declares that a type contains a [`Work<T, ID>`].
