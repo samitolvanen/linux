@@ -31,8 +31,8 @@ use crate::{
     time::Jiffies,
     types::{ForeignOwnable, NotThreadSafe, Opaque},
     workqueue::{
-        DelayedWork, HasDelayedWork, HasWork, OwnedQueue, RawDelayedWorkItem, RawWorkItem, Work,
-        WorkItem, WorkItemPointer, WqFlags,
+        DelayedWork, HasDelayedWork, HasWork, Queue, RawDelayedWorkItem, RawWorkItem, Work,
+        WorkItem, WorkItemPointer,
     },
 };
 
@@ -1226,7 +1226,11 @@ where
 }
 
 /// Workqueue that can only be used to schedule [`DmaFenceWork`] items.
-pub struct DmaFenceWorkqueue(OwnedQueue);
+///
+/// # Invariants
+///
+/// `0` points at a valid workqueue that is owned by this `DmaFenceWorkqueue`.
+pub struct DmaFenceWorkqueue(NonNull<Queue>);
 
 // SAFETY: `DmaFenceWorkqueue` owns a kernel workqueue. The workqueue core
 // synchronizes enqueue and destruction, and this wrapper only exposes enqueue
@@ -1237,28 +1241,10 @@ unsafe impl Send for DmaFenceWorkqueue {}
 unsafe impl Sync for DmaFenceWorkqueue {}
 
 impl DmaFenceWorkqueue {
-    /// Allocates a new DMA-fence constrained workqueue.
-    #[inline]
-    pub fn new(
-        name: &CStr,
-        flags: WqFlags,
-        max_active: usize,
-    ) -> Result<DmaFenceWorkqueue, AllocError> {
-        let flags = flags | WqFlags::MEM_RECLAIM;
-        let queue = OwnedQueue::new(name, flags, max_active)?;
-        Ok(Self(queue))
-    }
-
-    /// Allocates a new DMA-fence constrained workqueue with a formatted name.
-    #[inline]
-    pub fn new_fmt(
-        name: core::fmt::Arguments<'_>,
-        flags: WqFlags,
-        max_active: usize,
-    ) -> Result<DmaFenceWorkqueue, AllocError> {
-        let flags = flags | WqFlags::MEM_RECLAIM;
-        let queue = OwnedQueue::new_fmt(name, flags, max_active)?;
-        Ok(Self(queue))
+    /// Returns a reference to the wrapped queue.
+    fn as_queue(&self) -> &Queue {
+        // SAFETY: By the type invariants, `self.0` points at a valid workqueue.
+        unsafe { self.0.as_ref() }
     }
 
     /// Enqueues a work item.
@@ -1266,15 +1252,54 @@ impl DmaFenceWorkqueue {
     where
         W: RawDmaFenceWorkItem<ID> + Send + 'static,
     {
-        self.0.enqueue(w)
+        self.as_queue().enqueue(w)
     }
 
     /// Enqueues a delayed work item.
-    pub fn enqueue_delayed<W, const ID: u64>(&self, w: W, delay: Jiffies) -> W::EnqueueOutput
+    ///
+    /// This may fail if the work item is already enqueued in a workqueue.
+    ///
+    /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the workqueue is not dropped while the delayed work item is
+    /// pending, for example by having the work item own a reference to this workqueue.
+    pub unsafe fn enqueue_delayed<W, const ID: u64>(&self, w: W, delay: Jiffies) -> W::EnqueueOutput
     where
         W: RawDmaFenceDelayedWorkItem<ID> + Send + 'static,
     {
-        self.0.enqueue_delayed(w, delay)
+        let queue_ptr = core::ptr::from_ref(self.as_queue())
+            .cast::<bindings::workqueue_struct>()
+            .cast_mut();
+
+        // SAFETY: We only return `false` if the `work_struct` is already in a workqueue. The
+        // other `__enqueue` requirements are not relevant since `W` is `Send` and static.
+        //
+        // `queue_ptr` is valid for the call. `Queue` is `#[repr(transparent)]` over
+        // `Opaque<bindings::workqueue_struct>`, and this function's safety requirements
+        // guarantee that the workqueue outlives the pending work item.
+        //
+        // The call to `bindings::queue_delayed_work_on` will dereference the provided raw
+        // pointer, which is ok because `__enqueue` guarantees that the pointer is valid for the
+        // duration of this closure, and the safety requirements of `RawDelayedWorkItem` expands
+        // this requirement to apply to the entire `delayed_work`.
+        //
+        // Furthermore, if the C workqueue code accesses the pointer after this call to
+        // `__enqueue`, then the work item was successfully enqueued, and
+        // `bindings::queue_delayed_work_on` will have returned true. In this case, `__enqueue`
+        // promises that the raw pointer will stay valid until we call the function pointer in
+        // the `work_struct`, so the access is ok.
+        unsafe {
+            w.__enqueue(move |work_ptr| {
+                bindings::queue_delayed_work_on(
+                    bindings::wq_misc_consts_WORK_CPU_UNBOUND as c_int,
+                    queue_ptr,
+                    crate::container_of!(work_ptr, bindings::delayed_work, work),
+                    delay,
+                )
+            })
+        }
     }
 }
 

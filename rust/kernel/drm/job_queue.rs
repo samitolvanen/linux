@@ -1106,7 +1106,9 @@ impl<T: QueueOps> JobQueueInner<T> {
                     return;
                 }
                 StageAdvance::WaitFor(delay) => {
-                    let _ = self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay);
+                    // SAFETY: The pending work item is an `Arc<Self>` and `self.wq` is a field
+                    // of `Self`, so the workqueue stays alive while the item is pending.
+                    let _ = unsafe { self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay) };
                     return;
                 }
                 StageAdvance::Wait => return,
