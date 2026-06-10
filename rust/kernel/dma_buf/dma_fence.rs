@@ -31,8 +31,8 @@ use crate::{
     time::Jiffies,
     types::{ForeignOwnable, NotThreadSafe, Opaque},
     workqueue::{
-        DelayedWork, HasDelayedWork, HasWork, Queue, RawDelayedWorkItem, RawWorkItem, Work,
-        WorkItem, WorkItemPointer,
+        DelayedWork, HasDelayedWork, HasWork, OwnedQueue, Queue, RawDelayedWorkItem, RawWorkItem,
+        Work, WorkItem, WorkItemPointer,
     },
 };
 
@@ -1226,11 +1226,7 @@ where
 }
 
 /// Workqueue that can only be used to schedule [`DmaFenceWork`] items.
-///
-/// # Invariants
-///
-/// `0` points at a valid workqueue that is owned by this `DmaFenceWorkqueue`.
-pub struct DmaFenceWorkqueue(NonNull<Queue>);
+pub struct DmaFenceWorkqueue(OwnedQueue);
 
 // SAFETY: `DmaFenceWorkqueue` owns a kernel workqueue. The workqueue core
 // synchronizes enqueue and destruction, and this wrapper only exposes enqueue
@@ -1241,10 +1237,23 @@ unsafe impl Send for DmaFenceWorkqueue {}
 unsafe impl Sync for DmaFenceWorkqueue {}
 
 impl DmaFenceWorkqueue {
+    /// Allocates a new unbound DMA-fence constrained workqueue.
+    #[inline]
+    pub fn new_unbound(name: &CStr) -> Result<DmaFenceWorkqueue, AllocError> {
+        Ok(Self(Queue::new_unbound().mem_reclaim().build(name)?))
+    }
+
+    /// Allocates a new high-priority per-cpu DMA-fence constrained workqueue.
+    #[inline]
+    pub fn new_highpri(name: &CStr) -> Result<DmaFenceWorkqueue, AllocError> {
+        Ok(Self(
+            Queue::new_percpu().highpri().mem_reclaim().build(name)?,
+        ))
+    }
+
     /// Returns a reference to the wrapped queue.
     fn as_queue(&self) -> &Queue {
-        // SAFETY: By the type invariants, `self.0` points at a valid workqueue.
-        unsafe { self.0.as_ref() }
+        &self.0
     }
 
     /// Enqueues a work item.
@@ -1263,8 +1272,10 @@ impl DmaFenceWorkqueue {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the workqueue is not dropped while the delayed work item is
-    /// pending, for example by having the work item own a reference to this workqueue.
+    /// The caller must keep this [`DmaFenceWorkqueue`] alive until the delayed work item has run
+    /// or been canceled, for example by having the work item own a reference to this workqueue.
+    /// Dropping it destroys the backing [`OwnedQueue`], whose drop does not wait for pending
+    /// delayed work, so an early drop would leave the timer pointing at a freed workqueue.
     pub unsafe fn enqueue_delayed<W, const ID: u64>(&self, w: W, delay: Jiffies) -> W::EnqueueOutput
     where
         W: RawDmaFenceDelayedWorkItem<ID> + Send + 'static,

@@ -72,9 +72,9 @@ use kernel::{
         impl_has_delayed_work,
         DelayedWork,
         OwnedQueue,
+        Queue,
         Work,
-        WorkItem,
-        WqFlags, //
+        WorkItem, //
     }, //
 };
 
@@ -209,8 +209,8 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Dedicated DMA-fence-constrained workqueue for the scheduler
     /// bottom half. Created `WQ_HIGHPRI` (`MEM_RECLAIM` is added by
-    /// `DmaFenceWorkqueue::new`) so the scheduler can keep up with
-    /// firmware acks under memory pressure.
+    /// `DmaFenceWorkqueue::new_highpri`) so the scheduler can keep up
+    /// with firmware acks under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
     /// Per-device cleanup workqueue.
@@ -620,7 +620,7 @@ impl platform::Driver for TyrPlatformDriverData {
         let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
 
         let cleanup_wq = Arc::new(
-            CleanupQueue(OwnedQueue::new(c"tyr-cleanup", WqFlags::UNBOUND, 0)?),
+            CleanupQueue(Queue::new_unbound().build(c"tyr-cleanup")?),
             GFP_KERNEL,
         )?;
 
@@ -635,14 +635,11 @@ impl platform::Driver for TyrPlatformDriverData {
         )?;
 
         let wq = Arc::new(
-            DmaFenceWorkqueue::new(c"tyr-dma-fence", WqFlags::UNBOUND, 0)?,
+            DmaFenceWorkqueue::new_unbound(c"tyr-dma-fence")?,
             GFP_KERNEL,
         )?;
 
-        let sched_wq = Arc::new(
-            DmaFenceWorkqueue::new(c"tyr-sched", WqFlags::HIGHPRI, 0)?,
-            GFP_KERNEL,
-        )?;
+        let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
 
         let csg_slot_ops = CsgSlotOps::new(firmware.clone());
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(csg_slot_ops, MAX_CSGS)?;
