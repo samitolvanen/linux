@@ -115,6 +115,15 @@ pub trait DriverObject: Sync + Send + Sized {
 
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &DriverAllocImpl<Self>, _file: &DriverFile<Self>) {}
+
+    /// Called when userspace exports the object to a dma-buf.
+    ///
+    /// Returning an error rejects the export. On success the object is
+    /// exported through the default `drm_gem_prime_export()` path, as if no
+    /// export hook were installed.
+    fn export(_obj: &DriverAllocImpl<Self>, _flags: c_int) -> Result {
+        Ok(())
+    }
 }
 
 /// Trait that represents a GEM object subtype
@@ -165,6 +174,26 @@ extern "C" fn close_callback<T: DriverObject>(
     let obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
 
     T::close(obj, file);
+}
+
+extern "C" fn export_callback<T: DriverObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+    flags: c_int,
+) -> *mut bindings::dma_buf {
+    // SAFETY:
+    // * `export_callback` is specified in the AllocOps structure for `DriverObject`, ensuring
+    //   that `raw_obj` is contained within a `DriverAllocImpl<T>`
+    // * It is only possible for `export_callback` to be called after device registration,
+    //   ensuring that the object's device is in the `Registered` state.
+    let obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+    match T::export(obj, flags) {
+        // SAFETY: `raw_obj` is a valid GEM object (see above);
+        // `drm_gem_prime_export()` is the default the DRM core uses when no
+        // export hook is installed.
+        Ok(()) => unsafe { bindings::drm_gem_prime_export(raw_obj, flags) },
+        Err(e) => e.to_ptr(),
+    }
 }
 
 impl<T: DriverObject, Ctx: DeviceContext> IntoGEMObject for Object<T, Ctx> {
@@ -276,7 +305,7 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
         open: Some(open_callback::<T>),
         close: Some(close_callback::<T>),
         print_info: None,
-        export: None,
+        export: Some(export_callback::<T>),
         pin: None,
         unpin: None,
         get_sg_table: None,
