@@ -299,7 +299,7 @@ impl TyrDrmFileData {
         .reader();
 
         for i in 0..count {
-            let res = {
+            let res: Result = (|| {
                 let op: VmBindOp = reader.read()?;
                 read_padding_zero(&mut reader, stride - op_size)?;
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
@@ -341,8 +341,8 @@ impl TyrDrmFileData {
                     _ => Err(ENOTSUPP)?,
                 }
 
-                Ok(0)
-            };
+                Ok(())
+            })();
 
             if let Err(e) = res {
                 vmbind.ops.count = i as u32;
@@ -381,38 +381,29 @@ impl TyrDrmFileData {
         )
         .reader();
 
-        for i in 0..count {
-            let res = {
-                let op: VmBindOp = reader.read()?;
-                read_padding_zero(&mut reader, stride - op_size)?;
-                let validated_bo = validate_bind_op(&op, file)?;
-                let (job, syncs) = op.capture(&vm, true, validated_bo)?;
-                let deps = deps::wait_fences(file, &syncs)?;
-                let signals = deps::signal_syncs(file, &syncs)?;
-                let prepared = vm.prepare_bind_job(job, &deps)?;
+        for _ in 0..count {
+            let op: VmBindOp = reader.read()?;
+            read_padding_zero(&mut reader, stride - op_size)?;
+            let validated_bo = validate_bind_op(&op, file)?;
+            let (job, syncs) = op.capture(&vm, true, validated_bo)?;
+            let deps = deps::wait_fences(file, &syncs)?;
+            let signals = deps::signal_syncs(file, &syncs)?;
+            let prepared = vm.prepare_bind_job(job, &deps)?;
 
-                vm.with_prepared_vm(1, |mut prepared_vm| {
-                    let fence = vm.commit_bind_job(prepared);
-                    prepared_vm.resv_add_fence(
-                        &fence,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    );
+            vm.with_prepared_vm(1, |mut prepared_vm| {
+                let fence = vm.commit_bind_job(prepared);
+                prepared_vm.resv_add_fence(
+                    &fence,
+                    kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                    kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
+                );
 
-                    for signal in signals {
-                        signal.publish(&fence);
-                    }
+                for signal in signals {
+                    signal.publish(&fence);
+                }
 
-                    Ok(())
-                })?;
-
-                Ok(0)
-            };
-
-            if let Err(e) = res {
-                vmbind.ops.count = i as u32;
-                return Err(e);
-            }
+                Ok(())
+            })?;
         }
 
         Ok(0)
