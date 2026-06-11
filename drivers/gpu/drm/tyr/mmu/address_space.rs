@@ -66,6 +66,7 @@ use crate::{
         mmu_control::mmu_as_control::*,
         MAX_AS, //
     },
+    reset::ResetHandle,
     slot::{
         Seat,
         SlotOperations, //
@@ -275,6 +276,9 @@ pub(crate) struct AddressSpaceManager {
     /// handler while its slot binding was kept. Cleared when the slot
     /// is programmed again.
     faulty: [bool; MAX_AS],
+
+    /// Reset handle for escalating stuck AS commands and cache flushes.
+    reset: ResetHandle,
 }
 
 impl SlotOperations for AddressSpaceManager {
@@ -317,6 +321,7 @@ impl AddressSpaceManager {
         pdev: &platform::Device,
         iomem: ArcBorrow<'_, Devres<IoMem>>,
         as_present: u32,
+        reset: ResetHandle,
     ) -> Result<AddressSpaceManager> {
         Ok(Self {
             pdev: pdev.into(),
@@ -324,6 +329,7 @@ impl AddressSpaceManager {
             as_present,
             lock_pending: [false; MAX_AS],
             faulty: [false; MAX_AS],
+            reset,
         })
     }
 
@@ -359,7 +365,7 @@ impl AddressSpaceManager {
 
     /// Waits for an AS slot to become ready (not active).
     ///
-    /// Returns an error if polling times out after 10ms or if register access fails.
+    /// Returns an error if polling times out or if register access fails.
     fn as_wait_ready(&self, as_nr: usize) -> Result {
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
@@ -368,7 +374,14 @@ impl AddressSpaceManager {
             Ok(io.read(status_reg))
         };
         let cond = |status: &STATUS| -> bool { !status.active_ext() };
-        poll::read_poll_timeout(op, cond, Delta::from_millis(0), Delta::from_millis(10))?;
+        poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100))
+            .inspect_err(|e| {
+                // A stuck AS_ACTIVE bit only clears with a GPU reset.
+                if *e == ETIMEDOUT {
+                    dev_err!(dev, "AS_ACTIVE bit stuck\n");
+                    self.reset.schedule();
+                }
+            })?;
 
         Ok(())
     }
@@ -622,8 +635,14 @@ impl AddressSpaceManager {
             GPU_IRQ_CLEAR::zeroed().with_clean_caches_completed(true),
         );
 
-        res?;
-        Ok(())
+        if res.is_err() {
+            // The GPU stopped acknowledging cache maintenance. Only a
+            // reset unblocks the situation.
+            dev_err!(dev, "Flush caches timeout\n");
+            self.reset.schedule();
+        }
+
+        res.map(|_| ())
     }
 }
 

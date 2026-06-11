@@ -179,9 +179,8 @@ pub(crate) struct TyrPlatformDriverData {
 
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
-    // `ResetHandle::drop()` drains queued/running works and this must happen
-    // before clocks/regulators are dropped. So keep this field before them to
-    // ensure the correct drop order.
+    // A clone reachable through the MMU outlives this field, so dropping it
+    // here does not bound the worker.
     pub(crate) reset: reset::ResetHandle,
 
     pub(crate) pdev: ARef<platform::Device>,
@@ -608,7 +607,7 @@ impl platform::Driver for TyrPlatformDriverData {
         let platform: ARef<platform::Device> = pdev.into();
         let reset = reset::ResetHandle::new(platform.clone(), iomem.clone())?;
 
-        let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
+        let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info, reset.clone())?;
 
         let cleanup_wq = Arc::new(
             CleanupQueue(Queue::new_unbound().build(c"tyr-cleanup")?),
