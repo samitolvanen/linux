@@ -22,6 +22,7 @@ use crate::{
     },
     fw::{
         CsDbMask,
+        CsFatalExceptionType,
         CsFaultExceptionType,
         CsgSlotMask,
         CSG_REQ, //
@@ -215,6 +216,7 @@ impl Scheduler {
 
         let mut tiler_oom_mask: u32 = 0;
         let mut cs_fatal_mask: u32 = 0;
+        let mut cs_unrecoverable = false;
         let mut cs_inherit_fault_mask: u32 = 0;
         tdev.fw.with_csg_mut(csg_id, |csg| {
             let mut cs_irqs = pending_cs_irqs;
@@ -238,7 +240,10 @@ impl Scheduler {
                 let fault_event = input_req.fault() != output_ack.fault();
 
                 if fatal_event {
-                    let _ = cs.decode_fatal(csg_id, cs_id)?;
+                    let exception_type = cs.decode_fatal(csg_id, cs_id)?;
+                    if exception_type == CsFatalExceptionType::CsUnrecoverable as u32 {
+                        cs_unrecoverable = true;
+                    }
                     cs_fatal_mask |= 1u32 << cs_id;
                 }
 
@@ -286,6 +291,10 @@ impl Scheduler {
                     queue.fail_inflight_submit_fences(syncobj_seqno, EINVAL);
                 }
             }
+        }
+
+        if cs_unrecoverable {
+            tdev.reset.schedule();
         }
 
         if cs_fatal_mask != 0 {

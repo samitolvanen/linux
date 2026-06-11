@@ -854,6 +854,7 @@ impl Scheduler {
                     inner.fatal_error = Some(EINVAL);
                 }
             });
+            data.reset.schedule();
         }
         if new_state == group::State::Suspended {
             self.sync_csg_slot_queues_state(data, csg_slot_manager, csg_idx)?;
