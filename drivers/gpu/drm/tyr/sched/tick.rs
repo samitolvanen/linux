@@ -1138,7 +1138,7 @@ impl<'a> Tick<'a> {
                     };
                     slot_data
                         .group
-                        .with_locked_inner(|inner| inner.mark_timedout());
+                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
                     term_context.set_state(i, CsgExecutionState::Terminate);
                 }
             }
