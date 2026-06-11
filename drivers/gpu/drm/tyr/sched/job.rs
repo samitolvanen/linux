@@ -6,6 +6,8 @@
 //! firmware sync objects. Keeping that queue-side submit flow here lets the
 //! group object focus on group state and scheduler coordination.
 
+use core::mem::offset_of;
+
 use kernel::{
     alloc::KVec,
     bits::{
@@ -19,6 +21,8 @@ use kernel::{
     uapi,
     //
 };
+
+use crate::file::read_padding_zero;
 
 use super::{
     deps::{
@@ -210,18 +214,27 @@ pub(crate) fn append_queue_submits(
     stride: u32,
     queue_count: usize,
 ) -> Result {
-    if stride as usize != core::mem::size_of::<uapi::drm_panthor_queue_submit>() {
-        return Err(ENOTSUPP);
+    static_assert!(
+        size_of::<uapi::drm_panthor_queue_submit>()
+            == offset_of!(uapi::drm_panthor_queue_submit, syncs)
+                + size_of::<uapi::drm_panthor_obj_array>()
+    );
+    let min_size = offset_of!(uapi::drm_panthor_queue_submit, syncs)
+        + size_of::<uapi::drm_panthor_obj_array>();
+    let stride = stride as usize;
+    if stride < min_size {
+        return Err(EINVAL);
     }
 
     let mut reader = UserSlice::new(
         UserPtr::from_addr(array as usize),
-        stride as usize * count as usize,
+        stride.checked_mul(count as usize).ok_or(EINVAL)?,
     )
     .reader();
 
     for _ in 0..count {
         let queue: RawQueueSubmit = reader.read()?;
+        read_padding_zero(&mut reader, stride - min_size)?;
         queue.validate(queue_count)?;
         queue_submits.push(queue.capture()?, GFP_KERNEL)?;
     }
