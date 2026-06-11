@@ -879,9 +879,17 @@ impl platform::Driver for TyrPlatformDriverData {
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with
 // the C driver in the userspace stack.
+//
+// Version history:
+// - 1.0 - initial interface
+// - 1.1 - adds DEV_QUERY_TIMESTAMP_INFO query
+// - 1.2 - adds DEV_QUERY_GROUP_PRIORITIES_INFO query
+//       - adds PANTHOR_GROUP_PRIORITY_REALTIME priority
+// - 1.3 - adds DRM_PANTHOR_GROUP_STATE_INNOCENT flag
+// - 1.4 - adds DRM_IOCTL_PANTHOR_BO_SET_LABEL ioctl
 const INFO: drm::DriverInfo = drm::DriverInfo {
     major: 1,
-    minor: 0,
+    minor: 4,
     patchlevel: 0,
     name: c"panthor",
     desc: c"ARM Mali Tyr DRM driver",
