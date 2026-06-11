@@ -14,12 +14,14 @@ use kernel::{
         gem::BaseObject,
         DeviceContext, //
     },
-    pr_warn_once,
+    new_mutex, pr_warn_once,
     prelude::*,
+    str::CString,
     sync::{
         aref::ARef,
         Arc,
-        ArcBorrow, //
+        ArcBorrow,
+        Mutex, //
     },
 };
 
@@ -37,6 +39,9 @@ use crate::{
     },
 };
 
+/// Maximum length of a BO label, including the NUL terminator.
+pub(crate) const BO_LABEL_MAXLEN: usize = 4096;
+
 /// Driver-specific data for Tyr GEM buffer objects.
 ///
 /// This structure contains Tyr-specific metadata associated with each GEM object.
@@ -48,6 +53,9 @@ pub(crate) struct BoData {
     flags: u32,
     /// Root GEM object of the VM whose `dma_resv` this BO shares, if any.
     exclusive_vm_root_gem: Option<ARef<Bo>>,
+    /// User-assigned label.
+    #[pin]
+    label: Mutex<Option<CString>>,
 }
 
 impl BoData {
@@ -57,6 +65,10 @@ impl BoData {
 
     pub(crate) fn exclusive_vm_root_gem(&self) -> Option<&Bo> {
         self.exclusive_vm_root_gem.as_deref()
+    }
+
+    pub(crate) fn set_label(&self, label: Option<CString>) {
+        *self.label.lock() = label;
     }
 }
 
@@ -89,6 +101,7 @@ impl gem::DriverObject for BoData {
         try_pin_init!(Self {
             flags: args.flags,
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
+            label <- new_mutex!(None),
         })
     }
 
@@ -96,6 +109,7 @@ impl gem::DriverObject for BoData {
         try_pin_init!(Self {
             flags: 0,
             exclusive_vm_root_gem: None,
+            label <- new_mutex!(None),
         })
     }
 
