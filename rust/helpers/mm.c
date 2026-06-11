@@ -54,3 +54,17 @@ __rust_helper void rust_helper_vma_end_read(struct vm_area_struct *vma)
 {
 	vma_end_read(vma);
 }
+
+/*
+ * The "inline" implementation of unmap_mapping_range() is only available
+ * when CONFIG_MMU isn't set.
+ */
+#ifndef CONFIG_MMU
+__rust_helper void
+rust_helper_unmap_mapping_range(struct address_space *mapping,
+				loff_t const holebegin, loff_t const holelen,
+				int even_cows)
+{
+	unmap_mapping_range(mapping, holebegin, holelen, even_cows);
+}
+#endif

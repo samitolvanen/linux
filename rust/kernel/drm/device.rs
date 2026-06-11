@@ -355,6 +355,35 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         unsafe { &*ptr.cast() }
     }
 
+    /// Unmaps all userspace mappings within `[offset, offset + size)` of the
+    /// device's mmap offset space, including copy-on-write copies. A `size`
+    /// of zero unmaps everything from `offset` to the end.
+    ///
+    /// All DRM mmap offsets, GEM objects and driver-private ranges alike,
+    /// share the address space of the device's anonymous inode. The next
+    /// access faults the pages back in through the owning `vm_ops`.
+    ///
+    /// `offset` and `size` are in bytes. Values beyond [`i64::MAX`] are
+    /// saturated.
+    pub fn unmap_mapping_range(&self, offset: u64, size: u64) {
+        // SAFETY: `anon_inode` is created in `drm_dev_init()` before any
+        // `drm::Device` is exposed and is only released when the device is
+        // freed, so the inode and its `i_mapping` are valid for the
+        // lifetime of `self`.
+        let mapping = unsafe { (*(*self.as_raw()).anon_inode).i_mapping };
+
+        // SAFETY: `mapping` is a valid `address_space` (see above), which is
+        // all `unmap_mapping_range()` requires. It accepts any offset range.
+        unsafe {
+            bindings::unmap_mapping_range(
+                mapping,
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                i64::try_from(size).unwrap_or(i64::MAX),
+                1,
+            )
+        };
+    }
+
     extern "C" fn release(ptr: *mut bindings::drm_device) {
         // SAFETY: `ptr` is a valid pointer to a `struct drm_device` and embedded in `Self`.
         let this = unsafe { Self::from_drm_device(ptr) };
