@@ -154,11 +154,7 @@ impl Controller {
 
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
-        // SAFETY: `Controller` is part of driver-private data and only exists
-        // while the platform device is bound.
-        let pdev = unsafe { self.pdev.as_ref().as_bound() };
-
-        match gpu::reset(pdev, &self.iomem) {
+        match gpu::reset(self.pdev.as_ref(), &self.iomem) {
             Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
             Err(e) => {
                 dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
