@@ -56,9 +56,14 @@ use crate::{
 /// GPU MMU page size is fixed at 4 KiB regardless of host page size.
 const GPU_PAGE_MASK: u64 = (1 << 12) - 1;
 
-fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
+fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, min_size: usize, obj: &T) -> Result {
     let kern_size = core::mem::size_of_val(obj);
     let usr_size = usr_size as usize;
+
+    if usr_size < min_size {
+        return Err(EINVAL);
+    }
+
     let copy_size = usr_size.min(kern_size);
 
     // SAFETY: `obj` implements AsBytes, so viewing it as a byte slice is safe.
@@ -226,7 +231,9 @@ impl TyrDrmFileData {
         } else {
             match devquery.type_ {
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GPU_INFO => {
-                    set_uobj(devquery.pointer, devquery.size, &ddev.gpu_info)?;
+                    let min_size =
+                        offset_of!(uapi::drm_panthor_gpu_info, tiler_present) + size_of::<u64>();
+                    set_uobj(devquery.pointer, devquery.size, min_size, &ddev.gpu_info)?;
 
                     Ok(0)
                 }
@@ -235,7 +242,8 @@ impl TyrDrmFileData {
                         let csif = ddev.csif_info.lock();
                         *csif
                     };
-                    set_uobj(devquery.pointer, devquery.size, &csif_data)?;
+                    let min_size = size_of::<uapi::drm_panthor_csif_info>();
+                    set_uobj(devquery.pointer, devquery.size, min_size, &csif_data)?;
 
                     Ok(0)
                 }
@@ -262,7 +270,9 @@ impl TyrDrmFileData {
                     );
 
                     let data = [timestamp_frequency, current_timestamp, timestamp_offset];
-                    set_uobj(devquery.pointer, devquery.size, &data)?;
+                    let min_size = offset_of!(uapi::drm_panthor_timestamp_info, current_timestamp)
+                        + size_of::<u64>();
+                    set_uobj(devquery.pointer, devquery.size, min_size, &data)?;
 
                     Ok(0)
                 }
@@ -276,7 +286,8 @@ impl TyrDrmFileData {
                     }
                     let data: [u8; 4] = [allowed_mask, 0, 0, 0];
 
-                    set_uobj(devquery.pointer, devquery.size, &data)?;
+                    let min_size = size_of::<uapi::drm_panthor_group_priorities_info>();
+                    set_uobj(devquery.pointer, devquery.size, min_size, &data)?;
 
                     Ok(0)
                 }
