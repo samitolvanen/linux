@@ -30,6 +30,16 @@ pub const TASK_FREEZABLE: c_int = bindings::TASK_FREEZABLE as c_int;
 /// uninterruptible sleep.
 pub const TASK_NORMAL: c_uint = bindings::TASK_NORMAL as c_uint;
 
+/// Returns whether the current task is executing a 32-bit compat syscall.
+///
+/// Always returns `false` on kernels built without `CONFIG_COMPAT`. See
+/// `in_compat_syscall()` in `include/linux/compat.h`.
+#[inline]
+pub fn in_compat_syscall() -> bool {
+    // SAFETY: FFI call without preconditions, valid in any context.
+    unsafe { bindings::in_compat_syscall() }
+}
+
 /// Returns the currently running task.
 #[macro_export]
 macro_rules! current {
