@@ -177,6 +177,9 @@ impl<'a> GlobalInterfaceRequests<'a> {
 enum GlobalInterfaceState {
     /// Interface is not yet initialized.
     Disabled,
+    /// MCU halted for runtime suspend. The interface memory stays
+    /// resident, but the IRQ path must not RMW `GLB_REQ`.
+    Suspended(EnabledGlobalInterface),
     /// Interface is initialized and operational.
     Enabled(EnabledGlobalInterface),
 }
@@ -274,6 +277,42 @@ impl<'drm> GlobalInterface<'drm> {
 
         let mut inner = self.inner.lock();
         inner.install_enabled(enabled);
+        Ok(())
+    }
+
+    /// Re-enables a suspended interface in place.
+    ///
+    /// The MCU rebooted from the resident sections, so the interface views
+    /// from `enable` stay valid and reusing them keeps the resume path
+    /// allocation-free.
+    pub(crate) fn reenable(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
+        // Clone the retained views out so the firmware ack wait below
+        // runs without `inner` held. The GLB IRQ path takes `inner` and
+        // delivers the wakeup this wait sleeps on.
+        let (glb_input, glb_output) = {
+            let inner = self.inner.lock();
+            match &inner.state {
+                GlobalInterfaceState::Suspended(enabled) => {
+                    (enabled.glb_input.clone(), enabled.glb_output.clone())
+                }
+                GlobalInterfaceState::Enabled(_) | GlobalInterfaceState::Disabled => {
+                    return Err(EINVAL)
+                }
+            }
+        };
+
+        InnerGlobalInterface::configure_glb_input(&glb_input, &self.gpu_info, core_clk_rate)?;
+        let ack_mask = InnerGlobalInterface::configure_glb_requests(&glb_input, &glb_output)?;
+
+        io.write(DOORBELL::at(0), DOORBELL::zeroed().with_ring(true));
+
+        let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
+        if let Err(e) = request_field.wait_acks(ack_mask, &self.event_wait, 1000) {
+            pr_err!("CSF firmware failed to ACK the GLB config after resume\n");
+            return Err(e);
+        }
+
+        self.inner.lock().resume_enabled();
         Ok(())
     }
 
@@ -402,6 +441,27 @@ impl<'drm> GlobalInterface<'drm> {
 
         self.ring_doorbell(0)?;
         Ok(ret)
+    }
+
+    /// Requests an MCU halt through the global doorbell. The request is not
+    /// acknowledged through the firmware interface, so callers poll
+    /// `MCU_STATUS`.
+    pub(super) fn halt_mcu(&self) -> Result {
+        self.inner.lock().set_glb_halt(true)?;
+        self.ring_doorbell(0)
+    }
+
+    /// Clears a previously requested MCU halt so the firmware boots active. No
+    /// doorbell is needed, since the firmware re-reads `GLB_REQ` when it boots.
+    pub(super) fn set_mcu_active(&self) -> Result {
+        self.inner.lock().set_glb_halt(false)
+    }
+
+    /// Suspends the interface once the MCU has stopped, so the IRQ path no
+    /// longer writes `GLB_REQ` through the stale interface. The resume path is
+    /// then the sole `GLB_REQ` writer.
+    pub(super) fn suspend(&self) {
+        self.inner.lock().suspend();
     }
 
     fn ring_doorbell(&self, doorbell_id: usize) -> Result {
@@ -668,28 +728,69 @@ impl InnerGlobalInterface {
         Ok(ack_mask)
     }
 
-    fn csg(&self, index: usize) -> Option<&CsgInterface> {
-        let enabled = match &self.state {
-            GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return None,
+    /// Moves the interface to the suspended state for the MCU-halted
+    /// window. Already-disabled interfaces stay disabled.
+    fn suspend(&mut self) {
+        self.state = match core::mem::replace(&mut self.state, GlobalInterfaceState::Disabled) {
+            GlobalInterfaceState::Enabled(e) | GlobalInterfaceState::Suspended(e) => {
+                GlobalInterfaceState::Suspended(e)
+            }
+            GlobalInterfaceState::Disabled => GlobalInterfaceState::Disabled,
         };
+    }
 
-        enabled.csg.get(index)
+    /// Returns a suspended interface to the enabled state once the
+    /// resume path has reconfigured and re-acknowledged it.
+    fn resume_enabled(&mut self) {
+        self.state = match core::mem::replace(&mut self.state, GlobalInterfaceState::Disabled) {
+            GlobalInterfaceState::Enabled(e) | GlobalInterfaceState::Suspended(e) => {
+                GlobalInterfaceState::Enabled(e)
+            }
+            GlobalInterfaceState::Disabled => GlobalInterfaceState::Disabled,
+        };
+    }
+
+    /// Returns the interface view while its memory is resident, whether
+    /// enabled or suspended for the MCU-halted window.
+    fn resident(&self) -> Option<&EnabledGlobalInterface> {
+        match &self.state {
+            GlobalInterfaceState::Enabled(e) | GlobalInterfaceState::Suspended(e) => Some(e),
+            GlobalInterfaceState::Disabled => None,
+        }
+    }
+
+    fn resident_mut(&mut self) -> Option<&mut EnabledGlobalInterface> {
+        match &mut self.state {
+            GlobalInterfaceState::Enabled(e) | GlobalInterfaceState::Suspended(e) => Some(e),
+            GlobalInterfaceState::Disabled => None,
+        }
+    }
+
+    fn csg(&self, index: usize) -> Option<&CsgInterface> {
+        self.resident()?.csg.get(index)
     }
 
     fn csg_mut(&mut self, index: usize) -> Option<&mut CsgInterface> {
-        let enabled = match &mut self.state {
-            GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return None,
-        };
+        self.resident_mut()?.csg.get_mut(index)
+    }
 
-        enabled.csg.get_mut(index)
+    /// Sets or clears the `GLB_REQ.halt` bit, preserving the other request
+    /// bits. Clearing must work on a suspended interface, since the resume
+    /// path acts before re-enabling it.
+    fn set_glb_halt(&self, halt: bool) -> Result {
+        let enabled = self.resident().ok_or(EINVAL)?;
+
+        let cur_req = enabled.glb_input.read(GLB_REQ);
+        enabled.glb_input.write(GLB_REQ, cur_req.with_halt(halt));
+        Ok(())
     }
 
     fn toggle_glb_db_req(&self, csg_mask: CsgSlotMask) -> Result {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return Err(EINVAL),
+            GlobalInterfaceState::Disabled | GlobalInterfaceState::Suspended(_) => {
+                return Err(EINVAL)
+            }
         };
 
         // Toggle the requested doorbell bits relative to the firmware-
@@ -708,7 +809,11 @@ impl InnerGlobalInterface {
     fn process_global_irq(&mut self) -> Result<bool> {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return Ok(false),
+            // In the suspended state the resume path owns `GLB_REQ` until the
+            // interface is re-enabled, so this RMW must not run.
+            GlobalInterfaceState::Disabled | GlobalInterfaceState::Suspended(_) => {
+                return Ok(false)
+            }
         };
 
         let request_field = GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
@@ -725,10 +830,7 @@ impl InnerGlobalInterface {
     }
 
     fn csg_slot_count(&self) -> Result<u32> {
-        let enabled = match &self.state {
-            GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return Err(EINVAL),
-        };
+        let enabled = self.resident().ok_or(EINVAL)?;
 
         Ok(enabled.csg_num as u32)
     }
