@@ -361,7 +361,6 @@ impl ResetHandle {
     /// Schedules a GPU reset on the dedicated workqueue.
     ///
     /// A reset that is already pending or in progress absorbs new requests.
-    #[expect(dead_code)]
     pub(crate) fn schedule(&self) {
         let Some(tdev) = self.controller.device() else {
             return;

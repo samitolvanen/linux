@@ -191,6 +191,10 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
             .inspect_err(|_| Scheduler::request_tick(tdev))
     });
 
+    if result == Err(ETIMEDOUT) {
+        tdev.reset.schedule();
+    }
+
     // schedule_term does not take the scheduler mutex; drain after
     // releasing it.
     for slot in teardown_groups.iter_mut() {

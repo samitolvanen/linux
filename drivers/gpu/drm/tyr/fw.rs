@@ -88,6 +88,7 @@ mod parser;
 // to `crate::fw`; the apply path only depends on these typed views.
 pub(crate) use interfaces::{
     CsBlockedReason,
+    CsFatalExceptionType,
     CsFaultExceptionType,
     CsWaitCondition,
     CsgExecutionState,
