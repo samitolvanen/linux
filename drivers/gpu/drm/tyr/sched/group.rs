@@ -133,6 +133,8 @@ pub(crate) struct GroupInner {
     /// Set when a timeout occurred on any of the queues owned by this
     /// group, or when a CSG request targeting the group timed out.
     pub(crate) timedout: bool,
+    /// Set when a CSG update failure forced a still-runnable group off its slot.
+    pub(crate) innocent: bool,
     // Cached from Group::queues.len(); GroupInner has no borrow of Group.
     queue_count: usize,
     /// Set once `Group::schedule_term` has enqueued the per-group
@@ -160,6 +162,14 @@ impl GroupInner {
         if self.fatal_error.is_none() {
             self.fatal_error = Some(ETIMEDOUT);
         }
+    }
+
+    /// Records a timeout eviction, marking the group innocent if it could still run.
+    pub(crate) fn mark_evicted_by_timeout(&mut self) {
+        if self.can_run() {
+            self.innocent = true;
+        }
+        self.mark_timedout();
     }
 
     pub(crate) fn blocked_queues(&self) -> u32 {
@@ -445,6 +455,7 @@ impl Group {
                     fatal_queues: 0,
                     fatal_error: None,
                     timedout: false,
+                    innocent: false,
                     queue_count,
                     term_scheduled: false,
                 }),
@@ -1072,8 +1083,8 @@ impl Pool {
             .group(groupgetstate.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        let (timedout, fatal_queues) =
-            group.with_locked_inner(|inner| (inner.timedout, inner.fatal_queues()));
+        let (timedout, innocent, fatal_queues) =
+            group.with_locked_inner(|inner| (inner.timedout, inner.innocent, inner.fatal_queues()));
 
         *groupgetstate = Default::default();
 
@@ -1086,6 +1097,11 @@ impl Pool {
             groupgetstate.state |=
                 uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
             groupgetstate.fatal_queues = fatal_queues;
+        }
+
+        if innocent {
+            groupgetstate.state |=
+                uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_INNOCENT;
         }
 
         Ok(())
