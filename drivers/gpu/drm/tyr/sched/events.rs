@@ -245,11 +245,7 @@ impl Scheduler {
             // window elapsed without the group advancing.
             dev_warn!(tdev.as_ref(), "CSG slot {} progress timeout\n", csg_id);
             if let Some(group) = &group {
-                group.with_locked_inner(|inner| {
-                    if inner.fatal_error.is_none() {
-                        inner.fatal_error = Some(ETIMEDOUT);
-                    }
-                });
+                group.with_locked_inner(|inner| inner.mark_timedout());
             }
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
