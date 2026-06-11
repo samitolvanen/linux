@@ -888,9 +888,14 @@ impl platform::Driver for TyrPlatformDriverData {
 // - 1.3 - adds DRM_PANTHOR_GROUP_STATE_INNOCENT flag
 // - 1.4 - adds DRM_IOCTL_PANTHOR_BO_SET_LABEL ioctl
 // - 1.5 - adds DRM_PANTHOR_SET_USER_MMIO_OFFSET ioctl
+// - 1.6 - enables GLB_COUNTER_EN
+// - 1.7 - adds DRM_PANTHOR_BO_WB_MMAP flag
+//       - adds DRM_IOCTL_PANTHOR_BO_SYNC ioctl
+//       - adds DRM_IOCTL_PANTHOR_BO_QUERY_INFO ioctl
+//       - adds drm_panthor_gpu_info::selected_coherency
 const INFO: drm::DriverInfo = drm::DriverInfo {
     major: 1,
-    minor: 5,
+    minor: 7,
     patchlevel: 0,
     name: c"panthor",
     desc: c"ARM Mali Tyr DRM driver",
