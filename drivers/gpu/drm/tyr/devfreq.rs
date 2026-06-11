@@ -186,8 +186,14 @@ impl Drop for OppSetup {
 /// Devfreq resources owned by the device binding. The registration drops
 /// first, so devfreq is removed before the OPP setup is released.
 pub(crate) struct TyrDevfreq {
-    _registration: Registration<TyrDevfreqCallbacks>,
+    registration: Registration<TyrDevfreqCallbacks>,
     _opp: OppSetup,
+}
+
+impl TyrDevfreq {
+    fn devfreq(&self) -> &devfreq::Devfreq {
+        self.registration.devfreq()
+    }
 }
 
 /// Sets up devfreq for the GPU. Returns `None` when the device node
@@ -277,7 +283,30 @@ pub(crate) fn init(
     }
 
     Ok(Some(TyrDevfreq {
-        _registration: registration,
+        registration,
         _opp: opp_setup,
     }))
+}
+
+/// The runtime-PM payload is the devfreq registration slot, shared with
+/// `TyrPlatformDriverData`. The inner `Option` is `None` on devices without
+/// an OPP table and after `unbind`, making the devfreq steps no-ops.
+pub(crate) type DevfreqSlot = Mutex<Option<TyrDevfreq>>;
+
+/// Runs `f` against the registered devfreq device, if any.
+fn with_devfreq(slot: Option<&DevfreqSlot>, f: impl FnOnce(&devfreq::Devfreq) -> Result) -> Result {
+    match slot {
+        Some(slot) => slot.lock().as_ref().map_or(Ok(()), |reg| f(reg.devfreq())),
+        None => Ok(()),
+    }
+}
+
+/// Pauses the devfreq governor for runtime suspend.
+pub(crate) fn suspend(slot: Option<&DevfreqSlot>) -> Result {
+    with_devfreq(slot, |devfreq| devfreq.suspend_device())
+}
+
+/// Resumes the devfreq governor after a runtime resume.
+pub(crate) fn resume(slot: Option<&DevfreqSlot>) -> Result {
+    with_devfreq(slot, |devfreq| devfreq.resume_device())
 }

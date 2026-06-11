@@ -35,6 +35,13 @@ use kernel::{
     new_mutex,
     of,
     platform,
+    pm::{
+        self,
+        PMConfig,
+        PMContext,
+        PMProfile,
+        RuntimePMState, //
+    },
     prelude::*,
     regulator,
     regulator::Regulator,
@@ -50,7 +57,8 @@ use kernel::{
             Release, //
         },
         Arc,
-        Mutex, //
+        Mutex,
+        SetOnce, //
     },
     time::{
         self,
@@ -101,6 +109,10 @@ use crate::{
             MmuIrq, //
         },
         Mmu, //
+    },
+    pm::{
+        TyrPmOps,
+        AUTOSUSPEND_DELAY_MS, //
     },
     regs::gpu_control::*,
     sched::{
@@ -226,6 +238,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
+
+    /// Runtime PM context, `None` until the end of probe.
+    pub(crate) pm: SetOnce<PMContext<platform::Adapter<TyrPlatformDriver>, TyrPmOps>>,
 }
 
 impl TyrDrmDeviceData {
@@ -360,12 +375,6 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
                 Ok(())
             });
         });
-
-        // A CSG IRQ means firmware state changed on a slot we own. A
-        // CSG_REQ ack may have flipped, or a CS may have faulted or run
-        // out of tiler heap. Arm the periodic tick to re-evaluate
-        // residency and apply any pending transitions.
-        Scheduler::request_tick(&this);
     }
 }
 
@@ -439,6 +448,10 @@ pub(crate) struct TyrPlatformDriver;
 pub(crate) struct TyrPlatformDriverData<'bound> {
     /// Devfreq registration, `None` on devices without an OPP table.
     devfreq_registration: Arc<Mutex<Option<TyrDevfreq>>>,
+
+    /// Runtime PM registration. Owns the callback payload and disables
+    /// runtime PM on unbind. Held only for its `Drop`.
+    pm: pm::Registration<'bound, platform::Adapter<TyrPlatformDriver>, TyrPmOps>,
 
     #[pin]
     reg: drm::Registration<'bound, TyrDrmDriver>,
@@ -526,8 +539,12 @@ kernel::of_device_table!(
 impl platform::Driver for TyrPlatformDriver {
     type IdInfo = ();
     type Data<'bound> = TyrPlatformDriverData<'bound>;
-    type PmOps = ();
+    type PmOps = TyrPmOps;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn dev_pm_ops() -> Option<pm::DevPMOps<platform::Adapter<Self>, Self::PmOps>> {
+        Some(pm::DevPMOps::for_driver())
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -590,6 +607,7 @@ impl platform::Driver for TyrPlatformDriver {
                     sync_upd_pending: AtomicFlag::new(false),
                     periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                     devfreq_data,
+                    pm: SetOnce::new(),
                 }? Error),
             )?;
 
@@ -669,8 +687,30 @@ impl platform::Driver for TyrPlatformDriver {
                 }
             }
 
+            let mut pm_configs = KVec::<PMConfig>::with_capacity(1, GFP_KERNEL)?;
+            pm_configs.push(PMConfig::AutoSuspendDelay(AUTOSUSPEND_DELAY_MS), GFP_KERNEL)?;
+
+            let pm_registration = pm::Registration::<platform::Adapter<Self>, TyrPmOps>::new(
+                pdev.as_ref(),
+                pm::DevPMOps::for_driver(),
+                None,
+                Some(pm_configs),
+                Some(devfreq_registration.clone()),
+            )?;
+            let pm = pm_registration.ctx().clone();
+
+            // The device is already powered, so runtime PM starts resumed.
+            pm.enable(RuntimePMState::Resumed)?;
+
+            drop(pm.get(PMProfile::new().auto())?);
+
+            if !unreg_dev.pm.populate(pm) {
+                return Err(EBUSY);
+            }
+
             Ok(try_pin_init!(TyrPlatformDriverData {
                 devfreq_registration,
+                pm: pm_registration,
                 // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the
                 // driver is unbound; it is never forgotten.
                 reg <- unsafe { drm::Registration::new(

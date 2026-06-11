@@ -6,6 +6,7 @@ use kernel::{
         ListArc,
         ListItem, //
     },
+    pm::AwakeScope,
     pr_warn_once,
     prelude::*,
     sync::{
@@ -317,6 +318,9 @@ pub(crate) struct Scheduler {
     /// clock the periodic tick is armed in. Only a full tick writes
     /// it, so event ticks cannot push the next one out.
     pub(in crate::sched) last_full_tick_jiffies: u64,
+
+    /// Runtime-PM usage reference held while any resident group has work.
+    pub(in crate::sched) pm_ref: Option<AwakeScope>,
 }
 
 /// The tick to schedule after marking a group runnable.
@@ -390,6 +394,7 @@ impl Scheduler {
                 resched_target: None,
                 last_tick: Instant::<Monotonic>::now(),
                 last_full_tick_jiffies: jiffies64(),
+                pm_ref: None,
             },
             csif,
         ))
