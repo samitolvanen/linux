@@ -546,6 +546,14 @@ impl Firmware {
         self.reenable_global_interface(tdev)
     }
 
+    /// Cold-boots the firmware from the retained sections after a power
+    /// cycle or wedge. The stop step forces the interface through the
+    /// suspended state so bring-up starts from a known point.
+    pub(crate) fn reload(&self, tdev: &TyrDrmDevice) -> Result {
+        self.pre_reset();
+        self.post_reset(tdev)
+    }
+
     /// Rewrites every firmware section from the data retained at load
     /// time.
     ///
