@@ -130,6 +130,9 @@ pub(crate) struct GroupInner {
     idle_queues: u32,
     fatal_queues: u32,
     pub(crate) fatal_error: Option<Error>,
+    /// Set when a timeout occurred on any of the queues owned by this
+    /// group, or when a CSG request targeting the group timed out.
+    pub(crate) timedout: bool,
     // Cached from Group::queues.len(); GroupInner has no borrow of Group.
     queue_count: usize,
     /// Set once `Group::schedule_term` has enqueued the per-group
@@ -142,12 +145,21 @@ pub(crate) struct GroupInner {
 }
 
 impl GroupInner {
-    /// Returns false if the group is terminated, in an unknown state, or
-    /// has a fatal error recorded.
+    /// Returns false if the group is terminated, in an unknown state, timed
+    /// out, or has a fatal error recorded.
     pub(crate) fn can_run(&self) -> bool {
         self.state != State::Terminated
             && self.state != State::Unknown
             && self.fatal_error.is_none()
+            && !self.timedout
+    }
+
+    /// Records that a timeout forced the group off the GPU.
+    pub(crate) fn mark_timedout(&mut self) {
+        self.timedout = true;
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(ETIMEDOUT);
+        }
     }
 
     pub(crate) fn blocked_queues(&self) -> u32 {
@@ -432,6 +444,7 @@ impl Group {
                     idle_queues: 0,
                     fatal_queues: 0,
                     fatal_error: None,
+                    timedout: false,
                     queue_count,
                     term_scheduled: false,
                 }),
@@ -470,10 +483,6 @@ impl Group {
     {
         let mut inner = self.inner.lock();
         f(&mut inner)
-    }
-
-    pub(crate) fn fatal_queues(&self) -> u32 {
-        self.inner.lock().fatal_queues()
     }
 
     pub(crate) fn state(&self) -> State {
@@ -1063,12 +1072,20 @@ impl Pool {
             .group(groupgetstate.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        groupgetstate.state = 0;
-        groupgetstate.fatal_queues = group.fatal_queues();
+        let (timedout, fatal_queues) =
+            group.with_locked_inner(|inner| (inner.timedout, inner.fatal_queues()));
 
-        if groupgetstate.fatal_queues != 0 {
+        *groupgetstate = Default::default();
+
+        if timedout {
+            groupgetstate.state |=
+                uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_TIMEDOUT;
+        }
+
+        if fatal_queues != 0 {
             groupgetstate.state |=
                 uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+            groupgetstate.fatal_queues = fatal_queues;
         }
 
         Ok(())

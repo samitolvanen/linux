@@ -984,11 +984,9 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
 
         if adjusted_elapsed >= self.timeout {
             pr_err!("Tyr queue job {} timed out\n", ctx.counter);
-            ctx.job.group.with_locked_inner(|inner| {
-                if inner.fatal_error.is_none() {
-                    inner.fatal_error = Some(ETIMEDOUT);
-                }
-            });
+            ctx.job
+                .group
+                .with_locked_inner(|inner| inner.mark_timedout());
             TyrDrmDeviceData::schedule_tick(&ctx.job.group.tdev);
             if let Some(done_seqno) = ctx.job.done_seqno() {
                 self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));
