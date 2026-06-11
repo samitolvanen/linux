@@ -35,7 +35,10 @@ use crate::{
         VmAsData, //
     },
     regs::{
-        gpu_control::AS_PRESENT,
+        gpu_control::{
+            FlushMode,
+            AS_PRESENT, //
+        },
         MAX_AS, //
     },
     slot::SlotManager, //
@@ -141,6 +144,16 @@ impl Mmu {
     /// may evict the VM in between.
     pub(crate) fn vm_as_slot(&self, vm: &VmAsData) -> Option<u8> {
         self.as_manager.lock().vm_as_slot(vm)
+    }
+
+    /// Cleans the L2 and LSC caches and waits for completion.
+    ///
+    /// Used on suspend so that firmware-written state (CSG suspend
+    /// buffers) is in memory before the GPU loses power.
+    pub(crate) fn flush_caches(&self) -> Result {
+        self.as_manager
+            .lock()
+            .gpu_flush_caches(FlushMode::Clean, FlushMode::Clean, FlushMode::None)
     }
 
     /// Flags the start of a VM update.

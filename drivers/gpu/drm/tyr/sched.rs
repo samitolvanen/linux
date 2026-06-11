@@ -497,6 +497,12 @@ impl Scheduler {
         })
     }
 
+    /// Returns whether any priority band has runnable groups queued.
+    #[expect(dead_code)]
+    pub(crate) fn has_runnable_groups(&self) -> bool {
+        self.runnable_groups.iter().any(|list| !list.is_empty())
+    }
+
     /// Removes `group` from the list named by `list_state`.
     pub(crate) fn remove_group_from_list(
         &mut self,
