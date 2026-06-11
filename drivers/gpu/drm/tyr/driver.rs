@@ -37,6 +37,13 @@ use kernel::{
     of,
     opp::ConfigToken,
     platform,
+    pm::{
+        self,
+        PMConfig,
+        PMContext,
+        PMProfile,
+        RuntimePMState, //
+    },
     prelude::*,
     regulator,
     regulator::Regulator,
@@ -52,7 +59,8 @@ use kernel::{
             Release, //
         },
         Arc,
-        Mutex, //
+        Mutex,
+        SetOnce, //
     },
     time::{
         self,
@@ -103,6 +111,10 @@ use crate::{
             MmuIrq, //
         },
         Mmu, //
+    },
+    pm::{
+        TyrPmOps,
+        AUTOSUSPEND_DELAY_MS, //
     },
     regs::gpu_control::*,
     sched::{
@@ -228,6 +240,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
+
+    /// Runtime PM context, `None` until the end of probe.
+    pub(crate) pm: SetOnce<PMContext<platform::Adapter<TyrPlatformDriver>, TyrPmOps>>,
 
     #[pin]
     pub(crate) opp_config: Mutex<Option<ConfigToken>>,
@@ -452,6 +467,10 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
     /// Devfreq registration, `None` on devices without an OPP table.
     devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
 
+    /// Runtime PM registration. Owns the callback payload and disables
+    /// runtime PM on unbind. Held only for its `Drop`.
+    pm: pm::Registration<'bound, platform::Adapter<TyrPlatformDriver>, TyrPmOps>,
+
     reg: drm::Registration<'bound, TyrDrmDriver>,
 }
 
@@ -537,8 +556,12 @@ kernel::of_device_table!(
 impl platform::Driver for TyrPlatformDriver {
     type IdInfo = ();
     type Data<'bound> = TyrPlatformDriverData<'bound>;
-    type PmOps = ();
+    type PmOps = TyrPmOps;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn dev_pm_ops() -> Option<pm::DevPMOps<platform::Adapter<Self>, Self::PmOps>> {
+        Some(pm::DevPMOps::for_driver())
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -600,6 +623,7 @@ impl platform::Driver for TyrPlatformDriver {
                 sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 devfreq_data,
+                pm: SetOnce::new(),
                 opp_config <- new_mutex!(None),
             }? Error),
         )?;
@@ -703,12 +727,33 @@ impl platform::Driver for TyrPlatformDriver {
             }
         }
 
+        let mut pm_configs = KVec::<PMConfig>::with_capacity(1, GFP_KERNEL)?;
+        pm_configs.push(PMConfig::AutoSuspendDelay(AUTOSUSPEND_DELAY_MS), GFP_KERNEL)?;
+
+        let pm_registration = pm::Registration::<platform::Adapter<Self>, TyrPmOps>::new(
+            pdev.as_ref(),
+            pm::DevPMOps::for_driver(),
+            None,
+            Some(pm_configs),
+            Some(devfreq_registration.clone()),
+        )?;
+        let pm = pm_registration.ctx().clone();
+
+        // The device is already powered, so runtime PM starts resumed.
+        pm.enable(RuntimePMState::Resumed)?;
+
+        drop(pm.get(PMProfile::new().auto())?);
+
+        let populated = unreg_dev.pm.populate(pm);
+        debug_assert!(populated);
+
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), unreg_dev, reg_data, 0)? };
 
         let driver = TyrPlatformDriverData {
             devfreq_registration,
+            pm: pm_registration,
             reg,
         };
 

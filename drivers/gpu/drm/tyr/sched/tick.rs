@@ -932,8 +932,12 @@ impl<'a> Tick<'a> {
 
         if decision.all_idle {
             tdev.devfreq_data.devfreq_state.lock().mark_idle();
+            self.sched.pm_ref = None;
         } else {
             tdev.devfreq_data.devfreq_state.lock().mark_busy();
+            if self.sched.pm_ref.is_none() {
+                self.sched.pm_ref = tdev.sched_pm_get();
+            }
         }
 
         self.update_status_and_resched(tdev, decision);
