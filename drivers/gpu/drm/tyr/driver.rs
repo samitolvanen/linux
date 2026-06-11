@@ -449,6 +449,9 @@ pub(crate) struct TyrPlatformDriver;
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData<'bound> {
+    /// Devfreq registration, `None` on devices without an OPP table.
+    devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
+
     reg: drm::Registration<'bound, TyrDrmDriver>,
 }
 
@@ -491,12 +494,6 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     ///
     /// Freed after the IRQ registrations, so no handler can queue work into it by then.
     pub(crate) heap_wq: OwnedQueue,
-
-    /// Devfreq registration, absent when the device node declares no OPP table.
-    ///
-    /// Freed before `clks` and `regulators`, so the governor stops before the clock
-    /// and supply are released.
-    _devfreq: Option<DevfreqRegistration<TyrDevfreqCallbacks>>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -653,7 +650,8 @@ impl platform::Driver for TyrPlatformDriver {
         )?;
         job_irq_enable(io);
 
-        let devfreq = devfreq::init(&unreg_dev, pdev.as_ref(), &core_clk)?;
+        let devfreq_registration = devfreq::init(&unreg_dev, pdev.as_ref(), &core_clk)?;
+        let devfreq_registration = Arc::pin_init(new_mutex!(devfreq_registration), GFP_KERNEL)?;
 
         firmware.boot(io)?;
 
@@ -685,7 +683,6 @@ impl platform::Driver for TyrPlatformDriver {
                 wq,
                 sched_wq,
                 heap_wq,
-                _devfreq: devfreq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
@@ -710,7 +707,10 @@ impl platform::Driver for TyrPlatformDriver {
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), unreg_dev, reg_data, 0)? };
 
-        let driver = TyrPlatformDriverData { reg };
+        let driver = TyrPlatformDriverData {
+            devfreq_registration,
+            reg,
+        };
 
         dev_dbg!(pdev, "Tyr initialized correctly.");
         Ok(driver)
@@ -720,6 +720,7 @@ impl platform::Driver for TyrPlatformDriver {
 #[pinned_drop]
 impl PinnedDrop for TyrPlatformDriverData<'_> {
     fn drop(self: Pin<&mut Self>) {
+        drop(self.devfreq_registration.lock().take());
         // Let the queued terminations hand their groups to the cleanup
         // workqueue before the module can exit.
         self.reg.device().term_wq.flush();
