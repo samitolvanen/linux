@@ -33,6 +33,7 @@ use crate::{
     },
     gpu,
     mmu,
+    reset,
     sched, //
 };
 
@@ -72,12 +73,35 @@ fn suspend_hw_components(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDr
 fn resume_hw_components(
     dev: &platform::Device<Bound>,
     data: Pin<&TyrPlatformDriverData>,
+    reload: bool,
 ) -> Result {
     let tdev = &data.device;
 
     gpu::resume(dev, data)?;
     mmu::resume(dev, data)?;
-    tdev.fw.resume(dev.as_ref(), &data.job_irq, tdev)
+    if reload {
+        tdev.fw.reload(tdev)
+    } else {
+        tdev.fw.resume(dev.as_ref(), &data.job_irq, tdev)
+    }
+}
+
+/// Failure path of `resume`. The PM core records the error in
+/// `power.runtime_error` and the device stays suspended. Suspends the
+/// hardware first so nothing touches the gated block.
+fn fail_resume(
+    dev: &platform::Device<Bound>,
+    data: Pin<&TyrPlatformDriverData>,
+    e: Error,
+) -> Error {
+    dev_err!(
+        dev.as_ref(),
+        "Runtime resume failed, device is unusable: {:?}\n",
+        e
+    );
+    suspend_hw_components(dev, data);
+    data.device.clks.lock().gate();
+    e
 }
 
 /// Powers the GPU down for runtime suspend.
@@ -96,6 +120,9 @@ fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result 
     // Nothing below fails. Once the governor is paused, the device
     // always reaches the suspended state.
     tdev.user_mmio.lock().set_powered(tdev, false);
+
+    tdev.reset.flush();
+
     sched::tick::suspend(tdev);
     // Drain any worker that raced the gate before halting the hardware.
     tdev.drain_sched_work();
@@ -112,18 +139,41 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
 
     tdev.clks.lock().ungate()?;
 
-    if let Err(e) = resume_hw_components(dev, data) {
-        // The PM core latches the error in `power.runtime_error` and the
-        // device stays suspended until unbind. Shut the hardware down first
-        // so nothing touches the gated block.
-        dev_err!(
-            bound,
-            "Runtime resume failed, device is unusable: {:?}\n",
-            e
-        );
-        suspend_hw_components(dev, data);
-        tdev.clks.lock().gate();
-        return Err(e);
+    // A reset recorded while the device was suspended means the firmware state
+    // cannot be trusted, so complete the reset here with a full firmware
+    // reload instead of the fast resident-section reboot.
+    let pending_reset = tdev.reset.claim_pending();
+
+    let hw = if pending_reset {
+        resume_hw_components(dev, data, true)
+    } else {
+        resume_hw_components(dev, data, false).or_else(|e| {
+            dev_err!(
+                bound,
+                "Resume failed, retrying with a full firmware reload: {:?}\n",
+                e
+            );
+            resume_hw_components(dev, data, true)
+        })
+    };
+
+    if pending_reset {
+        tdev.reset.complete_claimed();
+    }
+
+    if let Err(e) = hw {
+        return Err(fail_resume(dev, data, e));
+    }
+
+    // A request recorded during the reboot arrived after the earlier
+    // claim, so no worker will pick it up. Complete it before the rebind.
+    if tdev.reset.claim_pending() {
+        let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem);
+        tdev.reset.complete_claimed();
+
+        if let Err(e) = reset_res {
+            return Err(fail_resume(dev, data, e));
+        }
     }
 
     // The work reissued below tests this flag, so clear it first. A failed
