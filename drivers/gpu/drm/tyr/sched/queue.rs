@@ -888,6 +888,12 @@ impl QueueOps for TyrQueueOps {
             // This path does not always schedule a tick, so record the busy
             // edge here.
             group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
+            let _ = group.tdev.with_locked_scheduler(|sched| {
+                if sched.pm_ref.is_none() {
+                    sched.pm_ref = group.tdev.sched_pm_get();
+                }
+                Ok(())
+            });
 
             if resume_tick {
                 if let Ok(tick) = group

@@ -17,6 +17,7 @@ mod heap;
 mod irq;
 mod mmap;
 mod mmu;
+mod pm;
 mod pool;
 mod regs;
 mod sched;

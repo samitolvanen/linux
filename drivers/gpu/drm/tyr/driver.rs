@@ -7,6 +7,7 @@ use core::sync::atomic::{
 };
 
 use kernel::{
+    bindings,
     clk::{
         Clk,
         OptionalClk, //
@@ -44,6 +45,13 @@ use kernel::{
     of,
     opp::ConfigToken,
     platform,
+    pm::{
+        self,
+        PMConfig,
+        PMContext,
+        PMProfile,
+        RuntimePMState, //
+    },
     prelude::*,
     regulator,
     regulator::Regulator,
@@ -51,7 +59,8 @@ use kernel::{
     sync::{
         aref::ARef,
         Arc,
-        Mutex, //
+        Mutex,
+        SetOnce, //
     },
     time::{
         self,
@@ -91,6 +100,10 @@ use crate::{
             mmu_irq_init, //
         },
         Mmu, //
+    },
+    pm::{
+        TyrPmOps,
+        AUTOSUSPEND_DELAY_MS, //
     },
     regs::gpu_control::*, //
     sched::{
@@ -152,7 +165,13 @@ pub(crate) struct TyrPlatformDriverData {
     /// Devfreq registration, `None` on devices without an OPP table.
     devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
 
-    _device: ARef<TyrDrmDevice>,
+    /// Runtime PM registration. Owns the callback payload and disables
+    /// runtime PM on unbind. Held only for its `Drop`.
+    #[expect(dead_code)]
+    pm: pm::Registration<TyrPmOps>,
+
+    #[expect(dead_code)]
+    pub(crate) device: ARef<TyrDrmDevice>,
 }
 
 #[pin_data]
@@ -273,6 +292,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
+
+    /// Runtime PM context, `None` until the end of probe.
+    pub(crate) pm: SetOnce<PMContext<TyrPmOps>>,
 
     #[pin]
     pub(crate) opp_config: Mutex<Option<ConfigToken>>,
@@ -500,6 +522,7 @@ kernel::of_device_table!(
 impl platform::Driver for TyrPlatformDriverData {
     type IdInfo = ();
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+    const PM_OPS: Option<&'static bindings::dev_pm_ops> = Some(&PMContext::<TyrPmOps>::PM_OPS);
 
     fn probe(
         pdev: &platform::Device<Core>,
@@ -603,6 +626,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 devfreq_data,
+                pm: SetOnce::new(),
                 opp_config <- new_mutex!(None),
         });
 
@@ -642,12 +666,32 @@ impl platform::Driver for TyrPlatformDriverData {
         let scheduler = Scheduler::init(&tdev)?;
         tdev.sched.lock().enable(scheduler);
 
+        let mut pm_configs = KVec::<PMConfig>::with_capacity(1, GFP_KERNEL)?;
+        pm_configs.push(PMConfig::AutoSuspendDelay(AUTOSUSPEND_DELAY_MS), GFP_KERNEL)?;
+
+        let pm_registration = pm::Registration::<TyrPmOps>::new(
+            pdev.as_ref(),
+            None,
+            Some(pm_configs),
+            Some(devfreq_registration.clone()),
+        )?;
+        let pm = pm_registration.ctx().clone();
+
+        // The device is already powered, so runtime PM starts resumed.
+        pm.enable(RuntimePMState::RESUMED)?;
+
+        drop(pm.get(PMProfile::new().auto())?);
+
+        let populated = tdev.pm.populate(pm);
+        debug_assert!(populated);
+
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
         Ok(TyrPlatformDriverData {
             devfreq_registration,
-            _device: tdev,
+            pm: pm_registration,
+            device: tdev,
         })
     }
 
