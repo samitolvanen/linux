@@ -787,6 +787,10 @@ impl TyrDrmFileData {
         args.extra_flags = 0;
         args.pad = 0;
 
+        if bo.is_imported() {
+            args.extra_flags |= uapi::drm_panthor_bo_extra_flags_DRM_PANTHOR_BO_IS_IMPORTED;
+        }
+
         Ok(0)
     }
 }
