@@ -16,6 +16,7 @@ use kernel::{
     io::Io,
     pm::PMProfile,
     prelude::*,
+    str::CString,
     sync::{
         aref::ARef,
         Arc, //
@@ -665,9 +666,33 @@ impl TyrDrmFileData {
 
     pub(crate) fn bo_set_label(
         _ddev: &TyrDrmDevice,
-        _args: &mut uapi::drm_panthor_bo_set_label,
-        _file: &TyrDrmFile,
+        args: &mut uapi::drm_panthor_bo_set_label,
+        file: &TyrDrmFile,
     ) -> Result<u32> {
+        if args.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let bo = gem::lookup_handle(file, args.handle)?;
+
+        let label = if args.label != 0 {
+            let mut buf = KVec::new();
+            buf.resize(gem::BO_LABEL_MAXLEN + 1, 0u8, GFP_KERNEL)?;
+
+            let reader =
+                UserSlice::new(UserPtr::from_addr(args.label as usize), buf.len()).reader();
+            let label = reader.strcpy_into_buf(&mut buf)?;
+            if label.to_bytes_with_nul().len() > gem::BO_LABEL_MAXLEN {
+                return Err(E2BIG);
+            }
+
+            Some(CString::try_from(label)?)
+        } else {
+            None
+        };
+
+        bo.set_label(label);
+
         Ok(0)
     }
 
