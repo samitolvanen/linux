@@ -887,9 +887,10 @@ impl platform::Driver for TyrPlatformDriverData {
 //       - adds PANTHOR_GROUP_PRIORITY_REALTIME priority
 // - 1.3 - adds DRM_PANTHOR_GROUP_STATE_INNOCENT flag
 // - 1.4 - adds DRM_IOCTL_PANTHOR_BO_SET_LABEL ioctl
+// - 1.5 - adds DRM_PANTHOR_SET_USER_MMIO_OFFSET ioctl
 const INFO: drm::DriverInfo = drm::DriverInfo {
     major: 1,
-    minor: 4,
+    minor: 5,
     patchlevel: 0,
     name: c"panthor",
     desc: c"ARM Mali Tyr DRM driver",
