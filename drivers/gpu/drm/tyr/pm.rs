@@ -39,10 +39,10 @@ use crate::{
 /// Autosuspend delay in milliseconds.
 pub(crate) const AUTOSUSPEND_DELAY_MS: u32 = 50;
 
-/// Asynchronous get/put with autosuspend for the scheduler's usage reference.
-/// Both edges sit in dma-fence signalling sections, where only the
-/// asynchronous variants are safe.
-const SCHED_PROFILE: PMProfile = PMProfile::new().r#async().auto();
+/// Asynchronous get/put with autosuspend. Some callers run inside
+/// dma-fence signalling sections, where only the asynchronous variants
+/// are safe.
+const ASYNC_PROFILE: PMProfile = PMProfile::new().r#async().auto();
 
 /// Marker type implementing the runtime PM callbacks.
 pub(crate) struct TyrPmOps;
@@ -178,7 +178,7 @@ impl PMOps for TyrPmOps {
     }
 }
 
-/// Permission token for scheduler hardware access.
+/// Permission token for hardware access.
 ///
 /// The `AwakeScope`-backed variant holds a usage reference that keeps the
 /// device runtime-active. The reference-less variant is granted when the
@@ -209,24 +209,27 @@ impl TyrDrmDeviceData {
     /// Returns `None` when runtime PM is unavailable, in which case the caller
     /// runs without a reference.
     pub(crate) fn sched_pm_get(&self) -> Option<AwakeScope> {
-        self.pm_context()?.get(SCHED_PROFILE).ok()
+        self.pm_context()?.get(ASYNC_PROFILE).ok()
     }
 
     /// Returns an `ActiveDevice` token if the device is powered, `None` if it
-    /// is runtime suspended or a transition is in flight.
+    /// is runtime suspended or a transition is in flight. While runtime PM is
+    /// disabled, the driver-owned powered-down flag decides the outcome, and
+    /// a granted token holds no reference.
     ///
-    /// Scheduler paths that program the hardware call this instead of resuming
-    /// the device, since a resume in a dma-fence signalling section would run
-    /// the heavyweight resume callback inline. On `None`, callers skip the
-    /// hardware access and rely on the resume callback to reissue a tick.
-    pub(crate) fn sched_pm_get_if_active(&self) -> Option<ActiveDevice> {
+    /// Callers that program the hardware take this token instead of resuming
+    /// the device. Some run in a dma-fence signalling section, where an
+    /// inline resume would run the heavyweight resume callback. On `None`,
+    /// callers skip the hardware access and rely on the resume path to
+    /// reissue the work.
+    pub(crate) fn pm_get_if_active(&self) -> Option<ActiveDevice> {
         let Some(ctx) = self.pm_context() else {
             // The device is powered for the whole probe window. The
             // window ends when probe publishes the PM context.
             return Some(ActiveDevice { _scope: None });
         };
 
-        match ctx.get_if_active(SCHED_PROFILE) {
+        match ctx.get_if_active(ASYNC_PROFILE) {
             Ok(scope @ Some(_)) => Some(ActiveDevice { _scope: scope }),
             Ok(None) => None,
             // `get_if_active` errors only when runtime PM is disabled, i.e.
