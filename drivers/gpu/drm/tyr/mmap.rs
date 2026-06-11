@@ -14,24 +14,36 @@ use kernel::{
         PAGE_SIZE, //
     },
     prelude::*,
+    uapi, //
 };
 
 use crate::driver::TyrDrmDevice;
 
-pub(crate) const DRM_PANTHOR_USER_MMIO_OFFSET_64BIT: u64 = 1u64 << 56;
-const DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET: u64 = DRM_PANTHOR_USER_MMIO_OFFSET_64BIT;
+/// Kernel-side user MMIO base, `DRM_PANTHOR_USER_MMIO_OFFSET` in the uapi
+/// header.
+pub(crate) const DRM_PANTHOR_USER_MMIO_OFFSET: u64 = if usize::BITS < 64 {
+    uapi::DRM_PANTHOR_USER_MMIO_OFFSET_32BIT
+} else {
+    uapi::DRM_PANTHOR_USER_MMIO_OFFSET_64BIT
+};
+const DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET: u64 = DRM_PANTHOR_USER_MMIO_OFFSET;
 const CSF_GPU_LATEST_FLUSH_ID_OFFSET: u64 = 0x10000;
 
 pub(crate) fn mmap(
     device: &TyrDrmDevice,
-    _file: &crate::file::TyrDrmFileData,
+    file: &crate::file::TyrDrmFileData,
     vma: &VmaNew,
 ) -> Option<Result> {
     let offset = (vma.pgoff() as u64) << PAGE_SHIFT;
+    let user_mmio_offset = file.user_mmio_offset();
 
-    if offset < DRM_PANTHOR_USER_MMIO_OFFSET_64BIT {
+    if offset < user_mmio_offset {
         return None;
     }
+
+    let offset = offset
+        .wrapping_sub(user_mmio_offset)
+        .wrapping_add(DRM_PANTHOR_USER_MMIO_OFFSET);
 
     if offset != DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET {
         return Some(Err(EINVAL));
@@ -64,6 +76,7 @@ pub(crate) fn mmap(
         flags |= vma_flags::PFNMAP | vma_flags::NORESERVE;
         (*vma_ptr).__bindgen_anon_2.vm_flags = flags;
 
+        (*vma_ptr).vm_pgoff = (offset >> PAGE_SHIFT) as usize;
         (*vma_ptr).vm_private_data = core::ptr::from_ref(device).cast_mut().cast();
         (*vma_ptr).vm_ops = core::ptr::from_ref(&VM_OPS).cast();
     }
@@ -101,7 +114,7 @@ unsafe extern "C" fn vm_fault_handler(vmf: *mut bindings::vm_fault) -> bindings:
     let tdev = unsafe { &*tdev_ptr };
 
     // SAFETY: `vma` came from the VM subsystem for this fault callback.
-    let offset = (unsafe { (*vma).vm_pgoff } << PAGE_SHIFT) as u64;
+    let offset = (unsafe { (*vma).vm_pgoff } as u64) << PAGE_SHIFT;
     if offset != DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET {
         return VM_FAULT_SIGBUS;
     }
@@ -163,6 +176,6 @@ impl UserMmio {
     /// PTEs so the fault handler re-derives the mapping.
     pub(crate) fn set_powered(&mut self, device: &TyrDrmDevice, powered: bool) {
         self.powered = powered;
-        device.unmap_mapping_range(DRM_PANTHOR_USER_MMIO_OFFSET_64BIT, 0);
+        device.unmap_mapping_range(DRM_PANTHOR_USER_MMIO_OFFSET, 0);
     }
 }
