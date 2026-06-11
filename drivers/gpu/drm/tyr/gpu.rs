@@ -105,8 +105,10 @@ impl GpuInfo {
             core_features: io.read(CORE_FEATURES).into_raw(),
             // Padding must be zero.
             pad: 0,
-            //GPU_FEATURES register is not available; it was introduced in arch 11.x.
-            gpu_features: 0,
+            gpu_features: join_u64(
+                io.read(GPU_FEATURES_LO).into_raw(),
+                io.read(GPU_FEATURES_HI).into_raw(),
+            ),
         }))
     }
 
