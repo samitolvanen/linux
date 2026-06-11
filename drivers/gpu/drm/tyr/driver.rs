@@ -465,7 +465,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
         // Processing events ACKs them through CSG doorbells. If the
         // device is runtime suspended, leave the events latched in
         // `fw_events`. The resume path reschedules this worker.
-        let Some(_active) = tdev.sched_pm_get_if_active() else {
+        let Some(_active) = tdev.pm_get_if_active() else {
             return;
         };
 
@@ -679,6 +679,9 @@ impl platform::Driver for TyrPlatformDriverData {
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
 
+        tdev.reset
+            .set_device(Devres::new(pdev.as_ref(), tdev.clone())?);
+
         let io = tdev.iomem.access(pdev.as_ref())?;
 
         let gpu_irq = Devres::new(
@@ -730,6 +733,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let populated = tdev.pm.populate(pm);
         debug_assert!(populated);
 
+        tdev.reset.set_ready();
+
         TyrDrmDeviceData::schedule_tick(&tdev);
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
@@ -746,6 +751,7 @@ impl platform::Driver for TyrPlatformDriverData {
     }
 
     fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
+        this.device.reset.unbind();
         drop(this.devfreq_registration.lock().take());
     }
 }

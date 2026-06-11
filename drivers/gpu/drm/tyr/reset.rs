@@ -27,11 +27,15 @@
 //!
 //!   - Idle/Pending/InProgress -> ShuttingDown
 //! ```
+//!
+//! A readiness gate holds a request recorded during probe at `Pending`
+//! until `set_ready` enqueues the worker.
 
 mod hw_gate;
 
 use kernel::{
     devres::Devres,
+    new_mutex,
     platform,
     prelude::*,
     sync::{
@@ -40,20 +44,25 @@ use kernel::{
             Atomic,
             AtomicType,
             Full,
+            Relaxed,
             Release, //
         },
-        Arc, //
+        Arc,
+        Mutex, //
     },
     workqueue::{
         self,
         OwnedQueue,
         Queue,
         Work, //
-    },
+    }, //
 };
 
 use crate::{
-    driver::IoMem,
+    driver::{
+        IoMem,
+        TyrDrmDevice, //
+    },
     gpu, //
 };
 
@@ -83,8 +92,17 @@ struct Controller {
     pdev: ARef<platform::Device>,
     /// Mapped register space needed for reset operations.
     iomem: Arc<Devres<IoMem>>,
+    /// DRM device reference, set once probe has created the device and
+    /// revoked by devres at unbind. Resolving it through `Devres` keeps
+    /// the back-reference from pinning the refcount cycle past unbind.
+    #[pin]
+    ddev: Mutex<Option<Devres<ARef<TyrDrmDevice>>>>,
     /// Lifecycle state of the reset worker.
     state: Atomic<ResetState>,
+    /// Set once probe has finished bringing the device up. Requests
+    /// recorded before that are held back until it is set.
+    #[pin]
+    ready: Mutex<bool>,
     /// Work item backing async reset processing.
     #[pin]
     work: Work<Controller>,
@@ -109,7 +127,9 @@ impl Controller {
             try_pin_init!(Self {
                 pdev,
                 iomem,
+                ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
+                ready <- new_mutex!(false),
                 work <- kernel::new_work!("tyr::reset"),
             }),
             GFP_KERNEL,
@@ -121,10 +141,26 @@ impl Controller {
         self.state.cmpxchg(from, to, Full).is_ok()
     }
 
-    #[inline]
-    fn record_request(&self) {
+    /// Records a reset request and returns whether the worker may run it.
+    ///
+    /// A request recorded before probe opens the reset path stays pending
+    /// until `set_ready` enqueues a worker for it.
+    fn record_request(&self) -> bool {
+        let ready = self.ready.lock();
         // A request lands only from Idle. Other states leave the machine as is.
         let _ = self.try_change_state(ResetState::Idle, ResetState::Pending);
+        *ready
+    }
+
+    /// Opens the reset path and returns whether a request is waiting.
+    ///
+    /// Both this and `record_request` run under the `ready` lock. Either
+    /// this call sees the recorded request, or the recording call sees the
+    /// open path and queues a worker itself.
+    fn set_ready(&self) -> bool {
+        let mut ready = self.ready.lock();
+        *ready = true;
+        self.state.load(Relaxed) == ResetState::Pending
     }
 
     #[inline]
@@ -144,10 +180,38 @@ impl Controller {
         self.state.store(ResetState::ShuttingDown, Release);
     }
 
+    /// Resolves the DRM device backing this controller.
+    ///
+    /// Returns `None` before probe wires the reference and after unbind
+    /// revokes it. The `ARef` is cloned out of the revocable guard so the
+    /// guard's RCU read-side critical section does not span the worker's
+    /// sleeps.
+    fn device(&self) -> Option<ARef<TyrDrmDevice>> {
+        let slot = self.ddev.lock();
+        let guard = slot.as_ref()?.try_access()?;
+        Some((*guard).clone())
+    }
+
     /// Processes one scheduled reset request.
     ///
     /// If the pending reset cannot be claimed, the worker returns immediately.
     fn reset_work(self: &Arc<Self>) {
+        let Some(tdev) = self.device() else {
+            // There is no device to reset, so consume the request without
+            // touching the hardware.
+            if self.claim_pending() {
+                self.finish_reset();
+            }
+            return;
+        };
+
+        // The token blocks a suspend when runtime PM can hold a reference. A
+        // reset must not run against a powered-off GPU, so a denied token
+        // leaves the request pending across the suspend cycle.
+        let Some(_active) = tdev.pm_get_if_active() else {
+            return;
+        };
+
         if !self.claim_pending() {
             return;
         }
@@ -194,15 +258,66 @@ impl ResetHandle {
         })
     }
 
+    /// Waits for an in-flight reset worker to finish.
+    pub(crate) fn flush(&self) {
+        let _ = workqueue::flush_work::<Controller, Controller, 0>(&self.controller);
+    }
+
+    /// Cancels the reset worker at unbind.
+    ///
+    /// Empties the device slot so requests resolve no device from here
+    /// on, then drains an in-flight worker. Unbind runs before devres
+    /// teardown, so the drained worker still holds a live register
+    /// mapping. A work item enqueued by a racing `schedule` finds the
+    /// slot empty and consumes the request without hardware access.
+    pub(crate) fn unbind(&self) {
+        drop(self.controller.ddev.lock().take());
+        self.flush();
+    }
+
+    /// Publishes the DRM device reference the reset worker resolves.
+    ///
+    /// Called once probe has created the device. Devres revokes the
+    /// reference at unbind.
+    pub(crate) fn set_device(&self, ddev: Devres<ARef<TyrDrmDevice>>) {
+        *self.controller.ddev.lock() = Some(ddev);
+    }
+
+    /// Opens the reset path once probe has brought the device up.
+    ///
+    /// A request recorded during probe has no worker queued for it, so
+    /// this queues one.
+    pub(crate) fn set_ready(&self) {
+        if self.controller.set_ready() {
+            let _ = self.wq.enqueue(self.controller.clone());
+        }
+    }
+
     /// Schedules a GPU reset on the dedicated workqueue.
     ///
     /// If a reset is already pending or in progress the call is a no-op.
     #[expect(dead_code)]
     pub(crate) fn schedule(&self) {
-        // Keep only one reset request running or queued. If one is already pending,
-        // we ignore new schedule requests. An enqueue failure means the work
-        // item is already queued. That run claims the pending request.
-        self.controller.record_request();
+        let Some(tdev) = self.controller.device() else {
+            return;
+        };
+
+        // Keep only one reset request running or queued. If one is already
+        // pending, we ignore new schedule requests.
+        if !self.controller.record_request() {
+            // Probe is still bringing the device up, so `set_ready` runs the
+            // request once it is done.
+            return;
+        }
+
+        let Some(_active) = tdev.pm_get_if_active() else {
+            // The GPU is (or is about to be) powered off, so the recorded
+            // request stays pending without a queued worker.
+            return;
+        };
+
+        // An enqueue failure means the work item is already queued. That run
+        // claims the pending request.
         let _ = self.wq.enqueue(self.controller.clone());
     }
 }

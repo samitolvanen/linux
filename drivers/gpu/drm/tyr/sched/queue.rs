@@ -872,7 +872,7 @@ impl QueueOps for TyrQueueOps {
         // suspend is evicting the group and the rebind re-rings the
         // committed bytes.
         let group = &job.job.group;
-        let awake = group.tdev.sched_pm_get_if_active();
+        let awake = group.tdev.pm_get_if_active();
         let device_active = awake.is_some();
         let queue_index = job.job.queue_index;
         let (active, kick_err, resume_tick) = group.with_locked_inner(|inner| {
