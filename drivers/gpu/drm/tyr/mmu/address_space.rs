@@ -531,7 +531,12 @@ impl AddressSpaceManager {
     /// The completion bit is cleared before and after polling so each call
     /// observes only its own completion event. This affects all GPU caches
     /// globally. It does not touch MMU AS lock state.
-    fn gpu_flush_caches(&self, l2: FlushMode, lsc: FlushMode, other: FlushMode) -> Result {
+    pub(super) fn gpu_flush_caches(
+        &self,
+        l2: FlushMode,
+        lsc: FlushMode,
+        other: FlushMode,
+    ) -> Result {
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
 

@@ -17,6 +17,7 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
+        atomic::Relaxed,
         Arc, //
     },
     time::{
@@ -31,7 +32,8 @@ use kernel::{
 use crate::{
     driver::{
         TyrDrmDevice,
-        TyrDrmDeviceData, //
+        TyrDrmDeviceData,
+        TyrDrmRegistrationData, //
     },
     fw::{
         global::csg::Priority,
@@ -166,6 +168,61 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
     }
 
     result
+}
+
+/// Suspends the scheduler for runtime PM.
+///
+/// Evicts every resident group so none is bound when the MCU halts,
+/// with the device still powered.
+///
+/// Must not be called with the scheduler mutex held.
+#[expect(dead_code)]
+pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationData<'_>) {
+    let mut teardown_groups: [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE] =
+        [const { None }; TEARDOWN_ARRAY_SIZE];
+
+    let result = tdev.with_locked_scheduler(|sched| {
+        // Record the suspend under the scheduler mutex so tick paths that
+        // re-check it there observe it once the eviction below begins.
+        tdev.sched_suspended.store(true, Relaxed);
+        Tick::new(sched, &mut teardown_groups).suspend(tdev, reg_data)
+    });
+    if let Err(e) = result {
+        dev_err!(
+            tdev.as_ref(),
+            "scheduler suspend failed: {}\n",
+            e.to_errno()
+        );
+    }
+
+    for slot in teardown_groups.iter_mut() {
+        let Some(group) = slot.take() else {
+            break;
+        };
+        group.schedule_term();
+    }
+}
+
+/// Resumes the scheduler after a runtime resume. Reissues the
+/// firmware-event drain for events latched across the suspend, the
+/// sync-update sweep for syncwaits satisfied while no group was
+/// resident, and the tick so evicted-but-runnable groups rebind.
+///
+/// The sweep runs on a separate workqueue and fires its own tick only
+/// for a real-time group. The immediate tick here can therefore run
+/// before the sweep promotes anything, so a delayed tick follows.
+#[expect(dead_code)]
+pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
+    // Clear the suspend under the scheduler mutex, the counterpart to the
+    // store in `suspend`, before reissuing work.
+    let _ = tdev.with_locked_scheduler(|_sched| {
+        tdev.sched_suspended.store(false, Relaxed);
+        Ok(())
+    });
+    TyrDrmDeviceData::schedule_fw_events(tdev);
+    TyrDrmDeviceData::schedule_sync_upd(tdev);
+    TyrDrmDeviceData::schedule_tick(tdev);
+    Scheduler::request_tick(tdev);
 }
 
 /// Identifies a group selected during rule evaluation.
@@ -665,53 +722,51 @@ impl<'a> Tick<'a> {
         Ok(())
     }
 
-    /// Suspends and unbinds groups not marked to be kept.
-    fn halt_and_unbind_evicted_groups(
+    /// Stages a `Suspend` (or `Terminate` for unhealthy groups) state
+    /// transition for every bound slot not covered by `keep_mask`.
+    fn stage_evictions(
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
-        fw: &Firmware<'_>,
-        decision: &SchedulingDecision,
-    ) -> Result<()> {
-        let slot_count = MAX_CSGS;
-        let mut context = CsgUpdateContext::new();
-        // An eviction reclaims the slot for other work only when this
-        // pass selected some.
-        context.reclaim = decision.num_selected != 0;
-
+        keep_mask: u32,
+        context: &mut CsgUpdateContext,
+    ) {
         // Build the halt request set under the slot-manager lock,
         // then drop the lock before issuing the firmware update.
         // `apply_csg_updates` re-acquires it itself across its wait
         // phase.
-        {
-            let csg_slot_manager = tdev.csg_slot_manager.lock();
-            for i in 0..slot_count {
-                if (decision.keep_mask & (1u32 << i)) != 0 {
-                    continue;
-                }
-                let Some(slot_data) = csg_slot_manager.slot_data(i) else {
-                    continue;
-                };
+        let csg_slot_manager = tdev.csg_slot_manager.lock();
+        for i in 0..MAX_CSGS {
+            if (keep_mask & (1u32 << i)) != 0 {
+                continue;
+            }
+            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                continue;
+            };
 
-                if slot_data.group.can_run() {
-                    context.set_state(i, CsgExecutionState::Suspend);
-                } else {
-                    context.set_state(i, CsgExecutionState::Terminate);
-                }
+            if slot_data.group.can_run() {
+                context.set_state(i, CsgExecutionState::Suspend);
+            } else {
+                context.set_state(i, CsgExecutionState::Terminate);
             }
         }
+    }
 
-        self.sched
-            .apply_csg_updates(tdev, fw, &mut context)
-            .inspect_err(|_| dev_err!(tdev.as_ref(), "apply_csg_updates (halt) failed\n"))?;
-
+    /// Tears down the binding of every slot not covered by `keep_mask`, after
+    /// the firmware acked (or timed out on) the staged state transitions.
+    fn unbind_evicted_groups(
+        &mut self,
+        tdev: &ARef<TyrDrmDevice>,
+        fw: &Firmware<'_>,
+        keep_mask: u32,
+    ) -> Result<()> {
         // Drain any pending CSG IRQs on each evicted slot so the
         // group's per-queue / per-CSG bookkeeping reflects the latest
         // firmware state before we tear the binding down. Runs
         // *before* taking the slot-manager lock below because
         // `process_csg_irq` re-takes the slot-manager lock itself to
         // look the group up.
-        for i in 0..slot_count {
-            if (decision.keep_mask & (1u32 << i)) != 0 {
+        for i in 0..MAX_CSGS {
+            if (keep_mask & (1u32 << i)) != 0 {
                 continue;
             }
             if let Err(e) = self.sched.process_csg_irq(tdev, fw, i) {
@@ -725,8 +780,11 @@ impl<'a> Tick<'a> {
         }
 
         let mut csg_slot_manager = tdev.csg_slot_manager.lock();
-        for i in 0..slot_count {
-            if (decision.keep_mask & (1u32 << i)) != 0 {
+        // Evict every slot even when one fails, so no group is left bound when
+        // the caller halts the MCU.
+        let mut ret = Ok(());
+        for i in 0..MAX_CSGS {
+            if (keep_mask & (1u32 << i)) != 0 {
                 continue;
             }
 
@@ -737,7 +795,12 @@ impl<'a> Tick<'a> {
                 (slot_data.group.clone(), slot_data.group.can_run())
             };
 
-            csg_slot_manager.evict(&group.csg_seat)?;
+            if let Err(e) = csg_slot_manager.evict(&group.csg_seat) {
+                dev_err!(tdev.as_ref(), "evict {} failed: {}\n", i, e.to_errno());
+                if ret.is_ok() {
+                    ret = Err(e);
+                }
+            }
 
             if can_run {
                 if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
@@ -751,7 +814,98 @@ impl<'a> Tick<'a> {
             }
         }
 
-        Ok(())
+        ret
+    }
+
+    /// Suspends and unbinds groups not marked to be kept.
+    fn halt_and_unbind_evicted_groups(
+        &mut self,
+        tdev: &ARef<TyrDrmDevice>,
+        fw: &Firmware<'_>,
+        decision: &SchedulingDecision,
+    ) -> Result<()> {
+        let mut context = CsgUpdateContext::new();
+        // An eviction reclaims the slot for other work only when this
+        // pass selected some.
+        context.reclaim = decision.num_selected != 0;
+
+        self.stage_evictions(tdev, decision.keep_mask, &mut context);
+
+        self.sched
+            .apply_csg_updates(tdev, fw, &mut context)
+            .inspect_err(|_| dev_err!(tdev.as_ref(), "apply_csg_updates (halt) failed\n"))?;
+
+        self.unbind_evicted_groups(tdev, fw, decision.keep_mask)
+    }
+
+    /// Evicts every resident group for runtime suspend.
+    ///
+    /// Like `halt_and_unbind_evicted_groups` with nothing kept, but leaves no
+    /// group bound even on failure. The L2/LSC caches are then cleaned so the
+    /// firmware-written suspend buffers reach memory before power loss.
+    fn suspend(
+        &mut self,
+        tdev: &ARef<TyrDrmDevice>,
+        reg_data: &TyrDrmRegistrationData<'_>,
+    ) -> Result<()> {
+        let mut context = CsgUpdateContext::new();
+
+        self.stage_evictions(tdev, 0, &mut context);
+
+        if self
+            .sched
+            .apply_csg_updates(tdev, &reg_data.fw, &mut context)
+            .is_err()
+        {
+            dev_err!(
+                tdev.as_ref(),
+                "CSG suspend failed, escalating to termination\n"
+            );
+            let mut term_context = CsgUpdateContext::new();
+            {
+                let csg_slot_manager = tdev.csg_slot_manager.lock();
+                for i in 0..MAX_CSGS {
+                    if !context.timedout_mask.contains(i) {
+                        continue;
+                    }
+                    let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                        continue;
+                    };
+                    slot_data.group.with_locked_inner(|inner| {
+                        if inner.fatal_error.is_none() {
+                            inner.fatal_error = Some(ETIMEDOUT);
+                        }
+                    });
+                    term_context.set_state(i, CsgExecutionState::Terminate);
+                }
+            }
+            if let Err(e) = self
+                .sched
+                .apply_csg_updates(tdev, &reg_data.fw, &mut term_context)
+            {
+                dev_err!(
+                    tdev.as_ref(),
+                    "CSG terminate on suspend failed: {}\n",
+                    e.to_errno()
+                );
+            }
+        }
+
+        if reg_data.mmu.flush_caches().is_err() {
+            dev_err!(
+                tdev.as_ref(),
+                "cache clean on suspend failed, terminating suspended groups\n"
+            );
+            let csg_slot_manager = tdev.csg_slot_manager.lock();
+            for i in 0..MAX_CSGS {
+                let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                    continue;
+                };
+                slot_data.group.set_state(State::Terminated);
+            }
+        }
+
+        self.unbind_evicted_groups(tdev, &reg_data.fw, 0)
     }
 
     /// Puts a staged bind back on a scheduler list so a later tick can

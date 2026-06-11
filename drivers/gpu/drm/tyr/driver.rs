@@ -180,6 +180,13 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sched: Mutex<SchedulerState>,
 
+    /// Set while the scheduler-level runtime suspend is in effect, from the
+    /// start of the tick suspend until resume. Written under the scheduler
+    /// mutex, so tick paths re-check it there. Read locklessly by the
+    /// hardware-access gate, which runs in dma-fence signalling sections and
+    /// must not sleep.
+    pub(crate) sched_suspended: Atomic<bool>,
+
     /// Slot manager for the firmware-visible CSG slots.
     ///
     /// Pinned at probe time with `MAX_CSGS` as an upper bound so the
@@ -275,6 +282,14 @@ impl TyrDrmDeviceData {
     /// the bits that were set.
     pub(crate) fn fw_events_take(&self) -> u32 {
         self.fw_events.xchg(0, Acquire)
+    }
+
+    /// Returns whether any firmware-events bits are pending, a hint for
+    /// rescheduling the drain worker. The drain itself synchronizes through
+    /// `fw_events_take`.
+    #[expect(dead_code)]
+    pub(crate) fn fw_events_pending(&self) -> bool {
+        self.fw_events.load(Relaxed) != 0
     }
 
     /// Schedules the fw-events worker on the scheduler workqueue.
@@ -615,6 +630,7 @@ impl platform::Driver for TyrPlatformDriver {
                 coherent,
                 term_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
+                sched_suspended: Atomic::new(false),
                 csg_slot_manager <- new_mutex!(csg_slot_manager),
                 fw_events: Atomic::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
