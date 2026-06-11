@@ -198,6 +198,13 @@ impl Page {
         unsafe { bindings::page_to_nid(self.as_ptr()) }
     }
 
+    /// Returns the page frame number of this page.
+    #[inline]
+    pub fn pfn(&self) -> usize {
+        // SAFETY: Always safe to call with a valid page.
+        unsafe { bindings::page_to_pfn(self.as_ptr()) as usize }
+    }
+
     /// Runs a piece of code with this page mapped to an address.
     ///
     /// The page is unmapped when this call returns.
