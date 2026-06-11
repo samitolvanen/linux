@@ -561,6 +561,23 @@ impl Group {
         let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 2>(self.clone());
     }
 
+    /// Parks every queue in the group.
+    ///
+    /// Must not be called with the scheduler mutex held. Submit takes
+    /// the per-queue pipeline lock before that mutex.
+    pub(crate) fn park_queues(&self) {
+        for queue in self.queues.iter() {
+            queue.park();
+        }
+    }
+
+    /// Releases the park taken by `park_queues`. Same locking rule.
+    pub(crate) fn unpark_queues(&self) {
+        for queue in self.queues.iter() {
+            queue.unpark();
+        }
+    }
+
     /// Cancels every queue in the group with `err`.
     ///
     /// Writes the per-queue terminator syncobj with `status = !0` and

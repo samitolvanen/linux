@@ -26,7 +26,7 @@ use kernel::{
         Delta,
         Instant,
         Monotonic, //
-    },
+    }, //
 };
 
 use crate::{
@@ -154,6 +154,12 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         return Ok(());
     };
 
+    if tdev.reset.in_progress() {
+        // The reset worker owns the CSG slots. It evicts every group itself
+        // and reissues the tick once the reset completes.
+        return Ok(());
+    }
+
     // The fw-events drain defers the same way this tick does, but
     // nothing re-kicks it once its IRQ has fired. Pick up events
     // latched while the device was down or a transition was in flight.
@@ -280,6 +286,78 @@ pub(crate) fn resume_after_system_sleep(tdev: &ARef<TyrDrmDevice>) {
     if kick {
         TyrDrmDeviceData::schedule_tick(tdev);
     }
+}
+
+/// The groups `pre_reset` parked, handed back to `post_reset`.
+#[must_use]
+pub(crate) struct ParkedGroups(KVec<Arc<Group>>);
+
+impl ParkedGroups {
+    /// Releases every queue `pre_reset` parked.
+    ///
+    /// The unpark is unconditional because a group whose terminal
+    /// cleanup finished while the reset ran has no other release path.
+    /// Unparking a group that is being torn down is harmless, since a
+    /// job reaching submit behind it signals ECANCELED there.
+    ///
+    /// A group that can no longer run is then routed to cleanup. No tick
+    /// would do that for it. That request is the winning one when
+    /// the destroy path has not made it yet, and a latched no-op
+    /// otherwise.
+    fn release(self) {
+        for group in self.0.iter() {
+            group.unpark_queues();
+            if !group.can_run() {
+                group.schedule_term();
+            }
+        }
+    }
+}
+
+/// Stops scheduling for a GPU reset.
+///
+/// New ticks and firmware-event drains bail out while the reset worker
+/// is executing a claimed reset. Flush the in-flight ones, then evict
+/// every resident group through the same machinery as runtime suspend,
+/// including escalating to termination on ack timeout.
+///
+/// The eviction leaves every group that can still run on a scheduler
+/// list, so parking the listed groups covers all of them. Groups it
+/// routed to terminal cleanup instead are drained by
+/// `Group::cancel_queues`.
+pub(crate) fn pre_reset(tdev: &ARef<TyrDrmDevice>) -> ParkedGroups {
+    let data: &TyrDrmDeviceData = tdev;
+    data.drain_sched_work();
+    suspend(tdev);
+
+    let groups = tdev
+        .with_locked_scheduler(|sched| Ok(sched.collect_listed_groups()))
+        .unwrap_or_default();
+    for group in groups.iter() {
+        group.park_queues();
+    }
+
+    ParkedGroups(groups)
+}
+
+/// Restores the scheduler state after a GPU reset.
+///
+/// Every queue `pre_reset` parked is released here, on both legs. After
+/// a successful reset the worker reissues the tick, and the groups that
+/// can still run rebind. A failed reset leaves the hardware
+/// unusable, so every group is terminated first, and
+/// `Group::cancel_queues` drains the queues of a terminated group,
+/// signaling the queued and in-flight fences rather than leaving them
+/// unsignaled.
+pub(crate) fn post_reset(tdev: &ARef<TyrDrmDevice>, parked: ParkedGroups, reset_failed: bool) {
+    if reset_failed {
+        let _ = tdev.with_locked_scheduler(|sched| {
+            sched.fail_all_groups();
+            Ok(())
+        });
+    }
+
+    parked.release();
 }
 
 /// Identifies a group selected during rule evaluation.

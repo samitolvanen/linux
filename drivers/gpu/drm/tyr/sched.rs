@@ -1039,6 +1039,94 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Appends every group on `list` to `out`, returning `false` if
+    /// `out` could not grow.
+    fn collect_list(list: &mut List<Group, 0>, out: &mut KVec<Arc<Group>>) -> bool {
+        let mut cursor = list.cursor_front();
+        while let Some(peek) = cursor.peek_next() {
+            let group: Arc<Group> = peek.arc().into();
+            if out.push(group, GFP_NOWAIT).is_err() {
+                return false;
+            }
+            cursor.move_next();
+        }
+        true
+    }
+
+    /// Snapshots every group on the runnable and idle lists.
+    ///
+    /// Allocates with `GFP_NOWAIT` so the caller can hold the scheduler
+    /// mutex without recording an `fs_reclaim` edge against it.
+    /// Allocation failure ends the walk and returns what was collected.
+    pub(crate) fn collect_listed_groups(&mut self) -> KVec<Arc<Group>> {
+        let mut groups = KVec::new();
+
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            if !Self::collect_list(&mut self.runnable_groups[prio], &mut groups)
+                || !Self::collect_list(&mut self.idle_groups[prio], &mut groups)
+            {
+                pr_err!("reset: out of memory snapshotting the group lists\n");
+                break;
+            }
+        }
+
+        groups
+    }
+
+    /// Detaches and terminates every group on `list`, canceling its fences.
+    fn terminate_list(list: &mut List<Group, 0>) {
+        while let Some(list_arc) = list.pop_front() {
+            let group: Arc<Group> = list_arc.into_arc();
+            group.with_locked_inner(|inner| {
+                inner.list_state = GroupListState::None;
+                inner.state = group::State::Terminated;
+                if inner.fatal_error.is_none() {
+                    inner.fatal_error = Some(ENODEV);
+                }
+            });
+            group.schedule_term();
+        }
+    }
+
+    /// Terminates every group on the scheduler lists.
+    ///
+    /// Called after a failed GPU reset, when the hardware is unusable.
+    /// Each group is detached, marked terminated, and routed through
+    /// `Group::schedule_term` so its queued and in-flight fences are
+    /// canceled. Nothing is bound at this point. The pre-reset pass
+    /// evicted every CSG slot.
+    pub(crate) fn fail_all_groups(&mut self) {
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            Self::terminate_list(&mut self.runnable_groups[prio]);
+            Self::terminate_list(&mut self.idle_groups[prio]);
+
+            // Groups on the wait list may also have been on an id-0
+            // list above. The `term_scheduled` flag stops the terminal
+            // cleanup running twice.
+            while let Some(wait_arc) = self.waiting_groups[prio].pop_front() {
+                let group: Arc<Group> = wait_arc.into_arc();
+                group.with_locked_inner(|inner| {
+                    inner.state = group::State::Terminated;
+                    if inner.fatal_error.is_none() {
+                        inner.fatal_error = Some(ENODEV);
+                    }
+                });
+                group.schedule_term();
+            }
+        }
+
+        // No runnable work remains. Release the usage reference so the
+        // unusable device is not pinned active.
+        self.pm_ref = None;
+
+        // No tick is armed once every group fails, so clear the coalescing
+        // state. Stale full-residency values would make a later submit skip
+        // its own tick, and no other tick source survives a dead device.
+        self.resched_target = None;
+        self.used_csg_slot_count = 0;
+        self.might_have_idle_groups = false;
+    }
+
     /// Requeues a group onto the idle or runnable list.
     pub(crate) fn requeue_group(&mut self, list_arc: ListArc<Group, 0>, is_idle: bool) {
         let group_arc: Arc<Group> = list_arc.clone_arc();

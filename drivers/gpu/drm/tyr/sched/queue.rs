@@ -1110,6 +1110,20 @@ impl Queue {
         self.job_queue.commit(prepared)
     }
 
+    /// Stops the pipeline from handing any further job to the
+    /// firmware and from failing one. Jobs keep resolving their
+    /// dependencies and pile up in front of the exec stage, and the
+    /// per-job deadline stops being evaluated until the unpark.
+    pub(crate) fn park(&self) {
+        self.job_queue.park();
+    }
+
+    /// Releases a park and rechecks the pipeline, so jobs that piled
+    /// up behind it are submitted without waiting for another event.
+    pub(crate) fn unpark(&self) {
+        self.job_queue.unpark();
+    }
+
     /// Cancels every job tracked by this queue and signals all
     /// remaining pending submit fences with `err`.
     ///

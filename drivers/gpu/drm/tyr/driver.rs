@@ -469,6 +469,12 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             return;
         };
 
+        // Skip while a reset owns the firmware interface. The reset worker
+        // reissues this work when the reset completes.
+        if tdev.reset.in_progress() {
+            return;
+        }
+
         let events = tdev.fw_events_take();
         if events == 0 {
             return;
