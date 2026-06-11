@@ -1008,7 +1008,7 @@ impl<'a> Tick<'a> {
                 if let Some(slot_data) = csg_slot_manager.slot_data(i) {
                     slot_data
                         .group
-                        .with_locked_inner(|inner| inner.mark_timedout());
+                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
                 }
             }
             return Err(e);
@@ -1041,7 +1041,7 @@ impl<'a> Tick<'a> {
                     };
                     slot_data
                         .group
-                        .with_locked_inner(|inner| inner.mark_timedout());
+                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
                     term_context.set_state(i, CsgExecutionState::Terminate);
                 }
             }
