@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::mem::offset_of;
+
 use kernel::{
     device::{
         Bound,
@@ -89,7 +91,7 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
 /// reader past them. Mirrors `copy_struct_from_user`. A larger user stride is
 /// accepted only if its trailing bytes are zero, otherwise the call is
 /// rejected with `E2BIG`.
-fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
+pub(crate) fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
     let mut buf = [0u8; 64];
     let mut remaining = len;
     while remaining > 0 {
@@ -330,18 +332,29 @@ impl TyrDrmFileData {
             return Self::vm_bind_async(ddev, reg_data, vmbind, file);
         }
 
-        let op_size = core::mem::size_of::<uapi::drm_panthor_vm_bind_op>();
-        let stride = vmbind.ops.stride as usize;
-        if stride < op_size {
-            return Err(EINVAL);
-        }
-
-        let count = vmbind.ops.count as usize;
         let vm = file
             .inner()
             .vm_pool()
             .get_vm(vmbind.vm_id as usize)
             .ok_or(EINVAL)?;
+
+        if vmbind.ops.count == 0 {
+            return Ok(0);
+        }
+
+        static_assert!(
+            size_of::<uapi::drm_panthor_vm_bind_op>()
+                == offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
+                    + size_of::<uapi::drm_panthor_obj_array>()
+        );
+        let min_size = offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
+            + size_of::<uapi::drm_panthor_obj_array>();
+        let stride = vmbind.ops.stride as usize;
+        if stride < min_size {
+            return Err(EINVAL);
+        }
+
+        let count = vmbind.ops.count as usize;
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(vmbind.ops.array as usize),
@@ -354,7 +367,7 @@ impl TyrDrmFileData {
         for i in 0..count {
             let res: Result = (|| {
                 let op: VmBindOp = reader.read()?;
-                read_padding_zero(&mut reader, stride - op_size)?;
+                read_padding_zero(&mut reader, stride - min_size)?;
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -362,7 +375,7 @@ impl TyrDrmFileData {
                         | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
                         as u32;
 
-                if op.0.syncs.count != 0 || op.0.syncs.array != 0 {
+                if op.0.syncs.count != 0 {
                     Err(EINVAL)?;
                 }
 
@@ -424,18 +437,24 @@ impl TyrDrmFileData {
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        let op_size = core::mem::size_of::<uapi::drm_panthor_vm_bind_op>();
-        let stride = vmbind.ops.stride as usize;
-        if stride < op_size {
-            return Err(EINVAL);
-        }
-
-        let count = vmbind.ops.count as usize;
         let vm = file
             .inner()
             .vm_pool()
             .get_vm(vmbind.vm_id as usize)
             .ok_or(EINVAL)?;
+
+        if vmbind.ops.count == 0 {
+            return Ok(0);
+        }
+
+        let min_size = offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
+            + size_of::<uapi::drm_panthor_obj_array>();
+        let stride = vmbind.ops.stride as usize;
+        if stride < min_size {
+            return Err(EINVAL);
+        }
+
+        let count = vmbind.ops.count as usize;
 
         if vm.is_unusable() {
             return Err(EINVAL);
@@ -460,17 +479,13 @@ impl TyrDrmFileData {
 
         for _ in 0..count {
             let op: VmBindOp = reader.read()?;
-            read_padding_zero(&mut reader, stride - op_size)?;
+            read_padding_zero(&mut reader, stride - min_size)?;
             let validated_bo = validate_bind_op(&op, file, &vm)?;
             let (job, syncs) =
                 op.capture(reg_data.pdev.as_ref(), &vm, true, validated_bo.clone())?;
 
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
             op_bos.push(validated_bo, GFP_KERNEL)?;
-        }
-
-        if op_bos.is_empty() {
-            return Ok(0);
         }
 
         ctx.collect_signal_ops()?;
