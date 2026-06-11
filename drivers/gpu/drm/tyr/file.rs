@@ -19,8 +19,13 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc, //
     },
+    task,
     time::arch_timer_get_rate,
     transmute::{
         AsBytes,
@@ -40,6 +45,7 @@ use crate::{
     },
     gem,
     heap,
+    mmap,
     regs::{
         gpu_control,
         join_u64,
@@ -154,6 +160,7 @@ pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
     heap_pools: heap::Pools,
+    user_mmio_offset: Atomic<u64>,
     tdev: ARef<TyrDrmDevice>,
 }
 
@@ -166,11 +173,18 @@ impl drm::file::DriverFile for TyrDrmFileData {
     fn open(dev: &drm::Device<Self::Driver>) -> Result<Pin<KBox<Self>>> {
         let tdev = ARef::from(dev);
 
+        let user_mmio_offset = if task::in_compat_syscall() {
+            uapi::DRM_PANTHOR_USER_MMIO_OFFSET_32BIT
+        } else {
+            mmap::DRM_PANTHOR_USER_MMIO_OFFSET
+        };
+
         KBox::try_pin_init(
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
                 group_pool: group::Pool::create()?,
                 heap_pools: heap::Pools::create()?,
+                user_mmio_offset: Atomic::new(user_mmio_offset),
                 tdev,
             }),
             GFP_KERNEL,
@@ -202,6 +216,10 @@ impl TyrDrmFileData {
 
     pub(crate) fn heap_pools(self: Pin<&Self>) -> &heap::Pools {
         &self.get_ref().heap_pools
+    }
+
+    pub(crate) fn user_mmio_offset(&self) -> u64 {
+        self.user_mmio_offset.load(Relaxed)
     }
 
     pub(crate) fn dev_query(
@@ -699,10 +717,18 @@ impl TyrDrmFileData {
 
     pub(crate) fn set_user_mmio_offset(
         _ddev: &TyrDrmDevice,
-        _args: &mut uapi::drm_panthor_set_user_mmio_offset,
-        _file: &TyrDrmFile,
+        args: &mut uapi::drm_panthor_set_user_mmio_offset,
+        file: &TyrDrmFile,
     ) -> Result<u32> {
-        Err(ENOTSUPP)
+        if args.offset != uapi::DRM_PANTHOR_USER_MMIO_OFFSET_32BIT
+            && args.offset != uapi::DRM_PANTHOR_USER_MMIO_OFFSET_64BIT
+        {
+            return Err(EINVAL);
+        }
+
+        file.inner().user_mmio_offset.store(args.offset, Relaxed);
+
+        Ok(0)
     }
 
     pub(crate) fn bo_sync(
