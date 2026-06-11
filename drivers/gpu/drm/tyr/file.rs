@@ -85,7 +85,7 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
 /// reader past them. Mirrors `copy_struct_from_user`: a larger user stride is
 /// accepted only if its trailing bytes are zero, otherwise the call is
 /// rejected with `E2BIG`.
-fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
+pub(crate) fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
     let mut buf = [0u8; 64];
     let mut remaining = len;
     while remaining > 0 {

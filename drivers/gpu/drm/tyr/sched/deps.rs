@@ -6,6 +6,8 @@
 //! the internal sync handle and operation vocabulary lives here instead of
 //! in the UAPI parsing layer.
 
+use core::mem::offset_of;
+
 use kernel::{
     alloc::KVec,
     dma_buf::dma_fence::{FenceChain, PublicDmaFence},
@@ -20,7 +22,13 @@ use kernel::{
     uapi,
 };
 
-use crate::{driver::TyrDrmDriver, file::TyrDrmFile};
+use crate::{
+    driver::TyrDrmDriver,
+    file::{
+        read_padding_zero,
+        TyrDrmFile, //
+    },
+};
 
 #[repr(transparent)]
 struct RawSyncOp(uapi::drm_panthor_sync_op);
@@ -209,18 +217,25 @@ pub(crate) fn append_syncops(
         return Ok(());
     }
 
-    if stride as usize != core::mem::size_of::<uapi::drm_panthor_sync_op>() {
-        return Err(ENOTSUPP);
+    static_assert!(
+        size_of::<uapi::drm_panthor_sync_op>()
+            == offset_of!(uapi::drm_panthor_sync_op, timeline_value) + size_of::<u64>()
+    );
+    let min_size = offset_of!(uapi::drm_panthor_sync_op, timeline_value) + size_of::<u64>();
+    let stride = stride as usize;
+    if stride < min_size {
+        return Err(EINVAL);
     }
 
     let mut reader = UserSlice::new(
         UserPtr::from_addr(array as usize),
-        stride as usize * count as usize,
+        stride.checked_mul(count as usize).ok_or(EINVAL)?,
     )
     .reader();
 
     for _ in 0..count {
         let sync: RawSyncOp = reader.read()?;
+        read_padding_zero(&mut reader, stride - min_size)?;
         syncops.push(SyncOp::try_from(&sync.0)?, GFP_KERNEL)?;
     }
 
