@@ -506,15 +506,15 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
     /// stops.
-    _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>>>,
+    pub(crate) job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>>>,
 
     /// MMU IRQ registration. Freed after `mmu`, so faults raised during teardown are still
     /// reported.
-    _mmu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>>>,
+    pub(crate) mmu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>>>,
 
     /// GPU IRQ registration. Freed after the job and MMU registrations, so the GPU fault
     /// handler outlives them.
-    _gpu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, GpuIrq>>>>,
+    pub(crate) gpu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, GpuIrq>>>>,
 
     /// Workqueue for work items that may signal DMA fences.
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
@@ -717,9 +717,9 @@ impl platform::Driver for TyrPlatformDriver {
                 pdev,
                 mmu,
                 fw: firmware,
-                _job_irq: job_irq,
-                _mmu_irq: mmu_irq,
-                _gpu_irq: gpu_irq,
+                job_irq,
+                mmu_irq,
+                gpu_irq,
                 wq,
                 sched_wq,
                 heap_wq,
