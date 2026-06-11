@@ -272,16 +272,13 @@ pub(crate) fn run_hw_reset(tdev: &TyrDrmDevice, dev: &Device, iomem: &Devres<IoM
     reset_result.and(reboot_result)
 }
 
-/// User-facing handle for scheduling resets.
-///
-/// Dropping the handle drains any queued or in-flight reset work to ensure a
-/// clean teardown before clocks and regulators are released.
-pub(crate) struct ResetHandle {
+/// Shared reset state, made up of the controller and its dedicated workqueue.
+struct Inner {
     controller: Arc<Controller>,
     wq: OwnedQueue,
 }
 
-impl Drop for ResetHandle {
+impl Drop for Inner {
     fn drop(&mut self) {
         // Block new reset scheduling before the queue drains, so a
         // queued-but-unstarted reset fails its claim instead of touching the
@@ -290,11 +287,26 @@ impl Drop for ResetHandle {
     }
 }
 
+/// User-facing handle for scheduling resets. Clones share one
+/// controller and workqueue.
+///
+/// `unbind()` drains the worker at platform unbind, before the clocks and
+/// regulators drop. Dropping the last clone then destroys the workqueue.
+#[derive(Clone)]
+pub(crate) struct ResetHandle {
+    inner: Arc<Inner>,
+}
+
 impl ResetHandle {
     pub(crate) fn new(pdev: ARef<platform::Device>, iomem: Arc<Devres<IoMem>>) -> Result<Self> {
         Ok(Self {
-            controller: Controller::new(pdev, iomem)?,
-            wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
+            inner: Arc::new(
+                Inner {
+                    controller: Controller::new(pdev, iomem)?,
+                    wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
+                },
+                GFP_KERNEL,
+            )?,
         })
     }
 
@@ -305,12 +317,12 @@ impl ResetHandle {
     /// stay pending across a whole active period, and the worker stops the
     /// scheduler itself after claiming the reset.
     pub(crate) fn in_progress(&self) -> bool {
-        self.controller.is_in_progress()
+        self.inner.controller.is_in_progress()
     }
 
     /// Waits for an in-flight reset worker to finish.
     pub(crate) fn flush(&self) {
-        let _ = workqueue::flush_work::<Controller, Controller, 0>(&self.controller);
+        let _ = workqueue::flush_work::<Controller, Controller, 0>(&self.inner.controller);
     }
 
     /// Cancels the reset worker at unbind.
@@ -321,7 +333,7 @@ impl ResetHandle {
     /// mapping. A work item enqueued by a racing `schedule` finds the
     /// slot empty and consumes the request without hardware access.
     pub(crate) fn unbind(&self) {
-        drop(self.controller.ddev.lock().take());
+        drop(self.inner.controller.ddev.lock().take());
         self.flush();
     }
 
@@ -332,12 +344,12 @@ impl ResetHandle {
     /// with a full firmware reload) and closes the cycle with
     /// `Self::complete_claimed`.
     pub(crate) fn claim_pending(&self) -> bool {
-        self.controller.claim_pending()
+        self.inner.controller.claim_pending()
     }
 
     /// Completes a reset cycle claimed with `Self::claim_pending`.
     pub(crate) fn complete_claimed(&self) {
-        self.controller.finish_reset()
+        self.inner.controller.finish_reset()
     }
 
     /// Publishes the DRM device reference the reset worker resolves.
@@ -345,7 +357,7 @@ impl ResetHandle {
     /// Called once probe has created the device. Devres revokes the
     /// reference at unbind.
     pub(crate) fn set_device(&self, ddev: Devres<ARef<TyrDrmDevice>>) {
-        *self.controller.ddev.lock() = Some(ddev);
+        *self.inner.controller.ddev.lock() = Some(ddev);
     }
 
     /// Opens the reset path once probe has brought the device up.
@@ -353,8 +365,8 @@ impl ResetHandle {
     /// A request recorded during probe has no worker queued for it, so
     /// this queues one.
     pub(crate) fn set_ready(&self) {
-        if self.controller.set_ready() {
-            let _ = self.wq.enqueue(self.controller.clone());
+        if self.inner.controller.set_ready() {
+            let _ = self.inner.wq.enqueue(self.inner.controller.clone());
         }
     }
 
@@ -362,14 +374,14 @@ impl ResetHandle {
     ///
     /// A reset that is already pending or in progress absorbs new requests.
     pub(crate) fn schedule(&self) {
-        let Some(tdev) = self.controller.device() else {
+        let Some(tdev) = self.inner.controller.device() else {
             return;
         };
 
         // Record before the enqueue below so a worker already queued but not
         // yet started observes and claims the request. A duplicate enqueue is
         // rejected harmlessly.
-        if !self.controller.record_request() {
+        if !self.inner.controller.record_request() {
             // Probe is still bringing the device up, so `set_ready` runs the
             // request once it is done.
             return;
@@ -383,6 +395,6 @@ impl ResetHandle {
 
         // Queue a worker even when a request is already pending, since a
         // request recorded while the device was inactive has no worker.
-        let _ = self.wq.enqueue(self.controller.clone());
+        let _ = self.inner.wq.enqueue(self.inner.controller.clone());
     }
 }

@@ -49,6 +49,7 @@ use crate::{
         },
         MAX_AS, //
     },
+    reset::ResetHandle,
     slot::SlotManager, //
 };
 
@@ -89,11 +90,12 @@ impl Mmu {
         pdev: &platform::Device,
         iomem: ArcBorrow<'_, Devres<IoMem>>,
         gpu_info: &GpuInfo,
+        reset: ResetHandle,
     ) -> Result<Arc<Mmu>> {
         let present = AS_PRESENT::from_raw(gpu_info.as_present).present().get();
         let slot_count: usize = present.count_ones().try_into()?;
 
-        let as_manager = AddressSpaceManager::new(pdev, iomem, present)?;
+        let as_manager = AddressSpaceManager::new(pdev, iomem, present, reset)?;
         let mmu_init = try_pin_init!(Self{
             as_slot_count: slot_count,
             as_manager <- new_mutex!(SlotManager::new(as_manager, slot_count)?),
