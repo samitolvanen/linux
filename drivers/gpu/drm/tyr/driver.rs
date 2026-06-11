@@ -11,6 +11,7 @@ use kernel::{
         Clk,
         OptionalClk, //
     },
+    devfreq::Registration as DevfreqRegistration,
     device::{
         Bound,
         Core,
@@ -70,6 +71,7 @@ use kernel::{
 use crate::{
     devfreq::{
         self,
+        TyrDevfreqCallbacks,
         TyrDevfreqData, //
     },
     file::TyrDrmFileData,
@@ -147,6 +149,9 @@ impl core::ops::Deref for CleanupQueue {
 }
 
 pub(crate) struct TyrPlatformDriverData {
+    /// Devfreq registration, `None` on devices without an OPP table.
+    devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
+
     _device: ARef<TyrDrmDevice>,
 }
 
@@ -625,11 +630,8 @@ impl platform::Driver for TyrPlatformDriverData {
         devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
         job_irq_enable(io);
 
-        // devres unwinds in reverse order, so the governor stops before
-        // the supplies and clocks registered earlier are released.
-        if let Some(registration) = devfreq::init(&tdev, pdev.as_ref())? {
-            devres::register(pdev.as_ref(), registration, GFP_KERNEL)?;
-        }
+        let devfreq_registration = devfreq::init(&tdev, pdev.as_ref())?;
+        let devfreq_registration = Arc::pin_init(new_mutex!(devfreq_registration), GFP_KERNEL)?;
 
         tdev.fw.boot()?;
         tdev.fw
@@ -643,7 +645,14 @@ impl platform::Driver for TyrPlatformDriverData {
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
-        Ok(TyrPlatformDriverData { _device: tdev })
+        Ok(TyrPlatformDriverData {
+            devfreq_registration,
+            _device: tdev,
+        })
+    }
+
+    fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
+        drop(this.devfreq_registration.lock().take());
     }
 }
 
