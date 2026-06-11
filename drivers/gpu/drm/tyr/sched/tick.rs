@@ -998,9 +998,21 @@ impl<'a> Tick<'a> {
 
         self.stage_evictions(data, decision.keep_mask, &mut context);
 
-        self.sched
-            .apply_csg_updates(data, &mut context)
-            .inspect_err(|_| pr_err!("apply_csg_updates (halt) failed\n"))?;
+        if let Err(e) = self.sched.apply_csg_updates(data, &mut context) {
+            pr_err!("apply_csg_updates (halt) failed\n");
+            let csg_slot_manager = data.csg_slot_manager.lock();
+            for i in 0..MAX_CSGS {
+                if !context.timedout_mask.contains(i) {
+                    continue;
+                }
+                if let Some(slot_data) = csg_slot_manager.slot_data(i) {
+                    slot_data
+                        .group
+                        .with_locked_inner(|inner| inner.mark_timedout());
+                }
+            }
+            return Err(e);
+        }
 
         self.unbind_evicted_groups(data, decision.keep_mask, &mut context)
     }
@@ -1027,11 +1039,9 @@ impl<'a> Tick<'a> {
                     let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                         continue;
                     };
-                    slot_data.group.with_locked_inner(|inner| {
-                        if inner.fatal_error.is_none() {
-                            inner.fatal_error = Some(ETIMEDOUT);
-                        }
-                    });
+                    slot_data
+                        .group
+                        .with_locked_inner(|inner| inner.mark_timedout());
                     term_context.set_state(i, CsgExecutionState::Terminate);
                 }
             }

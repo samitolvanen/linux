@@ -213,11 +213,7 @@ impl Scheduler {
             // The group made no progress within the `GLB_PROGRESS_TIMER` timeout.
             pr_warn!("CSG slot {} progress timeout\n", csg_id);
             if let Some(group) = &group {
-                group.with_locked_inner(|inner| {
-                    if inner.fatal_error.is_none() {
-                        inner.fatal_error = Some(ETIMEDOUT);
-                    }
-                });
+                group.with_locked_inner(|inner| inner.mark_timedout());
             }
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
