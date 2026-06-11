@@ -887,11 +887,9 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
                 "Queue job {} timed out\n",
                 ctx.counter
             );
-            ctx.job.group.with_locked_inner(|inner| {
-                if inner.fatal_error.is_none() {
-                    inner.fatal_error = Some(ETIMEDOUT);
-                }
-            });
+            ctx.job
+                .group
+                .with_locked_inner(|inner| inner.mark_timedout());
             ctx.job.group.detach_and_terminate();
             if let Some(done_seqno) = ctx.job.done_seqno() {
                 self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));

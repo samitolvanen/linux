@@ -152,6 +152,9 @@ pub(crate) struct GroupInner {
     idle_queues: u32,
     fatal_queues: u32,
     pub(crate) fatal_error: Option<Error>,
+    /// Set when a queue job or the CSG progress timer times out, or when the
+    /// group's CSG fails to halt for a reset or power-down.
+    pub(crate) timedout: bool,
     // Cached from Group::queues.len(). GroupInner has no borrow of Group.
     queue_count: usize,
     /// Set once `Group::schedule_term` has enqueued `term_work`. Latches
@@ -161,12 +164,21 @@ pub(crate) struct GroupInner {
 }
 
 impl GroupInner {
-    /// Returns false if the group is terminated, in an unknown state, or
-    /// has a fatal error recorded.
+    /// Returns false if the group is terminated, in an unknown state, timed
+    /// out, or has a fatal error recorded.
     pub(crate) fn can_run(&self) -> bool {
         self.state != State::Terminated
             && self.state != State::Unknown
             && self.fatal_error.is_none()
+            && !self.timedout
+    }
+
+    /// Records that a timeout forced the group off the GPU.
+    pub(crate) fn mark_timedout(&mut self) {
+        self.timedout = true;
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(ETIMEDOUT);
+        }
     }
 
     pub(crate) fn blocked_queues(&self) -> u32 {
@@ -450,6 +462,7 @@ impl Group {
                     idle_queues: u32::MAX >> (u32::BITS - queue_count as u32),
                     fatal_queues: 0,
                     fatal_error: None,
+                    timedout: false,
                     queue_count,
                     term_scheduled: false,
                 }),
@@ -493,10 +506,6 @@ impl Group {
     {
         let mut inner = self.inner.lock();
         f(&mut inner)
-    }
-
-    pub(crate) fn fatal_queues(&self) -> u32 {
-        self.inner.lock().fatal_queues()
     }
 
     pub(crate) fn state(&self) -> State {
@@ -651,13 +660,23 @@ impl Group {
         }
     }
 
-    /// Cancels every queue in the group with `err`.
+    /// Cancels every queue in the group.
     ///
     /// Writes the per-queue terminator syncobj with `status = !0` and
     /// the highest seqno so GPU-side consumers observe the queue as
     /// done.
-    pub(crate) fn cancel_queues(self: &Arc<Self>, err: Error) {
+    pub(crate) fn cancel_queues(self: &Arc<Self>) {
+        let (fatal_queues, timedout) =
+            self.with_locked_inner(|inner| (inner.fatal_queues(), inner.timedout));
+
         for (queue_idx, queue) in self.queues.iter().enumerate() {
+            let err = if fatal_queues & (1 << queue_idx) != 0 {
+                EINVAL
+            } else if timedout {
+                ETIMEDOUT
+            } else {
+                ECANCELED
+            };
             queue.cancel(err);
 
             let seqno = queue.next_seqno();
@@ -995,13 +1014,7 @@ impl DmaFenceWorkItem<{ work_id::TERM }> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
-        // Use the error captured at eviction time (fatal fault, user
-        // destroy, or tick timeout). Fall back to ECANCELED if none
-        // was recorded.
-        let err = this
-            .with_locked_inner(|inner| inner.fatal_error)
-            .unwrap_or(ECANCELED);
-        this.cancel_queues(err);
+        this.cancel_queues();
 
         // The `term_scheduled` latch makes this the only enqueue of
         // `release_work`, so it cannot find the item pending.
@@ -1162,12 +1175,20 @@ impl Pool {
             .group(groupgetstate.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        groupgetstate.state = 0;
-        groupgetstate.fatal_queues = group.fatal_queues();
+        let (timedout, fatal_queues) =
+            group.with_locked_inner(|inner| (inner.timedout, inner.fatal_queues()));
 
-        if groupgetstate.fatal_queues != 0 {
+        *groupgetstate = Default::default();
+
+        if timedout {
+            groupgetstate.state |=
+                uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_TIMEDOUT;
+        }
+
+        if fatal_queues != 0 {
             groupgetstate.state |=
                 uapi::drm_panthor_group_state_flags_DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+            groupgetstate.fatal_queues = fatal_queues;
         }
 
         Ok(())

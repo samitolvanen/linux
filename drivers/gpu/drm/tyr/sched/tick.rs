@@ -1136,11 +1136,9 @@ impl<'a> Tick<'a> {
                     let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                         continue;
                     };
-                    slot_data.group.with_locked_inner(|inner| {
-                        if inner.fatal_error.is_none() {
-                            inner.fatal_error = Some(ETIMEDOUT);
-                        }
-                    });
+                    slot_data
+                        .group
+                        .with_locked_inner(|inner| inner.mark_timedout());
                     term_context.set_state(i, CsgExecutionState::Terminate);
                 }
             }
