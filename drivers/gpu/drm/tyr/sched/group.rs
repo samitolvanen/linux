@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::mem::offset_of;
+
 use kernel::{
     capability::{
         capable,
@@ -47,7 +49,10 @@ use crate::{
         TyrDrmDeviceData,
         TyrDrmRegistrationData, //
     },
-    file::TyrDrmFile,
+    file::{
+        read_padding_zero,
+        TyrDrmFile, //
+    },
     fw::{
         global::csg::Priority,
         CsBlockedReason,
@@ -1002,15 +1007,21 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        if groupcreate.queues.stride as usize
-            != core::mem::size_of::<uapi::drm_panthor_queue_create>()
-        {
-            return Err(ENOTSUPP);
+        static_assert!(
+            size_of::<uapi::drm_panthor_queue_create>()
+                == offset_of!(uapi::drm_panthor_queue_create, ringbuf_size) + size_of::<u32>()
+        );
+        let min_size = offset_of!(uapi::drm_panthor_queue_create, ringbuf_size) + size_of::<u32>();
+        let stride = groupcreate.queues.stride as usize;
+        if stride < min_size {
+            return Err(EINVAL);
         }
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(groupcreate.queues.array as usize),
-            groupcreate.queues.stride as usize * groupcreate.queues.count as usize,
+            stride
+                .checked_mul(groupcreate.queues.count as usize)
+                .ok_or(EINVAL)?,
         )
         .reader();
 
@@ -1018,6 +1029,7 @@ impl Pool {
 
         for _ in 0..groupcreate.queues.count {
             let queue: QueueCreate = reader.read()?;
+            read_padding_zero(&mut reader, stride - min_size)?;
             queue.validate()?;
             queue_args.push(queue, GFP_KERNEL)?;
         }
