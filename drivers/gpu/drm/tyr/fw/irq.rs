@@ -63,6 +63,12 @@ impl JobIrqState {
         self.event_wait.clone()
     }
 
+    /// Re-arms the readiness latch so `wait_ready` observes the next
+    /// firmware boot. Call before starting the MCU.
+    pub(crate) fn clear_ready(&self) {
+        self.fw_ready.store(false, Ordering::Release);
+    }
+
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
         self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
             if self.fw_ready.load(Ordering::Acquire) {
@@ -96,6 +102,11 @@ pub(crate) fn job_irq_enable(io: &IoMem) {
             .with_const_csg::<CSG_IRQ_MASK>()
             .with_glb(true),
     );
+}
+
+/// Masks all job IRQ sources.
+pub(crate) fn job_irq_disable(io: &IoMem) {
+    io.write_reg(JOB_IRQ_MASK::zeroed());
 }
 
 pub(crate) fn job_irq_init<'a>(

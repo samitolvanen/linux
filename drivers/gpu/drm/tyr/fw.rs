@@ -376,24 +376,128 @@ impl Firmware {
         Ok(firmware)
     }
 
-    pub(crate) fn boot(&self) -> Result {
-        // SAFETY: Boot is currently only called in the probe path, so we're sure we have a bound
-        // device.
-        let dev = unsafe { self.pdev.as_ref().as_bound() };
-        let io = (self.iomem).access(dev)?;
-        io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
+    /// Polls `MCU_STATUS` until it reaches `target` or the timeout elapses.
+    ///
+    /// The MMIO guard is re-acquired for each read so it is never held
+    /// across the poll sleep, which would sleep under the RCU read lock.
+    fn wait_for_mcu_status(
+        iomem: &Devres<IoMem>,
+        target: McuStatus,
+        interval: time::Delta,
+        timeout: time::Delta,
+    ) -> Result {
+        poll::read_poll_timeout(
+            || {
+                iomem
+                    .try_access()
+                    .ok_or(ENODEV)
+                    .map(|io| io.read(MCU_STATUS))
+            },
+            |status| status.value() == target,
+            interval,
+            timeout,
+        )
+        .map(|_| ())
+    }
 
-        if let Err(e) = poll::read_poll_timeout(
-            || Ok(io.read(MCU_STATUS)),
-            |status| status.value() == McuStatus::Enabled,
+    pub(crate) fn boot(&self) -> Result {
+        {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
+            io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
+        }
+
+        if let Err(e) = Self::wait_for_mcu_status(
+            &self.iomem,
+            McuStatus::Enabled,
             time::Delta::from_millis(1),
             time::Delta::from_millis(100),
         ) {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
             let status = io.read(MCU_STATUS);
             pr_err!("MCU failed to boot, status: {:?}", status.value());
             return Err(e);
         }
         Ok(())
+    }
+
+    fn halt_mcu(&self) -> Result {
+        self.global_iface.halt_mcu()?;
+
+        Self::wait_for_mcu_status(
+            &self.iomem,
+            McuStatus::Halt,
+            time::Delta::from_micros(10),
+            time::Delta::from_millis(1000),
+        )
+    }
+
+    fn stop_mcu(&self) {
+        {
+            let Some(io) = self.iomem.try_access() else {
+                return;
+            };
+            io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Disable));
+        }
+
+        if Self::wait_for_mcu_status(
+            &self.iomem,
+            McuStatus::Disabled,
+            time::Delta::from_micros(10),
+            time::Delta::from_millis(100),
+        )
+        .is_err()
+        {
+            dev_err!(self.pdev.as_ref(), "Failed to stop MCU\n");
+        }
+    }
+
+    /// Halts and stops the MCU for runtime suspend, releasing the firmware AS
+    /// slot for resume to reprogram.
+    #[expect(dead_code)]
+    pub(crate) fn suspend(&self) {
+        if let Err(e) = self.halt_mcu() {
+            dev_warn!(
+                self.pdev.as_ref(),
+                "Failed to cleanly halt the MCU: {:?}\n",
+                e
+            );
+        }
+
+        if let Some(io) = self.iomem.try_access() {
+            irq::job_irq_disable(&io);
+        }
+
+        self.stop_mcu();
+        self.global_iface.suspend();
+
+        let _ = self.vm.deactivate();
+    }
+
+    /// Boots the MCU from the resident firmware sections after a runtime
+    /// suspend.
+    ///
+    /// The sections live in system RAM and survive the suspend, so they are
+    /// not reloaded.
+    #[expect(dead_code)]
+    pub(crate) fn resume(&self, tdev: &TyrDrmDevice) -> Result {
+        self.vm.activate()?;
+        self.irq_state.clear_ready();
+
+        {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
+            irq::job_irq_enable(&io);
+        }
+        self.global_iface.set_mcu_active()?;
+
+        self.boot()?;
+        self.wait_ready(1000).inspect_err(|_| {
+            dev_err!(
+                self.pdev.as_ref(),
+                "Timed out waiting for firmware to be ready.\n"
+            )
+        })?;
+
+        self.reenable_global_interface(tdev)
     }
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.
@@ -416,6 +520,12 @@ impl Firmware {
     pub(crate) fn enable_global_interface(&self, tdev: &TyrDrmDevice) -> Result {
         let core_clk_rate = tdev.with_locked_core_clk(|core_clk| core_clk.rate().as_hz() as u64);
         self.global_iface.enable(core_clk_rate)
+    }
+
+    /// Re-enables the global interface after a runtime resume.
+    fn reenable_global_interface(&self, tdev: &TyrDrmDevice) -> Result {
+        let core_clk_rate = tdev.with_locked_core_clk(|core_clk| core_clk.rate().as_hz() as u64);
+        self.global_iface.reenable(core_clk_rate)
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
