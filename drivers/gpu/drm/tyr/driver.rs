@@ -18,7 +18,6 @@ use kernel::{
         Core,
         Device, //
     },
-    devres,
     devres::Devres,
     dma::{
         Device as DmaDevice,
@@ -41,6 +40,7 @@ use kernel::{
         poll,
         Io, //
     },
+    irq::ThreadedRegistration,
     new_mutex,
     of,
     opp::ConfigToken,
@@ -88,17 +88,23 @@ use crate::{
     fw::{
         irq::{
             job_irq_enable,
-            job_irq_init, //
+            job_irq_init,
+            JobIrq, //
         },
         Firmware, //
     },
     gem::BoData,
     gpu,
-    gpu::GpuInfo,
+    gpu::{
+        irq::GpuIrq,
+        GpuInfo, //
+    },
+    irq::TyrIrq,
     mmu::{
         irq::{
             mmu_irq_enable,
-            mmu_irq_init, //
+            mmu_irq_init,
+            MmuIrq, //
         },
         Mmu, //
     },
@@ -170,6 +176,15 @@ pub(crate) struct TyrPlatformDriverData {
     /// runtime PM on unbind. Held only for its `Drop`.
     #[expect(dead_code)]
     pm: pm::Registration<TyrPmOps>,
+
+    /// IRQ registrations, kept reachable so the runtime-suspend path
+    /// can synchronize in-flight handlers before gating the clocks.
+    #[expect(dead_code)]
+    pub(crate) gpu_irq: Devres<ThreadedRegistration<TyrIrq<GpuIrq>>>,
+    #[expect(dead_code)]
+    pub(crate) mmu_irq: Devres<ThreadedRegistration<TyrIrq<MmuIrq>>>,
+    #[expect(dead_code)]
+    pub(crate) job_irq: Devres<ThreadedRegistration<TyrIrq<JobIrq>>>,
 
     #[expect(dead_code)]
     pub(crate) device: ARef<TyrDrmDevice>,
@@ -659,16 +674,22 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let io = tdev.iomem.access(pdev.as_ref())?;
 
-        let gpu_irq = gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
-        devres::register(pdev.as_ref(), gpu_irq, GFP_KERNEL)?;
+        let gpu_irq = Devres::new(
+            pdev.as_ref(),
+            gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+        )?;
         gpu::irq::gpu_irq_enable(io);
 
-        let mmu_irq = mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
-        devres::register(pdev.as_ref(), mmu_irq, GFP_KERNEL)?;
+        let mmu_irq = Devres::new(
+            pdev.as_ref(),
+            mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+        )?;
         mmu_irq_enable(io);
 
-        let job_irq = job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?;
-        devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
+        let job_irq = Devres::new(
+            pdev.as_ref(),
+            job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?,
+        )?;
         job_irq_enable(io);
 
         let devfreq_registration = devfreq::init(&tdev, pdev.as_ref())?;
@@ -708,6 +729,9 @@ impl platform::Driver for TyrPlatformDriverData {
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
+            gpu_irq,
+            mmu_irq,
+            job_irq,
             device: tdev,
         })
     }
