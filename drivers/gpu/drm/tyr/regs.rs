@@ -504,6 +504,16 @@ pub(crate) mod gpu_control {
             31:24   hash_function;
         }
 
+        /// GPU functionality bits. Read-only constant. Introduced in
+        /// arch 11.x.
+        pub(crate) GPU_FEATURES_LO(u32) @ 0x60 {
+            31:0    features;
+        }
+
+        pub(crate) GPU_FEATURES_HI(u32) @ 0x64 {
+            31:0    features;
+        }
+
         /// Global time stamp offset.
         pub(crate) TIMESTAMP_OFFSET_LO(u32) @ 0x88 {
             31:0    offset;
