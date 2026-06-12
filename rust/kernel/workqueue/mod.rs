@@ -577,6 +577,24 @@ pub trait WorkItem<const ID: u64 = 0> {
     fn run(this: Self::Pointer);
 }
 
+/// Work item pointers that support cancellation.
+///
+/// # Safety
+///
+/// Implementers must ensure that `from_raw_work` rebuilds the exact ownership transferred
+/// by a successful [`RawWorkItem::__enqueue`] call.
+pub unsafe trait SupportsCancel<const ID: u64>: WorkItemPointer<ID> + Sized {
+    /// Rebuild this work item's pointer from its embedded `work_struct`.
+    ///
+    /// # Safety
+    ///
+    /// The provided `work_struct` pointer must originate from a previous call to
+    /// [`RawWorkItem::__enqueue`] where the `queue_work_on` closure returned true,
+    /// ownership of the enqueued work item must already have been transferred back
+    /// from the workqueue and the pointer must still be valid.
+    unsafe fn from_raw_work(ptr: *mut bindings::work_struct) -> Self;
+}
+
 /// Links for a work item.
 ///
 /// This struct contains a function pointer to the [`run`] function from the [`WorkItemPointer`]
@@ -658,6 +676,30 @@ impl<T: ?Sized, const ID: u64> Work<T, ID> {
         // SAFETY: A `Work` only exists initialized, through `Work::new`, and `&self` keeps the
         // embedded `work_struct` alive for the duration of the call.
         unsafe { bindings::flush_work(self.work.get()) }
+    }
+
+    /// Cancels this work item if it is pending and waits for any running execution to finish.
+    ///
+    /// On return, the work item is guaranteed to not be pending or executing as long as there are
+    /// no racing re-enqueues.
+    ///
+    /// This should be called from a sleepable context if the work was last queued on a non-BH
+    /// workqueue.
+    #[inline]
+    pub fn cancel_sync(&self) -> Option<T::Pointer>
+    where
+        T: WorkItem<ID>,
+        T::Pointer: SupportsCancel<ID>,
+    {
+        let ptr = self.work.get();
+        // SAFETY: `ptr` is a valid embedded `work_struct`.
+        if unsafe { bindings::cancel_work_sync(ptr) } {
+            // SAFETY: A `true` return means the work was pending and got canceled, so the queued
+            // ownership transfer performed by `__enqueue` is reclaimed here.
+            Some(unsafe { T::Pointer::from_raw_work(ptr) })
+        } else {
+            None
+        }
     }
 }
 
@@ -847,6 +889,32 @@ impl<T: ?Sized, const ID: u64> DelayedWork<T, ID> {
         // CAST: Work and work_struct have compatible layouts.
         wrk.cast()
     }
+
+    /// Cancels this delayed work item if it is pending and waits for any running execution to
+    /// finish.
+    ///
+    /// On return, the work item is guaranteed to not be pending or executing as long as there are
+    /// no racing re-enqueues.
+    ///
+    /// This should be called from a sleepable context if the work was last queued on a non-BH
+    /// workqueue.
+    #[inline]
+    pub fn cancel_sync(&self) -> Option<T::Pointer>
+    where
+        T: WorkItem<ID>,
+        T::Pointer: SupportsCancel<ID>,
+    {
+        let ptr = self.dwork.get();
+
+        // SAFETY: `ptr` is a valid embedded `delayed_work`.
+        if unsafe { bindings::cancel_delayed_work_sync(ptr) } {
+            // SAFETY: A `true` return means the work was pending and got canceled, so the queued
+            // ownership transfer performed by `__enqueue` is reclaimed here.
+            Some(unsafe { T::Pointer::from_raw_work(&raw mut (*ptr).work) })
+        } else {
+            None
+        }
+    }
 }
 
 /// Declares that a type contains a [`DelayedWork<T, ID>`].
@@ -993,6 +1061,24 @@ where
     }
 }
 
+// SAFETY: `from_raw_work()` reconstructs exactly the `Arc<T>` ownership previously transferred by
+// `Arc::into_raw()` in `RawWorkItem::__enqueue`, using the same `Work<T, ID>` field selected by
+// `HasWork<T, ID>`.
+unsafe impl<T, const ID: u64> SupportsCancel<ID> for Arc<T>
+where
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+    unsafe fn from_raw_work(ptr: *mut bindings::work_struct) -> Self {
+        // The `__enqueue` method always uses a `work_struct` stored in a `Work<T, ID>`.
+        let ptr = ptr.cast::<Work<T, ID>>();
+        // SAFETY: This computes the pointer that `__enqueue` got from `Arc::into_raw`.
+        let ptr = unsafe { T::work_container_of(ptr) };
+        // SAFETY: This pointer comes from `Arc::into_raw` and we've been given back ownership.
+        unsafe { Arc::from_raw(ptr) }
+    }
+}
+
 // SAFETY: By the safety requirements of `HasDelayedWork`, the `work_struct` returned by methods in
 // `HasWork` provides a `work_struct` that is the `work` field of a `delayed_work`, and the rest of
 // the `delayed_work` has the same access rules as its `work` field.
@@ -1132,6 +1218,33 @@ where
             // SAFETY: The work queue has not taken ownership of the pointer.
             Err(unsafe { ARef::from_raw(ptr) })
         }
+    }
+}
+
+// SAFETY: `from_raw_work()` reconstructs exactly the `ARef<T>` ownership previously transferred by
+// `ARef::into_raw()` in `RawWorkItem::__enqueue`, using the same `Work<T, ID>` field selected by
+// `HasWork<T, ID>`.
+unsafe impl<T, const ID: u64> SupportsCancel<ID> for ARef<T>
+where
+    T: AlwaysRefCounted,
+    T: WorkItem<ID, Pointer = Self>,
+    T: HasWork<T, ID>,
+{
+    unsafe fn from_raw_work(ptr: *mut bindings::work_struct) -> Self {
+        // The `__enqueue` method always uses a `work_struct` stored in a `Work<T, ID>`.
+        let ptr = ptr.cast::<Work<T, ID>>();
+
+        // SAFETY: This computes the pointer that `__enqueue` got from
+        // `ARef::into_raw`.
+        let ptr = unsafe { T::work_container_of(ptr) };
+
+        // SAFETY: The safety contract of `work_container_of` ensures that it
+        // returns a valid non-null pointer.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+
+        // SAFETY: This pointer comes from `ARef::into_raw` and we've been given
+        // back ownership.
+        unsafe { ARef::from_raw(ptr) }
     }
 }
 
