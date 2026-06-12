@@ -65,6 +65,7 @@ use crate::{
         TyrDrmDevice, //
     },
     gpu,
+    mmu,
     sched::tick, //
 };
 
@@ -255,11 +256,14 @@ impl Controller {
 /// failed.
 pub(crate) fn run_hw_reset(tdev: &TyrDrmDevice, dev: &Device, iomem: &Devres<IoMem>) -> Result {
     tdev.fw.pre_reset();
+    mmu::pre_reset(tdev, iomem);
 
     let reset_result = gpu::reset(dev, iomem);
     if let Err(e) = &reset_result {
         dev_err!(dev, "GPU reset failed: {:?}\n", e);
     }
+
+    mmu::post_reset(tdev, iomem);
 
     let reboot_result = tdev.fw.post_reset(tdev);
     if let Err(e) = &reboot_result {

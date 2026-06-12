@@ -31,13 +31,10 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
+        TyrDrmDeviceData,
         TyrPlatformDriverData, //
     },
     gpu::GpuInfo,
-    irq::{
-        clear_suspended,
-        quiesce, //
-    },
     mmu::address_space::{
         AddressSpaceManager,
         VmAsData, //
@@ -204,23 +201,52 @@ impl Mmu {
     }
 }
 
+/// Stops the MMU for a GPU reset.
+///
+/// Only the MMU IRQ is suspended. No AS commands are issued. The reset
+/// may have been scheduled because an AS command or cache flush is
+/// stuck.
+pub(crate) fn pre_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
+    tdev.mmu_irq.reset_suspend(iomem, irq::mmu_irq_disable);
+}
+
+/// Restores the MMU after a GPU reset.
+///
+/// The reset left every AS slot unprogrammed, so every recorded
+/// binding is released and the next activation reprograms the slot.
+/// The MMU IRQ is then re-enabled with a full mask rewrite.
+pub(crate) fn post_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
+    {
+        let mut as_manager = tdev.mmu.as_manager.lock();
+        for as_idx in 0..tdev.mmu.as_slot_count {
+            // Clone the VM here because slot_data borrows as_manager and
+            // deactivate_vm takes &mut self.
+            let Some(vm) = as_manager.slot_data(as_idx).cloned() else {
+                continue;
+            };
+            if let Err(e) = as_manager.deactivate_vm(&vm) {
+                pr_err!("post_reset: releasing AS slot {} failed: {:?}\n", as_idx, e);
+            }
+        }
+    }
+
+    tdev.mmu_irq.reset_resume(iomem, irq::mmu_irq_enable);
+}
+
 /// Releases the resident AS slots and stops the MMU IRQ for runtime
 /// suspend.
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
+    let bound = dev.as_ref();
     let tdev = &data.device;
     tdev.mmu.suspend();
-    quiesce(
-        dev.as_ref(),
-        &data.mmu_irq,
-        &tdev.iomem,
-        irq::mmu_irq_disable,
-    );
+    tdev.mmu_irq
+        .quiesce(bound, &tdev.iomem, irq::mmu_irq_disable);
 }
 
 /// Re-enables the MMU IRQ for runtime resume.
 pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
     let io = data.device.iomem.access(dev.as_ref())?;
-    clear_suspended(dev.as_ref(), &data.mmu_irq);
+    data.device.mmu_irq.clear_suspended();
     irq::mmu_irq_enable(io);
     Ok(())
 }

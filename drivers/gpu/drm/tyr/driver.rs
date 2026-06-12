@@ -88,7 +88,10 @@ use crate::{
         irq::GpuIrq,
         GpuInfo, //
     },
-    irq::TyrIrq,
+    irq::{
+        IrqSlot,
+        TyrIrq, //
+    },
     mmap,
     mmu::{
         irq::{
@@ -171,7 +174,6 @@ pub(crate) struct TyrPlatformDriverData {
     /// IRQ registrations, kept reachable so the runtime-suspend path
     /// can synchronize in-flight handlers before gating the clocks.
     pub(crate) gpu_irq: Devres<ThreadedRegistration<TyrIrq<GpuIrq>>>,
-    pub(crate) mmu_irq: Devres<ThreadedRegistration<TyrIrq<MmuIrq>>>,
     pub(crate) job_irq: Devres<ThreadedRegistration<TyrIrq<JobIrq>>>,
 
     pub(crate) device: ARef<TyrDrmDevice>,
@@ -186,6 +188,10 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) pdev: ARef<platform::Device>,
 
     pub(crate) mmu: Arc<Mmu>,
+
+    /// MMU IRQ registration slot, set during probe and revoked by devres at unbind.
+    #[pin]
+    pub(crate) mmu_irq: IrqSlot<MmuIrq>,
 
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
@@ -639,6 +645,7 @@ impl platform::Driver for TyrPlatformDriverData {
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
                 mmu,
+                mmu_irq <- IrqSlot::new(),
                 iomem: iomem.clone(),
                 mmio_phys_addr,
                 coherent,
@@ -695,10 +702,11 @@ impl platform::Driver for TyrPlatformDriverData {
         )?;
         gpu::irq::gpu_irq_enable(io);
 
-        let mmu_irq = Devres::new(
-            pdev.as_ref(),
+        let mmu_irq = Arc::pin_init(
             mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+            GFP_KERNEL,
         )?;
+        tdev.mmu_irq.publish(Devres::new(pdev.as_ref(), mmu_irq)?);
         mmu_irq_enable(io);
 
         let job_irq = Devres::new(
@@ -749,7 +757,6 @@ impl platform::Driver for TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
             gpu_irq,
-            mmu_irq,
             job_irq,
             device: tdev,
         })
