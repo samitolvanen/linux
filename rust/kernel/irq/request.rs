@@ -64,9 +64,11 @@ struct RegistrationInner {
 }
 
 impl RegistrationInner {
-    fn synchronize(&self) {
-        // SAFETY: safe as per the invariants of `RegistrationInner`
-        unsafe { bindings::synchronize_irq(self.irq) };
+    fn synchronize(irq: u32) {
+        // SAFETY: `irq` came from a `RegistrationInner`, so it is a valid IRQ
+        // number. synchronize_irq() looks the descriptor up itself and is safe
+        // to call even after the registration has been freed.
+        unsafe { bindings::synchronize_irq(irq) };
     }
 }
 
@@ -244,15 +246,14 @@ impl<T: Handler> Registration<T> {
     ///
     /// This will attempt to access the inner [`Devres`] container.
     pub fn try_synchronize(&self) -> Result {
-        let inner = self.inner.try_access().ok_or(ENODEV)?;
-        inner.synchronize();
+        let irq = self.inner.try_access().ok_or(ENODEV)?.irq;
+        RegistrationInner::synchronize(irq);
         Ok(())
     }
 
     /// Wait for pending IRQ handlers on other CPUs.
     pub fn synchronize(&self, dev: &Device<Bound>) -> Result {
-        let inner = self.inner.access(dev)?;
-        inner.synchronize();
+        RegistrationInner::synchronize(self.inner.access(dev)?.irq);
         Ok(())
     }
 }
@@ -462,15 +463,14 @@ impl<T: ThreadedHandler> ThreadedRegistration<T> {
     ///
     /// This will attempt to access the inner [`Devres`] container.
     pub fn try_synchronize(&self) -> Result {
-        let inner = self.inner.try_access().ok_or(ENODEV)?;
-        inner.synchronize();
+        let irq = self.inner.try_access().ok_or(ENODEV)?.irq;
+        RegistrationInner::synchronize(irq);
         Ok(())
     }
 
     /// Wait for pending IRQ handlers on other CPUs.
     pub fn synchronize(&self, dev: &Device<Bound>) -> Result {
-        let inner = self.inner.access(dev)?;
-        inner.synchronize();
+        RegistrationInner::synchronize(self.inner.access(dev)?.irq);
         Ok(())
     }
 }
