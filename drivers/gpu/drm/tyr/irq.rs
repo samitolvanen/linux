@@ -12,7 +12,7 @@ use kernel::{
     device::{Bound, Device},
     devres::Devres,
     irq::{Flags, IrqReturn, ThreadedHandler, ThreadedIrqReturn, ThreadedRegistration},
-    platform,
+    new_mutex, platform,
     prelude::*,
     sync::{
         aref::ARef,
@@ -20,7 +20,9 @@ use kernel::{
             Acquire,
             Atomic,
             Release, //
-        }, //
+        },
+        Arc,
+        Mutex, //
     },
 };
 
@@ -43,10 +45,11 @@ pub(crate) trait TyrIrqTrait: Sync + 'static {
 pub(crate) struct TyrIrq<T: TyrIrqTrait> {
     tdev: ARef<TyrDrmDevice>,
     irq: T,
-    /// Set while runtime suspend holds this line quiesced. Suspend masks
-    /// the line before it sets the flag. The hard handler then leaves the
-    /// shared line to its other users without touching a register, and the
-    /// threaded handler leaves the line masked on exit.
+    /// Set while the driver holds this line quiesced for a GPU reset or a
+    /// runtime suspend. Both mask the line before they set the flag. The
+    /// hard handler then leaves the shared line to its other users without
+    /// touching a register, and the threaded handler leaves the line
+    /// masked on exit.
     suspended: Atomic<bool>,
     #[pin]
     _pin: PhantomPinned,
@@ -153,5 +156,120 @@ pub(crate) fn clear_suspended<T: TyrIrqTrait + Send>(
 ) {
     if let Ok(irq) = reg.access(dev) {
         irq.handler().set_suspended(false);
+    }
+}
+
+/// A revocable, refcounted IRQ registration held in a slot.
+pub(crate) type SlotReg<T> = Devres<Arc<ThreadedRegistration<TyrIrq<T>>>>;
+
+/// Slot holding a reset-reachable IRQ registration.
+///
+/// The handler holds the device, so the slot would keep a refcount cycle
+/// alive past unbind if devres did not revoke the registration.
+#[pin_data]
+pub(crate) struct IrqSlot<T: TyrIrqTrait + Send> {
+    #[pin]
+    inner: Mutex<Option<SlotReg<T>>>,
+}
+
+impl<T: TyrIrqTrait + Send> IrqSlot<T> {
+    /// Creates an empty slot.
+    pub(crate) fn new() -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- new_mutex!(None),
+        })
+    }
+
+    /// Publishes the registration so the reset path can reach it.
+    pub(crate) fn publish(&self, reg: SlotReg<T>) {
+        *self.inner.lock() = Some(reg);
+    }
+
+    /// Clones the registration out for the reset path.
+    ///
+    /// The `Arc` is cloned out of the revocable guard so the RCU read-side
+    /// critical section does not span a later synchronize. Returns `None`
+    /// before probe publishes the registration and after devres revokes it,
+    /// leaving the handlers to be drained by `free_irq()` at unbind.
+    fn resolve(&self) -> Option<Arc<ThreadedRegistration<TyrIrq<T>>>> {
+        let guard = self.inner.lock();
+        guard
+            .as_ref()
+            .and_then(|d| d.try_access())
+            .map(|reg| (*reg).clone())
+    }
+
+    /// Masks the slot IRQ for a GPU reset and waits out in-flight handlers.
+    ///
+    /// The line is masked before the suspended flag is set, so the hard
+    /// handler starts declining only once the sources are masked. The flag
+    /// stops a finishing threaded handler from re-enabling the line. The
+    /// mask is rewritten after the synchronize because a handler that
+    /// raced the flag re-enables it on exit. The wait is bounded. Does
+    /// nothing when the registration is not published.
+    pub(crate) fn reset_suspend(&self, iomem: &Devres<IoMem>, mask: impl Fn(&IoMem)) {
+        let Some(reg) = self.resolve() else {
+            return;
+        };
+        if let Some(io) = iomem.try_access() {
+            mask(&io);
+        }
+        reg.handler().set_suspended(true);
+        // A failed synchronize means the registration is already being torn
+        // down, with handlers drained by free_irq().
+        let _ = reg.try_synchronize();
+        if let Some(io) = iomem.try_access() {
+            mask(&io);
+        }
+    }
+
+    /// Re-enables the slot IRQ after a GPU reset.
+    pub(crate) fn reset_resume(&self, iomem: &Devres<IoMem>, enable: impl FnOnce(&IoMem)) {
+        let Some(reg) = self.resolve() else {
+            return;
+        };
+        reg.handler().set_suspended(false);
+        if let Some(io) = iomem.try_access() {
+            enable(&io);
+        }
+    }
+
+    /// Clears the suspended flag on the slot IRQ.
+    ///
+    /// A flag left set stops the hard handler from handling the line again.
+    /// Call this before unmasking the line, or an interrupt taken in
+    /// between goes unclaimed.
+    pub(crate) fn clear_suspended(&self) {
+        if let Some(reg) = self.resolve() {
+            reg.handler().set_suspended(false);
+        }
+    }
+
+    /// Quiesces the slot IRQ for runtime suspend on the bound device.
+    ///
+    /// Follows the same order as `reset_suspend`. The flag stays set until
+    /// the matching resume clears it.
+    pub(crate) fn quiesce(
+        &self,
+        dev: &Device<Bound>,
+        iomem: &Devres<IoMem>,
+        mask: impl Fn(&IoMem),
+    ) {
+        let sync = match &*self.inner.lock() {
+            Some(reg) => reg.access(dev).and_then(|irq| {
+                if let Ok(io) = iomem.access(dev) {
+                    mask(io);
+                }
+                irq.handler().set_suspended(true);
+                irq.synchronize(dev)
+            }),
+            None => Err(ENODEV),
+        };
+        if let Err(e) = sync {
+            dev_warn!(dev, "IRQ synchronize on suspend failed: {:?}\n", e);
+        }
+        if let Ok(io) = iomem.access(dev) {
+            mask(io);
+        }
     }
 }
