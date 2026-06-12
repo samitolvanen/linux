@@ -218,14 +218,28 @@ impl Controller {
 
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
-        match gpu::reset(self.pdev.as_ref(), &self.iomem) {
-            Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
-            Err(e) => {
-                dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
+        tdev.fw.pre_reset();
 
-                // TODO: Unplug the GPU.
-                // There is no API for unplugging the GPU.
-            }
+        let reset_result = gpu::reset(self.pdev.as_ref(), &self.iomem);
+        if let Err(e) = &reset_result {
+            dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
+        }
+
+        let reboot_result = tdev.fw.post_reset(&tdev);
+        if let Err(e) = &reboot_result {
+            dev_err!(
+                self.pdev.as_ref(),
+                "Firmware reboot after reset failed: {:?}\n",
+                e
+            );
+
+            // TODO: Unplug the GPU.
+            // There is no API for unplugging the GPU.
+        }
+
+        match reset_result.and(reboot_result) {
+            Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
+            Err(_) => dev_err!(self.pdev.as_ref(), "GPU reset cycle failed.\n"),
         }
 
         self.finish_reset();
