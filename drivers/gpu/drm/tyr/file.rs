@@ -15,6 +15,7 @@ use kernel::{
     },
     io::Io,
     pm::PMProfile,
+    preempt,
     prelude::*,
     str::CString,
     sync::{
@@ -26,7 +27,10 @@ use kernel::{
         Arc, //
     },
     task,
-    time::arch_timer_get_rate,
+    time::{
+        self,
+        Timespec64, //
+    },
     transmute::{
         AsBytes,
         FromBytes, //
@@ -268,33 +272,7 @@ impl TyrDrmFileData {
                     Ok(0)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_TIMESTAMP_INFO => {
-                    let timestamp_frequency = arch_timer_get_rate().map_or(0, u64::from);
-
-                    let _awake = match ddev.pm_context() {
-                        Some(ctx) => Some(ctx.get(PMProfile::new().auto())?),
-                        None => None,
-                    };
-
-                    // SAFETY: `ddev` is a bound device in the ioctl path.
-                    let dev = unsafe { ddev.as_ref().as_bound() };
-                    let io = ddev.iomem.access(dev)?;
-
-                    let current_timestamp = read_u64_no_tearing(
-                        || io.read(gpu_control::TIMESTAMP_LO).into_raw(),
-                        || io.read(gpu_control::TIMESTAMP_HI).into_raw(),
-                    );
-
-                    let timestamp_offset = join_u64(
-                        io.read(gpu_control::TIMESTAMP_OFFSET_LO).into_raw(),
-                        io.read(gpu_control::TIMESTAMP_OFFSET_HI).into_raw(),
-                    );
-
-                    let data = [timestamp_frequency, current_timestamp, timestamp_offset];
-                    let min_size = offset_of!(uapi::drm_panthor_timestamp_info, current_timestamp)
-                        + size_of::<u64>();
-                    set_uobj(devquery.pointer, devquery.size, min_size, &data)?;
-
-                    Ok(0)
+                    Self::query_timestamp_info(ddev, devquery)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GROUP_PRIORITIES_INFO => {
                     let mut allowed_mask: u8 = 0;
@@ -314,6 +292,153 @@ impl TyrDrmFileData {
                 _ => Err(EINVAL),
             }
         }
+    }
+
+    fn query_timestamp_info(
+        ddev: &TyrDrmDevice,
+        devquery: &mut uapi::drm_panthor_dev_query,
+    ) -> Result<u32> {
+        use uapi::{
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_CPU_MONOTONIC as CPU_MONOTONIC,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_CPU_MONOTONIC_RAW as CPU_MONOTONIC_RAW,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_CPU_NONE as CPU_NONE,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_CPU_TYPE_MASK as CPU_TYPE_MASK,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_DURATION as DURATION,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_FREQ as FREQ,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_GPU as GPU,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_GPU_CYCLE_COUNT as GPU_CYCLE_COUNT,
+            drm_panthor_timestamp_info_flags_DRM_PANTHOR_TIMESTAMP_GPU_OFFSET as GPU_OFFSET,
+        };
+
+        const VALID: u32 = GPU | CPU_TYPE_MASK | GPU_OFFSET | GPU_CYCLE_COUNT | FREQ | DURATION;
+
+        let min_size =
+            offset_of!(uapi::drm_panthor_timestamp_info, current_timestamp) + size_of::<u64>();
+
+        let mut info = TimestampInfo(uapi::drm_panthor_timestamp_info::default());
+        let kern_size = size_of::<uapi::drm_panthor_timestamp_info>();
+        let usr_size = devquery.size as usize;
+        let copy_size = usr_size.min(kern_size);
+        // SAFETY: `info` is `FromBytes`, so any byte pattern read into it is
+        // valid, and `AsBytes`, so the mutable byte view is sound.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut info).cast::<u8>(), kern_size)
+        };
+        let mut reader =
+            UserSlice::new(UserPtr::from_addr(devquery.pointer as usize), usr_size).reader();
+        reader.read_slice(&mut bytes[..copy_size])?;
+        read_padding_zero(&mut reader, usr_size - copy_size)?;
+
+        let flags = if info.0.flags != 0 {
+            info.0.flags
+        } else {
+            GPU | GPU_OFFSET | FREQ
+        };
+
+        let mut timestamp_types = 0u32;
+        match flags & CPU_TYPE_MASK {
+            CPU_NONE => {}
+            CPU_MONOTONIC | CPU_MONOTONIC_RAW => timestamp_types += 1,
+            _ => return Err(EINVAL),
+        }
+
+        if flags & !VALID != 0 {
+            return Err(EINVAL);
+        }
+
+        if flags & GPU != 0 {
+            timestamp_types += 1;
+        }
+        if flags & GPU_CYCLE_COUNT != 0 {
+            timestamp_types += 1;
+        }
+
+        let minimize_interruption = flags & DURATION != 0 || timestamp_types >= 2;
+
+        let _awake = match ddev.pm_context() {
+            Some(ctx) => Some(ctx.get(PMProfile::new().auto())?),
+            None => None,
+        };
+
+        // SAFETY: `ddev` is a bound device in the ioctl path.
+        let dev = unsafe { ddev.as_ref().as_bound() };
+        let io = ddev.iomem.access(dev)?;
+
+        info.0.timestamp_frequency = if flags & FREQ != 0 {
+            time::arch_timer_get_rate().map_or(0, u64::from)
+        } else {
+            0
+        };
+
+        info.0.timestamp_offset = if flags & GPU_OFFSET != 0 {
+            join_u64(
+                io.read(gpu_control::TIMESTAMP_OFFSET_LO).into_raw(),
+                io.read(gpu_control::TIMESTAMP_OFFSET_HI).into_raw(),
+            )
+        } else {
+            0
+        };
+
+        let mut cpu_ts = Timespec64::default();
+
+        let mut sample = || {
+            let query_start = if flags & DURATION != 0 {
+                time::local_clock()
+            } else {
+                0
+            };
+
+            info.0.current_timestamp = if flags & GPU != 0 {
+                read_u64_no_tearing(
+                    || io.read(gpu_control::TIMESTAMP_LO).into_raw(),
+                    || io.read(gpu_control::TIMESTAMP_HI).into_raw(),
+                )
+            } else {
+                0
+            };
+
+            match flags & CPU_TYPE_MASK {
+                CPU_MONOTONIC => cpu_ts = time::ktime_get_ts64(),
+                CPU_MONOTONIC_RAW => cpu_ts = time::ktime_get_raw_ts64(),
+                _ => {}
+            }
+
+            info.0.cycle_count = if flags & GPU_CYCLE_COUNT != 0 {
+                read_u64_no_tearing(
+                    || io.read(gpu_control::CYCLE_COUNT_LO).into_raw(),
+                    || io.read(gpu_control::CYCLE_COUNT_HI).into_raw(),
+                )
+            } else {
+                0
+            };
+
+            info.0.duration_nsec = if flags & DURATION != 0 {
+                (time::local_clock() - query_start) as u32
+            } else {
+                0
+            };
+        };
+
+        if minimize_interruption {
+            preempt::with_preempt_irq_disabled(sample);
+        } else {
+            sample();
+        }
+
+        if flags & CPU_TYPE_MASK != 0 {
+            // SAFETY: This runs in the ioctl's process context, so
+            // `current->nsproxy` is live.
+            unsafe { cpu_ts.add_monotonic() };
+            info.0.cpu_timestamp_sec = cpu_ts.tv_sec as u64;
+            info.0.cpu_timestamp_nsec = cpu_ts.tv_nsec as u64;
+        } else {
+            info.0.cpu_timestamp_sec = 0;
+            info.0.cpu_timestamp_nsec = 0;
+        }
+
+        set_uobj(devquery.pointer, devquery.size, min_size, &info)?;
+
+        Ok(0)
     }
 
     pub(crate) fn vm_create(
@@ -807,6 +932,17 @@ struct BoSyncOp(uapi::drm_panthor_bo_sync_op);
 // SAFETY: `drm_panthor_bo_sync_op` is a C-repr POD with no padding holes
 // and no validity invariants on any field, so every bit pattern is valid.
 unsafe impl FromBytes for BoSyncOp {}
+
+#[repr(transparent)]
+struct TimestampInfo(uapi::drm_panthor_timestamp_info);
+
+// SAFETY: `drm_panthor_timestamp_info` is a C-repr POD with no validity
+// invariants on any field, so every bit pattern is valid.
+unsafe impl FromBytes for TimestampInfo {}
+
+// SAFETY: `drm_panthor_timestamp_info` is a C-repr POD, so it is sound to
+// view as a byte slice.
+unsafe impl AsBytes for TimestampInfo {}
 
 impl VmBindOp {
     fn capture(
