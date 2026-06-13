@@ -4,6 +4,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/time_namespace.h>
 #include <linux/timekeeping.h>
 
 __rust_helper void rust_helper_fsleep(unsigned long usecs)
@@ -39,6 +40,11 @@ __rust_helper s64 rust_helper_ktime_to_us(const ktime_t kt)
 __rust_helper s64 rust_helper_ktime_to_ms(const ktime_t kt)
 {
 	return ktime_to_ms(kt);
+}
+
+__rust_helper void rust_helper_timens_add_monotonic(struct timespec64 *ts)
+{
+	timens_add_monotonic(ts);
 }
 
 __rust_helper void rust_helper_udelay(unsigned long usec)
