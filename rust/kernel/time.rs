@@ -5,10 +5,12 @@
 //! This module contains the kernel APIs related to time and timers that
 //! have been ported or wrapped for usage by Rust code in the kernel.
 //!
-//! There are two types in this module:
+//! There are three types in this module:
 //!
 //! - The [`Instant`] type represents a specific point in time.
 //! - The [`Delta`] type represents a span of time.
+//! - The [`Timespec64`] type represents a point in time as seconds and
+//!   nanoseconds, mirroring the C `struct timespec64`.
 //!
 //! Note that the C side uses `ktime_t` type to represent both. However, timestamp
 //! and timedelta are different. To avoid confusion, we use two different types.
@@ -409,6 +411,47 @@ pub fn arch_timer_get_rate() -> Option<u32> {
     } else {
         Some(rate)
     }
+}
+
+/// A point in time split into whole seconds and nanoseconds.
+///
+/// Mirrors the C `struct timespec64`. Kernel clock interfaces use this split form
+/// rather than the single `ktime_t` value that [`Instant`] wraps.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Timespec64 {
+    /// Whole seconds.
+    pub tv_sec: i64,
+    /// Nanoseconds within the second.
+    pub tv_nsec: i64,
+}
+
+impl From<bindings::timespec64> for Timespec64 {
+    fn from(ts: bindings::timespec64) -> Self {
+        Self {
+            tv_sec: ts.tv_sec,
+            tv_nsec: ts.tv_nsec as i64,
+        }
+    }
+}
+
+/// Returns the current `CLOCK_MONOTONIC` time as a [`Timespec64`].
+#[inline]
+pub fn ktime_get_ts64() -> Timespec64 {
+    let mut ts = bindings::timespec64::default();
+    // SAFETY: `ts` is a valid, owned stack `timespec64`, and the function only
+    // writes through the out-pointer. It is always safe to call outside NMI.
+    unsafe { bindings::ktime_get_ts64(&mut ts) };
+    ts.into()
+}
+
+/// Returns the current `CLOCK_MONOTONIC_RAW` time as a [`Timespec64`].
+#[inline]
+pub fn ktime_get_raw_ts64() -> Timespec64 {
+    let mut ts = bindings::timespec64::default();
+    // SAFETY: `ts` is a valid, owned stack `timespec64`, and the function only
+    // writes through the out-pointer. It is always safe to call outside NMI.
+    unsafe { bindings::ktime_get_raw_ts64(&mut ts) };
+    ts.into()
 }
 
 impl Delta {
