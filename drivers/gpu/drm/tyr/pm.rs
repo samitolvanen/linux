@@ -140,6 +140,8 @@ impl PMOps for TyrPmOps {
     type DeviceType = platform::Device<Bound>;
     type RuntimePayloadType = Arc<DevfreqSlot>;
 
+    const SYSTEM_SLEEP: bool = true;
+
     fn runtime_suspend<'a>(
         dev: &'a Self::DeviceType,
         data: Option<Arc<DevfreqSlot>>,
@@ -158,6 +160,14 @@ impl PMOps for TyrPmOps {
             Ok(()) => Ok(data),
             Err(e) => Err((data, e)),
         }
+    }
+
+    fn system_resume_done(dev: &Self::DeviceType) {
+        let Ok(data) = dev.as_ref().drvdata::<TyrPlatformDriverData>() else {
+            return;
+        };
+
+        sched::tick::resume_after_system_sleep(&data.device);
     }
 }
 

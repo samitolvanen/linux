@@ -267,6 +267,21 @@ pub(crate) fn resume_after_aborted_suspend(tdev: &ARef<TyrDrmDevice>) {
     resume(tdev);
 }
 
+/// Recovers the scheduler after a system resume. Runtime PM is disabled
+/// for the duration of a system sleep, so a tick that ran in that window
+/// could not take a usage reference. Without one it cannot arm a resume.
+/// Reissue the tick when the scheduler has runnable groups but holds no
+/// reference.
+pub(crate) fn resume_after_system_sleep(tdev: &ARef<TyrDrmDevice>) {
+    let kick = tdev
+        .with_locked_scheduler(|sched| Ok(sched.pm_ref.is_none() && sched.has_runnable_groups()))
+        .unwrap_or(false);
+
+    if kick {
+        TyrDrmDeviceData::schedule_tick(tdev);
+    }
+}
+
 /// Identifies a group selected during rule evaluation.
 #[derive(Copy, Clone)]
 pub(crate) enum SelectedGroup {
