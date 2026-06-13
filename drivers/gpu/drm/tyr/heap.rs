@@ -376,6 +376,13 @@ impl Pool {
         Ok(())
     }
 
+    fn heap_va_to_index(&self, tdev: &TyrDrmDevice, heap_gpu_va: u64) -> Result<usize> {
+        let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
+        let offset = heap_gpu_va.checked_sub(contexts_va).ok_or(EINVAL)?;
+        let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
+        Ok((offset / tdev.gpu_info.heap_context_stride()) as usize)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn grow_heap_context(
         &self,
@@ -384,9 +391,7 @@ impl Pool {
     ) -> Result<(u64, u64)> {
         let _ = args.pending_frag_count;
 
-        let offset = args.heap_gpu_va - self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
-        let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
-        let index = offset / tdev.gpu_info.heap_context_stride();
+        let index = self.heap_va_to_index(tdev, args.heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
 
@@ -395,7 +400,7 @@ impl Pool {
         // snapshot-then-recheck dance; the XArray spinlock would only guard the lookup.
         let (vm, chunk_size, max_chunks, cookie) = {
             let guard = xa.lock();
-            let heap_ctx = guard.get(index as usize).ok_or(EINVAL)?;
+            let heap_ctx = guard.get(index).ok_or(EINVAL)?;
 
             if args.renderpasses_in_flight > heap_ctx.target_in_flight
                 || heap_ctx.chunks.len() >= heap_ctx.max_chunks as usize
@@ -417,7 +422,7 @@ impl Pool {
         let chunk_bo = alloc_chunk_bo(tdev, &vm, chunk_size)?;
 
         let mut guard = xa.lock();
-        let heap_ctx = guard.get_mut(index as usize).ok_or(EINVAL)?;
+        let heap_ctx = guard.get_mut(index).ok_or(EINVAL)?;
 
         // While the lock was dropped the original context may have been
         // destroyed and a new one allocated at the same recycled index.
@@ -454,14 +459,12 @@ impl Pool {
         chunk_gpu_va: u64,
         cookie: u64,
     ) -> Result {
-        let offset = heap_gpu_va - self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
-        let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
-        let index = offset / tdev.gpu_info.heap_context_stride();
+        let index = self.heap_va_to_index(tdev, heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
         let removed = {
             let mut guard = xa.lock();
-            let heap_ctx = guard.get_mut(index as usize).ok_or(EINVAL)?;
+            let heap_ctx = guard.get_mut(index).ok_or(EINVAL)?;
 
             // The slot-manager lock was dropped between growing the chunk
             // and returning it, so this index may now hold a different
