@@ -307,6 +307,10 @@ impl Scheduler {
         let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
             fw.csif_info_counts()?;
 
+        // A distinct CSG priority per slot avoids a FW scheduler deadlock,
+        // capping the usable slots to the priority count.
+        let csg_slot_count = core::cmp::min(MAX_CSG_PRIO + 1, csg_slot_count);
+
         let csif = CsifInfo::new(
             csg_slot_count,
             cs_slot_count,
