@@ -121,6 +121,7 @@ pub mod pci;
 pub mod pid_namespace;
 pub mod platform;
 pub mod pm;
+pub mod preempt;
 pub mod prelude;
 pub mod print;
 pub mod processor;
