@@ -470,6 +470,17 @@ impl Timespec64 {
     }
 }
 
+/// Returns a per-CPU timestamp in nanoseconds for short-interval
+/// measurements.
+///
+/// The clock is fast but not synchronized across CPUs, so only a
+/// difference of two reads taken on the same CPU is meaningful.
+#[inline]
+pub fn local_clock() -> u64 {
+    // SAFETY: `local_clock()` has no preconditions.
+    unsafe { bindings::local_clock() }
+}
+
 /// Returns the current `CLOCK_MONOTONIC` time as a [`Timespec64`].
 #[inline]
 pub fn ktime_get_ts64() -> Timespec64 {
