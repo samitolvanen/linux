@@ -114,7 +114,17 @@ impl Pools {
         let pool = Arc::new(Pool::create(tdev, vm)?, GFP_KERNEL)?;
         let xa = self.entries.as_ref();
         let mut guard = xa.lock();
-        guard.store(vm_id, pool.clone(), GFP_KERNEL)?;
+        if let Some(existing_pool) = guard.get(vm_id) {
+            return Ok(existing_pool.into());
+        }
+        if let Some(existing) = guard.store(vm_id, pool.clone(), GFP_KERNEL)? {
+            // The XArray lock can be dropped while `store` allocates a node,
+            // so a concurrent creator may have stored its pool first. Keep
+            // that pool and discard ours. The slot already holds a node, so
+            // this GFP_NOWAIT store allocates nothing and cannot fail.
+            guard.store(vm_id, existing.clone(), GFP_NOWAIT)?;
+            return Ok(existing);
+        }
 
         Ok(pool)
     }
