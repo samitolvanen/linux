@@ -375,6 +375,38 @@ impl GlobalInterface {
         Ok(ret)
     }
 
+    /// Pings the firmware to check it is still alive.
+    ///
+    /// Toggles `GLB_REQ.ping` and waits up to `timeout_ms` for `GLB_ACK` to
+    /// mirror it. Runs only while the interface is enabled, since the suspended
+    /// state reserves `GLB_REQ` for the resume path. The toggle is a
+    /// read-modify-write held under `inner`, shared with the GLB IRQ path, so
+    /// the interface views are cloned out before the wait to let that path take
+    /// `inner` and deliver the wakeup.
+    pub(super) fn ping(&self, timeout_ms: u32) -> Result {
+        let ping_mask = GLB_REQ::zeroed().with_ping(true);
+
+        let (glb_input, glb_output) = {
+            let inner = self.inner.lock();
+            let enabled = match &inner.state {
+                GlobalInterfaceState::Enabled(enabled) => enabled,
+                GlobalInterfaceState::Suspended(_) | GlobalInterfaceState::Disabled => {
+                    return Err(EINVAL)
+                }
+            };
+
+            let request_field =
+                GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
+            request_field.toggle_requests(ping_mask)?;
+
+            (enabled.glb_input.clone(), enabled.glb_output.clone())
+        };
+
+        self.ring_doorbell(0)?;
+        let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
+        request_field.wait_acks(ping_mask, &self.event_wait, timeout_ms)
+    }
+
     /// Requests an MCU halt through the global doorbell. The request is not
     /// acknowledged through the firmware interface, so callers poll
     /// `MCU_STATUS`.
@@ -575,7 +607,8 @@ impl InnerGlobalInterface {
                 .with_cfg_pwroff_timer(true)
                 .with_idle_enable(true)
                 .with_idle_event(true)
-                .with_counter_enable(true),
+                .with_counter_enable(true)
+                .with_ping(true),
         );
 
         let cur_req = glb_input.read(GLB_REQ);

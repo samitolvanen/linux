@@ -43,7 +43,8 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice, //
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
     },
     fw::{
         global::GlobalInterface,
@@ -615,17 +616,30 @@ impl Firmware {
         self.global_iface.process_global_irq()
     }
 
+    /// Pings the firmware and waits up to `timeout_ms` for the ack.
+    ///
+    /// Returns `Err` if the firmware does not respond in time. The caller
+    /// must only ping while the device is powered and no reset owns the
+    /// firmware interface.
+    pub(crate) fn ping(&self, timeout_ms: u32) -> Result {
+        self.global_iface.ping(timeout_ms)
+    }
+
     /// Enable the global interface.
     pub(crate) fn enable_global_interface(&self, tdev: &TyrDrmDevice) -> Result {
         let core_clk_rate = tdev.with_locked_core_clk(|core_clk| core_clk.rate().as_hz() as u64);
-        self.global_iface.enable(core_clk_rate)
+        self.global_iface.enable(core_clk_rate)?;
+        TyrDrmDeviceData::arm_fw_ping(&tdev.into());
+        Ok(())
     }
 
     /// Re-enables the global interface after a runtime resume or a GPU
     /// reset.
     fn reenable_global_interface(&self, tdev: &TyrDrmDevice) -> Result {
         let core_clk_rate = tdev.with_locked_core_clk(|core_clk| core_clk.rate().as_hz() as u64);
-        self.global_iface.reenable(core_clk_rate)
+        self.global_iface.reenable(core_clk_rate)?;
+        TyrDrmDeviceData::arm_fw_ping(&tdev.into());
+        Ok(())
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {
