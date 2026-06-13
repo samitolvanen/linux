@@ -25,7 +25,6 @@ use crate::{
         TyrDrmDeviceData, //
     },
     fw::{
-        self,
         global::{
             csg::Priority,
             CsStatusWait,
@@ -55,10 +54,10 @@ const GROUP_PRIORITY_COUNT: usize = Priority::num_priorities();
 
 /// Maximum number of CSG slots the scheduler can address.
 ///
-/// Matches `fw::MAX_CSG`, the firmware-imposed hardware ceiling.
-/// Bounds the fixed-capacity per-tick accumulator so tick callbacks
-/// never allocate.
-pub(crate) const MAX_CSGS: usize = fw::MAX_CSG;
+/// One entry per CSG priority. `Scheduler::init` caps the slot count the
+/// firmware reports at this many. Bounds the fixed-capacity per-tick
+/// accumulator so tick callbacks never allocate.
+pub(crate) const MAX_CSGS: usize = MAX_CSG_PRIO as usize + 1;
 
 /// Highest firmware priority value assignable to a CSG (`CSG_EP_REQ.priority` field).
 pub(crate) const MAX_CSG_PRIO: u32 = 0xf;
@@ -306,6 +305,10 @@ impl Scheduler {
     pub(crate) fn init(tdev: &TyrDrmDevice, fw: &Firmware<'_>) -> Result<(Self, CsifInfo)> {
         let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
             fw.csif_info_counts()?;
+
+        // A distinct CSG priority per slot avoids a FW scheduler deadlock,
+        // capping the usable slots to the priority count.
+        let csg_slot_count = core::cmp::min(MAX_CSG_PRIO + 1, csg_slot_count);
 
         let csif = CsifInfo::new(
             csg_slot_count,

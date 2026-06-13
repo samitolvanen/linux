@@ -100,7 +100,9 @@ pub(crate) use interfaces::{
 };
 
 /// Maximum number of CSG interfaces supported by hardware.
-pub(crate) const MAX_CSG: usize = 16;
+///
+/// The scheduler addresses only `sched::MAX_CSGS` of these slots.
+pub(crate) const MAX_CSG: usize = 31;
 
 /// Minimum number of CSG interfaces the firmware must report.
 const MIN_CSG: usize = 3;
@@ -192,7 +194,7 @@ impl CsDbMask {
 }
 
 /// Maximum number of CS interfaces supported by hardware.
-const MAX_CS: usize = 16;
+const MAX_CS: usize = 32;
 
 /// Minimum number of CS interfaces a CSG must report.
 const MIN_CS: usize = 8;
