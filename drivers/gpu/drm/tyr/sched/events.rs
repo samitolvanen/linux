@@ -22,7 +22,8 @@ use crate::{
         parent_dev,
         work_id,
         TyrDrmDevice,
-        TyrDrmDeviceData, //
+        TyrDrmDeviceData,
+        TyrDrmRegistrationData, //
     },
     fw::{
         CsDbMask,
@@ -96,7 +97,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
                             },
                         )
                     })
-                    .unwrap_or(0);
+                    .unwrap_or((0, 0));
 
                 if chunk_vas.push(chunk_va, GFP_KERNEL).is_err() {
                     dev_err!(tdev.as_ref(), "tiler_oom_work: failed to store chunk VA\n");
@@ -106,7 +107,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
 
             let _ = tdev
                 .with_locked_scheduler(|sched| {
-                    sched.finish_pending_tiler_ooms(tdev, &reg_data.fw, &pending, &chunk_vas)
+                    sched.finish_pending_tiler_ooms(tdev, reg_data, &pending, &chunk_vas)
                 })
                 .inspect_err(|err| {
                     dev_err!(
@@ -365,9 +366,9 @@ impl Scheduler {
     fn finish_pending_tiler_ooms(
         &mut self,
         tdev: &TyrDrmDevice,
-        fw: &Firmware<'_>,
+        reg_data: &TyrDrmRegistrationData<'_>,
         pending: &KVec<PendingOom>,
-        chunk_vas: &KVec<u64>,
+        chunk_vas: &KVec<(u64, u64)>,
     ) -> Result {
         for (index, oom) in pending.iter().enumerate() {
             // The collect phase dropped the slot-manager lock so that
@@ -375,17 +376,34 @@ impl Scheduler {
             // slot-manager ahead of fw.inner (which other paths take
             // standalone). Confirm the slot is still owned by the
             // same group.
-            {
+            let owned = {
                 let slot_manager = tdev.csg_slot_manager.lock();
-                match slot_manager.slot_data(oom.csg_id) {
-                    Some(data) if Arc::ptr_eq(&data.group, &oom.group) => {}
-                    _ => continue,
+                matches!(
+                    slot_manager.slot_data(oom.csg_id),
+                    Some(data) if Arc::ptr_eq(&data.group, &oom.group)
+                )
+            };
+            if !owned {
+                let (chunk_va, cookie) = *chunk_vas.get(index).ok_or(EINVAL)?;
+                if chunk_va != 0 {
+                    if let Some(pool) = oom.group.get_heap_pool() {
+                        let _ = pool
+                            .return_chunk(reg_data, oom.heap_address, chunk_va, cookie)
+                            .inspect_err(|e| {
+                                dev_err!(
+                                    tdev.as_ref(),
+                                    "tiler_oom: failed to return orphaned chunk: {:?}\n",
+                                    e
+                                );
+                            });
+                    }
                 }
+                continue;
             }
 
-            let new_chunk_va = *chunk_vas.get(index).ok_or(EINVAL)?;
+            let (new_chunk_va, _) = *chunk_vas.get(index).ok_or(EINVAL)?;
 
-            fw.with_csg_mut(oom.csg_id, |csg| {
+            reg_data.fw.with_csg_mut(oom.csg_id, |csg| {
                 {
                     let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
                     cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
@@ -399,7 +417,7 @@ impl Scheduler {
 
             let mut mask = CsgSlotMask::empty();
             mask.insert(oom.csg_id);
-            fw.ring_csg_doorbells(mask)?;
+            reg_data.fw.ring_csg_doorbells(mask)?;
         }
 
         Ok(())
