@@ -238,10 +238,7 @@ impl Drop for PendingFenceReservation {
 /// `cached` carries a BO resolution from a prior evaluation; it
 /// stores its own `(gpu_va, sync64)` so the next evaluation can
 /// detect when the live wait has moved on and rebuild rather than
-/// read from a stale BO. Leaving the cache untouched in the
-/// firmware-update path keeps the eventual `Arc<gem::MappedUserBo>` drop
-/// out of the dma-fence signalling section that wraps that path; the
-/// drop happens via the sync-update worker instead.
+/// read from a stale BO.
 #[derive(Default, Clone)]
 pub(crate) struct SyncWait {
     /// GPU virtual address of the awaited sync object. `0` means no
@@ -670,11 +667,6 @@ impl QueueData {
     /// snapshot. The cached BO resolution is keyed independently by
     /// its own `(gpu_va, sync64)`; `Group::eval_syncwait` detects
     /// when the live wait has moved to a different key and rebuilds.
-    /// Leaving the cache untouched here keeps the eventual
-    /// `Arc<gem::MappedUserBo>` drop out of the dma-fence signalling
-    /// annotation that wraps this caller; the drop happens in
-    /// `eval_syncwait`'s rebuild or `take_syncwait_bo` path, both of
-    /// which run from the sync-update worker on `system_unbound()`.
     pub(crate) fn set_syncwait(&self, gpu_va: u64, ref_val: u64, sync64: bool, gt: bool) {
         let mut wait = self.syncwait.lock();
         wait.gpu_va = gpu_va;
@@ -689,10 +681,8 @@ impl QueueData {
     /// Both `gpu_va` and `sync64` are re-checked under the lock so a
     /// concurrent `set_syncwait` that reuses the same address with a
     /// different sync-object width does not install a stale resolution
-    /// that would later be read with the wrong type. Any previously
-    /// stored `CachedBo` is dropped here, which is safe because the
-    /// caller runs from the sync-update worker, outside any dma-fence
-    /// signalling annotation. Returns `true` if the cache was applied.
+    /// that would later be read with the wrong type. Returns `true` if
+    /// the cache was applied.
     pub(crate) fn cache_syncwait_bo(
         &self,
         gpu_va: u64,
@@ -715,9 +705,6 @@ impl QueueData {
 
     /// Removes and returns the cached BO resolution from the active
     /// sync-wait snapshot.
-    ///
-    /// Must not be called from a dma-fence signalling section: the
-    /// returned value's drop acquires `dma_resv_lock`.
     pub(crate) fn take_syncwait_bo(&self) -> Option<Arc<gem::MappedUserBo>> {
         let mut wait = self.syncwait.lock();
         wait.cached.take().map(|c| c.bo)

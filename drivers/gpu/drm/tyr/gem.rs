@@ -238,12 +238,14 @@ impl Drop for MappedBo {
 /// sync values out of user BOs without those BOs being kernel-owned.
 ///
 /// The BO must be pinned (i.e. it has at least one live GPU mapping)
-/// for the vmap to be safe. All current callers materialise the BO
-/// via `Vm::get_bo_for_va`, which only returns BOs reachable
-/// through a live `drm_gpuva`, satisfying that precondition.
+/// for the vmap to be safe.
+///
+/// The vmap's `owner` is the only GEM reference this type holds.
+/// `Drop` ships the vmap to the cleanup workqueue, so the final GEM put,
+/// whose `free_callback` tears down the cached sg table under
+/// `dma_resv_lock`, never runs on the dropping context, which may be
+/// a dma-fence signalling section.
 pub(crate) struct MappedUserBo {
-    #[expect(dead_code)]
-    bo: ARef<Bo>,
     /// `Some` for the entire lifetime of the value; taken to `None`
     /// only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
@@ -256,7 +258,6 @@ impl MappedUserBo {
         let vmap = bo.owned_vmap::<0>()?;
         Ok(Arc::new(
             Self {
-                bo: bo.into(),
                 vmap: Some(vmap),
                 cleanup_wq,
             },
