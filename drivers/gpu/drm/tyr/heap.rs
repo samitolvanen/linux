@@ -85,6 +85,9 @@ struct Context {
     chunk_size: u32,
     max_chunks: u32,
     target_in_flight: u32,
+    /// Identity of this context, distinguishing it from a later context
+    /// allocated at the same recycled index.
+    cookie: u64,
 }
 
 fn alloc_chunk_bo(
@@ -221,7 +224,10 @@ pub(crate) struct Pool {
     vm: Arc<Vm>,
     gpu_contexts: Arc<gem::MappedBo>,
     xa: Pin<KBox<XArray<KBox<Context>>>>,
-    free_index: Atomic<usize>,
+    next_id: Atomic<u32>,
+    /// Ever-incrementing source of context cookies. Unlike `next_id`, it
+    /// never wraps or recycles, so each context gets a unique identity.
+    next_cookie: Atomic<u64>,
 }
 
 impl Pool {
@@ -242,13 +248,14 @@ impl Pool {
             flags,
             ddev.coherent,
         )?;
-        let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
+        let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
 
         Ok(Self {
             vm,
             gpu_contexts,
             xa,
-            free_index: Atomic::new(1),
+            next_id: Atomic::new(0),
+            next_cookie: Atomic::new(0),
         })
     }
 
@@ -285,6 +292,7 @@ impl Pool {
                 chunk_size: args.chunk_size,
                 max_chunks: args.max_chunks,
                 target_in_flight: args.target_in_flight,
+                cookie: self.next_cookie.fetch_add(1, Relaxed),
             },
             GFP_KERNEL,
         )?;
@@ -302,25 +310,41 @@ impl Pool {
             .ok_or(EINVAL)?
             .start;
 
-        let index = self.free_index.fetch_add(1, Relaxed);
         let stride = reg_data.gpu_info.heap_context_stride() as usize;
-        let offset = index.checked_mul(stride).ok_or(EINVAL)?;
-        let end = offset.checked_add(stride).ok_or(EINVAL)?;
-        let vmap = self.gpu_contexts.vmap();
-        if end > vmap.owner().size() {
-            return Err(EINVAL);
-        }
-        let base = vmap.as_view().as_ptr().cast::<u8>();
-        // SAFETY: `offset..offset + stride` is within the mapping
-        // (`end <= vmap.owner().size()` checked above). The vmap outlives
-        // this write, because `self.gpu_contexts` holds the `Arc<MappedBo>`.
-        unsafe { core::ptr::write_bytes(base.add(offset), 0, stride) };
-
-        let context_gpu_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start + offset as u64;
+        let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
 
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
-        guard.store(index, heap_ctx, GFP_KERNEL)?;
+
+        let mut next = self.next_id.load(Relaxed);
+        let index = match guard.alloc_cyclic(
+            heap_ctx,
+            xarray::XaLimit::new(0, MAX_HEAPS_PER_POOL - 1),
+            &mut next,
+            GFP_KERNEL,
+        ) {
+            Err(e) => {
+                // Drop the guard before dropping the heap_ctx that fails to allocate,
+                // as dropping the Context might take the VM mutex.
+                drop(guard);
+                return Err(e.error);
+            }
+            Ok(index) => index,
+        };
+        self.next_id.store(next, Relaxed);
+
+        let offset = index * stride;
+
+        let vmap = self.gpu_contexts.vmap();
+        let base = vmap.as_view().as_ptr().cast::<u8>();
+        // SAFETY: `index` is allocated cyclically within `0..MAX_HEAPS_PER_POOL`.
+        // The contexts buffer is sized to fit `MAX_HEAPS_PER_POOL * stride`, so the
+        // write range `offset..offset + stride` is always within the mapping. The
+        // index is allocated in the XArray and the guard is held across this fill,
+        // so no concurrent create can be handed the same index and race it.
+        unsafe { core::ptr::write_bytes(base.add(offset), 0, stride) };
+
+        let context_gpu_va = contexts_va + offset as u64;
 
         Ok(CreatedContext {
             context_id: index,
@@ -346,7 +370,7 @@ impl Pool {
         // TODO: holding each Context behind its own mutex (XArray<Arc<Mutex<Context>>>)
         // would let the whole grow run under one sleeping lock and drop this
         // snapshot-then-recheck dance. The XArray spinlock would only guard the lookup.
-        let (vm, chunk_size, max_chunks) = {
+        let (vm, chunk_size, max_chunks, cookie) = {
             let guard = xa.lock();
             let heap_ctx = guard.get(index as usize).ok_or(EINVAL)?;
 
@@ -360,6 +384,7 @@ impl Pool {
                 heap_ctx.vm.clone(),
                 heap_ctx.chunk_size,
                 heap_ctx.max_chunks,
+                heap_ctx.cookie,
             )
         };
 
@@ -370,6 +395,13 @@ impl Pool {
 
         let mut guard = xa.lock();
         let heap_ctx = guard.get_mut(index as usize).ok_or(EINVAL)?;
+
+        // While the lock was dropped the original context may have been
+        // destroyed and a new one allocated at the same recycled index.
+        // The cookie identifies the original, so reject the grow if it changed.
+        if heap_ctx.cookie != cookie {
+            return Err(EINVAL);
+        }
 
         if heap_ctx.chunks.len() >= max_chunks as usize {
             return Err(ENOMEM);
