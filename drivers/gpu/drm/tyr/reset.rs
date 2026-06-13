@@ -233,6 +233,7 @@ impl Controller {
 
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
+        tdev.cancel_fw_ping();
         let parked = tick::pre_reset(&tdev);
         let reset_result = run_hw_reset(&tdev, self.pdev.as_ref(), &self.iomem, &self.gate);
         tick::post_reset(&tdev, parked, reset_result.is_err());

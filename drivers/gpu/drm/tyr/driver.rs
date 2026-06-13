@@ -55,7 +55,11 @@ use kernel::{
         Mutex,
         SetOnce, //
     },
-    time::Jiffies,
+    time::{
+        msecs_to_jiffies,
+        Jiffies, //
+    },
+    types::ScopeGuard,
     workqueue::{
         self,
         impl_has_delayed_work,
@@ -124,6 +128,13 @@ pub(crate) struct TyrDrmDriver;
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, Ctx>;
 
+/// Interval between firmware liveness pings.
+const PING_INTERVAL_MS: u32 = 12_000;
+
+/// Time the firmware is given to acknowledge a ping before the watchdog
+/// triggers a GPU reset.
+const PING_TIMEOUT_MS: u32 = 100;
+
 /// Per-device work-slot identifiers used as the `WORK_ID` const
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
@@ -136,6 +147,8 @@ pub(crate) mod work_id {
     pub(crate) const SYNC_UPD: u64 = 3;
     /// Periodic re-arming of the scheduler tick.
     pub(crate) const PERIODIC_TICK: u64 = 4;
+    /// Firmware liveness ping watchdog.
+    pub(crate) const FW_PING: u64 = 5;
 }
 
 /// `Send + Sync` newtype around `OwnedQueue` so the cleanup
@@ -309,6 +322,10 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     periodic_tick_work: DelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }>,
 
+    /// Firmware liveness ping watchdog on `system_unbound()`.
+    #[pin]
+    fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
+
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -443,6 +460,26 @@ impl TyrDrmDeviceData {
         let _ = workqueue::system_unbound()
             .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
     }
+
+    /// Arms the firmware ping watchdog `PING_INTERVAL_MS` from now.
+    ///
+    /// Called at global-interface enable and re-arm, so the watchdog only
+    /// runs while the firmware interface is live.
+    pub(crate) fn arm_fw_ping(tdev: &ARef<TyrDrmDevice>) {
+        let _ = workqueue::system_unbound()
+            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::FW_PING }>(
+                tdev.clone(),
+                msecs_to_jiffies(PING_INTERVAL_MS),
+            );
+    }
+
+    /// Cancels the firmware ping watchdog and waits for an in-flight ping.
+    ///
+    /// Called before the firmware is halted for a suspend or reset so no
+    /// ping reaches a stopped MCU. Must run in process context.
+    pub(crate) fn cancel_fw_ping(&self) {
+        let _ = self.fw_ping_work.cancel_sync();
+    }
 }
 
 impl_has_dma_fence_work! {
@@ -459,6 +496,10 @@ kernel::impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }> for TyrDrmDeviceData { self.periodic_tick_work }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::FW_PING }> for TyrDrmDeviceData { self.fw_ping_work }
 }
 
 impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
@@ -554,6 +595,36 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         Self::schedule_tick(&this);
+    }
+}
+
+impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        let tdev = &*this;
+
+        // A reset is in progress and owns the firmware interface, so skip
+        // the ping and the re-arm. The reset path re-arms the watchdog
+        // when it re-enables the global interface.
+        if tdev.reset.in_progress() {
+            return;
+        }
+
+        // The device is runtime suspended (or a transition is in flight),
+        // so the clocks are gated and the firmware MMIO is unreachable.
+        // The resume path, or an aborted suspend, re-arms the watchdog.
+        if !tdev.pm_active() {
+            return;
+        }
+
+        if tdev.fw.ping(PING_TIMEOUT_MS).is_err() {
+            dev_err!(tdev.pdev.as_ref(), "FW ping timeout, scheduling a reset\n");
+            tdev.reset.schedule();
+            return;
+        }
+
+        Self::arm_fw_ping(&this);
     }
 }
 
@@ -674,6 +745,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
+                fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
@@ -724,6 +796,10 @@ impl platform::Driver for TyrPlatformDriverData {
             .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
         tdev.fw.enable_global_interface(&tdev)?;
 
+        // enable_global_interface armed the firmware watchdog. Cancel it if
+        // probe fails past this point so no ping outlives a failed bring-up.
+        let ping_guard = ScopeGuard::new(|| tdev.cancel_fw_ping());
+
         let scheduler = Scheduler::init(&tdev)?;
         tdev.sched.lock().enable(scheduler);
 
@@ -753,6 +829,7 @@ impl platform::Driver for TyrPlatformDriverData {
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
+        ping_guard.dismiss();
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
@@ -764,6 +841,9 @@ impl platform::Driver for TyrPlatformDriverData {
 
     fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
         this.device.reset.unbind();
+        // Cancel the watchdog after the reset worker has drained, since a
+        // reset re-arms it when it re-enables the global interface.
+        this.device.cancel_fw_ping();
         drop(this.devfreq_registration.lock().take());
     }
 }

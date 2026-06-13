@@ -112,6 +112,9 @@ fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result 
 
     if let Err(e) = devfreq::suspend(slot) {
         sched::tick::resume_after_aborted_suspend(tdev);
+        // Re-arm the ping watchdog that the aborted suspend may have left
+        // disarmed.
+        TyrDrmDeviceData::arm_fw_ping(tdev);
         return Err(e);
     }
 
@@ -122,6 +125,8 @@ fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result 
     tdev.user_mmio.lock().set_powered(tdev, false);
 
     tdev.reset.flush();
+
+    tdev.cancel_fw_ping();
 
     sched::tick::suspend(tdev);
     // Drain any worker that raced the gate before halting the hardware.
@@ -248,6 +253,13 @@ impl TyrDrmDeviceData {
     /// before the end of probe, when the device is still powered.
     pub(crate) fn pm_suspended(&self) -> bool {
         self.pm_context().is_some_and(|ctx| ctx.suspended())
+    }
+
+    /// Returns whether the recorded runtime PM state is active, i.e. the
+    /// device is powered with no transition in flight. `true` before the
+    /// end of probe, when the device is still powered.
+    pub(crate) fn pm_active(&self) -> bool {
+        self.pm_context().is_none_or(|ctx| ctx.active())
     }
 
     /// Returns whether the runtime PM callbacks have the device powered down.
