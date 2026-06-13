@@ -17,6 +17,7 @@ use kernel::{
         Registered, //
     },
     io::Io,
+    pm::PMProfile,
     prelude::*,
     sync::{
         aref::ARef,
@@ -205,7 +206,7 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn dev_query(
-        _ddev: &TyrDrmDevice<Registered>,
+        ddev: &TyrDrmDevice<Registered>,
         reg_data: &TyrDrmRegistrationData<'_>,
         devquery: &mut uapi::drm_panthor_dev_query,
         file: &TyrDrmFile,
@@ -245,6 +246,12 @@ impl TyrDrmFileData {
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_TIMESTAMP_INFO => {
                     let timestamp_frequency = 0u64;
+
+                    let _awake = match ddev.pm_context() {
+                        Some(ctx) => Some(ctx.get(PMProfile::new().auto())?),
+                        None => None,
+                    };
+
                     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
                     let current_timestamp = read_u64_no_tearing(
