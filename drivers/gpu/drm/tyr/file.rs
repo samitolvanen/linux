@@ -12,6 +12,7 @@ use kernel::{
         gem::BaseObject, //
     },
     io::Io,
+    pm::PMProfile,
     prelude::*,
     sync::{
         aref::ARef,
@@ -238,6 +239,11 @@ impl TyrDrmFileData {
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_TIMESTAMP_INFO => {
                     let timestamp_frequency = 0u64;
+
+                    let _awake = match ddev.pm_context() {
+                        Some(ctx) => Some(ctx.get(PMProfile::new().auto())?),
+                        None => None,
+                    };
 
                     // SAFETY: `ddev` is a bound device in the ioctl path.
                     let dev = unsafe { ddev.as_ref().as_bound() };
