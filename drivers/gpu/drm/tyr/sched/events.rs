@@ -43,6 +43,20 @@ struct PendingOom {
     frag_end: u32,
 }
 
+/// Result of growing a heap for a pending tiler OOM, carried from the grow
+/// phase to the firmware-write phase.
+enum GrowOutcome {
+    /// A new chunk was linked into the heap context at this GPU address.
+    /// The second field is the cookie of the grown context, used to detect
+    /// slot recycling if the chunk has to be returned.
+    Grown(u64, u64),
+    /// The heap is out of memory; ask the firmware to reclaim.
+    Reclaim,
+    /// The grow failed for an unexpected reason; the queue is marked fatal
+    /// and the firmware write is skipped.
+    Fatal,
+}
+
 kernel::impl_has_work! {
     impl HasWork<TyrDrmDevice, { work_id::TILER_OOM }> for TyrDrmDeviceData { self.tiler_oom_work }
 }
@@ -63,33 +77,39 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
             }
         };
 
-        let mut chunk_vas = KVec::new();
+        let mut outcomes = KVec::new();
         for oom in pending.iter() {
-            let chunk_va = oom
-                .group
-                .get_heap_pool()
-                .ok_or(EINVAL)
-                .and_then(|pool| {
-                    pool.grow_heap_context(
-                        tdev,
-                        heap::ContextGrowArgs {
-                            heap_gpu_va: oom.heap_address,
-                            renderpasses_in_flight: oom.vt_start.wrapping_sub(oom.frag_end),
-                            pending_frag_count: oom.vt_end.wrapping_sub(oom.frag_end),
-                        },
-                    )
-                })
-                .unwrap_or((0, 0));
+            let grow_result = oom.group.get_heap_pool().ok_or(EINVAL).and_then(|pool| {
+                pool.grow_heap_context(
+                    tdev,
+                    heap::ContextGrowArgs {
+                        heap_gpu_va: oom.heap_address,
+                        renderpasses_in_flight: oom.vt_start.wrapping_sub(oom.frag_end),
+                        pending_frag_count: oom.vt_end.wrapping_sub(oom.frag_end),
+                    },
+                )
+            });
 
-            if chunk_vas.push(chunk_va, GFP_KERNEL).is_err() {
-                pr_err!("tiler_oom_work: failed to store chunk VA\n");
+            let outcome = match grow_result {
+                Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
+                Err(e) if e == ENOMEM => GrowOutcome::Reclaim,
+                Err(_) => {
+                    oom.group
+                        .with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id as usize));
+                    TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+                    GrowOutcome::Fatal
+                }
+            };
+
+            if outcomes.push(outcome, GFP_KERNEL).is_err() {
+                pr_err!("tiler_oom_work: failed to store grow outcome\n");
                 return;
             }
         }
 
         let _ = tdev
             .with_locked_scheduler(|sched| {
-                sched.finish_pending_tiler_ooms(tdev, &pending, &chunk_vas)
+                sched.finish_pending_tiler_ooms(tdev, &pending, &outcomes)
             })
             .inspect_err(|err| {
                 pr_err!(
@@ -336,9 +356,15 @@ impl Scheduler {
         &mut self,
         tdev: &TyrDrmDevice,
         pending: &KVec<PendingOom>,
-        chunk_vas: &KVec<(u64, u64)>,
+        outcomes: &KVec<GrowOutcome>,
     ) -> Result {
         for (index, oom) in pending.iter().enumerate() {
+            let (new_chunk_va, cookie) = match outcomes.get(index).ok_or(EINVAL)? {
+                GrowOutcome::Grown(va, cookie) => (*va, *cookie),
+                GrowOutcome::Reclaim => (0, 0),
+                GrowOutcome::Fatal => continue,
+            };
+
             // The collect phase dropped the slot-manager lock so that
             // the firmware MMIO below can run without ordering
             // slot-manager ahead of fw.inner (which other paths take
@@ -352,11 +378,10 @@ impl Scheduler {
                 )
             };
             if !owned {
-                let (chunk_va, cookie) = *chunk_vas.get(index).ok_or(EINVAL)?;
-                if chunk_va != 0 {
+                if new_chunk_va != 0 {
                     if let Some(pool) = oom.group.get_heap_pool() {
                         let _ = pool
-                            .return_chunk(tdev, oom.heap_address, chunk_va, cookie)
+                            .return_chunk(tdev, oom.heap_address, new_chunk_va, cookie)
                             .inspect_err(|e| {
                                 pr_err!("tiler_oom: failed to return orphaned chunk: {:?}\n", e);
                             });
@@ -364,8 +389,6 @@ impl Scheduler {
                 }
                 continue;
             }
-
-            let (new_chunk_va, _) = *chunk_vas.get(index).ok_or(EINVAL)?;
 
             tdev.fw.with_csg_mut(oom.csg_id, |csg| {
                 {
