@@ -252,14 +252,9 @@ pub(crate) struct Group {
     /// Enqueued by `Group::schedule_term` when the tick lifecycle
     /// evicts a group whose `can_run()` is false (fatal error, user
     /// destroy, timeout). The body does not carry an outer
-    /// `Arc<Group>` reference at the end of the run cascades into
-    /// `MappedUserBo`'s drop, which in turn drops the
-    /// `VMap` that wraps the
-    /// per-queue syncwait buffer and acquires `dma_resv_lock`. An
-    /// outer signalling annotation would forbid that. The per-fence
-    /// signalling inside the body opens its own local annotation
-    /// per signal call, satisfying the dma-fence signalling-section
-    /// rules.
+    /// `Arc<Group>` reference. The per-fence signalling inside the
+    /// body opens its own local annotation per signal call,
+    /// satisfying the dma-fence signalling-section rules.
     #[pin]
     term_work: Work<Group, 1>,
     #[pin]
@@ -647,13 +642,8 @@ impl Group {
             value <= syncwait.ref_val
         };
         if satisfied {
-            // Drop the cached BO resolution in this caller's context
-            // (`sync_upd_work`, which runs on `system_unbound()`) so
-            // the next wait does a fresh gpuvm walk and we do not run
-            // `gem::MappedUserBo::drop` (which acquires
-            // `dma_resv_lock` via `shmem::VMapOwned`'s drop) from
-            // inside the dma-fence signalling annotation that wraps
-            // `Queue::set_syncwait`'s caller.
+            // Drop the cached BO resolution so the next wait does a
+            // fresh gpuvm walk.
             drop(queue.take_syncwait_bo());
         }
         Ok(satisfied)
