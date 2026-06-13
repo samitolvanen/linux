@@ -434,6 +434,42 @@ impl From<bindings::timespec64> for Timespec64 {
     }
 }
 
+impl From<Timespec64> for bindings::timespec64 {
+    fn from(ts: Timespec64) -> Self {
+        Self {
+            tv_sec: ts.tv_sec,
+            tv_nsec: ts.tv_nsec as crate::ffi::c_long,
+        }
+    }
+}
+
+impl Timespec64 {
+    /// Adjusts a monotonic time in place for the current task's time
+    /// namespace.
+    ///
+    /// `self` must hold a `CLOCK_MONOTONIC` or `CLOCK_MONOTONIC_RAW` reading.
+    /// The current time namespace offset is added to it. Without
+    /// `CONFIG_TIME_NS` this is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `current->nsproxy` is live for the whole call,
+    /// e.g. by running in the process context of a task that has not passed
+    /// `exit_nsproxy_namespaces()`. Under `CONFIG_TIME_NS` the helper
+    /// dereferences `current->nsproxy->time_ns`, which `do_exit()` clears
+    /// while the task still runs.
+    #[inline]
+    pub unsafe fn add_monotonic(&mut self) {
+        let mut ts = bindings::timespec64::from(*self);
+        // SAFETY: `ts` is a valid, owned stack `timespec64` that the helper
+        // reads and writes through the pointer only for the duration of the
+        // call. The caller guarantees a live `current->nsproxy`, which the
+        // helper dereferences under `CONFIG_TIME_NS`.
+        unsafe { bindings::timens_add_monotonic(&mut ts) };
+        *self = ts.into();
+    }
+}
+
 /// Returns the current `CLOCK_MONOTONIC` time as a [`Timespec64`].
 #[inline]
 pub fn ktime_get_ts64() -> Timespec64 {
