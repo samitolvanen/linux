@@ -381,7 +381,7 @@ impl Pool {
         &self,
         tdev: &TyrDrmDevice,
         args: ContextGrowArgs,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         let _ = args.pending_frag_count;
 
         let offset = args.heap_gpu_va - self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
@@ -441,6 +441,52 @@ impl Pool {
         let chunk_bo = heap_ctx.chunks.first().ok_or(EINVAL)?;
         let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
 
-        Ok((chunk_start & CHUNK_SIZE_MASK) | (chunk_bo.size() as u64 >> 12))
+        Ok((
+            (chunk_start & CHUNK_SIZE_MASK) | (chunk_bo.size() as u64 >> 12),
+            cookie,
+        ))
+    }
+
+    pub(crate) fn return_chunk(
+        &self,
+        tdev: &TyrDrmDevice,
+        heap_gpu_va: u64,
+        chunk_gpu_va: u64,
+        cookie: u64,
+    ) -> Result {
+        let offset = heap_gpu_va - self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
+        let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
+        let index = offset / tdev.gpu_info.heap_context_stride();
+
+        let xa = self.xa.as_ref();
+        let removed = {
+            let mut guard = xa.lock();
+            let heap_ctx = guard.get_mut(index as usize).ok_or(EINVAL)?;
+
+            // The slot-manager lock was dropped between growing the chunk
+            // and returning it, so this index may now hold a different
+            // context. The cookie identifies the original, so we bail
+            // rather than remove a chunk from the wrong context.
+            if heap_ctx.cookie != cookie {
+                return Err(EINVAL);
+            }
+
+            let pos = heap_ctx
+                .chunks
+                .iter()
+                .position(|bo| {
+                    bo.kernel_va()
+                        .map(|va| va.start & CHUNK_SIZE_MASK == chunk_gpu_va & CHUNK_SIZE_MASK)
+                        .unwrap_or(false)
+                })
+                .ok_or(EINVAL)?;
+            heap_ctx.chunks.remove(pos).map_err(|_| EINVAL)?
+        };
+
+        // Drop the removed chunk after the XArray spinlock is released,
+        // because dropping the BO may run cleanup that takes the VM mutex.
+        drop(removed);
+
+        Ok(())
     }
 }
