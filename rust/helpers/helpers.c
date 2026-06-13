@@ -83,6 +83,7 @@
 #include "platform.c"
 #include "pm_runtime.c"
 #include "poll.c"
+#include "preempt.c"
 #include "processor.c"
 #include "property.c"
 #include "pwm.c"
