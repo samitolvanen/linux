@@ -11,6 +11,7 @@ pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
 pub mod job_queue;
+pub mod printer;
 pub mod syncobj;
 
 pub use self::device::Device;
