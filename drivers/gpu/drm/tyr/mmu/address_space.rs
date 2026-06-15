@@ -394,9 +394,10 @@ impl AddressSpaceManager {
     fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>) -> Result {
         self.validate_as_slot(as_nr)?;
 
-        // Avoid both an empty range and an inverted range.
-        if region.start >= region.end {
-            return Err(EINVAL);
+        // An empty region locks nothing. `region.end - 1` below would
+        // underflow.
+        if region.is_empty() {
+            return Ok(());
         }
 
         // The lock operates on full 64-byte cache lines of translation table entries.
@@ -552,6 +553,10 @@ impl SlotOperations<MAX_AS> for AddressSpaceManager {
 impl AsSlotManager {
     /// Locks a region for translation table updates if the VM has an active slot.
     pub(super) fn start_vm_update(&mut self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
+        if region.is_empty() {
+            return Ok(());
+        }
+
         let seat = vm_as_data.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {
@@ -563,7 +568,11 @@ impl AsSlotManager {
     }
 
     /// Completes translation table updates and unlocks the region.
-    pub(super) fn end_vm_update(&mut self, vm_as_data: &VmAsData) -> Result {
+    pub(super) fn end_vm_update(&mut self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
+        if region.is_empty() {
+            return Ok(());
+        }
+
         let seat = vm_as_data.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {
