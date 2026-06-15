@@ -1,0 +1,10 @@
+What:		/sys/bus/platform/drivers/tyr/.../profiling
+Date:		July 2026
+KernelVersion:	7.3
+Contact:	Sami Tolvanen <samitolvanen@google.com>
+Description:
+		Bitmask to enable drm fdinfo's job profiling measurements.
+		Valid values are:
+		0: Don't enable fdinfo job profiling sources.
+		1: Enable GPU cycle measurements for running jobs.
+		2: Enable GPU timestamp sampling for running jobs.
