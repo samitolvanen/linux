@@ -19,13 +19,14 @@ use kernel::{
         ListLinks,
         TryNewListArc, //
     },
-    new_mutex,
+    new_mutex, new_spinlock,
     prelude::*,
     sync::{
         aref::ARef,
         Arc,
         LockedBy,
-        Mutex, //
+        Mutex,
+        SpinLock, //
     },
     uaccess::UserSlice,
     uapi,
@@ -110,6 +111,18 @@ pub(crate) struct GroupStatus {
     pub(crate) has_blocked_queues: bool,
     /// CSG slot id when the group is bound, otherwise `None`.
     pub(crate) csg_id: Option<usize>,
+}
+
+/// Accumulated GPU usage for a group, exposed through fdinfo.
+///
+/// Filled in by the job completion path from the per-job profiling
+/// samples and drained into the per-file stats at fdinfo show time.
+#[derive(Default)]
+pub(crate) struct FdInfo {
+    /// Accumulated GPU cycles across completed jobs.
+    pub(crate) cycles: u64,
+    /// Accumulated GPU time in timestamp units across completed jobs.
+    pub(crate) time: u64,
 }
 
 /// The mutable scheduler-visible state for a `Group`.
@@ -331,6 +344,13 @@ pub(crate) struct Group {
     _syncobjs: Arc<gem::MappedBo>,
     #[pin]
     heap_pool: Mutex<Option<Arc<heap::Pool>>>,
+    /// Accumulated GPU usage, filled by the job completion path.
+    ///
+    /// A spinlock, not a mutex, because the accumulation runs inside the
+    /// dma-fence signalling section of the completion path, which may not
+    /// sleep.
+    #[pin]
+    fdinfo: SpinLock<FdInfo>,
 }
 
 impl_list_arc_safe! {
@@ -482,6 +502,7 @@ impl Group {
                 protm_suspend_buf,
                 _syncobjs: syncobjs,
                 heap_pool <- new_mutex!(file.inner().heap_pools().get_pool(group_args.vm_id as usize)),
+                fdinfo <- new_spinlock!(FdInfo::default()),
             }),
             GFP_KERNEL,
         )
@@ -775,6 +796,16 @@ impl Group {
         syncs::SyncObj64b::write(&self._syncobjs, self.syncobj_offset(queue_index)?, value)
     }
 
+    /// Adds GPU usage deltas to the group's fdinfo accumulator.
+    ///
+    /// Spinlock-only and allocation-free, so it is safe to call from the
+    /// dma-fence signalling section of the job completion path.
+    pub(in crate::sched) fn accumulate_fdinfo(&self, cycles: u64, time: u64) {
+        let mut fdinfo = self.fdinfo.lock();
+        fdinfo.cycles = fdinfo.cycles.wrapping_add(cycles);
+        fdinfo.time = fdinfo.time.wrapping_add(time);
+    }
+
     pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
         *self.heap_pool.lock() = Some(pool);
     }
@@ -795,7 +826,8 @@ impl Group {
 
         let jobs = Job::from_queue_submits(queue_submits)?;
         let job_count = jobs.len();
-        let mut ctx = deps::Context::new(file, SubmitOps::new(self.clone()));
+        let mut ctx =
+            deps::Context::new(file, SubmitOps::new(self.clone(), self.tdev.profile_mask()));
 
         for (job, syncs) in jobs.into_iter() {
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
@@ -841,11 +873,17 @@ struct PreparedSubmit {
 /// Runs the jobs of a group submit through `deps::Context`.
 struct SubmitOps {
     group: Arc<Group>,
+    /// Device profile mask snapshotted at submit time and baked into
+    /// every wrapped stream this batch prepares.
+    profile_mask: u32,
 }
 
 impl SubmitOps {
-    fn new(group: Arc<Group>) -> Self {
-        Self { group }
+    fn new(group: Arc<Group>, profile_mask: u32) -> Self {
+        Self {
+            group,
+            profile_mask,
+        }
     }
 }
 
@@ -865,21 +903,44 @@ impl deps::BatchOps for SubmitOps {
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
         let has_stream = job.has_stream();
 
+        let profiling = self.profile_mask != 0;
         let reservation = if has_stream {
-            Some(queue.reserve_pending_submit_fence()?)
+            Some(queue.reserve_pending_submit_fence(profiling)?)
         } else {
             None
         };
 
-        let wrapped = if has_stream {
+        // The reservation carries the profiling slot, so a failed prepare
+        // returns it and no two in-flight jobs ever share a slot. The slot
+        // GPU address is baked into the wrapped stream below. A stream-less
+        // job emits no GPU work and no samples, so it carries no slot.
+        let (wrapped, profiling_mask) = if has_stream {
             let sync_va = self.group.syncobj_va(queue_index)?;
-            job.build_wrapped_stream(&self.group, sync_va)?
+            let profiling_slot = reservation.as_ref().and_then(|r| r.profiling_slot());
+            let profiling_mask = if profiling_slot.is_some() {
+                self.profile_mask
+            } else {
+                0
+            };
+            let profiling_va = match profiling_slot {
+                Some(slot) => queue.profiling_slot_va(slot)?,
+                None => 0,
+            };
+            let wrapped =
+                job.build_wrapped_stream(&self.group, sync_va, profiling_va, profiling_mask)?;
+            (wrapped, profiling_mask)
         } else {
-            KVec::new()
+            (KVec::new(), 0)
         };
 
         let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, self.group.clone(), queue_index, reservation),
+            QueueJob::new(
+                wrapped,
+                self.group.clone(),
+                queue_index,
+                profiling_mask,
+                reservation,
+            ),
             deps,
             extra_dep_capacity,
         )?;
