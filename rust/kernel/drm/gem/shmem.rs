@@ -141,6 +141,23 @@ impl<T: DriverObject> Object<T> {
         self.obj.get()
     }
 
+    /// Returns whether the object's backing pages are currently present, i.e.
+    /// [`drm_gem_shmem_object::pages`] is non-NULL.
+    ///
+    /// This is a lockless read. The value may change concurrently, so a stale
+    /// result is possible. That is acceptable for the fdinfo memory accounting
+    /// this serves, where the read must not sleep or take a lock.
+    ///
+    /// [`drm_gem_shmem_object::pages`]: srctree/include/drm/drm_gem_shmem_helper.h
+    #[inline]
+    pub fn pages_present(&self) -> bool {
+        let shmem = self.as_raw_shmem();
+
+        // SAFETY: `shmem` points to the embedded `drm_gem_shmem_object`, which
+        // is valid for the lifetime of `self` per the type invariant.
+        !unsafe { (*shmem).pages }.is_null()
+    }
+
     /// Create a new shmem-backed DRM object of the given size.
     ///
     /// Additional config options can be specified using `config`.
