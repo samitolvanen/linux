@@ -204,12 +204,15 @@ pub(crate) fn init(
         None,
         opp::SearchType::Floor,
     ) {
-        Ok(opp) => dev_info!(
-            pdev,
-            "Max performance: {} Hz @ {} uV\n",
-            c_ulong::from(opp.freq(None)),
-            c_ulong::from(opp.voltage())
-        ),
+        Ok(opp) => {
+            tdev.set_max_freq(c_ulong::from(opp.freq(None)) as u64);
+            dev_info!(
+                pdev,
+                "Max performance: {} Hz @ {} uV\n",
+                c_ulong::from(opp.freq(None)),
+                c_ulong::from(opp.voltage())
+            );
+        }
         Err(e) => dev_info!(pdev, "Failed to get max OPP: {:?}\n", e),
     }
 

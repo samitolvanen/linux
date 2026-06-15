@@ -72,8 +72,10 @@ use kernel::{
         SetOnce, //
     },
     time::{
+        arch_timer_get_rate,
         msecs_to_jiffies,
-        Jiffies, //
+        Jiffies,
+        NSEC_PER_SEC, //
     },
     types::ScopeGuard,
     workqueue::{
@@ -147,6 +149,9 @@ pub(crate) const DEVICE_PROFILING_CYCLES: u32 = 1 << 0;
 /// `TyrDrmDeviceData::profile_mask` bit selecting GPU timestamp
 /// sampling around each job.
 pub(crate) const DEVICE_PROFILING_TIMESTAMP: u32 = 1 << 1;
+/// All profiling bits, used to decide whether any per-group samples
+/// need draining at fdinfo show time.
+pub(crate) const DEVICE_PROFILING_ALL: u32 = DEVICE_PROFILING_CYCLES | DEVICE_PROFILING_TIMESTAMP;
 
 /// Interval between firmware liveness pings.
 const PING_INTERVAL_MS: u32 = 12_000;
@@ -366,6 +371,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// wrapped command stream. `0` (the default) disables profiling.
     profile_mask: Atomic<u32>,
 
+    /// Maximum GPU frequency in Hz, reported as `drm-maxfreq-panthor` in
+    /// fdinfo. Captured from the floor-of-max OPP at devfreq setup, after
+    /// the device data is finalized, so it needs the atomic. `0` until then.
+    max_freq: Atomic<u64>,
+
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -419,6 +429,16 @@ impl TyrDrmDeviceData {
     /// Sets the device-wide job profiling enablement bitmask.
     pub(crate) fn set_profile_mask(&self, mask: u32) {
         self.profile_mask.store(mask, Relaxed);
+    }
+
+    /// Returns the maximum GPU frequency in Hz.
+    pub(crate) fn max_freq(&self) -> u64 {
+        self.max_freq.load(Relaxed)
+    }
+
+    /// Sets the maximum GPU frequency in Hz.
+    pub(crate) fn set_max_freq(&self, hz: u64) {
+        self.max_freq.store(hz, Relaxed);
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -833,6 +853,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 profile_mask: Atomic::new(0),
+                max_freq: Atomic::new(0),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
@@ -1004,6 +1025,49 @@ impl drm::Driver for TyrDrmDriver {
         Self: Sized,
     {
         crate::mmap::mmap(device, &file.inner(), vma)
+    }
+
+    fn show_fdinfo(
+        device: &TyrDrmDevice,
+        printer: &drm::printer::Printer,
+        file: &drm::File<TyrDrmFileData>,
+    ) where
+        Self: Sized,
+    {
+        use kernel::drm::printer::drm_printf;
+
+        let inner = file.inner();
+        let profile_mask = device.profile_mask();
+
+        if profile_mask & DEVICE_PROFILING_ALL != 0 {
+            inner.gather_group_samples();
+        }
+
+        let stats = inner.stats_snapshot();
+
+        if profile_mask & DEVICE_PROFILING_TIMESTAMP != 0 {
+            if let Some(rate) = arch_timer_get_rate() {
+                drm_printf!(
+                    printer,
+                    "drm-engine-panthor:\t{} ns\n",
+                    u64::div_ceil(
+                        stats.time.saturating_mul(NSEC_PER_SEC as u64),
+                        u64::from(rate)
+                    )
+                );
+            }
+        }
+
+        if profile_mask & DEVICE_PROFILING_CYCLES != 0 {
+            drm_printf!(printer, "drm-cycles-panthor:\t{}\n", stats.cycles);
+        }
+
+        drm_printf!(printer, "drm-maxfreq-panthor:\t{} Hz\n", device.max_freq());
+        drm_printf!(
+            printer,
+            "drm-curfreq-panthor:\t{} Hz\n",
+            device.devfreq_data.current_frequency.load(Relaxed)
+        );
     }
 }
 
