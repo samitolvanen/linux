@@ -1068,6 +1068,11 @@ impl drm::Driver for TyrDrmDriver {
             "drm-curfreq-panthor:\t{} Hz\n",
             device.devfreq_data.current_frequency.load(Relaxed)
         );
+
+        let mem = inner.gather_mem_info();
+        printer.fdinfo_print_size(c"panthor", c"resident", c"memory", mem.resident);
+        printer.fdinfo_print_size(c"panthor", c"active", c"memory", mem.active);
+        file.show_memory_stats(printer);
     }
 }
 

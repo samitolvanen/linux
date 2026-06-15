@@ -172,6 +172,13 @@ pub(crate) struct Stats {
     pub(crate) time: u64,
 }
 
+/// GPU memory footprint for a file, exposed through fdinfo.
+#[derive(Default)]
+pub(crate) struct MemoryStats {
+    pub(crate) resident: u64,
+    pub(crate) active: u64,
+}
+
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
@@ -260,6 +267,33 @@ impl TyrDrmFileData {
     /// Returns a snapshot of the file's accumulated GPU usage.
     pub(crate) fn stats_snapshot(&self) -> Stats {
         *self.stats.lock()
+    }
+
+    /// Collects the file's GPU memory footprint.
+    ///
+    /// Resident sums each group's kernel BOs and every VM's tiler-heap
+    /// pool. Active counts the groups on a CSG slot and the heap pools
+    /// whose VM holds an address-space slot.
+    pub(crate) fn gather_mem_info(self: Pin<&Self>) -> MemoryStats {
+        let mut stats = MemoryStats::default();
+        self.group_pool().gather_mem_info(&mut stats);
+
+        for vm_id in 1..self.vm_pool().index_upper_bound() {
+            if let Some(pool) = self.heap_pools().get_pool(vm_id) {
+                let size = pool.total_size() as u64;
+                stats.resident += size;
+                if self
+                    .vm_pool()
+                    .get_vm(vm_id)
+                    .and_then(|vm| vm.as_slot())
+                    .is_some()
+                {
+                    stats.active += size;
+                }
+            }
+        }
+
+        stats
     }
 
     pub(crate) fn dev_query(
