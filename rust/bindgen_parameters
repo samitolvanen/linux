@@ -35,6 +35,8 @@
 --with-attribute-custom-enum=irqreturn='#[cfi_encoding="9irqreturn"]'
 --newtype-enum lru_status
 --with-attribute-custom-enum=lru_status='#[cfi_encoding="10lru_status"]'
+--newtype-enum drm_gem_object_status
+--with-attribute-custom-enum=drm_gem_object_status='#[cfi_encoding="21drm_gem_object_status"]'
 
 # `seccomp`'s comment gets understood as a doctest
 --no-doc-comments
