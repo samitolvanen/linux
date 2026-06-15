@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::fmt::Write;
+
 use kernel::{
+    bindings,
     clk::{
         Clk,
         OptionalClk, //
@@ -25,13 +28,18 @@ use kernel::{
     },
     drm,
     drm::ioctl,
+    error::to_result,
     io::mem::DevresIoMem,
     irq::ThreadedRegistration,
     mm::virt::VmaNew,
     new_mutex,
     new_spinlock,
     of,
-    platform,
+    platform::{
+        self,
+        AttributeGroups,
+        DeviceAttribute, //
+    },
     pm::{
         self,
         PMConfig,
@@ -42,6 +50,7 @@ use kernel::{
     prelude::*,
     regulator,
     sizes::SZ_2M,
+    str::Formatter,
     sync::{
         aref::ARef,
         atomic::{
@@ -156,6 +165,8 @@ pub(crate) const DEVICE_PROFILING_CYCLES: u32 = 1 << 0;
 /// `TyrDrmDeviceData::profile_mask` bit selecting GPU timestamp
 /// sampling around each job.
 pub(crate) const DEVICE_PROFILING_TIMESTAMP: u32 = 1 << 1;
+/// All profiling bits.
+pub(crate) const DEVICE_PROFILING_ALL: u32 = DEVICE_PROFILING_CYCLES | DEVICE_PROFILING_TIMESTAMP;
 
 /// Interval between firmware liveness pings.
 const PING_INTERVAL_MS: u32 = 12_000;
@@ -375,6 +386,11 @@ impl TyrDrmDeviceData {
     /// Returns the device-wide job profiling enablement bitmask.
     pub(crate) fn profile_mask(&self) -> u32 {
         self.profile_mask.load(Relaxed)
+    }
+
+    /// Sets the device-wide job profiling enablement bitmask.
+    pub(crate) fn set_profile_mask(&self, mask: u32) {
+        self.profile_mask.store(mask, Relaxed);
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -823,6 +839,40 @@ kernel::of_device_table!(
     ]
 );
 
+struct ProfilingAttr;
+
+impl DeviceAttribute for ProfilingAttr {
+    type Driver = TyrPlatformDriver;
+    const NAME: &'static CStr = c"profiling";
+
+    fn show(
+        _dev: &device::Device<Bound>,
+        data: Pin<&TyrPlatformDriverData<'_>>,
+        writer: &mut Formatter<'_>,
+    ) -> Result {
+        writeln!(writer, "{}", data.reg.device().profile_mask())?;
+        Ok(())
+    }
+
+    fn store(
+        _dev: &device::Device<Bound>,
+        data: Pin<&TyrPlatformDriverData<'_>>,
+        buf: &CStr,
+    ) -> Result {
+        let mut value = 0;
+        // SAFETY: `buf` is a NUL-terminated string that outlives the call, and
+        // `value` is a live `u32` that `kstrtouint()` may write.
+        to_result(unsafe { bindings::kstrtouint(buf.as_char_ptr(), 0, &mut value) })?;
+        if value & !DEVICE_PROFILING_ALL != 0 {
+            return Err(EINVAL);
+        }
+        data.reg.device().set_profile_mask(value);
+        Ok(())
+    }
+}
+
+kernel::device_attribute_groups!(TYR_GROUPS, TyrPlatformDriver, [ProfilingAttr]);
+
 static PM_OPS: pm::DevPMOps<platform::Adapter<TyrPlatformDriver>, TyrPmOps> =
     pm::DevPMOps::for_driver();
 
@@ -831,6 +881,7 @@ impl platform::Driver for TyrPlatformDriver {
     type Data<'bound> = TyrPlatformDriverData<'bound>;
     type PmOps = TyrPmOps;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+    const DEV_GROUPS: Option<&'static dyn AttributeGroups<Self>> = Some(&TYR_GROUPS);
 
     fn dev_pm_ops() -> Option<&'static pm::DevPMOps<platform::Adapter<Self>, Self::PmOps>> {
         Some(&PM_OPS)
