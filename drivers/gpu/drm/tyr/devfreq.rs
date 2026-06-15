@@ -14,6 +14,7 @@ use kernel::{
         Device, //
     },
     kvec,
+    num::casts::FromSafeCast,
     opp,
     prelude::*,
     regulator,
@@ -242,12 +243,15 @@ pub(crate) fn init(
         None,
         opp::SearchType::Floor,
     ) {
-        Ok(opp) => dev_info!(
-            pdev,
-            "Max performance: {} Hz @ {} uV\n",
-            c_ulong::from(opp.freq(None)),
-            c_ulong::from(opp.voltage())
-        ),
+        Ok(opp) => {
+            tdev.set_max_freq(u64::from_safe_cast(c_ulong::from(opp.freq(None))));
+            dev_info!(
+                pdev,
+                "Max performance: {} Hz @ {} uV\n",
+                c_ulong::from(opp.freq(None)),
+                c_ulong::from(opp.voltage())
+            );
+        }
         Err(e) => dev_info!(pdev, "Failed to get max OPP: {:?}\n", e),
     }
 
@@ -319,4 +323,15 @@ pub(crate) fn suspend(slot: Option<&DevfreqSlot>) -> Result {
 /// Resumes the devfreq governor after a runtime resume.
 pub(crate) fn resume(slot: Option<&DevfreqSlot>) -> Result {
     with_devfreq(slot, |devfreq| devfreq.resume_device())
+}
+
+/// Returns the core clock rate in Hz, or zero without devfreq or after unbind.
+pub(crate) fn cur_freq(tdev: &TyrDrmDevice) -> c_ulong {
+    if tdev.devfreq_data.opp_table.lock().is_none() {
+        return 0;
+    }
+
+    tdev.registration_guard().map_or(0, |guard| {
+        guard.registration_data_with(|reg_data| reg_data.clks.lock().core.rate().as_hz())
+    })
 }
