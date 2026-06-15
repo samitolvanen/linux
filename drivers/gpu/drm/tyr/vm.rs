@@ -200,6 +200,13 @@ impl Pool {
         self.entries.get(index)
     }
 
+    pub(crate) fn for_each<F>(&self, f: F) -> Result
+    where
+        F: FnMut(usize, Arc<Vm>) -> Result,
+    {
+        self.entries.for_each(f)
+    }
+
     pub(crate) fn get_vm_state(&self, vmgetstate: &mut uapi::drm_panthor_vm_get_state) -> Result {
         let vm = self.get_vm(vmgetstate.vm_id as usize).ok_or(EINVAL)?;
 
