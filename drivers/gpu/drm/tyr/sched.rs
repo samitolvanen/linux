@@ -1269,7 +1269,7 @@ impl Scheduler {
             };
             for (queue_idx, queue) in group.queues.iter().enumerate() {
                 match group.read_syncobj(queue_idx) {
-                    Ok(syncobj) => queue.complete_submit_fences(syncobj.seqno),
+                    Ok(syncobj) => queue.complete_submit_fences(group, syncobj.seqno),
                     Err(err) => pr_err!(
                         "sync_upd: queue completion drain failed: {}\n",
                         err.to_errno()

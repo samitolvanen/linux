@@ -49,7 +49,10 @@ use kernel::{
     sizes::SZ_2M,
     sync::{
         aref::ARef,
-        atomic::Atomic,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         Mutex,
         SetOnce, //
@@ -123,6 +126,13 @@ pub(crate) struct TyrDrmDriver;
 
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, Ctx>;
+
+/// `TyrDrmDeviceData::profile_mask` bit selecting GPU cycle-count
+/// sampling around each job.
+pub(crate) const DEVICE_PROFILING_CYCLES: u32 = 1 << 0;
+/// `TyrDrmDeviceData::profile_mask` bit selecting GPU timestamp
+/// sampling around each job.
+pub(crate) const DEVICE_PROFILING_TIMESTAMP: u32 = 1 << 1;
 
 /// Interval between firmware liveness pings.
 const PING_INTERVAL_MS: u32 = 12_000;
@@ -337,6 +347,11 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
 
+    /// Device-wide job profiling enablement bitmask, a combination of
+    /// `DEVICE_PROFILING_*`. Read at job submit time and baked into the
+    /// wrapped command stream. `0` (the default) disables profiling.
+    profile_mask: Atomic<u32>,
+
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -380,6 +395,11 @@ impl TyrDrmDeviceData {
     {
         let mut sched = self.sched.lock();
         f(sched.enabled_mut()?)
+    }
+
+    /// Returns the device-wide job profiling enablement bitmask.
+    pub(crate) fn profile_mask(&self) -> u32 {
+        self.profile_mask.load(Relaxed)
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -768,6 +788,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
+                profile_mask: Atomic::new(0),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
