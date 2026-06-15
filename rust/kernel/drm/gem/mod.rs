@@ -84,6 +84,62 @@ pub type DriverFile<T> = drm::File<<<T as DriverObject>::Driver as drm::Driver>:
 pub type DriverAllocImpl<T, Ctx = Registered> =
     <<T as DriverObject>::Driver as drm::Driver>::Object<Ctx>;
 
+/// The state of a GEM object, as reported to fdinfo.
+///
+/// Mirrors `enum drm_gem_object_status`. Flags can be combined with the `|`,
+/// `&`, and `!` operators. The empty set is the default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStatus(c_int);
+
+impl ObjectStatus {
+    /// The object is resident in memory (i.e. not unpinned).
+    pub const RESIDENT: ObjectStatus =
+        ObjectStatus(bindings::drm_gem_object_status::DRM_GEM_OBJECT_RESIDENT.0);
+
+    /// The object is marked as purgeable by userspace.
+    pub const PURGEABLE: ObjectStatus =
+        ObjectStatus(bindings::drm_gem_object_status::DRM_GEM_OBJECT_PURGEABLE.0);
+
+    /// The object is in use by an active submission.
+    pub const ACTIVE: ObjectStatus =
+        ObjectStatus(bindings::drm_gem_object_status::DRM_GEM_OBJECT_ACTIVE.0);
+
+    /// Returns the empty set of flags.
+    pub const fn empty() -> ObjectStatus {
+        ObjectStatus(0)
+    }
+
+    /// Returns whether all of the flags in `flags` are set in `self`.
+    pub fn contains(self, flags: ObjectStatus) -> bool {
+        (self & flags) == flags
+    }
+
+    pub(crate) fn as_raw(self) -> bindings::drm_gem_object_status {
+        bindings::drm_gem_object_status(self.0)
+    }
+}
+
+impl core::ops::BitOr for ObjectStatus {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitAnd for ObjectStatus {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl core::ops::Not for ObjectStatus {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        Self(!self.0)
+    }
+}
+
 /// GEM object functions, which must be implemented by drivers.
 pub trait DriverObject: Sync + Send + Sized {
     /// Parent `Driver` for this object.
@@ -115,6 +171,15 @@ pub trait DriverObject: Sync + Send + Sized {
 
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &DriverAllocImpl<Self>, _file: &DriverFile<Self>) {}
+
+    /// Report the state of the object for fdinfo memory accounting.
+    ///
+    /// Called by `drm_show_memory_stats` while holding `file->table_lock`, so
+    /// the implementation runs in atomic context and must not sleep, allocate,
+    /// or acquire any locks.
+    fn status(_obj: &DriverAllocImpl<Self>) -> ObjectStatus {
+        ObjectStatus::empty()
+    }
 
     /// Called when userspace exports the object to a dma-buf.
     ///
@@ -195,6 +260,16 @@ extern "C" fn close_callback<T: DriverObject>(
     let obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
 
     T::close(obj, file);
+}
+
+pub(crate) extern "C" fn status_callback<T: DriverObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+) -> bindings::drm_gem_object_status {
+    // SAFETY: `status_callback` is installed in `OBJECT_FUNCS` (`drm_gem_object_funcs`) for
+    // `Object<T>`, so `raw_obj` is always contained within an `Object<T>`.
+    let obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+    T::status(obj).as_raw()
 }
 
 extern "C" fn export_callback<T: DriverObject>(
@@ -340,7 +415,7 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
         vmap: None,
         vunmap: None,
         mmap: None,
-        status: None,
+        status: Some(status_callback::<T>),
         vm_ops: core::ptr::null_mut(),
         evict: None,
         rss: None,
