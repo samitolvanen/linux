@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::fmt::Write;
+use core::num::NonZero;
 
 use kernel::{
     bindings,
@@ -28,9 +29,11 @@ use kernel::{
     },
     drm,
     drm::ioctl,
+    drm::printer::drm_printf,
     error::to_result,
     io::mem::DevresIoMem,
     irq::ThreadedRegistration,
+    math64::div_u64_rem,
     mm::virt::VmaNew,
     new_mutex,
     new_spinlock,
@@ -68,8 +71,10 @@ use kernel::{
         SpinLock, //
     },
     time::{
+        arch_timer_get_rate,
         msecs_to_jiffies,
-        Jiffies, //
+        Jiffies,
+        NSEC_PER_SEC, //
     },
     types::ScopeGuard,
     workqueue::{
@@ -334,6 +339,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// wrapped command stream. `0` (the default) disables profiling.
     profile_mask: Atomic<u32>,
 
+    /// Maximum GPU frequency in Hz, reported as `drm-maxfreq-panthor` in
+    /// fdinfo. Captured from the floor-of-max OPP at devfreq setup, after
+    /// the device data is finalized, so it needs the atomic. `0` until then.
+    max_freq: Atomic<u64>,
+
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -396,6 +406,16 @@ impl TyrDrmDeviceData {
     /// Sets the device-wide job profiling enablement bitmask.
     pub(crate) fn set_profile_mask(&self, mask: u32) {
         self.profile_mask.store(mask, Relaxed);
+    }
+
+    /// Returns the maximum GPU frequency in Hz.
+    pub(crate) fn max_freq(&self) -> u64 {
+        self.max_freq.load(Relaxed)
+    }
+
+    /// Sets the maximum GPU frequency in Hz.
+    pub(crate) fn set_max_freq(&self, hz: u64) {
+        self.max_freq.store(hz, Relaxed);
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -1000,6 +1020,7 @@ impl platform::Driver for TyrPlatformDriver {
                 work_gate_closed <- new_spinlock!(false),
                 unbind_halted <- Completion::new(),
                 profile_mask: Atomic::new(0),
+                max_freq: Atomic::new(0),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
@@ -1262,6 +1283,46 @@ impl drm::Driver for TyrDrmDriver {
         Self: Sized,
     {
         mmap::mmap(device, &file.inner(), vma)
+    }
+
+    fn show_fdinfo(
+        device: &TyrDrmDevice,
+        printer: &drm::printer::Printer,
+        file: &drm::File<TyrDrmFileData>,
+    ) where
+        Self: Sized,
+    {
+        let inner = file.inner();
+        let profile_mask = device.profile_mask();
+
+        if profile_mask & DEVICE_PROFILING_ALL != 0 {
+            inner.gather_group_samples();
+        }
+
+        let stats = inner.stats_snapshot();
+
+        if profile_mask & DEVICE_PROFILING_TIMESTAMP != 0 {
+            if let Some(rate) = arch_timer_get_rate().and_then(NonZero::new) {
+                let nsec_per_sec = NSEC_PER_SEC as u64;
+                let (secs, rem) = div_u64_rem(stats.time, rate);
+                let (frac, frac_rem) = div_u64_rem(u64::from(rem) * nsec_per_sec, rate);
+                let ns = secs
+                    .saturating_mul(nsec_per_sec)
+                    .saturating_add(frac + u64::from(frac_rem != 0));
+                drm_printf!(printer, "drm-engine-panthor:\t{} ns\n", ns);
+            }
+        }
+
+        if profile_mask & DEVICE_PROFILING_CYCLES != 0 {
+            drm_printf!(printer, "drm-cycles-panthor:\t{}\n", stats.cycles);
+        }
+
+        drm_printf!(printer, "drm-maxfreq-panthor:\t{} Hz\n", device.max_freq());
+        drm_printf!(
+            printer,
+            "drm-curfreq-panthor:\t{} Hz\n",
+            device.devfreq_data.current_frequency.load(Relaxed)
+        );
     }
 }
 
