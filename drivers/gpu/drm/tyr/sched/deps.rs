@@ -261,15 +261,17 @@ pub(crate) struct PreparedJob<'a, T: JobQueueOps + Send + Sync> {
 }
 
 impl<'a, T: JobQueueOps + Send + Sync> PreparedJob<'a, T> {
-    /// Creates the job for `data` on `queue` behind `deps`, and allocates
-    /// the memory for `extra_dep_capacity` more dependencies.
+    /// Creates the job for `data` on `queue` behind `deps`, taking `cost` of
+    /// the queue's credits, and allocates the memory for `extra_dep_capacity`
+    /// more dependencies.
     pub(crate) fn new(
         queue: &'a JobQueue<T>,
+        cost: u32,
         data: T::JobDataType,
         deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
     ) -> Result<Self> {
-        let mut job = queue.new_job(1, data)?;
+        let mut job = queue.new_job(cost, data)?;
         for fence in deps {
             job.add_dependency(fence)?;
         }

@@ -1416,7 +1416,7 @@ impl Vm {
             job,
             vm: self.clone(),
         };
-        PreparedJob::new(self.bind_queue()?, data, deps, extra_dep_capacity)
+        PreparedJob::new(self.bind_queue()?, 1, data, deps, extra_dep_capacity)
     }
 
     pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob<'_>) -> ARef<Fence> {
