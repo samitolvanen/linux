@@ -205,9 +205,38 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         }
     }
 
+    /// Custom `show_fdinfo` handler that calls into `Driver::show_fdinfo`.
+    ///
+    /// # Safety
+    ///
+    /// - `p` must be a valid pointer to a `struct drm_printer`.
+    /// - `f` must be a valid pointer to a `struct drm_file` whose `minor->dev`
+    ///   is embedded in a `Device<T>`.
+    unsafe extern "C" fn show_fdinfo_callback(
+        p: *mut bindings::drm_printer,
+        f: *mut bindings::drm_file,
+    ) {
+        // SAFETY: The caller guarantees `f` is valid for this call.
+        let file = unsafe { drm::file::File::<T::File>::from_raw(f) };
+
+        // SAFETY: `f` is valid, so `minor` is valid.
+        let raw_device = unsafe { (*(*f).minor).dev };
+
+        // SAFETY: The device is valid for the lifetime of the file.
+        let device = unsafe { Device::<T>::from_raw(raw_device) };
+
+        // SAFETY: The caller guarantees `p` is valid for this call.
+        let printer = unsafe { drm::printer::Printer::from_raw(p) };
+
+        T::show_fdinfo(device, printer, file);
+    }
+
     const GEM_FOPS: bindings::file_operations = {
         let mut fops = drm::gem::create_fops();
         fops.mmap = Some(Self::mmap_callback);
+        if T::HAS_SHOW_FDINFO {
+            fops.show_fdinfo = Some(bindings::drm_show_fdinfo);
+        }
         fops
     };
     const VTABLE: bindings::drm_driver = drm_legacy_fields! {
@@ -230,7 +259,11 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         dumb_create: T::Object::<Uninit>::ALLOC_OPS.dumb_create,
         dumb_map_offset: T::Object::<Uninit>::ALLOC_OPS.dumb_map_offset,
 
-        show_fdinfo: None,
+        show_fdinfo: if T::HAS_SHOW_FDINFO {
+            Some(Self::show_fdinfo_callback)
+        } else {
+            None
+        },
         fbdev_probe: None,
 
         major: T::INFO.major,

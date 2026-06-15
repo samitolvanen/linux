@@ -57,6 +57,15 @@ impl<T: DriverFile> File<T> {
         unsafe { Pin::new_unchecked(&*(self.driver_priv())) }
     }
 
+    /// Prints the standard DRM memory stats for this file into `printer`.
+    pub fn show_memory_stats(&self, printer: &drm::printer::Printer) {
+        // SAFETY: By their type invariants `self.as_raw()` points at a valid
+        // `struct drm_file` and `printer.as_raw()` at a valid `struct drm_printer`.
+        unsafe {
+            bindings::drm_show_memory_stats(printer.as_raw(), self.as_raw());
+        }
+    }
+
     /// Returns whether this file is the current DRM master.
     pub fn is_current_master(&self) -> bool {
         // SAFETY: By the type invariant, `self.as_raw()` points to a valid `struct drm_file`

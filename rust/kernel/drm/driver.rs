@@ -139,6 +139,19 @@ pub trait Driver {
     {
         None
     }
+
+    /// Print driver-specific information into a client's `fdinfo` file.
+    ///
+    /// The DRM core calls this when userspace reads `/proc/<pid>/fdinfo/<fd>`
+    /// for a file open on this device.
+    fn show_fdinfo(
+        _device: &drm::device::Device<Self>,
+        _printer: &drm::printer::Printer,
+        _file: &drm::file::File<Self::File>,
+    ) where
+        Self: Sized,
+    {
+    }
 }
 
 /// The registration type of a `drm::Device`.
