@@ -18,6 +18,7 @@ use kernel::{
         IoBase, //
     },
     kvec,
+    num::casts::FromSafeCast,
     page::PAGE_SIZE,
     prelude::*,
     sync::{
@@ -131,6 +132,14 @@ fn alloc_chunk_bo(
 }
 
 impl Context {
+    /// Combined size of the context's chunks.
+    fn heap_size(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|bo| bo.size())
+            .fold(0, usize::saturating_add)
+    }
+
     fn push_chunk(&mut self, chunk_bo: Arc<gem::MappedBo>) -> Result {
         self.chunks.reserve(1, GFP_KERNEL)?;
         self.chunks
@@ -210,6 +219,9 @@ pub(crate) struct Pool {
     /// Ever-incrementing source of context cookies. Unlike `next_id`, it
     /// never wraps or recycles, so each context gets a unique identity.
     next_cookie: Atomic<u64>,
+    /// Combined size of every BO this pool owns, the contexts buffer plus
+    /// all heap chunks. Reported as fdinfo memory.
+    pool_total_size: Atomic<usize>,
 }
 
 impl Pool {
@@ -233,6 +245,8 @@ impl Pool {
         )?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
 
+        let initial = gpu_contexts.size();
+
         Ok(Self {
             vm,
             gpu_contexts,
@@ -240,6 +254,7 @@ impl Pool {
             xa,
             next_id: Atomic::new(0),
             next_cookie: Atomic::new(0),
+            pool_total_size: Atomic::new(initial),
         })
     }
 
@@ -291,6 +306,7 @@ impl Pool {
             .and_then(|bo| bo.kernel_va())
             .ok_or(EINVAL)?
             .start;
+        let heap_size = heap_ctx.heap_size();
 
         let stride = self.stride.get() as usize;
         let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
@@ -316,6 +332,10 @@ impl Pool {
         self.next_id.store(next, Relaxed);
 
         let offset = index * stride;
+
+        // Account only once the context is in the XArray, because a failed
+        // `alloc_cyclic` drops `heap_ctx` and frees its chunks.
+        self.pool_total_size.add(heap_size, Relaxed);
 
         let vmap = self.gpu_contexts.vmap();
         let base = vmap.as_view().as_ptr().cast::<u8>();
@@ -407,6 +427,9 @@ impl Pool {
             .insert_within_capacity(0, chunk_bo)
             .map_err(|_| ENOMEM)?;
 
+        self.pool_total_size
+            .add(usize::from_safe_cast(chunk_size), Relaxed);
+
         let chunk_bo = heap_ctx.chunks.first().ok_or(EINVAL)?;
         let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
 
@@ -420,7 +443,7 @@ impl Pool {
         let index = self.heap_va_to_index(heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
-        let removed = {
+        let (removed, chunk_size) = {
             let mut guard = xa.lock();
             let heap_ctx = guard.get_mut(index).ok_or(EINVAL)?;
 
@@ -432,6 +455,7 @@ impl Pool {
                 return Err(EINVAL);
             }
 
+            let chunk_size = heap_ctx.chunk_size;
             let pos = heap_ctx
                 .chunks
                 .iter()
@@ -441,8 +465,11 @@ impl Pool {
                         .unwrap_or(false)
                 })
                 .ok_or(EINVAL)?;
-            heap_ctx.chunks.remove(pos).map_err(|_| EINVAL)?
+            (heap_ctx.chunks.remove(pos).map_err(|_| EINVAL)?, chunk_size)
         };
+
+        self.pool_total_size
+            .fetch_sub(usize::from_safe_cast(chunk_size), Relaxed);
 
         // Drop the removed chunk after the XArray spinlock is released,
         // because dropping the BO may run cleanup that takes the VM mutex.
@@ -458,8 +485,15 @@ impl Pool {
             guard.remove(context_id).ok_or(EINVAL)?
         };
 
+        self.pool_total_size
+            .fetch_sub(heap_ctx.heap_size(), Relaxed);
+
         drop(heap_ctx);
 
         Ok(())
+    }
+
+    pub(crate) fn total_size(&self) -> usize {
+        self.pool_total_size.load(Relaxed)
     }
 }
