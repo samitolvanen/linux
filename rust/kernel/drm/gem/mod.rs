@@ -83,7 +83,29 @@ pub type DriverFile<T> = drm::File<<<T as DriverObject>::Driver as drm::Driver>:
 /// [`Driver`]: drm::Driver
 pub type DriverAllocImpl<T> = <<T as DriverObject>::Driver as drm::Driver>::Object;
 
+/// The state of a GEM object, as reported to fdinfo.
+///
+/// Mirrors `enum drm_gem_object_status`. The empty set is the default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStatus(bindings::drm_gem_object_status);
+
+impl ObjectStatus {
+    /// The object is resident in memory (i.e. not unpinned).
+    pub const RESIDENT: ObjectStatus =
+        ObjectStatus(bindings::drm_gem_object_status::DRM_GEM_OBJECT_RESIDENT);
+
+    /// Returns the empty set of flags.
+    pub const fn empty() -> ObjectStatus {
+        ObjectStatus(bindings::drm_gem_object_status(0))
+    }
+
+    pub(crate) fn as_raw(self) -> bindings::drm_gem_object_status {
+        self.0
+    }
+}
+
 /// GEM object functions, which must be implemented by drivers.
+#[vtable]
 pub trait DriverObject: Sync + Send + Sized + 'static {
     /// Parent `Driver` for this object.
     type Driver: drm::Driver;
@@ -114,6 +136,14 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
 
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &DriverAllocImpl<Self>, _file: &DriverFile<Self>) {}
+
+    /// Report the state of the object for fdinfo memory accounting.
+    ///
+    /// Called by `drm_show_memory_stats` while holding `file->table_lock`, a
+    /// spinlock, so the implementation must not sleep.
+    fn status(_obj: &DriverAllocImpl<Self>) -> ObjectStatus {
+        ObjectStatus::empty()
+    }
 
     /// Called when userspace exports the object to a dma-buf.
     ///
@@ -212,6 +242,16 @@ extern "C" fn close_callback<T: DriverObject>(
     let obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
 
     T::close(obj, file);
+}
+
+pub(crate) extern "C" fn status_callback<T: DriverObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+) -> bindings::drm_gem_object_status {
+    // SAFETY: `status_callback` is installed in `OBJECT_FUNCS` (`drm_gem_object_funcs`) for
+    // `Object<T>`, so `raw_obj` is always contained within an `Object<T>`.
+    let obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+    T::status(obj).as_raw()
 }
 
 extern "C" fn export_callback<T: DriverObject>(
@@ -357,7 +397,11 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
         vmap: None,
         vunmap: None,
         mmap: None,
-        status: None,
+        status: if T::HAS_STATUS {
+            Some(status_callback::<T>)
+        } else {
+            None
+        },
         vm_ops: core::ptr::null_mut(),
         evict: None,
         rss: None,
