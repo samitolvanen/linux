@@ -593,7 +593,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
 
 impl Drop for PtUpdateContext<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.mmu.end_vm_update(self.as_data) {
+        if let Err(e) = self.mmu.end_vm_update(self.as_data, &self.region) {
             pr_err!("Failed to end VM update {:?}\n", e);
         }
     }

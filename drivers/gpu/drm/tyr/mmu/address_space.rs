@@ -467,6 +467,12 @@ impl AddressSpaceManager {
     fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>) -> Result {
         self.validate_as_slot(as_nr)?;
 
+        // An empty region locks nothing. `region.end - 1` below would
+        // underflow.
+        if region.is_empty() {
+            return Ok(());
+        }
+
         // The lock operates on full 64-byte cache lines of translation table entries.
         // Since each translation table entry (TTE) is 8 bytes, a cache line has 8 TTEs.
         // Since each TTE maps one page, the minimum locked region size will be 8 pages.
@@ -583,8 +589,13 @@ impl AsSlotManager {
     /// memory region to make translation table updates atomic. GPU accesses to the
     /// region will be blocked until [`end_vm_update`] is called.
     ///
-    /// If the VM is not resident in a hardware slot, this is a no-op.
+    /// If the region is empty or the VM is not resident in a hardware slot,
+    /// this is a no-op.
     pub(super) fn start_vm_update(&mut self, vm: &VmAsData, region: &Range<u64>) -> Result {
+        if region.is_empty() {
+            return Ok(());
+        }
+
         let seat = vm.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {
@@ -601,8 +612,13 @@ impl AsSlotManager {
     /// table cache and unlocks the region that was locked by [`start_vm_update`],
     /// allowing GPU accesses to proceed with the updated translation tables.
     ///
-    /// If the VM is not resident in a hardware slot, this is a no-op.
-    pub(super) fn end_vm_update(&mut self, vm: &VmAsData) -> Result {
+    /// If the region is empty or the VM is not resident in a hardware slot,
+    /// this is a no-op.
+    pub(super) fn end_vm_update(&mut self, vm: &VmAsData, region: &Range<u64>) -> Result {
+        if region.is_empty() {
+            return Ok(());
+        }
+
         let seat = vm.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {

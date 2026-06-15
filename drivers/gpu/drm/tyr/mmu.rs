@@ -128,7 +128,7 @@ impl Mmu {
     /// If the VM is resident, any GPU access on the memory range being
     /// updated will be blocked until `Mmu::end_vm_update()` is called.
     /// This guarantees the atomicity of a VM update.
-    /// If the VM is not resident, this is a NOP.
+    /// If the region is empty or the VM is not resident, this is a NOP.
     pub(crate) fn start_vm_update(&self, vm: &VmAsData, region: &Range<u64>) -> Result {
         self.as_manager.lock().start_vm_update(vm, region)
     }
@@ -137,8 +137,8 @@ impl Mmu {
     ///
     /// If the VM is resident, this will let GPU accesses on the updated
     /// range go through, in case any of them were blocked.
-    /// If the VM is not resident, this is a NOP.
-    pub(crate) fn end_vm_update(&self, vm: &VmAsData) -> Result {
-        self.as_manager.lock().end_vm_update(vm)
+    /// If the region is empty or the VM is not resident, this is a NOP.
+    pub(crate) fn end_vm_update(&self, vm: &VmAsData, region: &Range<u64>) -> Result {
+        self.as_manager.lock().end_vm_update(vm, region)
     }
 }
