@@ -60,6 +60,7 @@ use crate::{
     },
     file::{
         read_padding_zero,
+        MemoryStats,
         Stats,
         TyrDrmFile, //
     },
@@ -378,6 +379,10 @@ pub(crate) struct Group {
     /// guards nothing but this counter update.
     #[pin]
     fdinfo: SpinLock<FdInfo>,
+    /// Combined size of the group's kernel BOs, reported as resident
+    /// memory in fdinfo and as active memory while the group is on a
+    /// slot. Fixed at creation.
+    kbo_sizes: usize,
 }
 
 impl_list_arc_safe! {
@@ -503,6 +508,11 @@ impl Group {
         let queue_count = queues.len();
         let queues_handoff = cleanup::Handoff::new(())?;
 
+        let kbo_sizes = suspend_buf.bo().size()
+            + protm_suspend_buf.bo().size()
+            + syncobjs.size()
+            + queues.iter().map(|q| q.mem_size()).sum::<usize>();
+
         Arc::pin_init(
             pin_init!(Self {
                 inner <- new_mutex!(GroupInner {
@@ -543,6 +553,7 @@ impl Group {
                 protm_suspend_buf,
                 syncobjs,
                 fdinfo <- new_spinlock!(FdInfo::default()),
+                kbo_sizes,
             }),
             GFP_KERNEL,
         )
@@ -1208,6 +1219,18 @@ impl Pool {
     pub(crate) fn gather_stats(&self, stats: &mut Stats) {
         let _ = self.0.for_each(|_, group| {
             group.drain_fdinfo(stats);
+            Ok(())
+        });
+    }
+
+    /// Sums each group's kernel BOs into `stats`, counting the groups on
+    /// a CSG slot as active.
+    pub(crate) fn gather_mem_info(&self, stats: &mut MemoryStats) {
+        let _ = self.0.for_each(|_, group| {
+            stats.resident += group.kbo_sizes as u64;
+            if group.with_locked_inner(|inner| inner.csg_id.is_some()) {
+                stats.active += group.kbo_sizes as u64;
+            }
             Ok(())
         });
     }

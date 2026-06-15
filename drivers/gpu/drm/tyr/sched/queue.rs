@@ -206,6 +206,12 @@ pub(crate) struct QueueData {
 }
 
 impl QueueData {
+    /// Total size of the queue's kernel BOs, summed into a group's
+    /// fdinfo memory footprint.
+    pub(super) fn mem_size(&self) -> usize {
+        self.ringbuf.size() + self.interfaces.mem_size() + self.profiling_slots.size()
+    }
+
     fn ringbuf_capacity(&self) -> usize {
         self.ringbuf.size() - RINGBUF_RESERVED_BYTES
     }
@@ -1459,6 +1465,10 @@ impl Interfaces {
             input_offset: 0,
             output_offset: SZ_4K,
         })
+    }
+
+    pub(super) fn mem_size(&self) -> usize {
+        self.mem.size()
     }
 
     pub(super) fn read_insert(&self) -> Result<u64> {
