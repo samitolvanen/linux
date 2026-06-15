@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::fmt::Write;
 use core::sync::atomic::{
     AtomicBool,
     AtomicU32,
@@ -13,7 +14,11 @@ use kernel::{
         OptionalClk, //
     },
     devfreq::Registration as DevfreqRegistration,
-    device::Core,
+    device,
+    device::{
+        Bound,
+        Core, //
+    },
     devres::Devres,
     dma::{
         Device as DmaDevice,
@@ -36,6 +41,10 @@ use kernel::{
     of,
     opp::ConfigToken,
     platform,
+    platform::{
+        AttributeGroups,
+        DeviceAttribute, //
+    },
     pm::{
         self,
         PMConfig,
@@ -47,6 +56,11 @@ use kernel::{
     regulator,
     regulator::Regulator,
     sizes::SZ_2M,
+    str::{
+        parse_int::ParseInt,
+        BStr,
+        Formatter, //
+    },
     sync::{
         aref::ARef,
         atomic::{
@@ -402,6 +416,11 @@ impl TyrDrmDeviceData {
         self.profile_mask.load(Relaxed)
     }
 
+    /// Sets the device-wide job profiling enablement bitmask.
+    pub(crate) fn set_profile_mask(&self, mask: u32) {
+        self.profile_mask.store(mask, Relaxed);
+    }
+
     /// Accumulates `bits` into the firmware-events word.
     ///
     /// Safe to call from any context, including threaded IRQ handlers.
@@ -675,10 +694,35 @@ kernel::of_device_table!(
     ]
 );
 
+struct ProfilingAttr;
+
+impl DeviceAttribute for ProfilingAttr {
+    const NAME: &'static CStr = c"profiling";
+
+    fn show(dev: &device::Device<Bound>, writer: &mut Formatter<'_>) -> Result {
+        let data = dev.drvdata::<TyrPlatformDriverData>()?;
+        writeln!(writer, "{}", data.device.profile_mask())?;
+        Ok(())
+    }
+
+    fn store(dev: &device::Device<Bound>, buf: &CStr) -> Result {
+        let data = dev.drvdata::<TyrPlatformDriverData>()?;
+        let value = u32::from_str(BStr::from_bytes(buf.to_bytes().trim_ascii()))?;
+        if value & !(DEVICE_PROFILING_CYCLES | DEVICE_PROFILING_TIMESTAMP) != 0 {
+            return Err(EINVAL);
+        }
+        data.device.set_profile_mask(value);
+        Ok(())
+    }
+}
+
+kernel::device_attribute_groups!(TYR_GROUPS, [ProfilingAttr]);
+
 impl platform::Driver for TyrPlatformDriverData {
     type IdInfo = ();
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     const PM_OPS: Option<&'static bindings::dev_pm_ops> = Some(&PMContext::<TyrPmOps>::PM_OPS);
+    const DEV_GROUPS: Option<&'static dyn AttributeGroups> = Some(&TYR_GROUPS);
 
     fn probe(
         pdev: &platform::Device<Core>,
