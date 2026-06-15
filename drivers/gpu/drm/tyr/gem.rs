@@ -135,6 +135,14 @@ impl gem::DriverObject for BoData {
 
         Ok(())
     }
+
+    fn status(obj: &Bo) -> gem::ObjectStatus {
+        if obj.pages_present() || obj.is_imported() {
+            gem::ObjectStatus::RESIDENT
+        } else {
+            gem::ObjectStatus::empty()
+        }
+    }
 }
 
 /// Type alias for Tyr GEM buffer objects.
