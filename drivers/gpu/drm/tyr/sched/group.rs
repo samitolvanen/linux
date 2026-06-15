@@ -23,6 +23,10 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         LockedBy,
         Mutex,
@@ -46,6 +50,7 @@ use crate::{
     },
     file::{
         read_padding_zero,
+        MemoryStats,
         Stats,
         TyrDrmFile, //
     },
@@ -352,6 +357,13 @@ pub(crate) struct Group {
     /// sleep.
     #[pin]
     fdinfo: SpinLock<FdInfo>,
+    /// Whether the group currently occupies a CSG slot. Set on activate,
+    /// cleared on evict. Read by fdinfo to count active memory.
+    active: Atomic<bool>,
+    /// Combined size of the group's kernel BOs, reported as resident
+    /// memory in fdinfo and as active memory while the group is on a
+    /// slot. Fixed at creation.
+    kbo_sizes: usize,
 }
 
 impl_list_arc_safe! {
@@ -465,6 +477,11 @@ impl Group {
 
         let queue_count = queues.len();
 
+        let kbo_sizes = suspend_buf.bo.size()
+            + protm_suspend_buf.bo.size()
+            + syncobjs.size()
+            + queues.iter().map(|q| q.mem_size()).sum::<usize>();
+
         Arc::pin_init(
             pin_init!(Self {
                 inner <- new_mutex!(GroupInner {
@@ -504,6 +521,8 @@ impl Group {
                 _syncobjs: syncobjs,
                 heap_pool <- new_mutex!(file.inner().heap_pools().get_pool(group_args.vm_id as usize)),
                 fdinfo <- new_spinlock!(FdInfo::default()),
+                active: Atomic::new(false),
+                kbo_sizes,
             }),
             GFP_KERNEL,
         )
@@ -816,6 +835,11 @@ impl Group {
         fdinfo.time = 0;
     }
 
+    /// Records whether the group currently occupies a CSG slot.
+    pub(super) fn set_active(&self, active: bool) {
+        self.active.store(active, Relaxed);
+    }
+
     pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
         *self.heap_pool.lock() = Some(pool);
     }
@@ -1116,6 +1140,18 @@ impl Pool {
     pub(crate) fn gather_stats(&self, stats: &mut Stats) {
         let _ = self.0.for_each(|_, group| {
             group.drain_fdinfo(stats);
+            Ok(())
+        });
+    }
+
+    /// Sums each group's kernel BOs into `stats`, counting the groups on
+    /// a CSG slot as active.
+    pub(crate) fn gather_mem_info(&self, stats: &mut MemoryStats) {
+        let _ = self.0.for_each(|_, group| {
+            stats.resident += group.kbo_sizes as u64;
+            if group.active.load(Relaxed) {
+                stats.active += group.kbo_sizes as u64;
+            }
             Ok(())
         });
     }

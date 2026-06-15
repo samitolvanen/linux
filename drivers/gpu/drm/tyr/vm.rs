@@ -162,6 +162,10 @@ impl Pool {
         self.entries.get(index)
     }
 
+    pub(crate) fn index_upper_bound(&self) -> usize {
+        self.entries.index_upper_bound()
+    }
+
     pub(crate) fn get_vm_state(&self, vmgetstate: &mut uapi::drm_panthor_vm_get_state) -> Result {
         let vm = self.get_vm(vmgetstate.vm_id as usize).ok_or(EINVAL)?;
 
