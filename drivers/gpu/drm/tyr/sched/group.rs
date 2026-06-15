@@ -60,6 +60,7 @@ use crate::{
     },
     file::{
         read_padding_zero,
+        Stats,
         TyrDrmFile, //
     },
     fw::{
@@ -910,6 +911,15 @@ impl Group {
         fdinfo.time = fdinfo.time.wrapping_add(time);
     }
 
+    /// Drains the group's fdinfo accumulator into `stats`, resetting it.
+    fn drain_fdinfo(&self, stats: &mut Stats) {
+        let mut fdinfo = self.fdinfo.lock();
+        stats.cycles = stats.cycles.wrapping_add(fdinfo.cycles);
+        stats.time = stats.time.wrapping_add(fdinfo.time);
+        fdinfo.cycles = 0;
+        fdinfo.time = 0;
+    }
+
     pub(super) fn submit(
         self: &Arc<Self>,
         csif: &CsifInfo,
@@ -1186,6 +1196,14 @@ impl Pool {
 
     pub(crate) fn group(&self, index: usize) -> Option<Arc<Group>> {
         self.0.get(index)
+    }
+
+    /// Drains every group's profiling samples into `stats`.
+    pub(crate) fn gather_stats(&self, stats: &mut Stats) {
+        let _ = self.0.for_each(|_, group| {
+            group.drain_fdinfo(stats);
+            Ok(())
+        });
     }
 
     pub(crate) fn submit_group(

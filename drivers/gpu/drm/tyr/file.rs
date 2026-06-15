@@ -19,6 +19,7 @@ use kernel::{
         Registered, //
     },
     io::Io,
+    new_spinlock,
     pm::PMProfile,
     preempt,
     prelude::*,
@@ -29,7 +30,8 @@ use kernel::{
             Atomic,
             Relaxed, //
         },
-        Arc, //
+        Arc,
+        SpinLock, //
     },
     task,
     time::{
@@ -182,12 +184,25 @@ fn validate_bind_op(
     Ok(None)
 }
 
+/// Accumulated GPU usage for a file, exposed through fdinfo.
+///
+/// Drained from the per-group accumulators at fdinfo show time.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Stats {
+    pub(crate) cycles: u64,
+    pub(crate) time: u64,
+}
+
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
     user_mmio_offset: Atomic<u64>,
     tdev: ARef<TyrDrmDevice>,
+    /// Accumulated GPU usage, a spinlock to match the per-group
+    /// accumulator it drains from.
+    #[pin]
+    stats: SpinLock<Stats>,
 }
 
 /// Convenience type alias for our DRM `File` type
@@ -211,6 +226,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
                 group_pool: group::Pool::create()?,
                 user_mmio_offset: Atomic::new(user_mmio_offset),
                 tdev,
+                stats <- new_spinlock!(Stats::default()),
             }),
             GFP_KERNEL,
         )
@@ -247,6 +263,24 @@ impl TyrDrmFileData {
 
     pub(crate) fn user_mmio_offset(&self) -> u64 {
         self.user_mmio_offset.load(Relaxed)
+    }
+
+    /// Drains the per-group profiling samples into the file accumulator.
+    ///
+    /// The two spinlocks are never held at once, so no lock-order inversion
+    /// is possible.
+    pub(crate) fn gather_group_samples(self: Pin<&Self>) {
+        let mut drained = Stats::default();
+        self.group_pool().gather_stats(&mut drained);
+
+        let mut stats = self.stats.lock();
+        stats.cycles = stats.cycles.wrapping_add(drained.cycles);
+        stats.time = stats.time.wrapping_add(drained.time);
+    }
+
+    /// Returns a snapshot of the file's accumulated GPU usage.
+    pub(crate) fn stats_snapshot(&self) -> Stats {
+        *self.stats.lock()
     }
 
     pub(crate) fn dev_query(
