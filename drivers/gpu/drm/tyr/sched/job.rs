@@ -15,6 +15,7 @@ use kernel::{
         genmask_u32,
         //
     },
+    io::IoBase,
     prelude::*,
     transmute::FromBytes,
     uaccess::UserSlice,
@@ -22,7 +23,12 @@ use kernel::{
 };
 
 use crate::{
+    driver::{
+        DEVICE_PROFILING_CYCLES,
+        DEVICE_PROFILING_TIMESTAMP, //
+    },
     file::read_padding_zero,
+    gem,
     gpu::{
         CsifInfo,
         UNPRESERVED_CS_REG_COUNT, //
@@ -52,6 +58,7 @@ impl Instr {
     const WAIT: u64 = 3;
     const CALL: u64 = 32;
     const FLUSH_CACHE2: u64 = 36;
+    const STORE_STATE: u64 = 40;
     const ERROR_BARRIER: u64 = 47;
     const SYNC_ADD64: u64 = 51;
 
@@ -92,6 +99,13 @@ impl Instr {
         (Self::CALL << 56) | (addr_reg << 40) | (size_reg << 32)
     }
 
+    /// `STORE_STATE reg, type_sel`: write a GPU state value to the address
+    /// in `reg`. `type_sel` is `1` for the cycle counter or `0` for the
+    /// timestamp.
+    fn store_state(reg: u64, type_sel: u64) -> u64 {
+        (Self::STORE_STATE << 56) | (reg << 40) | (type_sel << 32)
+    }
+
     /// `SYNC_ADD64 *addr_reg += val_reg`. Error-propagating so a prior
     /// fault surfaces in the sync-object status word.
     fn sync_add64(addr_reg: u64, val_reg: u64) -> u64 {
@@ -115,6 +129,39 @@ impl Instr {
     /// error state.
     fn error_barrier() -> u64 {
         Self::ERROR_BARRIER << 56
+    }
+}
+
+/// Per-job GPU profiling sample slot. The wrapped command stream writes
+/// the cycle counter and timestamp before and after the job's stream.
+/// Job completion reads back the deltas.
+#[repr(C)]
+pub(crate) struct JobProfilingData {
+    pub(crate) cycles_before: u64,
+    pub(crate) cycles_after: u64,
+    pub(crate) time_before: u64,
+    pub(crate) time_after: u64,
+}
+
+impl JobProfilingData {
+    /// Reads the profiling slot at `offset` from a mapped BO.
+    pub(super) fn read(mem: &gem::BoVmap, offset: usize) -> Result<Self> {
+        mem.check_offset::<Self>(offset)?;
+
+        let vmap = mem.vmap();
+        // SAFETY: `check_offset` verified that the slot is inside the mapping
+        // and that `offset` is aligned for `Self`, and the vmap starts on a
+        // page boundary.
+        let ptr = unsafe {
+            vmap.as_view()
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast::<Self>()
+        };
+
+        // SAFETY: `Self` is four `u64`s, so any bit pattern is valid.
+        Ok(unsafe { core::ptr::read_volatile(ptr) })
     }
 }
 
@@ -300,13 +347,29 @@ impl Job {
     /// `SYNC_ADD64` / `ERROR_BARRIER` epilogue that bumps the per-queue
     /// syncobj at `sync_va` by one. It is padded to a 64-byte boundary so
     /// the firmware prefetcher sees cacheline-aligned trailing storage.
-    pub(crate) fn build_wrapped_stream(&self, csif: &CsifInfo, sync_va: u64) -> Result<KVec<u8>> {
+    ///
+    /// When `profiling_mask` enables sampling, `STORE_STATE` pairs
+    /// record the GPU cycle counter and/or timestamp into the sample
+    /// slot at `profiling_va`, before and after the `CALL`. Also returns
+    /// the offsets of the `MOV48`s that load the sample addresses, so the
+    /// slot can be changed after the build.
+    pub(crate) fn build_wrapped_stream(
+        &self,
+        csif: &CsifInfo,
+        sync_va: u64,
+        profiling_va: u64,
+        profiling_mask: u32,
+    ) -> Result<(KVec<u8>, KVec<usize>)> {
         const INSTR_BYTES: usize = 8;
-        const INSTRS_PER_WRAPPER: usize = 11;
-        const WRAPPER_BYTES: usize = INSTR_BYTES * INSTRS_PER_WRAPPER;
+        // Instructions in the base wrapper, and the `MOV48`/`STORE_STATE`
+        // pairs emitted for each enabled profiling flag, one pair before
+        // the `CALL` and one after it.
+        const BASE_INSTRS: usize = 11;
+        const INSTRS_PER_FLAG: usize = 4;
 
         static_assert!(
-            WRAPPER_BYTES.next_multiple_of(64) <= MIN_RINGBUF_SIZE - RINGBUF_RESERVED_BYTES
+            (INSTR_BYTES * (BASE_INSTRS + 2 * INSTRS_PER_FLAG)).next_multiple_of(64)
+                <= MIN_RINGBUF_SIZE - RINGBUF_RESERVED_BYTES
         );
 
         let piece = self.stream.as_ref().ok_or(EINVAL)?;
@@ -320,26 +383,61 @@ impl Job {
                 .ok_or(EINVAL)?,
         );
         let val_reg = addr_reg + 2;
+        // The cycle and timestamp samplers reuse the wrapper's address
+        // and value registers.
+        let cycle_reg = addr_reg;
+        let time_reg = val_reg;
         let top_sb = csif.scoreboard_slot_count.checked_sub(1).ok_or(EINVAL)?;
         let wait_all_mask = genmask_checked_u64(0..=top_sb).ok_or(EINVAL)?;
 
-        let padded = WRAPPER_BYTES.next_multiple_of(64);
-        let mut buf = KVec::<u8>::with_capacity(padded, GFP_KERNEL)?;
+        let cycles = profiling_mask & DEVICE_PROFILING_CYCLES != 0;
+        let timestamp = profiling_mask & DEVICE_PROFILING_TIMESTAMP != 0;
+        let cycles_before_va = profiling_va + offset_of!(JobProfilingData, cycles_before) as u64;
+        let cycles_after_va = profiling_va + offset_of!(JobProfilingData, cycles_after) as u64;
+        let time_before_va = profiling_va + offset_of!(JobProfilingData, time_before) as u64;
+        let time_after_va = profiling_va + offset_of!(JobProfilingData, time_after) as u64;
 
-        for word in [
-            Instr::mov32(val_reg, piece.latest_flush.into()),
-            Instr::flush_cache2(val_reg),
-            Instr::mov48(addr_reg, piece.stream_addr),
-            Instr::mov32(val_reg, piece.stream_size.into()),
-            Instr::wait(1),
-            Instr::call(addr_reg, val_reg),
-            Instr::mov48(addr_reg, sync_va),
-            Instr::mov48(val_reg, 1),
-            Instr::wait(wait_all_mask),
-            Instr::sync_add64(addr_reg, val_reg),
-            Instr::error_barrier(),
-        ] {
-            buf.extend_from_slice(&word.to_le_bytes(), GFP_KERNEL)?;
+        // Size to the instructions emitted for the enabled flags, so an
+        // unprofiled wrapper stays compact.
+        let flags = usize::from(cycles) + usize::from(timestamp);
+        let padded = (INSTR_BYTES * (BASE_INSTRS + INSTRS_PER_FLAG * flags)).next_multiple_of(64);
+        let mut buf = KVec::<u8>::with_capacity(padded, GFP_KERNEL)?;
+        let mut relocs = KVec::new();
+
+        {
+            let mut emit = |word: u64| -> Result<usize> {
+                let offset = buf.len();
+                buf.extend_from_slice(&word.to_le_bytes(), GFP_KERNEL)?;
+                Ok(offset)
+            };
+
+            emit(Instr::mov32(val_reg, piece.latest_flush.into()))?;
+            emit(Instr::flush_cache2(val_reg))?;
+            if cycles {
+                relocs.push(emit(Instr::mov48(cycle_reg, cycles_before_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(cycle_reg, 1))?;
+            }
+            if timestamp {
+                relocs.push(emit(Instr::mov48(time_reg, time_before_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(time_reg, 0))?;
+            }
+            emit(Instr::mov48(addr_reg, piece.stream_addr))?;
+            emit(Instr::mov32(val_reg, piece.stream_size.into()))?;
+            emit(Instr::wait(1))?;
+            emit(Instr::call(addr_reg, val_reg))?;
+            if cycles {
+                relocs.push(emit(Instr::mov48(cycle_reg, cycles_after_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(cycle_reg, 1))?;
+            }
+            if timestamp {
+                relocs.push(emit(Instr::mov48(time_reg, time_after_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(time_reg, 0))?;
+            }
+            emit(Instr::mov48(addr_reg, sync_va))?;
+            emit(Instr::mov48(val_reg, 1))?;
+            emit(Instr::wait(wait_all_mask))?;
+            emit(Instr::sync_add64(addr_reg, val_reg))?;
+            emit(Instr::error_barrier())?;
         }
 
         // Pad to a 64-byte boundary so the trailing instruction sits
@@ -351,6 +449,6 @@ impl Job {
             buf.push(0, GFP_KERNEL)?;
         }
 
-        Ok(buf)
+        Ok((buf, relocs))
     }
 }
