@@ -151,6 +151,13 @@ pub(crate) fn parent_dev(tdev: &TyrDrmDevice) -> &device::Device {
     tdev.as_ref().as_ref()
 }
 
+/// `TyrDrmDeviceData::profile_mask` bit selecting GPU cycle-count
+/// sampling around each job.
+pub(crate) const DEVICE_PROFILING_CYCLES: u32 = 1 << 0;
+/// `TyrDrmDeviceData::profile_mask` bit selecting GPU timestamp
+/// sampling around each job.
+pub(crate) const DEVICE_PROFILING_TIMESTAMP: u32 = 1 << 1;
+
 /// Interval between firmware liveness pings.
 const PING_INTERVAL_MS: u32 = 12_000;
 
@@ -311,6 +318,11 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     unbind_halted: Completion,
 
+    /// Device-wide job profiling enablement bitmask, a combination of
+    /// `DEVICE_PROFILING_*`. Read at job submit time and baked into the
+    /// wrapped command stream. `0` (the default) disables profiling.
+    profile_mask: Atomic<u32>,
+
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -363,6 +375,11 @@ impl TyrDrmDeviceData {
     /// Marks the device unusable. Never undone.
     pub(crate) fn mark_unusable(&self) {
         self.unusable.store(true, Relaxed);
+    }
+
+    /// Returns the device-wide job profiling enablement bitmask.
+    pub(crate) fn profile_mask(&self) -> u32 {
+        self.profile_mask.load(Relaxed)
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -931,6 +948,7 @@ impl platform::Driver for TyrPlatformDriver {
                 syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                 work_gate_closed <- new_spinlock!(false),
                 unbind_halted <- Completion::new(),
+                profile_mask: Atomic::new(0),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
