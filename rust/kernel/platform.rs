@@ -10,7 +10,8 @@ use crate::{
     container_of,
     device::{
         self,
-        Bound, //
+        Bound,
+        BoundInternal, //
     },
     driver,
     error::{
@@ -23,7 +24,12 @@ use crate::{
         IrqRequest, //
     },
     of,
+    page::PAGE_SIZE,
     prelude::*,
+    str::{
+        as_char_ptr_in_const_context,
+        Formatter, //
+    },
     types::Opaque,
     ThisModule, //
 };
@@ -76,6 +82,10 @@ unsafe impl<T: Driver + 'static> driver::RegistrationOps for Adapter<T> {
             .map(|ops| ops.as_raw())
             .unwrap_or(core::ptr::null());
 
+        let dev_groups = T::DEV_GROUPS
+            .map(|groups| groups.as_ptr())
+            .unwrap_or(core::ptr::null_mut());
+
         // SAFETY: It's safe to set the fields of `struct platform_driver` on initialization.
         unsafe {
             (*pdrv.get()).driver.name = name.as_char_ptr();
@@ -84,6 +94,7 @@ unsafe impl<T: Driver + 'static> driver::RegistrationOps for Adapter<T> {
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
             (*pdrv.get()).driver.pm = pm_ops;
+            (*pdrv.get()).driver.dev_groups = dev_groups;
         }
 
         // SAFETY: `pdrv` is guaranteed to be a valid `DriverType`.
@@ -212,7 +223,7 @@ macro_rules! module_platform_driver {
 ///     }
 /// }
 ///```
-pub trait Driver {
+pub trait Driver: 'static {
     /// The type holding driver private data about each device id supported by the driver.
     // TODO: Use associated_type_defaults once stabilized:
     //
@@ -242,6 +253,15 @@ pub trait Driver {
 
     /// The table of ACPI device ids supported by the driver.
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = None;
+
+    /// The sysfs device attribute groups exposed under the driver's devices.
+    ///
+    /// Wired into `driver.dev_groups`, so the core creates the attributes for every device the
+    /// driver binds. Build the value with [`device_attribute_groups!`]. The driver-typed table
+    /// only accepts attributes declared for this driver.
+    ///
+    /// [`device_attribute_groups!`]: crate::device_attribute_groups
+    const DEV_GROUPS: Option<&'static dyn AttributeGroups<Self>> = None;
 
     /// Provides driver's PM callbacks, if any.
     fn dev_pm_ops() -> Option<&'static crate::pm::DevPMOps<Adapter<Self>, Self::PmOps>>
@@ -653,4 +673,374 @@ where
         // reject the latter by requiring `(*drv).pm` to equal this table.
         unsafe { crate::pm::DevPMOps::new_unchecked() }
     }
+}
+
+/// A read-write sysfs device attribute.
+///
+/// Implement this on a unit type to describe one named attribute. [`device_attribute_groups!`]
+/// collects implementors into the table installed in [`Driver::DEV_GROUPS`], after which the core
+/// creates the file under each bound device's sysfs directory and dispatches reads to [`show`] and
+/// writes to [`store`].
+///
+/// The attribute is created with mode `0644` (read for everyone, write for root).
+///
+/// The sysfs core can invoke [`show`] and [`store`] concurrently, so the driver data must be
+/// [`Sync`].
+///
+/// [`device_attribute_groups!`]: crate::device_attribute_groups
+/// [`show`]: DeviceAttribute::show
+/// [`store`]: DeviceAttribute::store
+pub trait DeviceAttribute
+where
+    for<'a> <Self::Driver as Driver>::Data<'a>: Sync,
+{
+    /// The platform driver the attribute belongs to.
+    ///
+    /// The group table built by [`device_attribute_groups!`] carries this type. An attribute
+    /// therefore only installs in this driver's [`Driver::DEV_GROUPS`], and the trampolines
+    /// borrow the `Driver::Data` the bus stored at probe time.
+    ///
+    /// [`device_attribute_groups!`]: crate::device_attribute_groups
+    type Driver: Driver;
+
+    /// The sysfs file name.
+    const NAME: &'static CStr;
+
+    /// Formats the attribute value into `writer`.
+    ///
+    /// The text written to `writer` becomes the file contents.
+    fn show(
+        dev: &device::Device<Bound>,
+        data: Pin<&<Self::Driver as Driver>::Data<'_>>,
+        writer: &mut Formatter<'_>,
+    ) -> Result;
+
+    /// Parses and applies a value written to the attribute.
+    ///
+    /// `buf` is the NUL-terminated string the user wrote.
+    fn store(
+        dev: &device::Device<Bound>,
+        data: Pin<&<Self::Driver as Driver>::Data<'_>>,
+        buf: &CStr,
+    ) -> Result;
+}
+
+/// Builds the `device_attribute` for a [`DeviceAttribute`] implementor.
+///
+/// Used by [`device_attribute_groups!`]. Not meant to be called directly.
+#[doc(hidden)]
+// `struct attribute` gains lockdep fields under `CONFIG_DEBUG_LOCK_ALLOC`, so the rest-init is
+// required there.
+#[allow(clippy::needless_update)]
+pub const fn device_attribute<D, T>() -> bindings::device_attribute
+where
+    D: Driver,
+    T: DeviceAttribute<Driver = D>,
+    for<'a> D::Data<'a>: Sync,
+{
+    let mut dev_attr = bindings::device_attribute {
+        attr: bindings::attribute {
+            name: as_char_ptr_in_const_context(T::NAME),
+            mode: 0o644,
+            ..pin_init::zeroed()
+        },
+        ..pin_init::zeroed()
+    };
+    // `show` and `store` live in `__SYSFS_FUNCTION_ALTERNATIVE` blocks, a union
+    // normally and a struct under `CONFIG_CFI`, so assign the members by name
+    // on the zeroed value to cover both layouts.
+    dev_attr.__bindgen_anon_1.show = Some(device_attribute_show::<T>);
+    dev_attr.__bindgen_anon_2.store = Some(device_attribute_store::<T>);
+    dev_attr
+}
+
+/// The `show` trampoline for a [`DeviceAttribute`] implementor.
+///
+/// # Safety
+///
+/// `dev` must point at a live device bound to `T::Driver`, and `buf` must be writable for
+/// `PAGE_SIZE` bytes, as sysfs guarantees when it invokes a `device_attribute` show.
+unsafe extern "C" fn device_attribute_show<T: DeviceAttribute>(
+    dev: *mut bindings::device,
+    _attr: *mut bindings::device_attribute,
+    buf: *mut c_char,
+) -> isize {
+    from_result(|| {
+        // SAFETY: the driver core scopes the attribute file to the bound window, so sysfs only
+        // invokes `show` while `dev` is a live, bound device.
+        let dev = unsafe { device::Device::<BoundInternal>::from_raw(dev) };
+
+        // SAFETY: the driver-typed group table installs the attribute only under `T::Driver`,
+        // whose `probe()` stored a `Pin<KBox<<T::Driver as Driver>::Data<'_>>>` as the private
+        // data, and the attribute file only dispatches while the device remains bound.
+        let data = unsafe { dev.drvdata_borrow::<<T::Driver as Driver>::Data<'_>>() };
+
+        // SAFETY: sysfs guarantees `buf` is writable for one page.
+        let slice = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), PAGE_SIZE) };
+        let mut writer = Formatter::new(slice);
+
+        T::show(dev, data, &mut writer)?;
+        // A show that fills the whole buffer returns `PAGE_SIZE`, which sysfs
+        // rejects, so clamp that case.
+        Ok(core::cmp::min(writer.bytes_written(), PAGE_SIZE - 1) as isize)
+    })
+}
+
+/// The `store` trampoline for a [`DeviceAttribute`] implementor.
+///
+/// # Safety
+///
+/// `dev` must point at a live device bound to `T::Driver`, and `buf` must be a NUL-terminated
+/// string, as sysfs guarantees when it invokes a `device_attribute` store.
+unsafe extern "C" fn device_attribute_store<T: DeviceAttribute>(
+    dev: *mut bindings::device,
+    _attr: *mut bindings::device_attribute,
+    buf: *const c_char,
+    count: usize,
+) -> isize {
+    from_result(|| {
+        // SAFETY: the driver core scopes the attribute file to the bound window, so sysfs only
+        // invokes `store` while `dev` is a live, bound device.
+        let dev = unsafe { device::Device::<BoundInternal>::from_raw(dev) };
+
+        // SAFETY: the driver-typed group table installs the attribute only under `T::Driver`,
+        // whose `probe()` stored a `Pin<KBox<<T::Driver as Driver>::Data<'_>>>` as the private
+        // data, and the attribute file only dispatches while the device remains bound.
+        let data = unsafe { dev.drvdata_borrow::<<T::Driver as Driver>::Data<'_>>() };
+
+        // SAFETY: sysfs NUL-terminates the store buffer, so scanning to the NUL stays in bounds.
+        let buf = unsafe { CStr::from_char_ptr(buf) };
+
+        T::store(dev, data, buf)?;
+        Ok(count as isize)
+    })
+}
+
+/// A `'static` table of sysfs attribute groups for [`Driver::DEV_GROUPS`].
+///
+/// Build one with [`device_attribute_groups!`]. The trait lets the table be stored behind a
+/// `&'static dyn`, and its driver parameter ties the table to the driver whose data the
+/// attribute callbacks borrow.
+///
+/// # Safety
+///
+/// - `as_ptr` must return a pointer to a NULL-terminated `attribute_group` array that stays
+///   valid for reads while `self` is alive.
+/// - Every attribute in the array must be built for driver `D`, i.e. from [`DeviceAttribute`]
+///   implementors whose `Driver` is `D`.
+///
+/// [`device_attribute_groups!`]: crate::device_attribute_groups
+pub unsafe trait AttributeGroups<D: Driver> {
+    /// Returns a pointer to the NULL-terminated `attribute_group` array for `driver.dev_groups`.
+    fn as_ptr(&self) -> *mut *const bindings::attribute_group;
+}
+
+/// Storage for `N` `device_attribute`s.
+///
+/// A `device_attribute` holds raw pointers, so it is not `Sync`. This wrapper carries the manual
+/// impl that lets [`device_attribute_groups!`] place the attributes in a `static`.
+#[repr(transparent)]
+#[doc(hidden)]
+pub struct Attrs<const N: usize>([bindings::device_attribute; N]);
+
+// SAFETY: The attributes are only read by the kernel from the thread-safe sysfs core, and are
+// immutable for their `'static` lifetime.
+unsafe impl<const N: usize> Sync for Attrs<N> {}
+
+impl<const N: usize> Attrs<N> {
+    /// Wraps an array of attributes.
+    pub const fn new(attrs: [bindings::device_attribute; N]) -> Self {
+        Self(attrs)
+    }
+}
+
+/// A NULL-terminated array of `N` `device_attribute` pointers, as the kernel reads from
+/// `attribute_group.attrs`.
+///
+/// Built by [`device_attribute_groups!`] from a `static` [`Attrs`]. The entries point into that
+/// storage, so it must not move.
+///
+/// # Invariants
+///
+/// The first `N` entries point at live `device_attribute`s and `sentinel` is NULL.
+#[repr(C)]
+#[doc(hidden)]
+pub struct RawAttrs<const N: usize> {
+    attrs: [*mut bindings::attribute; N],
+    sentinel: *mut bindings::attribute,
+}
+
+// SAFETY: The pointers are only read by the kernel from the thread-safe sysfs core, and the data
+// they reference is immutable for the array's `'static` lifetime.
+unsafe impl<const N: usize> Sync for RawAttrs<N> {}
+
+impl<const N: usize> RawAttrs<N> {
+    /// Builds the pointer array from `'static` attribute storage.
+    pub const fn new(attrs: &'static Attrs<N>) -> Self {
+        let mut ptrs = [core::ptr::null_mut(); N];
+        let mut i = 0;
+        while i < N {
+            ptrs[i] = core::ptr::from_ref(&attrs.0[i])
+                .cast::<bindings::attribute>()
+                .cast_mut();
+            i += 1;
+        }
+        // INVARIANT: the loop fills all `N` entries from the `'static`
+        // attributes, and sentinel is null.
+        Self {
+            attrs: ptrs,
+            sentinel: core::ptr::null_mut(),
+        }
+    }
+
+    /// Returns the pointer to install in `attribute_group.attrs`.
+    pub const fn as_ptr(&self) -> *mut *mut bindings::attribute {
+        // Derive from `self`, not `self.attrs`, so the pointer has correct provenance to access
+        // the sentinel.
+        core::ptr::from_ref(self).cast_mut().cast()
+    }
+}
+
+/// An `attribute_group` over a `'static` [`RawAttrs`].
+///
+/// Built by [`device_attribute_groups!`]. The group points at the attribute array, so that array
+/// must not move.
+///
+/// # Invariants
+///
+/// `attrs` points at a NULL-terminated `device_attribute` pointer array.
+#[repr(transparent)]
+#[doc(hidden)]
+pub struct RawGroup(bindings::attribute_group);
+
+impl RawGroup {
+    /// Builds the group from a `'static` attribute pointer array.
+    pub const fn new<const N: usize>(attrs: &'static RawAttrs<N>) -> Self {
+        // INVARIANT: `attrs` is the `'static` `RawAttrs` pointer array, NULL-terminated by its
+        // invariant.
+        Self(bindings::attribute_group {
+            __bindgen_anon_2: bindings::attribute_group__bindgen_ty_2 {
+                attrs: attrs.as_ptr(),
+            },
+            ..pin_init::zeroed()
+        })
+    }
+}
+
+// SAFETY: The pointers are only read by the kernel from the thread-safe sysfs core, and the data
+// they reference is immutable for the table's `'static` lifetime.
+unsafe impl Sync for RawGroup {}
+
+/// A NULL-terminated array of one `attribute_group` pointer for `driver.dev_groups`.
+///
+/// Built by [`device_attribute_groups!`] from a `static` [`RawGroup`], which it points at, so that
+/// group must not move.
+///
+/// # Invariants
+///
+/// - `groups[0]` points at a live `attribute_group` and `sentinel` is NULL.
+/// - Every attribute reachable through `groups[0]` is built for driver `D`.
+#[repr(C)]
+#[doc(hidden)]
+pub struct RawGroups<D: Driver> {
+    groups: [*const bindings::attribute_group; 1],
+    sentinel: *const bindings::attribute_group,
+    _driver: PhantomData<fn() -> D>,
+}
+
+impl<D: Driver> RawGroups<D> {
+    /// Builds the group array from a `'static` group.
+    ///
+    /// # Safety
+    ///
+    /// Every attribute reachable through `group` must have been built for driver `D`, i.e. from
+    /// [`DeviceAttribute`] implementors whose `Driver` is `D`.
+    pub const unsafe fn new(group: &'static RawGroup) -> Self {
+        // INVARIANT: `groups[0]` is the `'static` `RawGroup`, sentinel is null, and the caller
+        // guarantees every attribute reachable through `group` is built for `D`.
+        Self {
+            groups: [core::ptr::from_ref(group).cast()],
+            sentinel: core::ptr::null(),
+            _driver: PhantomData,
+        }
+    }
+}
+
+// SAFETY: The pointers are only read by the kernel from the thread-safe sysfs core, and the data
+// they reference is immutable for the table's `'static` lifetime.
+unsafe impl<D: Driver> Sync for RawGroups<D> {}
+
+// SAFETY: By the type invariants `as_ptr` returns a NULL-terminated array valid while `self`
+// lives, and every attribute in it is built for `D`.
+unsafe impl<D: Driver> AttributeGroups<D> for RawGroups<D> {
+    fn as_ptr(&self) -> *mut *const bindings::attribute_group {
+        // Derive from `self`, not `self.groups`, so the pointer has correct provenance to access
+        // the sentinel.
+        core::ptr::from_ref(self).cast_mut().cast()
+    }
+}
+
+/// Defines a `'static` [`AttributeGroups`] table from a list of [`DeviceAttribute`] types.
+///
+/// Mirrors the C `DEVICE_ATTR_RW` plus `ATTRIBUTE_GROUPS` pair. It emits one `device_attribute` per
+/// type and a group with a NULL-terminated attribute array, and binds the result to a
+/// `static $name` ready to assign to [`Driver::DEV_GROUPS`].
+///
+/// # Examples
+///
+/// ```ignore
+/// struct Profiling;
+///
+/// impl platform::DeviceAttribute for Profiling {
+///     type Driver = MyDriver;
+///     const NAME: &'static CStr = c"profiling";
+///
+///     fn show(
+///         _dev: &device::Device<Bound>,
+///         data: Pin<&MyData<'_>>,
+///         writer: &mut Formatter<'_>,
+///     ) -> Result {
+///         writeln!(writer, "{}", data.mask())?;
+///         Ok(())
+///     }
+///
+///     fn store(_dev: &device::Device<Bound>, data: Pin<&MyData<'_>>, buf: &CStr) -> Result {
+///         data.set_mask(buf.to_str()?.trim().parse().map_err(|_| EINVAL)?);
+///         Ok(())
+///     }
+/// }
+///
+/// kernel::device_attribute_groups!(MY_GROUPS, MyDriver, [Profiling]);
+///
+/// impl platform::Driver for MyDriver {
+///     const DEV_GROUPS: Option<&'static dyn platform::AttributeGroups<Self>> = Some(&MY_GROUPS);
+///     // ...
+/// }
+/// ```
+#[macro_export]
+macro_rules! device_attribute_groups {
+    ($name:ident, $driver:ty, [$($attr:ty),+ $(,)?]) => {
+        $crate::macros::paste! {
+            // The attributes, their pointer array, the group, and the group array reference each
+            // other by address, so each lives in its own `static`, as the C `ATTRIBUTE_GROUPS`
+            // macro lays them out.
+            static [<$name _ATTRS>]: $crate::platform::Attrs<
+                { <[()]>::len(&[$($crate::device_attribute_groups!(@unit $attr)),+]) }> =
+                $crate::platform::Attrs::new(
+                    [$($crate::platform::device_attribute::<$driver, $attr>()),+]);
+            static [<$name _RAW_ATTRS>]: $crate::platform::RawAttrs<
+                { <[()]>::len(&[$($crate::device_attribute_groups!(@unit $attr)),+]) }> =
+                $crate::platform::RawAttrs::new(&[<$name _ATTRS>]);
+            static [<$name _GROUP>]: $crate::platform::RawGroup =
+                $crate::platform::RawGroup::new(&[<$name _RAW_ATTRS>]);
+            // SAFETY: every attribute above is built through `device_attribute::<$driver, _>`,
+            // which requires its `Driver` to be `$driver`.
+            static $name: $crate::platform::RawGroups<$driver> =
+                unsafe { $crate::platform::RawGroups::new(&[<$name _GROUP>]) };
+        }
+    };
+
+    (@unit $attr:ty) => {
+        ()
+    };
 }
