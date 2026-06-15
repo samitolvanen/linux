@@ -1300,7 +1300,7 @@ impl Scheduler {
             };
             for (queue_idx, queue) in group.queues.iter().enumerate() {
                 match group.read_syncobj(queue_idx) {
-                    Ok(syncobj_seqno) => queue.complete_submit_fences(syncobj_seqno),
+                    Ok(syncobj_seqno) => queue.complete_submit_fences(group, syncobj_seqno),
                     Err(err) => dev_err!(
                         tdev.as_ref(),
                         "queue completion drain failed: {}\n",
