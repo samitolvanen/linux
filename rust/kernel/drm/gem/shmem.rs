@@ -147,6 +147,11 @@ impl<T: DriverObject> Object<T> {
         vmap: Some(bindings::drm_gem_shmem_object_vmap),
         vunmap: Some(bindings::drm_gem_shmem_object_vunmap),
         mmap: Some(Self::mmap_callback),
+        status: if T::HAS_STATUS {
+            Some(super::status_callback::<T>)
+        } else {
+            None
+        },
         #[allow(unused_unsafe, reason = "Safe since Rust 1.82.0")]
         // SAFETY: `drm_gem_shmem_vm_ops` is a valid, static const on the C side.
         vm_ops: unsafe { &raw const bindings::drm_gem_shmem_vm_ops },
@@ -981,6 +986,7 @@ mod tests {
         }
     }
 
+    #[vtable]
     impl gem::DriverObject for KunitObject {
         type Driver = KunitDriver;
         type Args = ();
