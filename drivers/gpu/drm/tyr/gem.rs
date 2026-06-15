@@ -100,6 +100,7 @@ pub(crate) struct BoCreateArgs {
     exclusive_vm_root_gem: Option<ARef<Bo>>,
 }
 
+#[vtable]
 impl gem::DriverObject for BoData {
     type Driver = TyrDrmDriver;
     type Args = BoCreateArgs;
