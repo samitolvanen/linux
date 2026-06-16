@@ -392,8 +392,7 @@ impl ops::Div for Delta {
 /// }
 /// ```
 pub fn arch_timer_get_rate() -> Option<u32> {
-    // SAFETY: The C API is available in all configs; when CONFIG_ARM_ARCH_TIMER
-    // is disabled, the header provides a stub returning 0.
+    // SAFETY: FFI call to a parameterless accessor with no safety preconditions.
     let rate = unsafe { bindings::arch_timer_get_rate() };
     if rate == 0 {
         None
