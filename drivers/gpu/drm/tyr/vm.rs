@@ -61,12 +61,17 @@ use kernel::{
     iommu::pgtable::{
         prot,
         DevresIoPageTable,
+        IoPageTable,
         ARM64LPAES1, //
     },
     new_mutex,
     platform,
     pr_warn_once,
     prelude::*,
+    ptr::{
+        Alignable,
+        Alignment, //
+    },
     sizes::{
         SZ_1G,
         SZ_2M,
@@ -632,6 +637,21 @@ impl<'ctx> PtUpdateContext<'ctx> {
             *slot = Some(gpuva);
         }
     }
+
+    /// Widens the AS lock to also cover `region`.
+    ///
+    /// A remap can rebuild fragments beyond the originally locked request,
+    /// so the lock is grown to the union of the two before those fragments
+    /// are torn down. The locked region only ever grows, so several remaps
+    /// in one unmap union onto a single widening lock.
+    fn extend_lock(&mut self, region: Range<u64>) -> Result {
+        let union = self.region.start.min(region.start)..self.region.end.max(region.end);
+        if union.start < self.region.start || union.end > self.region.end {
+            self.mmu.extend_vm_update(self.as_data, &union)?;
+            self.region = union;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PtUpdateContext<'_> {
@@ -647,6 +667,16 @@ impl Drop for PtUpdateContext<'_> {
 /// Implements [`DriverGpuVm`] to provide VM operation callbacks (map, unmap, remap)
 /// and associated types for buffer objects, virtual addresses, and contexts.
 pub(crate) struct GpuVmData;
+
+/// Per-mapping private data stored on each `GpuVa`.
+///
+/// A remap splits an existing mapping and may have to rebuild page-table
+/// entries for the surviving fragments. Those fragments keep the protection
+/// of the original mapping, so the protection flags are recorded here.
+pub(crate) struct GpuVaData {
+    /// Memory protection flags of this mapping, as passed to `pt_map`.
+    prot: u32,
+}
 
 fn max_va_range(gpu_info: &GpuInfo) -> u64 {
     1u64 << MMU_FEATURES::from_raw(gpu_info.mmu_features)
@@ -1265,7 +1295,7 @@ impl DriverGpuVm for GpuVmData {
     type Driver = TyrDrmDriver;
     type Object = Bo;
     type VmBoData = ();
-    type VaData = ();
+    type VaData = GpuVaData;
     type SmContext<'ctx>
         = PtUpdateContext<'ctx>
     where
@@ -1365,7 +1395,7 @@ impl DriverGpuVm for GpuVmData {
         }
 
         let gpuva = context.preallocated_gpuva()?;
-        let op = op.insert(gpuva, pin_init::init_zeroed());
+        let op = op.insert(gpuva, GpuVaData { prot });
 
         Ok(op)
     }
@@ -1413,10 +1443,47 @@ impl DriverGpuVm for GpuVmData {
             op.va_to_unmap().addr() + op.va_to_unmap().length()
         };
 
-        let unmap_length = unmap_end - unmap_start;
+        // The surviving fragments inherit the protection of the mapping being
+        // split.
+        let prot = op.va_to_unmap().data_ref().prot;
 
-        if unmap_length > 0 {
-            let region = unmap_start..(unmap_start + unmap_length);
+        let block = Alignment::new::<{ SZ_2M }>();
+        let aligned_start = unmap_start.align_down(block);
+        let aligned_end = unmap_end.align_up(block).ok_or(EINVAL)?;
+
+        // An end may only be expanded if the fragment the expansion sweeps and
+        // rebuilds is fully mapped and physically contiguous, because the
+        // rebuild maps it linearly from a single recovered address. A genuine
+        // 2MB block is always contiguous, so this never misses one and the
+        // partial-block unmap can never reach arm-lpae. A fragmented region is
+        // never expanded, so its sub-range unmap stays correct.
+        let head_paddr = match op.prev() {
+            Some(prev) if aligned_start < unmap_start && prev.addr() <= aligned_start => {
+                contiguous_phys(context.pt, aligned_start..unmap_start)
+            }
+            _ => None,
+        };
+        let tail_paddr = match op.next() {
+            Some(next) if aligned_end > unmap_end && next.addr() + next.length() >= aligned_end => {
+                contiguous_phys(context.pt, unmap_end..aligned_end)
+            }
+            _ => None,
+        };
+
+        let region_start = if head_paddr.is_some() {
+            aligned_start
+        } else {
+            unmap_start
+        };
+        let region_end = if tail_paddr.is_some() {
+            aligned_end
+        } else {
+            unmap_end
+        };
+
+        if region_end > region_start {
+            let region = region_start..region_end;
+            context.extend_lock(region.clone())?;
             pt_unmap(context.dev, context.pt, region.clone()).inspect_err(|e| {
                 dev_err!(
                     context.dev,
@@ -1428,14 +1495,32 @@ impl DriverGpuVm for GpuVmData {
             })?;
         }
 
+        if let Some(head_paddr) = head_paddr {
+            pt_map_fragment(
+                context.dev,
+                context.pt,
+                aligned_start,
+                head_paddr,
+                unmap_start - aligned_start,
+                prot,
+            )?;
+        }
+        if let Some(tail_paddr) = tail_paddr {
+            pt_map_fragment(
+                context.dev,
+                context.pt,
+                unmap_end,
+                tail_paddr,
+                aligned_end - unmap_end,
+                prot,
+            )?;
+        }
+
         let prev_va = context.preallocated_gpuva()?;
         let next_va = context.preallocated_gpuva()?;
 
-        let (op_remapped, remap_ret) = op.remap(
-            [prev_va, next_va],
-            pin_init::init_zeroed(),
-            pin_init::init_zeroed(),
-        );
+        let (op_remapped, remap_ret) =
+            op.remap([prev_va, next_va], GpuVaData { prot }, GpuVaData { prot });
 
         if let Some(unused_va) = remap_ret.unused_va {
             context.return_preallocated_gpuva(unused_va);
@@ -1443,6 +1528,40 @@ impl DriverGpuVm for GpuVmData {
 
         Ok(op_remapped)
     }
+}
+
+/// Returns the base physical address of `range` if every 4KB page in it is
+/// mapped and the whole range is physically contiguous, otherwise `None`.
+///
+/// `range` is a sub-block fragment, so its length is below 2MB and the walk
+/// visits at most 511 pages. The walk is read-only, lock-free and does not
+/// allocate, so it is safe on the dma-fence signalling path. A revoked page
+/// table also reports `None`, leaving the unmap unexpanded.
+fn contiguous_phys(
+    page_table: &DevresIoPageTable<ARM64LPAES1>,
+    range: Range<u64>,
+) -> Option<PhysAddr> {
+    let pt = page_table.try_access()?;
+
+    // SAFETY: The page table is exclusively accessed through the
+    // &mut UniqueRefGpuVm held under the gpuvm_unique mutex for the duration of
+    // the VM update, so no other io-pgtable operation runs concurrently.
+    let base = unsafe { pt.iova_to_phys(range.start as usize) }?;
+
+    let mut iova = range.start + SZ_4K as u64;
+    while iova < range.end {
+        let offset = (iova - range.start) as PhysAddr;
+        // SAFETY: The page table is accessed exclusively through the
+        // &mut UniqueRefGpuVm held under the gpuvm_unique mutex, so no
+        // concurrent io-pgtable operation runs.
+        let paddr = unsafe { pt.iova_to_phys(iova as usize) }?;
+        if paddr != base + offset {
+            return None;
+        }
+        iova += SZ_4K as u64;
+    }
+
+    Some(base)
 }
 
 /// This function selects the largest supported block size (currently 4KB or 2MB)
@@ -1521,6 +1640,61 @@ fn pt_map(
     prot: u32,
 ) -> Result<u64> {
     let pt = page_table.access(dev)?;
+
+    let (mapped, result) = pt_map_pages(dev, pt, iova, paddr, len, prot);
+    if let Err(e) = result {
+        if mapped > 0 {
+            let _ = pt_unmap(dev, page_table, iova..(iova + mapped));
+        }
+        return Err(e);
+    }
+
+    Ok(mapped)
+}
+
+/// Maps the fragment a remap expansion swept away.
+///
+/// Same as `pt_map`, but the page table is resolved through the revocable
+/// guard because the remap path has no `&Device<Bound>` to resolve it with.
+///
+/// A revoked page table is an error here. `pt_unmap` instead succeeds
+/// because a freed table has nothing left to unmap.
+fn pt_map_fragment(
+    dev: &Device,
+    page_table: &DevresIoPageTable<ARM64LPAES1>,
+    iova: u64,
+    paddr: PhysAddr,
+    len: u64,
+    prot: u32,
+) -> Result {
+    // Expressly convert to u64 to work with arm 32-bit builds.
+    #[allow(clippy::useless_conversion)]
+    let paddr = u64::from(paddr);
+
+    let (mapped, result) = {
+        let pt = page_table.try_access().ok_or(ENODEV)?;
+        pt_map_pages(dev, &pt, iova, paddr, len, prot)
+    };
+
+    if result.is_err() && mapped > 0 {
+        let _ = pt_unmap(dev, page_table, iova..(iova + mapped));
+    }
+
+    result
+}
+
+/// Maps `len` bytes at `paddr` to `iova` in an already-resolved page table.
+///
+/// Returns how many bytes were mapped along with the outcome, so the caller
+/// can decide whether to unmap a partial mapping.
+fn pt_map_pages(
+    dev: &Device,
+    pt: &IoPageTable<'_, ARM64LPAES1>,
+    iova: u64,
+    paddr: u64,
+    len: u64,
+    prot: u32,
+) -> (u64, Result) {
     let mut segment_mapped = 0u64;
     while segment_mapped < len {
         let remaining = len - segment_mapped;
@@ -1541,11 +1715,7 @@ fn pt_map(
                     usize::MAX
                 );
 
-                if segment_mapped > 0 {
-                    let _ = pt_unmap(dev, page_table, iova..(iova + segment_mapped));
-                }
-
-                return Err(EOVERFLOW);
+                return (segment_mapped, Err(EOVERFLOW));
             }
         };
 
@@ -1575,24 +1745,18 @@ fn pt_map(
             // If map_pages fails, mapped will be zero because the ARM LPAE backend
             // only updates the mapped value after the entire request succeeds.
             dev_err!(dev, "pt.map_pages failed at iova {:#x}: {:?}", curr_iova, e);
-            if segment_mapped > 0 {
-                let _ = pt_unmap(dev, page_table, iova..(iova + segment_mapped));
-            }
-            return Err(e);
+            return (segment_mapped, Err(e));
         }
 
         if mapped == 0 {
             dev_err!(dev, "Failed to map any pages at iova {:#x}", curr_iova);
-            if segment_mapped > 0 {
-                let _ = pt_unmap(dev, page_table, iova..(iova + segment_mapped));
-            }
-            return Err(ENOMEM);
+            return (segment_mapped, Err(ENOMEM));
         }
 
         segment_mapped += mapped as u64;
     }
 
-    Ok(segment_mapped)
+    (segment_mapped, Ok(()))
 }
 
 /// Unmaps a virtual address range from the page table.
@@ -1629,7 +1793,7 @@ fn pt_unmap(
         // The guard is taken per chunk so the RCU read-side section covers a single
         // `unmap_pages()` call. The page table is freed when the device is unbound, leaving
         // nothing to unmap. Rollback calls from `pt_map()` never observe that, since
-        // `pt_map()` holds a `&Device<Bound>`.
+        // `pt_map()` holds a `&Device<Bound>`. A fragment rollback can.
         let Some(pt) = page_table.try_access() else {
             return Ok(());
         };
