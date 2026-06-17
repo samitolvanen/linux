@@ -677,6 +677,13 @@ impl platform::Driver for TyrPlatformDriver {
                 csif_info,
         });
 
+        if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
+            match unreg_dev.create_huge_mnt(c"within_size") {
+                Ok(()) => dev_info!(pdev, "Using transparent huge pages.\n"),
+                Err(e) => dev_warn!(pdev, "Can't use transparent huge pages: {:?}\n", e),
+            }
+        }
+
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), unreg_dev, reg_data, 0)? };
