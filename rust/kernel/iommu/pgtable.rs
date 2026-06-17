@@ -214,6 +214,29 @@ impl<F: IoPageTableFmt> IoPageTable<F> {
         // SAFETY: The safety requirements of this method are sufficient to call `unmap_pages`.
         unsafe { (unmap_pages)(self.raw_ops(), iova, pgsize, pgcount, core::ptr::null_mut()) }
     }
+
+    /// Translate an `iova` to the physical address it maps to.
+    ///
+    /// Returns [`None`] if `iova` is not mapped. As in the underlying C op, a mapping to physical
+    /// address 0 is indistinguishable from unmapped and also reports [`None`]. The returned address
+    /// includes the offset of `iova` within the mapping block, so it is exact for any `iova`, not
+    /// just block-aligned ones. This walk is lock-free and does not allocate.
+    ///
+    /// # Safety
+    ///
+    /// No other io-pgtable operation may modify the entry covering `iova` while this walk
+    /// executes.
+    #[inline]
+    pub unsafe fn iova_to_phys(&self, iova: usize) -> Option<PhysAddr> {
+        // SAFETY: The `iova_to_phys` function in `io_pgtable_ops` is never null.
+        let iova_to_phys = unsafe { (*self.raw_ops()).iova_to_phys.unwrap_unchecked() };
+
+        // SAFETY: The safety requirements of this method are sufficient to call `iova_to_phys`.
+        let paddr = unsafe { (iova_to_phys)(self.raw_ops(), iova) };
+
+        // A zero return means `iova` is not mapped.
+        (paddr != 0).then_some(paddr)
+    }
 }
 
 // For the initial users of these rust bindings, the GPU FW is managing the IOTLB and performs all
