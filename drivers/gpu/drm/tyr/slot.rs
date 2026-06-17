@@ -396,14 +396,29 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         }
     }
 
-    /// Flag a resource as idle. This method will be used for user VM support.
-    #[expect(dead_code)]
+    /// Flag a resource as idle.
     pub(crate) fn idle(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
         self.check_seat(locked_seat);
         if let Seat::Active(seat_info) = locked_seat.access(self) {
             self.idle_slot(seat_info.slot as usize, locked_seat)?;
         }
         Ok(())
+    }
+
+    /// Returns the slot a resource is resident on, or `None` if it has
+    /// none.
+    ///
+    /// Unlike `Seat::slot`, this resolves both `Seat::Active` and
+    /// `Seat::Idle` seats. An idle resource keeps its hardware slot
+    /// programmed until the slot is reclaimed. The seat is validated
+    /// first, so a stale idle seat whose slot has since been reclaimed
+    /// is reported as not resident.
+    pub(crate) fn resident_slot(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Option<u8> {
+        self.check_seat(locked_seat);
+        match locked_seat.access(self) {
+            Seat::Active(info) | Seat::Idle(info) => Some(info.slot),
+            Seat::NoSeat => None,
+        }
     }
 
     /// Evict a resource from its slot.

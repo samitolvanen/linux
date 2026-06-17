@@ -237,7 +237,8 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
 
     fn evict(&mut self, _slot_idx: usize, slot_data: &Self::SlotData) -> Result {
         // Tear the binding down. Clear `csg_id` and the per-queue
-        // `doorbell_id`, then release the AS slot. This makes no
+        // `doorbell_id`, then flag the VM's AS slot idle so it stays
+        // resident and reusable on the next bind. This makes no
         // assumption about firmware state. Only
         // `Tick::halt_and_unbind_evicted_groups` stages a halt and waits
         // for the ack before evicting. The bind rollback evicts without
@@ -251,7 +252,7 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
             inner.csg_id = None;
         });
 
-        slot_data.group.vm.deactivate()?;
+        slot_data.group.vm.idle()?;
         Ok(())
     }
 }

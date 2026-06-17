@@ -1074,6 +1074,17 @@ impl VmExec {
         self.unusable.store(true, Relaxed);
     }
 
+    /// Flag the VM idle, keeping its address space slot resident.
+    ///
+    /// The slot is reclaimed lazily under pressure. Use `deactivate`
+    /// instead when the address space must be torn down (teardown or an
+    /// unhandled fault).
+    pub(crate) fn idle(&self) -> Result {
+        self.mmu.idle_vm(&self.as_data).inspect_err(|e| {
+            dev_err!(self.dev(), "Failed to idle VM: {:?}", e);
+        })
+    }
+
     /// Deactivate the VM by evicting it from its address space slot.
     pub(crate) fn deactivate(&self) -> Result {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {

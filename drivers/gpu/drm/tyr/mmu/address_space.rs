@@ -90,6 +90,12 @@ pub(crate) struct VmAsData {
     /// It can only be accessed when holding the `Mmu::as_manager` lock.
     as_seat: LockedSeat<AddressSpaceManager, MAX_AS>,
 
+    /// Number of groups currently bound to a CSG slot that use this VM.
+    ///
+    /// The AS slot stays pinned (non-reclaimable) while this is non-zero,
+    /// and becomes reclaimable once the last group unbinds.
+    as_active_users: LockedBy<u32, AsSlotManager>,
+
     /// Virtual address bits for this address space.
     va_bits: u8,
 
@@ -123,6 +129,7 @@ impl VmAsData {
 
         try_pin_init!(Self {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
+            as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
             unhandled_fault: Atomic::new(false),
             page_table <- page_table_init,
@@ -551,19 +558,18 @@ impl SlotOperations<MAX_AS> for AddressSpaceManager {
 }
 
 impl AsSlotManager {
-    /// Locks a region for translation table updates if the VM has an active slot.
+    /// Locks a region for translation table updates if the VM is resident.
+    ///
+    /// An idle VM keeps its slot programmed in hardware, so the lock covers
+    /// idle-resident VMs as well as active ones.
     pub(super) fn start_vm_update(&mut self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
         if region.is_empty() {
             return Ok(());
         }
 
-        let seat = vm_as_data.as_seat.access(self);
-        match seat.slot() {
-            Some(slot) => {
-                let as_nr = slot as usize;
-                self.as_start_update(as_nr, region)
-            }
-            _ => Ok(()),
+        match self.resident_slot(&vm_as_data.as_seat) {
+            Some(slot) => self.as_start_update(slot as usize, region),
+            None => Ok(()),
         }
     }
 
@@ -574,6 +580,9 @@ impl AsSlotManager {
     /// the wider range it is about to rebuild. The hardware lock is replaced
     /// in place, so `region` must contain the previously locked range to keep
     /// the GPU stalled over it.
+    ///
+    /// An idle VM keeps its slot programmed in hardware, so the lock covers
+    /// idle-resident VMs as well as active ones.
     ///
     /// If the region is empty or the VM is not resident in a hardware slot,
     /// this is a no-op.
@@ -586,41 +595,61 @@ impl AsSlotManager {
             return Ok(());
         }
 
-        let seat = vm_as_data.as_seat.access(self);
-        match seat.slot() {
-            Some(slot) => {
-                let as_nr = slot as usize;
-                self.as_start_update(as_nr, region)
-            }
-            _ => Ok(()),
+        match self.resident_slot(&vm_as_data.as_seat) {
+            Some(slot) => self.as_start_update(slot as usize, region),
+            None => Ok(()),
         }
     }
 
     /// Completes translation table updates and unlocks the region.
+    ///
+    /// An idle VM keeps its slot programmed in hardware, so the flush covers
+    /// idle-resident VMs as well as active ones.
     pub(super) fn end_vm_update(&mut self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
         if region.is_empty() {
             return Ok(());
         }
 
-        let seat = vm_as_data.as_seat.access(self);
-        match seat.slot() {
-            Some(slot) => {
-                let as_nr = slot as usize;
-                self.as_end_update(as_nr)
-            }
-            _ => Ok(()),
+        match self.resident_slot(&vm_as_data.as_seat) {
+            Some(slot) => self.as_end_update(slot as usize),
+            None => Ok(()),
         }
     }
 
     /// Activates a VM by assigning it to a hardware slot.
     pub(super) fn activate_vm(&mut self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
-        self.activate(vm_as_data.into())?;
-        vm_as_data.unhandled_fault.store(false, Relaxed);
+        if *vm_as_data.as_active_users.access(self) == 0 {
+            self.activate(vm_as_data.into())?;
+            vm_as_data.unhandled_fault.store(false, Relaxed);
+        }
+        *vm_as_data.as_active_users.access_mut(self) += 1;
+        Ok(())
+    }
+
+    /// Drops one of the VM's bound users, flagging the slot idle once the
+    /// last one drops. The slot stays pinned and programmed while any user
+    /// remains, then is reclaimed and evicted lazily.
+    ///
+    /// A drop when no users remain is a no-op, so it safely follows a
+    /// `deactivate_vm` that already reset the count.
+    pub(super) fn idle_vm(&mut self, vm_as_data: &VmAsData) -> Result {
+        let users = vm_as_data.as_active_users.access_mut(self);
+        if *users == 0 {
+            return Ok(());
+        }
+        *users -= 1;
+        if *users == 0 {
+            self.idle(&vm_as_data.as_seat)?;
+        }
         Ok(())
     }
 
     /// Deactivates a VM by evicting it from its hardware slot.
+    ///
+    /// Resets the user count, so it evicts even while groups are still
+    /// bound.
     pub(super) fn deactivate_vm(&mut self, vm_as_data: &VmAsData) -> Result {
+        *vm_as_data.as_active_users.access_mut(self) = 0;
         self.evict(&vm_as_data.as_seat)
     }
 
