@@ -655,6 +655,13 @@ impl platform::Driver for TyrPlatformDriver {
 
             let heap_wq = Queue::new_unbound().build(c"tyr-heap")?;
 
+            if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
+                match unreg_dev.create_huge_mnt(c"within_size") {
+                    Ok(()) => dev_info!(pdev, "Using transparent huge pages.\n"),
+                    Err(e) => dev_warn!(pdev, "Can't use transparent huge pages: {:?}\n", e),
+                }
+            }
+
             Ok(try_pin_init!(TyrPlatformDriverData {
                 // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the
                 // driver is unbound; it is never forgotten.
