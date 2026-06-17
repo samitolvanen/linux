@@ -87,6 +87,12 @@ impl<T: DriverGpuVm> GpuVa<T> {
         unsafe { <T::Object as IntoGEMObject>::from_raw((*self.as_raw()).gem.obj) }
     }
 
+    /// Access the driver-private [`VaData`](DriverGpuVm::VaData) associated with this mapping.
+    #[inline]
+    pub fn data_ref(&self) -> &T::VaData {
+        &self.data
+    }
+
     /// Returns the underlying [`GpuVmBo`] object that backs this [`GpuVa`].
     #[inline]
     pub fn vm_bo(&self) -> &GpuVmBo<T> {
