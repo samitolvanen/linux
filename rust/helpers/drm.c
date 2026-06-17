@@ -22,6 +22,14 @@ rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
 	return drm_vma_node_offset_addr(node);
 }
 
+#ifndef CONFIG_TRANSPARENT_HUGEPAGE
+__rust_helper int
+rust_helper_drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
+{
+	return drm_gem_huge_mnt_create(dev, value);
+}
+#endif
+
 #ifdef CONFIG_DRM_GEM_SHMEM_HELPER
 __rust_helper void
 rust_helper_drm_gem_shmem_object_free(struct drm_gem_object *obj)
