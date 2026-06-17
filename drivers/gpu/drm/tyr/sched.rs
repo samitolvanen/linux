@@ -247,12 +247,14 @@ impl crate::slot::SlotOperations for CsgSlotOps {
     ) -> Result {
         slot_data.group.vm.activate()?;
 
-        // Release the AS-slot binding on any failure of the per-CS
-        // programming below.
+        // Undo the AS-slot user reference taken above on any failure of
+        // the per-CS programming below. A sibling group of the same VM
+        // may still be bound, so this drops a user rather than evicting
+        // the shared slot.
         let rollback = ScopeGuard::new(|| {
-            if let Err(e) = slot_data.group.vm.deactivate() {
+            if let Err(e) = slot_data.group.vm.idle() {
                 pr_err!(
-                    "CSG slot {} activate rollback: vm.deactivate() failed: {}\n",
+                    "CSG slot {} activate rollback: vm.idle() failed: {}\n",
                     slot_idx,
                     e.to_errno()
                 );
@@ -356,8 +358,9 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // around the firmware ack wait while the scheduler mutex
         // stays held) before this callback runs. This callback only
         // tears the binding down: clear `csg_id` / per-queue
-        // `doorbell_id`, release the AS slot. The suspend interval is
-        // opened at the staging point, not here, so the firmware-save
+        // `doorbell_id`, flag the VM's AS slot idle so it stays
+        // resident and reusable on the next bind. The suspend interval
+        // is opened at the staging point, not here, so the firmware-save
         // latency counts as off-slot time.
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
@@ -365,7 +368,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             }
             inner.csg_id = None;
         });
-        slot_data.group.vm.deactivate()?;
+        slot_data.group.vm.idle()?;
         Ok(())
     }
 }

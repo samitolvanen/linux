@@ -105,6 +105,14 @@ impl Mmu {
         self.as_manager.lock().activate_vm(vm)
     }
 
+    /// Flag the VM idle.
+    ///
+    /// Keeps the VM on its AS slot through the slot manager, leaving it
+    /// reclaimable under pressure.
+    pub(crate) fn idle_vm(&self, vm: &VmAsData) -> Result {
+        self.as_manager.lock().idle_vm(vm)
+    }
+
     /// Make the VM inactive.
     ///
     /// Evicts the VM from its AS slot through the slot manager.
