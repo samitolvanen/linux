@@ -17,7 +17,10 @@ use crate::{
         driver::AllocImpl,
         private::Sealed, //
     },
-    error::from_err_ptr,
+    error::{
+        from_err_ptr,
+        to_result, //
+    },
     prelude::*,
     sync::aref::{
         ARef,
@@ -376,6 +379,23 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         // - When `release` runs it is guaranteed that there is no further access to `this`.
         // - `this` is valid for dropping.
         unsafe { core::ptr::drop_in_place(this) };
+    }
+
+    /// Create and mount a dedicated huge tmpfs mountpoint for this device's GEM shmem objects.
+    ///
+    /// `value` is the tmpfs `huge=` mount option (for example `"within_size"`). Once mounted, GEM
+    /// shmem objects allocated for this device are backed from the huge mountpoint, which lets the
+    /// allocator hand out transparent huge pages.
+    ///
+    /// The mount is torn down automatically when the device is released; there is no matching
+    /// teardown to call. This is a no-op returning `Ok` when `CONFIG_TRANSPARENT_HUGEPAGE` is
+    /// disabled.
+    #[inline]
+    pub fn create_huge_mnt(&self, value: &CStr) -> Result {
+        // SAFETY: `self.as_raw()` is a valid `drm_device` by the type invariants, and `value` is a
+        // valid null-terminated C string for the duration of the call. The DRM core registers a
+        // drmm action to unmount on device release, so ownership of the mount stays with the C side.
+        to_result(unsafe { bindings::drm_gem_huge_mnt_create(self.as_raw(), value.as_char_ptr()) })
     }
 
     /// Change the [`DeviceContext`] for a [`Device`].
