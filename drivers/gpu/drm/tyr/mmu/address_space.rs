@@ -606,6 +606,31 @@ impl AsSlotManager {
         }
     }
 
+    /// Widens the active lock to cover a larger region.
+    ///
+    /// Re-issues the LOCKADDR and Lock command over `region`, which the
+    /// caller has computed as the union of the currently locked region and
+    /// the wider range it is about to rebuild. The hardware lock is replaced
+    /// in place, so `region` must contain the previously locked range to keep
+    /// the GPU stalled over it.
+    ///
+    /// If the region is empty or the VM is not resident in a hardware slot,
+    /// this is a no-op.
+    pub(super) fn extend_vm_update(&mut self, vm: &VmAsData, region: &Range<u64>) -> Result {
+        if region.is_empty() {
+            return Ok(());
+        }
+
+        let seat = vm.as_seat.access(self);
+        match seat.slot() {
+            Some(slot) => {
+                let as_nr = slot as usize;
+                self.as_start_update(as_nr, region)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Completes translation table updates and unlocks the region.
     ///
     /// If the VM is currently assigned to a hardware slot, flushes the translation

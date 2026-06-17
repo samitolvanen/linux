@@ -133,6 +133,15 @@ impl Mmu {
         self.as_manager.lock().start_vm_update(vm, region)
     }
 
+    /// Widens the active lock to cover a larger region.
+    ///
+    /// `region` must contain the currently locked range so the GPU stays
+    /// stalled over it while the update completes. If the region is empty or
+    /// the VM is not resident, this is a NOP.
+    pub(crate) fn extend_vm_update(&self, vm: &VmAsData, region: &Range<u64>) -> Result {
+        self.as_manager.lock().extend_vm_update(vm, region)
+    }
+
     /// Flags the end of a VM update.
     ///
     /// If the VM is resident, this will let GPU accesses on the updated
