@@ -526,7 +526,7 @@ impl AddressSpaceManager {
             LOCKADDR_HI::from_raw((lockaddr_val >> 32) as u32),
         );
 
-        self.as_send_cmd(as_nr, MmuCommand::Lock)?;
+        self.as_send_cmd_and_wait(as_nr, MmuCommand::Lock)?;
         self.lock_pending[as_nr] = true;
         Ok(())
     }
