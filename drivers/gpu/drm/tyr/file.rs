@@ -26,6 +26,7 @@ use kernel::{
         aref::ARef,
         Arc, //
     },
+    time::arch_timer_get_rate,
     transmute::{
         AsBytes,
         FromBytes, //
@@ -266,7 +267,7 @@ impl TyrDrmFileData {
                     Ok(0)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_TIMESTAMP_INFO => {
-                    let timestamp_frequency = 0u64;
+                    let timestamp_frequency = arch_timer_get_rate().map_or(0, u64::from);
 
                     let _awake = match ddev.pm_context() {
                         Some(ctx) => Some(ctx.get(PMProfile::new().auto())?),
