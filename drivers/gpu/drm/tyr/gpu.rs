@@ -517,7 +517,11 @@ pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDrive
     let tdev = &data.device;
     tdev.gpu_irq
         .quiesce(bound, &tdev.iomem, irq::gpu_irq_disable);
-    let _ = tdev.hw_ops.l2_power_off(bound, &tdev.iomem);
+    let l2_res = tdev.hw_ops.l2_power_off(bound, &tdev.iomem);
+    trace::pm_hw(
+        trace::PmHwStep::L2Off,
+        l2_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
     if let Some(pwr_irq) = &tdev.pwr_irq {
         pwr_irq.quiesce(bound, &tdev.iomem, pwr::pwr_irq_disable);
     }
@@ -534,8 +538,14 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     }
     tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
-    tdev.hw_ops
-        .l2_power_on(bound, &tdev.iomem, tdev.coherency, tdev.soc_data)
+    let l2_res = tdev
+        .hw_ops
+        .l2_power_on(bound, &tdev.iomem, tdev.coherency, tdev.soc_data);
+    trace::pm_hw(
+        trace::PmHwStep::L2On,
+        l2_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    l2_res
 }
 
 /// Snapshots shader-domain power state for tracing. Used to diagnose
