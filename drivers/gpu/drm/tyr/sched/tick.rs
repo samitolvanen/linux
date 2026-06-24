@@ -1298,6 +1298,9 @@ impl<'a> Tick<'a> {
 
         if decision.all_idle {
             data.devfreq_data.devfreq_state.lock().mark_idle();
+            if self.sched.pm_ref.is_some() {
+                trace::pm_usage(trace::PmUsageEvent::Release, false);
+            }
             self.sched.pm_ref = None;
         } else {
             data.devfreq_data.devfreq_state.lock().mark_busy();

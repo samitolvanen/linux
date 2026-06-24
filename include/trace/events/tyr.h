@@ -2652,6 +2652,123 @@ TRACE_EVENT(tyr_gpu_flush_caches,
 		  __print_symbolic(__entry->other, TYR_FLUSH_MODES))
 );
 
+/*
+ * Begin/end phase tag shared by the runtime suspend and resume events.
+ * Keep in sync with `PmPhase` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_PM_PHASES			\
+	{ 0, "BEGIN" },			\
+	{ 1, "END" }
+
+TRACE_EVENT(tyr_pm_runtime_suspend,
+	TP_PROTO(u32 phase, int errno),
+	TP_ARGS(phase, errno),
+	TP_STRUCT__entry(
+		__field(u32, phase)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->phase = phase;
+		__entry->errno = errno;
+	),
+	TP_printk("phase=%s errno=%d",
+		  __print_symbolic(__entry->phase, TYR_PM_PHASES),
+		  __entry->errno)
+);
+
+TRACE_EVENT(tyr_pm_runtime_resume,
+	TP_PROTO(u32 phase, int errno),
+	TP_ARGS(phase, errno),
+	TP_STRUCT__entry(
+		__field(u32, phase)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->phase = phase;
+		__entry->errno = errno;
+	),
+	TP_printk("phase=%s errno=%d",
+		  __print_symbolic(__entry->phase, TYR_PM_PHASES),
+		  __entry->errno)
+);
+
+/*
+ * Devfreq sub-step tag. Keep in sync with `PmDevfreqOp` in
+ * drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_PM_DEVFREQ_OPS		\
+	{ 0, "SUSPEND" },		\
+	{ 1, "RESUME" }
+
+TRACE_EVENT(tyr_pm_devfreq,
+	TP_PROTO(u32 op, int errno),
+	TP_ARGS(op, errno),
+	TP_STRUCT__entry(
+		__field(u32, op)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->op = op;
+		__entry->errno = errno;
+	),
+	TP_printk("op=%s errno=%d",
+		  __print_symbolic(__entry->op, TYR_PM_DEVFREQ_OPS),
+		  __entry->errno)
+);
+
+/*
+ * Scheduler usage-reference event tag. Keep in sync with
+ * `PmUsageEvent` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_PM_USAGE_EVENTS		\
+	{ 0, "ACQUIRE" },		\
+	{ 1, "RELEASE" },		\
+	{ 2, "SKIP_INACTIVE" },		\
+	{ 3, "RESIDENT_KICK" }
+
+TRACE_EVENT(tyr_pm_usage,
+	TP_PROTO(u32 event, bool acquired),
+	TP_ARGS(event, acquired),
+	TP_STRUCT__entry(
+		__field(u32, event)
+		__field(bool, acquired)
+	),
+	TP_fast_assign(
+		__entry->event = event;
+		__entry->acquired = acquired;
+	),
+	TP_printk("event=%s acquired=%d",
+		  __print_symbolic(__entry->event, TYR_PM_USAGE_EVENTS),
+		  __entry->acquired)
+);
+
+/*
+ * Suspend/resume choreography step tag. Keep in sync with `PmHwStep`
+ * in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_PM_HW_STEPS			\
+	{ 0, "FW_SUSPEND" },		\
+	{ 1, "FW_RESUME" },		\
+	{ 2, "L2_ON" },			\
+	{ 3, "L2_OFF" },		\
+	{ 4, "MMU_SUSPEND" }
+
+TRACE_EVENT(tyr_pm_hw,
+	TP_PROTO(u32 step, int errno),
+	TP_ARGS(step, errno),
+	TP_STRUCT__entry(
+		__field(u32, step)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->step = step;
+		__entry->errno = errno;
+	),
+	TP_printk("step=%s errno=%d",
+		  __print_symbolic(__entry->step, TYR_PM_HW_STEPS),
+		  __entry->errno)
+);
+
 #endif /* _TYR_TRACE_H */
 
 /* This part must be outside protection. */

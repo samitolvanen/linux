@@ -892,6 +892,31 @@ kernel::declare_trace! {
     ///
     /// Always safe to call.
     unsafe fn tyr_gpu_flush_caches(as_slot: u32, l2: u32, lsc: u32, other: u32);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_pm_runtime_suspend(phase: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_pm_runtime_resume(phase: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_pm_devfreq(op: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_pm_usage(event: u32, acquired: bool);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_pm_hw(step: u32, errno: c_int);
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -2618,4 +2643,80 @@ pub(crate) fn as_update_end(vm_id: u64, as_slot: u32) {
 pub(crate) fn gpu_flush_caches(as_slot: u32, l2: u32, lsc: u32, other: u32) {
     // SAFETY: Always safe to call.
     unsafe { tyr_gpu_flush_caches(as_slot, l2, lsc, other) }
+}
+
+/// Begin/end phase shared by the runtime suspend and resume events.
+/// Keep in sync with `TYR_PM_PHASES` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum PmPhase {
+    Begin = 0,
+    End = 1,
+}
+
+/// Devfreq sub-step. Keep in sync with `TYR_PM_DEVFREQ_OPS` in
+/// `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum PmDevfreqOp {
+    Suspend = 0,
+    Resume = 1,
+}
+
+/// Scheduler usage-reference event. Keep in sync with
+/// `TYR_PM_USAGE_EVENTS` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum PmUsageEvent {
+    /// A usage reference was taken for the scheduler.
+    Acquire = 0,
+    /// The held usage reference was dropped.
+    Release = 1,
+    /// `get_if_active` reported the device down, so a hardware access
+    /// was skipped.
+    SkipInactive = 2,
+    /// A resident-queue doorbell kick was requested after a failed
+    /// runtime suspend.
+    ResidentKick = 3,
+}
+
+/// Suspend/resume choreography step. Keep in sync with
+/// `TYR_PM_HW_STEPS` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum PmHwStep {
+    FwSuspend = 0,
+    FwResume = 1,
+    L2On = 2,
+    L2Off = 3,
+    MmuSuspend = 4,
+}
+
+/// Runtime suspend entry and exit. `errno` is meaningful only on
+/// [`PmPhase::End`].
+pub(crate) fn pm_runtime_suspend(phase: PmPhase, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_pm_runtime_suspend(phase as u32, errno) }
+}
+
+/// Runtime resume entry and exit. `errno` is meaningful only on
+/// [`PmPhase::End`].
+pub(crate) fn pm_runtime_resume(phase: PmPhase, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_pm_runtime_resume(phase as u32, errno) }
+}
+
+/// Result of a devfreq suspend or resume sub-step.
+pub(crate) fn pm_devfreq(op: PmDevfreqOp, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_pm_devfreq(op as u32, errno) }
+}
+
+/// Scheduler runtime-PM usage-reference event. `acquired` reports
+/// whether a reference is held after the event.
+pub(crate) fn pm_usage(event: PmUsageEvent, acquired: bool) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_pm_usage(event as u32, acquired) }
+}
+
+/// A suspend or resume choreography step and its result.
+pub(crate) fn pm_hw(step: PmHwStep, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_pm_hw(step as u32, errno) }
 }
