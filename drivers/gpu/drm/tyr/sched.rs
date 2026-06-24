@@ -592,6 +592,7 @@ impl Scheduler {
     /// tick. Called from the failed-runtime-suspend path.
     pub(crate) fn request_resident_kick(&mut self) {
         self.pending_resident_kick = true;
+        trace::pm_usage(trace::PmUsageEvent::ResidentKick, self.pm_ref.is_some());
     }
 
     /// Returns whether any priority band has runnable groups queued.

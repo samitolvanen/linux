@@ -292,7 +292,11 @@ pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDrive
     let tdev = &data.device;
     tdev.gpu_irq
         .quiesce(bound, &tdev.iomem, irq::gpu_irq_disable);
-    let _ = l2_power_off(bound, &tdev.iomem);
+    let l2_res = l2_power_off(bound, &tdev.iomem);
+    trace::pm_hw(
+        trace::PmHwStep::L2Off,
+        l2_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
 }
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
@@ -302,7 +306,12 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     let io = tdev.iomem.access(bound)?;
     tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
-    l2_power_on(bound, &tdev.iomem)
+    let l2_res = l2_power_on(bound, &tdev.iomem);
+    trace::pm_hw(
+        trace::PmHwStep::L2On,
+        l2_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    l2_res
 }
 
 /// Snapshots shader-domain power state for tracing. Used to diagnose

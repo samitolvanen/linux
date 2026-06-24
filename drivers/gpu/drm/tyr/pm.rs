@@ -34,7 +34,8 @@ use crate::{
     gpu,
     mmu,
     reset,
-    sched, //
+    sched,
+    trace, //
 };
 
 /// Autosuspend delay in milliseconds.
@@ -60,10 +61,12 @@ fn suspend_hw_components(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDr
     let tdev = &data.device;
 
     tdev.fw.suspend(tdev, bound);
+    trace::pm_hw(trace::PmHwStep::FwSuspend, 0);
 
     // After fw.suspend() frees the firmware's AS slot, drain the idle
     // user slots while still clocked so teardown hits no gated MMIO.
     mmu::suspend(dev, data);
+    trace::pm_hw(trace::PmHwStep::MmuSuspend, 0);
 
     gpu::suspend(dev, data);
 }
@@ -79,11 +82,16 @@ fn resume_hw_components(
 
     gpu::resume(dev, data)?;
     mmu::resume(dev, data)?;
-    if reload {
+    let fw_res = if reload {
         tdev.fw.reload(tdev)
     } else {
         tdev.fw.resume(tdev)
-    }
+    };
+    trace::pm_hw(
+        trace::PmHwStep::FwResume,
+        fw_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    fw_res
 }
 
 /// Failure path of `resume`. The PM core records the error in
@@ -132,19 +140,34 @@ fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result 
     let data = bound.drvdata::<TyrPlatformDriverData>()?;
     let tdev = &data.device;
 
-    if let Err(e) = devfreq::suspend(slot) {
-        sched::tick::resume_after_aborted_suspend(tdev);
-        // Re-arm the ping watchdog that the aborted suspend may have left
-        // disarmed.
-        TyrDrmDeviceData::arm_fw_ping(tdev);
-        return Err(e);
-    }
+    trace::pm_runtime_suspend(trace::PmPhase::Begin, 0);
 
-    // Nothing below fails. Once the governor is paused, the device
-    // always reaches the suspended state.
-    quiesce_and_suspend(dev, data);
-    tdev.clks.lock().gate();
-    Ok(())
+    let res = (|| -> Result {
+        let devfreq_res = devfreq::suspend(slot);
+        trace::pm_devfreq(
+            trace::PmDevfreqOp::Suspend,
+            devfreq_res.as_ref().err().map_or(0, |e| e.to_errno()),
+        );
+        if let Err(e) = devfreq_res {
+            sched::tick::resume_after_aborted_suspend(tdev);
+            // Re-arm the ping watchdog that the aborted suspend may have left
+            // disarmed.
+            TyrDrmDeviceData::arm_fw_ping(tdev);
+            return Err(e);
+        }
+
+        // Nothing below fails. Once the governor is paused, the device
+        // always reaches the suspended state.
+        quiesce_and_suspend(dev, data);
+        tdev.clks.lock().gate();
+        Ok(())
+    })();
+
+    trace::pm_runtime_suspend(
+        trace::PmPhase::End,
+        res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    res
 }
 
 /// Runtime resume, the reverse of `suspend`.
@@ -159,67 +182,82 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
         return Err(ENODEV);
     }
 
-    tdev.clks.lock().ungate()?;
+    trace::pm_runtime_resume(trace::PmPhase::Begin, 0);
 
-    // A reset recorded while the device was suspended means the firmware state
-    // cannot be trusted, so complete the reset here with a full firmware
-    // reload instead of the fast resident-section reboot.
-    let pending_reset = tdev.reset.claim_pending();
-    if pending_reset {
-        dev_info!(bound, "debug: completing latched GPU reset on resume\n");
-    }
+    let res = (|| -> Result {
+        tdev.clks.lock().ungate()?;
 
-    let hw = if pending_reset || tdev.fw.needs_reload() {
-        resume_hw_components(dev, data, true)
-    } else {
-        resume_hw_components(dev, data, false).or_else(|e| {
-            dev_err!(
-                bound,
-                "Resume failed, retrying with a full firmware reload: {:?}\n",
-                e
-            );
+        // A reset recorded while the device was suspended means the firmware
+        // state cannot be trusted, so complete the reset here with a full
+        // firmware reload instead of the fast resident-section reboot.
+        let pending_reset = tdev.reset.claim_pending();
+        if pending_reset {
+            dev_info!(bound, "debug: completing latched GPU reset on resume\n");
+        }
+
+        let hw = if pending_reset || tdev.fw.needs_reload() {
             resume_hw_components(dev, data, true)
-        })
-    };
+        } else {
+            resume_hw_components(dev, data, false).or_else(|e| {
+                dev_err!(
+                    bound,
+                    "Resume failed, retrying with a full firmware reload: {:?}\n",
+                    e
+                );
+                resume_hw_components(dev, data, true)
+            })
+        };
 
-    if pending_reset {
-        tdev.reset.complete_claimed();
-    }
+        if pending_reset {
+            tdev.reset.complete_claimed();
+        }
 
-    if let Err(e) = hw {
-        return Err(fail_resume(dev, data, e));
-    }
-
-    // A request recorded during the reboot arrived after the earlier
-    // claim, so no worker will pick it up. Complete it before the rebind.
-    if tdev.reset.claim_pending() {
-        dev_info!(
-            bound,
-            "debug: completing GPU reset latched during firmware reboot\n"
-        );
-        let gate = tdev.reset.hw_gate();
-        let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate);
-        tdev.reset.complete_claimed();
-
-        if let Err(e) = reset_res {
+        if let Err(e) = hw {
             return Err(fail_resume(dev, data, e));
         }
-    }
 
-    // The work reissued below tests this flag, so clear it first. A failed
-    // resume leaves the flag set, since the device then stays unusable until
-    // unbind.
-    tdev.pm_powered_down.store(false, ordering::Release);
+        // A request recorded during the reboot arrived after the earlier
+        // claim, so no worker will pick it up. Complete it before the rebind.
+        if tdev.reset.claim_pending() {
+            dev_info!(
+                bound,
+                "debug: completing GPU reset latched during firmware reboot\n"
+            );
+            let gate = tdev.reset.hw_gate();
+            let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate);
+            tdev.reset.complete_claimed();
 
-    sched::tick::resume(tdev);
+            if let Err(e) = reset_res {
+                return Err(fail_resume(dev, data, e));
+            }
+        }
 
-    if let Err(e) = devfreq::resume(slot) {
-        dev_warn!(bound, "Failed to resume devfreq: {:?}\n", e);
-    }
+        // The work reissued below tests this flag, so clear it first. A failed
+        // resume leaves the flag set, since the device then stays unusable
+        // until unbind.
+        tdev.pm_powered_down.store(false, ordering::Release);
 
-    tdev.user_mmio.lock().set_powered(tdev, true);
+        sched::tick::resume(tdev);
 
-    Ok(())
+        let devfreq_res = devfreq::resume(slot);
+        trace::pm_devfreq(
+            trace::PmDevfreqOp::Resume,
+            devfreq_res.as_ref().err().map_or(0, |e| e.to_errno()),
+        );
+        if let Err(e) = devfreq_res {
+            dev_warn!(bound, "Failed to resume devfreq: {:?}\n", e);
+        }
+
+        tdev.user_mmio.lock().set_powered(tdev, true);
+
+        Ok(())
+    })();
+
+    trace::pm_runtime_resume(
+        trace::PmPhase::End,
+        res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    res
 }
 
 #[vtable]
