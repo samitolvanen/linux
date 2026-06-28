@@ -489,6 +489,70 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     }
 }
 
+impl<T: drm::Driver> Device<T, Registered> {
+    /// Guard against the parent bus device being unbound.
+    ///
+    /// Returns a [`RegistrationGuard`] if the device has not been unplugged, [`None`] otherwise.
+    ///
+    /// While [`RegistrationGuard`] is held the parent device is guaranteed to be bound.
+    #[must_use]
+    pub fn registration_guard(&self) -> Option<RegistrationGuard<'_, T>> {
+        let mut idx: i32 = 0;
+        // SAFETY: `self.as_raw()` is a valid pointer to a `struct drm_device`.
+        if unsafe { bindings::drm_dev_enter(self.as_raw(), &mut idx) } {
+            // INVARIANT:
+            // - `idx` is the SRCU index from the successful `drm_dev_enter()` above.
+            // - The parent bus device is bound: `drm_dev_enter()` succeeded, meaning
+            //   `drm_dev_unplug()` has not completed; since it is only called from
+            //   `Registration::drop()` during parent unbind, the parent is still bound.
+            Some(RegistrationGuard {
+                dev: self,
+                idx,
+                _not_send: NotThreadSafe,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// A guard proving the DRM device is registered and the parent bus device is bound.
+///
+/// The guard dereferences to [`Device<T, Registered>`], providing access to the DRM device with
+/// the guarantee that the parent bus device is bound for the entire duration of the critical
+/// section.
+///
+/// Internally this is backed by a `drm_dev_enter()` / `drm_dev_exit()` SRCU critical section.
+///
+/// # Invariants
+///
+/// - `idx` is the SRCU read lock index returned by a successful `drm_dev_enter()` call.
+/// - The parent bus device of `dev` is bound for the lifetime of this guard.
+#[must_use]
+pub struct RegistrationGuard<'a, T: drm::Driver> {
+    dev: &'a Device<T, Registered>,
+    idx: i32,
+    _not_send: NotThreadSafe,
+}
+
+impl<T: drm::Driver> Deref for RegistrationGuard<'_, T> {
+    type Target = Device<T, Registered>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.dev
+    }
+}
+
+impl<T: drm::Driver> Drop for RegistrationGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `self.idx` was returned by a successful `drm_dev_enter()` call, as guaranteed
+        // by the type invariants of `RegistrationGuard`.
+        unsafe { bindings::drm_dev_exit(self.idx) };
+    }
+}
+
 impl<T: drm::Driver> Deref for Device<T, Registered> {
     type Target = T::Data;
 
