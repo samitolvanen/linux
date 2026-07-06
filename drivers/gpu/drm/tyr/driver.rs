@@ -9,6 +9,7 @@ use kernel::{
         Core,
         Device, //
     },
+    devres,
     dma::{
         Device as DmaDevice,
         DmaMask, //
@@ -34,6 +35,7 @@ use kernel::{
 };
 
 use crate::{
+    devfreq,
     file::TyrDrmFileData,
     gem::BoData,
     gpu,
@@ -50,7 +52,6 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Registered> = drm::Device<TyrDrmDriver, 
 
 pub(crate) struct TyrPlatformDriver;
 
-#[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData {
     _device: ARef<TyrDrmDevice>,
 }
@@ -60,7 +61,7 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) pdev: ARef<platform::Device>,
 
     #[pin]
-    clks: Mutex<Clocks>,
+    pub(crate) clks: Mutex<Clocks>,
 
     #[pin]
     regulators: Mutex<Regulators>,
@@ -150,21 +151,19 @@ impl platform::Driver for TyrPlatformDriver {
 
         let tdev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref(), data)?;
         let tdev = drm::driver::Registration::new_foreign_owned(tdev, pdev.as_ref(), 0)?;
+        let tdev: ARef<TyrDrmDevice> = tdev.into();
 
-        let driver = TyrPlatformDriverData {
-            _device: tdev.into(),
-        };
+        // devres unwinds in reverse order, so the governor stops before
+        // the OPP configuration registered inside init is cleared.
+        if let Some(registration) = devfreq::init(&tdev, pdev.as_ref())? {
+            devres::register(pdev.as_ref(), registration, GFP_KERNEL)?;
+        }
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
-        Ok(driver)
+        Ok(TyrPlatformDriverData { _device: tdev })
     }
-}
-
-#[pinned_drop]
-impl PinnedDrop for TyrPlatformDriverData {
-    fn drop(self: Pin<&mut Self>) {}
 }
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with
@@ -191,8 +190,8 @@ impl drm::Driver for TyrDrmDriver {
     }
 }
 
-struct Clocks {
-    core: Clk,
+pub(crate) struct Clocks {
+    pub(crate) core: Clk,
     stacks: OptionalClk,
     coregroup: OptionalClk,
 }

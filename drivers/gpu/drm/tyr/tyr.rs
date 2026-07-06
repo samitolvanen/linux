@@ -7,6 +7,7 @@
 
 use crate::driver::TyrPlatformDriver;
 
+mod devfreq;
 mod driver;
 mod file;
 mod gem;
