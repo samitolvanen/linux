@@ -2,6 +2,10 @@
 
 use core::fmt::Write;
 use core::num::NonZero;
+use core::sync::atomic::{
+    AtomicU32,
+    Ordering, //
+};
 
 use kernel::{
     bindings,
@@ -370,6 +374,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// and the firmware ping.
     #[pin]
     system_work_closed: SpinLock<bool>,
+    /// Remaining ping failures to inject, armed through the `fail_ping`
+    /// debugfs knob. While non-zero, the watchdog decrements it and
+    /// treats the ping as failed without calling the firmware.
+    pub(crate) fail_ping_count: AtomicU32,
 
     /// Device-wide job profiling enablement bitmask, a combination of
     /// `DEVICE_PROFILING_*`. Read at job submit time and baked into the
@@ -795,6 +803,16 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
             return;
         }
 
+        if tdev
+            .fail_ping_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            dev_info!(tdev.pdev.as_ref(), "debug: injecting ping failure\n");
+            tdev.reset.schedule();
+            return;
+        }
+
         if tdev.fw.ping(PING_TIMEOUT_MS).is_err() {
             dev_err!(tdev.pdev.as_ref(), "FW ping timeout, scheduling a reset\n");
             tdev.reset.schedule();
@@ -980,6 +998,7 @@ impl TyrPlatformDriverData {
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 system_work_closed <- new_spinlock!(false),
+                fail_ping_count: AtomicU32::new(0),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
                 devfreq_data,
