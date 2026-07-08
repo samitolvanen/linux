@@ -13,8 +13,12 @@ use kernel::{
         Dir,
         File, //
     },
+    fmt,
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        atomic::Relaxed, //
+    },
     uaccess::UserSliceReader, //
 };
 
@@ -48,6 +52,7 @@ pub(crate) const GEM_USAGE_FW_MAPPED: u32 = 1 << 1;
 /// unbind.
 pub(crate) struct TyrDebugfs {
     _reset: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
+    _fail_ping: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
     _dir: Dir<LocalModule>,
 }
 
@@ -55,12 +60,22 @@ impl TyrDebugfs {
     /// Creates the `tyr` debugfs directory and its entries.
     pub(crate) fn new(tdev: ARef<TyrDrmDevice>) -> Result<Self> {
         let dir = Dir::new(c"tyr");
+        let fail_ping = KBox::pin_init(
+            dir.read_write_callback_file(
+                c"fail_ping",
+                tdev.clone(),
+                &fail_ping_read,
+                &fail_ping_write,
+            ),
+            GFP_KERNEL,
+        )?;
         let reset = KBox::pin_init(
             dir.write_callback_file(c"reset", tdev, &reset_write),
             GFP_KERNEL,
         )?;
         Ok(Self {
             _reset: reset,
+            _fail_ping: fail_ping,
             _dir: dir,
         })
     }
@@ -70,6 +85,25 @@ impl TyrDebugfs {
 fn reset_write(tdev: &ARef<TyrDrmDevice>, _reader: &mut UserSliceReader) -> Result {
     dev_info!(tdev.as_ref(), "debug: scheduling a GPU reset\n");
     tdev.reset.schedule();
+    Ok(())
+}
+
+/// Reports the remaining number of armed ping failures.
+fn fail_ping_read(tdev: &ARef<TyrDrmDevice>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    writeln!(f, "{}", tdev.fail_ping_count.load(Relaxed))
+}
+
+/// Arms ping fault injection for the next N watchdog pings.
+fn fail_ping_write(tdev: &ARef<TyrDrmDevice>, reader: &mut UserSliceReader) -> Result {
+    let mut buf = [0u8; 16];
+    if reader.len() > buf.len() {
+        return Err(EINVAL);
+    }
+    let n = reader.len();
+    reader.read_slice(&mut buf[..n])?;
+    let s = core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?;
+    let count = s.trim().parse::<u32>().map_err(|_| EINVAL)?;
+    tdev.fail_ping_count.store(count, Relaxed);
     Ok(())
 }
 
