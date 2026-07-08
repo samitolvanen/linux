@@ -1,11 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! Device-wide object registries and their debugfs files, and the `shrink`
-//! file.
+//! Device-wide object registries and their debugfs files, the `shrink` file,
+//! and the debugfs knobs for exercising the GPU reset machinery. The knobs are
+//! a local debugging aid.
 //!
 //! Each registry tracks live objects without referencing them, so a debugfs
 //! file can dump them without walking per-file state. Without
 //! `CONFIG_DEBUG_FS` the registries do nothing.
+
+use kernel::{
+    debugfs::{
+        Dir,
+        File, //
+    },
+    prelude::*,
+    sync::aref::ARef,
+    uaccess::UserSliceReader, //
+};
+
+use crate::{
+    driver::TyrDrmDevice,
+    LocalModule, //
+};
 
 #[cfg(not(CONFIG_DEBUG_FS))]
 pub(crate) use self::disabled::{
@@ -27,6 +43,35 @@ pub(crate) use self::enabled::{
 pub(crate) const GEM_USAGE_KERNEL: u32 = 1 << 0;
 /// BO is mapped into the firmware VM.
 pub(crate) const GEM_USAGE_FW_MAPPED: u32 = 1 << 1;
+
+/// Owns the debugfs entries. Dropped with the platform driver data at
+/// unbind.
+pub(crate) struct TyrDebugfs {
+    _reset: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
+    _dir: Dir<LocalModule>,
+}
+
+impl TyrDebugfs {
+    /// Creates the `tyr` debugfs directory and its entries.
+    pub(crate) fn new(tdev: ARef<TyrDrmDevice>) -> Result<Self> {
+        let dir = Dir::new(c"tyr");
+        let reset = KBox::pin_init(
+            dir.write_callback_file(c"reset", tdev, &reset_write),
+            GFP_KERNEL,
+        )?;
+        Ok(Self {
+            _reset: reset,
+            _dir: dir,
+        })
+    }
+}
+
+/// Schedules an asynchronous GPU reset on any write to `tyr/reset`.
+fn reset_write(tdev: &ARef<TyrDrmDevice>, _reader: &mut UserSliceReader) -> Result {
+    dev_info!(tdev.as_ref(), "debug: scheduling a GPU reset\n");
+    tdev.reset.schedule();
+    Ok(())
+}
 
 #[cfg(CONFIG_DEBUG_FS)]
 mod enabled {
