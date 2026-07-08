@@ -91,6 +91,7 @@ use kernel::{
 use crate::{
     debugfs::{
         GemRegistry,
+        TyrDebugfs,
         VmRegistry, //
     },
     devfreq::{
@@ -810,6 +811,9 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
     /// runtime PM on unbind. Held only for its `Drop`.
     pm: pm::Registration<'bound, platform::Adapter<TyrPlatformDriver>, TyrPmOps>,
 
+    /// Debugfs reset knobs, removed when this struct is dropped at unbind.
+    _debugfs: TyrDebugfs,
+
     reg: drm::Registration<'bound, TyrDrmDriver>,
 }
 
@@ -1217,6 +1221,7 @@ impl platform::Driver for TyrPlatformDriver {
                 gem_registry,
                 reclaim,
         });
+        let debugfs = TyrDebugfs::new(ARef::from(&*unreg_dev))?;
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
         // unbound; it is never forgotten.
@@ -1227,6 +1232,7 @@ impl platform::Driver for TyrPlatformDriver {
         let driver = TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
+            _debugfs: debugfs,
             reg,
         };
 
