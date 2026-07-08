@@ -368,6 +368,11 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     dead_vm_work: Work<TyrDrmDevice, { work_id::DEAD_VMS }>,
 
+    /// Remaining ping failures to inject, armed through the `fail_ping`
+    /// debugfs knob. While non-zero, the watchdog decrements it and
+    /// treats the ping as failed without calling the firmware.
+    pub(crate) fail_ping_count: Atomic<u32>,
+
     /// Device-wide job profiling enablement bitmask, a combination of
     /// `DEVICE_PROFILING_*`. Read at job submit time and baked into the
     /// wrapped command stream. `0` (the default) disables profiling.
@@ -842,6 +847,18 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
             return;
         }
 
+        let mut armed = tdev.fail_ping_count.load(Relaxed);
+        while armed > 0 {
+            match tdev.fail_ping_count.cmpxchg(armed, armed - 1, Relaxed) {
+                Ok(_) => {
+                    dev_info!(tdev.as_ref(), "debug: injecting ping failure\n");
+                    tdev.reset.schedule();
+                    return;
+                }
+                Err(current) => armed = current,
+            }
+        }
+
         let Some(guard) = tdev.registration_guard() else {
             return;
         };
@@ -1112,6 +1129,7 @@ impl platform::Driver for TyrPlatformDriver {
                 unbind_halted <- Completion::new(),
                 dead_vms <- new_mutex!(KVec::new()),
                 dead_vm_work <- kernel::new_work!("TyrDrmDeviceData::dead_vm_work"),
+                fail_ping_count: Atomic::new(0),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
                 devfreq_data,
