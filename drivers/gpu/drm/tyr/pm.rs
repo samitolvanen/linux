@@ -165,6 +165,9 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     // cannot be trusted, so complete the reset here with a full firmware
     // reload instead of the fast resident-section reboot.
     let pending_reset = tdev.reset.claim_pending();
+    if pending_reset {
+        dev_info!(bound, "debug: completing latched GPU reset on resume\n");
+    }
 
     let hw = if pending_reset || tdev.fw.needs_reload() {
         resume_hw_components(dev, data, true)
@@ -190,6 +193,10 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     // A request recorded during the reboot arrived after the earlier
     // claim, so no worker will pick it up. Complete it before the rebind.
     if tdev.reset.claim_pending() {
+        dev_info!(
+            bound,
+            "debug: completing GPU reset latched during firmware reboot\n"
+        );
         let gate = tdev.reset.hw_gate();
         let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate);
         tdev.reset.complete_claimed();
