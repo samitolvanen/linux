@@ -97,6 +97,7 @@ use crate::{
     cleanup,
     debugfs::{
         GemRegistry,
+        TyrDebugfs,
         VmRegistry, //
     },
     devfreq::{
@@ -891,6 +892,9 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
     /// runtime PM on unbind. Held only for its `Drop`.
     pm: pm::Registration<'bound, platform::Adapter<TyrPlatformDriver>, TyrPmOps>,
 
+    /// Debugfs reset knobs, removed when this struct is dropped at unbind.
+    _debugfs: TyrDebugfs,
+
     #[pin]
     reg: drm::Registration<'bound, TyrDrmDriver>,
 }
@@ -1296,6 +1300,8 @@ impl platform::Driver for TyrPlatformDriver {
             let reclaim = Arc::pin_init(Reclaim::new(&unreg_dev), GFP_KERNEL)?;
             let shrinker = reclaim::register_shrinker(reclaim.clone())?;
 
+            let debugfs = TyrDebugfs::new(ARef::from(&*unreg_dev))?;
+
             // The data below owns the clocks and halts the GPU if the
             // registration fails.
             hw_guard.dismiss();
@@ -1305,6 +1311,7 @@ impl platform::Driver for TyrPlatformDriver {
             Ok(try_pin_init!(TyrPlatformDriverData {
                 devfreq_registration,
                 pm: pm_registration,
+                _debugfs: debugfs,
                 // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the
                 // driver is unbound; it is never forgotten.
                 reg <- unsafe { drm::Registration::new(
