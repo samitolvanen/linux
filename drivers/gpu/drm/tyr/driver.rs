@@ -150,6 +150,7 @@ use crate::debugfs::{
     GemRegistry,
     GemsFile,
     GpuvasFile,
+    TyrDebugfs,
     VmRegistry, //
 };
 
@@ -201,6 +202,10 @@ pub(crate) struct TyrPlatformDriverData {
     /// runtime PM on unbind. Held only for its `Drop`.
     #[expect(dead_code)]
     pm: pm::Registration<TyrPmOps>,
+
+    /// Debugfs reset knobs, removed when this struct is dropped at unbind.
+    #[cfg(CONFIG_DEBUG_FS)]
+    _debugfs: TyrDebugfs,
 
     /// DRM registration, taken by `unbind` to unplug the device first.
     drm_registration: Pin<KBox<Mutex<Option<Registration<TyrDrmDriver>>>>>,
@@ -1098,6 +1103,9 @@ impl TyrPlatformDriverData {
             tdev.debugfs_add_file::<GpuvasFile>();
         }
 
+        #[cfg(CONFIG_DEBUG_FS)]
+        let debugfs = TyrDebugfs::new(tdev.clone())?;
+
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
@@ -1105,6 +1113,8 @@ impl TyrPlatformDriverData {
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
+            #[cfg(CONFIG_DEBUG_FS)]
+            _debugfs: debugfs,
             drm_registration,
             device: tdev,
         })
