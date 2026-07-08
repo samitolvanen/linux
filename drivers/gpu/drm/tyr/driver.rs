@@ -71,6 +71,7 @@ use kernel::{
 };
 
 use crate::{
+    debugfs::TyrDebugfs,
     devfreq::{
         self,
         TyrDevfreqCallbacks,
@@ -179,6 +180,9 @@ pub(crate) struct TyrPlatformDriverData {
     /// runtime PM on unbind. Held only for its `Drop`.
     #[expect(dead_code)]
     pm: pm::Registration<TyrPmOps>,
+
+    /// Debugfs reset knobs, removed when this struct is dropped at unbind.
+    _debugfs: TyrDebugfs,
 
     pub(crate) device: ARef<TyrDrmDevice>,
 }
@@ -850,6 +854,8 @@ impl platform::Driver for TyrPlatformDriverData {
 
         TyrDrmDeviceData::schedule_tick(&tdev);
 
+        let debugfs = TyrDebugfs::new(tdev.clone())?;
+
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
@@ -857,6 +863,7 @@ impl platform::Driver for TyrPlatformDriverData {
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
+            _debugfs: debugfs,
             device: tdev,
         })
     }
