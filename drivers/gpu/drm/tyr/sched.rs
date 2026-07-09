@@ -1245,6 +1245,7 @@ impl Scheduler {
             group.with_locked_inner(|inner| {
                 inner.fatal = true;
             });
+            trace::reset_request(trace::ResetReason::CsgStateUnknown);
             data.reset.schedule();
         }
         if new_state == group::State::Suspended {
