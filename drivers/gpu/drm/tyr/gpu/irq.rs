@@ -38,19 +38,17 @@ use crate::{
 
 /// Returns the GPU IRQ sources the driver services.
 ///
-/// This selects the GPU faults, the protected-mode fault, the
-/// reset-completed event raised at the end of a soft reset, and the
-/// L2 power-changed events. Other GPU IRQ sources are left masked so
-/// the driver does not have to ack them.
+/// This selects the GPU faults, the protected-mode fault, and the L2
+/// power-changed events. Other GPU IRQ sources are left masked so the
+/// driver does not have to ack them.
 ///
-/// `issue_soft_reset` polls RAWSTAT for `reset_completed` and must run
-/// before `gpu_irq_enable` unmasks this source. The handler's drain loop
-/// clears the bit.
+/// `reset_completed` is left masked. `GPU_IRQ_RAWSTAT` latches the bit
+/// regardless of the mask, so `soft_reset`'s poll owns it on every path.
+/// No IRQ handler can clear the bit before the poll observes it.
 fn gpu_irq_sources() -> gpu_control::GPU_IRQ_MASK {
     gpu_control::GPU_IRQ_MASK::zeroed()
         .with_gpu_fault(true)
         .with_gpu_protected_fault(true)
-        .with_reset_completed(true)
         .with_power_changed_single(true)
         .with_power_changed_all(true)
 }
