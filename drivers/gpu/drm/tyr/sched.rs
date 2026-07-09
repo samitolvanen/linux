@@ -1113,6 +1113,7 @@ impl Scheduler {
                     inner.fatal_error = Some(EINVAL);
                 }
             });
+            trace::reset_request(trace::ResetReason::CsgStateUnknown);
             data.reset.schedule();
         }
         if new_state == group::State::Suspended {

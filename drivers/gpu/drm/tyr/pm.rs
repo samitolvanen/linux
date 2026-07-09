@@ -137,6 +137,7 @@ fn quiesce_and_suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriv
     tdev.pm_powered_down.store(true, ordering::Release);
 
     tdev.user_mmio.lock().set_powered(tdev, false);
+    trace::reset_pm(trace::ResetPmPath::SuspendFlush, 0);
     tdev.reset.flush();
     tdev.cancel_fw_ping();
     sched::tick::suspend(tdev);
@@ -220,6 +221,10 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
         };
 
         if pending_reset {
+            trace::reset_pm(
+                trace::ResetPmPath::ResumeReload,
+                hw.as_ref().err().map_or(0, |e| e.to_errno()),
+            );
             tdev.reset.complete_claimed();
         }
 
@@ -244,6 +249,10 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
                 let gate = tdev.reset.hw_gate();
                 reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate)
             };
+            trace::reset_pm(
+                trace::ResetPmPath::ResumeLateReload,
+                reset_res.as_ref().err().map_or(0, |e| e.to_errno()),
+            );
             tdev.reset.complete_claimed();
 
             if let Err(e) = reset_res {
