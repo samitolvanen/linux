@@ -533,6 +533,7 @@ impl AddressSpaceManager {
         if matches!(res, Err(e) if e == ETIMEDOUT) {
             // A stuck AS_ACTIVE bit only clears with a GPU reset.
             dev_err!(dev, "AS_ACTIVE bit stuck\n");
+            trace::reset_request(trace::ResetReason::AsActiveStuck);
             self.reset.schedule();
             self.stuck[slot.get()] = true;
         }
@@ -817,6 +818,7 @@ impl AddressSpaceManager {
             // The GPU stopped acknowledging cache maintenance. Only a
             // reset unblocks the situation.
             dev_err!(dev, "Flush caches timeout\n");
+            trace::reset_request(trace::ResetReason::CacheFlushTimeout);
             self.reset.schedule();
         }
 
