@@ -917,6 +917,36 @@ kernel::declare_trace! {
     ///
     /// Always safe to call.
     unsafe fn tyr_pm_hw(step: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_reset_request(reason: u32);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_reset_schedule(outcome: u32);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_reset_worker(outcome: u32);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_reset_cycle(phase: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_reset_pm(path: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_fw_ping(event: u32, errno: c_int);
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -2719,4 +2749,135 @@ pub(crate) fn pm_usage(event: PmUsageEvent, acquired: bool) {
 pub(crate) fn pm_hw(step: PmHwStep, errno: c_int) {
     // SAFETY: Always safe to call.
     unsafe { tyr_pm_hw(step as u32, errno) }
+}
+
+/// Why a reset was requested. Keep in sync with `TYR_RESET_REASONS` in
+/// `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum ResetReason {
+    /// The firmware missed a liveness ping.
+    FwPingTimeout = 0,
+    /// A CSG slot reported an unknown execution state.
+    CsgStateUnknown = 1,
+    /// The firmware cannot resume an unrecoverable command stream.
+    CsUnrecoverable = 2,
+    /// A CSG request timed out during a scheduler tick.
+    CsgReqTimeout = 3,
+    /// An address-space slot's `AS_ACTIVE` bit stayed set.
+    AsActiveStuck = 4,
+    /// A cache-flush command was never acknowledged.
+    CacheFlushTimeout = 5,
+}
+
+/// Outcome of one `schedule()` call. Keep in sync with
+/// `TYR_RESET_SCHEDULE_OUTCOMES` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum ResetScheduleOutcome {
+    /// No DRM device is bound, so the request was dropped.
+    NoDevice = 0,
+    /// The device is not runtime-active, so the request latched
+    /// without queuing the worker.
+    Latched = 1,
+    /// A reset that is already pending or in progress absorbed the
+    /// request.
+    Coalesced = 2,
+    /// The request was newly latched and the worker queued.
+    Queued = 3,
+}
+
+/// Outcome of one reset-worker invocation. Keep in sync with
+/// `TYR_RESET_WORKER_OUTCOMES` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum ResetWorkerOutcome {
+    /// No DRM device is bound, so the request was consumed without
+    /// touching the hardware.
+    NoDevice = 0,
+    /// The device is not runtime-active, so the request stays latched
+    /// for the resume path to claim.
+    PmInactive = 1,
+    /// The request could not be claimed because it was already consumed or
+    /// another reset owns the state machine.
+    ClaimFailed = 2,
+    /// The worker claimed the request and runs the reset cycle.
+    Run = 3,
+}
+
+/// Reset-cycle phase. The worker's `Run` outcome marks the cycle
+/// start. `errno` is meaningful on `SoftReset` and `FwReboot`. On
+/// `End` it carries the first failing errno of those steps, or `0` on
+/// success. Keep in sync with `TYR_RESET_CYCLE_PHASES` in
+/// `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum ResetCyclePhase {
+    /// The scheduler, firmware and MMU pre-reset work has completed.
+    Quiesced = 0,
+    /// The soft reset ran.
+    SoftReset = 1,
+    /// The firmware reboot ran.
+    FwReboot = 2,
+    /// The cycle is complete.
+    End = 3,
+}
+
+/// Runtime-PM path that handled a reset out of band. Keep in sync
+/// with `TYR_RESET_PM_PATHS` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum ResetPmPath {
+    /// Suspend waits for an in-flight reset worker to finish.
+    SuspendFlush = 0,
+    /// Resume claimed a latched request and completed it with a full
+    /// firmware reload instead of the fast reboot.
+    ResumeReload = 1,
+    /// Resume claimed a request that latched during its own firmware
+    /// reboot and reloaded again.
+    ResumeLateReload = 2,
+}
+
+/// Firmware ping watchdog event. Keep in sync with
+/// `TYR_FW_PING_EVENTS` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum FwPingEvent {
+    /// The ping ran; `errno` is `0` for an acknowledged ping.
+    Result = 0,
+    /// The ping was skipped because a reset is in progress.
+    SkipReset = 1,
+    /// The ping was skipped because the device is not runtime-active.
+    SkipInactive = 2,
+}
+
+/// A reset request and its trigger, emitted before the request is
+/// scheduled.
+pub(crate) fn reset_request(reason: ResetReason) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_reset_request(reason as u32) }
+}
+
+/// Outcome of one reset `schedule()` call.
+pub(crate) fn reset_schedule(outcome: ResetScheduleOutcome) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_reset_schedule(outcome as u32) }
+}
+
+/// Outcome of one reset-worker invocation.
+pub(crate) fn reset_worker(outcome: ResetWorkerOutcome) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_reset_worker(outcome as u32) }
+}
+
+/// A reset-cycle phase transition and its result.
+pub(crate) fn reset_cycle(phase: ResetCyclePhase, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_reset_cycle(phase as u32, errno) }
+}
+
+/// A runtime-PM path that handled a reset out of band.
+pub(crate) fn reset_pm(path: ResetPmPath, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_reset_pm(path as u32, errno) }
+}
+
+/// A firmware ping watchdog event and its result.
+pub(crate) fn fw_ping(event: FwPingEvent, errno: c_int) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_fw_ping(event as u32, errno) }
 }

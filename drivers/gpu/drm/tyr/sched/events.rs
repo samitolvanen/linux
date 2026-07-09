@@ -433,6 +433,7 @@ impl Scheduler {
         }
 
         if cs_unrecoverable {
+            trace::reset_request(trace::ResetReason::CsUnrecoverable);
             tdev.reset.schedule();
         }
 
