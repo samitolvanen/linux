@@ -712,6 +712,7 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
         // the ping and the re-arm. The reset path re-arms the watchdog
         // when it re-enables the global interface.
         if tdev.reset.in_progress() {
+            trace::fw_ping(trace::FwPingEvent::SkipReset, 0);
             return;
         }
 
@@ -719,6 +720,7 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
         // so the clocks are gated and the firmware MMIO is unreachable.
         // The resume path, or an aborted suspend, re-arms the watchdog.
         if !tdev.pm_active() {
+            trace::fw_ping(trace::FwPingEvent::SkipInactive, 0);
             return;
         }
 
@@ -732,8 +734,14 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
             return;
         }
 
-        if tdev.fw.ping(PING_TIMEOUT_MS).is_err() {
+        let ping_res = tdev.fw.ping(PING_TIMEOUT_MS);
+        trace::fw_ping(
+            trace::FwPingEvent::Result,
+            ping_res.as_ref().err().map_or(0, |e| e.to_errno()),
+        );
+        if ping_res.is_err() {
             dev_err!(tdev.pdev.as_ref(), "FW ping timeout, scheduling a reset\n");
+            trace::reset_request(trace::ResetReason::FwPingTimeout);
             tdev.reset.schedule();
             return;
         }

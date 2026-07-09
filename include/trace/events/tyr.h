@@ -2769,6 +2769,153 @@ TRACE_EVENT(tyr_pm_hw,
 		  __entry->errno)
 );
 
+/*
+ * Reset trigger tag. Keep in sync with `ResetReason` in
+ * drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_RESET_REASONS		\
+	{ 0, "FW_PING_TIMEOUT" },	\
+	{ 1, "CSG_STATE_UNKNOWN" },	\
+	{ 2, "CS_UNRECOVERABLE" },	\
+	{ 3, "CSG_REQ_TIMEOUT" },	\
+	{ 4, "AS_ACTIVE_STUCK" },	\
+	{ 5, "CACHE_FLUSH_TIMEOUT" }
+
+TRACE_EVENT(tyr_reset_request,
+	TP_PROTO(u32 reason),
+	TP_ARGS(reason),
+	TP_STRUCT__entry(
+		__field(u32, reason)
+	),
+	TP_fast_assign(
+		__entry->reason = reason;
+	),
+	TP_printk("reason=%s",
+		  __print_symbolic(__entry->reason, TYR_RESET_REASONS))
+);
+
+/*
+ * Reset schedule() outcome tag. Keep in sync with
+ * `ResetScheduleOutcome` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_RESET_SCHEDULE_OUTCOMES	\
+	{ 0, "NO_DEVICE" },		\
+	{ 1, "LATCHED" },		\
+	{ 2, "COALESCED" },		\
+	{ 3, "QUEUED" }
+
+TRACE_EVENT(tyr_reset_schedule,
+	TP_PROTO(u32 outcome),
+	TP_ARGS(outcome),
+	TP_STRUCT__entry(
+		__field(u32, outcome)
+	),
+	TP_fast_assign(
+		__entry->outcome = outcome;
+	),
+	TP_printk("outcome=%s",
+		  __print_symbolic(__entry->outcome, TYR_RESET_SCHEDULE_OUTCOMES))
+);
+
+/*
+ * Reset-worker outcome tag. Keep in sync with `ResetWorkerOutcome`
+ * in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_RESET_WORKER_OUTCOMES	\
+	{ 0, "NO_DEVICE" },		\
+	{ 1, "PM_INACTIVE" },		\
+	{ 2, "CLAIM_FAILED" },		\
+	{ 3, "RUN" }
+
+TRACE_EVENT(tyr_reset_worker,
+	TP_PROTO(u32 outcome),
+	TP_ARGS(outcome),
+	TP_STRUCT__entry(
+		__field(u32, outcome)
+	),
+	TP_fast_assign(
+		__entry->outcome = outcome;
+	),
+	TP_printk("outcome=%s",
+		  __print_symbolic(__entry->outcome, TYR_RESET_WORKER_OUTCOMES))
+);
+
+/*
+ * Reset-cycle phase tag. Keep in sync with `ResetCyclePhase` in
+ * drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_RESET_CYCLE_PHASES		\
+	{ 0, "QUIESCED" },		\
+	{ 1, "SOFT_RESET" },		\
+	{ 2, "FW_REBOOT" },		\
+	{ 3, "END" }
+
+TRACE_EVENT(tyr_reset_cycle,
+	TP_PROTO(u32 phase, int errno),
+	TP_ARGS(phase, errno),
+	TP_STRUCT__entry(
+		__field(u32, phase)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->phase = phase;
+		__entry->errno = errno;
+	),
+	TP_printk("phase=%s errno=%d",
+		  __print_symbolic(__entry->phase, TYR_RESET_CYCLE_PHASES),
+		  __entry->errno)
+);
+
+/*
+ * Runtime-PM out-of-band reset path tag. Keep in sync with
+ * `ResetPmPath` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_RESET_PM_PATHS		\
+	{ 0, "SUSPEND_FLUSH" },		\
+	{ 1, "RESUME_RELOAD" },		\
+	{ 2, "RESUME_LATE_RELOAD" }
+
+TRACE_EVENT(tyr_reset_pm,
+	TP_PROTO(u32 path, int errno),
+	TP_ARGS(path, errno),
+	TP_STRUCT__entry(
+		__field(u32, path)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->path = path;
+		__entry->errno = errno;
+	),
+	TP_printk("path=%s errno=%d",
+		  __print_symbolic(__entry->path, TYR_RESET_PM_PATHS),
+		  __entry->errno)
+);
+
+/*
+ * Firmware ping watchdog event tag. Keep in sync with `FwPingEvent`
+ * in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_FW_PING_EVENTS		\
+	{ 0, "RESULT" },		\
+	{ 1, "SKIP_RESET" },		\
+	{ 2, "SKIP_INACTIVE" }
+
+TRACE_EVENT(tyr_fw_ping,
+	TP_PROTO(u32 event, int errno),
+	TP_ARGS(event, errno),
+	TP_STRUCT__entry(
+		__field(u32, event)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->event = event;
+		__entry->errno = errno;
+	),
+	TP_printk("event=%s errno=%d",
+		  __print_symbolic(__entry->event, TYR_FW_PING_EVENTS),
+		  __entry->errno)
+);
+
 #endif /* _TYR_TRACE_H */
 
 /* This part must be outside protection. */

@@ -195,6 +195,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
     });
 
     if result == Err(ETIMEDOUT) {
+        trace::reset_request(trace::ResetReason::CsgReqTimeout);
         tdev.reset.schedule();
     }
 
