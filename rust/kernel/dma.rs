@@ -24,6 +24,7 @@ use crate::{
     },
     prelude::*,
     ptr::KnownSize,
+    scatterlist,
     sync::aref::ARef,
     transmute::{
         AsBytes,
@@ -366,6 +367,24 @@ impl From<DataDirection> for bindings::dma_data_direction {
     }
 }
 
+impl TryFrom<bindings::dma_data_direction> for DataDirection {
+    type Error = Error;
+
+    /// Converts a raw [`enum dma_data_direction`] into a [`DataDirection`].
+    ///
+    /// This validates a direction value received from C. Returns [`EINVAL`] if the value is
+    /// not a valid direction.
+    fn try_from(direction: bindings::dma_data_direction) -> Result<Self> {
+        match direction {
+            bindings::dma_data_direction_DMA_BIDIRECTIONAL => Ok(Self::Bidirectional),
+            bindings::dma_data_direction_DMA_TO_DEVICE => Ok(Self::ToDevice),
+            bindings::dma_data_direction_DMA_FROM_DEVICE => Ok(Self::FromDevice),
+            bindings::dma_data_direction_DMA_NONE => Ok(Self::None),
+            _ => Err(EINVAL),
+        }
+    }
+}
+
 /// Transfers ownership, in the DMA API sense, of a previously-mapped DMA region back to the CPU.
 ///
 /// This wraps `dma_sync_single_for_cpu()`. It performs the cache synchronization needed for the
@@ -418,6 +437,66 @@ pub unsafe fn sync_single_for_device(
     // - `dir` originates from a `DataDirection`, whose underlying value is a valid
     //   `enum dma_data_direction`.
     unsafe { bindings::dma_sync_single_for_device(dev.as_raw(), addr, size, dir.into()) };
+}
+
+/// Transfers ownership, in the DMA API sense, of a DMA-mapped scatter-gather table back to the
+/// CPU.
+///
+/// This wraps `dma_sync_sgtable_for_cpu()`. It performs the cache synchronization needed for the
+/// CPU to safely access the memory covered by `sgt`, which was previously DMA-mapped for `dev`.
+/// Before any further DMA operations, ownership must be transferred back to the device with
+/// [`sync_sgtable_for_device`].
+///
+/// Unlike [`sync_single_for_cpu`], this accepts an unbound device. dma-buf exporter callbacks
+/// may sync mappings of foreign devices, or run while the owning driver is unbinding.
+///
+/// # Safety
+///
+/// `sgt` must have been DMA-mapped for `dev`, and the mapping must remain live for the duration
+/// of this call. `dir` must not be [`DataDirection::None`].
+#[inline]
+pub unsafe fn sync_sgtable_for_cpu(
+    dev: &device::Device,
+    sgt: &scatterlist::SGTable,
+    dir: DataDirection,
+) {
+    // SAFETY:
+    // - `dev.as_raw()` and `sgt.as_raw()` are valid pointers to a `struct device` and a
+    //   `struct sg_table`.
+    // - `sgt` satisfies the function's `# Safety` precondition.
+    // - `dir` originates from a `DataDirection`, whose underlying value is a valid
+    //   `enum dma_data_direction`.
+    unsafe { bindings::dma_sync_sgtable_for_cpu(dev.as_raw(), sgt.as_raw(), dir.into()) };
+}
+
+/// Transfers ownership, in the DMA API sense, of a DMA-mapped scatter-gather table to the
+/// device.
+///
+/// This wraps `dma_sync_sgtable_for_device()`. It performs the cache synchronization needed
+/// before the device may access the memory covered by `sgt`, which was previously DMA-mapped for
+/// `dev`. After the device is done, ownership must be transferred back to the CPU with
+/// [`sync_sgtable_for_cpu`] (or by an unmap).
+///
+/// Unlike [`sync_single_for_device`], this accepts an unbound device. dma-buf exporter
+/// callbacks may sync mappings of foreign devices, or run while the owning driver is unbinding.
+///
+/// # Safety
+///
+/// `sgt` must have been DMA-mapped for `dev`, and the mapping must remain live for the duration
+/// of this call. `dir` must not be [`DataDirection::None`].
+#[inline]
+pub unsafe fn sync_sgtable_for_device(
+    dev: &device::Device,
+    sgt: &scatterlist::SGTable,
+    dir: DataDirection,
+) {
+    // SAFETY:
+    // - `dev.as_raw()` and `sgt.as_raw()` are valid pointers to a `struct device` and a
+    //   `struct sg_table`.
+    // - `sgt` satisfies the function's `# Safety` precondition.
+    // - `dir` originates from a `DataDirection`, whose underlying value is a valid
+    //   `enum dma_data_direction`.
+    unsafe { bindings::dma_sync_sgtable_for_device(dev.as_raw(), sgt.as_raw(), dir.into()) };
 }
 
 /// CPU-owned DMA allocation that can be converted into a device-shared [`Coherent`] object.
