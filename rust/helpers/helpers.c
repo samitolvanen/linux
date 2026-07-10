@@ -68,6 +68,7 @@
 #include "irq.c"
 #include "fs.c"
 #include "gpu.c"
+#include "highmem.c"
 #include "io.c"
 #include "jump_label.c"
 #include "kunit.c"
