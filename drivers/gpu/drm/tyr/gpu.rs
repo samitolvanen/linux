@@ -107,7 +107,7 @@ unsafe impl AsBytes for CsifInfo {}
 pub(crate) struct GpuInfo(pub(crate) uapi::drm_panthor_gpu_info);
 
 impl GpuInfo {
-    pub(crate) fn new(io: &IoMem<'_>) -> Self {
+    pub(crate) fn new(io: &IoMem<'_>, coherency: CoherencyMode) -> Self {
         Self(uapi::drm_panthor_gpu_info {
             gpu_id: io.read(GPU_ID).into_raw(),
             gpu_rev: io.read(REVIDR).into_raw(),
@@ -128,7 +128,7 @@ impl GpuInfo {
                 io.read(TEXTURE_FEATURES::at(3)).supported_formats().get(),
             ],
             as_present: io.read(AS_PRESENT).into_raw(),
-            selected_coherency: uapi::drm_panthor_gpu_coherency_DRM_PANTHOR_GPU_COHERENCY_NONE,
+            selected_coherency: coherency as u32,
             shader_present: join_u64(
                 io.read(SHADER_PRESENT_LO).into_raw(),
                 io.read(SHADER_PRESENT_HI).into_raw(),
@@ -245,6 +245,26 @@ const GPU_MODELS: [GpuModels; 1] = [GpuModels {
     prod_major: 7,
 }];
 
+/// Selects the coherency protocol to program into `COHERENCY_ENABLE`.
+///
+/// The ACE protocol has never been supported for CSF GPUs.
+pub(crate) fn select_coherency(
+    dev: &Device<Bound>,
+    io: &IoMem<'_>,
+    coherent: bool,
+) -> Result<CoherencyMode> {
+    if !coherent {
+        return Ok(CoherencyMode::None);
+    }
+
+    if io.read(COHERENCY_FEATURES).ace_lite() {
+        Ok(CoherencyMode::AceLite)
+    } else {
+        dev_err!(dev, "Coherency not supported by the device\n");
+        Err(EOPNOTSUPP)
+    }
+}
+
 /// Timeout for an L2 power transition to complete.
 const L2_TRANSITION_TIMEOUT: Delta = Delta::from_millis(20);
 
@@ -272,8 +292,9 @@ pub(crate) fn l2_power_off(dev: &Device, io: &IoMem<'_>) -> Result {
 }
 
 /// Powers on the l2 block.
-pub(crate) fn l2_power_on(dev: &Device, io: &IoMem<'_>) -> Result {
-    io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(CoherencyMode::None));
+pub(crate) fn l2_power_on(dev: &Device, io: &IoMem<'_>, coherency: CoherencyMode) -> Result {
+    // The coherency protocol must be selected before the L2 powers up.
+    io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(coherency));
 
     l2_wait_transition(io).inspect_err(|_| dev_err!(dev, "Failed to power on the GPU.\n"))?;
 
@@ -311,9 +332,9 @@ fn soft_reset(dev: &Device, io: &IoMem<'_>) -> Result {
 /// Runs one synchronous GPU reset pass.
 ///
 /// On success, the GPU is left in a state suitable for reinitialization.
-pub(crate) fn reset(dev: &Device, io: &IoMem<'_>) -> Result {
+pub(crate) fn reset(dev: &Device, io: &IoMem<'_>, coherency: CoherencyMode) -> Result {
     soft_reset(dev, io)?;
-    l2_power_on(dev, io)?;
+    l2_power_on(dev, io, coherency)?;
     Ok(())
 }
 
@@ -324,7 +345,11 @@ pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 }
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
-pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) -> Result {
+pub(crate) fn resume(
+    reg_data: &TyrDrmRegistrationData<'_>,
+    io: &IoMem<'_>,
+    coherency: CoherencyMode,
+) -> Result {
     unquiesce(&reg_data.gpu_irq, io, irq::gpu_irq_enable);
-    l2_power_on(reg_data.pdev.as_ref(), io)
+    l2_power_on(reg_data.pdev.as_ref(), io, coherency)
 }
