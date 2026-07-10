@@ -435,13 +435,15 @@ impl Firmware {
         Ok(firmware)
     }
 
-    /// Polls `MCU_STATUS` until it reaches `target` or the timeout elapses.
+    /// Polls `MCU_STATUS` until it reaches `target` and `acked` returns
+    /// true, or the timeout elapses.
     ///
     /// The MMIO guard is re-acquired for each read so it is never held
     /// across the poll sleep, which would sleep under the RCU read lock.
     fn wait_for_mcu_status(
         iomem: &Devres<IoMem>,
         target: McuStatus,
+        acked: impl Fn() -> bool,
         interval: time::Delta,
         timeout: time::Delta,
     ) -> Result<(), McuWaitError> {
@@ -449,15 +451,16 @@ impl Firmware {
 
         poll::read_poll_timeout(
             || {
-                iomem
-                    .try_access()
-                    .ok_or(ENODEV)
-                    .map(|io| io.read(MCU_STATUS))
-            },
-            |status| {
+                let status = {
+                    // `acked` may sleep, so the MMIO guard is dropped before
+                    // it runs.
+                    let io = iomem.try_access().ok_or(ENODEV)?;
+                    io.read(MCU_STATUS)
+                };
                 last = Some(status.value());
-                status.value() == target
+                Ok(status.value() == target && acked())
             },
+            |reached| *reached,
             interval,
             timeout,
         )
@@ -477,6 +480,7 @@ impl Firmware {
         if let Err(e) = Self::wait_for_mcu_status(
             &self.iomem,
             McuStatus::Enabled,
+            || true,
             time::Delta::from_millis(1),
             time::Delta::from_millis(100),
         ) {
@@ -494,6 +498,7 @@ impl Firmware {
         Self::wait_for_mcu_status(
             &self.iomem,
             McuStatus::Halt,
+            || self.global_iface.halt_acked(),
             time::Delta::from_micros(10),
             time::Delta::from_millis(1000),
         )
@@ -510,6 +515,7 @@ impl Firmware {
         if Self::wait_for_mcu_status(
             &self.iomem,
             McuStatus::Disabled,
+            || true,
             time::Delta::from_micros(10),
             time::Delta::from_millis(100),
         )

@@ -16,9 +16,9 @@ use crate::{
     driver::IoMem,
     fw::{
         interfaces::{
-            FwInterface, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_REQ, GLB_ACK, GLB_ACK_IRQ_MASK,
-            GLB_ALLOC_EN, GLB_CONTROL_BLOCK_SIZE, GLB_DB_ACK, GLB_DB_REQ, GLB_GROUP_NUM,
-            GLB_GROUP_STRIDE, GLB_IDLE_TIMER, GLB_INPUT_BLOCK_SIZE, GLB_INPUT_VA,
+            FwInterface, GlbState, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_REQ, GLB_ACK,
+            GLB_ACK_IRQ_MASK, GLB_ALLOC_EN, GLB_CONTROL_BLOCK_SIZE, GLB_DB_ACK, GLB_DB_REQ,
+            GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_IDLE_TIMER, GLB_INPUT_BLOCK_SIZE, GLB_INPUT_VA,
             GLB_OUTPUT_BLOCK_SIZE, GLB_OUTPUT_VA, GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER, GLB_REQ,
             GLB_VERSION,
         },
@@ -69,6 +69,11 @@ pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, 
     let timeout_val = timeout_val.min(u64::from(max_timeout)) as u32;
 
     Ok((timeout_val, timer_source))
+}
+
+/// CSF interface 4.1 replaced the halt request bit with a state field.
+fn has_glb_state(version: GLB_VERSION) -> bool {
+    (version.major().get(), version.minor().get()) >= (4, 1)
 }
 
 struct GlobalInterfaceRequests<'a> {
@@ -138,6 +143,12 @@ struct EnabledGlobalInterface {
     csg_stride: usize,
     csg_num: usize,
     csg: KVec<CsgInterface>,
+}
+
+impl EnabledGlobalInterface {
+    fn has_glb_state(&self) -> bool {
+        has_glb_state(self.glb_control.read(GLB_VERSION))
+    }
 }
 
 struct InnerGlobalInterface {
@@ -220,12 +231,14 @@ impl GlobalInterface {
         // Clone the retained views out so the firmware ack wait below
         // runs without `inner` held. The GLB IRQ path takes `inner` and
         // delivers the wakeup this wait sleeps on.
-        let (glb_input, glb_output) = {
+        let (glb_input, glb_output, has_glb_state) = {
             let inner = self.inner.lock();
             match &inner.state {
-                GlobalInterfaceState::Suspended(enabled) => {
-                    (enabled.glb_input.clone(), enabled.glb_output.clone())
-                }
+                GlobalInterfaceState::Suspended(enabled) => (
+                    enabled.glb_input.clone(),
+                    enabled.glb_output.clone(),
+                    enabled.has_glb_state(),
+                ),
                 GlobalInterfaceState::Enabled(_) | GlobalInterfaceState::Disabled => {
                     return Err(EINVAL)
                 }
@@ -233,7 +246,8 @@ impl GlobalInterface {
         };
 
         InnerGlobalInterface::configure_glb_input(&glb_input, &self.gpu_info, core_clk_rate)?;
-        let ack_mask = InnerGlobalInterface::configure_glb_requests(&glb_input, &glb_output)?;
+        let ack_mask =
+            InnerGlobalInterface::configure_glb_requests(&glb_input, &glb_output, has_glb_state)?;
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
@@ -407,12 +421,27 @@ impl GlobalInterface {
         request_field.wait_acks(ping_mask, &self.event_wait, timeout_ms)
     }
 
-    /// Requests an MCU halt through the global doorbell. The request is not
-    /// acknowledged through the firmware interface, so callers poll
-    /// `MCU_STATUS`.
+    /// Requests an MCU halt through the global doorbell. Completion is
+    /// observed by polling `MCU_STATUS` and `Self::halt_acked`.
     pub(super) fn halt_mcu(&self) -> Result {
         self.inner.lock().set_glb_halt(true)?;
         self.ring_doorbell(0)
+    }
+
+    /// Before CSF interface 4.1 the halt request is not acknowledged
+    /// through the interface, so a resident interface reports it
+    /// acknowledged at once.
+    pub(super) fn halt_acked(&self) -> bool {
+        let inner = self.inner.lock();
+        let Some(enabled) = inner.resident() else {
+            return false;
+        };
+
+        if !enabled.has_glb_state() {
+            return true;
+        }
+
+        matches!(enabled.glb_output.read(GLB_ACK).state(), Ok(GlbState::Halt))
     }
 
     /// Clears a previously requested MCU halt so the firmware boots active. No
@@ -486,7 +515,8 @@ impl InnerGlobalInterface {
         )?;
 
         Self::configure_glb_input(&glb_input, &gpu_info, core_clk_rate)?;
-        let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
+        let ack_mask =
+            Self::configure_glb_requests(&glb_input, &glb_output, has_glb_state(version))?;
 
         {
             let io = iomem.try_access().ok_or(ENODEV)?;
@@ -598,18 +628,22 @@ impl InnerGlobalInterface {
     fn configure_glb_requests(
         glb_input: &FwInterface<GLB_INPUT_BLOCK_SIZE>,
         glb_output: &FwInterface<GLB_OUTPUT_BLOCK_SIZE>,
+        has_glb_state: bool,
     ) -> Result<GLB_REQ> {
-        glb_input.write(
-            GLB_ACK_IRQ_MASK,
-            GLB_ACK_IRQ_MASK::zeroed()
-                .with_cfg_progress_timer(true)
-                .with_cfg_alloc_en(true)
-                .with_cfg_pwroff_timer(true)
-                .with_idle_enable(true)
-                .with_idle_event(true)
-                .with_counter_enable(true)
-                .with_ping(true),
-        );
+        let mut ack_irq_mask = GLB_ACK_IRQ_MASK::zeroed()
+            .with_cfg_progress_timer(true)
+            .with_cfg_alloc_en(true)
+            .with_cfg_pwroff_timer(true)
+            .with_idle_enable(true)
+            .with_idle_event(true)
+            .with_counter_enable(true)
+            .with_ping(true);
+
+        if has_glb_state {
+            ack_irq_mask = ack_irq_mask.with_const_state::<0b111>();
+        }
+
+        glb_input.write(GLB_ACK_IRQ_MASK, ack_irq_mask);
 
         let cur_req = glb_input.read(GLB_REQ);
         glb_input.write(
@@ -682,14 +716,23 @@ impl InnerGlobalInterface {
         self.resident_mut()?.csg.get_mut(index)
     }
 
-    /// Sets or clears the `GLB_REQ.halt` bit, preserving the other request
+    /// Sets or clears the MCU halt request, preserving the other request
     /// bits. Clearing must work on a suspended interface, since the resume
     /// path acts before re-enabling it.
     fn set_glb_halt(&self, halt: bool) -> Result {
         let enabled = self.resident().ok_or(EINVAL)?;
 
         let cur_req = enabled.glb_input.read(GLB_REQ);
-        enabled.glb_input.write(GLB_REQ, cur_req.with_halt(halt));
+        let new_req = if enabled.has_glb_state() {
+            cur_req.with_state(if halt {
+                GlbState::Halt
+            } else {
+                GlbState::Active
+            })
+        } else {
+            cur_req.with_halt(halt)
+        };
+        enabled.glb_input.write(GLB_REQ, new_req);
         Ok(())
     }
 
