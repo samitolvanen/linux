@@ -16,6 +16,7 @@ use crate::{
         Bound, //
     },
     devres::*,
+    dma,
     drm::{
         driver,
         gem,
@@ -27,6 +28,7 @@ use crate::{
         from_err_ptr,
         to_result, //
     },
+    highmem,
     io::{
         Io,
         IoCapable,
@@ -119,7 +121,7 @@ impl<T: DriverObject> Object<T> {
         open: Some(super::open_callback::<T>),
         close: Some(super::close_callback::<T>),
         print_info: Some(bindings::drm_gem_shmem_object_print_info),
-        export: Some(super::export_callback::<T>),
+        export: Some(Self::export_callback),
         pin: Some(bindings::drm_gem_shmem_object_pin),
         unpin: Some(bindings::drm_gem_shmem_object_unpin),
         get_sg_table: Some(bindings::drm_gem_shmem_object_get_sg_table),
@@ -262,6 +264,55 @@ impl<T: DriverObject> Object<T> {
 
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(rust_this) };
+    }
+
+    /// Exports the GEM object as a dma-buf, after running the driver's `export` hook.
+    extern "C" fn export_callback(
+        raw_obj: *mut bindings::drm_gem_object,
+        flags: c_int,
+    ) -> *mut bindings::dma_buf {
+        // SAFETY:
+        // * `export_callback` is only installed in the vtable of `Self`, ensuring that `raw_obj`
+        //   is contained within a `DriverAllocImpl<T>`.
+        // * It is only possible for `export_callback` to be called after device registration,
+        //   ensuring that the object's device is in the `Registered` state.
+        let obj: &gem::DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+        match T::export(obj, flags) {
+            Ok(()) if T::EXPORT_CPU_ACCESS_SYNC => {
+                // SAFETY: `raw_obj` is a valid GEM object (see above), so its `dev`, `size` and
+                // `resv` fields are valid, and every registered DRM device provides
+                // `driver->fops`.
+                let (dev, exp_name, owner, size, resv) = unsafe {
+                    let dev = (*raw_obj).dev;
+                    let driver = (*dev).driver;
+                    (
+                        dev,
+                        (*driver).name,
+                        (*(*driver).fops).owner,
+                        (*raw_obj).size,
+                        (*raw_obj).resv,
+                    )
+                };
+
+                let mut exp_info = bindings::dma_buf_export_info {
+                    exp_name,
+                    owner,
+                    ops: &CPU_SYNC_DMA_BUF_OPS,
+                    size,
+                    flags,
+                    resv,
+                    priv_: raw_obj.cast(),
+                };
+
+                // SAFETY: `dev` is the device of a valid GEM object, and `exp_info` is fully
+                // initialized above.
+                unsafe { bindings::drm_gem_dmabuf_export(dev, &mut exp_info) }
+            }
+            // SAFETY: `raw_obj` is a valid GEM object (see above).
+            Ok(()) => unsafe { bindings::drm_gem_prime_export(raw_obj, flags) },
+            Err(e) => e.to_ptr(),
+        }
     }
 
     // If necessary, create an SGTable for the gem object and register a Devres for it to ensure
@@ -479,11 +530,239 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
         gem_create_object: Some(Self::gem_create_object_callback),
         prime_handle_to_fd: None,
         prime_fd_to_handle: None,
-        gem_prime_import: None,
+        gem_prime_import: if T::EXPORT_CPU_ACCESS_SYNC {
+            Some(prime_import_callback)
+        } else {
+            None
+        },
         gem_prime_import_sg_table: Some(bindings::drm_gem_shmem_prime_import_sg_table),
         dumb_create: Some(bindings::drm_gem_shmem_dumb_create),
         dumb_map_offset: None,
     };
+}
+
+/// `dma_buf_ops` used for exports when [`DriverObject::EXPORT_CPU_ACCESS_SYNC`] is set.
+///
+/// This is a `static` rather than an associated `const` so that [`prime_import_callback`] can
+/// identify self-exported buffers by the ops address, since references to an associated `const`
+/// are not guaranteed to be unique. The static is shared by every driver that opts in, and
+/// [`prime_import_callback`] tells self-imports apart with a device-identity check.
+static CPU_SYNC_DMA_BUF_OPS: bindings::dma_buf_ops = bindings::dma_buf_ops {
+    attach: Some(bindings::drm_gem_map_attach),
+    detach: Some(bindings::drm_gem_map_detach),
+    pin: None,
+    unpin: None,
+    map_dma_buf: Some(map_dma_buf_callback),
+    unmap_dma_buf: Some(unmap_dma_buf_callback),
+    release: Some(bindings::drm_gem_dmabuf_release),
+    begin_cpu_access: Some(begin_cpu_access_callback),
+    end_cpu_access: Some(end_cpu_access_callback),
+    mmap: Some(bindings::drm_gem_dmabuf_mmap),
+    vmap: Some(bindings::drm_gem_dmabuf_vmap),
+    vunmap: Some(bindings::drm_gem_dmabuf_vunmap),
+};
+
+/// The scatter-gather table is cached in `attach->priv` so the CPU access callbacks can sync
+/// importers. `attach->priv` is protected by the buffer's reservation lock, which the dma-buf
+/// core holds across `map_dma_buf()`/`unmap_dma_buf()`.
+extern "C" fn map_dma_buf_callback(
+    attach: *mut bindings::dma_buf_attachment,
+    dir: bindings::dma_data_direction,
+) -> *mut bindings::sg_table {
+    // SAFETY: The dma-buf core calls this with a valid attachment on a buffer exported with
+    // `CPU_SYNC_DMA_BUF_OPS`, whose `priv` is a valid GEM object.
+    let sgt = unsafe { bindings::drm_gem_map_dma_buf(attach, dir) };
+
+    if let Ok(sgt) = from_err_ptr(sgt) {
+        // SAFETY: `attach` is valid (see above), and `attach->priv` is exporter-owned,
+        // protected by the reservation lock held by the core.
+        unsafe { (*attach).priv_ = sgt.cast() };
+    }
+
+    sgt
+}
+
+extern "C" fn unmap_dma_buf_callback(
+    attach: *mut bindings::dma_buf_attachment,
+    sgt: *mut bindings::sg_table,
+    dir: bindings::dma_data_direction,
+) {
+    // SAFETY: `attach` is a valid attachment and `attach->priv` is protected by the reservation
+    // lock held by the core.
+    unsafe { (*attach).priv_ = ptr::null_mut() };
+
+    // SAFETY: The core passes back the attachment and table produced by
+    // `map_dma_buf_callback`, both valid for this call.
+    unsafe { bindings::drm_gem_unmap_dma_buf(attach, sgt, dir) };
+}
+
+/// Syncs the cached scatter-gather tables of all of the buffer's attachments in `dir`.
+///
+/// # Safety
+///
+/// `dma_buf` must be a valid dma-buf exported with [`CPU_SYNC_DMA_BUF_OPS`], and its reservation
+/// lock must be held.
+unsafe fn sync_attachments(
+    dma_buf: *mut bindings::dma_buf,
+    dir: dma::DataDirection,
+    sync: unsafe fn(&device::Device, &scatterlist::SGTable, dma::DataDirection),
+) {
+    // SAFETY: `dma_buf` is valid and its attachment list is protected by the reservation lock,
+    // held per this function's safety requirements.
+    let head = unsafe { &raw const (*dma_buf).attachments };
+    // SAFETY: As above.
+    let mut pos = unsafe { (*head).next };
+
+    while !ptr::eq(pos.cast_const(), head) {
+        // SAFETY: Under the reservation lock, non-head nodes of the attachment list are
+        // embedded in valid `struct dma_buf_attachment` instances.
+        let attach = unsafe { container_of!(pos, bindings::dma_buf_attachment, node) };
+
+        // SAFETY: `attach` is valid (see above) and this read is under the reservation lock.
+        let sgt = unsafe { (*attach).priv_.cast::<bindings::sg_table>() };
+        if !sgt.is_null() {
+            // SAFETY: A non-NULL `attach->priv` is the table cached by `map_dma_buf_callback`,
+            // mapped for `attach->dev`, which stays valid while the attachment exists.
+            unsafe {
+                sync(
+                    device::Device::from_raw((*attach).dev),
+                    scatterlist::SGTable::from_raw(sgt),
+                    dir,
+                )
+            };
+        }
+
+        // SAFETY: `pos` is a valid list node while the reservation lock is held.
+        pos = unsafe { (*pos).next };
+    }
+}
+
+/// Called by the dma-buf core without the reservation lock held. The core waits for implicit
+/// fences afterwards.
+extern "C" fn begin_cpu_access_callback(
+    dma_buf: *mut bindings::dma_buf,
+    dir: bindings::dma_data_direction,
+) -> c_int {
+    let dir = match dma::DataDirection::try_from(dir) {
+        Ok(dir) if dir != dma::DataDirection::None => dir,
+        _ => return EINVAL.to_errno(),
+    };
+
+    // SAFETY: The core calls this with a valid dma-buf exported with `CPU_SYNC_DMA_BUF_OPS`,
+    // whose `priv` is the GEM object embedded in a valid `drm_gem_shmem_object`.
+    let obj = unsafe { (*dma_buf).priv_ }.cast::<bindings::drm_gem_object>();
+    // SAFETY: As above.
+    let shmem = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
+
+    // SAFETY: The object's reservation lock is initialized for its whole lifetime.
+    unsafe { bindings::dma_resv_lock((*obj).resv, ptr::null_mut()) };
+
+    // SAFETY: `shmem` is valid (see above) and this read is under the reservation lock.
+    let sgt = unsafe { (*shmem).sgt };
+    if !sgt.is_null() {
+        // SAFETY: Under the reservation lock, a non-NULL `shmem->sgt` is a live scatter-gather
+        // table mapped for the DRM device's parent device, both valid for the object's lifetime.
+        unsafe {
+            dma::sync_sgtable_for_cpu(
+                device::Device::from_raw((*(*obj).dev).dev),
+                scatterlist::SGTable::from_raw(sgt),
+                dir,
+            )
+        };
+    }
+
+    // SAFETY: `shmem` is valid (see above) and this read is under the reservation lock.
+    let vaddr = unsafe { (*shmem).vaddr };
+    if !vaddr.is_null() {
+        // SAFETY: `obj` is valid, and under the reservation lock a non-NULL `shmem->vaddr` is a
+        // live kernel vmap of the object's pages covering `size` bytes.
+        unsafe { highmem::invalidate_kernel_vmap_range(vaddr, (*obj).size) };
+    }
+
+    // SAFETY: `dma_buf` is valid and we hold its reservation lock.
+    unsafe { sync_attachments(dma_buf, dir, dma::sync_sgtable_for_cpu) };
+
+    // SAFETY: We are releasing the lock acquired above.
+    unsafe { bindings::dma_resv_unlock((*obj).resv) };
+
+    0
+}
+
+/// The mirror of [`begin_cpu_access_callback`], returning the mappings to the device in the
+/// opposite order.
+extern "C" fn end_cpu_access_callback(
+    dma_buf: *mut bindings::dma_buf,
+    dir: bindings::dma_data_direction,
+) -> c_int {
+    let dir = match dma::DataDirection::try_from(dir) {
+        Ok(dir) if dir != dma::DataDirection::None => dir,
+        _ => return EINVAL.to_errno(),
+    };
+
+    // SAFETY: The core calls this with a valid dma-buf exported with `CPU_SYNC_DMA_BUF_OPS`,
+    // whose `priv` is the GEM object embedded in a valid `drm_gem_shmem_object`.
+    let obj = unsafe { (*dma_buf).priv_ }.cast::<bindings::drm_gem_object>();
+    // SAFETY: As above.
+    let shmem = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
+
+    // SAFETY: The object's reservation lock is initialized for its whole lifetime.
+    unsafe { bindings::dma_resv_lock((*obj).resv, ptr::null_mut()) };
+
+    // SAFETY: `dma_buf` is valid and we hold its reservation lock.
+    unsafe { sync_attachments(dma_buf, dir, dma::sync_sgtable_for_device) };
+
+    // SAFETY: `shmem` is valid (see above) and this read is under the reservation lock.
+    let vaddr = unsafe { (*shmem).vaddr };
+    if !vaddr.is_null() {
+        // SAFETY: `obj` is valid, and under the reservation lock a non-NULL `shmem->vaddr` is a
+        // live kernel vmap of the object's pages covering `size` bytes.
+        unsafe { highmem::flush_kernel_vmap_range(vaddr, (*obj).size) };
+    }
+
+    // SAFETY: `shmem` is valid (see above) and this read is under the reservation lock.
+    let sgt = unsafe { (*shmem).sgt };
+    if !sgt.is_null() {
+        // SAFETY: Under the reservation lock, a non-NULL `shmem->sgt` is a live scatter-gather
+        // table mapped for the DRM device's parent device, both valid for the object's lifetime.
+        unsafe {
+            dma::sync_sgtable_for_device(
+                device::Device::from_raw((*(*obj).dev).dev),
+                scatterlist::SGTable::from_raw(sgt),
+                dir,
+            )
+        };
+    }
+
+    // SAFETY: We are releasing the lock acquired above.
+    unsafe { bindings::dma_resv_unlock((*obj).resv) };
+
+    0
+}
+
+/// Importing a buffer that this device itself exported must hand back the original GEM object
+/// rather than wrap the dma-buf in a new one. The DRM core only recognizes its own default
+/// `dma_buf_ops`, so buffers exported with [`CPU_SYNC_DMA_BUF_OPS`] need the equivalent check
+/// here.
+extern "C" fn prime_import_callback(
+    raw_dev: *mut bindings::drm_device,
+    dma_buf: *mut bindings::dma_buf,
+) -> *mut bindings::drm_gem_object {
+    // SAFETY: The DRM core calls this with a valid dma-buf.
+    if unsafe { ptr::eq((*dma_buf).ops, &CPU_SYNC_DMA_BUF_OPS) } {
+        // SAFETY: The ops identify the buffer as exported by `Object::export_callback`, so its
+        // `priv` is a valid GEM object.
+        let obj = unsafe { (*dma_buf).priv_ }.cast::<bindings::drm_gem_object>();
+
+        // SAFETY: As above.
+        if unsafe { ptr::eq((*obj).dev, raw_dev) } {
+            // SAFETY: `obj` has a non-zero refcount, since the dma-buf holds a reference to it.
+            unsafe { bindings::drm_gem_object_get(obj) };
+            return obj;
+        }
+    }
+
+    // SAFETY: `raw_dev` and `dma_buf` are valid.
+    unsafe { bindings::drm_gem_prime_import(raw_dev, dma_buf) }
 }
 
 /// A reference to a GEM object that is known to have a mapped [`SGTable`].
