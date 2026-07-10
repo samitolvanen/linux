@@ -55,6 +55,20 @@ __rust_helper void rust_helper_dma_sync_single_for_device(struct device *dev,
 	dma_sync_single_for_device(dev, addr, size, dir);
 }
 
+__rust_helper void rust_helper_dma_sync_sgtable_for_cpu(struct device *dev,
+							struct sg_table *sgt,
+							enum dma_data_direction dir)
+{
+	dma_sync_sgtable_for_cpu(dev, sgt, dir);
+}
+
+__rust_helper void rust_helper_dma_sync_sgtable_for_device(struct device *dev,
+							   struct sg_table *sgt,
+							   enum dma_data_direction dir)
+{
+	dma_sync_sgtable_for_device(dev, sgt, dir);
+}
+
 __rust_helper size_t rust_helper_dma_max_mapping_size(struct device *dev)
 {
 	return dma_max_mapping_size(dev);
