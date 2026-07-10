@@ -255,7 +255,7 @@ impl VmAsData {
             transcfg,
             // SAFETY: Caller ensures proper cleanup.
             transtab: unsafe { pt.ttbr() },
-            memattr: MEMATTR::from_mair(pt.mair()).into_raw(),
+            memattr: MEMATTR::from_mair(pt.mair(), self.coherent).into_raw(),
         })
     }
 }

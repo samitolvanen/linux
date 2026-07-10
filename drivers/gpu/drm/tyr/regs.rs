@@ -1247,10 +1247,7 @@ pub(crate) mod mmu_control {
                 (outer & Self::ARM_MAIR_WRITE_BACK) != 0 && (inner & Self::ARM_MAIR_WRITE_BACK) != 0
             }
 
-            // TODO: Add a `coherent` parameter like panthor's mair_to_memattr().
-            // For now, assume a non-coherent system and always encode write-back
-            // memory with MidgardInnerDomain coherency.
-            fn attribute_from_mair(mair_attr: u8) -> MMU_MEMATTR_STAGE1 {
+            fn attribute_from_mair(mair_attr: u8, coherent: bool) -> MMU_MEMATTR_STAGE1 {
                 // Device memory or non-writeback normal memory
                 if Self::is_device_memory(mair_attr) || !Self::is_writeback_cacheable(mair_attr) {
                     return Self::encode_attribute(
@@ -1262,13 +1259,21 @@ pub(crate) mod mmu_control {
                     );
                 }
 
+                // The GPU does not allow inner or outer-shareable write-back
+                // memory while coherency is disabled.
+                let coherency = if coherent {
+                    Coherency::CpuInnerDomain
+                } else {
+                    Coherency::MidgardInnerDomain
+                };
+
                 // Write-back cacheable normal memory
                 let inner: u8 = mair_attr & Self::ARM_MAIR_INNER_MASK;
                 Self::encode_attribute(
                     (inner & Self::ARM_MAIR_WRITE_ALLOCATE) != 0,
                     (inner & Self::ARM_MAIR_READ_ALLOCATE) != 0,
                     AllocPolicySelect::Alloc,
-                    Coherency::MidgardInnerDomain,
+                    coherency,
                     MemoryType::WriteBack,
                 )
             }
@@ -1278,12 +1283,12 @@ pub(crate) mod mmu_control {
             /// MAIR bytes map to GPU attributes as follows:
             /// - device/write-through/non-cacheable → GPU `NonCacheable`
             /// - write-back → GPU `WriteBack` (preserving inner allocation hints)
-            pub(crate) fn from_mair(mair: u64) -> Self {
+            pub(crate) fn from_mair(mair: u64, coherent: bool) -> Self {
                 mair.to_le_bytes()
                     .into_iter()
                     .enumerate()
                     .fold(Self::zeroed(), |acc, (i, attr)| {
-                        acc.with_encoded_attribute(i, Self::attribute_from_mair(attr))
+                        acc.with_encoded_attribute(i, Self::attribute_from_mair(attr, coherent))
                     })
             }
         }
