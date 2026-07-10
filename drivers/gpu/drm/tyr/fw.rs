@@ -531,12 +531,28 @@ impl Firmware {
     fn halt_mcu(&self) -> Result<(), McuWaitError> {
         self.global_iface.halt_mcu().map_err(McuWaitError::Failed)?;
 
-        Self::wait_for_mcu_status(
-            &self.iomem,
-            McuStatus::Halt,
+        let mut last = None;
+
+        poll::read_poll_timeout(
+            || {
+                let status = {
+                    // Drop the MMIO guard before `halt_acked` sleeps on
+                    // the interface mutex.
+                    let io = self.iomem.try_access().ok_or(ENODEV)?;
+                    io.read(MCU_STATUS)
+                };
+                last = Some(status.value());
+                Ok(status.value() == McuStatus::Halt && self.global_iface.halt_acked())
+            },
+            |halted| *halted,
             time::Delta::from_micros(10),
             time::Delta::from_millis(1000),
         )
+        .map(|_| ())
+        .map_err(|e| match last {
+            Some(status) if e == ETIMEDOUT => McuWaitError::Timeout(status),
+            _ => McuWaitError::Failed(e),
+        })
     }
 
     fn stop_mcu(&self) {
