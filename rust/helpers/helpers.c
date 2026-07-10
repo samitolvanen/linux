@@ -71,6 +71,7 @@
 #include "fs.c"
 #include "fwctl.c"
 #include "gpu.c"
+#include "highmem.c"
 #include "interrupt.c"
 #include "io.c"
 #include "irq.c"
