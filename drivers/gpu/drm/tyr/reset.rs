@@ -64,6 +64,7 @@ use crate::{
     },
     gpu,
     mmu,
+    regs::gpu_control::CoherencyMode,
     sched::tick, //
 };
 
@@ -97,6 +98,8 @@ struct Controller {
     pdev: ARef<platform::Device>,
     /// Mapped register space needed for reset operations.
     iomem: Arc<Devres<IoMem>>,
+    /// Coherency protocol programmed at L2 power-on.
+    coherency: CoherencyMode,
     /// DRM device reference, set once probe has created the device and
     /// revoked by devres at unbind. Resolving it through `Devres` keeps
     /// the back-reference from pinning the refcount cycle past unbind.
@@ -130,12 +133,17 @@ impl workqueue::WorkItem for Controller {
 
 impl Controller {
     /// Creates an `Arc<Controller>` ready for use.
-    fn new(pdev: ARef<platform::Device>, iomem: Arc<Devres<IoMem>>) -> Result<Arc<Self>> {
+    fn new(
+        pdev: ARef<platform::Device>,
+        iomem: Arc<Devres<IoMem>>,
+        coherency: CoherencyMode,
+    ) -> Result<Arc<Self>> {
         let gate = Arc::pin_init(HwGate::new(), GFP_KERNEL)?;
         Arc::pin_init(
             try_pin_init!(Self {
                 pdev,
                 iomem,
+                coherency,
                 ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
                 ready <- new_mutex!(false),
@@ -235,7 +243,13 @@ impl Controller {
 
         tdev.cancel_fw_ping();
         let parked = tick::pre_reset(&tdev);
-        let reset_result = run_hw_reset(&tdev, self.pdev.as_ref(), &self.iomem, &self.gate);
+        let reset_result = run_hw_reset(
+            &tdev,
+            self.pdev.as_ref(),
+            &self.iomem,
+            &self.gate,
+            self.coherency,
+        );
         tick::post_reset(&tdev, parked, reset_result.is_err());
 
         match reset_result {
@@ -268,6 +282,7 @@ pub(crate) fn run_hw_reset(
     dev: &Device,
     iomem: &Devres<IoMem>,
     gate: &HwGate,
+    coherency: CoherencyMode,
 ) -> Result {
     tdev.fw.pre_reset(tdev);
     mmu::pre_reset(tdev, iomem);
@@ -277,7 +292,7 @@ pub(crate) fn run_hw_reset(
     // path takes none while the gate is closed.
     let hw = gate.close();
 
-    let reset_result = gpu::reset(dev, iomem);
+    let reset_result = gpu::reset(dev, iomem, coherency);
     if let Err(e) = &reset_result {
         dev_err!(dev, "GPU reset failed: {:?}\n", e);
     }
@@ -326,11 +341,15 @@ pub(crate) struct ResetHandle {
 }
 
 impl ResetHandle {
-    pub(crate) fn new(pdev: ARef<platform::Device>, iomem: Arc<Devres<IoMem>>) -> Result<Self> {
+    pub(crate) fn new(
+        pdev: ARef<platform::Device>,
+        iomem: Arc<Devres<IoMem>>,
+        coherency: CoherencyMode,
+    ) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(
                 Inner {
-                    controller: Controller::new(pdev, iomem)?,
+                    controller: Controller::new(pdev, iomem, coherency)?,
                     wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
                 },
                 GFP_KERNEL,

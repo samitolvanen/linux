@@ -197,6 +197,27 @@ const GPU_MODELS: [GpuModels; 1] = [GpuModels {
     prod_major: 7,
 }];
 
+/// Selects the coherency protocol to program into `COHERENCY_ENABLE`.
+///
+/// The ACE protocol has never been supported for CSF GPUs.
+pub(crate) fn select_coherency(
+    dev: &Device<Bound>,
+    iomem: &Devres<IoMem>,
+    coherent: bool,
+) -> Result<CoherencyMode> {
+    if !coherent {
+        return Ok(CoherencyMode::None);
+    }
+
+    let io = (*iomem).access(dev)?;
+    if io.read(COHERENCY_FEATURES).ace_lite() {
+        Ok(CoherencyMode::AceLite)
+    } else {
+        dev_err!(dev, "Coherency not supported by the device\n");
+        Err(ENOTSUPP)
+    }
+}
+
 /// Powers off the L2 block.
 pub(crate) fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     let io = (*iomem).access(dev)?;
@@ -217,10 +238,11 @@ pub(crate) fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result
 }
 
 /// Powers on the l2 block.
-pub(crate) fn l2_power_on(dev: &Device, iomem: &Devres<IoMem>) -> Result {
+pub(crate) fn l2_power_on(dev: &Device, iomem: &Devres<IoMem>, coherency: CoherencyMode) -> Result {
     {
         let io = iomem.try_access().ok_or(ENODEV)?;
-        io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(CoherencyMode::None));
+        // The coherency protocol must be selected before the L2 powers up.
+        io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(coherency));
         io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
     }
 
@@ -269,9 +291,9 @@ fn soft_reset(dev: &Device, iomem: &Devres<IoMem>) -> Result {
 /// Runs one synchronous GPU reset pass.
 ///
 /// On success, the GPU is left in a state suitable for reinitialization.
-pub(crate) fn reset(dev: &Device, iomem: &Devres<IoMem>) -> Result {
+pub(crate) fn reset(dev: &Device, iomem: &Devres<IoMem>, coherency: CoherencyMode) -> Result {
     soft_reset(dev, iomem)?;
-    l2_power_on(dev, iomem)?;
+    l2_power_on(dev, iomem, coherency)?;
     Ok(())
 }
 
@@ -291,5 +313,5 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     let io = tdev.iomem.access(bound)?;
     tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
-    l2_power_on(bound, &tdev.iomem)
+    l2_power_on(bound, &tdev.iomem, tdev.coherency)
 }

@@ -191,7 +191,7 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     // claim, so no worker will pick it up. Complete it before the rebind.
     if tdev.reset.claim_pending() {
         let gate = tdev.reset.hw_gate();
-        let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate);
+        let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate, tdev.coherency);
         tdev.reset.complete_claimed();
 
         if let Err(e) = reset_res {
