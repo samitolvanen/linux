@@ -932,7 +932,10 @@ impl Vm {
         })?;
         let gpuvm = ARef::from(&*gpuvm_unique);
 
-        let as_data = Arc::pin_init(VmAsData::new(&mmu, pdev, va_bits, pa_bits)?, GFP_KERNEL)?;
+        let as_data = Arc::pin_init(
+            VmAsData::new(&mmu, pdev, va_bits, pa_bits, coherent)?,
+            GFP_KERNEL,
+        )?;
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
 
         let exec = Arc::pin_init(

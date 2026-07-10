@@ -126,6 +126,10 @@ pub(crate) struct VmAsData {
     /// Virtual address bits for this address space.
     va_bits: u8,
 
+    /// True if the GPU's page-table walks are coherent with the CPU
+    /// caches.
+    coherent: bool,
+
     /// Set by the MMU IRQ handler when this AS slot took a page fault
     /// the in-kernel handler could not service. The scheduler reads it
     /// during the next tick to terminate any groups bound to this VM.
@@ -157,6 +161,7 @@ impl VmAsData {
         pdev: &'a platform::Device,
         va_bits: u32,
         pa_bits: u32,
+        coherent: bool,
     ) -> Result<impl pin_init::PinInit<VmAsData, Error> + 'a> {
         // SAFETY: pdev is a bound device.
         let dev = unsafe { pdev.as_ref().as_bound() };
@@ -166,7 +171,7 @@ impl VmAsData {
             pgsize_bitmap: SZ_4K | SZ_2M,
             ias: va_bits,
             oas: pa_bits,
-            coherent_walk: false,
+            coherent_walk: coherent,
         };
 
         let pt_allocator = Arc::pin_init(PtAllocator::new(), GFP_KERNEL)?;
@@ -176,6 +181,7 @@ impl VmAsData {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
+            coherent,
             unhandled_fault: AtomicBool::new(false),
             op_lock <- new_mutex!(()),
             pt_allocator,
@@ -233,12 +239,17 @@ impl VmAsData {
             _ => return Err(EINVAL),
         };
 
-        let transcfg = mmu_as_control::TRANSCFG::zeroed()
+        let mut transcfg = mmu_as_control::TRANSCFG::zeroed()
             .with_ptw_memattr(mmu_as_control::PtwMemattr::WriteBack)
             .with_r_allocate(true)
             .with_mode(mmu_as_control::AddressSpaceMode::Aarch64_4K)
-            .with_ina_bits(ina_bits)
-            .into_raw();
+            .with_ina_bits(ina_bits);
+
+        if self.coherent {
+            transcfg = transcfg.with_ptw_sh(mmu_as_control::PtwShareability::OuterShareable);
+        }
+
+        let transcfg = transcfg.into_raw();
 
         Ok(AddressSpaceConfig {
             transcfg,
