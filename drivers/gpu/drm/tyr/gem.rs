@@ -87,6 +87,8 @@ impl gem::DriverObject for BoData {
     type Driver = TyrDrmDriver;
     type Args = BoCreateArgs;
 
+    const EXPORT_CPU_ACCESS_SYNC: bool = true;
+
     /// Constructs a new [`BoData`] instance for a GEM object.
     ///
     /// This function is called by the GEM subsystem when creating a new buffer
