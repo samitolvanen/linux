@@ -149,7 +149,7 @@ impl SGTable {
     }
 
     #[inline]
-    fn as_raw(&self) -> *mut bindings::sg_table {
+    pub(crate) fn as_raw(&self) -> *mut bindings::sg_table {
         self.inner.0.get()
     }
 
