@@ -141,6 +141,10 @@ pub(crate) struct VmAsData {
     /// Virtual address bits for this address space.
     va_bits: u8,
 
+    /// True if the device is DMA-coherent. Drives the coherent
+    /// page-table walks and the CPU inner-shareable MEMATTR encoding.
+    coherent: bool,
+
     /// Set by the MMU IRQ handler when this AS slot took a page fault
     /// the in-kernel handler could not service. The scheduler reads it
     /// during the next tick to terminate any groups bound to this VM.
@@ -167,13 +171,14 @@ impl VmAsData {
         dev: &Device<Bound>,
         va_bits: u32,
         pa_bits: u32,
+        coherent: bool,
     ) -> Result<impl pin_init::PinInit<VmAsData, Error> + 'a> {
         let pt_config = Config {
             quirks: 0,
             pgsize_bitmap: SZ_4K | SZ_2M,
             ias: va_bits,
             oas: pa_bits,
-            coherent_walk: false,
+            coherent_walk: coherent,
         };
 
         let pt_allocator = Arc::pin_init(PtAllocator::new(), GFP_KERNEL)?;
@@ -184,6 +189,7 @@ impl VmAsData {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
+            coherent,
             unhandled_fault: Atomic::new(false),
             op_lock <- new_mutex!(()),
             pt_allocator,
@@ -215,12 +221,17 @@ impl VmAsData {
                 bits => bits,
             };
 
-        let transcfg = mmu_as_control::TRANSCFG::zeroed()
+        let mut transcfg = mmu_as_control::TRANSCFG::zeroed()
             .with_ptw_memattr(mmu_as_control::PtwMemattr::WriteBack)
             .with_r_allocate(true)
             .with_mode(mmu_as_control::AddressSpaceMode::Aarch64_4K)
-            .with_ina_bits(ina_bits)
-            .into_raw();
+            .with_ina_bits(ina_bits);
+
+        if self.coherent {
+            transcfg = transcfg.with_ptw_sh(mmu_as_control::PtwShareability::OuterShareable);
+        }
+
+        let transcfg = transcfg.into_raw();
 
         Ok(AddressSpaceConfig {
             transcfg,
@@ -232,7 +243,7 @@ impl VmAsData {
             // driver's private data before releasing devres resources, so
             // `Firmware::drop()` stops the MCU first.
             transtab: unsafe { pt.ttbr() },
-            memattr: MEMATTR::from_mair(pt.mair()).into_raw(),
+            memattr: MEMATTR::from_mair(pt.mair(), self.coherent).into_raw(),
         })
     }
 }

@@ -195,6 +195,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// cacheability policy in `crate::gem::should_map_wc`.
     pub(crate) coherent: bool,
 
+    /// Coherency protocol selected at probe. `CoherencyMode::None` exactly
+    /// when `coherent` is false, since a coherent device whose GPU lacks
+    /// ACE-Lite support fails to probe.
+    pub(crate) coherency: CoherencyMode,
+
     /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
     /// at unbind. It sits on the device because a file release can terminate
     /// groups after unbind, with no registration data left to hold it.
@@ -829,7 +834,10 @@ impl platform::Driver for TyrPlatformDriver {
         let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?.into_devres()?, GFP_KERNEL)?;
         let io = iomem.access(pdev.as_ref())?;
 
-        gpu::reset(pdev.as_ref(), io)?;
+        let coherent = pdev.as_ref().dma_coherent();
+        let coherency = gpu::select_coherency(pdev.as_ref(), io, coherent)?;
+
+        gpu::reset(pdev.as_ref(), io, coherency)?;
 
         // Declared before the firmware, so a failed probe stops the MCU
         // before the guard powers the L2 off.
@@ -840,7 +848,7 @@ impl platform::Driver for TyrPlatformDriver {
             }
         });
 
-        let gpu_info = GpuInfo::new(io);
+        let gpu_info = GpuInfo::new(io, coherency);
         gpu_info.log(pdev.as_ref());
         gpu_info.check_l2_line_size(pdev.as_ref())?;
 
@@ -854,8 +862,6 @@ impl platform::Driver for TyrPlatformDriver {
             pdev.dma_set_max_seg_size(u32::MAX);
             pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)?;
         }
-
-        let coherent = pdev.as_ref().dma_coherent();
 
         let term_wq = DmaFenceWorkqueue::new_unbound(c"tyr-group-term")?;
 
@@ -875,6 +881,7 @@ impl platform::Driver for TyrPlatformDriver {
                 reset,
                 mmio_phys_addr,
                 coherent,
+                coherency,
                 term_wq,
                 heap_alloc_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
