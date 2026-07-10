@@ -119,11 +119,24 @@ pub trait DriverObject: Sync + Send + Sized {
     /// Called when userspace exports the object to a dma-buf.
     ///
     /// Returning an error rejects the export. On success the object is
-    /// exported through the default `drm_gem_prime_export()` path, as if no
-    /// export hook were installed.
+    /// exported through the default `drm_gem_prime_export()` path, or, for
+    /// shmem-backed objects with [`Self::EXPORT_CPU_ACCESS_SYNC`] set, with
+    /// CPU access synchronization.
     fn export(_obj: &DriverAllocImpl<Self>, _flags: c_int) -> Result {
         Ok(())
     }
+
+    /// Whether dma-bufs exported from this driver's GEM objects synchronize
+    /// CPU caches around CPU access.
+    ///
+    /// When `true`, dma-bufs exported from shmem-backed objects perform CPU
+    /// cache maintenance on the exporter's and all importers' DMA mappings
+    /// around CPU accesses, making `DMA_BUF_IOCTL_SYNC` work for buffers with
+    /// cached CPU mappings. This also installs an import hook, so that
+    /// self-imports of these exports still resolve to the original GEM
+    /// object. Objects that are not shmem-backed ignore this constant and
+    /// always use the default export path.
+    const EXPORT_CPU_ACCESS_SYNC: bool = false;
 }
 
 /// Trait that represents a GEM object subtype
