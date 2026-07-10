@@ -82,6 +82,8 @@ impl gem::DriverObject for BoData {
     type Driver = TyrDrmDriver;
     type Args = BoCreateArgs;
 
+    const EXPORT_CPU_ACCESS_SYNC: bool = true;
+
     fn new(_dev: &TyrDrmDevice, _size: usize, args: BoCreateArgs) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             flags: args.flags,
