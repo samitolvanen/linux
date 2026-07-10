@@ -277,7 +277,7 @@ pub(crate) fn run_hw_reset(
     // path takes none while the gate is closed.
     let hw = gate.close();
 
-    let reset_result = gpu::reset(dev, iomem);
+    let reset_result = gpu::reset(dev, iomem, tdev.coherency);
     if let Err(e) = &reset_result {
         dev_err!(dev, "GPU reset failed: {:?}\n", e);
     }
