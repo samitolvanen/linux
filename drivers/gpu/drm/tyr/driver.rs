@@ -806,7 +806,7 @@ impl platform::Driver for TyrPlatformDriverData {
 
         gpu::reset(pdev.as_ref(), &iomem, coherency)?;
 
-        let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem)?;
+        let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem, coherency)?;
         gpu_info.log(pdev.as_ref());
 
         let pa_bits = MMU_FEATURES::from_raw(gpu_info.mmu_features)

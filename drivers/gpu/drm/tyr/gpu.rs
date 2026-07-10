@@ -66,7 +66,11 @@ unsafe impl AsBytes for CsifInfo {}
 pub(crate) struct GpuInfo(pub(crate) uapi::drm_panthor_gpu_info);
 
 impl GpuInfo {
-    pub(crate) fn new(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result<Self> {
+    pub(crate) fn new(
+        dev: &Device<Bound>,
+        iomem: &Devres<IoMem>,
+        coherency: CoherencyMode,
+    ) -> Result<Self> {
         let io = (*iomem).access(dev)?;
 
         Ok(Self(uapi::drm_panthor_gpu_info {
@@ -89,7 +93,7 @@ impl GpuInfo {
                 io.read(TEXTURE_FEATURES::at(3)).supported_formats().get(),
             ],
             as_present: io.read(AS_PRESENT).into_raw(),
-            selected_coherency: uapi::drm_panthor_gpu_coherency_DRM_PANTHOR_GPU_COHERENCY_NONE,
+            selected_coherency: coherency as u32,
             shader_present: join_u64(
                 io.read(SHADER_PRESENT_LO).into_raw(),
                 io.read(SHADER_PRESENT_HI).into_raw(),
