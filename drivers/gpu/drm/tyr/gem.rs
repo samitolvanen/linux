@@ -50,6 +50,17 @@ use crate::{
     },
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use crate::debugfs::{
+    GEM_USAGE_FW_MAPPED,
+    GEM_USAGE_KERNEL,
+    NOT_REGISTERED, //
+};
+#[cfg(CONFIG_DEBUG_FS)]
+use core::sync::atomic::AtomicUsize;
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::str::CStr;
+
 /// Maximum length of a BO label, including the NUL terminator.
 pub(crate) const BO_LABEL_MAXLEN: usize = 4096;
 
@@ -67,6 +78,10 @@ pub(crate) struct BoData {
     /// User-assigned label.
     #[pin]
     label: Mutex<Option<CString>>,
+    /// Index of this BO in the device-wide debugfs registry, or
+    /// `NOT_REGISTERED`. Only ever touched under the registry lock.
+    #[cfg(CONFIG_DEBUG_FS)]
+    registry_slot: AtomicUsize,
 }
 
 impl BoData {
@@ -80,6 +95,18 @@ impl BoData {
 
     pub(crate) fn set_label(&self, label: Option<CString>) {
         *self.label.lock() = label;
+    }
+
+    /// Returns this BO's slot in the device-wide debugfs registry.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn registry_slot(&self) -> &AtomicUsize {
+        &self.registry_slot
+    }
+
+    /// Runs `f` with the BO label held under its lock.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn with_label<R>(&self, f: impl FnOnce(Option<&CStr>) -> R) -> R {
+        f(self.label.lock().as_deref())
     }
 }
 
@@ -117,6 +144,8 @@ impl gem::DriverObject for BoData {
             flags: args.flags,
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
             label <- new_mutex!(None),
+            #[cfg(CONFIG_DEBUG_FS)]
+            registry_slot: AtomicUsize::new(NOT_REGISTERED),
         })
     }
 
@@ -125,6 +154,8 @@ impl gem::DriverObject for BoData {
             flags: 0,
             exclusive_vm_root_gem: None,
             label <- new_mutex!(None),
+            #[cfg(CONFIG_DEBUG_FS)]
+            registry_slot: AtomicUsize::new(NOT_REGISTERED),
         })
     }
 
@@ -141,6 +172,15 @@ impl gem::DriverObject for BoData {
             gem::ObjectStatus::RESIDENT
         } else {
             gem::ObjectStatus::empty()
+        }
+    }
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    fn free(obj: &Bo) {
+        // A firmware-section BO can be created on the unregistered device and
+        // freed on a probe-error path, where the driver data is absent.
+        if let Some(data) = obj.dev().data() {
+            data.gem_registry().unregister(obj.registry_slot());
         }
     }
 }
@@ -425,8 +465,8 @@ pub(crate) fn new_dummy_object<Ctx: DeviceContext>(
     Ok(bo)
 }
 
-pub(crate) fn new_bo<Ctx: DeviceContext>(
-    ddev: &TyrDrmDevice<Ctx>,
+pub(crate) fn new_bo(
+    ddev: &TyrDrmDevice,
     size: usize,
     flags: u32,
     coherent: bool,
@@ -450,6 +490,9 @@ pub(crate) fn new_bo<Ctx: DeviceContext>(
             exclusive_vm_root_gem: exclusive_vm.map(|vm| vm.root_gem().into()),
         },
     )?;
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    ddev.gem_registry().register(&bo, 0);
 
     if map_wc {
         // SAFETY: `ddev` is bound for the duration of the ioctl path that
@@ -544,8 +587,8 @@ pub(crate) fn sync(
 ///
 /// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
 /// VM BO blocks operations on the others.
-pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
-    dev: &TyrDrmDevice<Ctx>,
+pub(crate) fn new_kernel_object(
+    dev: &TyrDrmDevice,
     vm: &Arc<Vm>,
     size: usize,
     flags: VmMapFlags,
@@ -568,8 +611,8 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
 ///
 /// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
 /// VM BO blocks operations on the others.
-pub(crate) fn new_kernel_object_no_vmap<Ctx: DeviceContext>(
-    dev: &TyrDrmDevice<Ctx>,
+pub(crate) fn new_kernel_object_no_vmap(
+    dev: &TyrDrmDevice,
     vm: &Arc<Vm>,
     size: usize,
     flags: VmMapFlags,
@@ -580,7 +623,7 @@ pub(crate) fn new_kernel_object_no_vmap<Ctx: DeviceContext>(
     let node = vm.alloc_kernel_range(aligned_size)?;
     let va = node.start();
 
-    Ok(KernelBo::new(
+    let kernel_bo = KernelBo::new(
         dev,
         vm.as_arc_borrow(),
         aligned_size as u64,
@@ -589,7 +632,15 @@ pub(crate) fn new_kernel_object_no_vmap<Ctx: DeviceContext>(
         coherent,
         cleanup_wq,
     )?
-    .with_va_reservation(node))
+    .with_va_reservation(node);
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    {
+        let usage = GEM_USAGE_KERNEL | if vm.is_fw() { GEM_USAGE_FW_MAPPED } else { 0 };
+        dev.gem_registry().register(&kernel_bo.bo, usage);
+    }
+
+    Ok(kernel_bo)
 }
 
 /// VA allocation strategy for kernel buffer objects.
