@@ -89,7 +89,10 @@ use kernel::{
 };
 
 use crate::{
-    debugfs::VmRegistry,
+    debugfs::{
+        GemRegistry,
+        VmRegistry, //
+    },
     devfreq::{
         self,
         TyrDevfreq,
@@ -154,7 +157,10 @@ use crate::{
 };
 
 #[cfg(CONFIG_DEBUG_FS)]
-use crate::debugfs::GpuvasShow;
+use crate::debugfs::{
+    GemsShow,
+    GpuvasShow, //
+};
 #[cfg(CONFIG_DEBUG_FS)]
 use kernel::debugfs::ScopeRef;
 
@@ -387,6 +393,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// Device-wide registry of live VMs backing the `gpuvas` debugfs file.
     /// Shared with the registration data, which the debugfs file receives.
     pub(crate) vm_registry: Arc<VmRegistry>,
+
+    /// Device-wide registry of live BOs backing the `gems` debugfs file.
+    /// Shared with the registration data, which the debugfs file receives.
+    pub(crate) gem_registry: Arc<GemRegistry>,
 }
 
 impl TyrDrmDeviceData {
@@ -864,6 +874,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Device-wide registry of live VMs, dumped by the `gpuvas` debugfs file.
     pub(crate) vm_registry: Arc<VmRegistry>,
+
+    /// Device-wide registry of live BOs, dumped by the `gems` debugfs file.
+    pub(crate) gem_registry: Arc<GemRegistry>,
 }
 
 kernel::of_device_table!(
@@ -1010,6 +1023,8 @@ impl platform::Driver for TyrPlatformDriver {
 
         let vm_registry = Arc::pin_init(VmRegistry::new(), GFP_KERNEL)?;
         let dev_vm_registry = vm_registry.clone();
+        let gem_registry = Arc::pin_init(GemRegistry::new(), GFP_KERNEL)?;
+        let dev_gem_registry = gem_registry.clone();
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
@@ -1044,6 +1059,7 @@ impl platform::Driver for TyrPlatformDriver {
                 unusable: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 vm_registry: dev_vm_registry,
+                gem_registry: dev_gem_registry,
             }? Error),
         )?;
 
@@ -1197,6 +1213,7 @@ impl platform::Driver for TyrPlatformDriver {
                 gpu_info,
                 csif_info,
                 vm_registry,
+                gem_registry,
         });
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
@@ -1350,6 +1367,7 @@ impl drm::Driver for TyrDrmDriver {
 
     #[cfg(CONFIG_DEBUG_FS)]
     fn debugfs_init(dir: &ScopeRef<'_, TyrDrmRegistrationData<'_>, Self::OwnerModule>) {
+        dir.seq_file::<GemsShow>(c"gems");
         dir.seq_file::<GpuvasShow>(c"gpuvas");
     }
 }

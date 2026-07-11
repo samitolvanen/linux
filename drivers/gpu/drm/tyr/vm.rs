@@ -1318,6 +1318,13 @@ impl Vm {
         self.sparse_bo.as_deref()
     }
 
+    /// Returns whether this is the firmware MCU VM.
+    ///
+    /// Detected by the absence of a bind queue, which only user VMs have.
+    pub(crate) fn is_fw(&self) -> bool {
+        self.bind_queue.is_none()
+    }
+
     /// Dumps this VM's GPU VA space to `m`, holding the lock that guards the
     /// VA tree against concurrent bind and unbind.
     #[cfg(CONFIG_DEBUG_FS)]
