@@ -7,6 +7,8 @@
 
 use crate::driver::TyrPlatformDriverData;
 
+#[cfg(CONFIG_DEBUG_FS)]
+mod debugfs;
 mod devfreq;
 mod driver;
 mod file;
