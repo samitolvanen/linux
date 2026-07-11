@@ -31,7 +31,6 @@ use kernel::{
         poll,
         Io, //
     },
-    irq::ThreadedRegistration,
     platform,
     prelude::*,
     sizes::SZ_8K,
@@ -62,11 +61,6 @@ use crate::{
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
-    irq::{
-        clear_suspended,
-        quiesce,
-        TyrIrq, //
-    },
     mmu::Mmu,
     regs::gpu_control::{
         McuControlMode,
@@ -484,11 +478,7 @@ impl Firmware {
 
     /// Halts and stops the MCU for runtime suspend, releasing the firmware AS
     /// slot for resume to reprogram.
-    pub(crate) fn suspend(
-        &self,
-        dev: &Device<Bound>,
-        job_irq: &Devres<ThreadedRegistration<TyrIrq<irq::JobIrq>>>,
-    ) {
+    pub(crate) fn suspend(&self, tdev: &TyrDrmDevice, dev: &Device<Bound>) {
         if let Err(e) = self.halt_mcu() {
             dev_warn!(
                 self.pdev.as_ref(),
@@ -498,7 +488,7 @@ impl Firmware {
         }
 
         self.stop_mcu();
-        quiesce(dev, job_irq, &self.iomem, irq::job_irq_disable);
+        tdev.job_irq.quiesce(dev, &self.iomem, irq::job_irq_disable);
         self.global_iface.suspend();
         let _ = self.vm.deactivate();
     }
@@ -573,18 +563,14 @@ impl Firmware {
     ///
     /// The sections live in system RAM and survive the suspend, so they are
     /// not reloaded.
-    pub(crate) fn resume(
-        &self,
-        dev: &Device<Bound>,
-        job_irq: &Devres<ThreadedRegistration<TyrIrq<irq::JobIrq>>>,
-        tdev: &TyrDrmDevice,
-    ) -> Result {
+    pub(crate) fn resume(&self, tdev: &TyrDrmDevice) -> Result {
+        tdev.job_irq.clear_suspended();
+
         self.vm.activate()?;
         self.irq_state.clear_ready();
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
-            clear_suspended(dev, job_irq);
             irq::job_irq_enable(&io);
         }
         self.global_iface.set_mcu_active()?;
