@@ -238,6 +238,37 @@ pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result 
     Ok(())
 }
 
+/// Issues a soft reset command and waits for reset-complete IRQ status.
+fn soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+    let io = (*iomem).access(dev)?;
+
+    io.write_reg(GPU_IRQ_CLEAR::zeroed().with_reset_completed(true));
+
+    io.write_reg(GPU_COMMAND::reset(ResetMode::SoftReset));
+
+    poll::read_poll_timeout(
+        || {
+            let io = (*iomem).access(dev)?;
+            Ok(io.read(GPU_IRQ_RAWSTAT))
+        },
+        |status| status.reset_completed(),
+        Delta::from_millis(1),
+        Delta::from_millis(100),
+    )
+    .inspect_err(|_| dev_err!(dev, "GPU reset timed out."))?;
+
+    Ok(())
+}
+
+/// Runs one synchronous GPU reset pass.
+///
+/// On success, the GPU is left in a state suitable for reinitialization.
+pub(crate) fn reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+    soft_reset(dev, iomem)?;
+    l2_power_on(dev, iomem)?;
+    Ok(())
+}
+
 /// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let bound = dev.as_ref();
