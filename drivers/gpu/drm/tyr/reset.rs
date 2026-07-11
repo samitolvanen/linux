@@ -31,12 +31,7 @@
 mod hw_gate;
 
 use kernel::{
-    device::Device,
-    io::{
-        mem::DevresIoMem,
-        poll,
-        Io, //
-    },
+    io::mem::DevresIoMem,
     platform,
     prelude::*,
     sizes::SZ_2M,
@@ -50,7 +45,6 @@ use kernel::{
         },
         Arc, //
     },
-    time,
     workqueue::{
         self,
         OwnedQueue,
@@ -60,9 +54,7 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
-    gpu,
-    regs::gpu_control::*, //
+    gpu, //
 };
 
 /// Lifecycle state of the reset worker.
@@ -166,7 +158,7 @@ impl Controller {
             .iomem
             .try_access()
             .ok_or(ENODEV)
-            .and_then(|io| run_reset(self.pdev.as_ref(), &io))
+            .and_then(|io| gpu::reset(self.pdev.as_ref(), &io))
         {
             Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
             Err(e) => {
@@ -221,39 +213,4 @@ impl ResetHandle {
         self.controller.record_request();
         let _ = self.wq.enqueue(self.controller.clone());
     }
-}
-
-/// Issues a soft reset command and waits for reset-complete IRQ status.
-fn issue_soft_reset(dev: &Device, iomem: &IoMem<'_>) -> Result {
-    // Clear any stale reset-complete IRQ state before issuing a new soft reset.
-    iomem.write_reg(GPU_IRQ_CLEAR::zeroed().with_reset_completed(true));
-
-    iomem.write_reg(GPU_COMMAND::reset(ResetMode::SoftReset));
-
-    poll::read_poll_timeout(
-        || Ok(iomem.read(GPU_IRQ_RAWSTAT)),
-        |status| status.reset_completed(),
-        time::Delta::from_millis(1),
-        time::Delta::from_millis(100),
-    )
-    .inspect_err(|_| dev_err!(dev, "GPU reset timed out."))?;
-
-    Ok(())
-}
-
-/// Runs one synchronous GPU reset pass.
-///
-/// Its visibility is `pub(super)` only so the probe path can run an
-/// initial reset; it is not part of this module's public API.
-///
-/// On success, the GPU is left in a state suitable for reinitialization.
-///
-/// The sequence is as follows:
-///   - Trigger a GPU soft reset.
-///   - Wait for the reset-complete IRQ status.
-///   - Power L2 back on.
-pub(super) fn run_reset(dev: &Device, iomem: &IoMem<'_>) -> Result {
-    issue_soft_reset(dev, iomem)?;
-    gpu::l2_power_on(dev, iomem)?;
-    Ok(())
 }
