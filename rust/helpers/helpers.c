@@ -82,6 +82,7 @@
 #include "pci.c"
 #include "pid_namespace.c"
 #include "platform.c"
+#include "pm_domain.c"
 #include "pm_runtime.c"
 #include "poll.c"
 #include "preempt.c"
