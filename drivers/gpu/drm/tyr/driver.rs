@@ -47,6 +47,7 @@ use kernel::{
     },
     pm::{
         self,
+        attach_pm_domains,
         PMConfig,
         PMContext,
         PMProfile,
@@ -794,6 +795,8 @@ impl platform::Driver for TyrPlatformDriverData {
         core_clk.prepare_enable()?;
         stacks_clk.prepare_enable()?;
         coregroup_clk.prepare_enable()?;
+
+        attach_pm_domains(pdev.as_ref())?;
 
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
 
