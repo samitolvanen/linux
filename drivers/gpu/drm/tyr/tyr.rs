@@ -20,6 +20,7 @@ mod mmu;
 mod pm;
 mod pool;
 mod regs;
+mod reset;
 mod sched;
 mod slot;
 mod vm;
