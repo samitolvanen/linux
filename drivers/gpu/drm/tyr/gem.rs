@@ -42,8 +42,16 @@ use kernel::{
     uapi, //
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::str::CStr;
+
 use crate::{
     cleanup,
+    debugfs::{
+        GemLink,
+        GEM_USAGE_FW_MAPPED,
+        GEM_USAGE_KERNEL, //
+    },
     driver::{
         TyrDrmDevice,
         TyrDrmDriver, //
@@ -73,6 +81,8 @@ pub(crate) struct BoData {
     /// Set once `flush_wc_pages` has built the DMA mapping. The pages stay
     /// pinned until the BO is freed, even after unbind frees the mapping.
     wc_flushed: Atomic<bool>,
+    /// Link to the device-wide `gems` debugfs registry.
+    gem_link: GemLink,
 }
 
 impl BoData {
@@ -86,6 +96,12 @@ impl BoData {
 
     pub(crate) fn set_label(&self, label: Option<CString>) {
         *self.label.lock() = label;
+    }
+
+    /// Runs `f` with the BO label held under its lock.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn with_label<R>(&self, f: impl FnOnce(Option<&CStr>) -> R) -> R {
+        f(self.label.lock().as_deref())
     }
 }
 
@@ -106,21 +122,23 @@ impl gem::DriverObject for BoData {
 
     const EXPOSE_DUMB_CREATE: bool = false;
 
-    fn new(_dev: &TyrDrmDevice, _size: usize, args: BoCreateArgs) -> impl PinInit<Self, Error> {
+    fn new(dev: &TyrDrmDevice, _size: usize, args: BoCreateArgs) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             flags: args.flags,
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
             label <- new_mutex!(None),
             wc_flushed: Atomic::new(false),
+            gem_link: GemLink::new(&dev.gem_registry),
         })
     }
 
-    fn create_imported(_dev: &TyrDrmDevice, _size: usize) -> impl PinInit<Self, Error> {
+    fn create_imported(dev: &TyrDrmDevice, _size: usize) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             flags: 0,
             exclusive_vm_root_gem: None,
             label <- new_mutex!(None),
             wc_flushed: Atomic::new(false),
+            gem_link: GemLink::new(&dev.gem_registry),
         })
     }
 
@@ -146,6 +164,10 @@ impl gem::DriverObject for BoData {
         } else {
             gem::ObjectStatus::empty()
         }
+    }
+
+    fn free(obj: &Bo) {
+        obj.gem_link.unregister(obj);
     }
 }
 
@@ -333,6 +355,8 @@ pub(crate) fn new_bo(
             exclusive_vm_root_gem: exclusive_vm.map(|vm| vm.root_gem().into()),
         },
     )?;
+
+    bo.gem_link.register(&bo, 0);
 
     Ok(bo)
 }
@@ -602,6 +626,9 @@ impl KernelBo {
         )?;
 
         vm.map_bo_range(dev, &bo, 0, size, va, flags, pt_gfp)?;
+
+        let usage = GEM_USAGE_KERNEL | if vm.is_fw() { GEM_USAGE_FW_MAPPED } else { 0 };
+        bo.gem_link.register(&bo, usage);
 
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
