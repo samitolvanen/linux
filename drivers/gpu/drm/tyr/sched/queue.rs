@@ -851,14 +851,19 @@ impl QueueData {
         group.detach_and_terminate();
         match err {
             RingBufferError::Inconsistent { insert, extract } => pr_warn!(
-                "queue {} has inconsistent ring pointers: insert={:#x}, extract={:#x}\n",
+                "queue {} has inconsistent ring pointers: insert={:#x}, extract={:#x}, pid={}, comm={}\n",
                 job.queue_index.get(),
                 insert,
-                extract
+                extract,
+                group.task_pid(),
+                group.task_comm()
             ),
-            RingBufferError::Full | RingBufferError::Other => {
-                pr_warn!("queue {} ring claim failed\n", job.queue_index.get())
-            }
+            RingBufferError::Full | RingBufferError::Other => pr_warn!(
+                "queue {} ring claim failed: pid={}, comm={}\n",
+                job.queue_index.get(),
+                group.task_pid(),
+                group.task_comm()
+            ),
         }
         self.cancel_job(job, fence_seqno)
     }
