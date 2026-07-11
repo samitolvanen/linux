@@ -1037,6 +1037,14 @@ impl Vm {
         &self.root_gem
     }
 
+    /// Returns whether this is the firmware MCU VM.
+    ///
+    /// Detected by the absence of a bind queue, which only user VMs have.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn is_fw(&self) -> bool {
+        self.bind_queue.is_none()
+    }
+
     pub(crate) fn with_prepared_vm<R>(
         &self,
         num_slots: u32,

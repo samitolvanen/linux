@@ -81,6 +81,13 @@ use crate::{
     vm::{Vm, VmFlag, VmMapFlags}, //
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use crate::debugfs::{
+    GemRegistry,
+    GEM_USAGE_FW_MAPPED,
+    GEM_USAGE_KERNEL, //
+};
+
 pub(crate) mod global;
 mod interfaces;
 pub(crate) mod irq;
@@ -768,6 +775,16 @@ impl Firmware {
         bytes.fill(0);
 
         Ok(mem)
+    }
+
+    /// Registers every firmware section BO in the device-wide `gems`
+    /// registry. The sections are created before the device data exists, so
+    /// they are registered once probe has set it up.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn register_gems(&self, registry: &GemRegistry) {
+        for section in self.sections.iter() {
+            registry.register(&section.mem.bo, GEM_USAGE_KERNEL | GEM_USAGE_FW_MAPPED);
+        }
     }
 
     pub(crate) fn alloc_suspend_buf(

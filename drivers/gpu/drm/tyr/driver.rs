@@ -136,6 +136,12 @@ use crate::{
     slot::SlotManager,
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use crate::debugfs::{
+    GemRegistry,
+    GemsFile, //
+};
+
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
 
 pub(crate) struct TyrDrmDriver;
@@ -402,6 +408,14 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) opp_config: Mutex<Option<ConfigToken>>,
+
+    /// Device-wide registry of live BOs backing the `gems` debugfs file.
+    ///
+    /// Declare after every field that owns BOs, so drop order keeps the
+    /// registry alive while their free hooks deregister.
+    #[cfg(CONFIG_DEBUG_FS)]
+    #[pin]
+    gem_registry: GemRegistry,
 }
 
 impl TyrDrmDeviceData {
@@ -439,6 +453,12 @@ impl TyrDrmDeviceData {
     /// Sets the maximum GPU frequency in Hz.
     pub(crate) fn set_max_freq(&self, hz: u64) {
         self.max_freq.store(hz, Relaxed);
+    }
+
+    /// Returns the device-wide BO registry backing the `gems` debugfs file.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn gem_registry(&self) -> &GemRegistry {
+        &self.gem_registry
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -860,6 +880,8 @@ impl platform::Driver for TyrPlatformDriverData {
                 unbinding: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
+                #[cfg(CONFIG_DEBUG_FS)]
+                gem_registry <- GemRegistry::new(),
         });
 
         if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
@@ -935,6 +957,12 @@ impl platform::Driver for TyrPlatformDriverData {
         tdev.reset.set_ready();
 
         TyrDrmDeviceData::schedule_tick(&tdev);
+
+        #[cfg(CONFIG_DEBUG_FS)]
+        {
+            tdev.fw.register_gems(tdev.gem_registry());
+            tdev.debugfs_add_file::<GemsFile>();
+        }
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
