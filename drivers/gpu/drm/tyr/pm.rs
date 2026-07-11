@@ -168,7 +168,8 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     // A request recorded during the reboot arrived after the earlier
     // claim, so no worker will pick it up. Complete it before the rebind.
     if tdev.reset.claim_pending() {
-        let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem);
+        let gate = tdev.reset.hw_gate();
+        let reset_res = reset::run_hw_reset(tdev, bound, &tdev.iomem, &gate);
         tdev.reset.complete_claimed();
 
         if let Err(e) = reset_res {
