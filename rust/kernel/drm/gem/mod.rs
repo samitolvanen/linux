@@ -319,6 +319,35 @@ pub trait BaseObject: IntoGEMObject {
         unsafe { bindings::drm_gem_is_imported(self.as_raw()) }
     }
 
+    /// Returns whether the object holds a dma-buf reference.
+    ///
+    /// The reference is present when the object has been exported or imported
+    /// through PRIME.
+    fn has_dma_buf(&self) -> bool {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`.
+        !unsafe { (*self.as_raw()).dma_buf }.is_null()
+    }
+
+    /// Returns the current reference count of the object.
+    fn refcount(&self) -> u32 {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`,
+        // whose `refcount` is initialized for its whole lifetime.
+        unsafe { bindings::kref_read(&raw const (*self.as_raw()).refcount) }
+    }
+
+    /// Returns the object's global (flink) name, or `0` if it has none.
+    fn global_name(&self) -> c_int {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`.
+        unsafe { (*self.as_raw()).name }
+    }
+
+    /// Returns the start of the object's fake mmap offset in page units.
+    fn vma_node_start(&self) -> u64 {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`,
+        // whose `vma_node` is embedded and valid for the object's lifetime.
+        unsafe { bindings::drm_vma_node_start(&raw const (*self.as_raw()).vma_node) as u64 }
+    }
+
     /// Creates a new handle for the object associated with a given `File`
     /// (or returns an existing one).
     fn create_handle<D, F>(&self, file: &drm::File<F>) -> Result<u32>
