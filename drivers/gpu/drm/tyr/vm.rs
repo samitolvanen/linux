@@ -86,7 +86,8 @@ use kernel::{
         Arc,
         ArcBorrow,
         LockClassKey,
-        Mutex, //
+        Mutex,
+        MutexGuard, //
     },
     uapi, //
 };
@@ -586,6 +587,10 @@ pub(crate) struct PtUpdateContext<'ctx> {
 
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
+
+    /// Serializes this span against hardware residency changes on the VM
+    /// for its whole life.
+    _op_lock: MutexGuard<'ctx, ()>,
 }
 
 impl<'ctx> PtUpdateContext<'ctx> {
@@ -603,6 +608,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
         op_type: PtOpType<'ctx>,
         resources: &'ctx mut VmOpResources,
     ) -> Result<PtUpdateContext<'ctx>> {
+        let _op_lock = as_data.lock_ops();
         mmu.start_vm_update(as_data, &region)?;
 
         Ok(Self {
@@ -613,6 +619,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
             region,
             op_type,
             resources,
+            _op_lock,
         })
     }
 

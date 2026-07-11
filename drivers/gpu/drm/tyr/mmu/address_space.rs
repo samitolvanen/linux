@@ -26,6 +26,7 @@ use kernel::{
         IoPageTable,
         ARM64LPAES1, //
     },
+    new_mutex,
     num::Bounded,
     platform,
     prelude::*,
@@ -41,7 +42,9 @@ use kernel::{
         },
         Arc,
         ArcBorrow,
-        LockedBy, //
+        LockedBy,
+        Mutex,
+        MutexGuard, //
     },
     time::Delta, //
 };
@@ -104,6 +107,12 @@ pub(crate) struct VmAsData {
     /// during the next tick to terminate any groups bound to this VM.
     pub(crate) unhandled_fault: Atomic<bool>,
 
+    /// Serializes page-table update spans on this VM against hardware
+    /// residency changes, so the GPU never translates against a page
+    /// table that is being modified.
+    #[pin]
+    op_lock: Mutex<()>,
+
     /// The page table which maps GPU virtual addresses to physical addresses for this VM.
     #[pin]
     pub(crate) page_table: DevresIoPageTable<ARM64LPAES1>,
@@ -132,8 +141,17 @@ impl VmAsData {
             as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
             unhandled_fault: Atomic::new(false),
+            op_lock <- new_mutex!(()),
             page_table <- page_table_init,
         }? Error)
+    }
+
+    /// Acquires the per-VM operation lock that guards page-table update
+    /// spans against concurrent hardware residency changes.
+    ///
+    /// Lock order `{csg_slot_manager or gpuvm_unique} > vm op_lock > as_manager`.
+    pub(crate) fn lock_ops(&self) -> MutexGuard<'_, ()> {
+        self.op_lock.lock()
     }
 
     /// Computes the hardware configuration for this address space.
@@ -614,6 +632,19 @@ impl AsSlotManager {
             Some(slot) => self.as_end_update(slot as usize),
             None => Ok(()),
         }
+    }
+
+    /// Bumps an already-resident VM's active-user count.
+    ///
+    /// A non-zero count means the VM is bound to a hardware slot, so an extra
+    /// user needs no residency change or hardware programming.
+    pub(super) fn bump_resident_vm_users(&mut self, vm_as_data: &VmAsData) -> bool {
+        let users = vm_as_data.as_active_users.access_mut(self);
+        if *users == 0 {
+            return false;
+        }
+        *users += 1;
+        true
     }
 
     /// Activates a VM by assigning it to a hardware slot.
