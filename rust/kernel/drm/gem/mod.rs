@@ -137,6 +137,20 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &DriverAllocImpl<Self>, _file: &DriverFile<Self>) {}
 
+    /// Notifies the driver that the object is about to be freed.
+    ///
+    /// Called from the free path once the last reference drops and before any
+    /// backing storage is released, so the object is still fully valid. The
+    /// core still performs the free. This is only a notification.
+    ///
+    /// This can run before the device finishes registering. An object created
+    /// on an unregistered device may be freed on a probe error path, so the
+    /// `Registered` typestate must not be assumed. The driver data reached
+    /// through the [`dev()`] deref is always initialized.
+    ///
+    /// [`dev()`]: crate::drm::gem::Object::dev
+    fn free(_obj: &DriverAllocImpl<Self>) {}
+
     /// Report the state of the object for fdinfo memory accounting.
     ///
     /// Called by `drm_show_memory_stats` while holding `file->table_lock`, a
@@ -458,6 +472,10 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
     }
 
     extern "C" fn free_callback(obj: *mut bindings::drm_gem_object) {
+        // SAFETY: The core passes a valid gem object contained in a `DriverAllocImpl<T>`.
+        let driver_obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(obj) };
+        T::free(driver_obj);
+
         let ptr: *mut Opaque<bindings::drm_gem_object> = obj.cast();
 
         // SAFETY: All of our objects are of type `Object<T>`.
