@@ -47,6 +47,10 @@ use kernel::{
         Mutex,
         SpinLock, //
     },
+    task::{
+        Pid,
+        TaskComm, //
+    },
     time::{
         msecs_to_jiffies,
         Delta, //
@@ -164,6 +168,12 @@ pub(crate) struct GroupStatus {
     pub(crate) is_idle: bool,
     /// CSG slot id when the group is bound, otherwise `None`.
     pub(crate) csg_id: Option<usize>,
+}
+
+/// The pid and command name of the task that created a group.
+struct TaskInfo {
+    pid: Pid,
+    comm: TaskComm,
 }
 
 /// Accumulated GPU usage for a group, exposed through fdinfo.
@@ -412,6 +422,7 @@ pub(crate) struct Group {
     /// memory in fdinfo and as active memory while the group is on a
     /// slot. Fixed at creation.
     kbo_sizes: usize,
+    task_info: TaskInfo,
 }
 
 impl_list_arc_safe! {
@@ -545,6 +556,13 @@ impl Group {
             + syncobjs.size()
             + queues.iter().map(|q| q.mem_size()).sum::<usize>();
 
+        let current = current!();
+        let leader = current.group_leader();
+        let task_info = TaskInfo {
+            pid: leader.pid(),
+            comm: leader.comm(),
+        };
+
         Arc::pin_init(
             pin_init!(Self {
                 inner <- new_mutex!(GroupInner {
@@ -589,6 +607,7 @@ impl Group {
                 syncobjs,
                 fdinfo <- new_spinlock!(FdInfo::default()),
                 kbo_sizes,
+                task_info,
             }),
             GFP_KERNEL,
         )
@@ -834,7 +853,13 @@ impl Group {
                 continue;
             }
 
-            dev_warn!(self.tdev.as_ref(), "Queue job {} timed out\n", done_seqno);
+            dev_warn!(
+                self.tdev.as_ref(),
+                "job timeout: pid={}, comm={}, seqno={}\n",
+                self.task_pid(),
+                self.task_comm(),
+                done_seqno
+            );
             self.with_locked_inner(|inner| inner.mark_timedout());
             self.detach_and_terminate();
         }
@@ -882,6 +907,14 @@ impl Group {
     /// every queue gets an index.
     pub(crate) fn indexed_queues(&self) -> impl Iterator<Item = (QueueIdx, &Queue)> {
         QueueIdx::all().zip(self.queues.iter())
+    }
+
+    pub(crate) fn task_pid(&self) -> Pid {
+        self.task_info.pid
+    }
+
+    pub(crate) fn task_comm(&self) -> &TaskComm {
+        &self.task_info.comm
     }
 
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
