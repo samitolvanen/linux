@@ -6,11 +6,16 @@
 
 use crate::{
     bindings,
+    fmt,
     mm::MmWithUser,
     pid_namespace::PidNamespace,
     prelude::*,
+    str::BStr,
     sync::aref::ARef,
-    types::{NotThreadSafe, Opaque},
+    types::{
+        NotThreadSafe,
+        Opaque, //
+    }, //
 };
 use core::{
     ops::Deref,
@@ -29,6 +34,9 @@ pub const TASK_FREEZABLE: c_int = bindings::TASK_FREEZABLE as c_int;
 /// Convenience constant for waking up tasks regardless of whether they are in interruptible or
 /// uninterruptible sleep.
 pub const TASK_NORMAL: c_uint = bindings::TASK_NORMAL as c_uint;
+
+/// The length of a task's command name buffer, including the trailing `NUL` byte.
+pub const TASK_COMM_LEN: usize = bindings::TASK_COMM_LEN as usize;
 
 /// Returns whether the current task is executing a 32-bit compat syscall.
 ///
@@ -163,6 +171,17 @@ pub struct Kuid {
     kuid: bindings::kuid_t,
 }
 
+/// A [`TASK_COMM_LEN`]-byte snapshot of a task's `comm`, NUL-padded.
+pub struct TaskComm([u8; TASK_COMM_LEN]);
+
+impl fmt::Display for TaskComm {
+    /// Formats printable ASCII characters up to the first `NUL`, escaping the rest.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
+        fmt::Display::fmt(BStr::from_bytes(&self.0[..len]), f)
+    }
+}
+
 impl Task {
     /// Returns a raw pointer to the current task.
     ///
@@ -218,6 +237,24 @@ impl Task {
         // SAFETY: The pid of a task never changes after initialization, so reading this field is
         // not a data race.
         unsafe { *ptr::addr_of!((*self.as_ptr()).pid) }
+    }
+
+    /// Returns a snapshot of the command name (`comm`) of the given task.
+    #[inline]
+    pub fn comm(&self) -> TaskComm {
+        let mut comm = [0u8; TASK_COMM_LEN];
+        // SAFETY: By the type invariant, `self.as_ptr()` is a valid task. `comm` is a buffer of
+        // exactly `TASK_COMM_LEN` bytes, which satisfies `get_task_comm`'s length contract. The
+        // helper reads `comm` lock-free as the C macro does, and `strscpy_pad` keeps it
+        // NUL-terminated, so a concurrent rename yields a well-formed name.
+        unsafe {
+            bindings::get_task_comm(
+                comm.as_mut_ptr().cast::<c_char>(),
+                TASK_COMM_LEN,
+                self.as_ptr(),
+            );
+        }
+        TaskComm(comm)
     }
 
     /// Returns the UID of the given task.
