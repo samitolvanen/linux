@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <drm/drm_debugfs.h>
 #include <drm/drm_exec.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -34,6 +35,20 @@ __rust_helper int
 rust_helper_drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 {
 	return drm_gem_huge_mnt_create(dev, value);
+}
+#endif
+
+/*
+ * `drm_debugfs_add_file` is a `static inline` no-op when `CONFIG_DEBUG_FS` is
+ * disabled, and an exported function otherwise.
+ */
+#ifndef CONFIG_DEBUG_FS
+__rust_helper void
+rust_helper_drm_debugfs_add_file(struct drm_device *dev, const char *name,
+				 int (*show)(struct seq_file *, void *),
+				 void *data)
+{
+	drm_debugfs_add_file(dev, name, show, data);
 }
 #endif
 

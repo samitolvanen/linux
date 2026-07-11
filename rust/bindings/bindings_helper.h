@@ -41,6 +41,12 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_print.h>
 #include <drm/drm_syncobj.h>
+/*
+ * Included after the other DRM headers so it does not pull in `drm_gem.h` (via
+ * `drm_gpuvm.h`) ahead of them, which would change the `bindgen` type chosen for
+ * `enum drm_gem_object_status`.
+ */
+#include <drm/drm_debugfs.h>
 #include <kunit/test.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/bitmap.h>
