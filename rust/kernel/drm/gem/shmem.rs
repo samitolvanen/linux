@@ -262,6 +262,11 @@ impl<T: DriverObject> Object<T> {
     }
 
     extern "C" fn free_callback(obj: *mut bindings::drm_gem_object) {
+        // Notify the driver before any teardown, while the object is still valid.
+        // SAFETY: The core passes a valid gem object contained in a `DriverAllocImpl<T>`.
+        let driver_obj: &gem::DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(obj) };
+        T::free(driver_obj);
+
         // SAFETY:
         // - DRM always passes a valid gem object here
         // - We used drm_gem_shmem_create() in our create_gem_object callback, so we know that

@@ -460,6 +460,23 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         to_result(unsafe { bindings::drm_gem_huge_mnt_create(self.as_raw(), value.as_char_ptr()) })
     }
 
+    /// Returns the driver's private data, or `None` if it is not initialized.
+    ///
+    /// Data is initialized during registration, so it can be absent when this
+    /// is called on a device that has not finished registering, for example
+    /// from a GEM object's free path taken on a probe-error path.
+    #[inline]
+    pub fn data(&self) -> Option<&T::Data> {
+        if self.data_is_init.load(Ordering::Acquire) {
+            // SAFETY: `data_is_init` is `true`, so `data` was initialized by
+            // `Registration::new` and is never written again, so this shared
+            // read cannot race.
+            Some(unsafe { (*self.data.get()).assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
     /// Change the [`DeviceContext`] for a [`Device`].
     ///
     /// # Safety
