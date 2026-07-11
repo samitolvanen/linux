@@ -94,7 +94,17 @@ impl Mmu {
 
     /// Assign a VM to an AS slot, provide a translation table,
     /// and update the MMU to make the VM resident.
+    ///
+    /// An extra user on an already-resident VM only bumps the count under the
+    /// AS slot manager lock, keeping it off any in-flight page-table update.
+    /// Binding a not-resident VM takes the op lock first.
     pub(crate) fn activate_vm(&self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
+        // The `.lock()` guard is a condition temporary, so it drops before
+        // the path below can take the op lock.
+        if self.as_manager.lock().bump_resident_vm_users(&vm_as_data) {
+            return Ok(());
+        }
+        let _op = vm_as_data.lock_ops();
         self.as_manager.lock().activate_vm(vm_as_data)
     }
 
@@ -107,7 +117,11 @@ impl Mmu {
     }
 
     /// Evict a VM from its AS slot and flush the MMU.
+    ///
+    /// The per-VM op lock is taken first so a residency change cannot overlap
+    /// an in-flight page-table update on the same VM.
     pub(crate) fn deactivate_vm(&self, vm_as_data: &VmAsData) -> Result {
+        let _op = vm_as_data.lock_ops();
         self.as_manager.lock().deactivate_vm(vm_as_data)
     }
 
