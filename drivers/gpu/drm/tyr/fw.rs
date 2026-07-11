@@ -335,7 +335,7 @@ impl Firmware {
 
     fn load(ddev: &TyrDrmDevice<Uninit>, gpu_info: &GpuInfo) -> Result<KVec<ParsedSection>> {
         let fw = Self::request(ddev, gpu_info)?;
-        let mut parser = FwParser::new(fw.data());
+        let mut parser = FwParser::new(fw.data(), ddev.as_ref());
 
         parser.parse()
     }
