@@ -609,7 +609,7 @@ impl platform::Driver for TyrPlatformDriver {
         let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?.into_devres()?, GFP_KERNEL)?;
         let io = iomem.access(pdev.as_ref())?;
 
-        reset::run_reset(pdev.as_ref(), io)?;
+        gpu::reset(pdev.as_ref(), io)?;
 
         let gpu_info = GpuInfo::new(io);
         gpu_info.log(pdev.as_ref());
