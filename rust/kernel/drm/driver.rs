@@ -170,7 +170,9 @@ impl<T: Driver> Registration<T> {
         // - `raw_data` will not move until it is dropped.
         unsafe { data.__pinned_init(drm.0.data.get().cast()) }?;
 
-        drm.data_is_init.store(true, Ordering::Relaxed);
+        // `Release` pairs with the `Acquire` in `Device::data()` so a reader
+        // that observes the flag also observes the initialized data.
+        drm.data_is_init.store(true, Ordering::Release);
 
         // SAFETY: `drm.as_raw()` is valid by the invariants of `drm::Device`.
         to_result(unsafe { bindings::drm_dev_register(drm.as_raw(), flags) })?;
