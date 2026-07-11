@@ -59,7 +59,7 @@ fn suspend_hw_components(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDr
     let bound = dev.as_ref();
     let tdev = &data.device;
 
-    tdev.fw.suspend(bound, &data.job_irq);
+    tdev.fw.suspend(tdev, bound);
 
     // After fw.suspend() frees the firmware's AS slot, drain the idle
     // user slots while still clocked so teardown hits no gated MMIO.
@@ -82,7 +82,7 @@ fn resume_hw_components(
     if reload {
         tdev.fw.reload(tdev)
     } else {
-        tdev.fw.resume(dev.as_ref(), &data.job_irq, tdev)
+        tdev.fw.resume(tdev)
     }
 }
 
