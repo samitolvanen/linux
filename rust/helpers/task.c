@@ -2,6 +2,7 @@
 
 #include <linux/kernel.h>
 #include <linux/sched/task.h>
+#include <linux/string.h>
 
 __rust_helper void rust_helper_might_resched(void)
 {
@@ -64,4 +65,15 @@ __rust_helper pid_t rust_helper_task_tgid_nr_ns(struct task_struct *tsk,
 						struct pid_namespace *ns)
 {
 	return task_tgid_nr_ns(tsk, ns);
+}
+
+__rust_helper void rust_helper_get_task_comm(char *buf, size_t size,
+					     struct task_struct *tsk)
+{
+	/*
+	 * The get_task_comm() macro only accepts a buffer whose size is known
+	 * at compile time, so it cannot take a pointer. Copy the same way it
+	 * does, which NUL-terminates and zero-pads the destination.
+	 */
+	strscpy_pad(buf, tsk->comm, size);
 }
