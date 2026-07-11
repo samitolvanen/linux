@@ -1101,7 +1101,12 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
         let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
 
         if adjusted_elapsed >= self.timeout {
-            pr_err!("Tyr queue job {} timed out\n", ctx.counter);
+            pr_warn!(
+                "job timeout: pid={}, comm={}, seqno={}\n",
+                ctx.job.group.task_pid(),
+                ctx.job.group.task_comm(),
+                ctx.counter
+            );
             ctx.job
                 .group
                 .with_locked_inner(|inner| inner.mark_timedout());
