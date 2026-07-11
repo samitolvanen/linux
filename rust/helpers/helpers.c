@@ -71,6 +71,7 @@
 #include "highmem.c"
 #include "io.c"
 #include "jump_label.c"
+#include "kref.c"
 #include "kunit.c"
 #include "list.c"
 #include "maple_tree.c"

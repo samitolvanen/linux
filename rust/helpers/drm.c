@@ -30,6 +30,12 @@ rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
 	return drm_vma_node_offset_addr(node);
 }
 
+__rust_helper unsigned long
+rust_helper_drm_vma_node_start(const struct drm_vma_offset_node *node)
+{
+	return drm_vma_node_start(node);
+}
+
 #ifndef CONFIG_TRANSPARENT_HUGEPAGE
 __rust_helper int
 rust_helper_drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
