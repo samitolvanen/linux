@@ -2,7 +2,8 @@
 
 //! Rust Runtime Power Management abstraction.
 //!
-//! C header: [`include/linux/pm_runtime.h`](srctree/include/linux/pm_runtime.h)
+//! C headers: [`include/linux/pm_runtime.h`](srctree/include/linux/pm_runtime.h),
+//! [`include/linux/pm_domain.h`](srctree/include/linux/pm_domain.h)
 
 use crate::{
     bindings,
@@ -1177,4 +1178,37 @@ impl<T: PMOps + 'static> Drop for Registration<T> {
             }
         }
     }
+}
+
+/// Attaches `dev` to the PM domains listed in its device-tree node.
+///
+/// Every power domain referenced by the node is attached with no extra flags,
+/// and a runtime-PM device link is created for each, mirroring the C
+/// `devm_pm_domain_attach_list()` null-data form.
+///
+/// A device with no device-tree node or no `power-domains` phandle attaches
+/// nothing. When the bus has already attached a single PM domain to the device
+/// (`-EEXIST`), that is treated the same way, since that domain is managed by
+/// the bus rather than by this list.
+///
+/// The attachment is devres-managed and detached at unbind.
+pub fn attach_pm_domains(dev: &device::Device<device::Bound>) -> Result {
+    let mut list: *mut bindings::dev_pm_domain_list = core::ptr::null_mut();
+
+    // SAFETY: `dev` is a bound device, so `as_raw()` yields a valid
+    // `struct device *` for the duration of the call. A null `data` is a
+    // valid argument, and `&mut list` is a valid writable out-pointer.
+    let ret =
+        unsafe { bindings::devm_pm_domain_attach_list(dev.as_raw(), core::ptr::null(), &mut list) };
+
+    if ret < 0 {
+        let err = Error::from_errno(ret);
+        // Already attached by the bus.
+        if err == EEXIST {
+            return Ok(());
+        }
+        return Err(err);
+    }
+
+    Ok(())
 }
