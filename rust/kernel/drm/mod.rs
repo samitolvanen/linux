@@ -2,6 +2,7 @@
 
 //! DRM subsystem abstractions.
 
+pub mod debugfs;
 pub mod device;
 pub mod driver;
 #[cfg(CONFIG_RUST_DRM_EXEC)]
