@@ -31,8 +31,6 @@
 //! A readiness gate holds a request recorded during probe at `Pending`
 //! until `set_ready` enqueues the worker.
 
-mod hw_gate;
-
 use kernel::{
     device::Device,
     devres::Devres,
@@ -68,6 +66,10 @@ use crate::{
     mmu,
     sched::tick, //
 };
+
+pub(crate) mod hw_gate;
+
+use hw_gate::HwGate;
 
 /// Lifecycle state of the reset worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +108,9 @@ struct Controller {
     /// recorded before that are held back until it is set.
     #[pin]
     ready: Mutex<bool>,
+    /// Gate closed around the reset so VM updates and address-space
+    /// operations drain before the hardware is wiped.
+    gate: Arc<HwGate>,
     /// Work item backing async reset processing.
     #[pin]
     work: Work<Controller>,
@@ -126,6 +131,7 @@ impl workqueue::WorkItem for Controller {
 impl Controller {
     /// Creates an `Arc<Controller>` ready for use.
     fn new(pdev: ARef<platform::Device>, iomem: Arc<Devres<IoMem>>) -> Result<Arc<Self>> {
+        let gate = Arc::pin_init(HwGate::new(), GFP_KERNEL)?;
         Arc::pin_init(
             try_pin_init!(Self {
                 pdev,
@@ -133,6 +139,7 @@ impl Controller {
                 ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
                 ready <- new_mutex!(false),
+                gate,
                 work <- kernel::new_work!("tyr::reset"),
             }),
             GFP_KERNEL,
@@ -227,7 +234,7 @@ impl Controller {
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
         let parked = tick::pre_reset(&tdev);
-        let reset_result = run_hw_reset(&tdev, self.pdev.as_ref(), &self.iomem);
+        let reset_result = run_hw_reset(&tdev, self.pdev.as_ref(), &self.iomem, &self.gate);
         tick::post_reset(&tdev, parked, reset_result.is_err());
 
         match reset_result {
@@ -247,16 +254,27 @@ impl Controller {
 
 /// Runs the hardware half of a reset cycle.
 ///
-/// Shared by the reset worker and the resume path that completes a reset
-/// latched while the device was suspended, so both run the identical
-/// sequence.
+/// The hardware-access gate is closed around the register wipe so in-flight
+/// readers drain first. Shared by the reset worker and the resume path that
+/// completes a reset latched while the device was suspended, so both run the
+/// identical sequence.
 ///
 /// The firmware reboot is attempted even when the soft reset reports a
 /// failure, since only the combined outcome decides whether the cycle
 /// failed.
-pub(crate) fn run_hw_reset(tdev: &TyrDrmDevice, dev: &Device, iomem: &Devres<IoMem>) -> Result {
+pub(crate) fn run_hw_reset(
+    tdev: &TyrDrmDevice,
+    dev: &Device,
+    iomem: &Devres<IoMem>,
+    gate: &HwGate,
+) -> Result {
     tdev.fw.pre_reset();
     mmu::pre_reset(tdev, iomem);
+
+    // A span parked on the closed gate holds a VM op lock while it waits.
+    // Taking an op lock here would deadlock against such a span, so this
+    // path takes none while the gate is closed.
+    let hw = gate.close();
 
     let reset_result = gpu::reset(dev, iomem);
     if let Err(e) = &reset_result {
@@ -264,6 +282,9 @@ pub(crate) fn run_hw_reset(tdev: &TyrDrmDevice, dev: &Device, iomem: &Devres<IoM
     }
 
     mmu::post_reset(tdev, iomem);
+
+    // Reopen before fw.post_reset reactivates the MCU VM through the gate.
+    drop(hw);
 
     let reboot_result = tdev.fw.post_reset(tdev);
     if let Err(e) = &reboot_result {
@@ -322,6 +343,14 @@ impl ResetHandle {
     /// scheduler itself after claiming the reset.
     pub(crate) fn in_progress(&self) -> bool {
         self.inner.controller.is_in_progress()
+    }
+
+    /// Returns a handle to the reset hardware-access gate.
+    ///
+    /// Readers acquire it around reset-sensitive hardware access so the
+    /// reset worker can drain them before wiping the hardware.
+    pub(crate) fn hw_gate(&self) -> Arc<HwGate> {
+        self.inner.controller.gate.clone()
     }
 
     /// Waits for an in-flight reset worker to finish.
