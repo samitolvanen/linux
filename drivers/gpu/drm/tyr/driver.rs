@@ -687,6 +687,8 @@ impl platform::Driver for TyrPlatformDriverData {
         stacks_clk.prepare_enable()?;
         coregroup_clk.prepare_enable()?;
 
+        pm::attach_domains(pdev.as_ref(), pm::DomainAttachFlags::DEV_LINK_ON)?;
+
         match regulator::devm_enable_optional(pdev.as_ref(), c"mali") {
             Ok(()) => {}
             Err(e) if e == ENODEV => {}
