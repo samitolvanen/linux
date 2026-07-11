@@ -10,7 +10,6 @@ use kernel::{
         self,
         Bound,
         Core,
-        Device,
         DeviceContext, //
     },
     dma::{
@@ -26,11 +25,7 @@ use kernel::{
     },
     drm,
     drm::ioctl,
-    io::{
-        mem::DevresIoMem,
-        poll,
-        Io, //
-    },
+    io::mem::DevresIoMem,
     irq::ThreadedRegistration,
     mm::virt::VmaNew,
     new_mutex,
@@ -62,10 +57,7 @@ use kernel::{
         Mutex,
         SetOnce, //
     },
-    time::{
-        self,
-        Jiffies, //
-    },
+    time::Jiffies,
     workqueue::{
         self,
         impl_has_delayed_work,
@@ -118,6 +110,7 @@ use crate::{
         AUTOSUSPEND_DELAY_MS, //
     },
     regs::gpu_control::*,
+    reset,
     sched::{
         tick,
         CsgSlotManager,
@@ -162,6 +155,14 @@ pub(crate) mod work_id {
 /// state they need through here.
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
+    /// Handle for scheduling asynchronous GPU resets.
+    ///
+    /// Dropping it drains queued and running reset work. The drain can run after
+    /// the registration data releases the clocks and regulators, but a late reset
+    /// worker cannot touch the hardware because the controller's register mapping
+    /// is revoked at unbind.
+    pub(crate) reset: reset::ResetHandle,
+
     /// Physical address of the GPU MMIO window.
     pub(crate) mmio_phys_addr: u64,
 
@@ -569,23 +570,6 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     pub(crate) csif_info: gpu::CsifInfo,
 }
 
-fn issue_soft_reset(dev: &Device, iomem: &IoMem<'_>) -> Result {
-    // Clear any stale reset IRQ state before issuing a new soft reset.
-    iomem.write_reg(GPU_IRQ_CLEAR::zeroed().with_reset_completed(true));
-
-    iomem.write_reg(GPU_COMMAND::reset(ResetMode::SoftReset));
-
-    poll::read_poll_timeout(
-        || Ok(iomem.read(GPU_IRQ_RAWSTAT)),
-        |status| status.reset_completed(),
-        time::Delta::from_millis(1),
-        time::Delta::from_millis(100),
-    )
-    .inspect_err(|_| dev_err!(dev, "GPU reset failed."))?;
-
-    Ok(())
-}
-
 kernel::of_device_table!(
     OF_TABLE,
     <TyrPlatformDriver as platform::Driver>::IdInfo,
@@ -625,8 +609,7 @@ impl platform::Driver for TyrPlatformDriver {
         let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?.into_devres()?, GFP_KERNEL)?;
         let io = iomem.access(pdev.as_ref())?;
 
-        issue_soft_reset(pdev.as_ref(), io)?;
-        gpu::l2_power_on(pdev.as_ref(), io)?;
+        reset::run_reset(pdev.as_ref(), io)?;
 
         let gpu_info = GpuInfo::new(io);
         gpu_info.log(pdev.as_ref());
@@ -650,9 +633,12 @@ impl platform::Driver for TyrPlatformDriver {
 
         let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
 
+        let reset = reset::ResetHandle::new(pdev.into(), iomem.clone())?;
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
+                reset,
                 mmio_phys_addr,
                 coherent,
                 term_wq,
