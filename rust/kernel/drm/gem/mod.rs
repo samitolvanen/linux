@@ -301,6 +301,39 @@ pub trait BaseObject: IntoGEMObject {
         unsafe { bindings::drm_gem_is_imported(self.as_raw()) }
     }
 
+    /// Returns whether the object holds a dma-buf reference.
+    ///
+    /// The reference is present when the object has been exported or imported
+    /// through PRIME. This and the other introspection accessors are lockless
+    /// snapshots, only meaningful for diagnostics.
+    fn has_dma_buf(&self) -> bool {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`.
+        // The volatile read tolerates a concurrent write from the PRIME paths.
+        !unsafe { core::ptr::read_volatile(&raw const (*self.as_raw()).dma_buf) }.is_null()
+    }
+
+    /// Returns the current reference count of the object.
+    fn refcount(&self) -> u32 {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`,
+        // whose `refcount` is initialized for its whole lifetime.
+        unsafe { bindings::kref_read(&raw const (*self.as_raw()).refcount) }
+    }
+
+    /// Returns the object's global (flink) name, if it has one.
+    fn global_name(&self) -> Option<u32> {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`.
+        // The volatile read tolerates a concurrent write from the flink paths.
+        let name = unsafe { core::ptr::read_volatile(&raw const (*self.as_raw()).name) };
+        u32::try_from(name).ok().filter(|name| *name != 0)
+    }
+
+    /// Returns the start of the object's fake mmap offset in page units.
+    fn vma_node_start(&self) -> u64 {
+        // SAFETY: `self.as_raw()` is guaranteed to be a pointer to a valid `struct drm_gem_object`,
+        // whose `vma_node` is embedded and valid for the object's lifetime.
+        unsafe { bindings::drm_vma_node_start(&raw const (*self.as_raw()).vma_node) as u64 }
+    }
+
     /// Creates a new handle for the object associated with a given `File`
     /// (or returns an existing one).
     fn create_handle<D, F>(&self, file: &drm::File<F>) -> Result<u32>
