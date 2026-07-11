@@ -94,6 +94,7 @@ use crate::{
     },
     pool::Pool as ObjectPool,
     regs::gpu_control::MMU_FEATURES,
+    reset::hw_gate::HwReadGuard,
     sched::deps,
 };
 
@@ -617,8 +618,13 @@ pub(crate) struct PtUpdateContext<'ctx> {
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
 
+    /// Held for the whole update, so the reset worker drains it before
+    /// wiping the hardware that the flush on drop polls.
+    _hw: HwReadGuard<'ctx>,
+
     /// Serializes this span against hardware residency changes on the VM
-    /// for its whole life.
+    /// for its whole life. Declared after `_hw` so the op lock is released
+    /// after the gate read, reversing the acquisition order.
     _op_lock: MutexGuard<'ctx, ()>,
 }
 
@@ -637,6 +643,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
         resources: &'ctx mut VmOpResources,
     ) -> Result<PtUpdateContext<'ctx>> {
         let _op_lock = as_data.lock_ops();
+        let _hw = mmu.begin_hw_access();
         mmu.start_vm_update(as_data, &region)?;
         as_data
             .pt_allocator
@@ -649,6 +656,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
             region,
             op_type,
             resources,
+            _hw,
             _op_lock,
         })
     }
