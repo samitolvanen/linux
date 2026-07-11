@@ -172,6 +172,27 @@ pub trait DriverObject: Sync + Send + Sized {
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &DriverAllocImpl<Self>, _file: &DriverFile<Self>) {}
 
+    /// Notifies the driver that the object is about to be freed.
+    ///
+    /// Called from the free path once the last reference drops and before any
+    /// backing storage is released, so the object is still fully valid. The
+    /// core still performs the free. This is only a notification.
+    ///
+    /// This can run before the device finishes registering, for an object
+    /// created on an unregistered device and freed on a probe-error path, so
+    /// the driver data reached through [`dev()`] may be absent. Use
+    /// [`Device::data`] rather than the `Registered` deref to reach it.
+    ///
+    /// It can also run while the device data is being dropped, when a data
+    /// field releasing its objects triggers this hook. A hook that reaches
+    /// device data through [`Device::data`] then observes partially-dropped
+    /// data, so a driver must drop the objects a hook frees before the data
+    /// fields that hook reads.
+    ///
+    /// [`dev()`]: crate::drm::gem::Object::dev
+    /// [`Device::data`]: crate::drm::device::Device::data
+    fn free(_obj: &DriverAllocImpl<Self>) {}
+
     /// Report the state of the object for fdinfo memory accounting.
     ///
     /// Called by `drm_show_memory_stats` while holding `file->table_lock`, so
@@ -501,6 +522,11 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
     }
 
     extern "C" fn free_callback(obj: *mut bindings::drm_gem_object) {
+        // Notify the driver before any teardown, while the object is still valid.
+        // SAFETY: The core passes a valid gem object contained in a `DriverAllocImpl<T>`.
+        let driver_obj: &DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(obj) };
+        T::free(driver_obj);
+
         let ptr: *mut Opaque<bindings::drm_gem_object> = obj.cast();
 
         // SAFETY: All of our objects are of type `Object<T>`.
