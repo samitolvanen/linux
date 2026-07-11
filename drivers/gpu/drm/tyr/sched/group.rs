@@ -32,6 +32,10 @@ use kernel::{
         Mutex,
         SpinLock, //
     },
+    task::{
+        Pid,
+        TaskComm, //
+    },
     uaccess::UserSlice,
     uapi,
     workqueue::{
@@ -117,6 +121,12 @@ pub(crate) struct GroupStatus {
     pub(crate) has_blocked_queues: bool,
     /// CSG slot id when the group is bound, otherwise `None`.
     pub(crate) csg_id: Option<usize>,
+}
+
+/// The pid and command name of the task that created a group.
+struct TaskInfo {
+    pid: Pid,
+    comm: TaskComm,
 }
 
 /// Accumulated GPU usage for a group, exposed through fdinfo.
@@ -364,6 +374,7 @@ pub(crate) struct Group {
     /// memory in fdinfo and as active memory while the group is on a
     /// slot. Fixed at creation.
     kbo_sizes: usize,
+    task_info: TaskInfo,
 }
 
 impl_list_arc_safe! {
@@ -482,6 +493,12 @@ impl Group {
             + syncobjs.size()
             + queues.iter().map(|q| q.mem_size()).sum::<usize>();
 
+        let leader = ARef::from(current!().group_leader());
+        let task_info = TaskInfo {
+            pid: leader.pid(),
+            comm: leader.comm(),
+        };
+
         Arc::pin_init(
             pin_init!(Self {
                 inner <- new_mutex!(GroupInner {
@@ -523,6 +540,7 @@ impl Group {
                 fdinfo <- new_spinlock!(FdInfo::default()),
                 active: Atomic::new(false),
                 kbo_sizes,
+                task_info,
             }),
             GFP_KERNEL,
         )
@@ -673,6 +691,14 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    pub(crate) fn task_pid(&self) -> Pid {
+        self.task_info.pid
+    }
+
+    pub(crate) fn task_comm(&self) -> &TaskComm {
+        &self.task_info.comm
     }
 
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait

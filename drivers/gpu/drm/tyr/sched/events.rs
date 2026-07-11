@@ -214,6 +214,11 @@ impl Scheduler {
             // window elapsed without the group advancing.
             pr_warn!("CSG slot {} progress timeout\n", csg_id);
             if let Some(group) = &group {
+                pr_warn!(
+                    "CSG_PROGRESS_TIMER_EVENT: pid={}, comm={}\n",
+                    group.task_pid(),
+                    group.task_comm()
+                );
                 group.with_locked_inner(|inner| inner.mark_timedout());
             }
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
@@ -248,6 +253,13 @@ impl Scheduler {
                 let fault_event = input_req.fault() != output_ack.fault();
 
                 if fatal_event {
+                    if let Some(group) = &group {
+                        pr_warn!(
+                            "CS_FATAL: pid={}, comm={}\n",
+                            group.task_pid(),
+                            group.task_comm()
+                        );
+                    }
                     let exception_type = cs.decode_fatal(csg_id, cs_id)?;
                     if exception_type == CsFatalExceptionType::CsUnrecoverable as u32 {
                         cs_unrecoverable = true;
@@ -255,11 +267,19 @@ impl Scheduler {
                     cs_fatal_mask |= 1u32 << cs_id;
                 }
 
-                if fault_event
-                    && cs.decode_fault(csg_id, cs_id)?
+                if fault_event {
+                    if let Some(group) = &group {
+                        pr_warn!(
+                            "CS_FAULT: pid={}, comm={}\n",
+                            group.task_pid(),
+                            group.task_comm()
+                        );
+                    }
+                    if cs.decode_fault(csg_id, cs_id)?
                         == CsFaultExceptionType::CsInheritFault as u32
-                {
-                    cs_inherit_fault_mask |= 1u32 << cs_id;
+                    {
+                        cs_inherit_fault_mask |= 1u32 << cs_id;
+                    }
                 }
 
                 if fatal_event || fault_event {
