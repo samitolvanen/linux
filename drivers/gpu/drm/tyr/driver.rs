@@ -545,6 +545,10 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
 
 fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     let io = (*iomem).access(dev)?;
+
+    // Clear any stale reset IRQ state before issuing a new soft reset.
+    io.write_reg(GPU_IRQ_CLEAR::zeroed().with_reset_completed(true));
+
     io.write_reg(GPU_COMMAND::reset(ResetMode::SoftReset));
 
     poll::read_poll_timeout(
