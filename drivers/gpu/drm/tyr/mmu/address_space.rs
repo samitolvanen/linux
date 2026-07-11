@@ -186,7 +186,8 @@ impl VmAsData {
     /// Acquires the per-VM operation lock that guards page-table update
     /// spans against concurrent hardware residency changes.
     ///
-    /// Lock order `{csg_slot_manager or gpuvm_unique} > vm op_lock > as_manager`.
+    /// Lock order `{csg_slot_manager or gpuvm_unique} > vm op_lock >
+    /// hw_gate read > as_manager`.
     pub(crate) fn lock_ops(&self) -> MutexGuard<'_, ()> {
         self.op_lock.lock()
     }
