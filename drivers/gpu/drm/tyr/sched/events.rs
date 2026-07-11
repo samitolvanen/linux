@@ -130,6 +130,14 @@ impl CsIrqEvents<'_> {
         }
 
         if fatal_event {
+            if let Some(group) = group {
+                dev_warn!(
+                    tdev.as_ref(),
+                    "CS_FATAL: pid={}, comm={}\n",
+                    group.task_pid(),
+                    group.task_comm()
+                );
+            }
             let exception_type = cs.decode_fatal(parent_dev(tdev), csg_id, cs_id)?;
             if exception_type == CsFatalExceptionType::CsUnrecoverable as u32 {
                 self.cs_unrecoverable = true;
@@ -138,6 +146,14 @@ impl CsIrqEvents<'_> {
         }
 
         if fault_event {
+            if let Some(group) = group {
+                dev_warn!(
+                    tdev.as_ref(),
+                    "CS_FAULT: pid={}, comm={}\n",
+                    group.task_pid(),
+                    group.task_comm()
+                );
+            }
             cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?;
             let queue = group.and_then(|group| group.queues.get(cs_id as usize));
             let extract = self.cs_fault_extract.get_mut(cs_id as usize);
@@ -468,6 +484,12 @@ impl Scheduler {
             // window elapsed without the group advancing.
             dev_warn!(tdev.as_ref(), "CSG slot {} progress timeout\n", csg_id);
             if let Some(group) = &group {
+                dev_warn!(
+                    tdev.as_ref(),
+                    "CSG_PROGRESS_TIMER_EVENT: pid={}, comm={}\n",
+                    group.task_pid(),
+                    group.task_comm()
+                );
                 group.with_locked_inner(|inner| inner.mark_timedout());
             }
             *tick = true;
