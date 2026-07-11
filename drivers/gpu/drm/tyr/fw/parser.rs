@@ -348,12 +348,15 @@ impl<'a> FwParser<'a> {
                     entry_hdr: entry_section.entry_hdr,
                     inner: Self::parse_section_entry(&mut entry_cursor, fw_data, firmware_size)?,
                 }),
+                Ok(EntryType::BuildInfoMetadata) => {
+                    Self::parse_build_info(&mut entry_cursor, fw_data)?;
+                    Ok(entry_section)
+                }
                 Ok(
                     EntryType::Config
                     | EntryType::FutfTest
                     | EntryType::TraceBuffer
-                    | EntryType::TimelineMetadata
-                    | EntryType::BuildInfoMetadata,
+                    | EntryType::TimelineMetadata,
                 ) => Ok(entry_section),
 
                 Err(_) => {
@@ -493,6 +496,40 @@ impl<'a> FwParser<'a> {
             vm_map_flags,
             section_flags: section_hdr.section_flags,
         }))
+    }
+
+    /// Reads the build-info metadata entry and logs the firmware git SHA.
+    fn parse_build_info(entry_cursor: &mut Cursor<'_>, fw_data: &[u8]) -> Result {
+        const GIT_SHA_HEADER: &[u8] = b"git_sha: ";
+
+        let dev = entry_cursor.dev;
+
+        let meta_start = entry_cursor.read_u32()? as usize;
+        let meta_size = entry_cursor.read_u32()? as usize;
+
+        let meta = meta_start
+            .checked_add(meta_size)
+            .and_then(|meta_end| fw_data.get(meta_start..meta_end));
+
+        let Some(meta) = meta else {
+            dev_err!(dev, "Firmware build info corrupt\n");
+            return Ok(());
+        };
+
+        if !meta.starts_with(GIT_SHA_HEADER) {
+            return Ok(());
+        }
+
+        if meta.last() != Some(&0) {
+            dev_warn!(dev, "Firmware git SHA is not NUL-terminated\n");
+            return Ok(());
+        }
+
+        if let Ok(sha) = CStr::from_bytes_until_nul(&meta[GIT_SHA_HEADER.len()..]) {
+            dev_info!(dev, "Firmware git sha: {}\n", sha);
+        }
+
+        Ok(())
     }
 }
 
