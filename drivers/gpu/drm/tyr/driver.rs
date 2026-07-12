@@ -106,6 +106,10 @@ use crate::{
         TyrPmOps,
         AUTOSUSPEND_DELAY_MS, //
     },
+    pwr::{
+        self,
+        PwrIrq, //
+    },
     regs::gpu_control::*,
     reset, //
     sched::{
@@ -205,6 +209,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// GPU IRQ registration slot, set during probe and revoked by devres at unbind.
     #[pin]
     pub(crate) gpu_irq: IrqSlot<GpuIrq>,
+
+    /// Second registration slot on the "gpu" interrupt line, for the PWR
+    /// block. `None` on hardware without PWR_CONTROL.
+    pub(crate) pwr_irq: Option<Pin<KBox<IrqSlot<PwrIrq>>>>,
 
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
@@ -709,6 +717,11 @@ impl platform::Driver for TyrPlatformDriverData {
         let hw_ops = HwOps::bind(pdev.as_ref(), &iomem)?;
         hw_ops.reset(pdev.as_ref(), &iomem, coherency, soc_data)?;
 
+        let pwr_irq = match hw_ops {
+            HwOps::V14 { .. } => Some(KBox::pin_init(IrqSlot::new(), GFP_KERNEL)?),
+            HwOps::V10 => None,
+        };
+
         let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem, coherency)?;
         gpu_info.log(pdev.as_ref());
 
@@ -765,6 +778,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmu_irq <- IrqSlot::new(),
                 job_irq <- IrqSlot::new(),
                 gpu_irq <- IrqSlot::new(),
+                pwr_irq,
                 iomem: iomem.clone(),
                 mmio_phys_addr,
                 coherent,
@@ -823,6 +837,15 @@ impl platform::Driver for TyrPlatformDriverData {
         tdev.gpu_irq.publish(Devres::new(pdev.as_ref(), gpu_irq)?);
         tdev.gpu_irq
             .reset_resume(&tdev.iomem, gpu::irq::gpu_irq_enable);
+
+        if let Some(pwr_irq) = &tdev.pwr_irq {
+            let reg = Arc::pin_init(
+                pwr::pwr_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+                GFP_KERNEL,
+            )?;
+            pwr_irq.publish(Devres::new(pdev.as_ref(), reg)?);
+            pwr_irq.reset_resume(&tdev.iomem, pwr::pwr_irq_enable);
+        }
 
         let mmu_irq = Arc::pin_init(
             mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
