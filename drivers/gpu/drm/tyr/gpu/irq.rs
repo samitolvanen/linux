@@ -86,7 +86,7 @@ pub(crate) fn gpu_irq_init<'a>(
         mask,
     };
 
-    TyrIrq::request(pdev, tdev, c"gpu", irq_type)
+    TyrIrq::request(pdev, tdev, c"gpu", c"gpu", irq_type)
 }
 
 impl TyrIrqTrait for GpuIrq {

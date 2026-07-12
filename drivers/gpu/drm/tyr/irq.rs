@@ -61,7 +61,8 @@ impl<T: TyrIrqTrait> TyrIrq<T> {
     pub(crate) fn request<'a>(
         pdev: &'a platform::Device<Bound>,
         tdev: ARef<TyrDrmDevice>,
-        name: &'static CStr,
+        irq_name: &'static CStr,
+        devname: &'static CStr,
         irq: T,
     ) -> Result<impl PinInit<ThreadedRegistration<Self>, Error> + 'a> {
         // The line starts suspended, so an interrupt taken before the caller
@@ -73,7 +74,7 @@ impl<T: TyrIrqTrait> TyrIrq<T> {
             _pin: PhantomPinned,
         });
 
-        Ok(pdev.request_threaded_irq_by_name(Flags::SHARED, name, name, handler))
+        Ok(pdev.request_threaded_irq_by_name(Flags::SHARED, irq_name, devname, handler))
     }
 
     fn set_suspended(&self, suspended: bool) {

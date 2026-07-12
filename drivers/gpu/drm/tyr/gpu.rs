@@ -29,6 +29,7 @@ use crate::{
         IoMem,
         TyrPlatformDriverData, //
     },
+    pwr,
     regs::{
         gpu_control::*,
         join_u64,
@@ -262,6 +263,9 @@ unsafe impl AsBytes for GpuInfo {}
 /// `gpu_features` bit set when the GPU supports ray intersection.
 const GPU_FEATURES_RAY_INTERSECTION: u64 = 1 << 2;
 
+/// `gpu_features` bit set when the GPU has a ray traversal unit.
+const GPU_FEATURES_RAY_TRAVERSAL: u64 = 1 << 5;
+
 /// Selects the coherency protocol to program into `COHERENCY_ENABLE`.
 ///
 /// The ACE protocol has never been supported for CSF GPUs.
@@ -290,6 +294,14 @@ pub(crate) fn select_coherency(
 pub(crate) enum HwOps {
     /// Architectures 10 through 13.
     V10,
+    /// Architecture 14, driving resets and power through PWR_CONTROL.
+    V14 {
+        /// Whether the GPU has a ray traversal unit, a subdomain of the
+        /// shader power domain.
+        has_rtu: bool,
+        /// L2 domain present bitmap.
+        l2_present: u64,
+    },
 }
 
 impl HwOps {
@@ -298,6 +310,17 @@ impl HwOps {
         let io = (*iomem).access(dev)?;
         match io.read(GPU_ID).arch_major().get() {
             10..=13 => Ok(Self::V10),
+            14 => Ok(Self::V14 {
+                has_rtu: join_u64(
+                    io.read(GPU_FEATURES_LO).into_raw(),
+                    io.read(GPU_FEATURES_HI).into_raw(),
+                ) & GPU_FEATURES_RAY_TRAVERSAL
+                    != 0,
+                l2_present: join_u64(
+                    io.read(pwr_control::PWR_L2_PRESENT_LO).into_raw(),
+                    io.read(pwr_control::PWR_L2_PRESENT_HI).into_raw(),
+                ),
+            }),
             _ => Err(EOPNOTSUPP),
         }
     }
@@ -305,18 +328,28 @@ impl HwOps {
     fn soft_reset(self, dev: &Device, iomem: &Devres<IoMem>) -> Result {
         match self {
             Self::V10 => soft_reset(dev, iomem),
+            Self::V14 { .. } => pwr::reset_soft(dev, iomem),
         }
     }
 
     fn l2_power_off(self, dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
         match self {
             Self::V10 => l2_power_off(dev, iomem),
+            Self::V14 {
+                has_rtu,
+                l2_present,
+            } => pwr::l2_power_off(dev, iomem, l2_present, has_rtu),
         }
     }
 
     fn l2_power_on(self, dev: &Device, iomem: &Devres<IoMem>, coherency: CoherencyMode) -> Result {
         match self {
             Self::V10 => l2_power_on(dev, iomem, coherency),
+            // The PWR_CONTROL path programs no coherency mode.
+            Self::V14 {
+                has_rtu,
+                l2_present,
+            } => pwr::l2_power_on(dev, iomem, l2_present, has_rtu),
         }
     }
 
@@ -405,20 +438,27 @@ fn soft_reset(dev: &Device, iomem: &Devres<IoMem>) -> Result {
     Ok(())
 }
 
-/// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
+/// Masks the interrupts and powers the L2 block off for runtime suspend.
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let bound = dev.as_ref();
     let tdev = &data.device;
     tdev.gpu_irq
         .quiesce(bound, &tdev.iomem, irq::gpu_irq_disable);
     let _ = tdev.hw_ops.l2_power_off(bound, &tdev.iomem);
+    if let Some(pwr_irq) = &data.pwr_irq {
+        pwr_irq.quiesce(bound, &tdev.iomem, pwr::pwr_irq_disable);
+    }
 }
 
-/// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
+/// Powers the L2 block on and unmasks the interrupts for runtime resume.
 pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
     let bound = dev.as_ref();
     let tdev = &data.device;
     let io = tdev.iomem.access(bound)?;
+    if let Some(pwr_irq) = &data.pwr_irq {
+        pwr_irq.clear_suspended();
+        pwr::pwr_irq_enable(io);
+    }
     tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
     tdev.hw_ops.l2_power_on(bound, &tdev.iomem, tdev.coherency)

@@ -126,6 +126,10 @@ use crate::{
         TyrPmOps,
         AUTOSUSPEND_DELAY_MS, //
     },
+    pwr::{
+        self,
+        PwrIrq, //
+    },
     regs::gpu_control::*,
     reset, //
     sched::{
@@ -218,6 +222,10 @@ pub(crate) struct TyrPlatformDriverData {
     /// runtime PM on unbind. Held only for its `Drop`.
     #[expect(dead_code)]
     pm: pm::Registration<TyrPmOps>,
+
+    /// Second registration on the "gpu" interrupt line, for the PWR block.
+    /// `None` on hardware without PWR_CONTROL.
+    pub(crate) pwr_irq: Option<Pin<KBox<IrqSlot<PwrIrq>>>>,
 
     pub(crate) device: ARef<TyrDrmDevice>,
 }
@@ -936,6 +944,19 @@ impl platform::Driver for TyrPlatformDriverData {
         tdev.gpu_irq
             .reset_resume(&tdev.iomem, gpu::irq::gpu_irq_enable);
 
+        let pwr_irq = match tdev.hw_ops {
+            HwOps::V14 { .. } => {
+                let reg = Arc::pin_init(
+                    pwr::pwr_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+                    GFP_KERNEL,
+                )?;
+                let slot = KBox::pin_init(IrqSlot::new(), GFP_KERNEL)?;
+                slot.publish(Devres::new(pdev.as_ref(), reg)?);
+                Some(slot)
+            }
+            HwOps::V10 => None,
+        };
+
         let mmu_irq = Arc::pin_init(
             mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
             GFP_KERNEL,
@@ -1004,6 +1025,7 @@ impl platform::Driver for TyrPlatformDriverData {
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
+            pwr_irq,
             device: tdev,
         })
     }

@@ -21,6 +21,7 @@ mod mmap;
 mod mmu;
 mod pm;
 mod pool;
+mod pwr;
 mod regs;
 mod reset;
 mod sched;
