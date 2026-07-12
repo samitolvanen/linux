@@ -119,18 +119,10 @@ impl GpuInfo {
     pub(crate) fn log(&self, dev: &Device<Bound>) {
         let gpu_id = GPU_ID::from_raw(self.gpu_id);
 
-        let model_name = if let Some(model) = GPU_MODELS.iter().find(|&f| {
-            f.arch_major == gpu_id.arch_major().get() && f.prod_major == gpu_id.prod_major().get()
-        }) {
-            model.name
-        } else {
-            "unknown"
-        };
-
         dev_info!(
             dev,
             "mali-{} GPU_ID 0x{:x} major 0x{:x} minor 0x{:x} status 0x{:x}",
-            model_name,
+            self.model_name(),
             gpu_id.into_raw(),
             gpu_id.ver_major().get(),
             gpu_id.ver_minor().get(),
@@ -162,6 +154,56 @@ impl GpuInfo {
 
         heap_context_size.next_multiple_of(line_size)
     }
+
+    /// Returns the product name, or `"unknown"` for an unrecognized GPU.
+    fn model_name(&self) -> &'static str {
+        let gpu_id = GPU_ID::from_raw(self.gpu_id);
+        let arch_major = gpu_id.arch_major().get();
+        let prod_major = gpu_id.prod_major().get();
+        let ray_intersection = (self.gpu_features & GPU_FEATURES_RAY_INTERSECTION) != 0;
+        let shader_core_count = self.shader_present.count_ones();
+
+        match (arch_major, prod_major) {
+            (10, 2) => "g710",
+            (10, 3) => "g510",
+            (10, 4) => "g310",
+            (10, 7) => "g610",
+            (11, 2) => {
+                if shader_core_count > 10 && ray_intersection {
+                    "g715-immortalis"
+                } else if shader_core_count >= 7 {
+                    "g715"
+                } else {
+                    "g615"
+                }
+            }
+            (11, 3) => "g615",
+            (12, 0) => {
+                if shader_core_count >= 10 && ray_intersection {
+                    "g720-immortalis"
+                } else if shader_core_count >= 6 {
+                    "g720"
+                } else {
+                    "g620"
+                }
+            }
+            (12, 1) => "g620",
+            (13, 0) => {
+                if shader_core_count >= 10 && ray_intersection {
+                    "g925-immortalis"
+                } else if shader_core_count >= 6 {
+                    "g725"
+                } else {
+                    "g625"
+                }
+            }
+            (13, 1) => "g625",
+            (14, 0) => "g1-ultra",
+            (14, 1) => "g1-premium",
+            (14, 3) => "g1-pro",
+            _ => "unknown",
+        }
+    }
 }
 
 impl Deref for GpuInfo {
@@ -189,17 +231,8 @@ impl DerefMut for GpuInfo {
 // - No interior mutability.
 unsafe impl AsBytes for GpuInfo {}
 
-struct GpuModels {
-    name: &'static str,
-    arch_major: u32,
-    prod_major: u32,
-}
-
-const GPU_MODELS: [GpuModels; 1] = [GpuModels {
-    name: "g610",
-    arch_major: 10,
-    prod_major: 7,
-}];
+/// `gpu_features` bit set when the GPU supports ray intersection.
+const GPU_FEATURES_RAY_INTERSECTION: u64 = 1 << 2;
 
 /// Selects the coherency protocol to program into `COHERENCY_ENABLE`.
 ///
