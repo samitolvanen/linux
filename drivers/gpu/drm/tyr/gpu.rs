@@ -31,7 +31,8 @@ use crate::{
     },
     regs::{
         gpu_control::*,
-        join_u64, //
+        join_u64,
+        pwr_control, //
     }, //
 };
 
@@ -73,8 +74,44 @@ impl GpuInfo {
     ) -> Result<Self> {
         let io = (*iomem).access(dev)?;
 
+        let gpu_id = io.read(GPU_ID);
+
+        // Architecture 14 and later report the present bitmaps through
+        // PWR_CONTROL instead of GPU_CONTROL.
+        let (shader_present, tiler_present, l2_present) = if gpu_id.arch_major().get() >= 14 {
+            (
+                join_u64(
+                    io.read(pwr_control::PWR_SHADER_PRESENT_LO).into_raw(),
+                    io.read(pwr_control::PWR_SHADER_PRESENT_HI).into_raw(),
+                ),
+                join_u64(
+                    io.read(pwr_control::PWR_TILER_PRESENT_LO).into_raw(),
+                    io.read(pwr_control::PWR_TILER_PRESENT_HI).into_raw(),
+                ),
+                join_u64(
+                    io.read(pwr_control::PWR_L2_PRESENT_LO).into_raw(),
+                    io.read(pwr_control::PWR_L2_PRESENT_HI).into_raw(),
+                ),
+            )
+        } else {
+            (
+                join_u64(
+                    io.read(SHADER_PRESENT_LO).into_raw(),
+                    io.read(SHADER_PRESENT_HI).into_raw(),
+                ),
+                join_u64(
+                    io.read(TILER_PRESENT_LO).into_raw(),
+                    io.read(TILER_PRESENT_HI).into_raw(),
+                ),
+                join_u64(
+                    io.read(L2_PRESENT_LO).into_raw(),
+                    io.read(L2_PRESENT_HI).into_raw(),
+                ),
+            )
+        };
+
         Ok(Self(uapi::drm_panthor_gpu_info {
-            gpu_id: io.read(GPU_ID).into_raw(),
+            gpu_id: gpu_id.into_raw(),
             gpu_rev: io.read(REVIDR).into_raw(),
             csf_id: io.read(CSF_ID).into_raw(),
             l2_features: io.read(L2_FEATURES).into_raw(),
@@ -94,18 +131,9 @@ impl GpuInfo {
             ],
             as_present: io.read(AS_PRESENT).into_raw(),
             selected_coherency: coherency as u32,
-            shader_present: join_u64(
-                io.read(SHADER_PRESENT_LO).into_raw(),
-                io.read(SHADER_PRESENT_HI).into_raw(),
-            ),
-            l2_present: join_u64(
-                io.read(L2_PRESENT_LO).into_raw(),
-                io.read(L2_PRESENT_HI).into_raw(),
-            ),
-            tiler_present: join_u64(
-                io.read(TILER_PRESENT_LO).into_raw(),
-                io.read(TILER_PRESENT_HI).into_raw(),
-            ),
+            shader_present,
+            l2_present,
+            tiler_present,
             core_features: io.read(CORE_FEATURES).into_raw(),
             // Padding must be zero.
             pad: 0,
