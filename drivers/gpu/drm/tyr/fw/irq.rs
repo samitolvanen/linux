@@ -124,7 +124,7 @@ pub(crate) fn job_irq_init<'a>(
         state,
     };
 
-    TyrIrq::request(pdev, tdev, c_str!("job"), job_irq)
+    TyrIrq::request(pdev, tdev, c_str!("job"), c_str!("job"), job_irq)
 }
 
 impl TyrIrqTrait for JobIrq {
