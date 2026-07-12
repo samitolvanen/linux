@@ -144,7 +144,9 @@ use crate::{
 #[cfg(CONFIG_DEBUG_FS)]
 use crate::debugfs::{
     GemRegistry,
-    GemsFile, //
+    GemsFile,
+    GpuvasFile,
+    VmRegistry, //
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -430,6 +432,14 @@ pub(crate) struct TyrDrmDeviceData {
     #[cfg(CONFIG_DEBUG_FS)]
     #[pin]
     gem_registry: GemRegistry,
+
+    /// Device-wide registry of live VMs backing the `gpuvas` debugfs file.
+    ///
+    /// Like `gem_registry`, this must be declared after every field owning a
+    /// VM so drop order keeps it alive while their free hooks deregister.
+    #[cfg(CONFIG_DEBUG_FS)]
+    #[pin]
+    vm_registry: VmRegistry,
 }
 
 impl TyrDrmDeviceData {
@@ -473,6 +483,12 @@ impl TyrDrmDeviceData {
     #[cfg(CONFIG_DEBUG_FS)]
     pub(crate) fn gem_registry(&self) -> &GemRegistry {
         &self.gem_registry
+    }
+
+    /// Returns the device-wide VM registry backing the `gpuvas` debugfs file.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn vm_registry(&self) -> &VmRegistry {
+        &self.vm_registry
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -923,6 +939,8 @@ impl platform::Driver for TyrPlatformDriverData {
                 opp_config <- new_mutex!(None),
                 #[cfg(CONFIG_DEBUG_FS)]
                 gem_registry <- GemRegistry::new(),
+                #[cfg(CONFIG_DEBUG_FS)]
+                vm_registry <- VmRegistry::new(),
         });
 
         if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
@@ -1011,7 +1029,9 @@ impl platform::Driver for TyrPlatformDriverData {
         #[cfg(CONFIG_DEBUG_FS)]
         {
             tdev.fw.register_gems(tdev.gem_registry());
+            tdev.fw.register_vm(tdev.vm_registry());
             tdev.debugfs_add_file::<GemsFile>();
+            tdev.debugfs_add_file::<GpuvasFile>();
         }
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
