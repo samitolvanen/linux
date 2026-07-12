@@ -89,6 +89,7 @@ use crate::{
     gpu::{
         irq::GpuIrq,
         GpuInfo,
+        HwOps,
         SocData, //
     },
     irq::IrqSlot,
@@ -220,6 +221,8 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Per-SoC match data selected by the device-tree compatible.
     pub(crate) soc_data: SocData,
+
+    pub(crate) hw_ops: HwOps,
 
     pub(crate) fw: Arc<Firmware>,
 
@@ -703,7 +706,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let coherency = gpu::select_coherency(pdev.as_ref(), &iomem, coherent)?;
         let soc_data = info.copied().unwrap_or_default();
 
-        gpu::reset(pdev.as_ref(), &iomem, coherency, soc_data)?;
+        let hw_ops = HwOps::bind(pdev.as_ref(), &iomem)?;
+        hw_ops.reset(pdev.as_ref(), &iomem, coherency, soc_data)?;
 
         let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem, coherency)?;
         gpu_info.log(pdev.as_ref());
@@ -766,6 +770,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 coherent,
                 coherency,
                 soc_data,
+                hw_ops,
                 fw: firmware,
                 wq,
                 sched_wq,

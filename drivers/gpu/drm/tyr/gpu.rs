@@ -283,8 +283,67 @@ pub(crate) struct SocData {
     pub(crate) asn_hash: Option<[u32; 3]>,
 }
 
+/// Hardware operations selected by GPU architecture major.
+///
+/// Bound once at probe and dispatched at reset and L2 power transitions.
+#[derive(Clone, Copy)]
+pub(crate) enum HwOps {
+    /// Architectures 10 through 13.
+    V10,
+}
+
+impl HwOps {
+    /// Selects the operations for the GPU behind `iomem`.
+    pub(crate) fn bind(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result<Self> {
+        let io = (*iomem).access(dev)?;
+        match io.read(GPU_ID).arch_major().get() {
+            10..=13 => Ok(Self::V10),
+            _ => Err(EOPNOTSUPP),
+        }
+    }
+
+    fn soft_reset(self, dev: &Device, iomem: &Devres<IoMem>) -> Result {
+        match self {
+            Self::V10 => soft_reset(dev, iomem),
+        }
+    }
+
+    fn l2_power_off(self, dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+        match self {
+            Self::V10 => l2_power_off(dev, iomem),
+        }
+    }
+
+    fn l2_power_on(
+        self,
+        dev: &Device,
+        iomem: &Devres<IoMem>,
+        coherency: CoherencyMode,
+        soc_data: SocData,
+    ) -> Result {
+        match self {
+            Self::V10 => l2_power_on(dev, iomem, coherency, soc_data),
+        }
+    }
+
+    /// Runs one synchronous GPU reset pass.
+    ///
+    /// On success, the GPU is left in a state suitable for reinitialization.
+    pub(crate) fn reset(
+        self,
+        dev: &Device,
+        iomem: &Devres<IoMem>,
+        coherency: CoherencyMode,
+        soc_data: SocData,
+    ) -> Result {
+        self.soft_reset(dev, iomem)?;
+        self.l2_power_on(dev, iomem, coherency, soc_data)?;
+        Ok(())
+    }
+}
+
 /// Powers off the L2 block.
-pub(crate) fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     let io = (*iomem).access(dev)?;
     io.write_reg(L2_PWROFF_LO::zeroed().with_const_request::<1>());
 
@@ -325,7 +384,7 @@ fn l2_config_set(dev: &Device, io: &IoMem, soc_data: SocData) {
 }
 
 /// Powers on the l2 block.
-pub(crate) fn l2_power_on(
+fn l2_power_on(
     dev: &Device,
     iomem: &Devres<IoMem>,
     coherency: CoherencyMode,
@@ -381,27 +440,13 @@ fn soft_reset(dev: &Device, iomem: &Devres<IoMem>) -> Result {
     Ok(())
 }
 
-/// Runs one synchronous GPU reset pass.
-///
-/// On success, the GPU is left in a state suitable for reinitialization.
-pub(crate) fn reset(
-    dev: &Device,
-    iomem: &Devres<IoMem>,
-    coherency: CoherencyMode,
-    soc_data: SocData,
-) -> Result {
-    soft_reset(dev, iomem)?;
-    l2_power_on(dev, iomem, coherency, soc_data)?;
-    Ok(())
-}
-
 /// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let bound = dev.as_ref();
     let tdev = &data.device;
     tdev.gpu_irq
         .quiesce(bound, &tdev.iomem, irq::gpu_irq_disable);
-    let _ = l2_power_off(bound, &tdev.iomem);
+    let _ = tdev.hw_ops.l2_power_off(bound, &tdev.iomem);
 }
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
@@ -411,5 +456,6 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     let io = tdev.iomem.access(bound)?;
     tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
-    l2_power_on(bound, &tdev.iomem, tdev.coherency, tdev.soc_data)
+    tdev.hw_ops
+        .l2_power_on(bound, &tdev.iomem, tdev.coherency, tdev.soc_data)
 }
