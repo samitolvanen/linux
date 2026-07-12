@@ -98,6 +98,13 @@ use crate::{
     sched::deps,
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use crate::debugfs::NOT_REGISTERED;
+#[cfg(CONFIG_DEBUG_FS)]
+use core::sync::atomic::AtomicUsize;
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::seq_file::SeqFile;
+
 // SAFETY: todo
 static VM_BIND_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 // SAFETY: todo
@@ -141,6 +148,16 @@ impl Pool {
             kernel_range,
         )?;
 
+        // Register before the pool can reach the VM by index, so a concurrent
+        // destroy never races ahead of the registration.
+        #[cfg(CONFIG_DEBUG_FS)]
+        let index = {
+            tdev.vm_registry().register(&vm);
+            self.entries.insert(vm.clone()).inspect_err(|_| {
+                tdev.vm_registry().unregister(vm.registry_slot());
+            })?
+        };
+        #[cfg(not(CONFIG_DEBUG_FS))]
         let index = self.entries.insert(vm)?;
 
         Ok((index, user_va_limit))
@@ -180,6 +197,10 @@ impl Pool {
 
     fn destroy_vm_index(&self, tdev: &TyrDrmDevice, index: usize) -> Result {
         let vm = self.entries.remove(index)?;
+
+        // Unregister while the removed `Arc` still holds the VM alive.
+        #[cfg(CONFIG_DEBUG_FS)]
+        tdev.vm_registry().unregister(vm.registry_slot());
 
         vm.mark_unusable();
         if vm.as_slot().is_some() {
@@ -867,6 +888,10 @@ pub(crate) struct Vm {
     /// Every kernel-owned BO in this VM aliases this `dma_resv`, so a
     /// fence on one blocks operations on the others.
     root_gem: ARef<Bo>,
+    /// Index of this VM in the device-wide `gpuvas` registry, or
+    /// `NOT_REGISTERED`. Only ever touched under the registry lock.
+    #[cfg(CONFIG_DEBUG_FS)]
+    registry_slot: AtomicUsize,
 }
 
 impl Vm {
@@ -941,6 +966,8 @@ impl Vm {
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
                 root_gem: dummy_obj,
+                #[cfg(CONFIG_DEBUG_FS)]
+                registry_slot: AtomicUsize::new(NOT_REGISTERED),
             }),
             GFP_KERNEL,
         )?;
@@ -1043,6 +1070,22 @@ impl Vm {
     #[cfg(CONFIG_DEBUG_FS)]
     pub(crate) fn is_fw(&self) -> bool {
         self.bind_queue.is_none()
+    }
+
+    /// Returns this VM's slot in the device-wide `gpuvas` registry.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn registry_slot(&self) -> &AtomicUsize {
+        &self.registry_slot
+    }
+
+    /// Dumps this VM's GPU VA space to `m`, holding the lock that guards the
+    /// VA tree against concurrent bind and unbind.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn show_gpuvas(&self, m: &SeqFile) -> Result {
+        match self.exec.gpuvm_unique.lock().as_ref() {
+            Some(unique) => unique.debugfs_gpuva_info(m),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn with_prepared_vm<R>(

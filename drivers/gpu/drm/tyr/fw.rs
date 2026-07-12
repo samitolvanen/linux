@@ -84,6 +84,7 @@ use crate::{
 #[cfg(CONFIG_DEBUG_FS)]
 use crate::debugfs::{
     GemRegistry,
+    VmRegistry,
     GEM_USAGE_FW_MAPPED,
     GEM_USAGE_KERNEL, //
 };
@@ -785,6 +786,16 @@ impl Firmware {
         for section in self.sections.iter() {
             registry.register(&section.mem.bo, GEM_USAGE_KERNEL | GEM_USAGE_FW_MAPPED);
         }
+    }
+
+    /// Registers the MCU VM in the device-wide `gpuvas` registry.
+    ///
+    /// The MCU VM is never unregistered. It outlives every user VM and is freed
+    /// only when the device data drops, which the DRM core sequences after it
+    /// has removed the debugfs files, so no dump can observe a stale entry.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn register_vm(&self, registry: &VmRegistry) {
+        registry.register(&self.vm);
     }
 
     pub(crate) fn alloc_suspend_buf(
