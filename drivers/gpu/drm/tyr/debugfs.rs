@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! Device-wide GEM object registry and the `gems` debugfs file.
+//! Device-wide object registries and their debugfs files.
 //!
-//! The registry tracks every user and kernel BO so the `gems` file can dump a
-//! device-wide view of GPU memory. It holds no reference to the BOs it tracks.
-//! See `GemRegistry` for the liveness argument.
+//! Each registry tracks live objects, without referencing them, so a debugfs
+//! file can dump them without walking per-file state.
 
 use core::{
     cmp::min,
@@ -41,6 +40,7 @@ use crate::{
         TyrDrmDriver, //
     },
     gem::Bo,
+    vm::Vm,
 };
 
 /// Sentinel `BoData` registry-slot value for a BO absent from the registry.
@@ -223,5 +223,101 @@ impl Info for GemsFile {
     fn show(device: &TyrDrmDevice, m: &SeqFile) -> Result {
         device.gem_registry().print_bos(m);
         Ok(())
+    }
+}
+
+/// One registry entry, holding a non-owning pointer to a live VM.
+struct VmEntry {
+    vm: NonNull<Vm>,
+}
+
+// SAFETY: It is safe to send a `VmEntry` to another thread because the
+// `NonNull<Vm>` it holds points to a `Vm`, which is `Send` and `Sync`, and the
+// registry only dereferences it while holding the registry lock, during which
+// an owning reference keeps the VM alive.
+unsafe impl Send for VmEntry {}
+
+/// Device-wide registry of live VMs backing the `gpuvas` debugfs file.
+///
+/// VMs are listed in registration order.
+///
+/// The registry holds no reference to its VMs. A user VM registers as it is
+/// created and unregisters when its file pool destroys it. The firmware VM
+/// registers at probe. While a VM is registered an owning reference keeps it
+/// alive, so both the dump and unregistration take the registry lock and a
+/// listed VM stays valid for the duration of the dump.
+///
+/// Lock ordering: the registry lock is acquired before a VM's `gpuvm_unique`
+/// lock, never the reverse.
+#[pin_data]
+pub(crate) struct VmRegistry {
+    #[pin]
+    vms: Mutex<KVec<VmEntry>>,
+}
+
+impl VmRegistry {
+    pub(crate) fn new() -> impl PinInit<Self> {
+        pin_init!(Self {
+            vms <- kernel::new_mutex!(KVec::new()),
+        })
+    }
+
+    /// Registers `vm` in the device-wide `gpuvas` registry.
+    ///
+    /// A failed allocation drops the VM from the dump but is otherwise harmless.
+    pub(crate) fn register(&self, vm: &Vm) {
+        let mut vms = self.vms.lock();
+        let index = vms.len();
+        match vms.push(VmEntry { vm: vm.into() }, GFP_KERNEL) {
+            Ok(()) => vm.registry_slot().store(index, Ordering::Relaxed),
+            Err(_) => {
+                pr_warn_once!("tyr: gpuvas debugfs registration failed under memory pressure\n")
+            }
+        }
+    }
+
+    /// Removes the VM owning `slot`. A no-op if the VM was never registered.
+    pub(crate) fn unregister(&self, slot: &AtomicUsize) {
+        let mut vms = self.vms.lock();
+        let index = slot.swap(NOT_REGISTERED, Ordering::Relaxed);
+        if index == NOT_REGISTERED {
+            return;
+        }
+
+        let _ = vms.remove(index);
+
+        // Every entry after `index` moved down by one. Fix up their slots.
+        for (i, entry) in vms.iter().enumerate().skip(index) {
+            // SAFETY: `entry.vm` is still in the registry, so an owning
+            // reference keeps its VM alive, and the registry lock is held.
+            unsafe { entry.vm.as_ref() }
+                .registry_slot()
+                .store(i, Ordering::Relaxed);
+        }
+    }
+
+    fn print_gpuvas(&self, m: &SeqFile) -> Result {
+        let vms = self.vms.lock();
+        for entry in vms.iter() {
+            // SAFETY: `entry.vm` points to a live VM. While registered an
+            // owning reference keeps it alive, and the registry lock blocks
+            // unregistration, so holding it keeps every listed VM valid.
+            let vm = unsafe { entry.vm.as_ref() };
+            vm.show_gpuvas(m)?;
+            seq_print!(m, "\n");
+        }
+        Ok(())
+    }
+}
+
+/// The `gpuvas` debugfs file, a device-wide dump of every VM's GPU VA space.
+pub(crate) struct GpuvasFile;
+
+impl Info for GpuvasFile {
+    type Driver = TyrDrmDriver;
+    const NAME: &'static CStr = c"gpuvas";
+
+    fn show(device: &TyrDrmDevice, m: &SeqFile) -> Result {
+        device.vm_registry().print_gpuvas(m)
     }
 }
