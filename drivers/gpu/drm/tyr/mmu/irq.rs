@@ -70,7 +70,7 @@ pub(crate) fn mmu_irq_init<'a>(
     io.write_reg(mmu_control::IRQ_MASK::from_raw(0));
 
     let irq_type = MmuIrq { iomem, mask };
-    TyrIrq::request(pdev, tdev, c_str!("mmu"), irq_type)
+    TyrIrq::request(pdev, tdev, c_str!("mmu"), c_str!("mmu"), irq_type)
 }
 
 impl TyrIrqTrait for MmuIrq {
