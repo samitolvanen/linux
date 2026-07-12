@@ -49,6 +49,9 @@ use core::{
     }, //
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use crate::seq_file::SeqFile;
+
 mod sm_ops;
 pub use self::sm_ops::*;
 
@@ -408,6 +411,17 @@ impl<T: DriverGpuVm> UniqueRefGpuVm<T> {
         // associated with a `GpuVmBo<T>` whose BO is on the GEM list,
         // satisfying `GpuVa::from_raw`'s contract.
         Some(unsafe { GpuVa::<T>::from_raw(ptr) })
+    }
+
+    /// Dumps this GPUVM's VA space to `m` in the standard DRM debugfs format.
+    #[cfg(CONFIG_DEBUG_FS)]
+    #[inline]
+    pub fn debugfs_gpuva_info(&self, m: &SeqFile) -> Result {
+        // SAFETY: `m.as_raw()` is a valid `seq_file` and `self.as_raw()` is a
+        // valid `drm_gpuvm`. The `&UniqueRefGpuVm<T>` borrow holds the interval
+        // tree stable for the call, satisfying the function's caller-side
+        // locking requirement.
+        to_result(unsafe { bindings::drm_debugfs_gpuva_info(m.as_raw(), self.as_raw()) })
     }
 }
 
