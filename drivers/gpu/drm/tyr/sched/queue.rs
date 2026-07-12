@@ -900,14 +900,17 @@ impl QueueOps for TyrQueueOps {
         } else {
             // Group is unbound; mark it runnable so the rule engine sees
             // it on the tick scheduled below.
-            if let Err(err) = group.tdev.with_locked_scheduler(|sched| {
+            let tick = match group.tdev.with_locked_scheduler(|sched| {
                 sched.mark_group_runnable(group);
-                Ok(())
+                Ok(sched.submit_tick(group.priority))
             }) {
-                self.data.signal_submit_fence(done_seqno, Err(err));
-                return Err(err);
-            }
-            TyrDrmDeviceData::schedule_tick(&group.tdev);
+                Ok(tick) => tick,
+                Err(err) => {
+                    self.data.signal_submit_fence(done_seqno, Err(err));
+                    return Err(err);
+                }
+            };
+            tick.dispatch(&group.tdev);
         }
 
         Ok(SubmitResult::Submitted)

@@ -172,6 +172,7 @@ impl Scheduler {
 
         if idle_event {
             // At least one resident group may now be idle.
+            self.might_have_idle_groups = true;
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
         if progress_event {
