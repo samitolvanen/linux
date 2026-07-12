@@ -872,6 +872,436 @@ pub(crate) mod gpu_control {
     }
 }
 
+/// These registers correspond to the PWR_CONTROL register page.
+/// On architecture 14 and later they control the power domains and
+/// host-issued resets.
+pub(crate) mod pwr_control {
+    use core::convert::TryFrom;
+    use kernel::{
+        error::{
+            code::EINVAL,
+            Error, //
+        },
+        num::Bounded,
+        register, //
+    };
+
+    register! {
+        /// IRQ sources raw status.
+        /// Writing to this register forces bits on, but does not clear them.
+        pub(crate) PWR_INT_RAWSTAT(u32) @ 0x800 {
+            /// A single power domain has powered up or down, a 1-bit boolean flag.
+            0:0     power_changed_single => bool;
+            /// All pending power domain changes have completed, a 1-bit boolean flag.
+            1:1     power_changed_all => bool;
+            /// Domain delegation has changed, a 1-bit boolean flag.
+            2:2     delegation_changed => bool;
+            /// Reset has completed, a 1-bit boolean flag.
+            3:3     reset_completed => bool;
+            /// Retract has completed, a 1-bit boolean flag.
+            4:4     retract_completed => bool;
+            /// Inspect has completed, a 1-bit boolean flag.
+            5:5     inspect_completed => bool;
+            /// The issued command was not allowed, a 1-bit boolean flag.
+            30:30   command_not_allowed => bool;
+            /// The issued command was invalid, a 1-bit boolean flag.
+            31:31   command_invalid => bool;
+        }
+
+        /// IRQ sources to clear. Write only.
+        pub(crate) PWR_INT_CLEAR(u32) @ 0x804 {
+            /// Clear the POWER_CHANGED_SINGLE interrupt, a 1-bit boolean flag.
+            0:0     power_changed_single => bool;
+            /// Clear the POWER_CHANGED_ALL interrupt, a 1-bit boolean flag.
+            1:1     power_changed_all => bool;
+            /// Clear the DELEGATION_CHANGED interrupt, a 1-bit boolean flag.
+            2:2     delegation_changed => bool;
+            /// Clear the RESET_COMPLETED interrupt, a 1-bit boolean flag.
+            3:3     reset_completed => bool;
+            /// Clear the RETRACT_COMPLETED interrupt, a 1-bit boolean flag.
+            4:4     retract_completed => bool;
+            /// Clear the INSPECT_COMPLETED interrupt, a 1-bit boolean flag.
+            5:5     inspect_completed => bool;
+            /// Clear the COMMAND_NOT_ALLOWED interrupt, a 1-bit boolean flag.
+            30:30   command_not_allowed => bool;
+            /// Clear the COMMAND_INVALID interrupt, a 1-bit boolean flag.
+            31:31   command_invalid => bool;
+        }
+
+        /// IRQ sources enabled.
+        pub(crate) PWR_INT_MASK(u32) @ 0x808 {
+            /// Enable the POWER_CHANGED_SINGLE interrupt, a 1-bit boolean flag.
+            0:0     power_changed_single => bool;
+            /// Enable the POWER_CHANGED_ALL interrupt, a 1-bit boolean flag.
+            1:1     power_changed_all => bool;
+            /// Enable the DELEGATION_CHANGED interrupt, a 1-bit boolean flag.
+            2:2     delegation_changed => bool;
+            /// Enable the RESET_COMPLETED interrupt, a 1-bit boolean flag.
+            3:3     reset_completed => bool;
+            /// Enable the RETRACT_COMPLETED interrupt, a 1-bit boolean flag.
+            4:4     retract_completed => bool;
+            /// Enable the INSPECT_COMPLETED interrupt, a 1-bit boolean flag.
+            5:5     inspect_completed => bool;
+            /// Enable the COMMAND_NOT_ALLOWED interrupt, a 1-bit boolean flag.
+            30:30   command_not_allowed => bool;
+            /// Enable the COMMAND_INVALID interrupt, a 1-bit boolean flag.
+            31:31   command_invalid => bool;
+        }
+
+        /// IRQ status for enabled sources. Read only.
+        pub(crate) PWR_INT_STAT(u32) @ 0x80c {
+            /// POWER_CHANGED_SINGLE interrupt status, a 1-bit boolean flag.
+            0:0     power_changed_single => bool;
+            /// POWER_CHANGED_ALL interrupt status, a 1-bit boolean flag.
+            1:1     power_changed_all => bool;
+            /// DELEGATION_CHANGED interrupt status, a 1-bit boolean flag.
+            2:2     delegation_changed => bool;
+            /// RESET_COMPLETED interrupt status, a 1-bit boolean flag.
+            3:3     reset_completed => bool;
+            /// RETRACT_COMPLETED interrupt status, a 1-bit boolean flag.
+            4:4     retract_completed => bool;
+            /// INSPECT_COMPLETED interrupt status, a 1-bit boolean flag.
+            5:5     inspect_completed => bool;
+            /// COMMAND_NOT_ALLOWED interrupt status, a 1-bit boolean flag.
+            30:30   command_not_allowed => bool;
+            /// COMMAND_INVALID interrupt status, a 1-bit boolean flag.
+            31:31   command_invalid => bool;
+        }
+    }
+
+    register! {
+        /// Power control status. Read only.
+        ///
+        /// The allow flags report the domains the host may currently issue
+        /// commands for, and the delegated flags the domains under MCU
+        /// control. A domain is either allowed or delegated, never both.
+        pub(crate) PWR_STATUS(u64) @ 0x820 {
+            /// Host commands for the L2 domain are allowed, a 1-bit boolean flag.
+            0:0     allow_l2 => bool;
+            /// Host commands for the tiler domain are allowed, a 1-bit boolean flag.
+            1:1     allow_tiler => bool;
+            /// Host commands for the shader domain are allowed, a 1-bit boolean flag.
+            8:8     allow_shader => bool;
+            /// Host commands for the base domain are allowed, a 1-bit boolean flag.
+            14:14   allow_base => bool;
+            /// Host commands for the stack domain are allowed, a 1-bit boolean flag.
+            15:15   allow_stack => bool;
+            /// The L2 domain is delegated to the MCU, a 1-bit boolean flag.
+            16:16   delegated_l2 => bool;
+            /// The tiler domain is delegated to the MCU, a 1-bit boolean flag.
+            17:17   delegated_tiler => bool;
+            /// The shader domain is delegated to the MCU, a 1-bit boolean flag.
+            24:24   delegated_shader => bool;
+            /// The base domain is delegated to the MCU, a 1-bit boolean flag.
+            30:30   delegated_base => bool;
+            /// The stack domain is delegated to the MCU, a 1-bit boolean flag.
+            31:31   delegated_stack => bool;
+            /// A soft reset command is allowed, a 1-bit boolean flag.
+            33:33   allow_soft_reset => bool;
+            /// A fast reset command is allowed, a 1-bit boolean flag.
+            34:34   allow_fast_reset => bool;
+            /// A power transition command is in progress, a 1-bit boolean flag.
+            41:41   power_pending => bool;
+            /// A reset command is in progress, a 1-bit boolean flag.
+            42:42   reset_pending => bool;
+            /// A retract command is in progress, a 1-bit boolean flag.
+            43:43   retract_pending => bool;
+            /// An inspect command is in progress, a 1-bit boolean flag.
+            44:44   inspect_pending => bool;
+        }
+
+        // PWR_STATUS is a logical 64-bit register, but it is laid out in hardware as two
+        // 32-bit halves. Define it as separate low/high u32 registers so accesses match
+        // the MMIO register layout and do not rely on native 64-bit MMIO transactions.
+        pub(crate) PWR_STATUS_LO(u32) @ 0x820 {
+            31:0    value;
+        }
+
+        pub(crate) PWR_STATUS_HI(u32) @ 0x824 {
+            31:0    value;
+        }
+    }
+
+    /// Helpers for the PWR_COMMAND register.
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    #[repr(u8)]
+    pub(crate) enum PwrCommand {
+        /// Power up the cores selected by PWR_CMDARG in a domain.
+        PowerUp = 0x10,
+        /// Power down the cores selected by PWR_CMDARG in a domain.
+        PowerDown = 0x11,
+        /// Delegate control of a domain to the MCU.
+        Delegate = 0x20,
+        /// Retract control of a domain from the MCU.
+        Retract = 0x21,
+        /// Stop all external bus interfaces, then reset the entire GPU.
+        ResetSoft = 0x31,
+        /// Reset the GPU without a full power cycle of the domains.
+        ResetFast = 0x32,
+        /// Inspect the power state of the domains.
+        Inspect = 0xF0,
+    }
+
+    impl TryFrom<Bounded<u32, 8>> for PwrCommand {
+        type Error = Error;
+
+        fn try_from(val: Bounded<u32, 8>) -> Result<Self, Self::Error> {
+            match val.get() {
+                0x10 => Ok(PwrCommand::PowerUp),
+                0x11 => Ok(PwrCommand::PowerDown),
+                0x20 => Ok(PwrCommand::Delegate),
+                0x21 => Ok(PwrCommand::Retract),
+                0x31 => Ok(PwrCommand::ResetSoft),
+                0x32 => Ok(PwrCommand::ResetFast),
+                0xF0 => Ok(PwrCommand::Inspect),
+                _ => Err(EINVAL),
+            }
+        }
+    }
+
+    impl From<PwrCommand> for Bounded<u32, 8> {
+        fn from(cmd: PwrCommand) -> Self {
+            (cmd as u8).into()
+        }
+    }
+
+    /// Power domains addressable through the PWR_COMMAND register.
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    #[repr(u8)]
+    pub(crate) enum PwrDomain {
+        /// Level 2 cache domain.
+        L2 = 0,
+        /// Tiler domain.
+        Tiler = 1,
+        /// Shader core domain.
+        Shader = 8,
+        /// Base domain.
+        Base = 14,
+        /// Core stack domain.
+        Stack = 15,
+    }
+
+    impl TryFrom<Bounded<u32, 8>> for PwrDomain {
+        type Error = Error;
+
+        fn try_from(val: Bounded<u32, 8>) -> Result<Self, Self::Error> {
+            match val.get() {
+                0 => Ok(PwrDomain::L2),
+                1 => Ok(PwrDomain::Tiler),
+                8 => Ok(PwrDomain::Shader),
+                14 => Ok(PwrDomain::Base),
+                15 => Ok(PwrDomain::Stack),
+                _ => Err(EINVAL),
+            }
+        }
+    }
+
+    impl From<PwrDomain> for Bounded<u32, 8> {
+        fn from(domain: PwrDomain) -> Self {
+            (domain as u8).into()
+        }
+    }
+
+    /// Ray traversal unit bit in the PWR_COMMAND subdomain field.
+    pub(crate) const PWR_SUBDOMAIN_RTU: u8 = 1 << 0;
+
+    register! {
+        /// Power control command register. Write only.
+        pub(crate) PWR_COMMAND(u32) @ 0x828 {
+            /// Command to execute.
+            7:0     command ?=> PwrCommand;
+            /// Domain the command applies to.
+            15:8    domain ?=> PwrDomain;
+            /// Subdomains the command applies to.
+            23:16   subdomain;
+        }
+
+        /// Command argument, split like PWR_STATUS.
+        pub(crate) PWR_CMDARG_LO(u32) @ 0x830 {
+            31:0    value;
+        }
+
+        pub(crate) PWR_CMDARG_HI(u32) @ 0x834 {
+            31:0    value;
+        }
+    }
+
+    // The per-domain state registers are logical 64-bit registers laid out
+    // as two 32-bit halves, like PWR_STATUS.
+    register! {
+        /// L2 domain present bitmap. Read only constant.
+        pub(crate) PWR_L2_PRESENT_LO(u32) @ 0x900 {
+            31:0    present;
+        }
+
+        pub(crate) PWR_L2_PRESENT_HI(u32) @ 0x904 {
+            31:0    present;
+        }
+
+        /// L2 domain ready bitmap. Read only.
+        pub(crate) PWR_L2_READY_LO(u32) @ 0x908 {
+            31:0    ready;
+        }
+
+        pub(crate) PWR_L2_READY_HI(u32) @ 0x90c {
+            31:0    ready;
+        }
+
+        /// L2 domain power transition bitmap. Read only.
+        pub(crate) PWR_L2_PWRTRANS_LO(u32) @ 0x910 {
+            31:0    changing;
+        }
+
+        pub(crate) PWR_L2_PWRTRANS_HI(u32) @ 0x914 {
+            31:0    changing;
+        }
+
+        /// L2 domain active bitmap. Read only.
+        pub(crate) PWR_L2_PWRACTIVE_LO(u32) @ 0x918 {
+            31:0    active;
+        }
+
+        pub(crate) PWR_L2_PWRACTIVE_HI(u32) @ 0x91c {
+            31:0    active;
+        }
+
+        /// Tiler domain present bitmap. Read only constant.
+        pub(crate) PWR_TILER_PRESENT_LO(u32) @ 0x940 {
+            31:0    present;
+        }
+
+        pub(crate) PWR_TILER_PRESENT_HI(u32) @ 0x944 {
+            31:0    present;
+        }
+
+        /// Tiler domain ready bitmap. Read only.
+        pub(crate) PWR_TILER_READY_LO(u32) @ 0x948 {
+            31:0    ready;
+        }
+
+        pub(crate) PWR_TILER_READY_HI(u32) @ 0x94c {
+            31:0    ready;
+        }
+
+        /// Tiler domain power transition bitmap. Read only.
+        pub(crate) PWR_TILER_PWRTRANS_LO(u32) @ 0x950 {
+            31:0    changing;
+        }
+
+        pub(crate) PWR_TILER_PWRTRANS_HI(u32) @ 0x954 {
+            31:0    changing;
+        }
+
+        /// Tiler domain active bitmap. Read only.
+        pub(crate) PWR_TILER_PWRACTIVE_LO(u32) @ 0x958 {
+            31:0    active;
+        }
+
+        pub(crate) PWR_TILER_PWRACTIVE_HI(u32) @ 0x95c {
+            31:0    active;
+        }
+
+        /// Shader domain present bitmap. Read only constant.
+        pub(crate) PWR_SHADER_PRESENT_LO(u32) @ 0xa00 {
+            31:0    present;
+        }
+
+        pub(crate) PWR_SHADER_PRESENT_HI(u32) @ 0xa04 {
+            31:0    present;
+        }
+
+        /// Shader domain ready bitmap. Read only.
+        pub(crate) PWR_SHADER_READY_LO(u32) @ 0xa08 {
+            31:0    ready;
+        }
+
+        pub(crate) PWR_SHADER_READY_HI(u32) @ 0xa0c {
+            31:0    ready;
+        }
+
+        /// Shader domain power transition bitmap. Read only.
+        pub(crate) PWR_SHADER_PWRTRANS_LO(u32) @ 0xa10 {
+            31:0    changing;
+        }
+
+        pub(crate) PWR_SHADER_PWRTRANS_HI(u32) @ 0xa14 {
+            31:0    changing;
+        }
+
+        /// Shader domain active bitmap. Read only.
+        pub(crate) PWR_SHADER_PWRACTIVE_LO(u32) @ 0xa18 {
+            31:0    active;
+        }
+
+        pub(crate) PWR_SHADER_PWRACTIVE_HI(u32) @ 0xa1c {
+            31:0    active;
+        }
+
+        /// Base domain present bitmap. Read only constant.
+        pub(crate) PWR_BASE_PRESENT_LO(u32) @ 0xb80 {
+            31:0    present;
+        }
+
+        pub(crate) PWR_BASE_PRESENT_HI(u32) @ 0xb84 {
+            31:0    present;
+        }
+
+        /// Base domain ready bitmap. Read only.
+        pub(crate) PWR_BASE_READY_LO(u32) @ 0xb88 {
+            31:0    ready;
+        }
+
+        pub(crate) PWR_BASE_READY_HI(u32) @ 0xb8c {
+            31:0    ready;
+        }
+
+        /// Base domain power transition bitmap. Read only.
+        pub(crate) PWR_BASE_PWRTRANS_LO(u32) @ 0xb90 {
+            31:0    changing;
+        }
+
+        pub(crate) PWR_BASE_PWRTRANS_HI(u32) @ 0xb94 {
+            31:0    changing;
+        }
+
+        /// Base domain active bitmap. Read only.
+        pub(crate) PWR_BASE_PWRACTIVE_LO(u32) @ 0xb98 {
+            31:0    active;
+        }
+
+        pub(crate) PWR_BASE_PWRACTIVE_HI(u32) @ 0xb9c {
+            31:0    active;
+        }
+
+        /// Stack domain present bitmap. Read only constant.
+        pub(crate) PWR_STACK_PRESENT_LO(u32) @ 0xbc0 {
+            31:0    present;
+        }
+
+        pub(crate) PWR_STACK_PRESENT_HI(u32) @ 0xbc4 {
+            31:0    present;
+        }
+
+        /// Stack domain ready bitmap. Read only.
+        pub(crate) PWR_STACK_READY_LO(u32) @ 0xbc8 {
+            31:0    ready;
+        }
+
+        pub(crate) PWR_STACK_READY_HI(u32) @ 0xbcc {
+            31:0    ready;
+        }
+
+        /// Stack domain power transition bitmap. Read only.
+        pub(crate) PWR_STACK_PWRTRANS_LO(u32) @ 0xbd0 {
+            31:0    changing;
+        }
+
+        pub(crate) PWR_STACK_PWRTRANS_HI(u32) @ 0xbd4 {
+            31:0    changing;
+        }
+    }
+}
+
 /// These registers correspond to the JOB_CONTROL register page.
 /// They are involved in communication between the firmware running on the MCU and the host.
 pub(crate) mod job_control {
