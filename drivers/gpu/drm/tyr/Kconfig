@@ -10,6 +10,7 @@ config DRM_TYR
 	depends on MMU
 	select DEVFREQ_GOV_SIMPLE_ONDEMAND
 	select IOMMU_IO_PGTABLE_LPAE
+	select NVMEM
 	select PM_DEVFREQ
 	select RUST_DRM_GEM_SHMEM_HELPER
 	select RUST_DRM_GPUVM

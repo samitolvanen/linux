@@ -17,6 +17,7 @@ use kernel::{
         register::Array,
         Io, //
     },
+    nvmem::Cell,
     platform,
     prelude::*,
     time::Delta,
@@ -67,6 +68,27 @@ unsafe impl AsBytes for CsifInfo {}
 #[derive(Clone, Copy)]
 pub(crate) struct GpuInfo(pub(crate) uapi::drm_panthor_gpu_info);
 
+/// Reads the shader-present override from the `shader-present` NVMEM cell.
+fn override_shader_present(dev: &Device<Bound>, shader_present: u64) -> Result<u64> {
+    let cell = match Cell::get(dev, c"shader-present") {
+        Ok(cell) => cell,
+        Err(e) if e == ENOENT => return Ok(shader_present),
+        Err(e) => return Err(e),
+    };
+
+    let bytes = cell.read()?;
+    if bytes.len() > size_of::<u64>() {
+        return Err(ERANGE);
+    }
+
+    let mut present = 0u64;
+    for (i, &byte) in bytes.iter().enumerate() {
+        present |= u64::from(byte) << (8 * i);
+    }
+
+    Ok(present)
+}
+
 impl GpuInfo {
     pub(crate) fn new(
         dev: &Device<Bound>,
@@ -110,6 +132,8 @@ impl GpuInfo {
                 ),
             )
         };
+
+        let shader_present = override_shader_present(dev, shader_present)?;
 
         Ok(Self(uapi::drm_panthor_gpu_info {
             gpu_id: gpu_id.into_raw(),
