@@ -110,7 +110,8 @@ use crate::{
     gpu::{
         irq::GpuIrq,
         GpuInfo,
-        HwOps, //
+        HwOps,
+        SocData, //
     },
     irq::IrqSlot,
     mmap,
@@ -264,6 +265,8 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Coherency protocol selected at probe.
     pub(crate) coherency: CoherencyMode,
+
+    pub(crate) soc_data: SocData,
 
     pub(crate) hw_ops: HwOps,
 
@@ -760,8 +763,20 @@ kernel::of_device_table!(
     MODULE_OF_TABLE,
     <TyrPlatformDriverData as platform::Driver>::IdInfo,
     [
-        (of::DeviceId::new(c"rockchip,rk3588-mali"), ()),
-        (of::DeviceId::new(c"arm,mali-valhall-csf"), ())
+        (
+            of::DeviceId::new(c"mediatek,mt8196-mali"),
+            SocData {
+                asn_hash: Some([0xb, 0xe, 0x0]),
+            }
+        ),
+        (
+            of::DeviceId::new(c"rockchip,rk3588-mali"),
+            SocData { asn_hash: None }
+        ),
+        (
+            of::DeviceId::new(c"arm,mali-valhall-csf"),
+            SocData { asn_hash: None }
+        )
     ]
 );
 
@@ -790,14 +805,14 @@ impl DeviceAttribute for ProfilingAttr {
 kernel::device_attribute_groups!(TYR_GROUPS, [ProfilingAttr]);
 
 impl platform::Driver for TyrPlatformDriverData {
-    type IdInfo = ();
+    type IdInfo = SocData;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     const PM_OPS: Option<&'static bindings::dev_pm_ops> = Some(&PMContext::<TyrPmOps>::PM_OPS);
     const DEV_GROUPS: Option<&'static dyn AttributeGroups> = Some(&TYR_GROUPS);
 
     fn probe(
         pdev: &platform::Device<Core>,
-        _info: Option<&Self::IdInfo>,
+        info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
         let core_clk = Clk::get(pdev.as_ref(), Some(c"core"))?;
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
@@ -817,9 +832,10 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let coherent = pdev.as_ref().dma_coherent();
         let coherency = gpu::select_coherency(pdev.as_ref(), &iomem, coherent)?;
+        let soc_data = info.copied().unwrap_or_default();
 
         let hw_ops = HwOps::bind(pdev.as_ref(), &iomem)?;
-        hw_ops.reset(pdev.as_ref(), &iomem, coherency)?;
+        hw_ops.reset(pdev.as_ref(), &iomem, coherency, soc_data)?;
 
         let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem, coherency)?;
         gpu_info.log(pdev.as_ref());
@@ -838,7 +854,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
 
         let platform: ARef<platform::Device> = pdev.into();
-        let reset = reset::ResetHandle::new(platform.clone(), iomem.clone(), coherency, hw_ops)?;
+        let reset =
+            reset::ResetHandle::new(platform.clone(), iomem.clone(), coherency, soc_data, hw_ops)?;
 
         let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info, reset.clone())?;
 
@@ -881,6 +898,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmio_phys_addr,
                 coherent,
                 coherency,
+                soc_data,
                 hw_ops,
                 fw: firmware,
                 wq,

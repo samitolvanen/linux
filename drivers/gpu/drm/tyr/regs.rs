@@ -497,9 +497,17 @@ pub(crate) mod gpu_control {
         }
 
         /// Level 2 cache configuration.
+        ///
+        /// Bit 24 has two meanings. Cores with a custom address-space-number
+        /// hash use it as the enable bit for `GPU_ASN_HASH`. On older cores
+        /// it is the low bit of the hash function index. Only one of the two
+        /// fields may be written on a given core.
         pub(crate) L2_CONFIG(u32) @ 0x48 {
             /// Requested cache size.
             23:16   cache_size;
+            /// Enables the custom address-space-number hash held in
+            /// `GPU_ASN_HASH`, a 1-bit boolean flag.
+            24:24   asn_hash_enable => bool;
             /// Requested hash function index.
             31:24   hash_function;
         }
@@ -739,6 +747,12 @@ pub(crate) mod gpu_control {
         /// Revision ID. Read only constant.
         pub(crate) REVIDR(u32) @ 0x280 {
             31:0    revision;
+        }
+
+        /// Custom address-space-number hash values, programmed before the
+        /// L2 block powers up when `L2_CONFIG::asn_hash_enable` is set.
+        pub(crate) GPU_ASN_HASH(u32)[3] @ 0x2c0 {
+            31:0    hash;
         }
 
         /// Coherency features present. Read only constant.

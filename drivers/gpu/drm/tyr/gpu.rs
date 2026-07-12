@@ -287,6 +287,16 @@ pub(crate) fn select_coherency(
     }
 }
 
+/// Per-SoC match data attached to a device-tree `compatible`.
+///
+/// The ASN hash must be reprogrammed each time the L2 block powers up.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SocData {
+    /// Custom L2 address-space-number hash to program before L2 power-up,
+    /// or `None` to keep the hardware default.
+    pub(crate) asn_hash: Option<[u32; 3]>,
+}
+
 /// Hardware operations selected by GPU architecture major.
 ///
 /// Bound once at probe and dispatched at every hardware access.
@@ -342,10 +352,17 @@ impl HwOps {
         }
     }
 
-    fn l2_power_on(self, dev: &Device, iomem: &Devres<IoMem>, coherency: CoherencyMode) -> Result {
+    fn l2_power_on(
+        self,
+        dev: &Device,
+        iomem: &Devres<IoMem>,
+        coherency: CoherencyMode,
+        soc_data: SocData,
+    ) -> Result {
         match self {
-            Self::V10 => l2_power_on(dev, iomem, coherency),
-            // The PWR_CONTROL path programs no coherency mode.
+            Self::V10 => l2_power_on(dev, iomem, coherency, soc_data),
+            // The PWR_CONTROL path programs neither the coherency mode nor
+            // the ASN hash.
             Self::V14 {
                 has_rtu,
                 l2_present,
@@ -361,9 +378,10 @@ impl HwOps {
         dev: &Device,
         iomem: &Devres<IoMem>,
         coherency: CoherencyMode,
+        soc_data: SocData,
     ) -> Result {
         self.soft_reset(dev, iomem)?;
-        self.l2_power_on(dev, iomem, coherency)?;
+        self.l2_power_on(dev, iomem, coherency, soc_data)?;
         Ok(())
     }
 }
@@ -387,12 +405,40 @@ fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     Ok(())
 }
 
+/// Programs the custom L2 ASN hash before the L2 block powers up.
+///
+/// A no-op when the device tree supplies no hash. The hash needs
+/// architecture 11 or newer, so on older cores it is logged and skipped
+/// while the L2 still powers up.
+fn l2_config_set(dev: &Device, io: &IoMem, soc_data: SocData) {
+    let Some(asn_hash) = soc_data.asn_hash else {
+        return;
+    };
+
+    if io.read(GPU_ID).arch_major().get() < 11 {
+        dev_err!(dev, "Custom ASN hash not supported by the device\n");
+        return;
+    }
+
+    io.write(GPU_ASN_HASH::at(0), GPU_ASN_HASH::from_raw(asn_hash[0]));
+    io.write(GPU_ASN_HASH::at(1), GPU_ASN_HASH::from_raw(asn_hash[1]));
+    io.write(GPU_ASN_HASH::at(2), GPU_ASN_HASH::from_raw(asn_hash[2]));
+
+    io.write_reg(io.read(L2_CONFIG).with_asn_hash_enable(true));
+}
+
 /// Powers on the l2 block.
-fn l2_power_on(dev: &Device, iomem: &Devres<IoMem>, coherency: CoherencyMode) -> Result {
+fn l2_power_on(
+    dev: &Device,
+    iomem: &Devres<IoMem>,
+    coherency: CoherencyMode,
+    soc_data: SocData,
+) -> Result {
     {
         let io = iomem.try_access().ok_or(ENODEV)?;
         // The coherency protocol must be selected before the L2 powers up.
         io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(coherency));
+        l2_config_set(dev, &io, soc_data);
         io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
     }
 
@@ -461,5 +507,6 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     }
     tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
-    tdev.hw_ops.l2_power_on(bound, &tdev.iomem, tdev.coherency)
+    tdev.hw_ops
+        .l2_power_on(bound, &tdev.iomem, tdev.coherency, tdev.soc_data)
 }
