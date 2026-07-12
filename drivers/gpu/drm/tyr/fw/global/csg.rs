@@ -13,7 +13,7 @@ use crate::fw::{
     interfaces::{
         FwInterface, CSG_ACK, CSG_ACK_IRQ_MASK, CSG_ALLOW_COMPUTE, CSG_ALLOW_FRAGMENT,
         CSG_ALLOW_OTHER, CSG_CONFIG, CSG_CONTROL_BLOCK_SIZE, CSG_DB_ACK, CSG_DB_REQ, CSG_EP_REQ,
-        CSG_INPUT_BLOCK_SIZE, CSG_IRQ_ACK, CSG_IRQ_REQ, CSG_OUTPUT_BLOCK_SIZE,
+        CSG_EP_REQ2, CSG_INPUT_BLOCK_SIZE, CSG_IRQ_ACK, CSG_IRQ_REQ, CSG_OUTPUT_BLOCK_SIZE,
         CSG_PROTM_SUSPEND_BUF, CSG_REQ, CSG_SUSPEND_BUF, CS_CONTROL_BLOCK_SIZE, GROUP_INPUT_VA,
         GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM, GROUP_STREAM_STRIDE,
         GROUP_SUSPEND_SIZE,
@@ -74,6 +74,31 @@ struct EnabledCsgInterface {
     cs_stride: usize,
     cs_num: usize,
     cs: KVec<CsInterface>,
+    has_64bit_ep_req: bool,
+}
+
+impl EnabledCsgInterface {
+    /// Writes the endpoint request, using the 64-bit `CSG_EP_REQ2`
+    /// register on CSF interface 4.0 and the 32-bit `CSG_EP_REQ`
+    /// otherwise.
+    fn write_ep_req(&self, ep_req: CSG_EP_REQ) {
+        if self.has_64bit_ep_req {
+            self.csg_input.write(
+                CSG_EP_REQ2,
+                CSG_EP_REQ2::from_raw(u64::from(ep_req.into_raw())),
+            );
+        } else {
+            self.csg_input.write(CSG_EP_REQ, ep_req);
+        }
+    }
+
+    fn read_ep_req(&self) -> CSG_EP_REQ {
+        if self.has_64bit_ep_req {
+            CSG_EP_REQ::from_raw(self.csg_input.read(CSG_EP_REQ2).into_raw() as u32)
+        } else {
+            self.csg_input.read(CSG_EP_REQ)
+        }
+    }
 }
 
 pub(crate) struct CsgInterface {
@@ -109,6 +134,7 @@ impl CsgInterface {
         shared_section: &SharedSectionInfo,
         csg_idx: usize,
         csg_stride: usize,
+        has_64bit_ep_req: bool,
     ) -> Result {
         let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
         let csg_control_va = shared_section.va_range.start + csg_control_offset as u64;
@@ -160,6 +186,7 @@ impl CsgInterface {
             cs_stride,
             cs_num: cs_num as usize,
             cs: KVec::with_capacity(cs_num as usize, GFP_KERNEL)?,
+            has_64bit_ep_req,
         });
 
         self.init_cs(shared_section, csg_control_offset)
@@ -271,7 +298,7 @@ impl CsgInterface {
         Ok(())
     }
 
-    /// Writes the `CSG_EP_REQ` input register.
+    /// Writes the CSG endpoint request input register.
     ///
     /// Returns `EINVAL` if the interface is not enabled.
     pub(crate) fn write_input_ep_req(&self, ep_req: CSG_EP_REQ) -> Result {
@@ -280,11 +307,11 @@ impl CsgInterface {
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        enabled.csg_input.write(CSG_EP_REQ, ep_req);
+        enabled.write_ep_req(ep_req);
         Ok(())
     }
 
-    /// Reads the live `CSG_EP_REQ` input register.
+    /// Reads the live CSG endpoint request input register.
     ///
     /// Returns `EINVAL` if the interface is not enabled.
     pub(crate) fn read_input_ep_req(&self) -> Result<CSG_EP_REQ> {
@@ -293,7 +320,7 @@ impl CsgInterface {
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        Ok(enabled.csg_input.read(CSG_EP_REQ))
+        Ok(enabled.read_ep_req())
     }
 
     /// Read-modify-write the CSG_REQ input register, performing one
@@ -363,7 +390,7 @@ impl CsgInterface {
             CSG_ALLOW_OTHER,
             CSG_ALLOW_OTHER::zeroed().with_mask(inputs.allow_other),
         );
-        enabled.csg_input.write(CSG_EP_REQ, inputs.ep_req);
+        enabled.write_ep_req(inputs.ep_req);
         enabled.csg_input.write(
             CSG_SUSPEND_BUF,
             CSG_SUSPEND_BUF::zeroed().with_pointer(inputs.suspend_buf),
