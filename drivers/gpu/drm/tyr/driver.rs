@@ -109,7 +109,8 @@ use crate::{
     gpu,
     gpu::{
         irq::GpuIrq,
-        GpuInfo, //
+        GpuInfo,
+        HwOps, //
     },
     irq::IrqSlot,
     mmap,
@@ -255,6 +256,8 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Coherency protocol selected at probe.
     pub(crate) coherency: CoherencyMode,
+
+    pub(crate) hw_ops: HwOps,
 
     pub(crate) fw: Arc<Firmware>,
 
@@ -807,7 +810,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let coherent = pdev.as_ref().dma_coherent();
         let coherency = gpu::select_coherency(pdev.as_ref(), &iomem, coherent)?;
 
-        gpu::reset(pdev.as_ref(), &iomem, coherency)?;
+        let hw_ops = HwOps::bind(pdev.as_ref(), &iomem)?;
+        hw_ops.reset(pdev.as_ref(), &iomem, coherency)?;
 
         let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem, coherency)?;
         gpu_info.log(pdev.as_ref());
@@ -826,7 +830,7 @@ impl platform::Driver for TyrPlatformDriverData {
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
 
         let platform: ARef<platform::Device> = pdev.into();
-        let reset = reset::ResetHandle::new(platform.clone(), iomem.clone(), coherency)?;
+        let reset = reset::ResetHandle::new(platform.clone(), iomem.clone(), coherency, hw_ops)?;
 
         let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info, reset.clone())?;
 
@@ -869,6 +873,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmio_phys_addr,
                 coherent,
                 coherency,
+                hw_ops,
                 fw: firmware,
                 wq,
                 sched_wq,

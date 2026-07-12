@@ -62,7 +62,7 @@ use crate::{
         IoMem,
         TyrDrmDevice, //
     },
-    gpu,
+    gpu::{self, HwOps},
     mmu,
     regs::gpu_control::CoherencyMode,
     sched::tick, //
@@ -100,6 +100,7 @@ struct Controller {
     iomem: Arc<Devres<IoMem>>,
     /// Coherency protocol programmed at L2 power-on.
     coherency: CoherencyMode,
+    hw_ops: HwOps,
     /// DRM device reference, set once probe has created the device and
     /// revoked by devres at unbind. Resolving it through `Devres` keeps
     /// the back-reference from pinning the refcount cycle past unbind.
@@ -137,6 +138,7 @@ impl Controller {
         pdev: ARef<platform::Device>,
         iomem: Arc<Devres<IoMem>>,
         coherency: CoherencyMode,
+        hw_ops: HwOps,
     ) -> Result<Arc<Self>> {
         let gate = Arc::pin_init(HwGate::new(), GFP_KERNEL)?;
         Arc::pin_init(
@@ -144,6 +146,7 @@ impl Controller {
                 pdev,
                 iomem,
                 coherency,
+                hw_ops,
                 ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
                 ready <- new_mutex!(false),
@@ -249,6 +252,7 @@ impl Controller {
             &self.iomem,
             &self.gate,
             self.coherency,
+            self.hw_ops,
         );
         tick::post_reset(&tdev, parked, reset_result.is_err());
 
@@ -283,6 +287,7 @@ pub(crate) fn run_hw_reset(
     iomem: &Devres<IoMem>,
     gate: &HwGate,
     coherency: CoherencyMode,
+    hw_ops: HwOps,
 ) -> Result {
     tdev.fw.pre_reset(tdev);
     mmu::pre_reset(tdev, iomem);
@@ -292,7 +297,7 @@ pub(crate) fn run_hw_reset(
     // path takes none while the gate is closed.
     let hw = gate.close();
 
-    let reset_result = gpu::reset(dev, iomem, coherency);
+    let reset_result = hw_ops.reset(dev, iomem, coherency);
     if let Err(e) = &reset_result {
         dev_err!(dev, "GPU reset failed: {:?}\n", e);
     }
@@ -345,11 +350,12 @@ impl ResetHandle {
         pdev: ARef<platform::Device>,
         iomem: Arc<Devres<IoMem>>,
         coherency: CoherencyMode,
+        hw_ops: HwOps,
     ) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(
                 Inner {
-                    controller: Controller::new(pdev, iomem, coherency)?,
+                    controller: Controller::new(pdev, iomem, coherency, hw_ops)?,
                     wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
                 },
                 GFP_KERNEL,
