@@ -109,6 +109,7 @@ use crate::{
         CsgSlotOps,
         Scheduler,
         SchedulerState,
+        SubmitTick,
         MAX_CSGS, //
     },
     slot::SlotManager, //
@@ -433,13 +434,11 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
             let results = Scheduler::evaluate_syncwait_candidates(&reg_data.fw, snapshot);
 
-            let immediate_tick = this
+            let tick = this
                 .with_locked_scheduler(|sched| Ok(sched.apply_syncwait_results(results)))
-                .unwrap_or(false);
+                .unwrap_or(SubmitTick::None);
 
-            if immediate_tick {
-                Self::schedule_tick(&this);
-            }
+            tick.dispatch(&this);
         });
     }
 }

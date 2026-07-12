@@ -14,7 +14,9 @@ use kernel::{
     },
     time::{
         msecs_to_jiffies,
+        Delta,
         Instant,
+        Jiffies,
         Monotonic, //
     }, //
 };
@@ -294,12 +296,39 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) idle_groups: [List<Group, 0>; GROUP_PRIORITY_COUNT],
     /// Groups whose queues are blocked on a sync object.
     pub(in crate::sched) waiting_groups: [List<Group, 1>; GROUP_PRIORITY_COUNT],
+    /// Number of CSG slots the firmware exposes, capped to `MAX_CSG_PRIO + 1`.
+    pub(in crate::sched) csg_slot_count: u32,
     /// Number of CSG slots used by the most recent tick.
     pub(in crate::sched) used_csg_slot_count: u32,
+    /// Set when a resident group may have become idle. The submit path
+    /// then ticks immediately to re-evaluate residency. Recomputed from
+    /// each tick's idle-group count.
+    pub(in crate::sched) might_have_idle_groups: bool,
     /// When the next tick should occur, if any.
     pub(in crate::sched) resched_target: Option<Instant<Monotonic>>,
     /// When the last tick occurred.
     pub(in crate::sched) last_tick: Instant<Monotonic>,
+}
+
+/// The tick to schedule after marking a group runnable.
+///
+/// Dispatched by the caller once the scheduler mutex is dropped.
+pub(crate) enum SubmitTick {
+    Immediate,
+    /// Re-arm the periodic tick `delay` from now.
+    Periodic(Jiffies),
+    /// No tick is needed.
+    None,
+}
+
+impl SubmitTick {
+    pub(crate) fn dispatch(self, tdev: &ARef<TyrDrmDevice>) {
+        match self {
+            Self::Immediate => TyrDrmDeviceData::schedule_tick(tdev),
+            Self::Periodic(delay) => TyrDrmDeviceData::schedule_periodic_tick(tdev, delay),
+            Self::None => {}
+        }
+    }
 }
 
 impl Scheduler {
@@ -329,7 +358,9 @@ impl Scheduler {
                 runnable_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
                 idle_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
                 waiting_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
+                csg_slot_count,
                 used_csg_slot_count: 0,
+                might_have_idle_groups: false,
                 resched_target: None,
                 last_tick: Instant::<Monotonic>::now(),
             },
@@ -962,6 +993,36 @@ impl Scheduler {
         });
     }
 
+    /// Decides which tick a submit should schedule after marking its group
+    /// runnable. A real-time group, a possibly-idle resident group, or a free
+    /// slot ticks now. With every slot busy the submit rides the periodic tick.
+    pub(crate) fn submit_tick(&mut self, priority: Priority) -> SubmitTick {
+        if priority == Priority::RealTime {
+            return SubmitTick::Immediate;
+        }
+
+        if self.might_have_idle_groups {
+            return SubmitTick::Immediate;
+        }
+
+        if self.resched_target.is_some() {
+            if self.used_csg_slot_count < self.csg_slot_count {
+                return SubmitTick::Immediate;
+            }
+            return SubmitTick::None;
+        }
+
+        let period_ms = i64::from(tick::TICK_PERIOD_MS);
+        self.resched_target = Some(self.last_tick + Delta::from_millis(period_ms));
+
+        let elapsed_ms = self.last_tick.elapsed().as_millis();
+        if self.used_csg_slot_count == self.csg_slot_count && elapsed_ms < period_ms {
+            SubmitTick::Periodic(msecs_to_jiffies((period_ms - elapsed_ms) as u32))
+        } else {
+            SubmitTick::Immediate
+        }
+    }
+
     /// Drains every resident queue's pending submit fences whose
     /// `done_seqno` is at or below the per-queue syncobj value.
     ///
@@ -1108,11 +1169,11 @@ impl Scheduler {
     /// that another path removed between the snapshot and the apply is
     /// skipped.
     ///
-    /// Returns `true` if an unbound RealTime-priority group was
-    /// promoted, in which case the caller fires an immediate tick so
-    /// the rule engine binds it without waiting for the periodic tick.
-    pub(crate) fn apply_syncwait_results(&mut self, results: KVec<SyncwaitResult>) -> bool {
+    /// Returns an immediate tick for a promoted real-time group and a
+    /// periodic one for any other promotion.
+    pub(crate) fn apply_syncwait_results(&mut self, results: KVec<SyncwaitResult>) -> SubmitTick {
         let mut immediate_tick = false;
+        let mut promoted = false;
 
         for prio in 0..GROUP_PRIORITY_COUNT {
             // Stage the wait-list links of groups that should move to
@@ -1153,6 +1214,7 @@ impl Scheduler {
                             if prio == Priority::RealTime as usize {
                                 immediate_tick = true;
                             }
+                            promoted = true;
                             make_runnable.push_back(list_arc);
                         }
                     } else {
@@ -1172,7 +1234,13 @@ impl Scheduler {
             }
         }
 
-        immediate_tick
+        if immediate_tick {
+            SubmitTick::Immediate
+        } else if promoted {
+            SubmitTick::Periodic(msecs_to_jiffies(tick::TICK_PERIOD_MS))
+        } else {
+            SubmitTick::None
+        }
     }
 
     /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
