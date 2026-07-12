@@ -76,6 +76,10 @@ fn has_glb_state(version: GLB_VERSION) -> bool {
     (version.major().get(), version.minor().get()) >= (4, 1)
 }
 
+fn has_64bit_ep_req(version: GLB_VERSION) -> bool {
+    (version.major().get(), version.minor().get()) >= (4, 0)
+}
+
 struct GlobalInterfaceRequests<'a> {
     input: &'a FwInterface<GLB_INPUT_BLOCK_SIZE>,
     output: &'a FwInterface<GLB_OUTPUT_BLOCK_SIZE>,
@@ -563,10 +567,11 @@ impl InnerGlobalInterface {
             );
         }
 
+        let has_64bit_ep_req = has_64bit_ep_req(version);
         let mut csg = KVec::with_capacity(csg_num, GFP_KERNEL)?;
         for csg_idx in 0..csg_num {
             let mut entry = CsgInterface::new(csg_idx)?;
-            entry.enable(shared_section, csg_idx, csg_stride)?;
+            entry.enable(shared_section, csg_idx, csg_stride, has_64bit_ep_req)?;
             csg.push(entry, GFP_KERNEL)?;
         }
 
