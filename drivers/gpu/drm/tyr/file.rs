@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::mem::offset_of;
+
 use kernel::{
     alloc::KVec,
     dma_buf::DmaResvUsage,
@@ -322,9 +324,15 @@ impl TyrDrmFileData {
             return Self::vm_bind_async(ddev, vmbind, file);
         }
 
-        let op_size = core::mem::size_of::<uapi::drm_panthor_vm_bind_op>();
+        static_assert!(
+            size_of::<uapi::drm_panthor_vm_bind_op>()
+                == offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
+                    + size_of::<uapi::drm_panthor_obj_array>()
+        );
+        let min_size = offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
+            + size_of::<uapi::drm_panthor_obj_array>();
         let stride = vmbind.ops.stride as usize;
-        if stride < op_size {
+        if stride < min_size {
             return Err(EINVAL);
         }
 
@@ -344,7 +352,7 @@ impl TyrDrmFileData {
         for i in 0..count {
             let res: Result = (|| {
                 let op: VmBindOp = reader.read()?;
-                read_padding_zero(&mut reader, stride - op_size)?;
+                read_padding_zero(&mut reader, stride - min_size)?;
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -406,9 +414,10 @@ impl TyrDrmFileData {
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        let op_size = core::mem::size_of::<uapi::drm_panthor_vm_bind_op>();
+        let min_size = offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
+            + size_of::<uapi::drm_panthor_obj_array>();
         let stride = vmbind.ops.stride as usize;
-        if stride < op_size {
+        if stride < min_size {
             return Err(EINVAL);
         }
 
@@ -437,7 +446,7 @@ impl TyrDrmFileData {
 
         for _ in 0..count {
             let op: VmBindOp = reader.read()?;
-            read_padding_zero(&mut reader, stride - op_size)?;
+            read_padding_zero(&mut reader, stride - min_size)?;
             let validated_bo = validate_bind_op(&op, file, &vm)?;
             let (job, syncs) = op.capture(&vm, true, validated_bo.clone())?;
 
