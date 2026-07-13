@@ -166,6 +166,14 @@ impl<T: DriverObject> Object<T> {
         unsafe { Device::from_raw((*self.as_raw()).dev) }
     }
 
+    /// Returns whether the object's CPU mappings are write-combined.
+    #[inline]
+    pub fn map_wc(&self) -> bool {
+        // SAFETY: `as_raw_shmem()` returns a valid pointer to this object's shmem object for the
+        // lifetime of `&self`.
+        unsafe { bindings::drm_gem_shmem_object::map_wc_raw(self.as_raw_shmem()) }
+    }
+
     extern "C" fn free_callback(obj: *mut bindings::drm_gem_object) {
         // SAFETY:
         // - DRM always passes a valid gem object here
