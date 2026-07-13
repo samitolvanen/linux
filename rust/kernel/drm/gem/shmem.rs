@@ -536,7 +536,11 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
             None
         },
         gem_prime_import_sg_table: Some(bindings::drm_gem_shmem_prime_import_sg_table),
-        dumb_create: Some(bindings::drm_gem_shmem_dumb_create),
+        dumb_create: if T::EXPOSE_DUMB_CREATE {
+            Some(bindings::drm_gem_shmem_dumb_create)
+        } else {
+            None
+        },
         dumb_map_offset: None,
     };
 }

@@ -137,6 +137,14 @@ pub trait DriverObject: Sync + Send + Sized {
     /// object. Objects that are not shmem-backed ignore this constant and
     /// always use the default export path.
     const EXPORT_CPU_ACCESS_SYNC: bool = false;
+
+    /// Whether the dumb-buffer creation ioctl is exposed for this driver's
+    /// shmem-backed GEM objects.
+    ///
+    /// When `true`, `DRM_IOCTL_MODE_CREATE_DUMB` allocates a shmem object
+    /// through the generic helper. Objects that are not shmem-backed ignore
+    /// this constant.
+    const EXPOSE_DUMB_CREATE: bool = true;
 }
 
 /// Trait that represents a GEM object subtype
