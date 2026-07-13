@@ -193,6 +193,14 @@ impl<T: DriverObject> Object<T> {
         unsafe { Device::from_raw((*self.as_raw()).dev) }
     }
 
+    /// Returns whether the object's CPU mappings are write-combined.
+    #[inline]
+    pub fn map_wc(&self) -> bool {
+        // SAFETY: `as_raw_shmem()` returns a valid pointer to this object's shmem object for the
+        // lifetime of `&self`.
+        unsafe { bindings::drm_gem_shmem_object::map_wc_raw(self.as_raw_shmem()) }
+    }
+
     /// Allocates the full [`Object<T>`] wrapper and zero-initialises the embedded shmem object;
     /// the helper's `__drm_gem_shmem_init` fills it in after we return.
     extern "C" fn gem_create_object_callback(
