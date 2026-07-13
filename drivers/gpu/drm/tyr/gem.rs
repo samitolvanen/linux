@@ -89,6 +89,8 @@ impl gem::DriverObject for BoData {
 
     const EXPORT_CPU_ACCESS_SYNC: bool = true;
 
+    const EXPOSE_DUMB_CREATE: bool = false;
+
     /// Constructs a new [`BoData`] instance for a GEM object.
     ///
     /// This function is called by the GEM subsystem when creating a new buffer
