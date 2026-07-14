@@ -165,6 +165,7 @@ use crate::{
 
 #[cfg(CONFIG_DEBUG_FS)]
 use crate::debugfs::{
+    FwVaShow,
     GemsShow,
     GpuvasShow,
     ShrinkAttr, //
@@ -1409,6 +1410,7 @@ impl drm::Driver for TyrDrmDriver {
 
     #[cfg(CONFIG_DEBUG_FS)]
     fn debugfs_init(dir: &ScopeRef<'_, TyrDrmRegistrationData<'_>, Self::OwnerModule>) {
+        dir.seq_file::<FwVaShow>(c"fw_va");
         dir.seq_file::<GemsShow>(c"gems");
         dir.seq_file::<GpuvasShow>(c"gpuvas");
         dir.attribute_file::<ShrinkAttr>(c"shrink");
