@@ -1019,6 +1019,12 @@ impl Vm {
         self.kernel_va.allocate(size, align, GFP_KERNEL)
     }
 
+    /// Bytes reserved in the kernel VA window and the window size, for
+    /// debug occupancy reporting.
+    pub(crate) fn kernel_va_occupancy(&self) -> (u64, u64) {
+        self.kernel_va.occupancy()
+    }
+
     /// Returns the dummy GEM object whose `dma_resv` anchors this VM.
     pub(crate) fn root_gem(&self) -> &Bo {
         &self.root_gem

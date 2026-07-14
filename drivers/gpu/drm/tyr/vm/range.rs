@@ -17,7 +17,16 @@ use kernel::{
         Alignment,
         //
     },
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{
+            Atomic,
+            Relaxed,
+            //
+        },
+        Arc,
+        Mutex,
+        //
+    },
 };
 
 #[pin_data]
@@ -27,6 +36,9 @@ struct RangeAllocInner {
     #[pin]
     lock: Mutex<()>,
     range: Range<u64>,
+    /// Bytes currently handed out, for debug occupancy reporting.
+    /// Updated under `lock`; read without it.
+    used: Atomic<usize>,
 }
 
 // SAFETY: `RangeAllocInner` can be sent between threads because all access to
@@ -66,6 +78,7 @@ impl RangeAlloc {
                 maple <- MapleTreeAlloc::new(),
                 lock <- new_mutex!(()),
                 range: start..end,
+                used: Atomic::new(0),
             }),
             gfp,
         )?;
@@ -79,6 +92,7 @@ impl RangeAlloc {
         let _guard = self.inner.lock.lock();
         let offset = self.inner.alloc_aligned(size, align, gfp)?;
 
+        self.inner.used.add(size, Relaxed);
         Ok(LiveRange {
             inner: self.inner.clone(),
             offset,
@@ -108,12 +122,23 @@ impl RangeAlloc {
                 .insert_range(start as usize..end as usize, (), gfp)?;
         }
 
+        let size = (end - start) as usize;
+        self.inner.used.add(size, Relaxed);
         Ok(LiveRange {
             inner: self.inner.clone(),
             offset: start,
-            size: (end - start) as usize,
+            size,
             leaked: false,
         })
+    }
+
+    /// Bytes currently handed out and the size of the managed window,
+    /// for debug occupancy reporting. Reservations count the same as
+    /// allocations.
+    pub(crate) fn occupancy(&self) -> (u64, u64) {
+        let used = self.inner.used.load(Relaxed) as u64;
+        let total = self.inner.range.end - self.inner.range.start;
+        (used, total)
     }
 }
 
@@ -223,6 +248,7 @@ impl Drop for LiveRange {
         if let Some(range) = self.inner.maple_range(self.start(), self.end()) {
             self.inner.maple.erase(range.start);
         }
+        self.inner.used.fetch_sub(self.size, Relaxed);
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -233,5 +259,6 @@ impl Drop for LiveRange {
 
         let _guard = self.inner.lock.lock();
         self.inner.maple.erase(self.offset as usize);
+        self.inner.used.fetch_sub(self.size, Relaxed);
     }
 }
