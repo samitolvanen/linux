@@ -917,6 +917,11 @@ impl<'drm> Firmware<'drm> {
         self.global_iface.wait_csg_acks(csg_idx, mask, timeout_ms)
     }
 
+    /// The firmware MCU VM.
+    pub(crate) fn vm(&self) -> &Vm {
+        &self.vm
+    }
+
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
     pub(crate) fn alloc_queue_mem(
         &self,
@@ -965,6 +970,14 @@ impl<'drm> Firmware<'drm> {
             pt_gfp,
             c"FW suspend buffer",
         )
+        .inspect_err(|e| {
+            dev_warn!(
+                dev,
+                "Failed to allocate {} bytes for a suspend buffer in the firmware VM: {:?}\n",
+                suspend_size,
+                e
+            );
+        })
     }
 }
 
