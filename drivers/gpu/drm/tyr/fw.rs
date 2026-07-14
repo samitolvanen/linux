@@ -792,6 +792,12 @@ impl Firmware {
         self.global_iface.wait_csg_acks(csg_idx, mask, timeout_ms)
     }
 
+    /// The firmware MCU VM.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn vm(&self) -> &Vm {
+        &self.vm
+    }
+
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
     pub(crate) fn alloc_queue_mem(&self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
@@ -836,6 +842,14 @@ impl Firmware {
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
         gem::new_kernel_object_no_vmap(tdev, &self.vm, suspend_size, flags, tdev.coherent)
+            .inspect_err(|e| {
+                dev_warn!(
+                    self.pdev.as_ref(),
+                    "Failed to allocate {} bytes for a suspend buffer in the firmware VM: {:?}\n",
+                    suspend_size,
+                    e
+                );
+            })
     }
 }
 
