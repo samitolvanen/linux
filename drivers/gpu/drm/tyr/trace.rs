@@ -954,7 +954,7 @@ kernel::declare_trace! {
 /// static-branch query that `declare_trace!` performs before emitting an
 /// event, so the dump's lock-free, allocation-free walk is skipped
 /// entirely while the tracepoints are off (the default). Enable at
-/// runtime with `echo 1 > .../tyr_heap_chunk_dump/enable`.
+/// runtime with `echo 1 > .../events/tyr_heap/enable`.
 #[cfg(CONFIG_TRACEPOINTS)]
 pub(crate) fn heap_dump_enabled() -> bool {
     // SAFETY: It's always okay to query the static key for a tracepoint.
