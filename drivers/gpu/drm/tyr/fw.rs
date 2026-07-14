@@ -502,10 +502,9 @@ impl Firmware {
     /// The firmware VM is left resident so page-table updates on it keep
     /// issuing cache and TLB maintenance up to the soft reset. It is released
     /// after the soft reset by `mmu::post_reset`, together with the user VMs.
-    pub(crate) fn pre_reset(&self) {
-        if let Some(io) = self.iomem.try_access() {
-            irq::job_irq_disable(&io);
-        }
+    pub(crate) fn pre_reset(&self, tdev: &TyrDrmDevice) {
+        tdev.job_irq
+            .reset_suspend(&self.iomem, irq::job_irq_disable);
 
         self.stop_mcu();
         self.global_iface.suspend();
@@ -518,6 +517,8 @@ impl Firmware {
     /// restarts. The reload also clears the halt request in the global
     /// input block, so no explicit `set_mcu_active` is needed.
     pub(crate) fn post_reset(&self, tdev: &TyrDrmDevice) -> Result {
+        tdev.job_irq.clear_suspended();
+
         self.vm.activate()?;
         self.reload_sections()?;
         self.irq_state.clear_ready();
@@ -542,7 +543,7 @@ impl Firmware {
     /// cycle or wedge. The stop step forces the interface through the
     /// suspended state so bring-up starts from a known point.
     pub(crate) fn reload(&self, tdev: &TyrDrmDevice) -> Result {
-        self.pre_reset();
+        self.pre_reset(tdev);
         self.post_reset(tdev)
     }
 
