@@ -1477,6 +1477,12 @@ impl Vm {
         va < self.user_va_limit && size <= self.user_va_limit - va
     }
 
+    /// Bytes reserved in the kernel VA window and the window size, for
+    /// debug occupancy reporting.
+    pub(crate) fn kernel_va_occupancy(&self) -> (u64, u64) {
+        self.kernel_va.occupancy()
+    }
+
     /// Returns the dummy GEM object whose `dma_resv` anchors this VM.
     pub(crate) fn root_gem(&self) -> &Bo {
         &self.root_gem
