@@ -269,7 +269,7 @@ pub(crate) fn run_hw_reset(
     iomem: &Devres<IoMem>,
     gate: &HwGate,
 ) -> Result {
-    tdev.fw.pre_reset();
+    tdev.fw.pre_reset(tdev);
     mmu::pre_reset(tdev, iomem);
 
     // A span parked on the closed gate holds a VM op lock while it waits.
