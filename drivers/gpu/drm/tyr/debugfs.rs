@@ -403,6 +403,7 @@ impl Attribute<TyrDrmDevice> for ShrinkAttr {
 pub(crate) struct TyrDebugfs {
     _reset: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
     _fail_ping: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
+    _fw_va: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
     _dir: Dir,
 }
 
@@ -419,6 +420,10 @@ impl TyrDebugfs {
             ),
             GFP_KERNEL,
         )?;
+        let fw_va = KBox::pin_init(
+            dir.read_callback_file(c"fw_va", tdev.clone(), &fw_va_read),
+            GFP_KERNEL,
+        )?;
         let reset = KBox::pin_init(
             dir.write_callback_file(c"reset", tdev, &reset_write),
             GFP_KERNEL,
@@ -426,6 +431,7 @@ impl TyrDebugfs {
         Ok(Self {
             _reset: reset,
             _fail_ping: fail_ping,
+            _fw_va: fw_va,
             _dir: dir,
         })
     }
@@ -455,4 +461,11 @@ fn fail_ping_write(tdev: &ARef<TyrDrmDevice>, reader: &mut UserSliceReader) -> R
     let count = s.trim().parse::<u32>().map_err(|_| EINVAL)?;
     tdev.fail_ping_count.store(count, Ordering::Relaxed);
     Ok(())
+}
+
+/// Reports the firmware VM kernel-VA window as "<used> <total>" bytes,
+/// for watching suspend-buffer VA growth across reset storms.
+fn fw_va_read(tdev: &ARef<TyrDrmDevice>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let (used, total) = tdev.fw.vm().kernel_va_occupancy();
+    writeln!(f, "{} {}", used, total)
 }
