@@ -35,6 +35,7 @@ pub(crate) use self::disabled::{
 };
 #[cfg(CONFIG_DEBUG_FS)]
 pub(crate) use self::enabled::{
+    FwVaShow,
     GemLink,
     GemRegistry,
     GemsShow,
@@ -515,6 +516,19 @@ mod enabled {
             reg_data
                 .reclaim
                 .shrink(usize::try_from(val).unwrap_or(usize::MAX));
+            Ok(())
+        }
+    }
+
+    /// The `fw_va` debugfs file, reporting the firmware VM kernel-VA window as
+    /// "<used> <total>" bytes, for watching suspend-buffer VA growth across
+    /// reset storms.
+    pub(crate) struct FwVaShow;
+
+    impl SeqShow<TyrDrmRegistrationData<'_>> for FwVaShow {
+        fn show(reg_data: &TyrDrmRegistrationData<'_>, m: &SeqFile) -> Result {
+            let (used, total) = reg_data.fw.vm().kernel_va_occupancy();
+            seq_print!(m, "{} {}\n", used, total);
             Ok(())
         }
     }
