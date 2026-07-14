@@ -116,6 +116,7 @@
 #include <trace/events/rust_syncobj_debug.h>
 #include <trace/events/rust_sample.h>
 #include <trace/events/tyr.h>
+#include <trace/events/tyr_heap.h>
 
 /*
  * The driver-core Rust code needs to know about some C driver-core private
