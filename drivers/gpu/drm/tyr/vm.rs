@@ -1240,6 +1240,13 @@ impl Vm {
         self.kernel_va.allocate(size, align, GFP_KERNEL)
     }
 
+    /// Bytes reserved in the kernel VA window and the window size, for
+    /// debug occupancy reporting.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn kernel_va_occupancy(&self) -> (u64, u64) {
+        self.kernel_va.occupancy()
+    }
+
     /// Returns whether `[va, va + size)` lies wholly below the exclusive
     /// user VA limit.
     pub(crate) fn in_user_va_range(&self, va: u64, size: u64) -> bool {
