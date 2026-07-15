@@ -284,6 +284,8 @@ pub(crate) fn run_hw_reset(
 
     mmu::post_reset(tdev, iomem);
 
+    tdev.gpu_irq.reset_resume(iomem, gpu::irq::gpu_irq_enable);
+
     // Reopen before fw.post_reset reactivates the MCU VM through the gate.
     drop(hw);
 

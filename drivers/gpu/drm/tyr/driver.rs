@@ -32,7 +32,6 @@ use kernel::{
         ioctl,
         UnregisteredDevice, //
     },
-    irq::ThreadedRegistration,
     new_mutex,
     of,
     opp::ConfigToken,
@@ -92,10 +91,7 @@ use crate::{
         irq::GpuIrq,
         GpuInfo, //
     },
-    irq::{
-        IrqSlot,
-        TyrIrq, //
-    },
+    irq::IrqSlot,
     mmap,
     mmu::{
         irq::{
@@ -184,10 +180,6 @@ pub(crate) struct TyrPlatformDriverData {
     #[expect(dead_code)]
     pm: pm::Registration<TyrPmOps>,
 
-    /// GPU IRQ registration, kept reachable so the runtime-suspend path
-    /// can synchronize in-flight handlers before gating the clocks.
-    pub(crate) gpu_irq: Devres<ThreadedRegistration<TyrIrq<GpuIrq>>>,
-
     pub(crate) device: ARef<TyrDrmDevice>,
 }
 
@@ -208,6 +200,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// Job IRQ registration slot, set during probe and revoked by devres at unbind.
     #[pin]
     pub(crate) job_irq: IrqSlot<JobIrq>,
+
+    /// GPU IRQ registration slot, set during probe and revoked by devres at unbind.
+    #[pin]
+    pub(crate) gpu_irq: IrqSlot<GpuIrq>,
 
     pub(crate) iomem: Arc<Devres<IoMem>>,
 
@@ -721,6 +717,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 mmu,
                 mmu_irq <- IrqSlot::new(),
                 job_irq <- IrqSlot::new(),
+                gpu_irq <- IrqSlot::new(),
                 iomem: iomem.clone(),
                 mmio_phys_addr,
                 coherent,
@@ -770,27 +767,27 @@ impl platform::Driver for TyrPlatformDriverData {
         tdev.reset
             .set_device(Devres::new(pdev.as_ref(), tdev.clone())?);
 
-        let io = tdev.iomem.access(pdev.as_ref())?;
-
-        let gpu_irq = Devres::new(
-            pdev.as_ref(),
+        let gpu_irq = Arc::pin_init(
             gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+            GFP_KERNEL,
         )?;
-        gpu::irq::gpu_irq_enable(io);
+        tdev.gpu_irq.publish(Devres::new(pdev.as_ref(), gpu_irq)?);
+        tdev.gpu_irq
+            .reset_resume(&tdev.iomem, gpu::irq::gpu_irq_enable);
 
         let mmu_irq = Arc::pin_init(
             mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
             GFP_KERNEL,
         )?;
         tdev.mmu_irq.publish(Devres::new(pdev.as_ref(), mmu_irq)?);
-        mmu_irq_enable(io);
+        tdev.mmu_irq.reset_resume(&tdev.iomem, mmu_irq_enable);
 
         let job_irq = Arc::pin_init(
             job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?,
             GFP_KERNEL,
         )?;
         tdev.job_irq.publish(Devres::new(pdev.as_ref(), job_irq)?);
-        job_irq_enable(io);
+        tdev.job_irq.reset_resume(&tdev.iomem, job_irq_enable);
 
         let devfreq_registration = devfreq::init(&tdev, pdev.as_ref())?;
         let devfreq_registration = Arc::pin_init(new_mutex!(devfreq_registration), GFP_KERNEL)?;
@@ -838,7 +835,6 @@ impl platform::Driver for TyrPlatformDriverData {
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
-            gpu_irq,
             device: tdev,
         })
     }
