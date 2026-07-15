@@ -29,10 +29,6 @@ use crate::{
         IoMem,
         TyrPlatformDriverData, //
     },
-    irq::{
-        clear_suspended,
-        quiesce, //
-    },
     regs::{
         gpu_control::*,
         join_u64, //
@@ -281,7 +277,8 @@ pub(crate) fn reset(dev: &Device, iomem: &Devres<IoMem>) -> Result {
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let bound = dev.as_ref();
     let tdev = &data.device;
-    quiesce(bound, &data.gpu_irq, &tdev.iomem, irq::gpu_irq_disable);
+    tdev.gpu_irq
+        .quiesce(bound, &tdev.iomem, irq::gpu_irq_disable);
     let _ = l2_power_off(bound, &tdev.iomem);
 }
 
@@ -290,7 +287,7 @@ pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriver
     let bound = dev.as_ref();
     let tdev = &data.device;
     let io = tdev.iomem.access(bound)?;
-    clear_suspended(bound, &data.gpu_irq);
+    tdev.gpu_irq.clear_suspended();
     irq::gpu_irq_enable(io);
     l2_power_on(bound, &tdev.iomem)
 }

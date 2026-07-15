@@ -45,8 +45,10 @@ pub(crate) trait TyrIrqTrait: Sync + 'static {
 pub(crate) struct TyrIrq<T: TyrIrqTrait> {
     tdev: ARef<TyrDrmDevice>,
     irq: T,
-    /// Set while the driver holds this line quiesced for a GPU reset or a
-    /// runtime suspend. Both mask the line before they set the flag. The
+    /// Set while the driver holds this line quiesced. The line is created
+    /// quiesced and probe clears the flag. A GPU reset and a runtime
+    /// suspend set it again. A
+    /// reset and a suspend both mask the line before they set the flag. The
     /// hard handler then leaves the shared line to its other users without
     /// touching a register, and the threaded handler leaves the line
     /// masked on exit.
@@ -62,10 +64,12 @@ impl<T: TyrIrqTrait> TyrIrq<T> {
         name: &'static CStr,
         irq: T,
     ) -> Result<impl PinInit<ThreadedRegistration<Self>, Error> + 'a> {
+        // The line starts suspended, so an interrupt taken before the caller
+        // clears the flag is left to the other users of the shared line.
         let handler = try_pin_init!(Self {
             tdev,
             irq,
-            suspended: Atomic::new(false),
+            suspended: Atomic::new(true),
             _pin: PhantomPinned,
         });
 
@@ -115,54 +119,10 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
     }
 }
 
-/// Stops one IRQ line for runtime suspend. Masks the line through `mask`,
-/// sets a per-line suspended flag, and waits for the in-flight threaded
-/// handler.
-///
-/// The line is masked before the flag is set, so the hard handler starts
-/// declining only once the sources are masked. The flag stops a finishing
-/// threaded handler from re-enabling the line. The mask is rewritten after
-/// the synchronize because a handler that raced the flag re-enables it on
-/// exit. The flag stays set until the matching resume clears it.
-pub(crate) fn quiesce<T: TyrIrqTrait + Send>(
-    dev: &Device<Bound>,
-    reg: &Devres<ThreadedRegistration<TyrIrq<T>>>,
-    iomem: &Devres<IoMem>,
-    mask: impl Fn(&IoMem),
-) {
-    let sync = reg.access(dev).and_then(|irq| {
-        if let Ok(io) = iomem.access(dev) {
-            mask(io);
-        }
-        irq.handler().set_suspended(true);
-        irq.synchronize(dev)
-    });
-    if let Err(e) = sync {
-        dev_warn!(dev, "IRQ synchronize on suspend failed: {:?}\n", e);
-    }
-    if let Ok(io) = iomem.access(dev) {
-        mask(io);
-    }
-}
-
-/// Clears the suspended flag on one IRQ line.
-///
-/// A flag left set stops the hard handler from handling the line again.
-/// Call this before unmasking the line, or an interrupt taken in between
-/// goes unclaimed.
-pub(crate) fn clear_suspended<T: TyrIrqTrait + Send>(
-    dev: &Device<Bound>,
-    reg: &Devres<ThreadedRegistration<TyrIrq<T>>>,
-) {
-    if let Ok(irq) = reg.access(dev) {
-        irq.handler().set_suspended(false);
-    }
-}
-
 /// A revocable, refcounted IRQ registration held in a slot.
 pub(crate) type SlotReg<T> = Devres<Arc<ThreadedRegistration<TyrIrq<T>>>>;
 
-/// Slot holding a reset-reachable IRQ registration.
+/// Slot holding a revocable IRQ registration.
 ///
 /// The handler holds the device, so the slot would keep a refcount cycle
 /// alive past unbind if devres did not revoke the registration.
@@ -223,7 +183,9 @@ impl<T: TyrIrqTrait + Send> IrqSlot<T> {
         }
     }
 
-    /// Re-enables the slot IRQ after a GPU reset.
+    /// Clears the suspended flag and unmasks the slot IRQ.
+    ///
+    /// Used by probe once the handler is registered, and after a GPU reset.
     pub(crate) fn reset_resume(&self, iomem: &Devres<IoMem>, enable: impl FnOnce(&IoMem)) {
         let Some(reg) = self.resolve() else {
             return;
