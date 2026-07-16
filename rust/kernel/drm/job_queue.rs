@@ -1337,7 +1337,8 @@ impl<T: QueueOps> JobQueueInner<T> {
     fn do_cleanup(self: &Arc<Self>) {
         let mut state = self.state.lock();
         while let Some(idx) = state.done_range.pop_front() {
-            drop(self.fifo.lock().remove(idx as usize));
+            let entry = self.fifo.lock().remove(idx as usize);
+            drop(entry);
         }
     }
 
@@ -1445,7 +1446,8 @@ impl<T: QueueOps> Drop for PreparedJob<T> {
         // The UninitDmaFence inside was never passed to dma_fence_init, so
         // dropping it is a plain kfree — no ECANCELED, no seqno hole.
         if let Some(idx) = self.xa_index.take() {
-            drop(self.inner.fifo.lock().remove(idx.index()));
+            let entry = self.inner.fifo.lock().remove(idx.index());
+            drop(entry);
         }
     }
 }
@@ -1882,7 +1884,8 @@ impl<T: QueueOps> JobQueue<T> {
         }
 
         while let Some(idx) = state.done_range.pop_front() {
-            drop(self.inner.fifo.lock().remove(idx as usize));
+            let entry = self.inner.fifo.lock().remove(idx as usize);
+            drop(entry);
         }
     }
 }
