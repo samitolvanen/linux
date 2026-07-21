@@ -16,17 +16,19 @@ use crate::{
     },
     macros::paste,
     prelude::*,
-    sync::atomic::{
-        ordering,
-        Atomic, //
+    sync::{
+        atomic::{
+            ordering,
+            Atomic, //
+        },
+        Arc, //
     },
-    sync::Arc,
     types::ForeignOwnable, //
 };
 
 use core::{
     cell::UnsafeCell,
-    marker::PhantomData
+    marker::PhantomData, //
 };
 
 /// Runtime Power Management modes that determine how a particular PM
@@ -84,10 +86,10 @@ impl core::ops::Not for Mode {
     }
 }
 
-impl From<Mode> for core::ffi::c_int {
+impl From<Mode> for c_int {
     #[inline]
-    fn from(mode: Mode) -> core::ffi::c_int {
-        mode.0 as core::ffi::c_int
+    fn from(mode: Mode) -> c_int {
+        mode.0 as c_int
     }
 }
 
@@ -105,7 +107,7 @@ macro_rules! mode {
 pub enum RuntimePMState {
     /// Runtime PM has not been initialized for this device yet.
     UNKNOWN = bindings::rpm_status_RPM_INVALID,
-    /// The device is expected to be runtime active and in it's normal operating state
+    /// The device is expected to be runtime active and in its normal operating state
     RESUMED = bindings::rpm_status_RPM_ACTIVE,
     /// The device is expected to be suspended, unavailable for normal operations
     SUSPENDED = bindings::rpm_status_RPM_SUSPENDED,
@@ -164,7 +166,7 @@ impl<'a> ResumeScope<'a> {
             return Err(EINVAL);
         }
 
-        // Mode::IDLE is internal so strip it of before passing further
+        // Mode::IDLE is internal so strip it off before passing further
         Request::resume(dev, mode & !Mode::IDLE).map(|()| {
             Self(Scope::<Resume> {
                 dev,
@@ -210,7 +212,7 @@ impl<'a> AwakeScope<'a> {
         if !mode.includes(Mode::ACQUIRE) {
             return Err(EINVAL);
         }
-        // Mode::IDLE is internal so strip it of before passing further
+        // Mode::IDLE is internal so strip it off before passing further
         Request::resume(dev, mode & !Mode::IDLE)
             .inspect_err(|_| Request::put_noidle(dev))
             .map(|()| {
@@ -544,7 +546,7 @@ macro_rules! define_pm_callback {
           /// for `T`.
             unsafe extern "C" fn [<$name _callback>]<'a, T:PMOps + 'static>(
                 dev: *mut bindings::device
-            ) -> core::ffi::c_int
+            ) -> c_int
                 where
                     <T as PMOps>::DeviceType: 'a
             {
@@ -633,9 +635,9 @@ macro_rules! define_pm_ops {
 
 /// RAII guard for ongoing runtime PM payload transition.
 ///
-/// For most of the callbacks this guard is not necessairly needed as
+/// For most of the callbacks this guard is not necessarily needed as
 /// the callbacks themselves are being serialized by the runtime PM C code.
-/// Still, some like runtime_idle are exempt ftom that.
+/// Still, some like runtime_idle are exempt from that.
 #[allow(unused)]
 struct PayloadGuard<'a> {
     busy: &'a Atomic<bool>,
@@ -724,7 +726,7 @@ struct PMContextInner<'a, T: PMOps> {
 /// Runtime PM context tied to a device.
 pub struct PMContext<'a, T: PMOps> {
     // Preferably, PMContext could be shared via borrowed reference over
-    // a pm Registraion's lifetime but that bares complications on its own
+    // a PM registration's lifetime but that complicates things on its own
     // when the context needs to be shared across different Registration types.
     inner: Arc<PMContextInner<'a, T>>,
 }
@@ -768,7 +770,7 @@ impl<'a, T: PMOps> PMContext<'a, T> {
 
     /// Creates an `AwakeScope` for the given PMProfile.
     /// Note that for ASYNC request this does not guarantee
-    /// the device has been resumed at the time this funtion returns.
+    /// the device has been resumed at the time this function returns.
     #[inline]
     pub fn get(&self, profile: PMProfile) -> Result<AwakeScope<'a>> {
         AwakeScope::new(self.inner.dev, profile.0 | Mode::ACQUIRE)
@@ -849,19 +851,19 @@ impl<'a, T: PMOps> PMContext<'a, T> {
         }
     }
 
-    /// Get a borrowed reference to PM profiles asociated wiht the PM context
+    /// Get a borrowed reference to PM profiles associated with the PM context.
     pub fn profiles(&self) -> &[PMProfile] {
         &self.inner.profiles
     }
 
-    /// Get a borrowed reference to PM configs asociated wiht the PM context
+    /// Get a borrowed reference to PM configs associated with the PM context.
     pub fn configs(&self) -> &[PMConfig] {
         &self.inner.configs
     }
 }
 
 // Preferably, PMContext could be shared via borrowed reference over
-// a pm Registraion's lifetime but that bares complications on its own
+// a PM registration's lifetime but that complicates things on its own
 // when the context needs to be shared across different Registration types.
 impl<T: PMOps> Clone for PMContext<'_, T> {
     fn clone(&self) -> Self {
@@ -885,7 +887,7 @@ impl PMProfile {
     pub const fn new() -> Self {
         Self(Mode::SYNC)
     }
-    /// /Enables async PM operations for this PMProfile.
+    /// Enables async PM operations for this PMProfile.
     pub const fn r#async(self) -> Self {
         Self(mode!(self.0, Mode::ASYNC))
     }
