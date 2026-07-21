@@ -213,15 +213,22 @@ impl<'a> AwakeScope<'a> {
             return Err(EINVAL);
         }
         // Mode::IDLE is internal so strip it off before passing further
-        Request::resume(dev, mode & !Mode::IDLE)
-            .inspect_err(|_| Request::put_noidle(dev))
-            .map(|()| {
-                Self(Scope::<Awake> {
-                    dev,
-                    mode,
-                    _tag: PhantomData,
-                })
-            })
+        match Request::resume(dev, mode & !Mode::IDLE) {
+            Ok(()) => {}
+            // For async/nowait requests, `EINPROGRESS` means the resume is in
+            // flight and the usage reference already keeps the device active.
+            Err(e) if e == EINPROGRESS && mode.includes(mode!(Mode::ASYNC, Mode::NOWAIT)) => {}
+            Err(e) => {
+                Request::put_noidle(dev);
+                return Err(e);
+            }
+        }
+
+        Ok(Self(Scope::<Awake> {
+            dev,
+            mode,
+            _tag: PhantomData,
+        }))
     }
 
     fn release_inner(&self) -> Result {
@@ -795,8 +802,12 @@ impl<'a, T: PMOps> PMContext<'a, T> {
         f()
     }
     /// Runs a closure while holding an `AwakeScope`.
+    ///
+    /// The closure runs on a resumed device, so nowait profiles are rejected
+    /// alongside async ones. `AwakeScope::new` accepts an in-flight resume for
+    /// those, which would let the closure run before that resume completes.
     pub fn with_get<R>(&self, profile: PMProfile, f: impl FnOnce() -> Result<R>) -> Result<R> {
-        if profile.0.includes(Mode::ASYNC) {
+        if profile.0.includes(mode!(Mode::ASYNC, Mode::NOWAIT)) {
             return Err(EINVAL);
         }
         let _scope = self.get(profile)?;
