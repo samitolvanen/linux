@@ -134,6 +134,7 @@ struct device_private {
 	struct device *device;
 #ifdef CONFIG_RUST
 	struct driver_type driver_type;
+	void *rust_private;
 #endif
 	u8 dead:1;
 };
