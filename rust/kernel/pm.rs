@@ -783,6 +783,29 @@ impl<'a, T: PMOps> PMContext<'a, T> {
         AwakeScope::new(self.inner.dev, profile.0 | Mode::ACQUIRE)
     }
 
+    /// Creates an `AwakeScope` only if the device is runtime-active.
+    ///
+    /// Acquires a usage reference if and only if the device's runtime PM
+    /// status is `RPM_ACTIVE`, without ever resuming it, mirroring
+    /// `pm_runtime_get_if_active()`. The reference blocks runtime suspend
+    /// until the returned scope is dropped, so this is safe to call from
+    /// contexts that must not run the resume callback inline.
+    ///
+    /// Returns `Ok(None)` when the device is not runtime-active and
+    /// `Err(EINVAL)` when runtime PM is disabled for the device.
+    #[inline]
+    pub fn get_if_active(&self, profile: PMProfile) -> Result<Option<AwakeScope<'a>>> {
+        match Request::get_if_active(self.inner.dev) {
+            Ok(()) => Ok(Some(AwakeScope(Scope::<Awake> {
+                dev: self.inner.dev,
+                mode: profile.0 | Mode::ACQUIRE,
+                _tag: PhantomData,
+            }))),
+            Err(e) if e == EAGAIN => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Creates a `RetainScope` for this device.
     pub fn hold(&self) -> Result<RetainScope<'a>> {
         RetainScope::new(self.inner.dev)
