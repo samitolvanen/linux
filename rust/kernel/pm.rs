@@ -372,17 +372,27 @@ impl Request {
         // The `Device<Bound>` reference provides that guarantee.
         unsafe { bindings::__pm_runtime_disable(dev.as_raw(), true) };
     }
+
+    #[inline]
+    fn barrier(dev: &device::Device<device::Bound>) {
+        // SAFETY: `dev.as_raw()` must provide a valid pointer to
+        // `struct device` for the duration of the call.
+        // The `Device<Bound>` reference provides that guarantee.
+        unsafe {
+            bindings::pm_runtime_barrier(dev.as_raw());
+        }
+    }
 }
 
 #[cfg(not(CONFIG_PM))]
 impl Request {
     #[inline]
-    fn active(dev: &device::Device<device::Bound>) -> bool {
+    fn active(_dev: &device::Device<device::Bound>) -> bool {
         true
     }
 
     #[inline]
-    fn suspended(dev: &device::Device<device::Bound>) -> bool {
+    fn suspended(_dev: &device::Device<device::Bound>) -> bool {
         false
     }
 
@@ -405,7 +415,7 @@ impl Request {
     }
 
     #[inline]
-    fn get_if_active(dev: &device::Device<device::Bound>) -> Result {
+    fn get_if_active(_dev: &device::Device<device::Bound>) -> Result {
         Err(EINVAL)
     }
 
@@ -413,7 +423,10 @@ impl Request {
     fn runtime_enable(_dev: &device::Device<device::Bound>) {}
 
     #[inline]
-    fn runtime_disable(dev: &device::Device<device::Bound>) {}
+    fn runtime_disable(_dev: &device::Device<device::Bound>) {}
+
+    #[inline]
+    fn barrier(_dev: &device::Device<device::Bound>) {}
 }
 
 impl Request {
@@ -992,15 +1005,10 @@ impl<'a, T: PMOps + 'static> Registration<'a, T> {
 
 impl<'a, T: PMOps + 'static> Drop for Registration<'a, T> {
     fn drop(&mut self) {
-        // SAFETY: `self.ctx.inner.dev` is the device this registration was
-        // created for. Runtime PM is disabled first, and `pm_runtime_barrier`
-        // waits for pending runtime PM work/callbacks before the callback data
-        // is removed below.
+        // Drain in-flight callbacks before the registration data below is freed.
+        Request::runtime_disable(self.ctx.inner.dev);
+        Request::barrier(self.ctx.inner.dev);
 
-        unsafe {
-            bindings::__pm_runtime_disable(self.ctx.inner.dev.as_raw(), true);
-            bindings::pm_runtime_barrier(self.ctx.inner.dev.as_raw());
-        }
         // SAFETY: The pointer, if non-null, was stored by `Registration::new`
         // using `Pin<KBox<RegistrationData<T>>>::into_foreign`. Runtime PM has
         // been disabled and drained above, so generated callbacks can no longer
