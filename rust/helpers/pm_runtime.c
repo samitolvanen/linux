@@ -14,7 +14,7 @@ __rust_helper void rust_helper_pm_runtime_put_noidle(struct device *dev)
 
 __rust_helper void rust_helper_pm_runtime_mark_last_busy(struct device *dev)
 {
-	pm_runtime_mark_last_busy(dev) ;
+	pm_runtime_mark_last_busy(dev);
 }
 
 __rust_helper bool rust_helper_pm_runtime_active(struct device *dev)
