@@ -1195,10 +1195,13 @@ impl Scheduler {
     /// another path removed between the snapshot and the apply is
     /// skipped.
     ///
+    /// Caller must not drop `results` before releasing the scheduler
+    /// mutex.
+    ///
     /// Returns `true` if an unbound RealTime-priority group was
     /// promoted, in which case the caller fires an immediate tick so
     /// the rule engine binds it without waiting for the periodic tick.
-    pub(crate) fn apply_syncwait_results(&mut self, results: KVec<SyncwaitResult>) -> bool {
+    pub(crate) fn apply_syncwait_results(&mut self, results: &KVec<SyncwaitResult>) -> bool {
         let mut immediate_tick = false;
 
         for prio in 0..GROUP_PRIORITY_COUNT {
