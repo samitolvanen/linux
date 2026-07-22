@@ -1180,9 +1180,12 @@ impl Scheduler {
     /// that another path removed between the snapshot and the apply is
     /// skipped.
     ///
+    /// Caller must not drop `results` before releasing the scheduler
+    /// mutex.
+    ///
     /// Returns an immediate tick for a promoted real-time group and a
     /// periodic one for any other promotion.
-    pub(crate) fn apply_syncwait_results(&mut self, results: KVec<SyncwaitResult>) -> SubmitTick {
+    pub(crate) fn apply_syncwait_results(&mut self, results: &KVec<SyncwaitResult>) -> SubmitTick {
         let mut immediate_tick = false;
         let mut promoted = false;
 
