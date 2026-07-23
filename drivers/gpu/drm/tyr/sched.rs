@@ -797,6 +797,11 @@ impl Scheduler {
             })?;
         }
 
+        // Publish `Active` before the kick loop below. A submit either
+        // sees `Active` and kicks itself, or has already committed its
+        // ring bytes, and the loop kicks that queue instead.
+        group.set_state(new_state);
+
         // On the bind-side `Start`/`Resume` ack, ring the per-CS user
         // doorbell on every queue whose ringbuf already has commands.
         // `CsgSlotOps::activate` publishes `doorbell_id` before this point.
@@ -816,7 +821,6 @@ impl Scheduler {
             }
         }
 
-        group.set_state(new_state);
         Ok(())
     }
 

@@ -55,7 +55,10 @@ use crate::{
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
-use super::group::Group;
+use super::group::{
+    Group,
+    State, //
+};
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
 const JOB_TIMEOUT_MS: u32 = 5000;
@@ -859,29 +862,21 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
-        // Decide bound-vs-unbound under the group's inner mutex and
-        // ring the doorbell while still holding it. The publish side
-        // (`CsgSlotOps::activate`) and the clear side
-        // (`CsgSlotOps::evict`) both update `csg_id` and the per-queue
-        // `doorbell_id` together under the same lock, so observing
-        // `csg_id == Some(_)` here guarantees `doorbell_id` is still
-        // assigned for the entire kick. Without the lock-spanning
-        // kick, a concurrent eviction could clear `doorbell_id`
-        // between the bound test and the MMIO write, surfacing
-        // `EINVAL` on already-committed ringbuf bytes that will
-        // execute as soon as the queue rebinds. The locked window is
-        // one MMIO doorbell write: no `GFP_KERNEL` allocation, no
-        // `dma_resv_lock`, no `mmu_notifier` path.
+        // `CsgSlotOps::activate` and `CsgSlotOps::evict` update `csg_id` and
+        // the per-queue `doorbell_id` together under this lock, so a bound
+        // group observed here keeps its doorbell for the whole kick. Ringing
+        // outside the lock would race an eviction and fail the kick for
+        // committed ringbuf bytes.
         let group = &job.job.group;
-        let (bound, kick_err) = group.with_locked_inner(|inner| {
-            if inner.csg_id.is_none() {
+        let (active, kick_err) = group.with_locked_inner(|inner| {
+            if inner.csg_id.is_none() || inner.state != State::Active {
                 return (false, Ok(()));
             }
             let kick_res = self.data.kick();
             (true, kick_res)
         });
 
-        if bound {
+        if active {
             if let Err(err) = kick_err {
                 self.data.signal_submit_fence(done_seqno, Err(err));
                 return Err(err);
@@ -889,8 +884,6 @@ impl QueueOps for TyrQueueOps {
             // No tick runs for a resumed queue, so record the busy edge here.
             group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
         } else {
-            // Group is unbound; mark it runnable so the rule engine sees
-            // it on the tick scheduled below.
             let tick = match group.tdev.with_locked_scheduler(|sched| {
                 sched.mark_group_runnable(group);
                 Ok(sched.submit_tick(group.priority))
