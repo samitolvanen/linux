@@ -167,7 +167,12 @@ kernel::declare_trace! {
     /// # Safety
     ///
     /// Always safe to call.
-    unsafe fn tyr_sched_evict(csg_id: u32, group_id: u64, sw_prio: u8);
+    unsafe fn tyr_group_innocent(group_id: u64, group_uid: u64);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_sched_evict(csg_id: u32, group_id: u64, sw_prio: u8, forced: bool);
 
     /// # Safety
     ///
@@ -1384,10 +1389,17 @@ pub(crate) fn group_timedout(group_id: u64) {
     unsafe { tyr_group_timedout(group_id) }
 }
 
-/// Rule engine evicted a CSG slot.
-pub(crate) fn sched_evict(csg_id: u32, group_id: u64, sw_prio: u8) {
+/// Group marked as innocent collateral of another group's failure.
+pub(crate) fn group_innocent(group_id: u64, group_uid: u64) {
     // SAFETY: Always safe to call.
-    unsafe { tyr_sched_evict(csg_id, group_id, sw_prio) }
+    unsafe { tyr_group_innocent(group_id, group_uid) }
+}
+
+/// Rule engine evicted a CSG slot. `forced` is true for a suspend or
+/// reset teardown, false for a scheduler-chosen preemption.
+pub(crate) fn sched_evict(csg_id: u32, group_id: u64, sw_prio: u8, forced: bool) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_sched_evict(csg_id, group_id, sw_prio, forced) }
 }
 
 /// Rule engine kept a CSG slot.
