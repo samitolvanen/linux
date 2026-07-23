@@ -995,6 +995,7 @@ impl<'a> Tick<'a> {
         &mut self,
         data: &ARef<TyrDrmDevice>,
         keep_mask: u32,
+        forced: bool,
         context: &mut CsgUpdateContext,
     ) -> CsgSlotMask {
         let mut evicted = CsgSlotMask::empty();
@@ -1017,6 +1018,7 @@ impl<'a> Tick<'a> {
                 csg_idx.get() as u32,
                 slot_data.group.handle(),
                 slot_data.group.priority as u8,
+                forced,
             );
 
             let can_run = slot_data.group.can_run();
@@ -1134,7 +1136,7 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        let evicted = self.stage_evictions(data, decision.keep_mask, &mut context);
+        let evicted = self.stage_evictions(data, decision.keep_mask, false, &mut context);
         if evicted.is_empty() {
             return Ok(());
         }
@@ -1154,7 +1156,7 @@ impl<'a> Tick<'a> {
     fn suspend(&mut self, data: &ARef<TyrDrmDevice>) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        let evicted = self.stage_evictions(data, 0, &mut context);
+        let evicted = self.stage_evictions(data, 0, true, &mut context);
 
         if self.sched.apply_csg_updates(data, &mut context).is_err() {
             pr_err!("CSG suspend failed, escalating to termination\n");
@@ -1168,9 +1170,14 @@ impl<'a> Tick<'a> {
                     let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                         continue;
                     };
-                    slot_data
-                        .group
-                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
+                    let innocent = slot_data.group.with_locked_inner(|inner| {
+                        let innocent = inner.can_run();
+                        inner.mark_evicted_by_timeout();
+                        innocent
+                    });
+                    if innocent {
+                        trace::group_innocent(slot_data.group.handle(), slot_data.group.uid());
+                    }
                     term_context.set_state(csg_idx, CsgExecutionState::Terminate);
                 }
             }
