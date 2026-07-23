@@ -2035,6 +2035,71 @@ TRACE_EVENT(tyr_group_state_query,
 );
 
 /*
+ * BO sync op type tag, matching `drm_panthor_bo_sync_op_type`.
+ */
+#define TYR_BO_SYNC_TYPES		\
+	{ 0, "FLUSH" },			\
+	{ 1, "FLUSH_AND_INVALIDATE" }
+
+TRACE_EVENT(tyr_bo_sync,
+	TP_PROTO(u64 bo, u32 sync_type, u64 offset, u64 size, bool imported,
+		 bool wc, int errno),
+	TP_ARGS(bo, sync_type, offset, size, imported, wc, errno),
+	TP_STRUCT__entry(
+		__field(u64, bo)
+		__field(u32, sync_type)
+		__field(u64, offset)
+		__field(u64, size)
+		__field(bool, imported)
+		__field(bool, wc)
+		__field(int, errno)
+	),
+	TP_fast_assign(
+		__entry->bo = bo;
+		__entry->sync_type = sync_type;
+		__entry->offset = offset;
+		__entry->size = size;
+		__entry->imported = imported;
+		__entry->wc = wc;
+		__entry->errno = errno;
+	),
+	TP_printk("bo=0x%llx type=%s offset=%llu size=%llu imported=%d wc=%d errno=%d",
+		  __entry->bo,
+		  __print_symbolic(__entry->sync_type, TYR_BO_SYNC_TYPES),
+		  __entry->offset, __entry->size, __entry->imported,
+		  __entry->wc, __entry->errno)
+);
+
+TRACE_EVENT(tyr_group_submit_entry,
+	TP_PROTO(u32 group_handle, u32 queue_count),
+	TP_ARGS(group_handle, queue_count),
+	TP_STRUCT__entry(
+		__field(u32, group_handle)
+		__field(u32, queue_count)
+	),
+	TP_fast_assign(
+		__entry->group_handle = group_handle;
+		__entry->queue_count = queue_count;
+	),
+	TP_printk("handle=%u queues=%u", __entry->group_handle,
+		  __entry->queue_count)
+);
+
+TRACE_EVENT(tyr_bo_set_label,
+	TP_PROTO(u64 bo, bool has_label),
+	TP_ARGS(bo, has_label),
+	TP_STRUCT__entry(
+		__field(u64, bo)
+		__field(bool, has_label)
+	),
+	TP_fast_assign(
+		__entry->bo = bo;
+		__entry->has_label = has_label;
+	),
+	TP_printk("bo=0x%llx has_label=%d", __entry->bo, __entry->has_label)
+);
+
+/*
  * Status tag for tyr_cs_user_stream_dump describing the outcome of the
  * lookup-and-read attempt for `cs_extract`.
  *   OK              - `bytes`/`len` carry payload read from a kernel

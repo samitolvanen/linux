@@ -681,6 +681,29 @@ kernel::declare_trace! {
 
     /// # Safety
     ///
+    /// Always safe to call.
+    unsafe fn tyr_bo_sync(
+        bo: u64,
+        sync_type: u32,
+        offset: u64,
+        size: u64,
+        imported: bool,
+        wc: bool,
+        errno: c_int,
+    );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_group_submit_entry(group_handle: u32, queue_count: u32);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_bo_set_label(bo: u64, has_label: bool);
+
+    /// # Safety
+    ///
     /// `ringbuf_words` must point to eight valid, readable `u64`
     /// values for the duration of the call.
     #[allow(clippy::too_many_arguments)]
@@ -2167,6 +2190,37 @@ pub(crate) fn vm_bind_syncop(
 pub(crate) fn group_state_query(vm_id: u64, group_id: u64, returned_state: u32, fatal_queues: u32) {
     // SAFETY: Always safe to call.
     unsafe { tyr_group_state_query(vm_id, group_id, returned_state, fatal_queues) }
+}
+
+/// One `DRM_IOCTL_PANTHOR_BO_SYNC` op and its result. Emitted on every
+/// exit so a no-op maintenance call is distinguishable from a real one.
+/// `bo` is the BO debug identity from `gem::debug_id`.
+pub(crate) fn bo_sync(
+    bo: u64,
+    sync_type: u32,
+    offset: u64,
+    size: u64,
+    imported: bool,
+    wc: bool,
+    errno: c_int,
+) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_bo_sync(bo, sync_type, offset, size, imported, wc, errno) }
+}
+
+/// Entry marker for a `DRM_IOCTL_PANTHOR_GROUP_SUBMIT` batch, so the
+/// downstream submit events attribute to their syscall.
+pub(crate) fn group_submit_entry(group_handle: u32, queue_count: u32) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_group_submit_entry(group_handle, queue_count) }
+}
+
+/// A `DRM_IOCTL_PANTHOR_BO_SET_LABEL` call. `has_label` is false when
+/// the label is cleared. `bo` is the BO debug identity from
+/// `gem::debug_id`.
+pub(crate) fn bo_set_label(bo: u64, has_label: bool) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_bo_set_label(bo, has_label) }
 }
 
 /// One decoded CS_FAULT or CS_FATAL ack. Emitted from the events
