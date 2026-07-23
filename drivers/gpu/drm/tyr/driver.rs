@@ -497,9 +497,11 @@ impl TyrDrmDeviceData {
     /// failed heap growth can still queue a fresh tick after this
     /// returns, so callers gate the tick first.
     pub(crate) fn drain_sched_work(&self) {
+        trace::pm_hw(trace::PmHwStep::DrainWorkBegin, 0);
         let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
         let _ =
             workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::FW_EVENTS }>(self);
+        trace::pm_hw(trace::PmHwStep::DrainWorkEnd, 0);
     }
 
     /// Re-arms the scheduler tick `delay` jiffies from now.

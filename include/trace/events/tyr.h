@@ -474,6 +474,22 @@ TRACE_EVENT(tyr_sched_bind,
 		  __entry->fw_prio)
 );
 
+/*
+ * Scheduler suspend-gate toggle. `suspended` is the new gate state,
+ * true across a scheduler suspend and false again on resume.
+ */
+TRACE_EVENT(tyr_sched_gate,
+	TP_PROTO(bool suspended),
+	TP_ARGS(suspended),
+	TP_STRUCT__entry(
+		__field(bool, suspended)
+	),
+	TP_fast_assign(
+		__entry->suspended = suspended;
+	),
+	TP_printk("suspended=%d", __entry->suspended)
+);
+
 TRACE_EVENT(tyr_queue_state,
 	TP_PROTO(u64 group_id, u32 cs_id, bool blocked),
 	TP_ARGS(group_id, cs_id, blocked),
@@ -2681,7 +2697,9 @@ TRACE_EVENT(tyr_pm_usage,
 	{ 1, "FW_RESUME" },		\
 	{ 2, "L2_ON" },			\
 	{ 3, "L2_OFF" },		\
-	{ 4, "MMU_SUSPEND" }
+	{ 4, "MMU_SUSPEND" },		\
+	{ 5, "DRAIN_WORK_BEGIN" },	\
+	{ 6, "DRAIN_WORK_END" }
 
 TRACE_EVENT(tyr_pm_hw,
 	TP_PROTO(u32 step, int errno),

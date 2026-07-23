@@ -139,9 +139,11 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         let (resume_pending, kick_pending) = tdev.with_locked_scheduler(|sched| {
             if sched.pm_ref.is_none() && sched.has_runnable_groups() {
                 sched.pm_ref = tdev.sched_pm_get();
+                trace::pm_usage(trace::PmUsageEvent::Acquire, sched.pm_ref.is_some());
             }
             Ok((sched.pm_ref.is_some(), sched.pending_resident_kick))
         })?;
+        trace::pm_usage(trace::PmUsageEvent::SkipInactive, resume_pending);
 
         // A denied token with a held reference means a resume is in flight
         // and this tick may be its kick, so re-arm a tick period out rather
@@ -235,6 +237,7 @@ pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>) {
         // Record the suspend under the scheduler mutex so tick paths that
         // re-check it there observe it once the eviction below begins.
         tdev.sched_suspended.store(true, ordering::Relaxed);
+        trace::sched_gate(true);
         Tick::new(sched, &mut teardown_groups).suspend(tdev)
     });
     if let Err(e) = result {
@@ -262,6 +265,7 @@ pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
     // store in `suspend`, before reissuing work.
     let _ = tdev.with_locked_scheduler(|_sched| {
         tdev.sched_suspended.store(false, ordering::Relaxed);
+        trace::sched_gate(false);
         Ok(())
     });
     TyrDrmDeviceData::schedule_fw_events(tdev);
@@ -1307,6 +1311,7 @@ impl<'a> Tick<'a> {
             data.devfreq_data.devfreq_state.lock().mark_busy();
             if self.sched.pm_ref.is_none() {
                 self.sched.pm_ref = data.sched_pm_get();
+                trace::pm_usage(trace::PmUsageEvent::Acquire, self.sched.pm_ref.is_some());
             }
         }
 

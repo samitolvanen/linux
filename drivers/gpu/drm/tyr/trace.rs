@@ -182,6 +182,11 @@ kernel::declare_trace! {
     /// # Safety
     ///
     /// Always safe to call.
+    unsafe fn tyr_sched_gate(suspended: bool);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
     unsafe fn tyr_queue_state(group_id: u64, cs_id: u32, blocked: bool);
 
     /// # Safety
@@ -1395,6 +1400,12 @@ pub(crate) fn sched_keep(csg_id: u32, group_id: u64, sw_prio: u8, fw_prio: u32) 
 pub(crate) fn sched_bind(csg_id: u32, group_id: u64, sw_prio: u8, fw_prio: u32) {
     // SAFETY: Always safe to call.
     unsafe { tyr_sched_bind(csg_id, group_id, sw_prio, fw_prio) }
+}
+
+/// Scheduler suspend gate toggled. `suspended` is the new gate state.
+pub(crate) fn sched_gate(suspended: bool) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_sched_gate(suspended) }
 }
 
 /// Queue blocked/unblocked state transition.
@@ -2716,6 +2727,10 @@ pub(crate) enum PmHwStep {
     L2On = 2,
     L2Off = 3,
     MmuSuspend = 4,
+    /// The runtime-suspend flush of the scheduler workers began.
+    DrainWorkBegin = 5,
+    /// The runtime-suspend flush of the scheduler workers finished.
+    DrainWorkEnd = 6,
 }
 
 /// Runtime suspend entry and exit. `errno` is meaningful only on

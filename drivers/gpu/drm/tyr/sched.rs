@@ -1455,6 +1455,9 @@ impl Scheduler {
 
         // No runnable work remains. Release the usage reference so the
         // unusable device is not pinned active.
+        if self.pm_ref.is_some() {
+            trace::pm_usage(trace::PmUsageEvent::Release, false);
+        }
         self.pm_ref = None;
 
         // No tick is armed once every group fails, so clear the coalescing

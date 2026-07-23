@@ -1268,6 +1268,7 @@ impl QueueOps for TyrQueueOps {
                 }
                 if sched.pm_ref.is_none() {
                     sched.pm_ref = group.tdev.sched_pm_get();
+                    trace::pm_usage(trace::PmUsageEvent::Acquire, sched.pm_ref.is_some());
                 }
                 Ok(())
             });
