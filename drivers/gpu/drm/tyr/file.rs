@@ -929,6 +929,7 @@ impl TyrDrmFileData {
         // SAFETY: The parent device stays bound while `reg` is held.
         let dev = unsafe { reg.as_ref().as_bound() };
 
+        trace::group_submit_entry(groupsubmit.group_handle, groupsubmit.queue_submits.count);
         file.inner()
             .group_pool()
             .submit_group(dev, groupsubmit, file)?;
@@ -993,7 +994,9 @@ impl TyrDrmFileData {
             None
         };
 
+        let has_label = label.is_some();
         bo.set_label(label);
+        trace::bo_set_label(gem::debug_id(&bo), has_label);
 
         Ok(0)
     }
