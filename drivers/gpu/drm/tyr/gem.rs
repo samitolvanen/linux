@@ -478,13 +478,38 @@ pub(crate) fn sync(
     offset: u64,
     size: u64,
 ) -> Result {
+    let imported = bo.is_imported();
+    let wc = bo.map_wc();
+
+    let result = sync_inner(bo, dev, type_, offset, size, imported, wc);
+    trace::bo_sync(
+        debug_id(bo),
+        type_,
+        offset,
+        size,
+        imported,
+        wc,
+        result.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    result
+}
+
+fn sync_inner(
+    bo: &Bo,
+    dev: &device::Device<Bound>,
+    type_: u32,
+    offset: u64,
+    size: u64,
+    imported: bool,
+    wc: bool,
+) -> Result {
     let bo_size = bo.size() as u64;
     let end = offset.checked_add(size).ok_or(EINVAL)?;
     if end > bo_size {
         return Err(EINVAL);
     }
 
-    if bo.is_imported() {
+    if imported {
         return Err(EINVAL);
     }
 
@@ -494,7 +519,7 @@ pub(crate) fn sync(
         _ => return Err(EINVAL),
     }
 
-    if bo.map_wc() {
+    if wc {
         return Ok(());
     }
 
