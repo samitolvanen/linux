@@ -485,18 +485,15 @@ impl QueueData {
     /// Publishes a previously claimed ringbuffer range to the firmware.
     ///
     /// `completion_point` must equal the value returned from the matching
-    /// `claim_ringbuf_range`. The leading `wmb()` orders the ringbuffer
-    /// writes before the `INSERT` write; the trailing `wmb()` orders `INSERT`
-    /// before the doorbell ring.
+    /// `claim_ringbuf_range`. `extract_init` and the ringbuffer bytes are
+    /// written before the leading `wmb()`, so they land before `insert`. The
+    /// trailing `wmb()` orders `insert` before the doorbell ring.
     pub(super) fn commit_ringbuf_range(&self, completion_point: u64) -> Result {
-        kernel::sync::barrier::wmb();
-
-        let mut ringbuf_input = self.interfaces.read_input()?;
         let ringbuf_output = self.interfaces.read_output()?;
-        ringbuf_input.extract_init = ringbuf_output.extract;
-        ringbuf_input.insert = completion_point;
+        self.interfaces.write_extract_init(ringbuf_output.extract)?;
 
-        self.interfaces.write_input(ringbuf_input)?;
+        kernel::sync::barrier::wmb();
+        self.interfaces.write_insert(completion_point)?;
         kernel::sync::barrier::wmb();
         Ok(())
     }
@@ -724,15 +721,9 @@ impl QueueData {
     /// Must be called before staging `CS_REQ.state = Start` at CSG-bind
     /// time so the firmware sees a consistent `(insert, extract_init)`
     /// snapshot when it starts reading the per-queue ringbuf mailbox.
-    ///
-    /// The read-modify-write preserves `insert`: only `extract_init`
-    /// is updated.
     pub(crate) fn sync_extract_init(&self) -> Result {
         let ringbuf_output = self.interfaces.read_output()?;
-        let mut ringbuf_input = self.interfaces.read_input()?;
-        ringbuf_input.extract_init = ringbuf_output.extract;
-        self.interfaces.write_input(ringbuf_input)?;
-        Ok(())
+        self.interfaces.write_extract_init(ringbuf_output.extract)
     }
 
     /// Builds the `CsActivateInputs` needed to program this queue's
@@ -1161,18 +1152,26 @@ impl Interfaces {
         Ok(input)
     }
 
-    #[allow(dead_code)]
-    pub(super) fn write_input(&self, value: RingBufferInput) -> Result {
+    pub(super) fn write_insert(&self, insert: u64) -> Result {
         let vmap = self.mem.vmap();
+        let input = (vmap.addr() + self.input_offset) as *mut RingBufferInput;
 
-        // SAFETY: `input_offset` selects the queue input structure inside the
-        // writable CPU mapping owned by `mem`.
-        unsafe {
-            (vmap.addr() as *mut u8)
-                .add(self.input_offset)
-                .cast::<RingBufferInput>()
-                .write_volatile(value)
-        };
+        // SAFETY: `input` points at the queue input structure inside the
+        // writable CPU mapping owned by `mem`. `addr_of_mut!` projects to the
+        // `insert` field without forming a reference to the mapped page.
+        unsafe { core::ptr::addr_of_mut!((*input).insert).write_volatile(insert) };
+
+        Ok(())
+    }
+
+    pub(super) fn write_extract_init(&self, extract_init: u64) -> Result {
+        let vmap = self.mem.vmap();
+        let input = (vmap.addr() + self.input_offset) as *mut RingBufferInput;
+
+        // SAFETY: `input` points at the queue input structure inside the
+        // writable CPU mapping owned by `mem`. `addr_of_mut!` projects to the
+        // `extract_init` field without forming a reference to the mapped page.
+        unsafe { core::ptr::addr_of_mut!((*input).extract_init).write_volatile(extract_init) };
 
         Ok(())
     }
