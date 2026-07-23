@@ -179,14 +179,11 @@ pub(crate) struct QueueData {
 }
 
 impl QueueData {
-    fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput> {
-        let ringbuf_input = self.interfaces.read_input()?;
+    fn ringbuf_space_for(&self, instr_count: usize) -> Result<u64> {
+        let insert = self.interfaces.read_insert()?;
         let size = self.ringbuf.vmap().size();
-        let ringbuf_output = self.interfaces.read_output()?;
-        let used = ringbuf_input
-            .insert
-            .checked_sub(ringbuf_output.extract)
-            .ok_or(EIO)?;
+        let extract = self.interfaces.read_extract()?;
+        let used = insert.checked_sub(extract).ok_or(EIO)?;
 
         if instr_count > size {
             return Err(ENOSPC);
@@ -196,7 +193,7 @@ impl QueueData {
             return Err(ENOSPC);
         }
 
-        Ok(ringbuf_input)
+        Ok(insert)
     }
 
     fn doorbell_id(&self) -> Option<usize> {
@@ -249,12 +246,11 @@ impl QueueData {
     /// `Self::commit_ringbuf_range` will publish once the caller has
     /// registered the matching pending submit fence.
     pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64> {
-        let ringbuf_input = self.ringbuf_space_for(instrs.len())?;
+        let ringbuf_start = self.ringbuf_space_for(instrs.len())?;
 
         let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.size();
 
-        let ringbuf_start = ringbuf_input.insert;
         let cs_insert = (ringbuf_start & (size as u64 - 1)) as usize;
 
         let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
@@ -281,18 +277,20 @@ impl QueueData {
     /// Publishes a previously claimed ringbuffer range to the firmware.
     ///
     /// `completion_point` must equal the value returned from the matching
-    /// `claim_ringbuf_range`. The leading `mb(Write)` orders the ringbuffer
-    /// writes before the `INSERT` write. The trailing `mb(Write)` orders `INSERT`
-    /// before the doorbell ring.
+    /// `claim_ringbuf_range`. `extract_init` and the ringbuffer bytes are
+    /// written before the leading `mb(Write)`, so they land before `insert`.
+    /// The trailing `mb(Write)` orders `insert` before the doorbell ring.
+    ///
+    /// The `extract` read here can race the firmware, but it need not be
+    /// exact. `program_csg_activate` re-latches `extract_init` for every
+    /// queue while the CSG is unbound, and the firmware starts a CS from
+    /// that value.
     pub(super) fn commit_ringbuf_range(&self, completion_point: u64) -> Result {
+        let extract = self.interfaces.read_extract()?;
+        self.interfaces.write_extract_init(extract)?;
+
         mb(Write);
-
-        let mut ringbuf_input = self.interfaces.read_input()?;
-        let ringbuf_output = self.interfaces.read_output()?;
-        ringbuf_input.extract_init = ringbuf_output.extract;
-        ringbuf_input.insert = completion_point;
-
-        self.interfaces.write_input(ringbuf_input)?;
+        self.interfaces.write_insert(completion_point)?;
         mb(Write);
         Ok(())
     }
@@ -502,9 +500,7 @@ impl QueueData {
     /// Returns `true` if the firmware-visible ring buffer is currently
     /// empty (`INSERT == EXTRACT`).
     pub(crate) fn is_ringbuf_empty(&self) -> Result<bool> {
-        let input = self.interfaces.read_input()?;
-        let output = self.interfaces.read_output()?;
-        Ok(input.insert == output.extract)
+        Ok(self.interfaces.read_insert()? == self.interfaces.read_extract()?)
     }
 
     /// Synchronizes the queue's `input.extract_init` from the firmware's
@@ -513,15 +509,9 @@ impl QueueData {
     /// Must be called before staging `CS_REQ.state = Start` at CSG-bind
     /// time so the firmware sees a consistent `(insert, extract_init)`
     /// snapshot when it starts reading the per-queue ringbuf mailbox.
-    ///
-    /// The read-modify-write preserves `insert` and updates only
-    /// `extract_init`.
     pub(crate) fn sync_extract_init(&self) -> Result {
-        let ringbuf_output = self.interfaces.read_output()?;
-        let mut ringbuf_input = self.interfaces.read_input()?;
-        ringbuf_input.extract_init = ringbuf_output.extract;
-        self.interfaces.write_input(ringbuf_input)?;
-        Ok(())
+        let extract = self.interfaces.read_extract()?;
+        self.interfaces.write_extract_init(extract)
     }
 
     /// Builds the `CsActivateInputs` needed to program this queue's
@@ -1142,7 +1132,7 @@ impl Deref for Queue {
 
 /// Firmware layout of the queue input block.
 #[repr(C)]
-pub(super) struct RingBufferInput {
+struct RingBufferInput {
     insert: u64,
     extract_init: u64,
 }
@@ -1155,7 +1145,7 @@ impl RingBufferInput {
 /// Firmware layout of the queue output block. It stops at `extract`,
 /// since the driver never reads the word that follows.
 #[repr(C)]
-pub(super) struct RingBufferOutput {
+struct RingBufferOutput {
     extract: u64,
 }
 
@@ -1187,31 +1177,28 @@ impl Interfaces {
         })
     }
 
-    pub(super) fn read_input(&self) -> Result<RingBufferInput> {
-        let vmap = self.mem.vmap();
-
-        Ok(RingBufferInput {
-            insert: vmap.try_read64(self.input_offset + RingBufferInput::INSERT)?,
-            extract_init: vmap.try_read64(self.input_offset + RingBufferInput::EXTRACT_INIT)?,
-        })
+    pub(super) fn read_insert(&self) -> Result<u64> {
+        self.mem
+            .vmap()
+            .try_read64(self.input_offset + RingBufferInput::INSERT)
     }
 
-    pub(super) fn write_input(&self, value: RingBufferInput) -> Result {
-        let vmap = self.mem.vmap();
+    pub(super) fn write_insert(&self, insert: u64) -> Result {
+        self.mem
+            .vmap()
+            .try_write64(insert, self.input_offset + RingBufferInput::INSERT)
+    }
 
-        vmap.try_write64(
-            value.extract_init,
+    pub(super) fn write_extract_init(&self, extract_init: u64) -> Result {
+        self.mem.vmap().try_write64(
+            extract_init,
             self.input_offset + RingBufferInput::EXTRACT_INIT,
-        )?;
-        vmap.try_write64(value.insert, self.input_offset + RingBufferInput::INSERT)
+        )
     }
 
-    pub(super) fn read_output(&self) -> Result<RingBufferOutput> {
-        Ok(RingBufferOutput {
-            extract: self
-                .mem
-                .vmap()
-                .try_read64(self.output_offset + RingBufferOutput::EXTRACT)?,
-        })
+    pub(super) fn read_extract(&self) -> Result<u64> {
+        self.mem
+            .vmap()
+            .try_read64(self.output_offset + RingBufferOutput::EXTRACT)
     }
 }
