@@ -913,6 +913,7 @@ impl TyrDrmFileData {
         groupsubmit: &mut uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result<u32> {
+        trace::group_submit_entry(groupsubmit.group_handle, groupsubmit.queue_submits.count);
         file.inner().group_pool().submit_group(groupsubmit, file)?;
 
         Ok(0)
@@ -982,7 +983,9 @@ impl TyrDrmFileData {
             None
         };
 
+        let has_label = label.is_some();
         bo.set_label(label);
+        trace::bo_set_label(gem::debug_id(&bo), has_label);
 
         Ok(0)
     }
