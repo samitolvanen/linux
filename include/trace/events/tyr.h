@@ -417,21 +417,43 @@ TRACE_EVENT(tyr_group_timedout,
 	TP_printk("group=%llu", __entry->group_id)
 );
 
+/*
+ * Group marked innocent, i.e. collateral of another group's failure
+ * rather than the culprit. Emitted where the scheduler sets the bit
+ * that GROUP_GET_STATE later reports.
+ */
+TRACE_EVENT(tyr_group_innocent,
+	TP_PROTO(u64 group_id, u64 group_uid),
+	TP_ARGS(group_id, group_uid),
+	TP_STRUCT__entry(
+		__field(u64, group_id)
+		__field(u64, group_uid)
+	),
+	TP_fast_assign(
+		__entry->group_id = group_id;
+		__entry->group_uid = group_uid;
+	),
+	TP_printk("group=%llu group_uid=%llu", __entry->group_id,
+		  __entry->group_uid)
+);
+
 TRACE_EVENT(tyr_sched_evict,
-	TP_PROTO(u32 csg_id, u64 group_id, u8 sw_prio),
-	TP_ARGS(csg_id, group_id, sw_prio),
+	TP_PROTO(u32 csg_id, u64 group_id, u8 sw_prio, bool forced),
+	TP_ARGS(csg_id, group_id, sw_prio, forced),
 	TP_STRUCT__entry(
 		__field(u32, csg_id)
 		__field(u64, group_id)
 		__field(u8, sw_prio)
+		__field(bool, forced)
 	),
 	TP_fast_assign(
 		__entry->csg_id = csg_id;
 		__entry->group_id = group_id;
 		__entry->sw_prio = sw_prio;
+		__entry->forced = forced;
 	),
-	TP_printk("csg=%u group=%llu sw_prio=%u", __entry->csg_id,
-		  __entry->group_id, __entry->sw_prio)
+	TP_printk("csg=%u group=%llu sw_prio=%u forced=%d", __entry->csg_id,
+		  __entry->group_id, __entry->sw_prio, __entry->forced)
 );
 
 TRACE_EVENT(tyr_sched_keep,

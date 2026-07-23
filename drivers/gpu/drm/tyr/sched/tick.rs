@@ -923,6 +923,7 @@ impl<'a> Tick<'a> {
         &mut self,
         data: &ARef<TyrDrmDevice>,
         keep_mask: u32,
+        forced: bool,
         context: &mut CsgUpdateContext,
     ) {
         // Build the halt request set under the slot-manager lock,
@@ -942,6 +943,7 @@ impl<'a> Tick<'a> {
                 i as u32,
                 slot_data.group.handle(),
                 slot_data.group.priority as u8,
+                forced,
             );
 
             let can_run = slot_data.group.can_run();
@@ -1038,7 +1040,7 @@ impl<'a> Tick<'a> {
         // pass selected some.
         context.reclaim = decision.num_selected != 0;
 
-        self.stage_evictions(data, decision.keep_mask, &mut context);
+        self.stage_evictions(data, decision.keep_mask, false, &mut context);
 
         if let Err(e) = self.sched.apply_csg_updates(data, &mut context) {
             pr_err!("apply_csg_updates (halt) failed\n");
@@ -1048,9 +1050,14 @@ impl<'a> Tick<'a> {
                     continue;
                 }
                 if let Some(slot_data) = csg_slot_manager.slot_data(i) {
-                    slot_data
-                        .group
-                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
+                    let innocent = slot_data.group.with_locked_inner(|inner| {
+                        let innocent = inner.can_run();
+                        inner.mark_evicted_by_timeout();
+                        innocent
+                    });
+                    if innocent {
+                        trace::group_innocent(slot_data.group.handle(), slot_data.group.uid());
+                    }
                 }
             }
             return Err(e);
@@ -1067,7 +1074,7 @@ impl<'a> Tick<'a> {
     fn suspend(&mut self, data: &ARef<TyrDrmDevice>) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        self.stage_evictions(data, 0, &mut context);
+        self.stage_evictions(data, 0, true, &mut context);
 
         if self.sched.apply_csg_updates(data, &mut context).is_err() {
             pr_err!("CSG suspend failed, escalating to termination\n");
@@ -1081,9 +1088,14 @@ impl<'a> Tick<'a> {
                     let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                         continue;
                     };
-                    slot_data
-                        .group
-                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
+                    let innocent = slot_data.group.with_locked_inner(|inner| {
+                        let innocent = inner.can_run();
+                        inner.mark_evicted_by_timeout();
+                        innocent
+                    });
+                    if innocent {
+                        trace::group_innocent(slot_data.group.handle(), slot_data.group.uid());
+                    }
                     term_context.set_state(i, CsgExecutionState::Terminate);
                 }
             }
