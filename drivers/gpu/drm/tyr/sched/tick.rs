@@ -753,7 +753,7 @@ impl<'a> Tick<'a> {
 
             if can_run {
                 if let Ok(list_arc) = ListArc::try_from_arc(group.clone()) {
-                    let is_idle = group.is_idle();
+                    let is_idle = group.is_idle_live();
                     self.sched.requeue_group(list_arc, is_idle);
                 }
             } else if self.num_teardown < self.teardown_groups.len() {
@@ -835,11 +835,10 @@ impl<'a> Tick<'a> {
                                 // Activate failed, so restore the list_arc to
                                 // the list `take_unbound` sourced it from
                                 // (recorded in `prior_state`) so the next
-                                // tick can rediscover the group. A group not
-                                // on the runnable list is treated as idle for
-                                // requeue purposes.
+                                // tick can rediscover the group.
                                 let is_idle =
-                                    !matches!(pending.prior_state, GroupListState::Runnable);
+                                    !matches!(pending.prior_state, GroupListState::Runnable)
+                                        && group.is_idle_live();
                                 self.sched.requeue_group(pending.list_arc, is_idle);
                                 continue;
                             }
@@ -877,7 +876,8 @@ impl<'a> Tick<'a> {
                                     }
                                 });
                             }
-                            let is_idle = !matches!(pending.prior_state, GroupListState::Runnable);
+                            let is_idle = !matches!(pending.prior_state, GroupListState::Runnable)
+                                && group.is_idle_live();
                             self.sched.requeue_group(pending.list_arc, is_idle);
                             continue;
                         }
