@@ -468,8 +468,23 @@ impl Group {
         !self.vm.is_unusable() && self.inner.lock().can_run()
     }
 
-    pub(crate) fn is_idle(&self) -> bool {
-        self.inner.lock().is_idle()
+    /// Unlike the snapshot-only `GroupInner::is_idle`, each idle-classified
+    /// queue's live ring is re-read to catch a job published after the
+    /// snapshot. Only meaningful once the group has left `State::Active`.
+    pub(crate) fn is_idle_live(&self) -> bool {
+        let inner = self.inner.lock();
+        if !inner.is_idle() {
+            return false;
+        }
+        for (cs_id, queue) in self.queues.iter().enumerate() {
+            if inner.blocked_queues() & (1u32 << cs_id) != 0 {
+                continue;
+            }
+            if !queue.is_ringbuf_empty().unwrap_or(false) {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn status(&self) -> GroupStatus {
