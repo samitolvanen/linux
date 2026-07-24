@@ -884,6 +884,8 @@ impl QueueOps for TyrQueueOps {
             // No tick runs for a resumed queue, so record the busy edge here.
             group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
         } else {
+            // A concurrent eviction requeues by live ring state, so the
+            // bytes committed above are still kicked.
             let tick = match group.tdev.with_locked_scheduler(|sched| {
                 sched.mark_group_runnable(group);
                 Ok(sched.submit_tick(group.priority))
