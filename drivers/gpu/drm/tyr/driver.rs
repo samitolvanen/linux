@@ -45,7 +45,6 @@ use kernel::{
     },
     prelude::*,
     regulator,
-    regulator::Regulator,
     sizes::SZ_2M,
     sync::{
         aref::ARef,
@@ -253,9 +252,6 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) clks: Mutex<Clocks>,
-
-    #[pin]
-    regulators: Mutex<Regulators>,
 
     /// Some information on the GPU.
     ///
@@ -675,7 +671,11 @@ impl platform::Driver for TyrPlatformDriverData {
         stacks_clk.prepare_enable()?;
         coregroup_clk.prepare_enable()?;
 
-        let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
+        match regulator::devm_enable_optional(pdev.as_ref(), c"mali") {
+            Ok(()) => {}
+            Err(e) if e == ENODEV => {}
+            Err(e) => return Err(e),
+        }
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
         let mmio_phys_addr = request.start();
@@ -756,9 +756,6 @@ impl platform::Driver for TyrPlatformDriverData {
                     stacks: stacks_clk,
                     coregroup: coregroup_clk,
                     gated: false,
-                }),
-                regulators <- new_mutex!(Regulators {
-                    _mali: mali_regulator,
                 }),
                 reset,
                 gpu_info,
@@ -994,8 +991,4 @@ impl Drop for Clocks {
             self.core.disable_unprepare();
         }
     }
-}
-
-struct Regulators {
-    _mali: Regulator<regulator::Enabled>,
 }
