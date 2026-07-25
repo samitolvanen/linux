@@ -183,19 +183,27 @@ pub(crate) fn init(
         Err(e) => return Err(e),
     }
 
-    let names = kvec![CString::try_from(c"mali")?]?;
-
-    let config_token = opp::Config::<OppConfigOps>::new()
-        .set_regulator_names(names)?
-        .set(pdev)?;
-
-    *tdev.opp_config.lock() = Some(config_token);
-
     let dev: ARef<Device> = tdev.pdev.as_ref().into();
-    let table = match opp::Table::from_of(&dev, 0) {
+    let table = match opp::Table::from_dev(&dev) {
         Ok(t) => t,
-        Err(e) if e == ENODEV => return Ok(None),
-        Err(e) => return Err(e),
+        Err(_) => {
+            let names = kvec![CString::try_from(c"mali")?]?;
+
+            match opp::Config::<OppConfigOps>::new()
+                .set_regulator_names(names)?
+                .set(pdev)
+            {
+                Ok(config_token) => *tdev.opp_config.lock() = Some(config_token),
+                Err(e) if e == ENODEV => {}
+                Err(e) => return Err(e),
+            }
+
+            match opp::Table::from_of(&dev, 0) {
+                Ok(t) => t,
+                Err(e) if e == ENODEV => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
     };
 
     match table.opp_from_freq(
