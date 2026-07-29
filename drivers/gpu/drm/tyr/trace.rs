@@ -1012,6 +1012,21 @@ kernel::declare_trace! {
         vt_end: u32,
         frag_end: u32,
     );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_heap_grow_decision(
+        group_uid: u64,
+        cs_id: u32,
+        chunk_count: u32,
+        max_chunks: u32,
+        renderpasses_in_flight: u32,
+        target_in_flight: u32,
+        pending_frag_count: u32,
+        outcome: u32,
+    );
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -3055,6 +3070,48 @@ pub(crate) fn wedge_cs_state(
             vt_start,
             vt_end,
             frag_end,
+        )
+    }
+}
+
+/// Outcome of one tiler-heap grow attempt. Keep in sync with
+/// `TYR_HEAP_GROW_OUTCOMES` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum HeapGrowOutcome {
+    /// A chunk was linked into the heap.
+    Grown = 0,
+    /// The heap cannot grow, so the firmware is asked to reclaim.
+    Reclaim = 1,
+    /// The grow failed unexpectedly and the queue is marked fatal.
+    Fatal = 2,
+}
+
+/// State a tiler-heap grow decision was taken on, and its outcome. The
+/// counts are the ones the decision was taken on, so on a grow they
+/// precede the new chunk. A `Fatal` outcome can carry zeroes, because
+/// the heap the grow addressed was never found.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn heap_grow_decision(
+    group_uid: u64,
+    cs_id: u32,
+    chunk_count: u32,
+    max_chunks: u32,
+    renderpasses_in_flight: u32,
+    target_in_flight: u32,
+    pending_frag_count: u32,
+    outcome: HeapGrowOutcome,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_heap_grow_decision(
+            group_uid,
+            cs_id,
+            chunk_count,
+            max_chunks,
+            renderpasses_in_flight,
+            target_in_flight,
+            pending_frag_count,
+            outcome as u32,
         )
     }
 }
