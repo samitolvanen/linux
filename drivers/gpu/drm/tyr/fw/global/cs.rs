@@ -39,6 +39,7 @@ use crate::fw::interfaces::{
     CS_REQ,
     CS_SIZE,
     CS_STATUS_BLOCKED_REASON,
+    CS_STATUS_REQ_RESOURCE,
     CS_STATUS_SCOREBOARDS,
     CS_STATUS_WAIT,
     CS_STATUS_WAIT_SYNC_POINTER,
@@ -418,6 +419,20 @@ impl CsInterface {
         };
 
         Ok(enabled.cs_output.read(CS_STATUS_WAIT).into_raw())
+    }
+
+    /// Reads the raw `CS_STATUS_REQ_RESOURCE` output register value.
+    ///
+    /// The low bits say which resources the command stream asked for and
+    /// bits 16 and up which of them the firmware granted, so a CS blocked
+    /// on `CsBlockedReason::Resource` shows what it is waiting for.
+    pub(crate) fn read_status_req_resource_raw(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_output.read(CS_STATUS_REQ_RESOURCE).into_raw())
     }
 
     /// Reads the raw `CS_STATUS_WAIT_SYNC_POINTER` output register value.
