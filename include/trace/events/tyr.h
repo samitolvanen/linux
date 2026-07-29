@@ -2951,6 +2951,123 @@ TRACE_EVENT(tyr_fw_ping,
 		  __entry->errno)
 );
 
+/*
+ * MCU_STATUS values as defined in drivers/gpu/drm/tyr/regs.rs. Keep in
+ * sync with the `McuStatus` enum.
+ */
+#define TYR_MCU_STATUS_VALUES		\
+	{ 0, "DISABLED" },		\
+	{ 1, "ENABLED" },		\
+	{ 2, "HALT" },			\
+	{ 3, "FATAL" }
+
+TRACE_EVENT(tyr_wedge_glb_probe,
+	TP_PROTO(u32 csg_id, u32 req_mask, u32 glb_req_before,
+		 u32 glb_ack_before, u32 glb_req_after, u32 glb_ack_after,
+		 bool ping_acked, u32 mcu_status),
+	TP_ARGS(csg_id, req_mask, glb_req_before, glb_ack_before,
+		glb_req_after, glb_ack_after, ping_acked, mcu_status),
+	TP_STRUCT__entry(
+		__field(u32, csg_id)
+		__field(u32, req_mask)
+		__field(u32, glb_req_before)
+		__field(u32, glb_ack_before)
+		__field(u32, glb_req_after)
+		__field(u32, glb_ack_after)
+		__field(bool, ping_acked)
+		__field(u32, mcu_status)
+	),
+	TP_fast_assign(
+		__entry->csg_id = csg_id;
+		__entry->req_mask = req_mask;
+		__entry->glb_req_before = glb_req_before;
+		__entry->glb_ack_before = glb_ack_before;
+		__entry->glb_req_after = glb_req_after;
+		__entry->glb_ack_after = glb_ack_after;
+		__entry->ping_acked = ping_acked;
+		__entry->mcu_status = mcu_status;
+	),
+	TP_printk("csg=%u req_mask=0x%08x glb_req=0x%08x->0x%08x glb_ack=0x%08x->0x%08x ping_acked=%d mcu_status=0x%08x(%s)",
+		  __entry->csg_id, __entry->req_mask,
+		  __entry->glb_req_before, __entry->glb_req_after,
+		  __entry->glb_ack_before, __entry->glb_ack_after,
+		  __entry->ping_acked, __entry->mcu_status,
+		  __print_symbolic(__entry->mcu_status & 0x3,
+				   TYR_MCU_STATUS_VALUES))
+);
+
+/*
+ * CS_STATUS_BLOCKED_REASON values as defined in
+ * drivers/gpu/drm/tyr/fw/interfaces.rs. Keep in sync with the
+ * `CsBlockedReason` enum.
+ */
+#define TYR_CS_BLOCKED_REASONS		\
+	{ 0, "UNBLOCKED" },		\
+	{ 1, "SB_WAIT" },		\
+	{ 2, "PROGRESS_WAIT" },		\
+	{ 3, "SYNC_WAIT" },		\
+	{ 4, "DEFERRED" },		\
+	{ 5, "RESOURCE" },		\
+	{ 6, "FLUSH" }
+
+/*
+ * CS_STATUS_REQ_RESOURCE bits as defined in
+ * drivers/gpu/drm/tyr/fw/interfaces.rs. The low bits are the resources
+ * the command stream asked for, bits 16 and up the ones the firmware
+ * granted.
+ */
+#define TYR_CS_REQ_RESOURCE_FLAGS		\
+	{ 0x00000001, "COMPUTE_REQ" },		\
+	{ 0x00000002, "FRAGMENT_REQ" },		\
+	{ 0x00000004, "TILER_REQ" },		\
+	{ 0x00000008, "IDVS_REQ" },		\
+	{ 0x00010000, "COMPUTE_GRANT" },	\
+	{ 0x00020000, "FRAGMENT_GRANT" },	\
+	{ 0x00040000, "TILER_GRANT" },		\
+	{ 0x00080000, "IDVS_GRANT" }
+
+TRACE_EVENT(tyr_wedge_cs_state,
+	TP_PROTO(u32 csg_id, u64 group_uid, u32 cs_id, u32 status_wait,
+		 u32 blocked_reason, u32 req_resource, u64 heap_address,
+		 u32 vt_start, u32 vt_end, u32 frag_end),
+	TP_ARGS(csg_id, group_uid, cs_id, status_wait, blocked_reason,
+		req_resource, heap_address, vt_start, vt_end, frag_end),
+	TP_STRUCT__entry(
+		__field(u32, csg_id)
+		__field(u64, group_uid)
+		__field(u32, cs_id)
+		__field(u32, status_wait)
+		__field(u32, blocked_reason)
+		__field(u32, req_resource)
+		__field(u64, heap_address)
+		__field(u32, vt_start)
+		__field(u32, vt_end)
+		__field(u32, frag_end)
+	),
+	TP_fast_assign(
+		__entry->csg_id = csg_id;
+		__entry->group_uid = group_uid;
+		__entry->cs_id = cs_id;
+		__entry->status_wait = status_wait;
+		__entry->blocked_reason = blocked_reason;
+		__entry->req_resource = req_resource;
+		__entry->heap_address = heap_address;
+		__entry->vt_start = vt_start;
+		__entry->vt_end = vt_end;
+		__entry->frag_end = frag_end;
+	),
+	TP_printk("csg=%u group_uid=%llu cs=%u status_wait=0x%08x blocked_reason=%s req_resource=0x%08x(%s) heap_address=0x%llx vt_start=%u vt_end=%u frag_end=%u",
+		  __entry->csg_id, __entry->group_uid, __entry->cs_id,
+		  __entry->status_wait,
+		  __print_symbolic(__entry->blocked_reason,
+				   TYR_CS_BLOCKED_REASONS),
+		  __entry->req_resource,
+		  __print_flags(__entry->req_resource, "|",
+				TYR_CS_REQ_RESOURCE_FLAGS),
+		  __entry->heap_address, __entry->vt_start, __entry->vt_end,
+		  __entry->frag_end)
+);
+
 #endif /* _TYR_TRACE_H */
 
 /* This part must be outside protection. */
