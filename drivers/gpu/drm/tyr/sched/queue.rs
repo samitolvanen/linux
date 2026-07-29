@@ -1075,11 +1075,17 @@ impl Queue {
     /// Cancels every job tracked by this queue and signals all
     /// remaining pending submit fences with `err`.
     ///
+    /// The caller must have made the group unrunnable first, so no
+    /// fresh job reaches the queue while this runs.
+    ///
     /// Must be called from process context: `cancel_all` may sleep
     /// waiting for in-flight HW fences.
     pub(crate) fn cancel(&self, err: Error) {
+        self.job_queue.park();
+        self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
         self.job_queue.cancel_all();
         self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
+        self.job_queue.unpark();
     }
 }
 
