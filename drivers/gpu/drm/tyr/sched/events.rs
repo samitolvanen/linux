@@ -130,6 +130,8 @@ impl WorkItem<2> for Group {
                             heap_gpu_va: oom.heap_address,
                             renderpasses_in_flight: oom.vt_start.wrapping_sub(oom.frag_end),
                             pending_frag_count: oom.vt_end.wrapping_sub(oom.frag_end),
+                            group_uid: this.uid(),
+                            cs_id: oom.cs_id,
                         },
                     )
                 })

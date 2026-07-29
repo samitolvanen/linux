@@ -80,6 +80,21 @@ pub(crate) struct ContextGrowArgs {
     pub(crate) heap_gpu_va: u64,
     pub(crate) renderpasses_in_flight: u32,
     pub(crate) pending_frag_count: u32,
+    /// Identity of the group whose CS raised the OOM, carried for the
+    /// `tyr_heap_grow_decision` tracepoint.
+    pub(crate) group_uid: u64,
+    /// Index of the CS within that group.
+    pub(crate) cs_id: u32,
+}
+
+/// Per-heap state observed while deciding whether a grow can proceed,
+/// reported by `Pool::grow_heap_context` through the
+/// `tyr_heap_grow_decision` tracepoint.
+#[derive(Default)]
+struct GrowState {
+    chunk_count: u32,
+    max_chunks: u32,
+    target_in_flight: u32,
 }
 
 pub(crate) struct Pools {
@@ -391,8 +406,39 @@ impl Pool {
         tdev: &TyrDrmDevice,
         args: ContextGrowArgs,
     ) -> Result<(u64, u64)> {
-        let _ = args.pending_frag_count;
+        let mut state = GrowState::default();
+        let result = self.try_grow_heap_context(tdev, &args, &mut state);
 
+        // Mirrors the outcome the caller derives from the same error
+        // codes in `sched::events`.
+        let outcome = match &result {
+            Ok(_) => trace::HeapGrowOutcome::Grown,
+            Err(e) if *e == ENOMEM => trace::HeapGrowOutcome::Reclaim,
+            Err(_) => trace::HeapGrowOutcome::Fatal,
+        };
+        trace::heap_grow_decision(
+            args.group_uid,
+            args.cs_id,
+            state.chunk_count,
+            state.max_chunks,
+            args.renderpasses_in_flight,
+            state.target_in_flight,
+            args.pending_frag_count,
+            outcome,
+        );
+
+        result
+    }
+
+    /// Links one more chunk into the heap context addressed by
+    /// `args.heap_gpu_va`, recording the state the decision was taken on
+    /// in `state` so the caller can trace refusals.
+    fn try_grow_heap_context(
+        &self,
+        tdev: &TyrDrmDevice,
+        args: &ContextGrowArgs,
+        state: &mut GrowState,
+    ) -> Result<(u64, u64)> {
         let index = self.heap_va_to_index(tdev, args.heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
@@ -403,6 +449,10 @@ impl Pool {
         let (vm, chunk_size, max_chunks, cookie) = {
             let guard = xa.lock();
             let heap_ctx = guard.get(index).ok_or(EINVAL)?;
+
+            state.chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
+            state.max_chunks = heap_ctx.max_chunks;
+            state.target_in_flight = heap_ctx.target_in_flight;
 
             if args.renderpasses_in_flight > heap_ctx.target_in_flight
                 || heap_ctx.chunks.len() >= heap_ctx.max_chunks as usize
@@ -432,6 +482,10 @@ impl Pool {
         if heap_ctx.cookie != cookie {
             return Err(EINVAL);
         }
+
+        // Chunks may have been added while the lock was dropped, so refresh
+        // the count the refusal below is taken on.
+        state.chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
 
         if heap_ctx.chunks.len() >= max_chunks as usize {
             return Err(ENOMEM);
