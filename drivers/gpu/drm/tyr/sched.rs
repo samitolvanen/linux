@@ -806,6 +806,7 @@ impl Scheduler {
 
         data.fw.ring_csg_doorbells(context.update_mask)?;
 
+        let mut glb_probed = false;
         for csg_id in 0..MAX_CSGS {
             if !context.update_mask.contains(csg_id) {
                 continue;
@@ -824,9 +825,13 @@ impl Scheduler {
                             req_mask,
                             acked
                         );
-                        if let Some(re_acked) =
-                            self.probe_csg_ack_timeout(data, csg_id, req_mask, acked)
-                        {
+                        if let Some(re_acked) = self.probe_csg_ack_timeout(
+                            data,
+                            csg_id,
+                            req_mask,
+                            acked,
+                            &mut glb_probed,
+                        ) {
                             context.acked_reqs[csg_id] = re_acked;
                         } else {
                             context.timedout_mask.insert(csg_id);
@@ -865,12 +870,13 @@ impl Scheduler {
         if !context.timedout_mask.is_empty() {
             // `sync_csg_slot_queues_state` is unreachable when STATUS_UPDATE
             // times out, so snapshot the per-CS status registers directly
-            // here.
+            // here. Firmware that stops acking one slot may have stopped
+            // acking all of them, so dump every slot and every CS
+            // interface on it, bound or not. A CS whose blocked reason
+            // does not decode still gets dumped, with the reason reported
+            // as `u32::MAX`.
             gpu::trace_shader_power_state(&data.iomem);
             for csg_id in 0..MAX_CSGS {
-                if !context.timedout_mask.contains(csg_id) {
-                    continue;
-                }
                 if let Ok((ack, state, ep_cur, ep_req, rdep)) = data
                     .fw
                     .with_csg_mut(csg_id, |csg| csg.read_output_dump_raw())
@@ -878,27 +884,25 @@ impl Scheduler {
                     trace::fw_csg_dump_output(csg_id as u32, ack, state, ep_cur, ep_req, rdep);
                 }
 
-                let (vm, group_uid, queue_count) = csg_slot_manager
+                let (vm, group_uid) = csg_slot_manager
                     .slot_data(csg_id)
-                    .map(|s| {
-                        (
-                            Some(s.group.vm.clone()),
-                            s.group.uid(),
-                            core::cmp::min(s.group.queue_count(), group::MAX_CS_PER_GROUP),
-                        )
-                    })
-                    .unwrap_or((None, 0, 0));
+                    .map(|s| (Some(s.group.vm.clone()), s.group.uid()))
+                    .unwrap_or((None, 0));
                 let _ = data.fw.with_csg_mut(csg_id, |csg| {
-                    for cs_id in 0..queue_count {
+                    for cs_id in 0..group::MAX_CS_PER_GROUP {
                         let Some(cs) = csg.cs_mut(cs_id) else {
                             continue;
                         };
                         let req = cs.read_input_req_raw()?;
                         let ack = cs.read_output_ack_raw()?;
                         let status_wait = cs.read_status_wait_raw()?;
-                        let reason = cs.read_status_blocked_reason()? as u32;
+                        let reason = cs
+                            .read_status_blocked_reason()
+                            .map_or(u32::MAX, |reason| reason as u32);
                         let scoreboards = cs.read_status_scoreboards()?;
                         let sync_ptr = cs.read_status_wait_sync_pointer_raw()?;
+                        let req_resource = cs.read_status_req_resource_raw()?;
+                        let heap = cs.read_heap_output_state()?;
                         let (cur_val, cur_val_valid) = match &vm {
                             Some(vm) if trace::cs_status_snapshot_enabled() => {
                                 let sync64 = status_wait & (1 << 30) != 0;
@@ -919,6 +923,18 @@ impl Scheduler {
                             cur_val,
                             cur_val_valid,
                         );
+                        trace::wedge_cs_state(
+                            csg_id as u32,
+                            group_uid,
+                            cs_id as u32,
+                            status_wait,
+                            reason,
+                            req_resource,
+                            heap.heap_address,
+                            heap.vt_start,
+                            heap.vt_end,
+                            heap.frag_end,
+                        );
                     }
                     Ok::<_, Error>(())
                 });
@@ -938,6 +954,10 @@ impl Scheduler {
     /// it stayed wedged, in which case the caller records the timeout
     /// unchanged.
     ///
+    /// A slot that stays wedged also gets a global-interface liveness
+    /// probe, unless `glb_probed` says an earlier slot in this pass
+    /// already ran one.
+    ///
     /// Downstream-only debug aid; not for upstream. Distinguishes a
     /// transient CPU->MCU visibility race (re-kick recovers) from
     /// firmware state corruption (re-kick does not).
@@ -947,6 +967,7 @@ impl Scheduler {
         csg_id: usize,
         req_mask: CSG_REQ,
         acked: CSG_REQ,
+        glb_probed: &mut bool,
     ) -> Option<CSG_REQ> {
         // Snapshot the per-CS ringbuf state under a short-lived slot
         // manager lock; the lock must be dropped before `wait_csg_acks`.
@@ -984,39 +1005,97 @@ impl Scheduler {
         const CSG_REQ_ACK_TIMEOUT_MS: u32 = 100;
         let mut rekick_mask = CsgSlotMask::empty();
         rekick_mask.insert(csg_id);
-        if let Err(e) = data.fw.ring_csg_doorbells(rekick_mask) {
-            pr_info!(
-                "CSG {}: re-kick doorbell failed: {}\n",
-                csg_id,
-                e.to_errno()
-            );
-            return None;
-        }
-        match data
-            .fw
-            .wait_csg_acks(csg_id, req_mask, CSG_REQ_ACK_TIMEOUT_MS)
-        {
-            Ok(re_acked) if re_acked == req_mask => {
+        let recovered = match data.fw.ring_csg_doorbells(rekick_mask) {
+            Err(e) => {
                 pr_info!(
-                    "CSG {}: re-kick recovered ack: req_mask=0x{:x} acked=0x{:x}\n",
+                    "CSG {}: re-kick doorbell failed: {}\n",
                     csg_id,
-                    req_mask,
-                    re_acked
-                );
-                Some(re_acked)
-            }
-            Ok(re_acked) => {
-                pr_info!(
-                    "CSG {}: re-kick did not recover: req_mask=0x{:x} acked=0x{:x}\n",
-                    csg_id,
-                    req_mask,
-                    re_acked
+                    e.to_errno()
                 );
                 None
+            }
+            Ok(()) => match data
+                .fw
+                .wait_csg_acks(csg_id, req_mask, CSG_REQ_ACK_TIMEOUT_MS)
+            {
+                Ok(re_acked) if re_acked == req_mask => {
+                    pr_info!(
+                        "CSG {}: re-kick recovered ack: req_mask=0x{:x} acked=0x{:x}\n",
+                        csg_id,
+                        req_mask,
+                        re_acked
+                    );
+                    Some(re_acked)
+                }
+                Ok(re_acked) => {
+                    pr_info!(
+                        "CSG {}: re-kick did not recover: req_mask=0x{:x} acked=0x{:x}\n",
+                        csg_id,
+                        req_mask,
+                        re_acked
+                    );
+                    None
+                }
+                Err(e) => {
+                    pr_info!("CSG {}: re-kick wait failed: {}\n", csg_id, e.to_errno());
+                    None
+                }
+            },
+        };
+
+        if recovered.is_none() && !*glb_probed {
+            *glb_probed = true;
+            Self::probe_glb_liveness(data, csg_id, req_mask);
+        }
+
+        recovered
+    }
+
+    /// Probes the global interface once for a slot that stayed unacked
+    /// through a re-kick.
+    ///
+    /// A ping ack means the firmware still runs the global protocol and
+    /// only the CSG state machine is stuck. A missing ack points at the
+    /// MCU itself, and `MCU_STATUS` says which state it stopped in.
+    ///
+    /// Downstream-only debug aid. Not for upstream.
+    fn probe_glb_liveness(data: &TyrDrmDevice, csg_id: usize, req_mask: CSG_REQ) {
+        const GLB_PROBE_TIMEOUT_MS: u32 = 100;
+
+        match data.fw.probe_liveness(GLB_PROBE_TIMEOUT_MS) {
+            Ok((probe, mcu_status)) => {
+                pr_err!(
+                    "CSG {}: GLB liveness probe: {} req_mask=0x{:x} glb_req=0x{:x}->0x{:x} glb_ack=0x{:x}->0x{:x} mcu_status=0x{:x}\n",
+                    csg_id,
+                    if probe.acked {
+                        "glb alive"
+                    } else {
+                        "glb unresponsive"
+                    },
+                    req_mask.into_raw(),
+                    probe.req_before,
+                    probe.req_after,
+                    probe.ack_before,
+                    probe.ack_after,
+                    mcu_status
+                );
+                trace::wedge_glb_probe(
+                    csg_id as u32,
+                    req_mask.into_raw(),
+                    probe.req_before,
+                    probe.ack_before,
+                    probe.req_after,
+                    probe.ack_after,
+                    probe.acked,
+                    mcu_status,
+                );
             }
             Err(e) => {
-                pr_info!("CSG {}: re-kick wait failed: {}\n", csg_id, e.to_errno());
-                None
+                pr_err!(
+                    "CSG {}: GLB liveness probe failed: {}\n",
+                    csg_id,
+                    e.to_errno()
+                );
             }
         }
     }

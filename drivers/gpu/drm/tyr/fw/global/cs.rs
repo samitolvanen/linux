@@ -19,10 +19,10 @@ use crate::fw::interfaces::{
     CS_CONFIG, CS_CONTROL_BLOCK_SIZE, CS_FATAL, CS_FATAL_INFO, CS_FAULT, CS_FAULT_INFO,
     CS_HEAP_ADDRESS, CS_HEAP_FRAG_END, CS_HEAP_VT_END, CS_HEAP_VT_START,
     CS_KERNEL_INPUT_BLOCK_SIZE, CS_KERNEL_OUTPUT_BLOCK_SIZE, CS_REQ, CS_SIZE,
-    CS_STATUS_BLOCKED_REASON, CS_STATUS_SCOREBOARDS, CS_STATUS_WAIT, CS_STATUS_WAIT_SYNC_POINTER,
-    CS_STATUS_WAIT_SYNC_VALUE, CS_STATUS_WAIT_SYNC_VALUE_HI, CS_TILER_HEAP_END,
-    CS_TILER_HEAP_START, CS_USER_INPUT, CS_USER_OUTPUT, STREAM_FEATURES, STREAM_INPUT_VA,
-    STREAM_OUTPUT_VA,
+    CS_STATUS_BLOCKED_REASON, CS_STATUS_REQ_RESOURCE, CS_STATUS_SCOREBOARDS, CS_STATUS_WAIT,
+    CS_STATUS_WAIT_SYNC_POINTER, CS_STATUS_WAIT_SYNC_VALUE, CS_STATUS_WAIT_SYNC_VALUE_HI,
+    CS_TILER_HEAP_END, CS_TILER_HEAP_START, CS_USER_INPUT, CS_USER_OUTPUT, STREAM_FEATURES,
+    STREAM_INPUT_VA, STREAM_OUTPUT_VA,
 };
 
 /// Names for `CS_FATAL.exception_type` codes, used by `CsInterface::decode_fatal`.
@@ -385,6 +385,20 @@ impl CsInterface {
         };
 
         Ok(enabled.cs_output.read(CS_STATUS_WAIT).into_raw())
+    }
+
+    /// Reads the raw `CS_STATUS_REQ_RESOURCE` output register value.
+    ///
+    /// The low bits say which resources the command stream asked for and
+    /// bits 16 and up which of them the firmware granted, so a CS blocked
+    /// on `CsBlockedReason::Resource` shows what it is waiting for.
+    pub(crate) fn read_status_req_resource_raw(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_output.read(CS_STATUS_REQ_RESOURCE).into_raw())
     }
 
     /// Reads the raw `CS_STATUS_WAIT_SYNC_POINTER` output register value.

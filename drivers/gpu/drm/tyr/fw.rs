@@ -55,7 +55,10 @@ use crate::{
         TyrDrmDeviceData, //
     },
     fw::{
-        global::GlobalInterface,
+        global::{
+            GlbProbe,
+            GlobalInterface, //
+        },
         parser::{
             FwParser,
             ParsedSection,
@@ -669,6 +672,25 @@ impl Firmware {
     /// firmware interface.
     pub(crate) fn ping(&self, timeout_ms: u32) -> Result {
         self.global_iface.ping(timeout_ms)
+    }
+
+    /// Probes global-interface liveness with a single ping.
+    ///
+    /// Returns the raw `GLB_REQ`/`GLB_ACK` words sampled around the ping
+    /// together with the raw `MCU_STATUS` read once the ping wait is over,
+    /// or `u32::MAX` if the registers went away with the device. Callers
+    /// that already saw a CSG request go unacked use this to tell a
+    /// stopped MCU from a stuck CSG state machine.
+    ///
+    /// Downstream-only debug aid. Not for upstream.
+    pub(crate) fn probe_liveness(&self, timeout_ms: u32) -> Result<(GlbProbe, u32)> {
+        let probe = self.global_iface.probe_liveness(timeout_ms)?;
+        let mcu_status = self
+            .iomem
+            .try_access()
+            .map_or(u32::MAX, |io| io.read(MCU_STATUS).into_raw());
+
+        Ok((probe, mcu_status))
     }
 
     /// Enable the global interface.

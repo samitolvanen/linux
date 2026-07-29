@@ -73,6 +73,21 @@ pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, 
     Ok((timeout_val, timer_source))
 }
 
+/// Raw global-interface state sampled by `GlobalInterface::probe_liveness`.
+pub(crate) struct GlbProbe {
+    /// `GLB_REQ` before the ping toggle.
+    pub(crate) req_before: u32,
+    /// `GLB_ACK` before the ping toggle.
+    pub(crate) ack_before: u32,
+    /// `GLB_REQ` after the ping wait.
+    pub(crate) req_after: u32,
+    /// `GLB_ACK` after the ping wait.
+    pub(crate) ack_after: u32,
+    /// Whether the firmware mirrored the ping bit into `GLB_ACK` within
+    /// the timeout.
+    pub(crate) acked: bool,
+}
+
 struct GlobalInterfaceRequests<'a> {
     input: &'a FwInterface<GLB_INPUT_BLOCK_SIZE>,
     output: &'a FwInterface<GLB_OUTPUT_BLOCK_SIZE>,
@@ -417,6 +432,61 @@ impl GlobalInterface {
         self.ring_doorbell(0)?;
         let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
         request_field.wait_acks(ping_mask, &self.event_wait, timeout_ms)
+    }
+
+    /// Pings the firmware once and reports the raw global-interface words
+    /// around the ping.
+    ///
+    /// Unlike `ping`, this never turns a missing ack into an error, so a
+    /// caller that has already given up on a CSG slot can tell an
+    /// unresponsive MCU from a firmware that still runs the global
+    /// protocol. The `GLB_REQ` toggle is the same read-modify-write under
+    /// `inner` that `ping` does, so the interface views are cloned out
+    /// before the wait to let the GLB IRQ path take `inner` and deliver
+    /// the wakeup.
+    ///
+    /// Downstream-only debug aid. Not for upstream.
+    pub(super) fn probe_liveness(&self, timeout_ms: u32) -> Result<GlbProbe> {
+        let ping_mask = GLB_REQ::zeroed().with_ping(true);
+
+        let (glb_input, glb_output, req_before, ack_before) = {
+            let inner = self.inner.lock();
+            let enabled = match &inner.state {
+                GlobalInterfaceState::Enabled(enabled) => enabled,
+                GlobalInterfaceState::Suspended(_) | GlobalInterfaceState::Disabled => {
+                    return Err(EINVAL)
+                }
+            };
+
+            let req_before = enabled.glb_input.read(GLB_REQ).into_raw();
+            let ack_before = enabled.glb_output.read(GLB_ACK).into_raw();
+
+            let request_field =
+                GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
+            request_field.toggle_requests(ping_mask)?;
+
+            (
+                enabled.glb_input.clone(),
+                enabled.glb_output.clone(),
+                req_before,
+                ack_before,
+            )
+        };
+
+        self.ring_doorbell(0)?;
+
+        let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
+        let acked = request_field
+            .wait_acks(ping_mask, &self.event_wait, timeout_ms)
+            .is_ok();
+
+        Ok(GlbProbe {
+            req_before,
+            ack_before,
+            req_after: glb_input.read(GLB_REQ).into_raw(),
+            ack_after: glb_output.read(GLB_ACK).into_raw(),
+            acked,
+        })
     }
 
     /// Requests an MCU halt through the global doorbell. The request is not

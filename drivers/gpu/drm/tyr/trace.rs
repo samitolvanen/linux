@@ -980,6 +980,38 @@ kernel::declare_trace! {
     ///
     /// Always safe to call.
     unsafe fn tyr_fw_ping(event: u32, errno: c_int);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_wedge_glb_probe(
+        csg_id: u32,
+        req_mask: u32,
+        glb_req_before: u32,
+        glb_ack_before: u32,
+        glb_req_after: u32,
+        glb_ack_after: u32,
+        ping_acked: bool,
+        mcu_status: u32,
+    );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_wedge_cs_state(
+        csg_id: u32,
+        group_uid: u64,
+        cs_id: u32,
+        status_wait: u32,
+        blocked_reason: u32,
+        req_resource: u32,
+        heap_address: u64,
+        vt_start: u32,
+        vt_end: u32,
+        frag_end: u32,
+    );
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -2961,4 +2993,68 @@ pub(crate) fn reset_pm(path: ResetPmPath, errno: c_int) {
 pub(crate) fn fw_ping(event: FwPingEvent, errno: c_int) {
     // SAFETY: Always safe to call.
     unsafe { tyr_fw_ping(event as u32, errno) }
+}
+
+/// Global-interface liveness probe run for a CSG slot whose request
+/// stayed unacked through a re-kick. Downstream-only debug aid.
+/// Not for upstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wedge_glb_probe(
+    csg_id: u32,
+    req_mask: u32,
+    glb_req_before: u32,
+    glb_ack_before: u32,
+    glb_req_after: u32,
+    glb_ack_after: u32,
+    ping_acked: bool,
+    mcu_status: u32,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_wedge_glb_probe(
+            csg_id,
+            req_mask,
+            glb_req_before,
+            glb_ack_before,
+            glb_req_after,
+            glb_ack_after,
+            ping_acked,
+            mcu_status,
+        )
+    }
+}
+
+/// Wait, block and tiler-heap output state of one CS interface, dumped
+/// for every CSG slot when a CSG ack times out. `group_uid` is 0 and the
+/// state is stale when no group is bound to the slot, and
+/// `blocked_reason` is `u32::MAX` when the firmware value does not
+/// decode. Downstream-only debug aid. Not for upstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wedge_cs_state(
+    csg_id: u32,
+    group_uid: u64,
+    cs_id: u32,
+    status_wait: u32,
+    blocked_reason: u32,
+    req_resource: u32,
+    heap_address: u64,
+    vt_start: u32,
+    vt_end: u32,
+    frag_end: u32,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_wedge_cs_state(
+            csg_id,
+            group_uid,
+            cs_id,
+            status_wait,
+            blocked_reason,
+            req_resource,
+            heap_address,
+            vt_start,
+            vt_end,
+            frag_end,
+        )
+    }
 }
