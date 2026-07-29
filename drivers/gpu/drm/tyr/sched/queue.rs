@@ -599,6 +599,11 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         }
 
+        if !job.job.group.can_run() {
+            fence.signal(Err(ECANCELED));
+            return Ok(SubmitResult::Submitted);
+        }
+
         if job.job.stream.len() > self.data.ringbuf.vmap().size() {
             fence.signal(Err(ENOSPC));
             return Err(ENOSPC);
