@@ -12,6 +12,7 @@ use kernel::{
         DmaFenceWorkqueue,
         DriverDmaFence,
         DriverDmaFenceOps,
+        FenceWaitResult,
         PublicDmaFence,
         Published, //
     },
@@ -173,6 +174,9 @@ pub(crate) struct QueueData {
     /// retires. `None` until the first command-stream job is committed.
     #[pin]
     last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
+    /// Submit fence of the most recently committed job of any kind.
+    #[pin]
+    last_job_fence: Mutex<Option<ARef<PublicDmaFence>>>,
     /// Active GPU sync-wait captured for this queue.
     #[pin]
     syncwait: Mutex<SyncWait>,
@@ -1077,6 +1081,7 @@ impl Queue {
                     outstanding: 0,
                 }),
                 last_submit_fence <- new_mutex!(None),
+                last_job_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
                 suspend_state <- new_mutex!(SuspendState {
                     since: Some(Instant::<Monotonic>::now()),
@@ -1086,12 +1091,10 @@ impl Queue {
             GFP_KERNEL,
         )?;
 
-        let pipeline = PipelineBuilder::new()
-            .set_cancel_timeout(msecs_to_jiffies(JOB_TIMEOUT_MS))
-            .add_stage(QueueCompletionStage {
-                data: data.clone(),
-                timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
-            })?;
+        let pipeline = PipelineBuilder::new().add_stage(QueueCompletionStage {
+            data: data.clone(),
+            timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
+        })?;
         let job_queue = JobQueue::new(
             TyrQueueOps { data: data.clone() },
             reg_data.wq.clone(),
@@ -1133,17 +1136,41 @@ impl Queue {
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
-        self.job_queue.commit(prepared)
+        let fence = self.job_queue.commit(prepared);
+        *self.data.last_job_fence.lock() = Some(fence.clone());
+        fence
     }
 
-    /// Cancels every job tracked by this queue and signals all
-    /// remaining pending submit fences with `err`.
+    /// Signals every pending submit fence with `err`.
     ///
-    /// `cancel_all` may sleep waiting for in-flight hardware fences, so
-    /// this must be called from process context.
+    /// The caller must have made the group unrunnable first, so the jobs
+    /// left in the pipeline fail at submit.
     pub(crate) fn cancel(&self, err: Error) {
-        self.job_queue.cancel_all();
+        self.job_queue.park();
         self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
+        self.job_queue.unpark();
+    }
+
+    /// Retires every job left in the pipeline.
+    ///
+    /// Waits for the last committed job first, so a job committed before the
+    /// drain is not canceled before its dependencies signal. Waits on
+    /// fences, so it must not be called from a dma-fence signalling section.
+    pub(crate) fn drain(&self) {
+        let last = self.data.last_job_fence.lock().clone();
+        if let Some(fence) = last {
+            wait_for_fence(&fence);
+        }
+        self.job_queue.cancel_all();
+    }
+}
+
+/// Waits for `fence` to signal, in `JOB_TIMEOUT_MS` steps so the wait does
+/// not trip the hung-task detector.
+pub(crate) fn wait_for_fence(fence: &PublicDmaFence) {
+    let step = msecs_to_jiffies(JOB_TIMEOUT_MS);
+    while let Ok(FenceWaitResult::TimedOut) = fence.wait_timeout(step) {
+        pr_warn_once!("still waiting for job dependencies during teardown\n");
     }
 }
 
