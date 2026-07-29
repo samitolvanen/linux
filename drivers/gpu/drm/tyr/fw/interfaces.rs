@@ -66,6 +66,7 @@ pub(in crate::fw) use self::{
             CS_HEAP_VT_END,
             CS_HEAP_VT_START,
             CS_STATUS_BLOCKED_REASON,
+            CS_STATUS_REQ_RESOURCE,
             CS_STATUS_SCOREBOARDS,
             CS_STATUS_WAIT,
             CS_STATUS_WAIT_SYNC_POINTER,
