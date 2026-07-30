@@ -2,9 +2,9 @@
 
 //! Scheduler-owned synchronization operation types.
 //!
-//! Group submission consumes parsed sync operations as scheduler input, so the
-//! internal sync handle and operation vocabulary lives here instead of in the
-//! UAPI parsing layer.
+//! Group submission and async VM bind consume parsed sync operations, so
+//! the internal sync handle and operation vocabulary lives here instead of
+//! in the UAPI parsing layer.
 
 use kernel::{
     alloc::KVec,
@@ -58,28 +58,6 @@ impl SyncHandle {
 pub(crate) struct SyncOp {
     pub(crate) ty: SyncOpType,
     pub(crate) handle: SyncHandle,
-}
-
-pub(crate) enum SyncSignal {
-    Binary(SyncObj<TyrDrmDriver>),
-    Timeline {
-        syncobj: SyncObj<TyrDrmDriver>,
-        point: u64,
-        chain: FenceChain,
-    },
-}
-
-impl SyncSignal {
-    pub(crate) fn publish(self, fence: &PublicDmaFence) {
-        match self {
-            Self::Binary(syncobj) => syncobj.replace_fence(Some(fence)),
-            Self::Timeline {
-                syncobj,
-                point,
-                chain,
-            } => syncobj.add_point(chain, fence, point),
-        }
-    }
 }
 
 /// An entry in `Context`'s per-batch signal registry.
@@ -219,45 +197,6 @@ impl TryFrom<&uapi::drm_panthor_sync_op> for SyncOp {
 
         Ok(Self { ty, handle })
     }
-}
-
-pub(crate) fn wait_fences(
-    file: &TyrDrmFile,
-    syncops: &[SyncOp],
-) -> Result<KVec<ARef<PublicDmaFence>>> {
-    let mut fences = KVec::new();
-
-    for sync in syncops.iter().filter(|sync| sync.is_wait()) {
-        let fence = SyncObj::<TyrDrmDriver>::find_fence(
-            file,
-            sync.handle.handle(),
-            sync.handle.timeline_value(),
-            0,
-        )?
-        .ok_or(EINVAL)?;
-        fences.push(fence, GFP_KERNEL)?;
-    }
-
-    Ok(fences)
-}
-
-pub(crate) fn signal_syncs(file: &TyrDrmFile, syncops: &[SyncOp]) -> Result<KVec<SyncSignal>> {
-    let mut signals = KVec::new();
-
-    for sync in syncops.iter().filter(|sync| sync.is_signal()) {
-        let syncobj = SyncObj::<TyrDrmDriver>::lookup_handle(file, sync.handle.handle())?;
-        let signal = match sync.handle {
-            SyncHandle::Binary { .. } => SyncSignal::Binary(syncobj),
-            SyncHandle::Timeline { timeline_value, .. } => SyncSignal::Timeline {
-                syncobj,
-                point: timeline_value,
-                chain: FenceChain::new()?,
-            },
-        };
-        signals.push(signal, GFP_KERNEL)?;
-    }
-
-    Ok(signals)
 }
 
 pub(crate) fn append_syncops(
