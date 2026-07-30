@@ -277,13 +277,9 @@ pub(crate) struct CachedBo {
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    /// Per-queue syncobj seqno value at which this job is complete.
-    /// Non-zero for stream-bearing jobs; zero for sync-only jobs that
-    /// emit no `SYNC_ADD64` and thus do not advance the syncobj. Set
-    /// from `QueueData::claim_seqnos` only after every fallible
-    /// prepare step has succeeded, so the submit and timeout paths can
-    /// look up the matching pending fence by the same key the
-    /// firmware's `SYNC_ADD64` will produce.
+    /// Per-queue syncobj seqno at which this job is complete. Zero for a
+    /// sync-only job that advances no syncobj. Claimed at commit time, the
+    /// same key the firmware's `SYNC_ADD64` produces for the job.
     done_seqno: AtomicU64,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
