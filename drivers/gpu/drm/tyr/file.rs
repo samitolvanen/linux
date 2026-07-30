@@ -13,7 +13,10 @@ use kernel::{
     },
     io::Io,
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     transmute::{
         AsBytes,
         FromBytes, //
@@ -428,30 +431,48 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        // `count` is unbounded, so the arrays come from kvmalloc.
+        let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
+
+        let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL)?;
+
         for _ in 0..count {
             let op: VmBindOp = reader.read()?;
             read_padding_zero(&mut reader, stride - op_size)?;
             let validated_bo = validate_bind_op(&op, file, &vm)?;
-            let (job, syncs) = op.capture(reg_data.pdev.as_ref(), &vm, true, validated_bo)?;
-            let deps = deps::wait_fences(file, &syncs)?;
-            let signals = deps::signal_syncs(file, &syncs)?;
-            let prepared = vm.prepare_bind_job(job, &deps)?;
+            let (job, syncs) =
+                op.capture(reg_data.pdev.as_ref(), &vm, true, validated_bo.clone())?;
 
-            vm.with_prepared_vm(1, |mut prepared_vm| {
-                let fence = vm.commit_bind_job(prepared)?;
+            ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
+            op_bos.push(validated_bo, GFP_KERNEL)?;
+        }
+
+        if op_bos.is_empty() {
+            return Ok(0);
+        }
+
+        ctx.collect_signal_ops()?;
+
+        let _bind_lock = vm.lock_binds();
+
+        for idx in 0..op_bos.len() {
+            ctx.prepare(idx)?;
+        }
+
+        vm.with_prepared_vm(op_bos.len() as u32, |mut prepared_vm| {
+            for idx in 0..op_bos.len() {
+                let fence = ctx.commit(idx)?;
                 prepared_vm.resv_add_fence(
                     &fence,
                     kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                 );
+            }
 
-                for signal in signals {
-                    signal.publish(&fence);
-                }
+            Ok(())
+        })?;
 
-                Ok(())
-            })?;
-        }
+        ctx.push_fences();
 
         Ok(0)
     }

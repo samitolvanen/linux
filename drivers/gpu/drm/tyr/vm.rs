@@ -108,6 +108,7 @@ use crate::{
     },
     pool::Pool as ObjectPool,
     regs::gpu_control::MMU_FEATURES,
+    sched::deps,
 };
 
 // SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
@@ -485,6 +486,39 @@ impl QueueOps for VmBindQueueOps {
 
 pub(crate) type PreparedVmBindJob = PreparedJob<VmBindQueueOps>;
 
+/// Runs the ops of an async VM bind through `deps::Context`.
+pub(crate) struct BindOps {
+    vm: Arc<Vm>,
+}
+
+impl BindOps {
+    pub(crate) fn new(vm: Arc<Vm>) -> Self {
+        Self { vm }
+    }
+}
+
+impl deps::BatchOps for BindOps {
+    type Job = VmBindJob;
+    type Prepared = PreparedVmBindJob;
+
+    fn prepare(
+        &self,
+        job: VmBindJob,
+        deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
+    ) -> Result<PreparedVmBindJob> {
+        self.vm.prepare_bind_job(job, deps, extra_dep_capacity)
+    }
+
+    fn add_dep(&self, prepared: &mut PreparedVmBindJob, fence: ARef<PublicDmaFence>) -> Result {
+        prepared.add_dep(fence)
+    }
+
+    fn commit(&self, prepared: PreparedVmBindJob) -> Result<ARef<PublicDmaFence>> {
+        self.vm.commit_bind_job(prepared)
+    }
+}
+
 impl TryFrom<u32> for VmMapFlags {
     type Error = Error;
 
@@ -788,6 +822,11 @@ impl PinnedDrop for VmExec {
 pub(crate) struct Vm {
     exec: Arc<VmExec>,
     bind_queue: Option<JobQueue<VmBindQueueOps>>,
+    /// Serializes the window from prepare to commit of an async bind,
+    /// so the bind queue claims its pipeline slots and its fence
+    /// sequence numbers in the same order.
+    #[pin]
+    bind_lock: Mutex<()>,
     /// Exclusive upper bound on what user space may bind.
     user_va_limit: u64,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
@@ -874,6 +913,7 @@ impl Vm {
             pin_init!(Self {
                 exec,
                 bind_queue,
+                bind_lock <- new_mutex!(()),
                 user_va_limit: kernel_range.start,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
@@ -1000,14 +1040,27 @@ impl Vm {
         self.bind_queue.as_ref().ok_or(EINVAL)
     }
 
+    /// Acquires the lock that serializes the window from prepare to
+    /// commit of an async bind on this VM.
+    ///
+    /// Lock order `bind_lock > {drm_exec, job queue}`, with nothing else
+    /// held when it is taken. The window allocates and holds the VM
+    /// reservation lock, so the lock is off limits to dma-fence
+    /// signalling sections and must not cover a userspace copy.
+    pub(crate) fn lock_binds(&self) -> MutexGuard<'_, ()> {
+        self.bind_lock.lock()
+    }
+
     pub(crate) fn prepare_bind_job(
         &self,
         job: VmBindJob,
         deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
     ) -> Result<PreparedVmBindJob> {
         self.flush_deferred_cleanup();
 
-        self.bind_queue()?.prepare(job, deps, 0, VmBindFenceData)
+        self.bind_queue()?
+            .prepare(job, deps, extra_dep_capacity, VmBindFenceData)
     }
 
     pub(crate) fn commit_bind_job(
