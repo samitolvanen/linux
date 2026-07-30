@@ -21,25 +21,25 @@ impl<'a, T: DriverGpuVm> ExecToken<'a, T> {
     pub(crate) fn prepare(gpuvm: &'a GpuVm<T>, num_slots: u32) -> Result<Self> {
         const DRM_EXEC_INTERRUPTIBLE_WAIT: u32 = 0;
 
-        let mut guard = core::mem::ManuallyDrop::new(Self {
-            _gpuvm: gpuvm,
-            vm_exec: KBox::pin_init(
-                init!(drm_gpuvm_exec {
-                    vm: gpuvm.as_raw(),
-                    flags: DRM_EXEC_INTERRUPTIBLE_WAIT,
-                    exec: Default::default(),
-                    extra: Default::default(),
-                    num_fences: num_slots,
-                }),
-                GFP_KERNEL,
-            )?,
-            num_slots,
-        });
+        let mut vm_exec = KBox::pin_init(
+            init!(drm_gpuvm_exec {
+                vm: gpuvm.as_raw(),
+                flags: DRM_EXEC_INTERRUPTIBLE_WAIT,
+                exec: Default::default(),
+                extra: Default::default(),
+                num_fences: num_slots,
+            }),
+            GFP_KERNEL,
+        )?;
 
         // SAFETY: `vm_exec` is initialized above and points at a live GPUVM.
-        to_result(unsafe { kernel::bindings::drm_gpuvm_exec_lock(&mut *guard.vm_exec) })?;
+        to_result(unsafe { kernel::bindings::drm_gpuvm_exec_lock(&mut *vm_exec) })?;
 
-        Ok(core::mem::ManuallyDrop::into_inner(guard))
+        Ok(Self {
+            _gpuvm: gpuvm,
+            vm_exec,
+            num_slots,
+        })
     }
 
     pub(crate) fn resv_add_fence(
