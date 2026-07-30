@@ -88,7 +88,13 @@ use kernel::{
         Mutex,
         MutexGuard, //
     },
-    uapi, //
+    uapi,
+    workqueue::{
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
+    }, //
 };
 
 use crate::{
@@ -420,7 +426,7 @@ impl QueueOps for VmBindQueueOps {
     ) -> Result<SubmitResult<Self::FenceData>> {
         let Some(guard) = self.ddev.registration_guard() else {
             fence.signal(Err(ENODEV));
-            return Err(ENODEV);
+            return Ok(SubmitResult::Submitted);
         };
 
         let result = guard.registration_data_with(|reg_data| {
@@ -458,16 +464,17 @@ impl QueueOps for VmBindQueueOps {
         });
 
         match result {
-            Ok(()) => {
-                fence.signal(Ok(()));
-                Ok(SubmitResult::Submitted)
-            }
+            Ok(()) => fence.signal(Ok(())),
             Err(err) => {
                 self.exec.mark_unusable();
                 fence.signal(Err(err));
-                Err(err)
             }
         }
+
+        // A pending flush also covers the vm_bos this job deferred.
+        let _ = cleanup::enqueue(self.exec.clone());
+
+        Ok(SubmitResult::Submitted)
     }
 }
 
@@ -730,6 +737,21 @@ pub(crate) struct VmExec {
     /// Passes the gpuvm references to the cleanup workqueue. `None` for the
     /// firmware VM. Taken by `Drop`.
     handoff: Option<cleanup::Handoff<GpuVmRelease>>,
+    /// Flushes the deferred `vm_bo` list on the cleanup workqueue.
+    #[pin]
+    cleanup_work: Work<VmExec>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for VmExec { self.cleanup_work }
+}
+
+impl WorkItem for VmExec {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        this.flush_deferred_cleanup();
+    }
 }
 
 /// References that `VmExec::drop` passes to `release_gpuvm`.
@@ -864,6 +886,7 @@ impl Vm {
                 unusable: Atomic::new(false),
                 va_range: total_range,
                 handoff,
+                cleanup_work <- new_work!("tyr-vm-cleanup"),
             }),
             GFP_KERNEL,
         )?;
@@ -1266,9 +1289,8 @@ impl VmExec {
         };
         let result = self.map_bo_range_inner(dev, bo_offset, map_size, va, flags, &mut resources);
 
-        // We flush the defer cleanup list now. Things will be different in
-        // the asynchronous VM_BIND path, where we want the cleanup to
-        // happen outside the DMA signalling path.
+        // Flush inline here. The asynchronous VM_BIND path defers this to
+        // the cleanup workqueue instead.
         self.flush_deferred_cleanup();
         result
     }
@@ -1326,9 +1348,8 @@ impl VmExec {
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
 
-        // We flush the defer cleanup list now. Things will be different in
-        // the asynchronous VM_BIND path, where we want the cleanup to
-        // happen outside the DMA signalling path.
+        // Flush inline here. The asynchronous VM_BIND path defers this to
+        // the cleanup workqueue instead.
         self.flush_deferred_cleanup();
         result
     }
