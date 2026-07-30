@@ -2,8 +2,15 @@
 
 use kernel::{
     alloc::KVec,
-    drm,
-    drm::gem::BaseObject,
+    dma_buf::DmaResvUsage,
+    drm::{
+        self,
+        exec::{
+            Exec,
+            ExecFlag, //
+        },
+        gem::BaseObject, //
+    },
     io::Io,
     prelude::*,
     sync::{
@@ -443,18 +450,40 @@ impl TyrDrmFileData {
             ctx.prepare(idx)?;
         }
 
-        vm.with_prepared_vm(op_bos.len() as u32, |mut prepared_vm| {
-            for idx in 0..op_bos.len() {
-                let fence = ctx.commit(idx)?;
-                prepared_vm.resv_add_fence(
-                    &fence,
-                    kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                );
-            }
+        // One slot per object covers the whole array, because its fences share
+        // the bind queue's fence context and their sequence numbers increase,
+        // so the first add on a reservation takes the slot and the rest
+        // replace it.
+        let (mut exec, (vm_resv, obj_resvs)) = Exec::lock(
+            ExecFlag::InterruptibleWait | ExecFlag::IgnoreDuplicates,
+            0,
+            |exec_ctx| {
+                let vm_resv = vm.prepare_resv(exec_ctx)?;
+                let mut obj_resvs = KVVec::with_capacity(op_bos.len(), GFP_KERNEL)?;
 
-            Ok(())
-        })?;
+                for bo in op_bos.iter() {
+                    let obj_resv = match bo.as_deref() {
+                        Some(bo) => Some(exec_ctx.prepare_obj(bo, 1)?),
+                        None => None,
+                    };
+
+                    obj_resvs.push(obj_resv, GFP_KERNEL)?;
+                }
+
+                Ok((vm_resv, obj_resvs))
+            },
+        )?;
+
+        // The context, `op_bos`, and `obj_resvs` were all filled in op
+        // order, so `idx` names the same op in all three.
+        for (idx, obj_resv) in obj_resvs.into_iter().enumerate() {
+            let fence = ctx.commit(idx)?;
+
+            exec.resv_add_fence(vm_resv, &fence, DmaResvUsage::Bookkeep);
+            if let Some(obj_resv) = obj_resv {
+                exec.resv_add_fence(obj_resv, &fence, DmaResvUsage::Bookkeep);
+            }
+        }
 
         ctx.push_fences();
 

@@ -26,6 +26,10 @@ use kernel::{
         DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, PublicDmaFence, Published,
     },
     drm::{
+        exec::{
+            ExecCtx,
+            Prepared, //
+        },
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
@@ -974,6 +978,11 @@ impl Vm {
         };
 
         f(prepared_vm)
+    }
+
+    /// Locks this VM's reservation in `ctx` and reserves one fence slot on it.
+    pub(crate) fn prepare_resv(&self, ctx: &mut ExecCtx<'_>) -> Result<Prepared> {
+        self.exec.gpuvm.prepare_resv(ctx, 1)
     }
 
     /// Reserves `[start, end)` in the kernel auto-VA window so future
