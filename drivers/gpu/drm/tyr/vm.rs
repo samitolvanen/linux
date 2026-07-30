@@ -30,6 +30,10 @@ use kernel::{
         Published, //
     },
     drm::{
+        exec::{
+            ExecCtx,
+            Prepared, //
+        },
         gem::BaseObject,
         gpuvm::{
             DriverGpuVm,
@@ -1023,6 +1027,11 @@ impl Vm {
         };
 
         f(prepared_vm)
+    }
+
+    /// Locks this VM's reservation in `ctx` and reserves one fence slot on it.
+    pub(crate) fn prepare_resv(&self, ctx: &mut ExecCtx<'_>) -> Result<Prepared> {
+        self.exec.gpuvm.prepare_resv(ctx, 1)
     }
 
     /// Reserves `[start, end)` in the kernel auto-VA window so future
