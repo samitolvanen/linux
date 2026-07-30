@@ -431,7 +431,7 @@ impl QueueOps for VmBindQueueOps {
             Ok(())
         })();
 
-        match result {
+        let submitted = match result {
             Ok(()) => {
                 fence.signal(Ok(()));
                 Ok(SubmitResult::Submitted)
@@ -441,7 +441,20 @@ impl QueueOps for VmBindQueueOps {
                 fence.signal(Err(err));
                 Err(err)
             }
+        };
+
+        let exec = self.exec.clone();
+        let queued = self.exec.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
+            exec.flush_deferred_cleanup();
+        });
+
+        if queued.is_err() {
+            pr_warn_once!(
+                "VM_BIND cleanup_wq enqueue failed, so deferred vm_bos wait for the next flush\n",
+            );
         }
+
+        submitted
     }
 }
 
@@ -1162,9 +1175,8 @@ impl VmExec {
         };
         self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)?;
 
-        // We flush the defer cleanup list now. Things will be different in
-        // the asynchronous VM_BIND path, where we want the cleanup to
-        // happen outside the DMA signalling path.
+        // Flush inline here. The asynchronous VM_BIND path defers this to
+        // the cleanup workqueue instead.
         self.flush_deferred_cleanup();
         Ok(())
     }
@@ -1198,9 +1210,8 @@ impl VmExec {
         };
         self.unmap_range_inner(va, size, &mut resources)?;
 
-        // We flush the defer cleanup list now. Things will be different in
-        // the asynchronous VM_BIND path, where we want the cleanup to
-        // happen outside the DMA signalling path.
+        // Flush inline here. The asynchronous VM_BIND path defers this to
+        // the cleanup workqueue instead.
         self.flush_deferred_cleanup();
         Ok(())
     }
