@@ -605,11 +605,6 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         }
 
-        if job.job.stream.len() > self.data.ringbuf.vmap().size() {
-            fence.signal(Err(ENOSPC));
-            return Err(ENOSPC);
-        }
-
         if let Err(err) = self.data.can_append(job.job.stream.len()) {
             if err == ENOSPC {
                 return Ok(SubmitResult::NoResources(fence));
@@ -790,13 +785,9 @@ impl DriverDmaFenceOps for QueueFenceData {
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    /// Per-queue syncobj seqno value at which this job is complete.
-    /// Non-zero for stream-bearing jobs; zero for sync-only jobs that
-    /// emit no `SYNC_ADD64` and thus do not advance the syncobj. Set
-    /// from `QueueData::claim_seqnos` only after every fallible
-    /// prepare step has succeeded, so the submit and timeout paths can
-    /// look up the matching pending fence by the same key the
-    /// firmware's `SYNC_ADD64` will produce.
+    /// Per-queue syncobj seqno at which this job is complete. Zero for a
+    /// sync-only job that advances no syncobj. Claimed at commit time, the
+    /// same key the firmware's `SYNC_ADD64` produces for the job.
     done_seqno: Atomic<u64>,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
@@ -1082,6 +1073,12 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
+        // A stream larger than the ringbuffer can never be appended, so
+        // reject it before commit claims seqnos for it.
+        if job.stream.len() > self.data.ringbuf.vmap().size() {
+            return Err(ENOSPC);
+        }
+
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
