@@ -329,7 +329,10 @@ enum JobState {
     Prepared {
         queue_index: usize,
         prepared: PreparedQueueJob,
-        has_stream: bool,
+        /// Number of command-stream pieces the job carries, and the
+        /// number of seqnos `Context::commit` claims for it. Zero for a
+        /// sync-only job.
+        piece_count: usize,
         /// (handle, point) pairs of WAIT syncops resolved at prepare time
         /// to a SIGNAL produced earlier in the same batch. The producer's
         /// submit fence is looked up from `Context::signals` at commit
@@ -460,24 +463,10 @@ impl<'a> Context<'a> {
             intra_batch_deps.len() + usize::from(!has_stream),
         )?;
 
-        // Claim the per-queue seqno range only after prepare_job has
-        // succeeded, then thread it into the prepared job. Claiming
-        // earlier would advance next_seqno even when a fallible prepare
-        // step fails, leaving a range of seqnos that no piece reaches
-        // the GPU to retire. The GPU-relative syncobj would then stay
-        // permanently behind every later job's completion threshold.
-        // The wrapped stream emits exactly one `SYNC_ADD64(+1)` per
-        // piece, so the syncobj reaches the highest claimed seqno
-        // precisely when every piece has retired.
-        if has_stream {
-            let done_seqno = queue.claim_seqnos(job.piece_count());
-            prepared.job().ok_or(EINVAL)?.set_done_seqno(done_seqno);
-        }
-
         self.jobs[job_idx].state = Some(JobState::Prepared {
             queue_index,
             prepared,
-            has_stream,
+            piece_count: job.piece_count(),
             intra_batch_deps,
         });
 
@@ -500,16 +489,17 @@ impl<'a> Context<'a> {
     /// so a queue claims its seqno ranges in the order its pipeline
     /// runs the jobs.
     pub(crate) fn commit(&mut self, job_idx: usize, group: &Group) -> Result<ARef<PublicDmaFence>> {
-        let (queue_index, mut prepared, has_stream, intra_batch_deps) =
+        let (queue_index, mut prepared, piece_count, intra_batch_deps) =
             match self.jobs[job_idx].state.take() {
                 Some(JobState::Prepared {
                     queue_index,
                     prepared,
-                    has_stream,
+                    piece_count,
                     intra_batch_deps,
-                }) => (queue_index, prepared, has_stream, intra_batch_deps),
+                }) => (queue_index, prepared, piece_count, intra_batch_deps),
                 _ => return Err(EINVAL),
             };
+        let has_stream = piece_count != 0;
 
         for (handle, point) in intra_batch_deps.iter() {
             let fence = self
@@ -522,12 +512,16 @@ impl<'a> Context<'a> {
 
         let queue = group.queues.get(queue_index).ok_or(EINVAL)?;
 
-        // A stream-less job emits no GPU work, so its submit fence signals
+        // The wrapped stream emits exactly one `SYNC_ADD64(+1)` per piece,
+        // so the syncobj reaches the highest claimed seqno precisely when
+        // every piece has retired. A stream-less job emits no GPU work, so
+        // it waits on the queue's last command stream instead of signalling
         // as soon as its dependencies resolve.
-        if !has_stream {
-            if let Some(fence) = queue.last_submit_fence() {
-                prepared.add_dep(fence)?;
-            }
+        if has_stream {
+            let job = prepared.job().ok_or(EINVAL)?;
+            job.set_done_seqno(queue.claim_seqnos(piece_count));
+        } else if let Some(fence) = queue.last_submit_fence() {
+            prepared.add_dep(fence)?;
         }
 
         let submit_fence = queue.commit_job(prepared);

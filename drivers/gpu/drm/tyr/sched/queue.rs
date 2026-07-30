@@ -105,6 +105,10 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 /// never needs to allocate under the lock.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
 
+/// The hardware considers a CSF ring buffer full one 64-byte cache
+/// line short of its allocated size.
+const RINGBUF_RESERVED_BYTES: usize = 64;
+
 // SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
 // static is never dropped.
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -187,18 +191,24 @@ pub(crate) struct QueueData {
 }
 
 impl QueueData {
-    fn ringbuf_space_for(&self, instr_count: usize) -> Result<u64> {
-        let insert = self.interfaces.read_insert()?;
-        let size = self.ringbuf.vmap().size();
-        let extract = self.interfaces.read_extract()?;
-        let used = insert.checked_sub(extract).ok_or(EIO)?;
+    fn ringbuf_capacity(&self) -> usize {
+        self.ringbuf.size() - RINGBUF_RESERVED_BYTES
+    }
 
-        if instr_count > size {
-            return Err(ENOSPC);
+    /// The distance from `EXTRACT` to `INSERT` uses only the low 32 bits, so a
+    /// torn read of `EXTRACT` still gives an exact distance.
+    fn ringbuf_space_for(&self, instr_count: usize) -> Result<u64, RingBufferError> {
+        let insert = self.interfaces.read_insert()?;
+        let capacity = self.ringbuf_capacity() as u64;
+        let extract = self.interfaces.read_extract()?;
+        let used = u64::from((insert as u32).wrapping_sub(extract as u32));
+
+        if used > capacity {
+            return Err(RingBufferError::Inconsistent { insert, extract });
         }
 
-        if used > size as u64 || instr_count as u64 > size as u64 - used {
-            return Err(ENOSPC);
+        if instr_count as u64 > capacity - used {
+            return Err(RingBufferError::Full);
         }
 
         Ok(insert)
@@ -219,7 +229,7 @@ impl QueueData {
             .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
-    pub(super) fn can_append(&self, instr_count: usize) -> Result {
+    pub(super) fn can_append(&self, instr_count: usize) -> Result<(), RingBufferError> {
         self.ringbuf_space_for(instr_count)?;
         Ok(())
     }
@@ -253,7 +263,7 @@ impl QueueData {
     /// the ring offsets they occupy. The range end is the `INSERT` value
     /// `Self::commit_ringbuf_range` will publish once the caller has
     /// registered the matching pending submit fence.
-    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<Range<u64>> {
+    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<Range<u64>, RingBufferError> {
         let ringbuf_start = self.ringbuf_space_for(instrs.len())?;
         let completion_point = ringbuf_start.checked_add(instrs.len() as u64).ok_or(EIO)?;
 
@@ -591,6 +601,45 @@ pub(super) struct TyrQueueOps {
     data: Arc<QueueData>,
 }
 
+impl TyrQueueOps {
+    /// Cancels a job of a group that can no longer run.
+    fn cancel_job(
+        &self,
+        job: &QueueJob,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> SubmitResult<QueueFenceData> {
+        TyrDrmDeviceData::schedule_tick(&job.group.tdev);
+        match self.data.signal_unpushed_fence(fence, ECANCELED) {
+            Ok(()) => SubmitResult::Submitted,
+            Err(fence) => SubmitResult::NoResources(fence),
+        }
+    }
+
+    /// Fails the queue of `job` after a ring claim error.
+    fn fail_queue(
+        &self,
+        job: &QueueJob,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+        err: RingBufferError,
+    ) -> SubmitResult<QueueFenceData> {
+        let group = &job.group;
+        group.with_locked_inner(|inner| inner.set_queue_fatal(job.queue_index));
+        group.detach_and_terminate();
+        match err {
+            RingBufferError::Inconsistent { insert, extract } => pr_warn!(
+                "queue {} has inconsistent ring pointers: insert={:#x}, extract={:#x}\n",
+                job.queue_index,
+                insert,
+                extract
+            ),
+            RingBufferError::Full | RingBufferError::Other => {
+                pr_warn!("queue {} ring claim failed\n", job.queue_index)
+            }
+        }
+        self.cancel_job(job, fence)
+    }
+}
+
 impl QueueOps for TyrQueueOps {
     type Job = QueueJob;
     type FenceData = QueueFenceData;
@@ -614,11 +663,7 @@ impl QueueOps for TyrQueueOps {
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
         if !job.job.group.can_run() {
-            TyrDrmDeviceData::schedule_tick(&job.job.group.tdev);
-            if let Err(fence) = self.data.signal_unpushed_fence(fence, ECANCELED) {
-                return Ok(SubmitResult::NoResources(fence));
-            }
-            return Ok(SubmitResult::Submitted);
+            return Ok(self.cancel_job(job.job, fence));
         }
 
         if job.job.stream.is_empty() {
@@ -626,21 +671,11 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         }
 
-        if job.job.stream.len() > self.data.ringbuf.vmap().size() {
-            fence.signal(Err(ENOSPC));
-            return Err(ENOSPC);
-        }
-
         if let Err(err) = self.data.can_append(job.job.stream.len()) {
-            if err == ENOSPC {
+            if matches!(err, RingBufferError::Full) {
                 return Ok(SubmitResult::NoResources(fence));
             }
-
-            pr_warn_once!("queue ring space check failed: {}\n", err.to_errno());
-            if let Err(fence) = self.data.signal_unpushed_fence(fence, err) {
-                return Ok(SubmitResult::NoResources(fence));
-            }
-            return Ok(SubmitResult::Submitted);
+            return Ok(self.fail_queue(job.job, fence, err));
         }
 
         // Fold any in-flight suspend interval into the baseline so it
@@ -655,13 +690,7 @@ impl QueueOps for TyrQueueOps {
 
         let ringbuf_range = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(range) => range,
-            Err(err) => {
-                pr_warn_once!("queue ring claim failed: {}\n", err.to_errno());
-                if let Err(fence) = self.data.signal_unpushed_fence(fence, err) {
-                    return Ok(SubmitResult::NoResources(fence));
-                }
-                return Ok(SubmitResult::Submitted);
-            }
+            Err(err) => return Ok(self.fail_queue(job.job, fence, err)),
         };
 
         let (Some(reservation), Some(done_seqno)) =
@@ -821,13 +850,9 @@ impl DriverDmaFenceOps for QueueFenceData {
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    /// Per-queue syncobj seqno value at which this job is complete.
-    /// Non-zero for stream-bearing jobs; zero for sync-only jobs that
-    /// emit no `SYNC_ADD64` and thus do not advance the syncobj. Set
-    /// from `QueueData::claim_seqnos` only after every fallible
-    /// prepare step has succeeded, so the submit and timeout paths can
-    /// look up the matching pending fence by the same key the
-    /// firmware's `SYNC_ADD64` will produce.
+    /// Per-queue syncobj seqno at which this job is complete. Zero for a
+    /// sync-only job that advances no syncobj. Claimed at commit time, the
+    /// same key the firmware's `SYNC_ADD64` produces for the job.
     done_seqno: Atomic<u64>,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
@@ -1112,6 +1137,12 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
+        // A stream larger than the ring capacity can never be appended, so
+        // reject it before commit claims seqnos for it.
+        if job.stream.len() > self.data.ringbuf_capacity() {
+            return Err(ENOSPC);
+        }
+
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
@@ -1204,6 +1235,22 @@ struct RingBufferOutput {
 
 impl RingBufferOutput {
     const EXTRACT: usize = core::mem::offset_of!(Self, extract);
+}
+
+/// Failure to claim ring buffer space for a job.
+pub(super) enum RingBufferError {
+    /// The ring has no room for the job yet.
+    Full,
+    /// `EXTRACT` is past `INSERT` or more than the ring capacity behind it.
+    Inconsistent { insert: u64, extract: u64 },
+    /// Any other failure.
+    Other,
+}
+
+impl From<Error> for RingBufferError {
+    fn from(_: Error) -> Self {
+        Self::Other
+    }
 }
 
 /// The firmware-owned input and output blocks of a single queue.
