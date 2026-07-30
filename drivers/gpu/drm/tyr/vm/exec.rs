@@ -5,7 +5,13 @@
 use kernel::{
     bindings::drm_gpuvm_exec,
     dma_buf::dma_fence::PublicDmaFence,
-    drm::gpuvm::{DriverGpuVm, GpuVm},
+    drm::{
+        exec::ExecFlag,
+        gpuvm::{
+            DriverGpuVm,
+            GpuVm, //
+        },
+    },
     error::{to_result, Result},
     prelude::*,
 };
@@ -19,12 +25,10 @@ pub(crate) struct ExecToken<'a, T: DriverGpuVm> {
 
 impl<'a, T: DriverGpuVm> ExecToken<'a, T> {
     pub(crate) fn prepare(gpuvm: &'a GpuVm<T>, num_slots: u32) -> Result<Self> {
-        const DRM_EXEC_INTERRUPTIBLE_WAIT: u32 = 0;
-
         let mut vm_exec = KBox::pin_init(
             init!(drm_gpuvm_exec {
                 vm: gpuvm.as_raw(),
-                flags: DRM_EXEC_INTERRUPTIBLE_WAIT,
+                flags: (ExecFlag::InterruptibleWait | ExecFlag::IgnoreDuplicates).into(),
                 exec: Default::default(),
                 extra: Default::default(),
                 num_fences: num_slots,
