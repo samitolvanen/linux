@@ -99,6 +99,14 @@
 //!   [`PipelineBuilder::set_cancel_timeout`] to bound this wait.
 //! - The driver's [`QueueOps`] methods are never called again after drop returns.
 //!
+//! These guarantees require that no [`PreparedJob`] is outstanding when the
+//! queue is dropped. An outstanding reservation stops the drain, so jobs
+//! reserved behind it never enter a stage and [`JobQueue::cancel_all`] does
+//! not see them. Jobs committed behind it keep an unsignaled submit fence
+//! until the last reference to the queue goes away. Dropping the
+//! outstanding [`PreparedJob`] afterwards schedules a tick that can still
+//! call [`QueueOps`] methods.
+//!
 //! Together these guarantees make teardown straightforward to reason about: no
 //! fence callback or scheduled work item can fire against hardware or firmware
 //! state that has already been freed. In the common synchronous case this
@@ -159,7 +167,9 @@ use crate::{
         UninitDmaFence,
     },
     error::Result,
-    impl_has_dma_fence_delayed_work, impl_has_dma_fence_work,
+    impl_has_dma_fence_delayed_work,
+    impl_has_dma_fence_work,
+    pr_err_once, //
     prelude::*,
     sync::{aref::ARef, Arc, LockClassKey, Mutex},
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
@@ -656,31 +666,39 @@ impl<T: QueueOps> XaEntry<T> {
     }
 }
 
+/// What [`process_stage`](JobQueueInner::process_stage) found at the front of
+/// a stage. Read under the XArray lock, acted on after it is dropped.
+enum FrontEntry {
+    /// A live job. `timed_out` mirrors `JobEntry::timed_out`.
+    Live { timed_out: bool },
+    /// A reservation that [`JobQueue::commit`] has not consumed yet.
+    Reserved,
+    /// No entry, because the reservation was dropped before commit.
+    Gone,
+}
+
 // State managed by `submit()`. This is separate from `PipelineState` to avoid
 // lock ordering issues between `submit()` and `check_progress()`. In other
 // words, new jobs can be submitted even if the pipeline itself is locked.
 #[allow(dead_code)]
 struct InboxState {
-    /// The `next` cursor for `xa_alloc_cyclic`.
+    /// The `next` cursor for `xa_alloc_cyclic`, i.e. one past the index most
+    /// recently handed out by [`JobQueue::prepare`]. It only moves forward,
+    /// and `check_progress()` drains reserved indices up to it.
     cyclic_next: u32,
-
-    /// One past the last XArray index that `submit()` has written.
-    /// `check_progress()` advances `submitted_start` up to this value to pull
-    /// new entries into `deps_range`.
-    submitted_end: u32,
 }
 
 /// The locked pipeline state.
 #[allow(dead_code)]
 struct PipelineState {
-    /// Where the pipeline has consumed up to in the submitted range.
-    /// Jobs in `submitted_start..inbox.submitted_end` have not yet been
+    /// Where the pipeline has consumed up to in the reserved index range.
+    /// Indices in `submitted_start..inbox.cyclic_next` have not yet been
     /// pulled into `stage_ranges[0]`.
     submitted_start: u32,
 
     /// Per-stage queues, indexed identically to `JobQueueInner::stages`.
-    /// `stage_ranges[i]` holds the XArray indices of jobs currently at
-    /// stage `i`.
+    /// `stage_ranges[i]` holds the XArray indices currently at stage `i`.
+    /// An index whose reservation was dropped before commit carries no job.
     stage_ranges: KVec<WrapRange>,
 
     /// Completed jobs awaiting XArray cleanup in process context.
@@ -851,10 +869,21 @@ impl_has_dma_fence_delayed_work! {
 }
 
 impl<T: QueueOps> JobQueueInner<T> {
-    /// Pull newly submitted jobs from the inbox into `stage_ranges[0]`.
+    /// Pull reserved XArray indices from the inbox into `stage_ranges[0]`.
+    ///
+    /// Stops at an index that is still reserved. The pipeline retires an entry
+    /// that is not live, and cleanup would then free the reservation under the
+    /// [`PreparedJob`] that owns it. An index whose [`PreparedJob`] was dropped
+    /// holds no entry. It is pulled in like any other, for
+    /// [`process_stage`](Self::process_stage) to retire.
     fn drain_inbox(&self, state: &mut PipelineState) {
-        let end = self.inbox.lock().submitted_end;
+        let end = self.inbox.lock().cyclic_next;
         while state.submitted_start != end {
+            if let Some(XaEntry::Reserved { .. }) =
+                self.fifo.lock().get(state.submitted_start as usize)
+            {
+                return;
+            }
             state.stage_ranges[0].push_back();
             state.submitted_start = state.submitted_start.wrapping_add(1);
         }
@@ -924,30 +953,55 @@ impl<T: QueueOps> JobQueueInner<T> {
             }
             let entry_idx = state.stage_ranges[stage_i].start;
 
-            // Fast-path: if this entry is already timed out, skip the stage
-            // handler and advance it to the next stage immediately. For driver
-            // stages, cancel() is called to release any per-stage resources.
-            let is_timed_out = {
+            let front = {
                 let guard = self.fifo.lock();
-                guard
-                    .get(entry_idx as usize)
-                    .and_then(|e| e.as_live())
-                    .is_some_and(|e| e.timed_out)
-            };
-            let advance = if is_timed_out {
-                if let StageKind::Driver(stage) = &self.stages[stage_i] {
-                    let guard = self.fifo.lock();
-                    if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
-                        stage.teardown(&*entry.job, entry.counter);
-                    }
+                match guard.get(entry_idx as usize) {
+                    Some(XaEntry::Live(entry)) => FrontEntry::Live {
+                        timed_out: entry.timed_out,
+                    },
+                    Some(XaEntry::Reserved { .. }) => FrontEntry::Reserved,
+                    None => FrontEntry::Gone,
                 }
-                StageAdvance::Advance
-            } else {
-                match &self.stages[stage_i] {
-                    StageKind::WaitingForDeps => self.process_deps(entry_idx),
-                    StageKind::WaitingForExec => self.process_exec(entry_idx),
-                    StageKind::Executing => self.process_default_hw_wait(entry_idx),
-                    StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
+            };
+            let mut advancing = false;
+            let advance = match front {
+                // A reservation dropped before commit leaves no entry behind.
+                // Retire the index so it cannot hold up the stage.
+                FrontEntry::Gone => StageAdvance::Advance,
+                // drain_inbox() never pulls a reserved index in, so this arm
+                // is unreachable and purely defensive. If that ever changes,
+                // waiting keeps the pipeline from retiring an entry a
+                // PreparedJob still owns.
+                FrontEntry::Reserved => {
+                    pr_err_once!(
+                        "JobQueue: process_stage() BUG: xa_idx={} still reserved\n",
+                        entry_idx
+                    );
+                    StageAdvance::Wait
+                }
+                // Fast-path for an entry that is already timed out. Skip the
+                // stage handler and advance it to the next stage immediately.
+                // For driver stages, teardown() is called to release any
+                // per-stage resources.
+                FrontEntry::Live { timed_out: true } => {
+                    if let StageKind::Driver(stage) = &self.stages[stage_i] {
+                        let guard = self.fifo.lock();
+                        if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
+                            stage.teardown(&*entry.job, entry.counter);
+                        }
+                    }
+                    StageAdvance::Advance
+                }
+                FrontEntry::Live { timed_out: false } => {
+                    advancing = true;
+                    match &self.stages[stage_i] {
+                        StageKind::WaitingForDeps => self.process_deps(entry_idx),
+                        StageKind::WaitingForExec => self.process_exec(entry_idx),
+                        StageKind::Executing => self.process_default_hw_wait(entry_idx),
+                        StageKind::Driver(stage) => {
+                            self.process_driver_stage(stage.clone(), entry_idx)
+                        }
+                    }
                 }
             };
 
@@ -959,7 +1013,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                         // Reset the elapsed timer when entering a new stage
                         // (only for legitimately advancing jobs, not timed-out
                         // entries draining through).
-                        if !is_timed_out {
+                        if advancing {
                             let mut guard = self.fifo.lock();
                             if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                                 entry.stage_entered_at = Instant::now();
@@ -976,7 +1030,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     // invariant: every cursor move is a front-of-stage pop,
                     // so done_range.end always equals stage_ranges[N-1].start.
                     // The timed-out entry drains silently through subsequent
-                    // stages via the is_timed_out fast-path above.
+                    // stages via the timed-out fast-path above.
                     {
                         let mut guard = self.fifo.lock();
                         if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
@@ -1396,6 +1450,13 @@ impl<T: QueueOps> Drop for CoalesceGuard<T> {
 /// Because [`dma_fence_init`](crate::dma_fence) was never called, no seqno
 /// was assigned and no fence ever existed — rollback produces no `ECANCELED`
 /// signal and leaves no hole in the seqno sequence.
+///
+/// The reserved XArray index is consumed either way.
+/// [`JobQueue::commit`] turns the reservation into a live job, and dropping
+/// leaves an empty slot that the pipeline retires without processing it.
+/// Until one of the two happens the pipeline runs no job reserved after this
+/// one, so code holding a [`PreparedJob`] must not wait on a job committed
+/// after it.
 pub struct PreparedJob<T: QueueOps> {
     inner: Arc<JobQueueInner<T>>,
     /// Reserved XArray slot.  `None` once consumed by `commit()`.
@@ -1448,6 +1509,9 @@ impl<T: QueueOps> Drop for PreparedJob<T> {
         if let Some(idx) = self.xa_index.take() {
             let entry = self.inner.fifo.lock().remove(idx.index());
             drop(entry);
+            // Let the pipeline retire the index and pick up whatever was
+            // reserved behind it.
+            self.inner.maybe_check_progress();
         }
     }
 }
@@ -1488,10 +1552,7 @@ impl<T: QueueOps> JobQueue<T> {
             try_pin_init!(JobQueueInner {
                 fifo <- XArray::new(AllocKind::Alloc),
                 inbox <- Mutex::new(
-                    InboxState {
-                        cyclic_next: 0,
-                        submitted_end: 0,
-                    },
+                    InboxState { cyclic_next: 0 },
                     c_str!("JobQueue::inbox"),
                     ::core::pin::Pin::static_ref(lock_classes.inbox),
                 ),
@@ -1539,7 +1600,9 @@ impl<T: QueueOps> JobQueue<T> {
     /// committed.
     ///
     /// Call [`commit`](Self::commit) to assign the seqno, insert the job into
-    /// the pipeline, and receive the public fence.
+    /// the pipeline, and receive the public fence. Callers sharing a queue
+    /// must serialize prepare and commit as a unit, to keep the ordering
+    /// contract on [`JobQueue::commit`].
     pub fn prepare(
         &self,
         job: T::Job,
@@ -1592,11 +1655,22 @@ impl<T: QueueOps> JobQueue<T> {
         let xa_index = {
             let mut inbox = self.inner.inbox.lock();
             let mut guard = self.inner.fifo.lock();
+            // `xa_alloc_cyclic` restarts its scan at the bottom of the limit
+            // whenever the scan from `cyclic_next` fails, and publishes the
+            // lower index it finds there. Taking that index would move the
+            // cursor backwards and leave the pipeline a whole u32 range to
+            // drain, so hand it back and fail the reservation.
+            let expected = inbox.cyclic_next;
             let idx = guard.alloc_cyclic_reserve(
                 XaLimit::LIMIT_32B,
                 &mut inbox.cyclic_next,
                 GFP_KERNEL,
             )?;
+            if idx.index() as u32 != expected {
+                guard.release(idx);
+                inbox.cyclic_next = expected;
+                return Err(ENOMEM);
+            }
             if let Err(store_err) = guard.store_reserved(idx, entry) {
                 drop(store_err);
                 guard.release(idx);
@@ -1619,6 +1693,10 @@ impl<T: QueueOps> JobQueue<T> {
     /// refer to a live `XaEntry::Reserved` slot, which is guaranteed as long
     /// as `prepared` was produced by `prepare()` on the same queue and has
     /// not yet been committed or dropped.
+    ///
+    /// Callers must commit jobs in the order they prepared them, and callers
+    /// sharing a queue must serialize from prepare to commit. Interleaving
+    /// would signal one fence context out of seqno order.
     pub fn commit(&self, mut prepared: PreparedJob<T>) -> ARef<PublicDmaFence> {
         let xa_index = prepared
             .xa_index
@@ -1696,19 +1774,6 @@ impl<T: QueueOps> JobQueue<T> {
                 timed_out: false,
             });
         }
-
-        let mut inbox = self.inner.inbox.lock();
-        let expected = inbox.submitted_end;
-        if xa_index.index() as u32 != expected {
-            pr_err!(
-                "JobQueue: commit() BUG: xa_idx={} != submitted_end={} (job={})\n",
-                xa_index.index(),
-                expected,
-                counter
-            );
-        }
-        inbox.submitted_end = inbox.submitted_end.wrapping_add(1);
-        drop(inbox);
 
         self.inner.maybe_check_progress();
         submit_fence
