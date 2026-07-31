@@ -54,6 +54,12 @@ pub(crate) fn mmu_irq_enable(io: &IoMem) {
     io.write_reg(mmu_control::IRQ_MASK::from_raw(mmu_interrupts_mask()));
 }
 
+/// Masks all MMU IRQ sources.
+#[expect(dead_code)]
+pub(crate) fn mmu_irq_disable(io: &IoMem) {
+    io.write_reg(mmu_control::IRQ_MASK::from_raw(0));
+}
+
 pub(crate) fn mmu_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
