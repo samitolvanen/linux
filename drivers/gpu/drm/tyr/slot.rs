@@ -371,23 +371,26 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
 
     /// Evicts a seat from its slot and marks the slot as free.
     ///
-    /// Calls the eviction callback then frees the slot and resets the seat to `NoSeat`.
+    /// On eviction-callback failure the slot is freed only when `force` is set.
     fn evict_slot(
         &mut self,
         slot_idx: usize,
         locked_seat: &LockedSeat<T, MAX_SLOTS>,
         ctx: &mut T::Context,
+        force: bool,
     ) -> Result {
-        match &self.slots[slot_idx] {
+        let res = match &self.slots[slot_idx] {
             Slot::Active(slot_info) | Slot::Idle(slot_info) => {
-                self.manager.evict(slot_idx, &slot_info.slot_data, ctx)?;
-                take(&mut self.slots[slot_idx]);
+                self.manager.evict(slot_idx, &slot_info.slot_data, ctx)
             }
-            _ => (),
-        }
+            _ => Ok(()),
+        };
 
-        *locked_seat.access_mut(self) = Seat::NoSeat;
-        Ok(())
+        if res.is_ok() || force {
+            take(&mut self.slots[slot_idx]);
+            *locked_seat.access_mut(self) = Seat::NoSeat;
+        }
+        res
     }
 
     /// Checks and updates the seat state based on the slot it points to.
@@ -464,11 +467,31 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
     /// Evict a resource from its slot, and make this slot free again
     /// for other users.
     ///
-    /// May return errors from the eviction callback.
+    /// On eviction-callback failure the slot stays occupied, so a slot with
+    /// live hardware state is never reused.
     pub(crate) fn evict(
         &mut self,
         locked_seat: &LockedSeat<T, MAX_SLOTS>,
         ctx: &mut T::Context,
+    ) -> Result {
+        self.evict_common(locked_seat, ctx, false)
+    }
+
+    /// Like `evict`, but frees the slot even when the eviction callback fails,
+    /// for teardown paths that must leave nothing bound.
+    pub(crate) fn evict_forced(
+        &mut self,
+        locked_seat: &LockedSeat<T, MAX_SLOTS>,
+        ctx: &mut T::Context,
+    ) -> Result {
+        self.evict_common(locked_seat, ctx, true)
+    }
+
+    fn evict_common(
+        &mut self,
+        locked_seat: &LockedSeat<T, MAX_SLOTS>,
+        ctx: &mut T::Context,
+        force: bool,
     ) -> Result {
         self.check_seat(locked_seat);
 
@@ -476,7 +499,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
             Seat::Active(seat_info) | Seat::Idle(seat_info) => {
                 let slot_idx = seat_info.slot as usize;
 
-                self.evict_slot(slot_idx, locked_seat, ctx)?;
+                self.evict_slot(slot_idx, locked_seat, ctx, force)?;
             }
             _ => (),
         }
