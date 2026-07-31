@@ -121,7 +121,6 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
 /// threaded handler from re-enabling the line. The mask is rewritten after
 /// the synchronize because a handler that raced the flag re-enables it on
 /// exit. The flag stays set until the matching resume clears it.
-#[expect(dead_code)]
 pub(crate) fn quiesce<T: TyrIrqTrait + Send>(
     dev: &Device<Bound>,
     reg: &Devres<ThreadedRegistration<TyrIrq<T>>>,
@@ -148,7 +147,6 @@ pub(crate) fn quiesce<T: TyrIrqTrait + Send>(
 /// A flag left set stops the hard handler from handling the line again.
 /// Call this before unmasking the line, or an interrupt taken in between
 /// goes unclaimed.
-#[expect(dead_code)]
 pub(crate) fn clear_suspended<T: TyrIrqTrait + Send>(
     dev: &Device<Bound>,
     reg: &Devres<ThreadedRegistration<TyrIrq<T>>>,
