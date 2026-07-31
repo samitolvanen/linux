@@ -142,11 +142,11 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
 
         // A denied token with a held reference means a resume is in flight
         // and this tick may be its kick, so re-arm a tick period out rather
-        // than spinning against the resume's own immediate tick. The
-        // scheduler flag covers the force-suspend window `pm_suspended`
-        // misses.
+        // than spinning against the resume's own immediate tick. The driver
+        // flags cover the force-suspend window `pm_suspended` misses.
         if (resume_pending || kick_pending)
             && !tdev.pm_suspended()
+            && !tdev.pm_powered_down()
             && !tdev.sched_suspended.load(ordering::Relaxed)
         {
             Scheduler::request_tick(tdev);
