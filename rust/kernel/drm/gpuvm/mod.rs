@@ -17,6 +17,10 @@ use kernel::{
     },
     bindings,
     drm,
+    drm::exec::{
+        ExecCtx,
+        Prepared, //
+    },
     drm::gem::IntoGEMObject,
     error::to_result,
     prelude::*,
@@ -216,6 +220,36 @@ impl<T: DriverGpuVm> GpuVm<T> {
         data: impl PinInit<T::VmBoData>,
     ) -> Result<ARef<GpuVmBo<T>>, AllocError> {
         Ok(GpuVmBoAlloc::new(self, obj, data)?.obtain())
+    }
+
+    /// Locks this GPUVM's own reservation in the [`ExecCtx`] round `ctx` and
+    /// reserves `num_fences` slots on it, issuing the [`Prepared`] receipt for
+    /// it.
+    ///
+    /// The reservation belongs to the GPUVM's root GEM object, which every
+    /// object private to the GPUVM shares. A `num_fences` of zero only takes
+    /// the lock, because `drm_gpuvm_prepare_vm()` routes it to
+    /// `drm_exec_lock_obj()`.
+    ///
+    /// Wraps `drm_gpuvm_prepare_vm()`.
+    #[inline]
+    pub fn prepare_resv(&self, ctx: &mut ExecCtx<'_>, num_fences: u32) -> Result<Prepared> {
+        // SAFETY: `drm_gpuvm_prepare_vm()` is a prepare call on the context it
+        // is given, and locks the root object's reservation on success. The
+        // round then holds a reference to the root object, so the reservation
+        // outlives it.
+        unsafe {
+            ctx.prepare_with(
+                |exec| {
+                    to_result(bindings::drm_gpuvm_prepare_vm(
+                        self.as_raw(),
+                        exec,
+                        num_fences,
+                    ))
+                },
+                self.raw_resv(),
+            )
+        }
     }
 
     /// Clean up buffer objects that are no longer used.
