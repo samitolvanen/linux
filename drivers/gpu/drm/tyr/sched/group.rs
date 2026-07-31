@@ -23,7 +23,8 @@ use kernel::{
             DmaFenceWorkItem,
             DmaFenceWorkqueue, //
         },
-        Fence,
+        DmaResvUsage,
+        Fence, //
     },
     drm::gem::BaseObject,
     io::IoBase,
@@ -1021,23 +1022,19 @@ impl Group {
             ctx.prepare(idx)?;
         }
 
-        self.vm
-            .with_prepared_vm(batch_queues.count_ones(), |mut prepared_vm| {
-                let res = (0..job_count).try_for_each(|idx| ctx.commit(idx).map(|_| ()));
+        let num_slots = batch_queues.count_ones();
+        self.vm.with_prepared_vm(num_slots, |vm_exec| {
+            let res = (0..job_count).try_for_each(|idx| ctx.commit(idx).map(|_| ()));
 
-                let queues = self
-                    .indexed_queues()
-                    .filter(|(idx, _)| batch_queues & idx.bit() != 0);
-                for fence in queues.filter_map(|(_, queue)| queue.last_job_fence()) {
-                    prepared_vm.resv_add_fence(
-                        &fence,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    );
-                }
+            let queues = self
+                .indexed_queues()
+                .filter(|(idx, _)| batch_queues & idx.bit() != 0);
+            for fence in queues.filter_map(|(_, queue)| queue.last_job_fence()) {
+                vm_exec.resv_add_fence(&fence, DmaResvUsage::Bookkeep, DmaResvUsage::Bookkeep);
+            }
 
-                res
-            })?;
+            res
+        })?;
 
         ctx.push_fences();
 
