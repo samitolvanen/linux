@@ -17,6 +17,7 @@ use kernel::{
         register::Array,
         Io, //
     },
+    platform,
     prelude::*,
     time::Delta,
     transmute::AsBytes,
@@ -24,7 +25,14 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
+    driver::{
+        IoMem,
+        TyrPlatformDriverData, //
+    },
+    irq::{
+        clear_suspended,
+        quiesce, //
+    },
     regs::{
         gpu_control::*,
         join_u64, //
@@ -191,6 +199,25 @@ const GPU_MODELS: [GpuModels; 1] = [GpuModels {
     prod_major: 7,
 }];
 
+/// Powers off the L2 block.
+pub(crate) fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+    let io = (*iomem).access(dev)?;
+    io.write_reg(L2_PWROFF_LO::zeroed().with_const_request::<1>());
+
+    poll::read_poll_timeout(
+        || {
+            let io = (*iomem).access(dev)?;
+            Ok(io.read(L2_PWRTRANS_LO))
+        },
+        |status| status.changing() == 0,
+        Delta::from_micros(100),
+        Delta::from_millis(20),
+    )
+    .inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
+
+    Ok(())
+}
+
 /// Powers on the l2 block.
 pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
     let io = (*iomem).access(dev)?;
@@ -209,4 +236,24 @@ pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result 
     .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."))?;
 
     Ok(())
+}
+
+/// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
+#[expect(dead_code)]
+pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
+    let bound = dev.as_ref();
+    let tdev = &data.device;
+    quiesce(bound, &data.gpu_irq, &tdev.iomem, irq::gpu_irq_disable);
+    let _ = l2_power_off(bound, &tdev.iomem);
+}
+
+/// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
+#[expect(dead_code)]
+pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
+    let bound = dev.as_ref();
+    let tdev = &data.device;
+    let io = tdev.iomem.access(bound)?;
+    clear_suspended(bound, &data.gpu_irq);
+    irq::gpu_irq_enable(io);
+    l2_power_on(bound, &tdev.iomem)
 }
