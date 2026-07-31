@@ -4,6 +4,8 @@
 
 pub mod device;
 pub mod driver;
+#[cfg(CONFIG_RUST_DRM_EXEC)]
+pub mod exec;
 pub mod file;
 pub mod gem;
 pub mod gpuvm;

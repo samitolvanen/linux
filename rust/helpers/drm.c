@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <drm/drm_exec.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_vma_manager.h>
@@ -27,6 +28,13 @@ __rust_helper int
 rust_helper_drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 {
 	return drm_gem_huge_mnt_create(dev, value);
+}
+#endif
+
+#ifdef CONFIG_DRM_EXEC
+__rust_helper bool rust_helper_drm_exec_is_contended(struct drm_exec *exec)
+{
+	return drm_exec_is_contended(exec);
 }
 #endif
 
