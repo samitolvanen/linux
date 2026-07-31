@@ -161,7 +161,6 @@ impl UserMmio {
 
     /// Sets whether the GPU MMIO is powered and drops the user `LATEST_FLUSH`
     /// PTEs so the fault handler re-derives the mapping.
-    #[expect(dead_code)]
     pub(crate) fn set_powered(&mut self, device: &TyrDrmDevice, powered: bool) {
         self.powered = powered;
         device.unmap_mapping_range(DRM_PANTHOR_USER_MMIO_OFFSET_64BIT, 0);

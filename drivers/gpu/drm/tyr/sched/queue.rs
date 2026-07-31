@@ -867,7 +867,13 @@ impl QueueOps for TyrQueueOps {
         // group observed here keeps its doorbell for the whole kick. Ringing
         // outside the lock would race an eviction and fail the kick for
         // committed ringbuf bytes.
+        //
+        // Ring only while the device is runtime-active. When it is not, a
+        // suspend is evicting the group and the rebind re-rings the
+        // committed bytes.
         let group = &job.job.group;
+        let awake = group.tdev.sched_pm_get_if_active();
+        let device_active = awake.is_some();
         let queue_index = job.job.queue_index;
         let (active, kick_err, resume_tick) = group.with_locked_inner(|inner| {
             if inner.csg_id.is_none() || inner.state != State::Active {
@@ -876,9 +882,13 @@ impl QueueOps for TyrQueueOps {
             let group_idle = inner.is_idle();
             let blocked = inner.blocked_queues() & (1u32 << queue_index) != 0;
             let queue_idle = inner.set_queue_idle(queue_index, false);
+            if awake.is_none() {
+                return (true, Ok(()), group_idle && queue_idle && !blocked);
+            }
             let kick_res = self.data.kick();
             (true, kick_res, group_idle && queue_idle && !blocked)
         });
+        drop(awake);
 
         if active {
             if let Err(err) = kick_err {
@@ -889,6 +899,12 @@ impl QueueOps for TyrQueueOps {
             // edge here.
             group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
             let _ = group.tdev.with_locked_scheduler(|sched| {
+                // Close the interval only if the group is still bound. A
+                // rotation tick may have evicted it since the kick saw it
+                // resident.
+                if device_active && group.with_locked_inner(|inner| inner.csg_id.is_some()) {
+                    self.data.resume_timeout();
+                }
                 if sched.pm_ref.is_none() {
                     sched.pm_ref = group.tdev.sched_pm_get();
                 }
