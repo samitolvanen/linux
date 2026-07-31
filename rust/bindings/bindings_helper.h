@@ -33,6 +33,7 @@
 #include <drm/drm_auth.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_exec.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -156,6 +157,9 @@ const vm_flags_t RUST_CONST_HELPER_VM_SOFTDIRTY = VM_SOFTDIRTY;
 const vm_flags_t RUST_CONST_HELPER_VM_MIXEDMAP = VM_MIXEDMAP;
 const vm_flags_t RUST_CONST_HELPER_VM_HUGEPAGE = VM_HUGEPAGE;
 const vm_flags_t RUST_CONST_HELPER_VM_NOHUGEPAGE = VM_NOHUGEPAGE;
+
+const u32 RUST_CONST_HELPER_DRM_EXEC_INTERRUPTIBLE_WAIT = DRM_EXEC_INTERRUPTIBLE_WAIT;
+const u32 RUST_CONST_HELPER_DRM_EXEC_IGNORE_DUPLICATES = DRM_EXEC_IGNORE_DUPLICATES;
 
 #if IS_ENABLED(CONFIG_GPU_BUDDY)
 const unsigned long RUST_CONST_HELPER_GPU_BUDDY_RANGE_ALLOCATION = GPU_BUDDY_RANGE_ALLOCATION;
