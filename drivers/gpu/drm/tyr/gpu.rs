@@ -239,7 +239,6 @@ pub(crate) fn l2_power_on(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result 
 }
 
 /// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
-#[expect(dead_code)]
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let bound = dev.as_ref();
     let tdev = &data.device;
@@ -248,7 +247,6 @@ pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDrive
 }
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
-#[expect(dead_code)]
 pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
     let bound = dev.as_ref();
     let tdev = &data.device;

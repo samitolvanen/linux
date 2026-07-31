@@ -14,6 +14,10 @@
 //! [`Section`]: crate::fw::Section
 
 use kernel::{
+    device::{
+        Bound,
+        Device, //
+    },
     devres::Devres,
     drm::{
         gem::BaseObject,
@@ -24,6 +28,7 @@ use kernel::{
         poll,
         Io, //
     },
+    irq::ThreadedRegistration,
     platform,
     prelude::*,
     sizes::SZ_8K,
@@ -52,6 +57,11 @@ use crate::{
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
+    irq::{
+        clear_suspended,
+        quiesce,
+        TyrIrq, //
+    },
     mmu::Mmu,
     regs::gpu_control::{
         McuControlMode,
@@ -453,8 +463,11 @@ impl Firmware {
 
     /// Halts and stops the MCU for runtime suspend, releasing the firmware AS
     /// slot for resume to reprogram.
-    #[expect(dead_code)]
-    pub(crate) fn suspend(&self) {
+    pub(crate) fn suspend(
+        &self,
+        dev: &Device<Bound>,
+        job_irq: &Devres<ThreadedRegistration<TyrIrq<irq::JobIrq>>>,
+    ) {
         if let Err(e) = self.halt_mcu() {
             dev_warn!(
                 self.pdev.as_ref(),
@@ -463,13 +476,9 @@ impl Firmware {
             );
         }
 
-        if let Some(io) = self.iomem.try_access() {
-            irq::job_irq_disable(&io);
-        }
-
         self.stop_mcu();
+        quiesce(dev, job_irq, &self.iomem, irq::job_irq_disable);
         self.global_iface.suspend();
-
         let _ = self.vm.deactivate();
     }
 
@@ -478,13 +487,18 @@ impl Firmware {
     ///
     /// The sections live in system RAM and survive the suspend, so they are
     /// not reloaded.
-    #[expect(dead_code)]
-    pub(crate) fn resume(&self, tdev: &TyrDrmDevice) -> Result {
+    pub(crate) fn resume(
+        &self,
+        dev: &Device<Bound>,
+        job_irq: &Devres<ThreadedRegistration<TyrIrq<irq::JobIrq>>>,
+        tdev: &TyrDrmDevice,
+    ) -> Result {
         self.vm.activate()?;
         self.irq_state.clear_ready();
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
+            clear_suspended(dev, job_irq);
             irq::job_irq_enable(&io);
         }
         self.global_iface.set_mcu_active()?;

@@ -204,7 +204,6 @@ impl Mmu {
 
 /// Releases the resident AS slots and stops the MMU IRQ for runtime
 /// suspend.
-#[expect(dead_code)]
 pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let tdev = &data.device;
     tdev.mmu.suspend();
@@ -217,7 +216,6 @@ pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDrive
 }
 
 /// Re-enables the MMU IRQ for runtime resume.
-#[expect(dead_code)]
 pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
     let io = data.device.iomem.access(dev.as_ref())?;
     clear_suspended(dev.as_ref(), &data.mmu_irq);

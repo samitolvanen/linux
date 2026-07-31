@@ -182,7 +182,6 @@ pub(crate) struct TyrPlatformDriverData {
     /// can synchronize in-flight handlers before gating the clocks.
     pub(crate) gpu_irq: Devres<ThreadedRegistration<TyrIrq<GpuIrq>>>,
     pub(crate) mmu_irq: Devres<ThreadedRegistration<TyrIrq<MmuIrq>>>,
-    #[expect(dead_code)]
     pub(crate) job_irq: Devres<ThreadedRegistration<TyrIrq<JobIrq>>>,
 
     pub(crate) device: ARef<TyrDrmDevice>,
@@ -360,7 +359,6 @@ impl TyrDrmDeviceData {
     /// Returns whether any firmware-events bits are pending, a hint for
     /// rescheduling the drain worker. The drain itself synchronizes through
     /// `fw_events_take`.
-    #[expect(dead_code)]
     pub(crate) fn fw_events_pending(&self) -> bool {
         self.fw_events.load(Ordering::Relaxed) != 0
     }
@@ -412,6 +410,21 @@ impl TyrDrmDeviceData {
         let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
     }
 
+    /// Waits for the tick and firmware-events workers to finish.
+    ///
+    /// Both block bounded. Not callable under the scheduler or CSG
+    /// slot-manager mutexes, nor in a dma-fence signalling section. The
+    /// per-group tiler OOM workers are not flushed. They re-check slot
+    /// ownership and read the acknowledgment from the live interface
+    /// under the scheduler mutex before writing to the firmware. A
+    /// failed heap growth can still queue a fresh tick after this
+    /// returns, so callers gate the tick first.
+    pub(crate) fn drain_sched_work(&self) {
+        let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
+        let _ =
+            workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::FW_EVENTS }>(self);
+    }
+
     /// Re-arms the scheduler tick `delay` jiffies from now.
     ///
     /// If a periodic tick is already pending, `delay` is ignored:
@@ -445,6 +458,13 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         let tdev = &*this;
+
+        // Processing events ACKs them through CSG doorbells. If the
+        // device is runtime suspended, leave the events latched in
+        // `fw_events`. The resume path reschedules this worker.
+        let Some(_active) = tdev.sched_pm_get_if_active() else {
+            return;
+        };
 
         let events = tdev.fw_events_take();
         if events == 0 {
@@ -726,6 +746,8 @@ impl platform::Driver for TyrPlatformDriverData {
         let populated = tdev.pm.populate(pm);
         debug_assert!(populated);
 
+        TyrDrmDeviceData::schedule_tick(&tdev);
+
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
@@ -804,7 +826,6 @@ pub(crate) struct Clocks {
 
 impl Clocks {
     /// Disables and unprepares the clocks for runtime suspend.
-    #[expect(dead_code)]
     pub(crate) fn gate(&mut self) {
         if self.gated {
             return;
@@ -816,7 +837,6 @@ impl Clocks {
     }
 
     /// Re-enables the clocks on runtime resume.
-    #[expect(dead_code)]
     pub(crate) fn ungate(&mut self) -> Result {
         if !self.gated {
             return Ok(());
