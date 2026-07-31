@@ -100,6 +100,7 @@ use crate::{
         GpuInfo, //
     },
     irq::TyrIrq,
+    mmap,
     mmu::{
         irq::{
             mmu_irq_enable,
@@ -318,6 +319,9 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Runtime PM context, `None` until the end of probe.
     pub(crate) pm: SetOnce<PMContext<TyrPmOps>>,
+
+    #[pin]
+    pub(crate) user_mmio: Mutex<mmap::UserMmio>,
 
     #[pin]
     pub(crate) opp_config: Mutex<Option<ConfigToken>>,
@@ -659,6 +663,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 devfreq_data,
                 pm: SetOnce::new(),
+                user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
         });
 
