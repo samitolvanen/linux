@@ -11,12 +11,15 @@ use kernel::{
         Bound,
         Device, //
     },
-    dma_buf::dma_fence::{
-        impl_has_dma_fence_work,
-        new_dma_fence_work,
-        DmaFenceWork,
-        DmaFenceWorkItem,
-        PublicDmaFence, //
+    dma_buf::{
+        dma_fence::{
+            impl_has_dma_fence_work,
+            new_dma_fence_work,
+            DmaFenceWork,
+            DmaFenceWorkItem,
+            PublicDmaFence, //
+        },
+        DmaResvUsage, //
     },
     drm::gem::BaseObject,
     io::IoBase,
@@ -912,19 +915,18 @@ impl Group {
             ctx.prepare(idx)?;
         }
 
-        self.vm
-            .with_prepared_vm(job_count as u32, |mut prepared_vm| {
-                for idx in 0..job_count {
-                    let signal_fence = ctx.commit(idx)?;
-                    prepared_vm.resv_add_fence(
-                        &signal_fence,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    );
-                }
+        self.vm.with_prepared_vm(job_count as u32, |vm_exec| {
+            for idx in 0..job_count {
+                let signal_fence = ctx.commit(idx)?;
+                vm_exec.resv_add_fence(
+                    &signal_fence,
+                    DmaResvUsage::Bookkeep,
+                    DmaResvUsage::Bookkeep,
+                );
+            }
 
-                Ok(())
-            })?;
+            Ok(())
+        })?;
 
         ctx.push_fences();
 
