@@ -10,6 +10,7 @@ use kernel::{
         Capability, //
     },
     dma_buf::dma_fence::PublicDmaFence,
+    dma_buf::DmaResvUsage,
     drm::gem::BaseObject,
     io::Io,
     list::{
@@ -901,19 +902,18 @@ impl Group {
             ctx.prepare(idx)?;
         }
 
-        self.vm
-            .with_prepared_vm(job_count as u32, |mut prepared_vm| {
-                for idx in 0..job_count {
-                    let signal_fence = ctx.commit(idx)?;
-                    prepared_vm.resv_add_fence(
-                        &signal_fence,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                        kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
-                    );
-                }
+        self.vm.with_prepared_vm(job_count as u32, |vm_exec| {
+            for idx in 0..job_count {
+                let signal_fence = ctx.commit(idx)?;
+                vm_exec.resv_add_fence(
+                    &signal_fence,
+                    DmaResvUsage::Bookkeep,
+                    DmaResvUsage::Bookkeep,
+                );
+            }
 
-                Ok(())
-            })?;
+            Ok(())
+        })?;
 
         ctx.push_fences();
 
