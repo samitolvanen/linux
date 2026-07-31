@@ -16,6 +16,7 @@
 use core::ops::Range;
 
 use kernel::{
+    device::Bound,
     devres::Devres,
     new_mutex,
     platform,
@@ -28,8 +29,15 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
+    driver::{
+        IoMem,
+        TyrPlatformDriverData, //
+    },
     gpu::GpuInfo,
+    irq::{
+        clear_suspended,
+        quiesce, //
+    },
     mmu::address_space::{
         AddressSpaceManager,
         VmAsData, //
@@ -135,6 +143,15 @@ impl Mmu {
         self.as_manager.lock().deactivate_vm(vm)
     }
 
+    /// Releases every resident VM's hardware AS slot for runtime suspend.
+    ///
+    /// Runs with the GPU still clocked and the MCU halted, so the eviction
+    /// MMIO completes and no AS slot is programmed when the clocks gate.
+    /// Takes no VM op lock.
+    pub(crate) fn suspend(&self) {
+        self.as_manager.lock().suspend()
+    }
+
     /// Returns the AS slot index `vm` is currently bound to, or `None`
     /// if it is not resident.
     ///
@@ -183,4 +200,27 @@ impl Mmu {
     pub(crate) fn end_vm_update(&self, vm: &VmAsData, region: &Range<u64>) -> Result {
         self.as_manager.lock().end_vm_update(vm, region)
     }
+}
+
+/// Releases the resident AS slots and stops the MMU IRQ for runtime
+/// suspend.
+#[expect(dead_code)]
+pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
+    let tdev = &data.device;
+    tdev.mmu.suspend();
+    quiesce(
+        dev.as_ref(),
+        &data.mmu_irq,
+        &tdev.iomem,
+        irq::mmu_irq_disable,
+    );
+}
+
+/// Re-enables the MMU IRQ for runtime resume.
+#[expect(dead_code)]
+pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
+    let io = data.device.iomem.access(dev.as_ref())?;
+    clear_suspended(dev.as_ref(), &data.mmu_irq);
+    irq::mmu_irq_enable(io);
+    Ok(())
 }

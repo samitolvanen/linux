@@ -55,7 +55,6 @@ pub(crate) fn mmu_irq_enable(io: &IoMem) {
 }
 
 /// Masks all MMU IRQ sources.
-#[expect(dead_code)]
 pub(crate) fn mmu_irq_disable(io: &IoMem) {
     io.write_reg(mmu_control::IRQ_MASK::from_raw(0));
 }
