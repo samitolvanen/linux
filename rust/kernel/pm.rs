@@ -603,16 +603,41 @@ unsafe extern "C" fn system_sleep_suspend(dev: *mut bindings::device) -> c_int {
 /// System-sleep resume wrapper for the resume, thaw, and restore slots.
 ///
 /// Runs the device's runtime-resume callback via `pm_runtime_force_resume`,
-/// as `DEFINE_RUNTIME_DEV_PM_OPS` does.
+/// as `DEFINE_RUNTIME_DEV_PM_OPS` does. On success it then calls
+/// [`PMOps::system_resume_done`].
 ///
 /// # Safety
 ///
-/// `dev` must be a valid `struct device *` provided by the PM core.
+/// `dev` must be a valid `struct device *` provided by the PM core for a
+/// device whose PM callback table was generated for `T`.
 #[cfg(CONFIG_PM_SLEEP)]
-unsafe extern "C" fn system_sleep_resume(dev: *mut bindings::device) -> c_int {
+unsafe extern "C" fn system_sleep_resume<T: PMOps>(dev: *mut bindings::device) -> c_int {
     // SAFETY: The PM core passes a valid `struct device *` to a system-sleep
     // callback and it stays valid for the duration of the call.
-    unsafe { bindings::pm_runtime_force_resume(dev) }
+    let ret = unsafe { bindings::pm_runtime_force_resume(dev) };
+    if ret != 0 {
+        return ret;
+    }
+
+    if !T::HAS_SYSTEM_RESUME_DONE {
+        return 0;
+    }
+
+    let dev: &device::Device<device::Bound> =
+        // SAFETY: The PM core passes a valid `struct device *` to a system-sleep
+        // callback and it stays valid for the duration of the call. System-sleep
+        // callbacks only run for bound devices.
+        unsafe { device::Device::from_raw(dev) };
+
+    let pm_dev: &T::DeviceType =
+        // SAFETY: The generated `dev_pm_ops` for `T` is installed on devices whose
+        // bus-specific type is `T::DeviceType`. Therefore the base `Device<Bound>`
+        // passed by the PM core is embedded in a valid `T::DeviceType`. The
+        // `AsBusDevice` implementation supplies the correct offset for this cast.
+        unsafe { T::DeviceType::from_device(dev) };
+
+    T::system_resume_done(pm_dev);
+    0
 }
 
 /// Builds the base `dev_pm_ops` carrying the six system-sleep/hibernation
@@ -622,15 +647,20 @@ unsafe extern "C" fn system_sleep_resume(dev: *mut bindings::device) -> c_int {
 /// force-resume wrappers. Otherwise they stay `None`, matching the
 /// `pm_sleep_ptr()` gating in C. The runtime slots are filled by the caller.
 const fn system_sleep_base<T: PMOps>() -> bindings::dev_pm_ops {
+    const_assert!(
+        T::SYSTEM_SLEEP || !T::HAS_SYSTEM_RESUME_DONE,
+        "PMOps::system_resume_done requires PMOps::SYSTEM_SLEEP"
+    );
+
     if T::SYSTEM_SLEEP {
         #[cfg(CONFIG_PM_SLEEP)]
         return bindings::dev_pm_ops {
             suspend: Some(system_sleep_suspend),
-            resume: Some(system_sleep_resume),
+            resume: Some(system_sleep_resume::<T>),
             freeze: Some(system_sleep_suspend),
-            thaw: Some(system_sleep_resume),
+            thaw: Some(system_sleep_resume::<T>),
             poweroff: Some(system_sleep_suspend),
-            restore: Some(system_sleep_resume),
+            restore: Some(system_sleep_resume::<T>),
             ..PMOPS_NONE
         };
     }
@@ -674,6 +704,21 @@ macro_rules! define_pm_ops {
             /// that reuse the runtime PM callbacks. The slots stay unset under
             /// `CONFIG_PM_SLEEP=n`.
             const SYSTEM_SLEEP: bool = false;
+
+            /// Called after a system-sleep resume, thaw, or restore has
+            /// re-enabled runtime PM for the device.
+            ///
+            /// Runtime PM is disabled for the duration of a system-sleep
+            /// transition, so runtime PM requests issued in that window fail.
+            /// This hook runs once runtime PM is enabled again, which lets a
+            /// driver reissue the work those requests would have started. The
+            /// device is not necessarily runtime-active when the hook runs.
+            /// Implementing this without [`PMOps::SYSTEM_SLEEP`] fails the
+            /// build.
+            ///
+            /// The hook is not called when the resume fails. It runs in
+            /// process context with the device lock held and may sleep.
+            fn system_resume_done(_dev: &Self::DeviceType) {}
 
             $(
                 #[allow(missing_docs)]
