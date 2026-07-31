@@ -239,9 +239,9 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Set while the scheduler-level runtime suspend is in effect, from the
     /// start of the tick suspend until resume. Written under the scheduler
-    /// mutex, so tick paths re-check it there. Read locklessly by the
-    /// hardware-access gate, which runs in dma-fence signalling sections and
-    /// must not sleep.
+    /// mutex, so tick paths re-check it there. Also read without the lock
+    /// in the tick re-arm gate, where a stale value only costs a redundant
+    /// tick.
     pub(crate) sched_suspended: Atomic<bool>,
 
     /// Slot manager for the firmware-visible CSG slots.
@@ -310,6 +310,14 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Runtime PM context, `None` until the end of probe.
     pub(crate) pm: SetOnce<PMContext<TyrPmOps>>,
+
+    /// Set once runtime suspend can no longer fail and cleared when resume
+    /// brings the hardware back, a different window from the mmap `powered`
+    /// state. Written only by the runtime PM callbacks and read without a
+    /// lock from dma-fence signalling paths. It carries no other state, so
+    /// `Relaxed` suffices. `sched_suspended` cannot be used instead, since
+    /// the reset worker clears it.
+    pub(crate) pm_powered_down: Atomic<bool>,
 
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
@@ -656,6 +664,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 devfreq_data,
                 pm: SetOnce::new(),
+                pm_powered_down: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
         });
