@@ -23,6 +23,7 @@ use kernel::{
     drm,
     drm::exec::{
         ExecCtx,
+        ExecFlags,
         Prepared, //
     },
     drm::gem::IntoGEMObject,
@@ -231,16 +232,21 @@ impl<T: DriverGpuVm> GpuVm<T> {
 
     /// Prepare this GPUVM.
     ///
-    /// The parameter indicates how many fences to preallocate space for.
+    /// `flags` controls how the locks are taken, and `num_fences` how many fences to preallocate
+    /// space for.
     #[inline]
-    pub fn prepare(&self, num_fences: u32) -> impl PinInit<GpuVmExec<'_, T>, Error> {
+    pub fn prepare(
+        &self,
+        flags: ExecFlags,
+        num_fences: u32,
+    ) -> impl PinInit<GpuVmExec<'_, T>, Error> {
         try_pin_init!(GpuVmExec {
             exec <- Opaque::try_ffi_init(|exec: *mut bindings::drm_gpuvm_exec| {
                 // SAFETY: exec is valid but unused memory, so we can write.
                 unsafe {
                     ptr::write_bytes(exec, 0u8, 1usize);
                     ptr::write(&raw mut (*exec).vm, self.as_raw());
-                    ptr::write(&raw mut (*exec).flags, bindings::DRM_EXEC_INTERRUPTIBLE_WAIT);
+                    ptr::write(&raw mut (*exec).flags, flags.into());
                     ptr::write(&raw mut (*exec).num_fences, num_fences);
                 }
 
