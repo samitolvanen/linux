@@ -8,13 +8,17 @@ use kernel::{
         VmaNew,
         VmaRef, //
     },
-    page::{PAGE_SHIFT, PAGE_SIZE},
+    page::{
+        Page,
+        PAGE_SHIFT,
+        PAGE_SIZE, //
+    },
     prelude::*,
 };
 
 use crate::driver::TyrDrmDevice;
 
-const DRM_PANTHOR_USER_MMIO_OFFSET_64BIT: u64 = 1u64 << 56;
+pub(crate) const DRM_PANTHOR_USER_MMIO_OFFSET_64BIT: u64 = 1u64 << 56;
 const DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET: u64 = DRM_PANTHOR_USER_MMIO_OFFSET_64BIT;
 const CSF_GPU_LATEST_FLUSH_ID_OFFSET: u64 = 0x10000;
 
@@ -102,12 +106,64 @@ unsafe extern "C" fn vm_fault_handler(vmf: *mut bindings::vm_fault) -> bindings:
         return VM_FAULT_SIGBUS;
     }
 
-    let phys_addr = tdev.mmio_phys_addr + CSF_GPU_LATEST_FLUSH_ID_OFFSET;
-    let pfn = (phys_addr >> PAGE_SHIFT) as usize;
-
     // SAFETY: `vma` is the active VMA for this fault; the kernel holds the
     // mmap read lock for the duration of the callback.
     let vma_ref = unsafe { VmaRef::from_raw(vma) };
-    let pgprot = vma_ref.vm_page_prot().noncached();
+
+    // A read through a live PTE into unclocked MMIO is an external
+    // abort, so a suspended device gets the dummy page. The `user_mmio`
+    // lock orders the check and the PTE insert against the suspend
+    // path's unmap.
+    let user_mmio = tdev.user_mmio.lock();
+    let (pfn, pgprot) = if user_mmio.powered {
+        let phys_addr = tdev.mmio_phys_addr + CSF_GPU_LATEST_FLUSH_ID_OFFSET;
+        (
+            (phys_addr >> PAGE_SHIFT) as usize,
+            vma_ref.vm_page_prot().noncached(),
+        )
+    } else {
+        (user_mmio.dummy_latest_flush.pfn(), vma_ref.vm_page_prot())
+    };
+
     vma_ref.vmf_insert_pfn_prot(address, pfn, pgprot)
+}
+
+/// State of the user `LATEST_FLUSH` mapping, shared under one lock by
+/// the fault handler and the runtime PM callbacks so the mapping tracks
+/// whether the GPU is powered.
+pub(crate) struct UserMmio {
+    /// Whether the GPU MMIO region is powered. The fault handler may
+    /// insert the real `LATEST_FLUSH` PFN only while this is set.
+    powered: bool,
+    /// Stand-in page served by the fault handler while the GPU is
+    /// suspended. It holds 1 so userspace skips the cache flush. Zero
+    /// cannot be used because it means "always flush".
+    dummy_latest_flush: Page,
+}
+
+impl UserMmio {
+    /// Allocates and initializes the dummy page. Called once at probe,
+    /// while the device is powered.
+    pub(crate) fn new() -> Result<Self> {
+        let dummy_latest_flush = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+
+        let init = 1u32.to_ne_bytes();
+        // SAFETY: the page was just allocated and is not shared, so the
+        // write cannot race, and the 4-byte write at offset 0 is in
+        // bounds.
+        unsafe { dummy_latest_flush.write_raw(init.as_ptr(), 0, init.len())? };
+
+        Ok(Self {
+            powered: true,
+            dummy_latest_flush,
+        })
+    }
+
+    /// Sets whether the GPU MMIO is powered and drops the user `LATEST_FLUSH`
+    /// PTEs so the fault handler re-derives the mapping.
+    #[expect(dead_code)]
+    pub(crate) fn set_powered(&mut self, device: &TyrDrmDevice, powered: bool) {
+        self.powered = powered;
+        device.unmap_mapping_range(DRM_PANTHOR_USER_MMIO_OFFSET_64BIT, 0);
+    }
 }
