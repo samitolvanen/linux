@@ -791,4 +791,24 @@ impl AsSlotManager {
     pub(super) fn vm_as_slot(&self, vm: &VmAsData) -> Option<u8> {
         vm.as_seat.access(self).slot()
     }
+
+    /// Evicts every resident VM from its hardware AS slot.
+    pub(super) fn suspend(&mut self) {
+        for slot_idx in 0..self.slot_count() {
+            let Some(vm) = self.slot_data(slot_idx).cloned() else {
+                continue;
+            };
+            // On a flush timeout the slot is freed anyway so the clocks can
+            // gate with nothing programmed, and the reset on resume reprograms
+            // it. Keeping it would fault the next VM bound there.
+            *vm.as_active_users.access_mut(self) = 0;
+            if let Err(e) = self.evict_forced(&vm.as_seat, &mut ()) {
+                pr_err!(
+                    "AS slot {} suspend evict failed: {}\n",
+                    slot_idx,
+                    e.to_errno()
+                );
+            }
+        }
+    }
 }

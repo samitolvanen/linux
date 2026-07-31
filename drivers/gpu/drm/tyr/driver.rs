@@ -181,7 +181,6 @@ pub(crate) struct TyrPlatformDriverData {
     /// IRQ registrations, kept reachable so the runtime-suspend path
     /// can synchronize in-flight handlers before gating the clocks.
     pub(crate) gpu_irq: Devres<ThreadedRegistration<TyrIrq<GpuIrq>>>,
-    #[expect(dead_code)]
     pub(crate) mmu_irq: Devres<ThreadedRegistration<TyrIrq<MmuIrq>>>,
     #[expect(dead_code)]
     pub(crate) job_irq: Devres<ThreadedRegistration<TyrIrq<JobIrq>>>,
