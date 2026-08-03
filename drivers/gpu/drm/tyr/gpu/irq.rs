@@ -44,7 +44,8 @@ use crate::{
 /// the driver does not have to ack them.
 ///
 /// `issue_soft_reset` polls RAWSTAT for `reset_completed` and must run
-/// before this IRQ is registered. The handler's drain loop clears the bit.
+/// before `gpu_irq_enable` unmasks this source. The handler's drain loop
+/// clears the bit.
 fn gpu_irq_sources() -> gpu_control::GPU_IRQ_MASK {
     gpu_control::GPU_IRQ_MASK::zeroed()
         .with_gpu_fault(true)
@@ -56,7 +57,15 @@ fn gpu_irq_sources() -> gpu_control::GPU_IRQ_MASK {
 
 pub(crate) struct GpuIrq;
 
-/// Unmasks the GPU IRQ sources and registers the handler.
+/// Clears the latched GPU IRQs the driver services and unmasks them.
+pub(crate) fn gpu_irq_enable(io: &IoMem<'_>) {
+    let sources = gpu_irq_sources();
+
+    io.write_reg(gpu_control::GPU_IRQ_CLEAR::from_raw(sources.into_raw()));
+    io.write_reg(sources);
+}
+
+/// Registers the GPU IRQ handler with the sources masked.
 ///
 /// # Safety
 ///
@@ -67,12 +76,10 @@ pub(crate) unsafe fn gpu_irq_init<'drm>(
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
 ) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, GpuIrq>>, Error> + 'drm> {
-    let sources = gpu_irq_sources();
-    let io = iomem.access(pdev.as_ref())?;
-
-    // Drop any latched IRQs from a previous probe.
-    io.write_reg(gpu_control::GPU_IRQ_CLEAR::from_raw(sources.into_raw()));
-    io.write_reg(sources);
+    // The caller unmasks the sources once the handler is registered.
+    iomem
+        .access(pdev.as_ref())?
+        .write_reg(gpu_control::GPU_IRQ_MASK::from_raw(0));
 
     // SAFETY: The caller guarantees that the registration is not leaked.
     Ok(unsafe { TyrIrq::request(pdev, tdev, c"gpu", iomem, GpuIrq) })
