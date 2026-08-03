@@ -367,6 +367,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             }
             inner.csg_id = None;
         });
+        slot_data.group.tiler_oom.store(0, Ordering::Relaxed);
         slot_data.group.vm.idle()?;
         Ok(())
     }
