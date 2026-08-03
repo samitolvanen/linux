@@ -724,8 +724,6 @@ impl Scheduler {
     }
 
     /// Stages a firmware-priority update for CSG slot `csg_idx`.
-    ///
-    /// Caller must hold the slot-manager lock.
     pub(crate) fn update_csg_slot_priority(
         &mut self,
         tdev: &TyrDrmDevice,
