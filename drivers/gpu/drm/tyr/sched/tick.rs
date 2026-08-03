@@ -760,6 +760,18 @@ impl<'a> Tick<'a> {
         Ok(())
     }
 
+    /// Puts a staged bind back on a scheduler list so a later tick can
+    /// rediscover the group.
+    ///
+    /// The idle state is rechecked live, so a group that turned runnable
+    /// while staged does not land back on the idle list.
+    fn requeue_pending_bind(&mut self, pending: PendingBind) {
+        let group: Arc<Group> = pending.list_arc.clone_arc();
+        let is_idle =
+            !matches!(pending.prior_state, GroupListState::Runnable) && group.is_idle_live();
+        self.sched.requeue_group(pending.list_arc, is_idle);
+    }
+
     /// Updates priorities for retained groups and binds new pending
     /// groups into available hardware slots in a single prioritized
     /// pass.
@@ -770,6 +782,7 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
         let mut next_fw_prio = MAX_CSG_PRIO;
+        let mut bind_timed_out = false;
 
         // Build the priority/bind request set under the slot-manager
         // lock, then drop the lock before issuing the firmware update.
@@ -814,6 +827,14 @@ impl<'a> Tick<'a> {
                             continue;
                         };
 
+                        // An earlier bind in this pass timed out on its
+                        // address space. Requeue the rest rather than
+                        // repeat the wait for each remaining group.
+                        if bind_timed_out {
+                            self.requeue_pending_bind(pending);
+                            continue;
+                        }
+
                         let group: Arc<Group> = pending.list_arc.clone_arc();
                         if let Err(e) = csg_slot_manager.activate(
                             &group.csg_seat,
@@ -824,13 +845,12 @@ impl<'a> Tick<'a> {
                             &mut context,
                         ) {
                             pr_err!("activate (pending) failed: {}\n", e.to_errno());
-                            // Activate failed; restore the list_arc to
-                            // the list `take_unbound` sourced it from
-                            // (recorded in `prior_state`) so the next
-                            // tick can rediscover the group.
-                            let is_idle = !matches!(pending.prior_state, GroupListState::Runnable)
-                                && group.is_idle_live();
-                            self.sched.requeue_group(pending.list_arc, is_idle);
+                            // ETIMEDOUT reaches here from the AS-ready
+                            // and cache-flush polls under vm.activate().
+                            if e == ETIMEDOUT {
+                                bind_timed_out = true;
+                            }
+                            self.requeue_pending_bind(pending);
                             continue;
                         }
 
