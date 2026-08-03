@@ -90,16 +90,28 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
 
         let mut outcomes = KVec::new();
         for oom in pending.iter() {
-            let grow_result = oom.group.get_heap_pool().ok_or(EINVAL).and_then(|pool| {
-                pool.grow_heap_context(
-                    tdev,
-                    heap::ContextGrowArgs {
-                        heap_gpu_va: oom.heap_address,
-                        renderpasses_in_flight: oom.vt_start.wrapping_sub(oom.frag_end),
-                        pending_frag_count: oom.vt_end.wrapping_sub(oom.frag_end),
-                    },
-                )
-            });
+            let grow_result = if oom.frag_end > oom.vt_end || oom.vt_end >= oom.vt_start {
+                pr_err!(
+                    "tiler_oom_work: CSG {} CS {} bad counters vt_start={} vt_end={} frag_end={}\n",
+                    oom.csg_id,
+                    oom.cs_id,
+                    oom.vt_start,
+                    oom.vt_end,
+                    oom.frag_end
+                );
+                Err(EINVAL)
+            } else {
+                oom.group.get_heap_pool().ok_or(EINVAL).and_then(|pool| {
+                    pool.grow_heap_context(
+                        tdev,
+                        heap::ContextGrowArgs {
+                            heap_gpu_va: oom.heap_address,
+                            renderpasses_in_flight: oom.vt_start.wrapping_sub(oom.frag_end),
+                            pending_frag_count: oom.vt_end.wrapping_sub(oom.frag_end),
+                        },
+                    )
+                })
+            };
 
             let outcome = match grow_result {
                 Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
