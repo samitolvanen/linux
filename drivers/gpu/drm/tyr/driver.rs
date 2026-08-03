@@ -74,14 +74,20 @@ use crate::{
     },
     file::TyrDrmFileData,
     fw::{
-        irq::job_irq_init,
+        irq::{
+            job_irq_enable,
+            job_irq_init, //
+        },
         Firmware, //
     },
     gem::BoData,
     gpu,
     gpu::GpuInfo,
     mmu::{
-        irq::mmu_irq_init,
+        irq::{
+            mmu_irq_enable,
+            mmu_irq_init, //
+        },
         Mmu, //
     },
     regs::gpu_control::*, //
@@ -613,14 +619,19 @@ impl platform::Driver for TyrPlatformDriverData {
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
 
+        let io = tdev.iomem.access(pdev.as_ref())?;
+
         let gpu_irq = gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
         devres::register(pdev.as_ref(), gpu_irq, GFP_KERNEL)?;
+        gpu::irq::gpu_irq_enable(io);
 
         let mmu_irq = mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?;
         devres::register(pdev.as_ref(), mmu_irq, GFP_KERNEL)?;
+        mmu_irq_enable(io);
 
         let job_irq = job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?;
         devres::register(pdev.as_ref(), job_irq, GFP_KERNEL)?;
+        job_irq_enable(io);
 
         // devres unwinds in reverse order, so the governor stops before
         // the supplies and clocks registered earlier are released.

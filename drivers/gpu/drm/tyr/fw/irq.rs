@@ -88,6 +88,16 @@ pub(crate) struct JobIrq {
     state: JobIrqState,
 }
 
+/// Clears latched job IRQs and unmasks the sources the driver handles.
+pub(crate) fn job_irq_enable(io: &IoMem) {
+    io.write_reg(JOB_IRQ_CLEAR::from_raw(u32::MAX));
+    io.write_reg(
+        JOB_IRQ_MASK::zeroed()
+            .with_const_csg::<CSG_IRQ_MASK>()
+            .with_glb(true),
+    );
+}
+
 pub(crate) fn job_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
@@ -95,13 +105,8 @@ pub(crate) fn job_irq_init<'a>(
     state: JobIrqState,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<JobIrq>>, Error> + 'a> {
     let io = iomem.access(pdev.as_ref())?;
-    // Drop any latched IRQs from a previous probe.
-    io.write_reg(JOB_IRQ_CLEAR::from_raw(u32::MAX));
-    io.write_reg(
-        JOB_IRQ_MASK::zeroed()
-            .with_const_csg::<CSG_IRQ_MASK>()
-            .with_glb(true),
-    );
+    // The caller unmasks the sources once the handler is registered.
+    io.write_reg(JOB_IRQ_MASK::zeroed());
 
     let job_irq = JobIrq {
         iomem: iomem.clone(),

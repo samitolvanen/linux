@@ -48,6 +48,12 @@ pub(crate) struct MmuIrq {
     mask: u32,
 }
 
+/// Clears latched MMU IRQs and unmasks the sources the driver handles.
+pub(crate) fn mmu_irq_enable(io: &IoMem) {
+    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(u32::MAX));
+    io.write_reg(mmu_control::IRQ_MASK::from_raw(mmu_interrupts_mask()));
+}
+
 pub(crate) fn mmu_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
@@ -55,9 +61,8 @@ pub(crate) fn mmu_irq_init<'a>(
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<MmuIrq>>, Error> + 'a> {
     let mask = mmu_interrupts_mask();
     let io = iomem.access(pdev.as_ref())?;
-    // Drop any latched IRQs from a previous probe.
-    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(u32::MAX));
-    io.write_reg(mmu_control::IRQ_MASK::from_raw(mask));
+    // The caller unmasks the sources once the handler is registered.
+    io.write_reg(mmu_control::IRQ_MASK::from_raw(0));
 
     let irq_type = MmuIrq { iomem, mask };
     TyrIrq::request(pdev, tdev, c_str!("mmu"), irq_type)
