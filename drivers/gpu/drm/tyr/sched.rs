@@ -255,6 +255,7 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
             }
             inner.csg_id = None;
         });
+        slot_data.group.tiler_oom.store(0, Relaxed);
 
         slot_data.group.vm.idle()?;
         Ok(())
