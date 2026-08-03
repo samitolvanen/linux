@@ -44,7 +44,8 @@ use crate::{
 /// the driver does not have to ack them.
 ///
 /// `issue_soft_reset` polls RAWSTAT for `reset_completed` and must run
-/// before this IRQ is registered: the handler's drain loop clears the bit.
+/// before `gpu_irq_enable` unmasks this source. The handler's drain loop
+/// clears the bit.
 pub(crate) fn gpu_interrupts_mask() -> u32 {
     gpu_control::GPU_IRQ_MASK::zeroed()
         .with_gpu_fault(true)
@@ -61,6 +62,12 @@ pub(crate) struct GpuIrq {
     mask: u32,
 }
 
+/// Clears latched GPU IRQs and unmasks the sources the driver handles.
+pub(crate) fn gpu_irq_enable(io: &IoMem) {
+    io.write_reg(gpu_control::GPU_IRQ_CLEAR::from_raw(u32::MAX));
+    io.write_reg(gpu_control::GPU_IRQ_MASK::from_raw(gpu_interrupts_mask()));
+}
+
 pub(crate) fn gpu_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
@@ -68,9 +75,8 @@ pub(crate) fn gpu_irq_init<'a>(
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<GpuIrq>>, Error> + 'a> {
     let mask = gpu_interrupts_mask();
     let io = iomem.access(pdev.as_ref())?;
-    // Drop any latched IRQs from a previous probe.
-    io.write_reg(gpu_control::GPU_IRQ_CLEAR::from_raw(u32::MAX));
-    io.write_reg(gpu_control::GPU_IRQ_MASK::from_raw(mask));
+    // The caller unmasks the sources once the handler is registered.
+    io.write_reg(gpu_control::GPU_IRQ_MASK::from_raw(0));
 
     let irq_type = GpuIrq {
         iomem: iomem.clone(),
