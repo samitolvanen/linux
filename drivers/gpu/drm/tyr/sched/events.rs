@@ -30,7 +30,11 @@ use crate::{
     heap,
 };
 
-use super::{group::Group, Scheduler};
+use super::{
+    group::Group,
+    CsgSlotManager,
+    Scheduler, //
+};
 
 struct PendingOom {
     group: Arc<Group>,
@@ -59,6 +63,13 @@ enum GrowOutcome {
 
 kernel::impl_has_work! {
     impl HasWork<TyrDrmDevice, { work_id::TILER_OOM }> for TyrDrmDeviceData { self.tiler_oom_work }
+}
+
+fn slot_holds(slot_manager: &CsgSlotManager, csg_id: usize, group: &Arc<Group>) -> bool {
+    matches!(
+        slot_manager.slot_data(csg_id),
+        Some(data) if Arc::ptr_eq(&data.group, group)
+    )
 }
 
 impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
@@ -140,9 +151,8 @@ impl Scheduler {
     }
 
     pub(super) fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
-        // Holding slot-manager across with_csg_mut() would order it
-        // ahead of fw.inner, but other paths take fw.inner standalone;
-        // introducing that order would risk ABBA.
+        // The lock order documented on `Scheduler` allows holding the
+        // slot lock across the firmware reads below.
         let group = {
             let slot_manager = tdev.csg_slot_manager.lock();
             match slot_manager.slot_data(csg_id) {
@@ -283,14 +293,8 @@ impl Scheduler {
         let mut pending = KVec::new();
 
         // Snapshot the (group, oom_mask) pairs that have a pending
-        // tiler-OOM bit set, then drop the slot-manager lock before
-        // we read the per-CS OOM state from the firmware. Holding
-        // slot-manager across with_csg_mut() would order it ahead of
-        // fw.inner, but other paths take fw.inner standalone;
-        // introducing that order would risk ABBA. The snapshot is a
-        // fixed-capacity array so this stays allocation-free under the
-        // lock; the pending KVec is built afterwards with no scheduler
-        // or slot-manager lock held.
+        // tiler-OOM bit set. The snapshot is a fixed-capacity array, so
+        // this pass stays allocation-free under the lock.
         let mut to_visit: [Option<(Arc<Group>, u32)>; super::MAX_CSGS] =
             [const { None }; super::MAX_CSGS];
         {
@@ -319,7 +323,16 @@ impl Scheduler {
                     continue;
                 }
 
-                let (saved_tiler_oom_ack, heap_address, vt_start, vt_end, frag_end) =
+                // The counters are indexed by slot, so confirm the occupant and
+                // read under one acquisition. A gone group makes the rest of its
+                // mask stale, and the firmware re-raises the event when it runs
+                // again.
+                let (saved_tiler_oom_ack, heap_address, vt_start, vt_end, frag_end) = {
+                    let slot_manager = tdev.csg_slot_manager.lock();
+                    if !slot_holds(&slot_manager, csg_id, &group) {
+                        break;
+                    }
+
                     tdev.fw.with_csg_mut(csg_id, |csg| {
                         let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
                         let ack = cs.read_output_ack()?;
@@ -332,7 +345,8 @@ impl Scheduler {
                             heap.vt_end,
                             heap.frag_end,
                         ))
-                    })?;
+                    })?
+                };
 
                 pending.push(
                     PendingOom {
@@ -366,17 +380,11 @@ impl Scheduler {
                 GrowOutcome::Fatal => continue,
             };
 
-            // The collect phase dropped the slot-manager lock so that
-            // the firmware MMIO below can run without ordering
-            // slot-manager ahead of fw.inner (which other paths take
-            // standalone). Confirm the slot is still owned by the
-            // same group.
+            // The grow ran with no lock held, so confirm the same group
+            // still owns the slot before writing to its interface.
             let owned = {
                 let slot_manager = tdev.csg_slot_manager.lock();
-                matches!(
-                    slot_manager.slot_data(oom.csg_id),
-                    Some(data) if Arc::ptr_eq(&data.group, &oom.group)
-                )
+                slot_holds(&slot_manager, oom.csg_id, &oom.group)
             };
             if !owned {
                 if new_chunk_va != 0 {
