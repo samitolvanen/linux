@@ -49,7 +49,15 @@ fn mmu_irq_sources() -> mmu_control::IRQ_MASK {
 
 pub(crate) struct MmuIrq;
 
-/// Unmasks the MMU IRQ sources and registers the handler.
+/// Clears the latched MMU IRQs the driver services and unmasks them.
+pub(crate) fn mmu_irq_enable(io: &IoMem<'_>) {
+    let sources = mmu_irq_sources();
+
+    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(sources.into_raw()));
+    io.write_reg(sources);
+}
+
+/// Registers the MMU IRQ handler with the sources masked.
 ///
 /// # Safety
 ///
@@ -60,12 +68,10 @@ pub(crate) unsafe fn mmu_irq_init<'drm>(
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
 ) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, MmuIrq>>, Error> + 'drm> {
-    let mask = mmu_irq_sources();
-    let io = iomem.access(pdev.as_ref())?;
-
-    // Drop any latched IRQs from a previous probe.
-    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(mask.into_raw()));
-    io.write_reg(mask);
+    // The caller unmasks the sources once the handler is registered.
+    iomem
+        .access(pdev.as_ref())?
+        .write_reg(mmu_control::IRQ_MASK::from_raw(0));
 
     // SAFETY: The caller guarantees that the registration is not leaked.
     Ok(unsafe { TyrIrq::request(pdev, tdev, c"mmu", iomem, MmuIrq) })

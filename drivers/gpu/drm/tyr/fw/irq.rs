@@ -112,7 +112,15 @@ pub(crate) struct JobIrq<'drm> {
     global_iface: Arc<GlobalInterface<'drm>>,
 }
 
-/// Unmasks the Job IRQ sources and registers the handler.
+/// Clears the latched job IRQs the driver services and unmasks them.
+pub(crate) fn job_irq_enable(io: &IoMem<'_>) {
+    let sources = job_irq_sources();
+
+    io.write_reg(JOB_IRQ_CLEAR::from_raw(sources.into_raw()));
+    io.write_reg(sources);
+}
+
+/// Registers the Job IRQ handler with the sources masked.
 ///
 /// # Safety
 ///
@@ -125,11 +133,10 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     state: JobIrqState,
     global_iface: Arc<GlobalInterface<'drm>>,
 ) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>, Error> + 'drm> {
-    let mask = job_irq_sources();
-
-    let io = iomem.access(pdev.as_ref())?;
-    io.write_reg(JOB_IRQ_CLEAR::from_raw(mask.into_raw()));
-    io.write_reg(mask);
+    // The caller unmasks the sources once the handler is registered.
+    iomem
+        .access(pdev.as_ref())?
+        .write_reg(JOB_IRQ_MASK::zeroed());
 
     let job_irq = JobIrq {
         state,

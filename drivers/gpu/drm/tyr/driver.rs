@@ -78,6 +78,7 @@ use crate::{
     file::TyrDrmFileData,
     fw::{
         irq::{
+            job_irq_enable,
             job_irq_init,
             JobIrq, //
         },
@@ -87,6 +88,7 @@ use crate::{
     gpu::{
         self,
         irq::{
+            gpu_irq_enable,
             gpu_irq_init,
             GpuIrq, //
         },
@@ -96,6 +98,7 @@ use crate::{
     mmap,
     mmu::{
         irq::{
+            mmu_irq_enable,
             mmu_irq_init,
             MmuIrq, //
         },
@@ -631,6 +634,7 @@ impl platform::Driver for TyrPlatformDriver {
             unsafe { gpu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
             GFP_KERNEL,
         )?;
+        gpu_irq_enable(io);
 
         // SAFETY: The registration is owned by `mmu_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
@@ -639,6 +643,7 @@ impl platform::Driver for TyrPlatformDriver {
             unsafe { mmu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
             GFP_KERNEL,
         )?;
+        mmu_irq_enable(io);
 
         // SAFETY: The registration is owned by `job_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
@@ -655,6 +660,7 @@ impl platform::Driver for TyrPlatformDriver {
             }?,
             GFP_KERNEL,
         )?;
+        job_irq_enable(io);
 
         let devfreq = devfreq::init(&unreg_dev, pdev.as_ref(), &core_clk)?;
 
