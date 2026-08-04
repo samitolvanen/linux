@@ -130,6 +130,8 @@ pub(crate) struct CsgUpdateContext {
     /// Bitmask of CSG slot indices whose request timed out during the
     /// most recent apply cycle.
     pub(crate) timedout_mask: CsgSlotMask,
+    /// True when this batch frees slots for other work.
+    pub(crate) reclaim: bool,
 }
 
 /// CSG_REQ::state field mask (bits 2:0). The firmware transitions all
@@ -161,6 +163,7 @@ impl CsgUpdateContext {
             db_toggle: [CsDbMask::empty(); MAX_CSGS],
             update_mask: CsgSlotMask::empty(),
             timedout_mask: CsgSlotMask::empty(),
+            reclaim: false,
         }
     }
 
@@ -244,9 +247,7 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
         // assumption about firmware state. Only
         // `Tick::halt_and_unbind_evicted_groups` stages a halt and waits
         // for the ack before evicting. The bind rollback evicts without
-        // staging one. The suspend interval is opened at the staging
-        // point, not here, so the firmware-save latency counts as
-        // off-slot time.
+        // staging one.
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
@@ -653,7 +654,7 @@ impl Scheduler {
                 self.sync_csg_slot_priority(fw, &mut csg_slot_manager, csg_id)?;
             }
             if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
-                self.sync_csg_slot_state(fw, &csg_slot_manager, csg_id)?;
+                self.sync_csg_slot_state(fw, &csg_slot_manager, csg_id, context.reclaim)?;
             }
             if !(acked_reqs & CSG_REQ_STATUS_UPDATE).is_empty() {
                 self.sync_csg_slot_queues_state(fw, &csg_slot_manager, csg_id)?;
@@ -729,15 +730,18 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Refreshes the resident group's recorded `group::State` from
-    /// `CSG_ACK.state`. Transitions into `Suspend` also refresh the
-    /// per-CS queue state. Transitions out of `Active` clear per-CS
-    /// `CS_REQ.state` so a subsequent re-bind starts clean.
+    /// Refreshes the resident group's recorded `group::State` from the
+    /// firmware-acknowledged `CSG_ACK.state`.
+    ///
+    /// A transition into `Suspend` also opens the off-slot deadline
+    /// credit. `Group::blocked_idle_queues` documents the reclaim
+    /// exception.
     fn sync_csg_slot_state(
         &mut self,
         fw: &Firmware<'_>,
         csg_slot_manager: &CsgSlotManager,
         csg_idx: usize,
+        reclaim: bool,
     ) -> Result {
         let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
             return Ok(());
@@ -769,6 +773,18 @@ impl Scheduler {
 
         if new_state == group::State::Suspended {
             self.sync_csg_slot_queues_state(fw, csg_slot_manager, csg_idx)?;
+
+            let blocked_idle = if reclaim {
+                group.blocked_idle_queues()
+            } else {
+                0
+            };
+            for (queue_idx, queue) in group.queues.iter().enumerate() {
+                if (blocked_idle & (1u32 << queue_idx)) != 0 {
+                    continue;
+                }
+                queue.suspend_timeout();
+            }
         }
 
         if old_state == group::State::Active {
