@@ -601,6 +601,7 @@ impl QueueOps for TyrQueueOps {
 
         if !job.job.group.can_run() {
             fence.signal(Err(ECANCELED));
+            TyrDrmDeviceData::schedule_tick(&job.job.group.tdev);
             return Ok(SubmitResult::Submitted);
         }
 
