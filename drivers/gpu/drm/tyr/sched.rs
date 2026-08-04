@@ -5,7 +5,8 @@ use core::sync::atomic::Ordering;
 use kernel::{
     list::{
         List,
-        ListArc, //
+        ListArc,
+        ListItem, //
     },
     prelude::*,
     sync::{
@@ -515,6 +516,22 @@ impl Scheduler {
         }
     }
 
+    /// Removes `group` from the wait list at its priority, if it is on
+    /// that list.
+    fn remove_group_from_wait_list(&mut self, group: &Group) {
+        let priority = group.priority as usize;
+        let target: *const Group = core::ptr::from_ref(group);
+        let mut cursor = self.waiting_groups[priority].cursor_front();
+        while let Some(peek) = cursor.peek_next() {
+            let here: *const Group = &*peek.arc();
+            if core::ptr::eq(here, target) {
+                let _ = peek.remove();
+                return;
+            }
+            cursor.move_next();
+        }
+    }
+
     /// Detaches `group` from every scheduler list it is currently on.
     ///
     /// The id-0 (idle/runnable) and id-1 (waiting) memberships are
@@ -530,14 +547,51 @@ impl Scheduler {
             });
         }
 
-        let target = Arc::as_ptr(group);
-        let mut cursor = self.waiting_groups[priority].cursor_front();
+        self.remove_group_from_wait_list(group);
+    }
+
+    /// Moves every unbound group that can no longer run from `list` to
+    /// `dead`.
+    fn take_unrunnable_groups<const ID: u64>(list: &mut List<Group, ID>, dead: &mut List<Group, ID>)
+    where
+        Group: ListItem<ID>,
+    {
+        let mut cursor = list.cursor_front();
+
         while let Some(peek) = cursor.peek_next() {
-            let here: *const Group = &*peek.arc();
-            if core::ptr::eq(here, target) {
-                let _ = peek.remove();
-                return;
+            let status = peek.arc().status();
+            if status.can_run || status.csg_id.is_some() {
+                cursor.move_next();
+                continue;
             }
+
+            dead.push_back(peek.remove());
+        }
+    }
+
+    /// Detaches every unbound group that can no longer run, moving its
+    /// idle or runnable link to `dead` and its wait-list link to
+    /// `dead_waiting`.
+    ///
+    /// Both lists must be empty on entry. They hold the detached links
+    /// until the caller drains them outside the scheduler mutex, so no
+    /// path can take a fresh `ListArc` and relist the group.
+    pub(crate) fn detach_unrunnable_groups(
+        &mut self,
+        dead: &mut List<Group, 0>,
+        dead_waiting: &mut List<Group, 1>,
+    ) {
+        for prio in 0..GROUP_PRIORITY_COUNT {
+            Self::take_unrunnable_groups(&mut self.idle_groups[prio], dead);
+            Self::take_unrunnable_groups(&mut self.runnable_groups[prio], dead);
+            Self::take_unrunnable_groups(&mut self.waiting_groups[prio], dead_waiting);
+        }
+
+        let mut cursor = dead.cursor_front();
+        while let Some(peek) = cursor.peek_next() {
+            peek.arc().with_locked_inner(|inner| {
+                inner.list_state = GroupListState::None;
+            });
             cursor.move_next();
         }
     }

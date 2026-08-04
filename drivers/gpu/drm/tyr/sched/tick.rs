@@ -134,9 +134,13 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
     let mut teardown_groups: [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE] =
         [const { None }; TEARDOWN_ARRAY_SIZE];
 
+    let mut dead_groups = List::<Group, 0>::new();
+    let mut dead_waiting = List::<Group, 1>::new();
+
     // The closure does not run until the scheduler is enabled, so a tick
     // step that fires during probe cannot re-arm itself and keep retrying.
     let result = tdev.with_locked_scheduler(|sched| {
+        sched.detach_unrunnable_groups(&mut dead_groups, &mut dead_waiting);
         Tick::new(sched, &mut teardown_groups)
             .tick(tdev)
             .inspect_err(|_| Scheduler::request_tick(tdev))
@@ -148,6 +152,16 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         let Some(group) = slot.take() else {
             break;
         };
+        group.schedule_term();
+    }
+
+    while let Some(list_arc) = dead_groups.pop_front() {
+        let group: Arc<Group> = list_arc.into_arc();
+        group.schedule_term();
+    }
+
+    while let Some(list_arc) = dead_waiting.pop_front() {
+        let group: Arc<Group> = list_arc.into_arc();
         group.schedule_term();
     }
 
