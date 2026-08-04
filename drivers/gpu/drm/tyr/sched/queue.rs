@@ -175,10 +175,8 @@ pub(crate) struct QueueData {
     /// Active GPU sync-wait captured for this queue.
     #[pin]
     syncwait: Mutex<SyncWait>,
-    /// Per-queue accounting of off-slot suspend time; advanced by
-    /// `Self::suspend_timeout` from `halt_and_unbind_evicted_groups`
-    /// and `Self::resume_timeout` from `sync_csg_slot_state`, and
-    /// snapshotted by `TyrQueueOps::submit` for the per-job baseline.
+    /// Per-queue accounting of off-slot suspend time, credited against
+    /// the job deadline.
     #[pin]
     suspend_state: Mutex<SuspendState>,
 }
@@ -666,11 +664,9 @@ impl QueueOps for TyrQueueOps {
     }
 }
 
-/// Bounds an in-flight job by `JOB_TIMEOUT_MS` of on-slot time.
-///
-/// "Suspend-adjusted" means the time the queue spent evicted off
-/// its CSG slot for higher-priority work is credited back against
-/// the per-job deadline.
+/// Bounds an in-flight job by `JOB_TIMEOUT_MS`, not counting time its
+/// queue spent suspended off a CSG slot. A queue blocked on a sync wait
+/// gets no such credit when no queue in its group is active.
 struct QueueCompletionStage {
     data: Arc<QueueData>,
     timeout: Jiffies,
