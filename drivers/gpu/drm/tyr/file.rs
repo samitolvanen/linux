@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
-    alloc::KVec,
     device::{
         Bound,
         Device, //
@@ -444,8 +443,9 @@ impl TyrDrmFileData {
 
         // `count` is unbounded, so the arrays come from kvmalloc.
         let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
+        ctx.reserve_jobs(count)?;
 
-        let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL)?;
+        let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL | __GFP_NOWARN)?;
 
         for _ in 0..count {
             let op: VmBindOp = reader.read()?;
@@ -479,7 +479,7 @@ impl TyrDrmFileData {
             0,
             |exec_ctx| {
                 let vm_resv = vm.prepare_resv(exec_ctx)?;
-                let mut obj_resvs = KVVec::with_capacity(op_bos.len(), GFP_KERNEL)?;
+                let mut obj_resvs = KVVec::with_capacity(op_bos.len(), GFP_KERNEL | __GFP_NOWARN)?;
 
                 for bo in op_bos.iter() {
                     let obj_resv = match bo.as_deref() {
@@ -726,13 +726,13 @@ impl VmBindOp {
         vm: &vm::Vm,
         is_async: bool,
         validated_bo: Option<ARef<gem::Bo>>,
-    ) -> Result<(vm::VmBindJob, KVec<deps::SyncOp>)> {
+    ) -> Result<(vm::VmBindJob, KVVec<deps::SyncOp>)> {
         let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
         let map_flags = (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
             | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
             | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
             as u32;
-        let mut syncs = KVec::new();
+        let mut syncs = KVVec::new();
 
         if is_async {
             deps::append_syncops(
