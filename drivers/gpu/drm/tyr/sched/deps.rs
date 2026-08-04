@@ -335,7 +335,7 @@ struct JobContext<T: BatchOps> {
 pub(crate) struct Context<'a, T: BatchOps> {
     file: &'a TyrDrmFile,
     ops: T,
-    jobs: KVec<JobContext<T>>,
+    jobs: KVVec<JobContext<T>>,
     signals: KVec<PendingSignal>,
 }
 
@@ -344,9 +344,14 @@ impl<'a, T: BatchOps> Context<'a, T> {
         Self {
             file,
             ops,
-            jobs: KVec::new(),
+            jobs: KVVec::new(),
             signals: KVec::new(),
         }
+    }
+
+    pub(crate) fn reserve_jobs(&mut self, count: usize) -> Result {
+        self.jobs.reserve(count, GFP_KERNEL)?;
+        Ok(())
     }
 
     pub(crate) fn add_job(&mut self, job: T::Job, syncops: Arc<KVec<SyncOp>>) -> Result {
