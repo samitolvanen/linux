@@ -1053,6 +1053,10 @@ impl Scheduler {
         let priority = group.priority as usize;
 
         group.with_locked_inner(|inner| {
+            if inner.fatal_error.is_some() || group.vm.is_unusable() {
+                return;
+            }
+
             match inner.list_state {
                 group::GroupListState::Runnable => {}
                 group::GroupListState::None => {
