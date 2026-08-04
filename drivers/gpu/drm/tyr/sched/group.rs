@@ -202,6 +202,16 @@ pub(crate) struct Group {
     /// The mutable, lock-protected portion of the group state.
     #[pin]
     inner: Mutex<GroupInner>,
+    /// Serializes a submit's prepare-to-commit window on this group, so
+    /// every queue claims its pipeline slots and fence seqnos in the
+    /// same order.
+    ///
+    /// Lock order `submit_lock > {drm_exec, job queue}`, with nothing
+    /// else held when it is taken. The window allocates and holds the VM
+    /// reservation lock, so the lock is off limits to dma-fence
+    /// signalling sections and must not cover a userspace copy.
+    #[pin]
+    submit_lock: Mutex<()>,
     pub(crate) tiler_oom: AtomicU32,
     /// Number of consecutive ticks the group has remained bound to a
     /// hardware slot. Reset to zero when the group is bound and
@@ -417,6 +427,7 @@ impl Group {
                     queue_count,
                     term_scheduled: false,
                 }),
+                submit_lock <- new_mutex!(()),
                 tiler_oom: AtomicU32::new(0),
                 bound_tick_counter: AtomicU32::new(0),
                 tdev: ddev.into(),
@@ -744,6 +755,8 @@ impl Group {
         }
 
         ctx.collect_signal_ops()?;
+
+        let _submit_lock = self.submit_lock.lock();
 
         for idx in 0..job_count {
             ctx.prepare(idx, self)?;

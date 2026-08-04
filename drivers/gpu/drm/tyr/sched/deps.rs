@@ -483,6 +483,11 @@ impl<'a> Context<'a> {
     /// prepare time), `JobQueue::commit` is itself allocation-free,
     /// and `Self::update_job_syncs` only writes into a pre-allocated
     /// slot.
+    ///
+    /// A batch commits in prepare order, and `Group::submit` holds the
+    /// group's submit lock across the whole prepare-to-commit window,
+    /// so a queue claims its seqno ranges in the order its pipeline
+    /// runs the jobs.
     pub(crate) fn commit(&mut self, job_idx: usize, group: &Group) -> Result<ARef<PublicDmaFence>> {
         let (queue_index, mut prepared, piece_count, intra_batch_deps) =
             match self.jobs[job_idx].state.take() {
