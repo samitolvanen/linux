@@ -487,6 +487,21 @@ impl Group {
         true
     }
 
+    /// Mask of the blocked queues. Zero when any queue in the group is
+    /// still active.
+    ///
+    /// No other queue in an idle group can signal the sync object a
+    /// blocked queue waits on. The signal has to come from outside the
+    /// group, and the job deadline bounds that wait.
+    pub(crate) fn blocked_idle_queues(&self) -> u32 {
+        let inner = self.inner.lock();
+        if inner.is_idle() {
+            inner.blocked_queues()
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn status(&self) -> GroupStatus {
         let inner = self.inner.lock();
         GroupStatus {

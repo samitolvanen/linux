@@ -682,6 +682,9 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let slot_count = MAX_CSGS;
         let mut context = CsgUpdateContext::new();
+        // An eviction reclaims the slot for other work only when this
+        // pass selected some.
+        context.reclaim = decision.num_selected != 0;
 
         // Build the halt request set under the slot-manager lock,
         // then drop the lock before issuing the firmware update.
@@ -698,12 +701,6 @@ impl<'a> Tick<'a> {
                 };
 
                 if slot_data.group.can_run() {
-                    // The firmware saves CS state during the ack wait; opening the
-                    // interval here credits that latency as off-slot time. Only
-                    // suspended groups resume, so only they need the interval.
-                    for queue in slot_data.group.queues.iter() {
-                        queue.suspend_timeout();
-                    }
                     context.set_state(i, CsgExecutionState::Suspend);
                 } else {
                     context.set_state(i, CsgExecutionState::Terminate);
