@@ -438,6 +438,7 @@ impl TyrDrmFileData {
 
         // `count` is unbounded, so the arrays come from kvmalloc.
         let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
+        ctx.reserve_jobs(count)?;
 
         let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL)?;
 
