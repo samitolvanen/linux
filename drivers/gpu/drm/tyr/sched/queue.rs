@@ -614,6 +614,7 @@ impl QueueOps for TyrQueueOps {
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
         if !job.job.group.can_run() {
+            TyrDrmDeviceData::schedule_tick(&job.job.group.tdev);
             if let Err(fence) = self.data.signal_unpushed_fence(fence, ECANCELED) {
                 return Ok(SubmitResult::NoResources(fence));
             }
@@ -779,7 +780,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
                     inner.fatal_error = Some(ETIMEDOUT);
                 }
             });
-            TyrDrmDeviceData::schedule_tick(&ctx.job.group.tdev);
+            ctx.job.group.detach_and_terminate();
             if let Some(done_seqno) = ctx.job.done_seqno() {
                 self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));
             }
