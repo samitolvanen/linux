@@ -9,7 +9,8 @@ use kernel::{
         impl_has_dma_fence_work,
         new_dma_fence_work,
         DmaFenceWork,
-        DmaFenceWorkItem, //
+        DmaFenceWorkItem,
+        PublicDmaFence, //
     },
     drm::gem::BaseObject,
     io::IoBase,
@@ -72,8 +73,10 @@ use super::{
         QueueSubmit, //
     },
     queue::{
+        PreparedQueueJob,
         Queue,
-        QueueCreate, //
+        QueueCreate,
+        QueueJob, //
     },
     syncs, //
 };
@@ -793,7 +796,7 @@ impl Group {
 
         let jobs = Job::from_queue_submits(queue_submits)?;
         let job_count = jobs.len();
-        let mut ctx = deps::Context::new(file);
+        let mut ctx = deps::Context::new(file, SubmitOps::new(self.clone(), *csif));
 
         for (job, syncs) in jobs.into_iter() {
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
@@ -804,13 +807,13 @@ impl Group {
         let _submit_lock = self.submit_lock.lock();
 
         for idx in 0..job_count {
-            ctx.prepare(idx, self, csif)?;
+            ctx.prepare(idx)?;
         }
 
         self.vm
             .with_prepared_vm(job_count as u32, |mut prepared_vm| {
                 for idx in 0..job_count {
-                    let signal_fence = ctx.commit(idx, self)?;
+                    let signal_fence = ctx.commit(idx)?;
                     prepared_vm.resv_add_fence(
                         &signal_fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
@@ -824,6 +827,109 @@ impl Group {
         ctx.push_fences();
 
         Ok(())
+    }
+}
+
+/// A submit job that has claimed its slot on a queue.
+struct PreparedSubmit {
+    queue_index: usize,
+    queue_job: PreparedQueueJob,
+    /// Number of command-stream pieces the job carries, and the number
+    /// of seqnos the commit claims for it. Zero for a sync-only job.
+    piece_count: usize,
+}
+
+/// Runs the jobs of a group submit through `deps::Context`.
+struct SubmitOps {
+    group: Arc<Group>,
+    /// CSIF information snapshotted at submit time and used to size the
+    /// wrapper's working registers.
+    csif: CsifInfo,
+}
+
+impl SubmitOps {
+    fn new(group: Arc<Group>, csif: CsifInfo) -> Self {
+        Self { group, csif }
+    }
+}
+
+impl deps::BatchOps for SubmitOps {
+    type Job = Job;
+    type Prepared = PreparedSubmit;
+
+    /// Allocates the wrapped command stream, reserves the pending submit
+    /// fence slot, and hands the job to its queue.
+    fn prepare(
+        &self,
+        job: Job,
+        deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
+    ) -> Result<PreparedSubmit> {
+        let queue_index = job.queue_index();
+        let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+        let has_stream = job.has_stream();
+
+        let reservation = if has_stream {
+            Some(queue.reserve_pending_submit_fence()?)
+        } else {
+            None
+        };
+
+        let wrapped = if has_stream {
+            let sync_va = self.group.syncobj_va(queue_index)?;
+            job.build_wrapped_stream(&self.csif, sync_va)?
+        } else {
+            KVec::new()
+        };
+
+        // The extra slot holds the prior-work dependency that
+        // `SubmitOps::commit` adds.
+        let prepared = queue.prepare_job(
+            QueueJob::new(wrapped, self.group.clone(), queue_index, reservation),
+            deps,
+            extra_dep_capacity + usize::from(!has_stream),
+        )?;
+
+        Ok(PreparedSubmit {
+            queue_index,
+            queue_job: prepared,
+            piece_count: job.piece_count(),
+        })
+    }
+
+    fn add_dep(&self, prepared: &mut PreparedSubmit, fence: ARef<PublicDmaFence>) -> Result {
+        prepared.queue_job.add_dep(fence)
+    }
+
+    fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<PublicDmaFence>> {
+        let PreparedSubmit {
+            queue_index,
+            mut queue_job,
+            piece_count,
+        } = prepared;
+        let has_stream = piece_count != 0;
+
+        let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+
+        // The wrapped stream emits exactly one `SYNC_ADD64(+1)` per piece,
+        // so the syncobj reaches the highest claimed seqno precisely when
+        // every piece has retired. A stream-less job emits no GPU work, so
+        // it waits on the queue's last command stream instead of signalling
+        // as soon as its dependencies resolve.
+        if has_stream {
+            let job = queue_job.job().ok_or(EINVAL)?;
+            job.set_done_seqno(queue.claim_seqnos(piece_count));
+        } else if let Some(fence) = queue.last_submit_fence() {
+            queue_job.add_dep(fence)?;
+        }
+
+        let submit_fence = queue.commit_job(queue_job);
+
+        if has_stream {
+            queue.set_last_submit_fence(submit_fence.clone());
+        }
+
+        Ok(submit_fence)
     }
 }
 

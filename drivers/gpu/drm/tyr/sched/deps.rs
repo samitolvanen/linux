@@ -25,17 +25,7 @@ use kernel::{
 
 use crate::{
     driver::TyrDrmDriver,
-    file::TyrDrmFile,
-    gpu::CsifInfo, //
-};
-
-use super::{
-    group::Group,
-    job::Job,
-    queue::{
-        PreparedQueueJob,
-        QueueJob, //
-    }, //
+    file::TyrDrmFile, //
 };
 
 #[repr(transparent)]
@@ -304,10 +294,48 @@ pub(crate) fn append_syncops(
     Ok(())
 }
 
+/// How one job of a batch reaches its queue.
+///
+/// A group submit and an async VM bind track dependencies the same way
+/// and differ only in the queue a job goes to, so each path implements
+/// this and shares `Context`.
+///
+/// `Context` prepares each job at most once. The caller drives prepare
+/// and then commit in ascending job index, and a caller that shares a
+/// queue with another batch serializes the whole window from the first
+/// prepare to the last commit. The queue fixes the order it runs jobs
+/// in at prepare time and their fence sequence numbers at commit time.
+pub(crate) trait BatchOps {
+    /// Job description the context holds until it is prepared.
+    type Job;
+    /// Handle to a prepared job, consumed by `Self::commit`.
+    type Prepared;
+
+    /// Queues `job` behind `deps` and reserves `extra_dep_capacity`
+    /// dependency slots for `Self::add_dep` to fill.
+    fn prepare(
+        &self,
+        job: Self::Job,
+        deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
+    ) -> Result<Self::Prepared>;
+
+    /// Appends `fence` to the dependencies of a prepared job. Must not
+    /// allocate. Later calls in a batch run with earlier fences already
+    /// installed in a reservation, so they run inside a dma-fence
+    /// signalling section.
+    fn add_dep(&self, prepared: &mut Self::Prepared, fence: ARef<PublicDmaFence>) -> Result;
+
+    /// Submits a prepared job and returns the fence that gates its
+    /// completion. Must not allocate, for the same reason as
+    /// `Self::add_dep`.
+    fn commit(&self, prepared: Self::Prepared) -> Result<ARef<PublicDmaFence>>;
+}
+
 /// Dependencies collected for one job's WAIT syncops.
 struct CollectedDeps {
     /// Fences that already exist when the job is prepared, passed to
-    /// `JobQueue::prepare`.
+    /// `BatchOps::prepare`.
     external: KVec<ARef<PublicDmaFence>>,
     /// (handle, point) keys of WAITs met by a producer earlier in the
     /// batch.
@@ -324,42 +352,36 @@ struct StagedSignal {
 }
 
 /// Per-job tracking state inside `Context`.
-enum JobState {
-    Pending(Job),
+enum JobState<T: BatchOps> {
+    Pending(T::Job),
     Prepared {
-        queue_index: usize,
-        prepared: PreparedQueueJob,
-        /// Number of command-stream pieces the job carries, and the
-        /// number of seqnos `Context::commit` claims for it. Zero for a
-        /// sync-only job.
-        piece_count: usize,
+        prepared: T::Prepared,
         /// (handle, point) pairs of WAIT syncops resolved at prepare time
         /// to a SIGNAL produced earlier in the same batch. The producer's
-        /// submit fence is looked up from `Context::signals` at commit
-        /// time and pushed into `prepared` via
-        /// `PreparedQueueJob::add_dep`.
+        /// fence is looked up from `Context::signals` at commit time and
+        /// pushed into `prepared` via `BatchOps::add_dep`.
         intra_batch_deps: KVec<(u32, u64)>,
     },
 }
 
-struct JobContext {
+struct JobContext<T: BatchOps> {
     /// `None` once the job has been moved out by `Context::prepare` or
     /// `Context::commit`.
-    state: Option<JobState>,
+    state: Option<JobState<T>>,
     /// Shared so `Context::update_job_syncs` can scan the signal ops
     /// while `Context::signals` is borrowed mutably.
     syncops: Arc<KVec<SyncOp>>,
 }
 
-/// Tracks intra-batch dependencies across a single group submit.
+/// Tracks intra-batch dependencies across a single batch of jobs.
 ///
-/// Userspace can submit several queue jobs in one
-/// `DRM_IOCTL_PANTHOR_GROUP_SUBMIT` where a later job WAITs on a syncobj
-/// a producer earlier in the same batch SIGNALs. The producer's submit
-/// fence does not exist until its own commit returns it, so
-/// `drm_syncobj_find_fence` at prepare time returns `None` and the wait
-/// fails.
+/// Userspace can submit several jobs in one batch where a later job
+/// WAITs on a syncobj a producer earlier in the same batch SIGNALs. The
+/// producer's fence does not exist until its own commit returns it, so
+/// plain `drm_syncobj_find_fence` at prepare time would return `None`
+/// and the wait would fail.
 ///
+/// `Self::add_job` is called for every job in the batch.
 /// `Self::collect_signal_ops` registers every (handle, point) the batch
 /// SIGNALs. `Self::prepare` resolves each WAIT against that registry
 /// first and falls back to `drm_syncobj_find_fence`, stashing the
@@ -367,22 +389,24 @@ struct JobContext {
 /// the prepared job within the capacity reserved at prepare time, so it
 /// allocates nothing. `Self::push_fences` publishes the producer fences
 /// only once every commit has succeeded.
-pub(crate) struct Context<'a> {
+pub(crate) struct Context<'a, T: BatchOps> {
     file: &'a TyrDrmFile,
-    jobs: KVec<JobContext>,
+    ops: T,
+    jobs: KVec<JobContext<T>>,
     signals: KVec<PendingSignal>,
 }
 
-impl<'a> Context<'a> {
-    pub(crate) fn new(file: &'a TyrDrmFile) -> Self {
+impl<'a, T: BatchOps> Context<'a, T> {
+    pub(crate) fn new(file: &'a TyrDrmFile, ops: T) -> Self {
         Self {
             file,
+            ops,
             jobs: KVec::new(),
             signals: KVec::new(),
         }
     }
 
-    pub(crate) fn add_job(&mut self, job: Job, syncops: Arc<KVec<SyncOp>>) -> Result {
+    pub(crate) fn add_job(&mut self, job: T::Job, syncops: Arc<KVec<SyncOp>>) -> Result {
         self.jobs.push(
             JobContext {
                 state: Some(JobState::Pending(job)),
@@ -416,90 +440,59 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
-    /// Prepares the Job at `job_idx` for submission.
+    /// Prepares the job at `job_idx` for submission.
     ///
-    /// Allocates the wrapped command stream, reserves the pending submit
-    /// fence slot, resolves WAIT syncops against the in-batch signal
-    /// registry (intra-batch) and `drm_syncobj_find_fence` (external),
-    /// and hands the job to the queue with enough dep capacity reserved
-    /// to absorb every intra-batch fence, and a stream-less job's prior
-    /// submit fence, at commit time.
-    pub(crate) fn prepare(
-        &mut self,
-        job_idx: usize,
-        group: &Arc<Group>,
-        csif: &CsifInfo,
-    ) -> Result {
+    /// Resolves WAIT syncops against the in-batch signal registry
+    /// (intra-batch) and `drm_syncobj_find_fence` (external), then hands
+    /// the job to `BatchOps::prepare` with enough dep capacity reserved
+    /// to absorb every intra-batch fence at commit time.
+    pub(crate) fn prepare(&mut self, job_idx: usize) -> Result {
         let job = match self.jobs[job_idx].state.take() {
             Some(JobState::Pending(job)) => job,
             _ => return Err(EINVAL),
         };
 
-        let queue_index = job.queue_index();
-        let queue = group.queues.get(queue_index).ok_or(EINVAL)?;
-
         let CollectedDeps {
             external: external_deps,
             intra_batch: intra_batch_deps,
         } = self.collect_job_deps(job_idx)?;
-        let has_stream = job.has_stream();
 
-        let reservation = if has_stream {
-            Some(queue.reserve_pending_submit_fence()?)
-        } else {
-            None
-        };
-
-        let wrapped = if has_stream {
-            let sync_va = group.syncobj_va(queue_index)?;
-            job.build_wrapped_stream(csif, sync_va)?
-        } else {
-            KVec::new()
-        };
-
-        let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, group.clone(), queue_index, reservation),
-            &external_deps,
-            intra_batch_deps.len() + usize::from(!has_stream),
-        )?;
+        let prepared = self
+            .ops
+            .prepare(job, &external_deps, intra_batch_deps.len())?;
 
         self.jobs[job_idx].state = Some(JobState::Prepared {
-            queue_index,
             prepared,
-            piece_count: job.piece_count(),
             intra_batch_deps,
         });
 
         Ok(())
     }
 
-    /// Commits the Job at `job_idx` and returns its submit fence. This is
-    /// the same fence wired to the job's signal syncobjs, so the caller can
-    /// add it to the VM resv in agreement with the syncobjs.
+    /// Commits the job at `job_idx` and returns the fence that gates its
+    /// completion. This is the same fence wired to the job's signal
+    /// syncobjs, so the caller can add it to a reservation object in
+    /// agreement with the syncobjs.
     ///
-    /// Runs inside the caller's dma-fence signalling section. The path
-    /// is allocation-free. Intra-batch fences and a stream-less job's
-    /// prior submit fence are appended via `PreparedQueueJob::add_dep`
-    /// (within the capacity reserved at prepare time), `JobQueue::commit`
-    /// is itself allocation-free, and `Self::update_job_syncs` only
-    /// writes into a pre-allocated slot.
+    /// The path is allocation-free, so it may run in a dma-fence
+    /// signalling section. Intra-batch fences are appended via
+    /// `BatchOps::add_dep` within the capacity reserved at prepare time,
+    /// and `Self::update_job_syncs` only writes into a pre-allocated
+    /// slot. Neither caller opens an annotation of its own. Both hold a
+    /// reservation lock, and every fence they have already installed
+    /// there is in a signalling section from that point on.
     ///
-    /// A batch commits in prepare order, and `Group::submit` holds the
-    /// group's submit lock across the whole prepare-to-commit window,
-    /// so a queue claims its seqno ranges in the order its pipeline
-    /// runs the jobs.
-    pub(crate) fn commit(&mut self, job_idx: usize, group: &Group) -> Result<ARef<PublicDmaFence>> {
-        let (queue_index, mut prepared, piece_count, intra_batch_deps) =
-            match self.jobs[job_idx].state.take() {
-                Some(JobState::Prepared {
-                    queue_index,
-                    prepared,
-                    piece_count,
-                    intra_batch_deps,
-                }) => (queue_index, prepared, piece_count, intra_batch_deps),
-                _ => return Err(EINVAL),
-            };
-        let has_stream = piece_count != 0;
+    /// A batch commits in prepare order, and the caller holds the lock
+    /// that serializes the whole prepare-to-commit window, so a queue
+    /// claims its seqno ranges in the order its pipeline runs the jobs.
+    pub(crate) fn commit(&mut self, job_idx: usize) -> Result<ARef<PublicDmaFence>> {
+        let (mut prepared, intra_batch_deps) = match self.jobs[job_idx].state.take() {
+            Some(JobState::Prepared {
+                prepared,
+                intra_batch_deps,
+            }) => (prepared, intra_batch_deps),
+            _ => return Err(EINVAL),
+        };
 
         for (handle, point) in intra_batch_deps.iter() {
             let fence = self
@@ -507,31 +500,13 @@ impl<'a> Context<'a> {
                 .and_then(PendingSignal::fence)
                 .ok_or(EINVAL)?
                 .clone();
-            prepared.add_dep(fence)?;
+            self.ops.add_dep(&mut prepared, fence)?;
         }
 
-        let queue = group.queues.get(queue_index).ok_or(EINVAL)?;
+        let signal_fence = self.ops.commit(prepared)?;
 
-        // The wrapped stream emits exactly one `SYNC_ADD64(+1)` per piece,
-        // so the syncobj reaches the highest claimed seqno precisely when
-        // every piece has retired. A stream-less job emits no GPU work, so
-        // it waits on the queue's last command stream instead of signalling
-        // as soon as its dependencies resolve.
-        if has_stream {
-            let job = prepared.job().ok_or(EINVAL)?;
-            job.set_done_seqno(queue.claim_seqnos(piece_count));
-        } else if let Some(fence) = queue.last_submit_fence() {
-            prepared.add_dep(fence)?;
-        }
-
-        let submit_fence = queue.commit_job(prepared);
-
-        if has_stream {
-            queue.set_last_submit_fence(submit_fence.clone());
-        }
-
-        self.update_job_syncs(job_idx, submit_fence.clone())?;
-        Ok(submit_fence)
+        self.update_job_syncs(job_idx, signal_fence.clone())?;
+        Ok(signal_fence)
     }
 
     /// Publishes each registered producer fence to its syncobj.
