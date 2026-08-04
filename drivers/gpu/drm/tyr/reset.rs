@@ -424,8 +424,8 @@ impl ResetHandle {
         }
 
         let Some(_active) = tdev.pm_get_if_active() else {
-            // The GPU is (or is about to be) powered off, so the resume path
-            // claims the recorded request.
+            // The GPU is (or is about to be) powered off, so any later
+            // resume claims the recorded request.
             return;
         };
 

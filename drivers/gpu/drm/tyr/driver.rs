@@ -234,6 +234,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// `dma_fence_map` lockdep token, so the cleanup work is free to
     /// take `dma_resv_lock`, the per-VM gpuvm mutex, and allocate
     /// with `GFP_KERNEL`.
+    ///
+    /// Declared before `clks` so the drop-time drain still runs with the
+    /// clocks up. Probe failure takes the same drop order. After unbind the
+    /// drained unmaps reach no hardware, since devres has revoked the
+    /// mapping.
     pub(crate) cleanup_wq: Arc<CleanupQueue>,
 
     #[pin]
@@ -334,11 +339,17 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Set once runtime suspend can no longer fail and cleared when resume
     /// brings the hardware back, a different window from the mmap `powered`
-    /// state. Written only by the runtime PM callbacks and read without a
-    /// lock from dma-fence signalling paths. It carries no other state, so
-    /// `Relaxed` suffices. `sched_suspended` cannot be used instead, since
-    /// the reset worker clears it.
+    /// state. Written by the runtime PM callbacks and by unbind, and read
+    /// without a lock from dma-fence signalling paths. The clearing store
+    /// releases so a reader that sees the device powered also sees the
+    /// hardware bring-up, and the load acquires to match. `sched_suspended`
+    /// cannot be used instead, since the reset worker clears it.
     pub(crate) pm_powered_down: Atomic<bool>,
+
+    /// Set when unbind takes over the device power state, and never
+    /// cleared. Runtime resume refuses while it is set. `pm_powered_down`
+    /// cannot serve instead, since resume clears it.
+    pub(crate) unbinding: Atomic<bool>,
 
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
@@ -750,6 +761,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
+                unbinding: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
         });
@@ -839,12 +851,16 @@ impl platform::Driver for TyrPlatformDriverData {
         })
     }
 
-    fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
+    fn unbind(pdev: &platform::Device<Core>, this: Pin<&Self>) {
+        // Runtime PM outlives unbind, so refuse resumes before any teardown
+        // starts.
+        this.device.set_unbinding();
         this.device.reset.unbind();
-        // Cancel the watchdog after the reset worker has drained, since a
-        // reset re-arms it when it re-enables the global interface.
-        this.device.cancel_fw_ping();
         drop(this.devfreq_registration.lock().take());
+        Self::suspend_at_unbind(pdev, this);
+        // Cancel the watchdog last. Both the reset worker and a resume that
+        // was already in flight when `unbinding` was set re-arm it.
+        this.device.cancel_fw_ping();
     }
 }
 
