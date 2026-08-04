@@ -104,6 +104,28 @@ fn fail_resume(
     e
 }
 
+/// Stops every driver path that reaches the GPU, then powers the hardware
+/// components down. Shared by runtime suspend and unbind. A second call is
+/// a no-op, since the powered-down flag latches the halt.
+fn quiesce_and_suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
+    let tdev = &data.device;
+
+    // The halt below is not idempotent, so the powered-down flag doubles as
+    // the latch.
+    if tdev.pm_powered_down() {
+        return;
+    }
+    tdev.pm_powered_down.store(true, ordering::Release);
+
+    tdev.user_mmio.lock().set_powered(tdev, false);
+    tdev.reset.flush();
+    tdev.cancel_fw_ping();
+    sched::tick::suspend(tdev);
+    // Drain any worker that raced the gate before halting the hardware.
+    tdev.drain_sched_work();
+    suspend_hw_components(dev, data);
+}
+
 /// Powers the GPU down for runtime suspend.
 fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     let bound = dev.as_ref();
@@ -118,20 +140,9 @@ fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result 
         return Err(e);
     }
 
-    tdev.pm_powered_down.store(true, ordering::Relaxed);
-
     // Nothing below fails. Once the governor is paused, the device
     // always reaches the suspended state.
-    tdev.user_mmio.lock().set_powered(tdev, false);
-
-    tdev.reset.flush();
-
-    tdev.cancel_fw_ping();
-
-    sched::tick::suspend(tdev);
-    // Drain any worker that raced the gate before halting the hardware.
-    tdev.drain_sched_work();
-    suspend_hw_components(dev, data);
+    quiesce_and_suspend(dev, data);
     tdev.clks.lock().gate();
     Ok(())
 }
@@ -141,6 +152,12 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     let bound = dev.as_ref();
     let data = bound.drvdata::<TyrPlatformDriverData>()?;
     let tdev = &data.device;
+
+    // Unbind stopped the hardware and the firmware memory is about to be
+    // freed, so refuse before touching any of it.
+    if tdev.unbinding() {
+        return Err(ENODEV);
+    }
 
     tdev.clks.lock().ungate()?;
 
@@ -185,7 +202,7 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     // The work reissued below tests this flag, so clear it first. A failed
     // resume leaves the flag set, since the device then stays unusable until
     // unbind.
-    tdev.pm_powered_down.store(false, ordering::Relaxed);
+    tdev.pm_powered_down.store(false, ordering::Release);
 
     sched::tick::resume(tdev);
 
@@ -234,6 +251,41 @@ impl PMOps for TyrPmOps {
     }
 }
 
+impl TyrPlatformDriverData {
+    /// Halts the hardware at platform unbind.
+    ///
+    /// Unbind is the last point at which the driver can reach the registers.
+    /// Devres revokes the mapping right after, and the device data drop then
+    /// frees the firmware sections. The caller sets `unbinding` first, so no
+    /// resume can restart what this stops.
+    pub(crate) fn suspend_at_unbind(dev: &platform::Device<Bound>, data: Pin<&Self>) {
+        // Unbind only follows a successful probe, which publishes the
+        // context.
+        let Some(ctx) = data.device.pm_context() else {
+            return;
+        };
+
+        // The driver core dropped its usage reference already, so pin the
+        // count above zero for the rest of the function.
+        let _hold = ctx.hold();
+
+        // Wait out a transition already in flight. A suspended device fails
+        // here, since the resume it needs is refused.
+        let resumed = ctx.get(PMProfile::new()).is_ok();
+
+        // A sticky runtime error or disabled runtime PM fails the call even
+        // on a powered device. The powered-down latch inside the halt
+        // covers those.
+        if !resumed && !ctx.active() {
+            return;
+        }
+
+        // A resume here re-arms the ping watchdog and remaps the user MMIO
+        // page, so run the software steps too, not only the hardware halt.
+        quiesce_and_suspend(dev, data);
+    }
+}
+
 /// Permission token for hardware access.
 ///
 /// The `AwakeScope`-backed variant holds a usage reference that keeps the
@@ -264,7 +316,17 @@ impl TyrDrmDeviceData {
 
     /// Returns whether the runtime PM callbacks have the device powered down.
     pub(crate) fn pm_powered_down(&self) -> bool {
-        self.pm_powered_down.load(ordering::Relaxed)
+        self.pm_powered_down.load(ordering::Acquire)
+    }
+
+    /// Returns whether unbind has taken over the device power state.
+    pub(crate) fn unbinding(&self) -> bool {
+        self.unbinding.load(ordering::Relaxed)
+    }
+
+    /// Records that unbind has taken over the device power state.
+    pub(crate) fn set_unbinding(&self) {
+        self.unbinding.store(true, ordering::Relaxed);
     }
 
     /// Takes an asynchronous runtime-PM usage reference for the scheduler.
@@ -276,15 +338,17 @@ impl TyrDrmDeviceData {
     }
 
     /// Returns an `ActiveDevice` token if the device is powered, `None` if it
-    /// is runtime suspended or a transition is in flight. While runtime PM is
-    /// disabled, the driver-owned powered-down flag decides the outcome, and
-    /// a granted token holds no reference.
+    /// is runtime suspended or a transition is in flight. The driver-owned
+    /// powered-down flag vetoes the token, since unbind halts the hardware
+    /// without changing the PM core's recorded state. While runtime PM is
+    /// disabled that flag decides on its own, and a granted token holds no
+    /// reference.
     ///
     /// Callers that program the hardware take this token instead of resuming
     /// the device. Some run in a dma-fence signalling section, where an
     /// inline resume would run the heavyweight resume callback. On `None`,
-    /// callers skip the hardware access and rely on the resume path to
-    /// reissue the work.
+    /// callers skip the hardware access and leave the work to any later
+    /// resume.
     pub(crate) fn pm_get_if_active(&self) -> Option<ActiveDevice> {
         let Some(ctx) = self.pm_context() else {
             // The device is powered for the whole probe window. The
@@ -293,7 +357,9 @@ impl TyrDrmDeviceData {
         };
 
         match ctx.get_if_active(ASYNC_PROFILE) {
-            Ok(scope @ Some(_)) => Some(ActiveDevice { _scope: scope }),
+            Ok(Some(scope)) => (!self.pm_powered_down()).then_some(ActiveDevice {
+                _scope: Some(scope),
+            }),
             Ok(None) => None,
             // `get_if_active` errors only when runtime PM is disabled, i.e.
             // under `CONFIG_PM=n` or inside the force-suspend window. A
