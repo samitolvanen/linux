@@ -683,7 +683,7 @@ enum FrontEntry {
 #[allow(dead_code)]
 struct InboxState {
     /// The `next` cursor for `xa_alloc_cyclic`, i.e. one past the index most
-    /// recently handed out by [`JobQueue::prepare`]. It only moves forward,
+    /// recently published by [`JobQueue::prepare`]. It only moves forward,
     /// and `check_progress()` drains reserved indices up to it.
     cyclic_next: u32,
 }
@@ -1652,32 +1652,42 @@ impl<T: QueueOps> JobQueue<T> {
             GFP_KERNEL,
         )?;
 
+        // Reserve with the inbox mutex dropped. `drain_inbox` takes it from
+        // the fence signalling path, and the reservation can sleep in reclaim.
+        let expected = self.inner.inbox.lock().cyclic_next;
+        let mut next = expected;
         let xa_index = {
-            let mut inbox = self.inner.inbox.lock();
             let mut guard = self.inner.fifo.lock();
             // `xa_alloc_cyclic` restarts its scan at the bottom of the limit
-            // whenever the scan from `cyclic_next` fails, and publishes the
-            // lower index it finds there. Taking that index would move the
-            // cursor backwards and leave the pipeline a whole u32 range to
-            // drain, so hand it back and fail the reservation.
-            let expected = inbox.cyclic_next;
-            let idx = guard.alloc_cyclic_reserve(
-                XaLimit::LIMIT_32B,
-                &mut inbox.cyclic_next,
-                GFP_KERNEL,
-            )?;
+            // whenever the scan from `next` fails, and publishes the lower
+            // index it finds there. Taking that index would move the cursor
+            // backwards and leave the pipeline a whole u32 range to drain,
+            // so hand it back and fail the reservation.
+            let idx = guard.alloc_cyclic_reserve(XaLimit::LIMIT_32B, &mut next, GFP_KERNEL)?;
             if idx.index() as u32 != expected {
-                guard.release(idx);
-                inbox.cyclic_next = expected;
-                return Err(ENOMEM);
-            }
-            if let Err(store_err) = guard.store_reserved(idx, entry) {
-                drop(store_err);
                 guard.release(idx);
                 return Err(ENOMEM);
             }
             idx
         };
+
+        // Store the entry and publish the cursor together, so `drain_inbox`
+        // never sees an index before its entry is there. Hand the index back
+        // when another call already advanced the cursor.
+        {
+            let mut inbox = self.inner.inbox.lock();
+            let mut guard = self.inner.fifo.lock();
+            if inbox.cyclic_next != expected {
+                guard.release(xa_index);
+                return Err(ENOMEM);
+            }
+            if let Err(store_err) = guard.store_reserved(xa_index, entry) {
+                drop(store_err);
+                guard.release(xa_index);
+                return Err(ENOMEM);
+            }
+            inbox.cyclic_next = next;
+        }
 
         Ok(PreparedJob {
             inner: self.inner.clone(),
