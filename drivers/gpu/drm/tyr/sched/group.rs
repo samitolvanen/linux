@@ -818,7 +818,29 @@ impl Pool {
 
         ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
 
-        groupcreate.group_handle = self.0.insert(group)? as u32;
+        let handle = match self.0.insert(group.clone()) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The group is unreachable without a handle, and a
+                // tick may already have bound it.
+                group.with_locked_inner(|inner| {
+                    inner.fatal_error = Some(ECANCELED);
+                });
+
+                let csg_id = ddev.with_locked_scheduler(|sched| {
+                    sched.detach_destroyed_group(&group);
+                    Ok(group.with_locked_inner(|inner| inner.csg_id))
+                });
+
+                if matches!(csg_id, Ok(Some(_))) {
+                    TyrDrmDeviceData::schedule_tick(&ARef::from(ddev));
+                }
+
+                return Err(e);
+            }
+        };
+
+        groupcreate.group_handle = handle as u32;
         Ok(())
     }
 
