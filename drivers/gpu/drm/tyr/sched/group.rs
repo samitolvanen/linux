@@ -9,7 +9,8 @@ use kernel::{
         impl_has_dma_fence_work,
         new_dma_fence_work,
         DmaFenceWork,
-        DmaFenceWorkItem, //
+        DmaFenceWorkItem,
+        PublicDmaFence, //
     },
     drm::gem::BaseObject,
     io::IoBase,
@@ -73,8 +74,10 @@ use super::{
         QueueSubmit, //
     },
     queue::{
+        PreparedQueueJob,
         Queue,
-        QueueCreate, //
+        QueueCreate,
+        QueueJob, //
     },
     syncs, //
 };
@@ -820,7 +823,7 @@ impl Group {
 
         let jobs = Job::from_queue_submits(queue_submits)?;
         let job_count = jobs.len();
-        let mut ctx = deps::Context::new(file);
+        let mut ctx = deps::Context::new(file, SubmitOps::new(self.clone(), *csif));
 
         for (job, syncs) in jobs.into_iter() {
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
@@ -835,13 +838,13 @@ impl Group {
         }
 
         for idx in 0..job_count {
-            ctx.prepare(idx, self, csif)?;
+            ctx.prepare(idx)?;
         }
 
         self.vm
             .with_prepared_vm(job_count as u32, |mut prepared_vm| {
                 for idx in 0..job_count {
-                    let signal_fence = ctx.commit(idx, self)?;
+                    let signal_fence = ctx.commit(idx)?;
                     prepared_vm.resv_add_fence(
                         &signal_fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
@@ -855,6 +858,87 @@ impl Group {
         ctx.push_fences();
 
         Ok(())
+    }
+}
+
+/// A submit job that has claimed its slot on a queue.
+struct PreparedSubmit {
+    queue_index: usize,
+    queue_job: PreparedQueueJob,
+    has_stream: bool,
+}
+
+/// Runs the jobs of a group submit through `deps::Context`.
+struct SubmitOps {
+    group: Arc<Group>,
+    /// CSIF information snapshotted at submit time and used to size the
+    /// wrapper's working registers.
+    csif: CsifInfo,
+}
+
+impl SubmitOps {
+    fn new(group: Arc<Group>, csif: CsifInfo) -> Self {
+        Self { group, csif }
+    }
+}
+
+impl deps::BatchOps for SubmitOps {
+    type Job = Job;
+    type Prepared = PreparedSubmit;
+
+    /// Allocates the wrapped command stream and hands the job to its queue.
+    fn prepare(
+        &self,
+        job: Job,
+        deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
+    ) -> Result<PreparedSubmit> {
+        let queue_index = job.queue_index();
+        let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+        let has_stream = job.has_stream();
+
+        let wrapped = if has_stream {
+            let sync_va = self.group.syncobj_va(queue_index)?;
+            job.build_wrapped_stream(&self.csif, sync_va)?
+        } else {
+            KVec::new()
+        };
+
+        let prepared = queue.prepare_job(
+            QueueJob::new(wrapped, self.group.clone(), queue_index),
+            deps,
+            extra_dep_capacity,
+        )?;
+
+        Ok(PreparedSubmit {
+            queue_index,
+            queue_job: prepared,
+            has_stream,
+        })
+    }
+
+    fn add_dep(&self, prepared: &mut PreparedSubmit, fence: ARef<PublicDmaFence>) -> Result {
+        prepared.queue_job.add_dep(fence)
+    }
+
+    fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<PublicDmaFence>> {
+        let PreparedSubmit {
+            queue_index,
+            queue_job,
+            has_stream,
+        } = prepared;
+
+        let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+        let job = queue_job.job().ok_or(EINVAL)?;
+
+        let done_seqno = if has_stream {
+            queue.claim_seqno()
+        } else {
+            queue.next_seqno()
+        };
+        job.set_done_seqno(done_seqno);
+
+        Ok(queue.commit_job(queue_job))
     }
 }
 
