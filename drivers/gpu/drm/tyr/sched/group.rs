@@ -892,19 +892,18 @@ impl Pool {
     fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 
-        let csg_id = group.with_locked_inner(|inner| {
+        group.with_locked_inner(|inner| {
             inner.fatal_error = Some(ECANCELED);
-            inner.csg_id
         });
 
         self.0.remove(index)?;
 
-        let _ = ddev.with_locked_scheduler(|sched| {
+        let csg_id = ddev.with_locked_scheduler(|sched| {
             sched.detach_destroyed_group(&group);
-            Ok(())
+            Ok(group.with_locked_inner(|inner| inner.csg_id))
         });
 
-        if csg_id.is_some() {
+        if matches!(csg_id, Ok(Some(_))) {
             // Bound: the tick observes `can_run() == false`, stages
             // terminate, evicts, and routes the group through
             // `schedule_term`.
