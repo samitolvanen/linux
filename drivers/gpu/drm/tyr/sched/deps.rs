@@ -98,20 +98,25 @@ impl SyncSignal {
     }
 }
 
-/// An entry in `Context`'s per-batch signal registry. The `fence`
-/// slot is `None` until the producing job has been committed.
-/// `Context::push_fences` publishes whatever fences are present once
-/// every commit has succeeded.
+/// An entry in `Context`'s per-batch signal registry.
+///
+/// The `fence` slot starts as the fence the syncobj carries when the
+/// entry is created, and the commit of the producing job replaces it.
+/// Every entry comes from a SIGNAL syncop, and `Context::push_fences`
+/// runs only after every commit in the batch has succeeded. The starting
+/// fence is therefore never published back to the syncobj.
 enum PendingSignal {
     Binary {
         syncobj: SyncObj<TyrDrmDriver>,
         handle: u32,
+        job_idx: usize,
         fence: Option<ARef<PublicDmaFence>>,
     },
     Timeline {
         syncobj: SyncObj<TyrDrmDriver>,
         handle: u32,
         point: u64,
+        job_idx: usize,
         chain: FenceChain,
         fence: Option<ARef<PublicDmaFence>>,
     },
@@ -122,6 +127,13 @@ impl PendingSignal {
         match self {
             Self::Binary { handle, .. } => (*handle, 0),
             Self::Timeline { handle, point, .. } => (*handle, *point),
+        }
+    }
+
+    /// Index of the first job in the batch that signals this key.
+    fn job_idx(&self) -> usize {
+        match self {
+            Self::Binary { job_idx, .. } | Self::Timeline { job_idx, .. } => *job_idx,
         }
     }
 
@@ -294,11 +306,21 @@ pub(crate) fn append_syncops(
 
 /// Dependencies collected for one job's WAIT syncops.
 struct CollectedDeps {
-    /// External fences passed to `JobQueue::prepare`.
+    /// Fences that already exist when the job is prepared, passed to
+    /// `JobQueue::prepare`.
     external: KVec<ARef<PublicDmaFence>>,
-    /// (handle, point) keys of WAITs resolved against the per-batch
-    /// signal registry.
+    /// (handle, point) keys of WAITs met by a producer earlier in the
+    /// batch.
     intra_batch: KVec<(u32, u64)>,
+}
+
+/// One SIGNAL syncop held by `Context::collect_signal_ops` while the job
+/// list is borrowed, then consumed to build the signal registry.
+struct StagedSignal {
+    /// Index of the job that carries this syncop.
+    job_idx: usize,
+    handle: u32,
+    point: u64,
 }
 
 /// Per-job tracking state inside `Context`.
@@ -372,17 +394,21 @@ impl<'a> Context<'a> {
     /// every `Self::add_job`, and before any `Self::prepare`.
     pub(crate) fn collect_signal_ops(&mut self) -> Result {
         let mut to_add = KVec::new();
-        for job_ctx in self.jobs.iter() {
+        for (job_idx, job_ctx) in self.jobs.iter().enumerate() {
             for syncop in job_ctx.syncops.iter() {
                 if !syncop.is_signal() {
                     continue;
                 }
-                let key = (syncop.handle.handle(), syncop.handle.timeline_value());
-                to_add.push(key, GFP_KERNEL)?;
+                let staged = StagedSignal {
+                    job_idx,
+                    handle: syncop.handle.handle(),
+                    point: syncop.handle.timeline_value(),
+                };
+                to_add.push(staged, GFP_KERNEL)?;
             }
         }
-        for (handle, point) in to_add.into_iter() {
-            self.add_sync_signal(handle, point)?;
+        for staged in to_add.into_iter() {
+            self.add_sync_signal(staged.job_idx, staged.handle, staged.point)?;
         }
         Ok(())
     }
@@ -528,25 +554,34 @@ impl<'a> Context<'a> {
         self.signals.iter().find(|sig| sig.key() == (handle, point))
     }
 
-    fn add_sync_signal(&mut self, handle: u32, point: u64) -> Result {
+    fn add_sync_signal(&mut self, job_idx: usize, handle: u32, point: u64) -> Result {
         if self.search_sync_signal(handle, point).is_some() {
             return Ok(());
         }
 
         let syncobj = SyncObj::<TyrDrmDriver>::lookup_handle(self.file, handle)?;
+
+        // A syncobj the batch signals often carries no fence yet, so a
+        // failed lookup is expected and leaves the slot empty.
+        let fence = SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)
+            .ok()
+            .flatten();
+
         let signal = if point > 0 {
             PendingSignal::Timeline {
                 syncobj,
                 handle,
                 point,
+                job_idx,
                 chain: FenceChain::new()?,
-                fence: None,
+                fence,
             }
         } else {
             PendingSignal::Binary {
                 syncobj,
                 handle,
-                fence: None,
+                job_idx,
+                fence,
             }
         };
 
@@ -566,8 +601,16 @@ impl<'a> Context<'a> {
             let handle = syncop.handle.handle();
             let point = syncop.handle.timeline_value();
 
-            if self.search_sync_signal(handle, point).is_some() {
-                intra_batch.push((handle, point), GFP_KERNEL)?;
+            if let Some(signal) = self.search_sync_signal(handle, point) {
+                if signal.job_idx() < job_idx {
+                    intra_batch.push((handle, point), GFP_KERNEL)?;
+                    continue;
+                }
+
+                // The producer commits at or after this job, so only the
+                // fence the syncobj carried at registration can meet
+                // the wait.
+                external.push(signal.fence().ok_or(EINVAL)?.clone(), GFP_KERNEL)?;
                 continue;
             }
 
