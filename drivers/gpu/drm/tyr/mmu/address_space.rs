@@ -29,8 +29,7 @@ use kernel::{
     },
     iommu::pgtable::{
         Config,
-        IoPageTable,
-        ARM64LPAES1, //
+        IoPageTable, //
     },
     new_mutex,
     platform,
@@ -70,6 +69,10 @@ use crate::{
     slot::{
         Seat,
         SlotOperations, //
+    },
+    vm::pt_alloc::{
+        PageTable,
+        PtAllocator, //
     }, //
 };
 
@@ -133,12 +136,15 @@ pub(crate) struct VmAsData {
     #[pin]
     op_lock: Mutex<()>,
 
+    /// Provides the memory backing the page tables of this VM.
+    pub(crate) pt_allocator: Arc<PtAllocator>,
+
     /// Page table.
     ///
     /// Managed by devres to ensure proper cleanup. The page table maps
     /// GPU virtual addresses to physical addresses for this VM.
     #[pin]
-    pub(crate) page_table: Devres<IoPageTable<ARM64LPAES1>>,
+    pub(crate) page_table: Devres<PageTable>,
 }
 
 impl VmAsData {
@@ -150,7 +156,7 @@ impl VmAsData {
         pdev: &'a platform::Device,
         va_bits: u32,
         pa_bits: u32,
-    ) -> impl pin_init::PinInit<VmAsData, Error> + 'a {
+    ) -> Result<impl pin_init::PinInit<VmAsData, Error> + 'a> {
         // SAFETY: pdev is a bound device.
         let dev = unsafe { pdev.as_ref().as_bound() };
 
@@ -162,16 +168,18 @@ impl VmAsData {
             coherent_walk: false,
         };
 
-        let page_table_init = IoPageTable::new(dev, pt_config);
+        let pt_allocator = Arc::pin_init(PtAllocator::new(), GFP_KERNEL)?;
+        let page_table_init = IoPageTable::new_with_alloc(dev, pt_config, pt_allocator.clone());
 
-        try_pin_init!(Self {
+        Ok(try_pin_init!(Self {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
             unhandled_fault: AtomicBool::new(false),
             op_lock <- new_mutex!(()),
+            pt_allocator,
             page_table <- page_table_init,
-        }? Error)
+        }? Error))
     }
 
     /// Acquires the per-VM operation lock that guards page-table update
