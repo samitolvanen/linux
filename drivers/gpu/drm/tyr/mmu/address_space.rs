@@ -22,9 +22,7 @@ use kernel::{
     },
     iommu::pgtable::{
         Config,
-        DevresIoPageTable,
-        IoPageTable,
-        ARM64LPAES1, //
+        IoPageTable, //
     },
     new_mutex,
     num::Bounded,
@@ -69,6 +67,10 @@ use crate::{
         LockedSeat,
         Seat,
         SlotOperations, //
+    },
+    vm::pt_alloc::{
+        DevresPageTable,
+        PtAllocator, //
     }, //
 };
 
@@ -113,9 +115,12 @@ pub(crate) struct VmAsData {
     #[pin]
     op_lock: Mutex<()>,
 
+    /// Provides the memory backing the page tables of this VM.
+    pub(crate) pt_allocator: Arc<PtAllocator>,
+
     /// The page table which maps GPU virtual addresses to physical addresses for this VM.
     #[pin]
-    pub(crate) page_table: DevresIoPageTable<ARM64LPAES1>,
+    pub(crate) page_table: DevresPageTable,
 }
 
 impl VmAsData {
@@ -125,7 +130,7 @@ impl VmAsData {
         dev: &Device<Bound>,
         va_bits: u32,
         pa_bits: u32,
-    ) -> impl pin_init::PinInit<VmAsData, Error> + 'a {
+    ) -> Result<impl pin_init::PinInit<VmAsData, Error> + 'a> {
         let pt_config = Config {
             quirks: 0,
             pgsize_bitmap: SZ_4K | SZ_2M,
@@ -134,16 +139,19 @@ impl VmAsData {
             coherent_walk: false,
         };
 
-        let page_table_init = IoPageTable::new_devres(dev, pt_config);
+        let pt_allocator = Arc::pin_init(PtAllocator::new(), GFP_KERNEL)?;
+        let page_table_init =
+            IoPageTable::new_devres_with_alloc(dev, pt_config, pt_allocator.clone());
 
-        try_pin_init!(Self {
+        Ok(try_pin_init!(Self {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
             as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
             unhandled_fault: Atomic::new(false),
             op_lock <- new_mutex!(()),
+            pt_allocator,
             page_table <- page_table_init,
-        }? Error)
+        }? Error))
     }
 
     /// Acquires the per-VM operation lock that guards page-table update
