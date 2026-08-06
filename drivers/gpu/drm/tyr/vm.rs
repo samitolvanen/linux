@@ -555,7 +555,7 @@ pub(crate) struct VmOpResources {
     /// VM_BIND dma-fence signalling section. Each entry is a
     /// `(dma_address, dma_len)` pair, in the order yielded by the BO's
     /// scatter-gather table. `None` for Unmap.
-    map_sgt: Option<KVec<(PhysAddr, u64)>>,
+    map_sgt: Option<KVVec<(PhysAddr, u64)>>,
 }
 
 /// Request to execute a virtual memory operation.
@@ -1540,12 +1540,12 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 /// `Object::sg_table` takes `dma_resv_lock`, which must not be taken on
 /// the path to `dma_fence_signal()`. The segments are consumed lock-free
 /// inside the signalling section.
-fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVec<(PhysAddr, u64)>> {
+fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(PhysAddr, u64)>> {
     let sgt = bo.sg_table(dev).inspect_err(|e| {
         pr_err!("Failed to get sg_table: {:?}\n", e);
     })?;
 
-    let mut segments = KVec::new();
+    let mut segments = KVVec::new();
     for sgt_entry in sgt.iter() {
         segments.push((sgt_entry.dma_address(), sgt_entry.dma_len()), GFP_KERNEL)?;
     }
