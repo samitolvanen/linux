@@ -7,6 +7,7 @@
 use crate::{
     alloc::allocator::Kmalloc,
     bindings,
+    debugfs,
     device,
     dma_buf::dma_fence::{
         DmaFenceDelayedWorkItem,
@@ -248,7 +249,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         release: Some(Device::<T>::release),
         master_set: None,
         master_drop: None,
-        debugfs_init: None,
+        debugfs_init: Some(Device::<T>::debugfs_init_callback),
 
         gem_create_object: T::Object::ALLOC_OPS.gem_create_object,
         prime_handle_to_fd: T::Object::ALLOC_OPS.prime_handle_to_fd,
@@ -469,6 +470,48 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         // valid null-terminated C string for the duration of the call. The DRM core registers a
         // drmm action to unmount on device release, so ownership of the mount stays with the C side.
         to_result(unsafe { bindings::drm_gem_huge_mnt_create(self.as_raw(), value.as_char_ptr()) })
+    }
+
+    /// C callback for `drm_driver.debugfs_init`.
+    ///
+    /// # Safety
+    ///
+    /// The DRM core guarantees that `minor` is valid and non-null, that
+    /// `minor->dev` is a valid `drm_device` embedded in a `Device<T>`.
+    unsafe extern "C" fn debugfs_init_callback(minor: *mut bindings::drm_minor) {
+        // SAFETY: `minor` is valid and non-null per the function's safety
+        // precondition.
+        let dev_ptr = unsafe { (*minor).dev };
+        // SAFETY: `minor` is valid per the function's safety precondition.
+        let debugfs_root = unsafe { (*minor).debugfs_root };
+
+        // Debugfs may be disabled.
+        if debugfs_root.is_null() {
+            return;
+        }
+
+        // SAFETY: `dev_ptr` points to a valid `drm_device` embedded in
+        // `Device<T>`.
+        let dev = unsafe { Self::from_raw(dev_ptr) };
+
+        // SAFETY: The device is in the registered state per the function's
+        // safety precondition.
+        let dev = unsafe { dev.assume_ctx::<Registered>() };
+
+        dev.registration_data_with(|reg_data| {
+            // SAFETY: `debugfs_root` is valid as long as the DRM device is
+            // registered. The debugfs proxy fops wait for in-progress file
+            // operations and block new ones during `debugfs_remove()`, so no
+            // access to `reg_data` can outlive it. `debugfs_remove()` runs
+            // before `Registration::drop` frees `reg_data`. Should
+            // `drm_dev_register()` fail after this callback, the files
+            // outlive `reg_data` until `drm_dev_release()`. The only failure
+            // points after this callback are the `load` callback and modeset
+            // registration, and Rust drivers use neither.
+            let dir = unsafe { debugfs::ScopeRef::new(debugfs_root, reg_data) };
+
+            T::debugfs_init(&dir);
+        });
     }
 
     /// Change the [`DeviceContext`] for a [`Device`].
