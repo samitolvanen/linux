@@ -25,7 +25,7 @@ use core::{
         PhantomData,
         PhantomPinned, //
     },
-    ops::Deref,
+    ops::Deref, //
 };
 
 mod traits;
@@ -758,5 +758,80 @@ impl<'data, M> ScopedDir<'data, 'static, M> {
             _phantom: PhantomData,
             _module: PhantomData,
         }
+    }
+
+    /// Creates a [`ScopedDir`] wrapping an existing debugfs dentry.
+    ///
+    /// Files created under this directory are not automatically removed on drop;
+    /// their lifetime is tied to the dentry owner.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the dentry remains valid for the lifetime of the
+    /// returned `ScopedDir`.
+    pub unsafe fn from_dentry(dentry: *mut bindings::dentry) -> Self {
+        let _ = dentry;
+        ScopedDir {
+            #[cfg(CONFIG_DEBUG_FS)]
+            // SAFETY: The caller guarantees the dentry is valid and outlives this `ScopedDir`.
+            entry: ManuallyDrop::new(unsafe { Entry::from_raw(dentry) }),
+            _phantom: PhantomData,
+            _module: PhantomData,
+        }
+    }
+}
+
+/// A reference to a debugfs directory that also holds a reference to
+/// associated data of type `T`.
+///
+/// Created from an existing debugfs dentry (e.g. the DRM debugfs root).
+/// `data` must remain valid while the debugfs files created under this
+/// scope may be accessed.
+pub struct ScopeRef<'a, T> {
+    #[cfg(CONFIG_DEBUG_FS)]
+    inner: ScopedDir<'a, 'a, crate::LocalModule>,
+    data: &'a T,
+}
+
+impl<'a, T> ScopeRef<'a, T> {
+    /// Creates a [`ScopeRef`] from an existing debugfs dentry and a data reference.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `dentry` remains valid for the lifetime of
+    /// the returned [`ScopeRef`] and that `data` remains valid while the
+    /// debugfs files created under this scope may be accessed.
+    pub unsafe fn new(dentry: *mut bindings::dentry, data: &'a T) -> Self {
+        let _ = dentry;
+        ScopeRef {
+            #[cfg(CONFIG_DEBUG_FS)]
+            // SAFETY: By the safety preconditions of `new`, `dentry` is valid
+            // and remains valid for the lifetime of the returned `ScopeRef`.
+            inner: unsafe { ScopedDir::from_dentry(dentry) },
+            data,
+        }
+    }
+
+    /// Creates a seq_file debugfs file in this directory.
+    ///
+    /// The file's contents are produced by invoking [`SeqShow::show`] with
+    /// `data` on each read.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub fn seq_file<S: SeqShow<T>>(&self, name: &CStr)
+    where
+        T: Sync,
+    {
+        self.inner.seq_file::<S, T>(name, self.data);
+    }
+
+    /// Creates a seq_file debugfs file in this directory.
+    ///
+    /// Debugfs is disabled, so no file is created.
+    #[cfg(not(CONFIG_DEBUG_FS))]
+    pub fn seq_file<S: SeqShow<T>>(&self, _name: &CStr)
+    where
+        T: Sync,
+    {
+        let _ = self.data;
     }
 }
