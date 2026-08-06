@@ -39,6 +39,11 @@ impl Flags {
         self.0
     }
 
+    /// Build flags from their raw representation.
+    pub(crate) fn from_raw(flags: u32) -> Self {
+        Self(flags)
+    }
+
     /// Check whether `flags` is contained in `self`.
     pub fn contains(self, flags: Flags) -> bool {
         (self & flags) == flags

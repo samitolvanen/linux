@@ -19,7 +19,8 @@ use crate::{
     devres::Devres,
     error::to_result,
     io::PhysAddr,
-    prelude::*, //
+    prelude::*,
+    sync::Arc, //
 };
 
 use bindings::io_pgtable_fmt;
@@ -56,23 +57,139 @@ pub struct Config {
 
 /// An io page table using a specific format.
 ///
+/// `A` is the allocator that provides the memory backing the page tables. By default the
+/// io-pgtable core allocates that memory itself.
+///
 /// # Invariants
 ///
 /// The pointer references a valid io page table.
-pub struct IoPageTable<F: IoPageTableFmt> {
+pub struct IoPageTable<F: IoPageTableFmt, A = CoreAlloc> {
     ptr: NonNull<bindings::io_pgtable_ops>,
+    /// The custom allocator, if any.
+    _allocator: Option<Arc<A>>,
     _marker: PhantomData<F>,
 }
 
-// SAFETY: `struct io_pgtable_ops` is not restricted to a single thread.
-unsafe impl<F: IoPageTableFmt> Send for IoPageTable<F> {}
-// SAFETY: `struct io_pgtable_ops` may be accessed concurrently.
-unsafe impl<F: IoPageTableFmt> Sync for IoPageTable<F> {}
+// SAFETY: `struct io_pgtable_ops` is not restricted to a single thread, and it is safe to drop the
+// allocator on another thread because `A: Send + Sync`.
+unsafe impl<F: IoPageTableFmt, A: Send + Sync> Send for IoPageTable<F, A> {}
+// SAFETY: `struct io_pgtable_ops` may be accessed concurrently, and the page table operations only
+// take a shared reference to the allocator, which is safe from any thread because `A: Sync`.
+unsafe impl<F: IoPageTableFmt, A: Send + Sync> Sync for IoPageTable<F, A> {}
 
 /// The format used by this page table.
 pub trait IoPageTableFmt: 'static {
     /// The value representing this format.
     const FORMAT: io_pgtable_fmt;
+}
+
+/// Smallest page table an [`IoPageTable`] asks a [`PageTableAlloc`] for.
+///
+/// A page table can be smaller than the alignment the hardware needs for it, so both hooks round
+/// the size up to this value.
+const MIN_PAGE_TABLE_SIZE: usize = 64;
+
+/// The allocator that provides the memory backing the page tables of an [`IoPageTable`].
+///
+/// [`alloc`] may sleep only when the flags passed to it allow sleeping. [`free`] can run in a
+/// context that cannot sleep, so it must never block.
+///
+/// Both hooks can be called at any time while the [`IoPageTable`] exists. Dropping the
+/// [`IoPageTable`] frees the page tables that are still live, so [`free`] runs during that drop
+/// as well.
+///
+/// # Safety
+///
+/// Memory returned by [`alloc`] is programmed into a page table walked by hardware, so
+/// implementers must return memory that is
+///
+/// * zeroed, because the hardware and the io-pgtable core both read it as page table entries
+///   before anything writes them,
+/// * suitable for `dma_map_single()` and `virt_to_phys()`, so it must not come from `vmalloc`,
+/// * at least `size` bytes long and aligned to `size`,
+/// * owned by the page table until it is passed back to [`free`], so [`alloc`] must not return
+///   memory it has already returned, and must not free it in the meantime.
+///
+/// [`alloc`]: PageTableAlloc::alloc
+/// [`free`]: PageTableAlloc::free
+pub unsafe trait PageTableAlloc: Send + Sync + 'static {
+    /// Allocates one page table of `size` bytes.
+    ///
+    /// `size` is fixed by the granule the [`IoPageTable`] was created with, except for the
+    /// top-level table, which is allocated while the [`IoPageTable`] itself is created. [`free`]
+    /// is called with the same `size` for the same page table.
+    ///
+    /// Returns [`None`] if no memory is available.
+    ///
+    /// [`free`]: PageTableAlloc::free
+    fn alloc(&self, size: usize, flags: alloc::Flags) -> Option<NonNull<u8>>;
+
+    /// Frees a page table obtained from [`PageTableAlloc::alloc`].
+    ///
+    /// # Safety
+    ///
+    /// `pages` must have been returned by [`PageTableAlloc::alloc`] on `self` for the same `size`,
+    /// and must not have been freed since.
+    unsafe fn free(&self, pages: NonNull<u8>, size: usize);
+}
+
+/// The io-pgtable core's own page allocator, which is the default for [`IoPageTable`].
+///
+/// This type has no values. It only implements [`PageTableAlloc`] so that it can be used as the
+/// default type parameter.
+pub enum CoreAlloc {}
+
+// SAFETY: This type has no values, so neither method can be called.
+unsafe impl PageTableAlloc for CoreAlloc {
+    fn alloc(&self, _size: usize, _flags: alloc::Flags) -> Option<NonNull<u8>> {
+        match *self {}
+    }
+
+    unsafe fn free(&self, _pages: NonNull<u8>, _size: usize) {
+        match *self {}
+    }
+}
+
+/// # Safety
+///
+/// `cookie` must point to a valid `A` that outlives this call.
+unsafe extern "C" fn alloc_callback<A: PageTableAlloc>(
+    cookie: *mut c_void,
+    size: usize,
+    gfp: bindings::gfp_t,
+) -> *mut c_void {
+    // SAFETY: The caller guarantees that `cookie` points to a valid `A`.
+    let allocator = unsafe { &*cookie.cast::<A>() };
+
+    match allocator.alloc(size.max(MIN_PAGE_TABLE_SIZE), alloc::Flags::from_raw(gfp)) {
+        Some(pages) => pages.as_ptr().cast(),
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+///
+/// * `cookie` must point to a valid `A` that outlives this call.
+/// * `pages` must have been returned by `alloc_callback::<A>` for the same `cookie` and must not
+///   have been freed since. `size` rounded up to `MIN_PAGE_TABLE_SIZE` must be the size that call
+///   was made for.
+unsafe extern "C" fn free_callback<A: PageTableAlloc>(
+    cookie: *mut c_void,
+    pages: *mut c_void,
+    size: usize,
+) {
+    let Some(pages) = NonNull::new(pages.cast::<u8>()) else {
+        return;
+    };
+
+    // SAFETY: The caller guarantees that `cookie` points to a valid `A`.
+    let allocator = unsafe { &*cookie.cast::<A>() };
+
+    // SAFETY: The caller guarantees that `pages` came from `A::alloc` and has not been freed
+    // since. The io-pgtable core passes the size of the page table, not the size the core asked
+    // for. Rounding that size the same way `alloc_callback` does gives back the size of the
+    // allocation.
+    unsafe { allocator.free(pages, size.max(MIN_PAGE_TABLE_SIZE)) };
 }
 
 impl<F: IoPageTableFmt> IoPageTable<F> {
@@ -94,6 +211,59 @@ impl<F: IoPageTableFmt> IoPageTable<F> {
     /// unbound.
     #[inline]
     pub unsafe fn new_raw(dev: &Device<Bound>, config: Config) -> Result<IoPageTable<F>> {
+        // SAFETY: The caller ensures that the io pgtable does not outlive the device.
+        unsafe { Self::create(dev, config, None) }
+    }
+}
+
+impl<F: IoPageTableFmt, A: PageTableAlloc> IoPageTable<F, A> {
+    /// Create a new `IoPageTable` with a custom allocator, as a device resource.
+    ///
+    /// `F` must be a format that supports a custom allocator, i.e. one that advertises
+    /// `IO_PGTABLE_CAP_CUSTOM_ALLOCATOR`. Any other format fails with [`ENOMEM`].
+    #[inline]
+    pub fn new_with_alloc(
+        dev: &Device<Bound>,
+        config: Config,
+        allocator: Arc<A>,
+    ) -> impl PinInit<Devres<IoPageTable<F, A>>, Error> + '_ {
+        // SAFETY: Devres ensures that the value is dropped during device unbind.
+        Devres::new(dev, unsafe {
+            Self::new_raw_with_alloc(dev, config, allocator)
+        })
+    }
+
+    /// Create a new `IoPageTable` with a custom allocator.
+    ///
+    /// `allocator` provides the memory backing the page tables, including the top-level table
+    /// this call allocates. The allocator is released once the page table has been freed.
+    ///
+    /// `F` must be a format that supports a custom allocator, i.e. one that advertises
+    /// `IO_PGTABLE_CAP_CUSTOM_ALLOCATOR`. Any other format fails with [`ENOMEM`].
+    ///
+    /// # Safety
+    ///
+    /// If successful, then the returned `IoPageTable` must be dropped before the device is
+    /// unbound.
+    #[inline]
+    pub unsafe fn new_raw_with_alloc(
+        dev: &Device<Bound>,
+        config: Config,
+        allocator: Arc<A>,
+    ) -> Result<IoPageTable<F, A>> {
+        // SAFETY: The caller ensures that the io pgtable does not outlive the device.
+        unsafe { Self::create(dev, config, Some(allocator)) }
+    }
+
+    /// # Safety
+    ///
+    /// If successful, then the returned `IoPageTable` must be dropped before the device is
+    /// unbound.
+    unsafe fn create(
+        dev: &Device<Bound>,
+        config: Config,
+        allocator: Option<Arc<A>>,
+    ) -> Result<Self> {
         let mut raw_cfg = bindings::io_pgtable_cfg {
             quirks: config.quirks,
             pgsize_bitmap: config.pgsize_bitmap,
@@ -106,22 +276,34 @@ impl<F: IoPageTableFmt> IoPageTable<F> {
             ..unsafe { core::mem::zeroed() }
         };
 
+        let cookie = match &allocator {
+            Some(allocator) => {
+                raw_cfg.alloc = Some(alloc_callback::<A>);
+                raw_cfg.free = Some(free_callback::<A>);
+                // The `Arc` keeps the allocator at this address until the returned page table
+                // drops it.
+                Arc::as_ptr(allocator).cast_mut().cast()
+            }
+            None => core::ptr::null_mut(),
+        };
+
         // SAFETY:
         // * The raw_cfg pointer is valid for the duration of this call.
-        // * The provided `FLUSH_OPS` contains valid function pointers that accept a null pointer
-        //   as cookie.
+        // * The provided `FLUSH_OPS` contains valid function pointers that ignore the cookie.
+        // * The allocator callbacks accept `cookie`, which the returned page table keeps alive.
         // * The caller ensures that the io pgtable does not outlive the device.
-        let ops = unsafe {
-            bindings::alloc_io_pgtable_ops(F::FORMAT, &mut raw_cfg, core::ptr::null_mut())
-        };
+        let ops = unsafe { bindings::alloc_io_pgtable_ops(F::FORMAT, &mut raw_cfg, cookie) };
 
         // INVARIANT: We successfully created a valid page table.
         Ok(IoPageTable {
             ptr: NonNull::new(ops).ok_or(ENOMEM)?,
+            _allocator: allocator,
             _marker: PhantomData,
         })
     }
+}
 
+impl<F: IoPageTableFmt, A> IoPageTable<F, A> {
     /// Obtain a raw pointer to the underlying `struct io_pgtable_ops`.
     #[inline]
     pub fn raw_ops(&self) -> *mut bindings::io_pgtable_ops {
@@ -263,8 +445,11 @@ extern "C" fn rust_tlb_flush_walk_noop(
 ) {
 }
 
-impl<F: IoPageTableFmt> Drop for IoPageTable<F> {
+impl<F: IoPageTableFmt, A> Drop for IoPageTable<F, A> {
     fn drop(&mut self) {
+        // Freeing the remaining page tables calls back into the allocator, which is only dropped
+        // once this function returns.
+        //
         // SAFETY: The caller of `Self::ttbr()` promised that the page table is not live when this
         // destructor runs.
         unsafe { bindings::free_io_pgtable_ops(self.raw_ops()) };
@@ -278,7 +463,7 @@ impl IoPageTableFmt for ARM64LPAES1 {
     const FORMAT: io_pgtable_fmt = bindings::io_pgtable_fmt_ARM_64_LPAE_S1 as io_pgtable_fmt;
 }
 
-impl IoPageTable<ARM64LPAES1> {
+impl<A> IoPageTable<ARM64LPAES1, A> {
     /// Access the `ttbr` field of the configuration.
     ///
     /// This is the physical address of the page table, which may be passed to the device that
