@@ -34,6 +34,7 @@ pub use traits::{
     BinaryReaderMut,
     BinaryWriter,
     Reader,
+    SeqShow,
     Writer, //
 };
 
@@ -52,6 +53,7 @@ use file_ops::{
     FileOps,
     ReadFile,
     ReadWriteFile,
+    SeqReadFile,
     WriteFile, //
 };
 
@@ -564,7 +566,7 @@ impl<'data, 'dir, M: ModuleMetadata> ScopedDir<'data, 'dir, M> {
         }
     }
 
-    fn create_file<T: Sync>(&self, name: &CStr, data: &'data T, vtable: &'static FileOps<T>) {
+    fn create_file<T: Sync>(&self, name: &CStr, data: &'data T, vtable: &FileOps<T>) {
         #[cfg(CONFIG_DEBUG_FS)]
         core::mem::forget(Entry::file(name, &self.entry, data, vtable));
     }
@@ -612,6 +614,14 @@ impl<'data, 'dir, M: ModuleMetadata> ScopedDir<'data, 'dir, M> {
     {
         let vtable = <FormatAdapter<T, F> as ReadFile<M, _>>::FILE_OPS.adapt();
         self.create_file(name, data, vtable)
+    }
+
+    /// Creates a seq_file debugfs file in this directory.
+    ///
+    /// The file's contents are produced by invoking [`SeqShow::show`] with
+    /// `data` on each read.
+    pub fn seq_file<S: SeqShow<U>, U: Sync>(&self, name: &CStr, data: &'data U) {
+        self.create_file(name, data, &<S as SeqReadFile<U>>::FILE_OPS)
     }
 
     /// Creates a read-write file in this directory.

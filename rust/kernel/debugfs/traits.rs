@@ -8,6 +8,7 @@ use crate::{
     fmt,
     fs::file,
     prelude::*,
+    seq_file::SeqFile,
     sync::{
         atomic::{
             Atomic,
@@ -318,4 +319,14 @@ impl<T: ?Sized + BinaryReader> BinaryReader for Arc<T> {
     ) -> Result<usize> {
         self.deref().read_from_slice(reader, offset)
     }
+}
+
+/// Renders `data` into a seq_file.
+///
+/// `data` is the value stashed as the debugfs file's `i_private` at creation
+/// time. `show` is invoked on each read to produce the file's contents.
+/// `data` must remain valid while the debugfs file is registered.
+pub trait SeqShow<T> {
+    /// Writes debugfs output for the file.
+    fn show(data: &T, m: &SeqFile) -> Result;
 }
