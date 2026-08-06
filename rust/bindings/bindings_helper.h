@@ -32,6 +32,7 @@
 #include <linux/gpu_buddy.h>
 #include <clocksource/arm_arch_timer.h>
 #include <drm/drm_auth.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_exec.h>
