@@ -6,6 +6,7 @@
 
 use crate::{
     bindings,
+    debugfs,
     device,
     drm,
     error::to_result,
@@ -169,6 +170,16 @@ pub trait Driver {
         _printer: &drm::printer::Printer,
         _file: &drm::file::File<Self::File>,
     ) where
+        Self: Sized,
+    {
+    }
+
+    /// Populates debugfs for this DRM device.
+    ///
+    /// Called by the DRM core during registration. The `ScopeRef` provides
+    /// access to the device's `RegistrationData` for creating debugfs files.
+    fn debugfs_init(_dir: &debugfs::ScopeRef<'_, Self::RegistrationData<'_>>)
+    where
         Self: Sized,
     {
     }
