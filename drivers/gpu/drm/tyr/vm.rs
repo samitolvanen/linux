@@ -8,6 +8,7 @@
 //! mapped into hardware address space (AS) slots for GPU execution.
 
 mod exec;
+pub(crate) mod pt_alloc;
 pub(crate) mod range;
 
 use core::mem::ManuallyDrop;
@@ -62,12 +63,7 @@ use kernel::{
     fmt,
     impl_flags,
     io::PhysAddr,
-    iommu::pgtable::{
-        prot,
-        DevresIoPageTable,
-        IoPageTable,
-        ARM64LPAES1, //
-    },
+    iommu::pgtable::prot,
     new_mutex,
     platform,
     pr_warn_once,
@@ -357,6 +353,7 @@ impl VmBindJob {
             ],
             vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
             map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
+            pt_reserve: pt_alloc::PtReserve::for_map(va, size)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -382,6 +379,7 @@ impl VmBindJob {
             ],
             vm_bo: None,
             map_sgt: None,
+            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -579,6 +577,10 @@ pub(crate) struct VmOpResources {
     /// `(dma_address, dma_len)` pair, in the order yielded by the BO's
     /// scatter-gather table. `None` for Unmap.
     map_sgt: Option<KVVec<(DmaAddress, u64)>>,
+    /// Page tables the operation can need, reserved outside the VM_BIND
+    /// dma-fence signalling section because that section must not make
+    /// allocations that can wait for reclaim.
+    pt_reserve: pt_alloc::PtReserve,
 }
 
 /// Request to execute a virtual memory operation.
@@ -620,7 +622,7 @@ pub(crate) struct PtUpdateContext<'ctx> {
     dev: &'ctx Device,
 
     /// Page table.
-    pt: &'ctx DevresIoPageTable<ARM64LPAES1>,
+    pt: &'ctx pt_alloc::DevresPageTable,
 
     /// MMU manager.
     mmu: &'ctx Mmu,
@@ -650,7 +652,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
     /// complete the update when dropped.
     fn new(
         dev: &'ctx Device,
-        pt: &'ctx DevresIoPageTable<ARM64LPAES1>,
+        pt: &'ctx pt_alloc::DevresPageTable,
         mmu: &'ctx Mmu,
         as_data: &'ctx VmAsData,
         region: Range<u64>,
@@ -659,6 +661,9 @@ impl<'ctx> PtUpdateContext<'ctx> {
     ) -> Result<PtUpdateContext<'ctx>> {
         let _op_lock = as_data.lock_ops();
         mmu.start_vm_update(as_data, &region)?;
+        as_data
+            .pt_allocator
+            .set_reserve(core::mem::take(&mut resources.pt_reserve));
 
         Ok(Self {
             dev,
@@ -715,6 +720,11 @@ impl Drop for PtUpdateContext<'_> {
         if let Err(e) = self.mmu.end_vm_update(self.as_data, &self.region) {
             dev_err!(self.dev, "Failed to end VM update {:?}", e);
         }
+
+        // The leftovers go back to the resources. They are freed with
+        // everything else the operation reserved, once this context has
+        // released the op lock.
+        self.resources.pt_reserve = self.as_data.pt_allocator.take_reserve();
     }
 }
 
@@ -882,7 +892,7 @@ impl Vm {
         let gpuvm = ARef::from(&*gpuvm_unique);
 
         let as_data = Arc::pin_init(
-            VmAsData::new(&mmu, pdev.as_ref(), va_bits, pa_bits),
+            VmAsData::new(&mmu, pdev.as_ref(), va_bits, pa_bits)?,
             GFP_KERNEL,
         )?;
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
@@ -1311,6 +1321,7 @@ impl VmExec {
             ],
             vm_bo: Some(self.gpuvm.obtain(bo, ())?),
             map_sgt: Some(prefetch_map_sgt(bo, dev)?),
+            pt_reserve: pt_alloc::PtReserve::for_map(va, map_size)?,
         };
         let result = self.map_bo_range_inner(dev, bo_offset, map_size, va, flags, &mut resources);
 
@@ -1370,6 +1381,7 @@ impl VmExec {
             },
             vm_bo: None,
             map_sgt: None,
+            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
 
@@ -1536,7 +1548,7 @@ impl DriverGpuVm for GpuVmData {
         // split.
         let prot = op.va_to_unmap().data_ref().prot;
 
-        let block = Alignment::new::<{ SZ_2M }>();
+        let block = Alignment::new::<{ pt_alloc::PT_MIN_BLOCK_SIZE }>();
         let aligned_start = unmap_start.align_down(block);
         let aligned_end = unmap_end.align_up(block).ok_or(EINVAL)?;
 
@@ -1626,10 +1638,7 @@ impl DriverGpuVm for GpuVmData {
 /// visits at most 511 pages. The walk is read-only, lock-free and does not
 /// allocate, so it is safe on the dma-fence signalling path. A revoked page
 /// table also reports `None`, leaving the unmap unexpanded.
-fn contiguous_phys(
-    page_table: &DevresIoPageTable<ARM64LPAES1>,
-    range: Range<u64>,
-) -> Option<PhysAddr> {
+fn contiguous_phys(page_table: &pt_alloc::DevresPageTable, range: Range<u64>) -> Option<PhysAddr> {
     let pt = page_table.try_access()?;
 
     // SAFETY: The page table is exclusively accessed through the
@@ -1722,7 +1731,7 @@ fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(DmaAddress, u
 /// Returns the number of bytes successfully mapped.
 fn pt_map(
     dev: &Device<Bound>,
-    page_table: &DevresIoPageTable<ARM64LPAES1>,
+    page_table: &pt_alloc::DevresPageTable,
     iova: u64,
     paddr: u64,
     len: u64,
@@ -1750,7 +1759,7 @@ fn pt_map(
 /// because a freed table has nothing left to unmap.
 fn pt_map_fragment(
     dev: &Device,
-    page_table: &DevresIoPageTable<ARM64LPAES1>,
+    page_table: &pt_alloc::DevresPageTable,
     iova: u64,
     paddr: PhysAddr,
     len: u64,
@@ -1778,7 +1787,7 @@ fn pt_map_fragment(
 /// can decide whether to unmap a partial mapping.
 fn pt_map_pages(
     dev: &Device,
-    pt: &IoPageTable<'_, ARM64LPAES1>,
+    pt: &pt_alloc::PageTable<'_>,
     iova: u64,
     paddr: u64,
     len: u64,
@@ -1808,10 +1817,9 @@ fn pt_map_pages(
             }
         };
 
-        // TODO: GFP_NOWAIT because this runs in the VM_BIND dma-fence
-        // signalling section. The proper fix is to preallocate the
-        // page-table pages in the prepare phase so this path does not
-        // allocate.
+        // The page tables for this map come from the reserve. The flags only
+        // reach the fallback path, which runs in the VM_BIND dma-fence
+        // signalling section and so must not wait for reclaim.
         //
         // SAFETY:
         // No other io-pgtable operation can currently access this range because Tyr holds
@@ -1852,11 +1860,7 @@ fn pt_map_pages(
 ///
 /// This function removes all page table entries in the specified range,
 /// automatically handling different page sizes that may be present.
-fn pt_unmap(
-    dev: &Device,
-    page_table: &DevresIoPageTable<ARM64LPAES1>,
-    range: Range<u64>,
-) -> Result {
+fn pt_unmap(dev: &Device, page_table: &pt_alloc::DevresPageTable, range: Range<u64>) -> Result {
     let mut iova = range.start;
     let mut bytes_left_to_unmap = range.end - range.start;
 
