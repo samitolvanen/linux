@@ -85,6 +85,9 @@ pub(crate) struct ContextGrowArgs {
     pub(crate) group_uid: u64,
     /// Index of the CS within that group.
     pub(crate) cs_id: u32,
+    pub(crate) vt_start: u32,
+    pub(crate) vt_end: u32,
+    pub(crate) frag_end: u32,
 }
 
 /// Per-heap state observed while deciding whether a grow can proceed,
@@ -419,11 +422,15 @@ impl Pool {
         trace::heap_grow_decision(
             args.group_uid,
             args.cs_id,
+            args.heap_gpu_va,
             state.chunk_count,
             state.max_chunks,
             args.renderpasses_in_flight,
             state.target_in_flight,
             args.pending_frag_count,
+            args.vt_start,
+            args.vt_end,
+            args.frag_end,
             outcome,
         );
 
