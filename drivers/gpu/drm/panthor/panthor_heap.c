@@ -640,7 +640,7 @@ size_t panthor_heap_pool_size(struct panthor_heap_pool *pool)
 /**
  * panthor_heap_pool_dump_for_trace() - Dump every heap-context entry and
  * chunk-header in this pool to the panthor_heap_context_dump /
- * panthor_heap_chunk_dump tracepoints (and a matching pr_info fallback).
+ * panthor_heap_chunk_dump tracepoints.
  * @pool: Pool to dump. May be NULL.
  * @group: Identifier to emit in the @group tracepoint field. The periodic
  * trigger passes the owning VM's trace id; a fault-triggered caller would
@@ -684,9 +684,6 @@ void panthor_heap_pool_dump_for_trace(struct panthor_heap_pool *pool,
 		chunk_count = heap->chunk_count;
 		trace_panthor_heap_context_dump(group, cs, (u32)i, heap_ctx_va,
 						chunk_count, content);
-		pr_info("panthor DBG heap_context_dump: group=%llu cs=%u heap=%u va=0x%llx chunks=%u content=%*ph\n",
-			group, cs, (u32)i, heap_ctx_va, chunk_count,
-			(int)sizeof(content), content);
 
 		list_for_each_entry(chunk, &heap->chunks, node) {
 			struct iosys_map map;
@@ -711,9 +708,6 @@ void panthor_heap_pool_dump_for_trace(struct panthor_heap_pool *pool,
 			trace_panthor_heap_chunk_dump(group, cs, (u32)i,
 						      chunk_index, chunk_va,
 						      header);
-			pr_info("panthor DBG heap_chunk_dump: group=%llu cs=%u heap=%u chunk=%u va=0x%llx header=%*ph\n",
-				group, cs, (u32)i, chunk_index, chunk_va,
-				(int)sizeof(header), header);
 			chunk_index++;
 		}
 
