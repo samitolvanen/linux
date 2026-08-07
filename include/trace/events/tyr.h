@@ -3078,36 +3078,47 @@ TRACE_EVENT(tyr_wedge_cs_state,
 	{ 2, "FATAL" }
 
 TRACE_EVENT(tyr_heap_grow_decision,
-	TP_PROTO(u64 group_uid, u32 cs_id, u32 chunk_count, u32 max_chunks,
-		 u32 renderpasses_in_flight, u32 target_in_flight,
-		 u32 pending_frag_count, u32 outcome),
-	TP_ARGS(group_uid, cs_id, chunk_count, max_chunks,
+	TP_PROTO(u64 group_uid, u32 cs_id, u64 heap_gpu_va, u32 chunk_count,
+		 u32 max_chunks, u32 renderpasses_in_flight,
+		 u32 target_in_flight, u32 pending_frag_count, u32 vt_start,
+		 u32 vt_end, u32 frag_end, u32 outcome),
+	TP_ARGS(group_uid, cs_id, heap_gpu_va, chunk_count, max_chunks,
 		renderpasses_in_flight, target_in_flight, pending_frag_count,
-		outcome),
+		vt_start, vt_end, frag_end, outcome),
 	TP_STRUCT__entry(
 		__field(u64, group_uid)
 		__field(u32, cs_id)
+		__field(u64, heap_gpu_va)
 		__field(u32, chunk_count)
 		__field(u32, max_chunks)
 		__field(u32, renderpasses_in_flight)
 		__field(u32, target_in_flight)
 		__field(u32, pending_frag_count)
+		__field(u32, vt_start)
+		__field(u32, vt_end)
+		__field(u32, frag_end)
 		__field(u32, outcome)
 	),
 	TP_fast_assign(
 		__entry->group_uid = group_uid;
 		__entry->cs_id = cs_id;
+		__entry->heap_gpu_va = heap_gpu_va;
 		__entry->chunk_count = chunk_count;
 		__entry->max_chunks = max_chunks;
 		__entry->renderpasses_in_flight = renderpasses_in_flight;
 		__entry->target_in_flight = target_in_flight;
 		__entry->pending_frag_count = pending_frag_count;
+		__entry->vt_start = vt_start;
+		__entry->vt_end = vt_end;
+		__entry->frag_end = frag_end;
 		__entry->outcome = outcome;
 	),
-	TP_printk("group_uid=%llu cs=%u chunks=%u/%u renderpasses_in_flight=%u/%u pending_frag=%u outcome=%s",
-		  __entry->group_uid, __entry->cs_id, __entry->chunk_count,
-		  __entry->max_chunks, __entry->renderpasses_in_flight,
-		  __entry->target_in_flight, __entry->pending_frag_count,
+	TP_printk("group_uid=%llu cs=%u heap_va=0x%llx chunks=%u/%u renderpasses_in_flight=%u/%u pending_frag=%u vt_start=%u vt_end=%u frag_end=%u outcome=%s",
+		  __entry->group_uid, __entry->cs_id, __entry->heap_gpu_va,
+		  __entry->chunk_count, __entry->max_chunks,
+		  __entry->renderpasses_in_flight, __entry->target_in_flight,
+		  __entry->pending_frag_count, __entry->vt_start,
+		  __entry->vt_end, __entry->frag_end,
 		  __print_symbolic(__entry->outcome, TYR_HEAP_GROW_OUTCOMES))
 );
 

@@ -294,6 +294,9 @@ impl WorkItem<2> for Group {
                             pending_frag_count: oom.vt_end.wrapping_sub(oom.frag_end),
                             group_uid: this.uid(),
                             cs_id: oom.cs_id.get() as u32,
+                            vt_start: oom.vt_start,
+                            vt_end: oom.vt_end,
+                            frag_end: oom.frag_end,
                         },
                     )
                 })
