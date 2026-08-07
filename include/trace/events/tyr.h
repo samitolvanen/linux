@@ -3205,6 +3205,50 @@ TRACE_EVENT(tyr_heap_event_chunk_dump,
 		  __print_hex(__entry->header, 64))
 );
 
+/*
+ * When a tiler-heap read-back was taken. Keep in sync with
+ * `ReadbackPhase` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_HEAP_READBACK_PHASES	\
+	{ 0, "BEFORE_DOORBELL" },	\
+	{ 1, "AFTER_DOORBELL" }
+
+/*
+ * Read-back of the CS_TILER_HEAP_START / CS_TILER_HEAP_END input words
+ * the tiler-OOM worker stored, taken once with the store barriered out
+ * and once after the doorbell. The worker writes one value to both
+ * words, so a read half that differs from `written` means the words the
+ * firmware reads are not the words the worker wrote.
+ */
+TRACE_EVENT(tyr_tiler_heap_readback,
+	TP_PROTO(u64 group_uid, u32 csg_id, u32 cs_id, u32 phase, u64 written,
+		 u64 read_start, u64 read_end),
+	TP_ARGS(group_uid, csg_id, cs_id, phase, written, read_start,
+		read_end),
+	TP_STRUCT__entry(
+		__field(u64, group_uid)
+		__field(u32, csg_id)
+		__field(u32, cs_id)
+		__field(u32, phase)
+		__field(u64, written)
+		__field(u64, read_start)
+		__field(u64, read_end)
+	),
+	TP_fast_assign(
+		__entry->group_uid = group_uid;
+		__entry->csg_id = csg_id;
+		__entry->cs_id = cs_id;
+		__entry->phase = phase;
+		__entry->written = written;
+		__entry->read_start = read_start;
+		__entry->read_end = read_end;
+	),
+	TP_printk("group_uid=%llu csg=%u cs=%u phase=%s written=0x%llx read=0x%llx/0x%llx",
+		  __entry->group_uid, __entry->csg_id, __entry->cs_id,
+		  __print_symbolic(__entry->phase, TYR_HEAP_READBACK_PHASES),
+		  __entry->written, __entry->read_start, __entry->read_end)
+);
+
 #endif /* _TYR_TRACE_H */
 
 /* This part must be outside protection. */
