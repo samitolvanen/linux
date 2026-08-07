@@ -212,6 +212,9 @@ use core::{
 mod builder;
 pub use self::builder::Builder;
 
+mod scoped;
+pub use self::scoped::ScopedQueue;
+
 /// Creates a [`Work`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
 macro_rules! new_work {
