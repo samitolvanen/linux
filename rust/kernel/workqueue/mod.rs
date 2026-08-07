@@ -213,7 +213,13 @@ mod builder;
 pub use self::builder::Builder;
 
 mod scoped;
-pub use self::scoped::ScopedQueue;
+pub use self::scoped::{
+    new_scoped_work,
+    ScopedQueue,
+    ScopedWork,
+    ScopedWorkItem,
+    ScopedWorkRef, //
+};
 
 /// Creates a [`Work`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
@@ -283,23 +289,39 @@ impl Queue {
     /// This may fail if the work item is already enqueued in a workqueue.
     ///
     /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    #[inline]
     pub fn enqueue<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
     where
         W: RawWorkItem<ID> + Send + 'static,
     {
+        // SAFETY: `W: 'static` guarantees the work item remains valid indefinitely,
+        // so the `enqueue_scoped` requirement that the work item stays valid until
+        // the work function runs (or is cancelled) is trivially satisfied.
+        unsafe { self.enqueue_scoped(w) }
+    }
+
+    /// Enqueues a work item that may not be `'static`.
+    ///
+    /// Unlike [`Queue::enqueue`], this does not require the work item to be `'static`.
+    ///
+    /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the work item's destructor runs before any
+    /// lifetime it captures expires (i.e., the work item must not be forgotten).
+    #[inline]
+    pub unsafe fn enqueue_scoped<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
+    where
+        W: RawWorkItem<ID> + Send,
+    {
         let queue_ptr = self.0.get();
 
-        // SAFETY: We only return `false` if the `work_struct` is already in a workqueue. The other
-        // `__enqueue` requirements are not relevant since `W` is `Send` and static.
-        //
-        // The call to `bindings::queue_work_on` will dereference the provided raw pointer, which
-        // is ok because `__enqueue` guarantees that the pointer is valid for the duration of this
-        // closure.
-        //
-        // Furthermore, if the C workqueue code accesses the pointer after this call to
-        // `__enqueue`, then the work item was successfully enqueued, and `bindings::queue_work_on`
-        // will have returned true. In this case, `__enqueue` promises that the raw pointer will
-        // stay valid until we call the function pointer in the `work_struct`, so the access is ok.
+        // SAFETY: We only return `false` if the `work_struct` is already in a workqueue. The
+        // caller guarantees the work item remains valid until the work function runs or the item
+        // is cancelled, satisfying the `__enqueue` requirement that the pointer stays valid until
+        // the function pointer in the `work_struct` is called. `W: Send` satisfies the
+        // cross-thread safety requirement.
         unsafe {
             w.__enqueue(move |work_ptr| {
                 bindings::queue_work_on(
