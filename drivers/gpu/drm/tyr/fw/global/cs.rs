@@ -307,6 +307,20 @@ impl CsInterface {
         );
     }
 
+    /// Reads the raw `CS_TILER_HEAP_START` and `CS_TILER_HEAP_END` input
+    /// register values back.
+    pub(crate) fn read_tiler_heap_raw(&self) -> Result<(u64, u64)> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(enabled) => enabled,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok((
+            enabled.cs_input.read(CS_TILER_HEAP_START).into_raw(),
+            enabled.cs_input.read(CS_TILER_HEAP_END).into_raw(),
+        ))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn read_output_ack(&self) -> Result<CS_ACK> {
         let enabled = match &self.state {
