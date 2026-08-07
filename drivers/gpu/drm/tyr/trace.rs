@@ -781,6 +781,38 @@ kernel::declare_trace! {
 
     /// # Safety
     ///
+    /// `content` must point to 32 valid, readable bytes for the
+    /// duration of the call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_heap_event_context_dump(
+        trigger: u32,
+        group_id: u64,
+        group_uid: u64,
+        cs_id: u32,
+        heap_index: u32,
+        heap_context_va: u64,
+        chunk_count: u32,
+        content: *const u8,
+    );
+
+    /// # Safety
+    ///
+    /// `header` must point to 64 valid, readable bytes for the
+    /// duration of the call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_heap_event_chunk_dump(
+        trigger: u32,
+        group_id: u64,
+        group_uid: u64,
+        cs_id: u32,
+        heap_index: u32,
+        chunk_index: u32,
+        chunk_va: u64,
+        header: *const u8,
+    );
+
+    /// # Safety
+    ///
     /// `mnemonic` must be a valid, nul-terminated C string pointer
     /// and `bytes` must point to at least `len` valid, readable bytes
     /// for the duration of the call.
@@ -1064,6 +1096,39 @@ pub(crate) fn heap_dump_enabled() -> bool {
 /// exist, so the dump can never produce trace output and is always off.
 #[cfg(not(CONFIG_TRACEPOINTS))]
 pub(crate) fn heap_dump_enabled() -> bool {
+    false
+}
+
+/// Returns whether an event-driven tiler-heap dump should run, i.e.
+/// whether either of the `tyr`-system dump tracepoints is enabled.
+/// These sit outside the `tyr_heap` system so a capture that arms `tyr`
+/// records the reclaim and MMU-fault dumps without arming the 1Hz
+/// worker.
+#[cfg(CONFIG_TRACEPOINTS)]
+pub(crate) fn heap_event_dump_enabled() -> bool {
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    let chunk = unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_heap_event_chunk_dump,
+            kernel::bindings::tracepoint,
+            key
+        )
+    };
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    let context = unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_heap_event_context_dump,
+            kernel::bindings::tracepoint,
+            key
+        )
+    };
+    chunk || context
+}
+
+/// Without `CONFIG_TRACEPOINTS` the `__tracepoint_*` symbols do not
+/// exist, so the dump can never produce trace output and is always off.
+#[cfg(not(CONFIG_TRACEPOINTS))]
+pub(crate) fn heap_event_dump_enabled() -> bool {
     false
 }
 
@@ -2394,16 +2459,51 @@ pub(crate) fn cs_user_stream_dump(
     }
 }
 
+/// Site that triggered an event-driven tiler-heap dump. Keep in sync
+/// with `TYR_HEAP_DUMP_TRIGGERS` in `include/trace/events/tyr.h`.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum HeapDumpTrigger {
+    /// The tiler-OOM worker answered a grow request with a reclaim.
+    Reclaim = 0,
+    /// The MMU reported an unhandled page fault.
+    MmuFault = 1,
+}
+
 /// 32-byte snapshot of one tiler-heap context entry, dumped from the
-/// kernel vmap of the pool's heap-context BO on CS_FAULT / CS_FATAL.
+/// kernel vmap of the pool's heap-context BO. `Some(trigger)` routes
+/// the dump to the event-driven tracepoint in the `tyr` system, `None`
+/// to the `tyr_heap` pair the periodic worker and the CS_FAULT /
+/// CS_FATAL path use.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn heap_context_dump(
+    trigger: Option<HeapDumpTrigger>,
     group_id: u64,
+    group_uid: u64,
     cs_id: u32,
     heap_index: u32,
     heap_context_va: u64,
     chunk_count: u32,
     content: &[u8; 32],
 ) {
+    if let Some(trigger) = trigger {
+        // SAFETY: `content` is a borrow of a `[u8; 32]`, so the pointer
+        // is valid and readable for 32 bytes for the duration of the call.
+        unsafe {
+            tyr_heap_event_context_dump(
+                trigger as u32,
+                group_id,
+                group_uid,
+                cs_id,
+                heap_index,
+                heap_context_va,
+                chunk_count,
+                content.as_ptr(),
+            )
+        }
+        return;
+    }
+
     pr_err!(
         "tyr DBG heap_context_dump: group={} cs={} heap_index={} heap_context_va={:#x} chunk_count={} bytes={}\n",
         group_id,
@@ -2428,15 +2528,37 @@ pub(crate) fn heap_context_dump(
 }
 
 /// 64-byte snapshot of one tiler-heap chunk header, dumped from the
-/// kernel vmap of the chunk BO on CS_FAULT / CS_FATAL.
+/// kernel vmap of the chunk BO. `trigger` selects the tracepoint as in
+/// `heap_context_dump`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn heap_chunk_dump(
+    trigger: Option<HeapDumpTrigger>,
     group_id: u64,
+    group_uid: u64,
     cs_id: u32,
     heap_index: u32,
     chunk_index: u32,
     chunk_va: u64,
     header: &[u8; 64],
 ) {
+    if let Some(trigger) = trigger {
+        // SAFETY: `header` is a borrow of a `[u8; 64]`, so the pointer
+        // is valid and readable for 64 bytes for the duration of the call.
+        unsafe {
+            tyr_heap_event_chunk_dump(
+                trigger as u32,
+                group_id,
+                group_uid,
+                cs_id,
+                heap_index,
+                chunk_index,
+                chunk_va,
+                header.as_ptr(),
+            )
+        }
+        return;
+    }
+
     pr_err!(
         "tyr DBG heap_chunk_dump: group={} cs={} heap_index={} chunk_index={} chunk_va={:#x} bytes={}\n",
         group_id,
