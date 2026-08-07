@@ -324,7 +324,20 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
 
                 let outcome = match grow_result {
                     Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
-                    Err(e) if e == ENOMEM => GrowOutcome::Reclaim,
+                    Err(e) if e == ENOMEM => {
+                        if trace::heap_event_dump_enabled() {
+                            if let Some(pool) = heap_pool.as_ref() {
+                                pool.dump_for_trace(
+                                    this.handle(),
+                                    this.uid(),
+                                    oom.cs_id.get() as u32,
+                                    Some(oom.heap_address),
+                                    Some(trace::HeapDumpTrigger::Reclaim),
+                                );
+                            }
+                        }
+                        GrowOutcome::Reclaim
+                    }
                     Err(_) => {
                         this.with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id));
                         TyrDrmDeviceData::schedule_tick(tdev);
@@ -528,7 +541,7 @@ impl Scheduler {
             if cs_fault_dump_mask != 0 {
                 if let Some(pool) = group.try_get_heap_pool() {
                     let dump_cs_id = cs_fault_dump_mask.trailing_zeros();
-                    pool.dump_for_trace(group_id, dump_cs_id);
+                    pool.dump_for_trace(group_id, group.uid(), dump_cs_id, None, None);
                 }
             }
 
