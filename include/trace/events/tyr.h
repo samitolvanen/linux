@@ -3122,6 +3122,89 @@ TRACE_EVENT(tyr_heap_grow_decision,
 		  __print_symbolic(__entry->outcome, TYR_HEAP_GROW_OUTCOMES))
 );
 
+/*
+ * Sites that trigger an event-driven tiler-heap dump. Keep in sync with
+ * `HeapDumpTrigger` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_HEAP_DUMP_TRIGGERS		\
+	{ 0, "RECLAIM" },		\
+	{ 1, "MMU_FAULT" }
+
+/*
+ * Event-driven twins of tyr_heap_context_dump and tyr_heap_chunk_dump.
+ * The originals sit in the tyr_heap system because the 1Hz heap-state
+ * worker keys its walk off them, which makes them too costly to leave
+ * armed. These fire once per reclaim answer or per MMU fault, so they
+ * live in the tyr system and are captured by a blanket enable of tyr.
+ * `cs_id` is ~0 when the trigger names no command stream, and the chunk
+ * dump covers the newest EVENT_DUMP_MAX_CHUNKS chunks of each heap.
+ */
+TRACE_EVENT(tyr_heap_event_context_dump,
+	TP_PROTO(u32 trigger, u64 group_id, u64 group_uid, u32 cs_id,
+		 u32 heap_index, u64 heap_context_va, u32 chunk_count,
+		 const u8 *content),
+	TP_ARGS(trigger, group_id, group_uid, cs_id, heap_index,
+		heap_context_va, chunk_count, content),
+	TP_STRUCT__entry(
+		__field(u32, trigger)
+		__field(u64, group_id)
+		__field(u64, group_uid)
+		__field(u32, cs_id)
+		__field(u32, heap_index)
+		__field(u64, heap_context_va)
+		__field(u32, chunk_count)
+		__array(u8, content, 32)
+	),
+	TP_fast_assign(
+		__entry->trigger = trigger;
+		__entry->group_id = group_id;
+		__entry->group_uid = group_uid;
+		__entry->cs_id = cs_id;
+		__entry->heap_index = heap_index;
+		__entry->heap_context_va = heap_context_va;
+		__entry->chunk_count = chunk_count;
+		memcpy(__entry->content, content, 32);
+	),
+	TP_printk("trigger=%s group=%llu group_uid=%llu cs=%u heap=%u va=0x%llx chunks=%u content=%s",
+		  __print_symbolic(__entry->trigger, TYR_HEAP_DUMP_TRIGGERS),
+		  __entry->group_id, __entry->group_uid, __entry->cs_id,
+		  __entry->heap_index, __entry->heap_context_va,
+		  __entry->chunk_count, __print_hex(__entry->content, 32))
+);
+
+TRACE_EVENT(tyr_heap_event_chunk_dump,
+	TP_PROTO(u32 trigger, u64 group_id, u64 group_uid, u32 cs_id,
+		 u32 heap_index, u32 chunk_index, u64 chunk_va,
+		 const u8 *header),
+	TP_ARGS(trigger, group_id, group_uid, cs_id, heap_index, chunk_index,
+		chunk_va, header),
+	TP_STRUCT__entry(
+		__field(u32, trigger)
+		__field(u64, group_id)
+		__field(u64, group_uid)
+		__field(u32, cs_id)
+		__field(u32, heap_index)
+		__field(u32, chunk_index)
+		__field(u64, chunk_va)
+		__array(u8, header, 64)
+	),
+	TP_fast_assign(
+		__entry->trigger = trigger;
+		__entry->group_id = group_id;
+		__entry->group_uid = group_uid;
+		__entry->cs_id = cs_id;
+		__entry->heap_index = heap_index;
+		__entry->chunk_index = chunk_index;
+		__entry->chunk_va = chunk_va;
+		memcpy(__entry->header, header, 64);
+	),
+	TP_printk("trigger=%s group=%llu group_uid=%llu cs=%u heap=%u chunk=%u va=0x%llx header=%s",
+		  __print_symbolic(__entry->trigger, TYR_HEAP_DUMP_TRIGGERS),
+		  __entry->group_id, __entry->group_uid, __entry->cs_id,
+		  __entry->heap_index, __entry->chunk_index, __entry->chunk_va,
+		  __print_hex(__entry->header, 64))
+);
+
 #endif /* _TYR_TRACE_H */
 
 /* This part must be outside protection. */

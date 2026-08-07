@@ -15,6 +15,7 @@ use crate::{
         TyrDrmDevice, //
     },
     regs::mmu_control::mmu_as_control,
+    sched::Scheduler,
     trace, //
 };
 
@@ -193,6 +194,15 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDr
             snapshot.cs1_extract,
             snapshot.ringbuf_words,
         );
+
+        if csg_id != u32::MAX {
+            Scheduler::dump_heap_for_csg(
+                tdev,
+                csg_id as usize,
+                group_uid,
+                trace::HeapDumpTrigger::MmuFault,
+            );
+        }
 
         let decoded_status = if fault_status_raw & (1 << 10) != 0 {
             "DECODER FAULT"
