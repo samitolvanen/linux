@@ -15,8 +15,9 @@ use kernel::{
         BaseObject,
         IntoGEMObject, //
     },
+    pr_warn_once,
     prelude::*,
-    sync::{aref::ARef, Arc},
+    sync::{aref::ARef, barrier::wmb, Arc},
     workqueue::WorkItem,
 };
 
@@ -542,6 +543,31 @@ impl Scheduler {
                     let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
                     cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
 
+                    if trace::tiler_heap_readback_enabled() {
+                        // The doorbell's barrier comes too late to keep
+                        // the read below from being answered out of the
+                        // store buffer.
+                        wmb();
+                        let (start, end) = cs.read_tiler_heap_raw()?;
+                        if tiler_heap_readback(
+                            group,
+                            oom,
+                            trace::ReadbackPhase::BeforeDoorbell,
+                            new_chunk_va,
+                            start,
+                            end,
+                        ) {
+                            pr_warn_once!(
+                                "tiler_oom: CSG {} CS {} heap words changed before the doorbell: wrote {:#x} read {:#x}/{:#x}\n",
+                                oom.csg_id,
+                                oom.cs_id,
+                                new_chunk_va,
+                                start,
+                                end,
+                            );
+                        }
+                    }
+
                     let ack = cs.read_output_ack()?.tiler_oom();
                     let req = cs.read_input_req()?.with_tiler_oom(ack);
                     cs.write_input_req(req);
@@ -549,10 +575,61 @@ impl Scheduler {
 
                 csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
             })?;
+
+            if trace::tiler_heap_readback_enabled() {
+                // A readback that cannot reach the interface must not
+                // skip the pending OOMs behind this one.
+                let _ = tdev.fw.with_csg_mut(oom.csg_id, |csg| {
+                    let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
+                    let (start, end) = cs.read_tiler_heap_raw()?;
+                    if tiler_heap_readback(
+                        group,
+                        oom,
+                        trace::ReadbackPhase::AfterDoorbell,
+                        new_chunk_va,
+                        start,
+                        end,
+                    ) {
+                        pr_warn_once!(
+                            "tiler_oom: CSG {} CS {} heap words changed across the doorbell: wrote {:#x} read {:#x}/{:#x}\n",
+                            oom.csg_id,
+                            oom.cs_id,
+                            new_chunk_va,
+                            start,
+                            end,
+                        );
+                    }
+                    Ok(())
+                });
+            }
         }
 
         Ok(())
     }
+}
+
+/// Emits `tyr_tiler_heap_readback` for the `CS_TILER_HEAP_START` /
+/// `CS_TILER_HEAP_END` pair read out of the CS input block. Returns
+/// whether either word differs from what the worker wrote.
+fn tiler_heap_readback(
+    group: &Group,
+    oom: &PendingOom,
+    phase: trace::ReadbackPhase,
+    written: u64,
+    read_start: u64,
+    read_end: u64,
+) -> bool {
+    trace::tiler_heap_readback(
+        group.uid(),
+        oom.csg_id as u32,
+        oom.cs_id,
+        phase,
+        written,
+        read_start,
+        read_end,
+    );
+
+    read_start != written || read_end != written
 }
 
 /// Resolves `CS_FAULT_INFO` (`info_va`) to a BO via the group's VM

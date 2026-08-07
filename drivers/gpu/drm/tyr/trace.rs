@@ -1063,6 +1063,19 @@ kernel::declare_trace! {
         frag_end: u32,
         outcome: u32,
     );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_tiler_heap_readback(
+        group_uid: u64,
+        csg_id: u32,
+        cs_id: u32,
+        phase: u32,
+        written: u64,
+        read_start: u64,
+        read_end: u64,
+    );
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -1129,6 +1142,29 @@ pub(crate) fn heap_event_dump_enabled() -> bool {
 /// exist, so the dump can never produce trace output and is always off.
 #[cfg(not(CONFIG_TRACEPOINTS))]
 pub(crate) fn heap_event_dump_enabled() -> bool {
+    false
+}
+
+/// Returns whether the tiler-heap readback should run, i.e. whether its
+/// tracepoint is enabled. The readback puts a barrier between the heap
+/// store and the acknowledgement that follows it, so a run that is not
+/// recording keeps the untouched store order.
+#[cfg(CONFIG_TRACEPOINTS)]
+pub(crate) fn tiler_heap_readback_enabled() -> bool {
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_tiler_heap_readback,
+            kernel::bindings::tracepoint,
+            key
+        )
+    }
+}
+
+/// Without `CONFIG_TRACEPOINTS` the `__tracepoint_*` symbols do not
+/// exist, so the readback can never produce trace output.
+#[cfg(not(CONFIG_TRACEPOINTS))]
+pub(crate) fn tiler_heap_readback_enabled() -> bool {
     false
 }
 
@@ -3246,6 +3282,42 @@ pub(crate) fn heap_grow_decision(
             vt_end,
             frag_end,
             outcome as u32,
+        )
+    }
+}
+
+/// When a tiler-heap readback was taken. Keep in sync with
+/// `TYR_HEAP_READBACK_PHASES` in `include/trace/events/tyr.h`.
+#[repr(u32)]
+pub(crate) enum ReadbackPhase {
+    /// After the store is barriered out, before the doorbell rings.
+    BeforeDoorbell = 0,
+    /// After the doorbell rings.
+    AfterDoorbell = 1,
+}
+
+/// The value the tiler-OOM worker wrote to `CS_TILER_HEAP_START` and
+/// `CS_TILER_HEAP_END`, next to the pair read back from the same
+/// mapping.
+pub(crate) fn tiler_heap_readback(
+    group_uid: u64,
+    csg_id: u32,
+    cs_id: u32,
+    phase: ReadbackPhase,
+    written: u64,
+    read_start: u64,
+    read_end: u64,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_tiler_heap_readback(
+            group_uid,
+            csg_id,
+            cs_id,
+            phase as u32,
+            written,
+            read_start,
+            read_end,
         )
     }
 }
