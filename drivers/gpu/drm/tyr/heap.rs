@@ -39,6 +39,12 @@ use crate::{
 const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
 
+/// Chunk headers an event-driven dump reads per heap. The chunk BOs are
+/// write-combine mapped on a non-coherent device, so an uncapped chain
+/// walk would cost hundreds of microseconds of uncached reads on the
+/// tiler-OOM answer path.
+const EVENT_DUMP_MAX_CHUNKS: usize = 4;
+
 #[repr(C)]
 pub(crate) struct ChunkHeader {
     // Written to GPU-visible memory through `write`; never read back.
@@ -560,10 +566,11 @@ impl Pool {
     /// this pool to the `tyr_heap_context_dump` / `tyr_heap_chunk_dump`
     /// tracepoints. Called from the CS_FAULT / CS_FATAL event path in
     /// dma-fence signalling context and from the periodic 1Hz heap-dump
-    /// worker (which passes `cs_id = 0`). The dump only runs while a
-    /// heap-dump tracepoint is enabled; it is disabled by default and is
-    /// enabled at runtime with `echo 1 > .../tyr_heap_chunk_dump/enable`.
-    /// When enabled, the walk:
+    /// worker (which passes `cs_id = 0`). A `Some(trigger)` caller gets
+    /// the event-driven tracepoints instead, narrowed to the heap at
+    /// `heap_gpu_va` if one is given and to `EVENT_DUMP_MAX_CHUNKS`
+    /// headers per heap. The dump only runs while the tracepoints it
+    /// would emit to are enabled. When enabled, the walk:
     ///
     /// * uses `try_lock` on the heap XArray (a spinlock-backed lock)
     ///   and silently skips the dump when the lock is contended;
@@ -573,10 +580,34 @@ impl Pool {
     ///   chain length.
     ///
     /// This is a downstream-only debug aid and never returns an error.
-    pub(crate) fn dump_for_trace(&self, tdev: &TyrDrmDevice, group_id: u64, cs_id: u32) {
-        if !trace::heap_dump_enabled() {
+    pub(crate) fn dump_for_trace(
+        &self,
+        tdev: &TyrDrmDevice,
+        group_id: u64,
+        group_uid: u64,
+        cs_id: u32,
+        heap_gpu_va: Option<u64>,
+        trigger: Option<trace::HeapDumpTrigger>,
+    ) {
+        let enabled = match trigger {
+            Some(_) => trace::heap_event_dump_enabled(),
+            None => trace::heap_dump_enabled(),
+        };
+        if !enabled {
             return;
         }
+
+        let indices = match heap_gpu_va {
+            Some(va) => match self.heap_va_to_index(tdev, va) {
+                Ok(index) => index..index + 1,
+                Err(_) => return,
+            },
+            None => 0..MAX_HEAPS_PER_POOL as usize,
+        };
+        let chunk_limit = match trigger {
+            Some(_) => EVENT_DUMP_MAX_CHUNKS,
+            None => usize::MAX,
+        };
 
         let stride = tdev.gpu_info.heap_context_stride() as usize;
         let Some(ctx_base) = self.gpu_contexts.kernel_va().map(|r| r.start) else {
@@ -591,7 +622,7 @@ impl Pool {
             return;
         };
 
-        for index in 0..MAX_HEAPS_PER_POOL as usize {
+        for index in indices {
             let Some(heap_ctx) = guard.get(index) else {
                 continue;
             };
@@ -615,9 +646,18 @@ impl Pool {
 
             let ctx_va = ctx_base + (index as u64) * (stride as u64);
             let chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
-            trace::heap_context_dump(group_id, cs_id, index as u32, ctx_va, chunk_count, &content);
+            trace::heap_context_dump(
+                trigger,
+                group_id,
+                group_uid,
+                cs_id,
+                index as u32,
+                ctx_va,
+                chunk_count,
+                &content,
+            );
 
-            for (chunk_index, chunk_bo) in heap_ctx.chunks.iter().enumerate() {
+            for (chunk_index, chunk_bo) in heap_ctx.chunks.iter().enumerate().take(chunk_limit) {
                 let chunk_vmap = chunk_bo.vmap();
                 let chunk_size = chunk_vmap.owner().size();
                 if chunk_size < 64 {
@@ -641,7 +681,9 @@ impl Pool {
                 }
 
                 trace::heap_chunk_dump(
+                    trigger,
                     group_id,
+                    group_uid,
                     cs_id,
                     index as u32,
                     chunk_index as u32,

@@ -2018,8 +2018,55 @@ impl Scheduler {
             if seen.iter().any(|p| Arc::ptr_eq(p, &pool)) {
                 continue;
             }
-            pool.dump_for_trace(tdev, group.handle(), 0);
+            pool.dump_for_trace(tdev, group.handle(), group.uid(), 0, None, None);
             let _ = seen.push(pool, GFP_KERNEL);
         }
+    }
+
+    /// Dumps the tiler-heap state of the group bound to `csg_id` through
+    /// the event-driven dump tracepoints. `group_uid` is the identity the
+    /// caller expects on the slot, and a slot recycled since is skipped
+    /// rather than attributed to the caller's event.
+    ///
+    /// Returns without taking a lock while the dump tracepoints are off.
+    /// Otherwise the slot-manager mutex is taken and dropped before the
+    /// pool is resolved, and both the group's `heap_pool` mutex and the
+    /// pool's heap XArray are taken with `try_lock`, so a caller that
+    /// races the tiler-OOM grow path skips the dump instead of waiting
+    /// on it.
+    ///
+    /// Downstream-only debug aid; not for upstream.
+    pub(crate) fn dump_heap_for_csg(
+        tdev: &TyrDrmDevice,
+        csg_id: usize,
+        group_uid: u64,
+        trigger: trace::HeapDumpTrigger,
+    ) {
+        if !trace::heap_event_dump_enabled() {
+            return;
+        }
+
+        let group = {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            match slot_manager.slot_data(csg_id) {
+                Some(data) => data.group().clone(),
+                None => return,
+            }
+        };
+        if group.uid() != group_uid {
+            return;
+        }
+
+        let Some(pool) = group.try_get_heap_pool() else {
+            return;
+        };
+        pool.dump_for_trace(
+            tdev,
+            group.handle(),
+            group_uid,
+            u32::MAX,
+            None,
+            Some(trigger),
+        );
     }
 }
