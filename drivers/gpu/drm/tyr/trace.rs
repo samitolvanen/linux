@@ -1020,11 +1020,15 @@ kernel::declare_trace! {
     unsafe fn tyr_heap_grow_decision(
         group_uid: u64,
         cs_id: u32,
+        heap_gpu_va: u64,
         chunk_count: u32,
         max_chunks: u32,
         renderpasses_in_flight: u32,
         target_in_flight: u32,
         pending_frag_count: u32,
+        vt_start: u32,
+        vt_end: u32,
+        frag_end: u32,
         outcome: u32,
     );
 }
@@ -3094,11 +3098,15 @@ pub(crate) enum HeapGrowOutcome {
 pub(crate) fn heap_grow_decision(
     group_uid: u64,
     cs_id: u32,
+    heap_gpu_va: u64,
     chunk_count: u32,
     max_chunks: u32,
     renderpasses_in_flight: u32,
     target_in_flight: u32,
     pending_frag_count: u32,
+    vt_start: u32,
+    vt_end: u32,
+    frag_end: u32,
     outcome: HeapGrowOutcome,
 ) {
     // SAFETY: Always safe to call.
@@ -3106,11 +3114,15 @@ pub(crate) fn heap_grow_decision(
         tyr_heap_grow_decision(
             group_uid,
             cs_id,
+            heap_gpu_va,
             chunk_count,
             max_chunks,
             renderpasses_in_flight,
             target_in_flight,
             pending_frag_count,
+            vt_start,
+            vt_end,
+            frag_end,
             outcome as u32,
         )
     }
