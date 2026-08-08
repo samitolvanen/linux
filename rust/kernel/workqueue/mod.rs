@@ -388,6 +388,27 @@ unsafe impl Send for OwnedQueue {}
 // is thread safe as documented by the `Sync` implementation for `Queue`.
 unsafe impl Sync for OwnedQueue {}
 
+impl OwnedQueue {
+    /// Flushes this workqueue.
+    ///
+    /// Blocks until every work item that was queued on this queue when the
+    /// call was made has finished executing. Does not prevent new work items
+    /// from being queued while it waits.
+    ///
+    /// The caller must not hold any lock that a queued work item may
+    /// acquire, and must not be inside a dma-fence signalling critical
+    /// section.
+    ///
+    /// This wraps the C `__flush_workqueue` function and may sleep, so it
+    /// must not be called from atomic context.
+    #[inline]
+    pub fn flush(&self) {
+        // SAFETY: By the type invariants, `self.queue` points at a valid
+        // workqueue.
+        unsafe { bindings::__flush_workqueue(self.queue.as_ptr().cast()) }
+    }
+}
+
 impl Deref for OwnedQueue {
     type Target = Queue;
     fn deref(&self) -> &Queue {
