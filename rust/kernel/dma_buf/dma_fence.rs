@@ -1257,6 +1257,14 @@ impl DmaFenceWorkqueue {
         ))
     }
 
+    /// Flushes this workqueue.
+    ///
+    /// See [`OwnedQueue::flush`] for the contract.
+    #[inline]
+    pub fn flush(&self) {
+        self.0.flush()
+    }
+
     /// Enqueues a work item.
     pub fn enqueue<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
     where
