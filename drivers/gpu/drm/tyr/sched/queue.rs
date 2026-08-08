@@ -577,9 +577,10 @@ impl QueueData {
 
     pub(super) fn kick(&self) -> Result {
         let io = self.iomem.try_access().ok_or(EINVAL)?;
-        let doorbell_reg =
-            doorbell_block::DOORBELL::try_at(self.doorbell_id().ok_or(EINVAL)?).ok_or(EINVAL)?;
+        let doorbell_id = self.doorbell_id().ok_or(EINVAL)?;
+        let doorbell_reg = doorbell_block::DOORBELL::try_at(doorbell_id).ok_or(EINVAL)?;
 
+        trace::fw_doorbell_ring(doorbell_id as u32);
         io.try_write(
             doorbell_reg,
             doorbell_block::DOORBELL::zeroed().with_ring(true),
