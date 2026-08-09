@@ -220,6 +220,11 @@ pub(crate) struct AddressSpaceManager {
     /// through `as_start_update`, `as_end_update`, and `as_disable` under the
     /// `as_manager` mutex, so the flag follows whichever VM occupies the slot.
     lock_pending: [bool; MAX_AS],
+
+    /// Whether hardware AS slot N was unprogrammed by the fault
+    /// handler while its slot binding was kept. Cleared when the slot
+    /// is programmed again.
+    faulty: [bool; MAX_AS],
 }
 
 impl AddressSpaceManager {
@@ -246,6 +251,7 @@ impl AddressSpaceManager {
             iomem,
             as_present,
             lock_pending: [false; MAX_AS],
+            faulty: [false; MAX_AS],
         })
     }
 
@@ -354,6 +360,7 @@ impl AddressSpaceManager {
         }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
+        self.faulty[as_nr] = false;
 
         Ok(())
     }
@@ -658,6 +665,14 @@ impl AsSlotManager {
     /// Activates a VM by assigning it to a hardware slot.
     pub(super) fn activate_vm(&mut self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
         if *vm_as_data.as_active_users.access(self) == 0 {
+            // A slot disabled by the fault handler keeps its binding
+            // but not its hardware programming. Evict so activation
+            // programs the hardware again.
+            if let Some(slot) = self.resident_slot(&vm_as_data.as_seat) {
+                if self.faulty[slot as usize] {
+                    self.evict(&vm_as_data.as_seat)?;
+                }
+            }
             self.activate(vm_as_data.into())?;
             vm_as_data.unhandled_fault.store(false, Relaxed);
         }
@@ -690,6 +705,30 @@ impl AsSlotManager {
     pub(super) fn deactivate_vm(&mut self, vm_as_data: &VmAsData) -> Result {
         *vm_as_data.as_active_users.access_mut(self) = 0;
         self.evict(&vm_as_data.as_seat)
+    }
+
+    /// Disables a faulted VM's hardware address space while keeping
+    /// the slot bound to the VM.
+    ///
+    /// The user count is untouched, so the slot cannot be handed to
+    /// another VM while bound groups still name it through their CSG
+    /// JASID. Evicting those groups drops the users, after which the
+    /// slot is reclaimed through the normal idle path.
+    ///
+    /// A no-op if the VM is not resident or its slot is already
+    /// marked faulty.
+    pub(super) fn disable_vm(&mut self, vm_as_data: &VmAsData) -> Result {
+        let Some(slot) = self.resident_slot(&vm_as_data.as_seat) else {
+            return Ok(());
+        };
+        let slot = slot as usize;
+        if self.faulty[slot] {
+            return Ok(());
+        }
+        // Set the flag before disabling, so a disable that fails on a
+        // wedged address space is not retried on every repeat fault.
+        self.faulty[slot] = true;
+        self.as_disable(slot)
     }
 
     /// Returns the AS slot index the VM is currently assigned to, or `None`
