@@ -287,7 +287,10 @@ impl<'drm> GlobalInterface<'drm> {
         inner.group_suspend_buf_sizes()
     }
 
-    pub(super) fn process_global_irq(&self) -> Result {
+    /// Acknowledges pending global interface events.
+    ///
+    /// Returns whether an idle event was pending.
+    pub(super) fn process_global_irq(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
         inner.process_global_irq()
     }
@@ -702,10 +705,10 @@ impl InnerGlobalInterface {
         Ok(())
     }
 
-    fn process_global_irq(&mut self) -> Result {
+    fn process_global_irq(&mut self) -> Result<bool> {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
-            GlobalInterfaceState::Disabled => return Ok(()),
+            GlobalInterfaceState::Disabled => return Ok(false),
         };
 
         let request_field = GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
@@ -718,7 +721,7 @@ impl InnerGlobalInterface {
             request_field.sync_requests_with_ack(idle_mask)?;
         }
 
-        Ok(())
+        Ok(pending_idle)
     }
 
     fn csg_slot_count(&self) -> Result<u32> {
