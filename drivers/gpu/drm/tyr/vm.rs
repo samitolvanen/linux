@@ -128,17 +128,20 @@ impl Pool {
         requested_user_va_range: u64,
     ) -> Result<(usize, u64)> {
         let user_va_range = normalize_user_va_range(&tdev.gpu_info, requested_user_va_range);
+        let kernel_range = kernel_va_window(&tdev.gpu_info, user_va_range)?;
+        let user_va_limit = kernel_range.start;
+
         let vm = Vm::new_for_user(
             &tdev.pdev,
             tdev,
             tdev.mmu.as_arc_borrow(),
             &tdev.gpu_info,
-            user_va_range,
+            kernel_range,
         )?;
 
         let index = self.entries.insert(vm)?;
 
-        Ok((index, user_va_range))
+        Ok((index, user_va_limit))
     }
 
     pub(crate) fn create_vm(
@@ -204,7 +207,7 @@ impl Pool {
     }
 }
 
-/// 256M of every VM is reserved for kernel objects by default.
+/// Minimum VA space every VM leaves for kernel objects.
 const MIN_KERNEL_VA_SIZE: u64 = 0x10000000;
 
 impl_flags!(
@@ -720,6 +723,19 @@ pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64
     }
 }
 
+/// The kernel window at the top of the VA space, given the user range.
+///
+/// The window is the largest power of two that fits in the space remaining after
+/// the user range. The address space is itself a power of two, so the window
+/// base is aligned to the window size.
+fn kernel_va_window(gpu_info: &GpuInfo, user_va_range: u64) -> Result<Range<u64>> {
+    let full_va_range = max_va_range(gpu_info);
+    let leftover = full_va_range - user_va_range;
+    let kernel_va_range = 1u64 << leftover.checked_ilog2().ok_or(EINVAL)?;
+
+    Ok((full_va_range - kernel_va_range)..full_va_range)
+}
+
 /// GPU virtual address space.
 ///
 /// Each VM can be mapped into a hardware address space slot.
@@ -929,17 +945,9 @@ impl Vm {
         ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
-        user_va_range: u64,
+        kernel_range: Range<u64>,
     ) -> Result<Arc<Vm>> {
-        let user_va_range = normalize_user_va_range(gpu_info, user_va_range);
-
-        let total_va_end = if user_va_range >= max_va_range(gpu_info) {
-            max_va_range(gpu_info)
-        } else {
-            user_va_range + MIN_KERNEL_VA_SIZE
-        };
-        let total_range = 0..total_va_end;
-        let kernel_range = (total_va_end - MIN_KERNEL_VA_SIZE)..total_va_end;
+        let total_range = 0..max_va_range(gpu_info);
 
         Self::new_with_ranges(
             pdev,
