@@ -405,7 +405,10 @@ impl Firmware {
         self.irq_state.clone()
     }
 
-    pub(super) fn process_global_irq(&self) -> Result {
+    /// Acknowledges pending global interface events.
+    ///
+    /// Returns whether an idle event was pending.
+    pub(super) fn process_global_irq(&self) -> Result<bool> {
         self.global_iface.process_global_irq()
     }
 
