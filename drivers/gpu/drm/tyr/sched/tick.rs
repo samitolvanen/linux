@@ -21,6 +21,8 @@ use kernel::{
         Arc, //
     },
     time::{
+        jiffies64,
+        msecs_to_jiffies,
         Delta,
         Instant,
         Monotonic, //
@@ -122,11 +124,13 @@ macro_rules! build_scheduling_rules {
 /// scheduler mutex held but with `csg_slot_manager` dropped. See
 /// `Scheduler::apply_csg_updates` for the lock contract.
 ///
-/// If a slot shortage left some groups unbound, re-arms the tick so the
-/// scheduler retries once a slot becomes free. A tick that runs and fails
-/// re-arms too. Without that, `resched_target` would stay armed with
-/// nothing queued behind it. Otherwise the tick stays idle until something
-/// requests it via `Scheduler::request_tick`.
+/// Re-arms the tick while any software priority level holds more than
+/// one selected non-idle group, so groups sharing a level keep
+/// rotating. It also re-arms while every slot holds a non-idle group
+/// and a runnable group waits. A tick that runs and fails re-arms too.
+/// Without that, `resched_target` would stay armed with nothing queued
+/// behind it. Otherwise the tick stays idle until something requests it
+/// via `Scheduler::request_tick`.
 pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result {
     // Stack-allocated array for groups evicted during this tick that
     // need terminal cleanup (`!can_run()`). Sized to handle every
@@ -318,8 +322,8 @@ pub(crate) struct SchedulingDecision {
     pub(crate) num_pending: usize,
     /// Total number of groups (kept + pending) selected for execution.
     pub(crate) num_selected: usize,
-    /// The lowest priority among all selected groups.
-    pub(crate) min_priority: Priority,
+    /// Number of non-idle groups selected per software priority.
+    nonidle_group_counts: [usize; Priority::num_priorities()],
     /// Records the exact order in which groups were selected.
     pub(crate) selections: [Option<SelectedGroup>; MAX_CSGS],
 }
@@ -341,7 +345,7 @@ impl SchedulingDecision {
             pending_groups: [const { None }; MAX_CSGS],
             num_selected: 0,
             num_pending: 0,
-            min_priority: Priority::RealTime,
+            nonidle_group_counts: [0; Priority::num_priorities()],
             selections: [const { None }; MAX_CSGS],
         };
 
@@ -457,12 +461,9 @@ impl SchedulingDecision {
 
             if !is_idle {
                 self.all_idle = false;
+                self.nonidle_group_counts[priority as usize] += 1;
             } else {
                 self.idle_group_count += 1;
-            }
-
-            if (self.min_priority as u8) > (priority as u8) {
-                self.min_priority = priority;
             }
         }
     }
@@ -545,12 +546,9 @@ impl SchedulingDecision {
 
             if !is_idle {
                 self.all_idle = false;
+                self.nonidle_group_counts[priority as usize] += 1;
             } else {
                 self.idle_group_count += 1;
-            }
-
-            if (self.min_priority as u8) > (priority as u8) {
-                self.min_priority = priority;
             }
         }
     }
@@ -589,11 +587,9 @@ impl SchedulingDecision {
         if count > 0 {
             if !is_idle {
                 self.all_idle = false;
+                self.nonidle_group_counts[priority as usize] += count;
             } else {
                 self.idle_group_count += count;
-            }
-            if (self.min_priority as u8) > (priority as u8) {
-                self.min_priority = priority;
             }
             for i in 0..count {
                 self.selections[self.num_selected + i] =
@@ -604,6 +600,12 @@ impl SchedulingDecision {
         self.num_selected += count;
 
         Ok(())
+    }
+
+    /// Returns whether more than one non-idle group was selected at
+    /// the same software priority.
+    fn needs_resched(&self) -> bool {
+        self.nonidle_group_counts.iter().any(|&count| count > 1)
     }
 }
 
@@ -634,7 +636,9 @@ impl<'a> Tick<'a> {
             .sync_group_states(tdev, fw)
             .inspect_err(|_| dev_err!(tdev.as_ref(), "sync_group_states failed\n"))?;
 
-        let full_tick = self.sched.last_tick.elapsed().as_millis() >= i64::from(TICK_PERIOD_MS);
+        let now = jiffies64();
+        let full_tick = now.wrapping_sub(self.sched.last_full_tick_jiffies)
+            >= msecs_to_jiffies(TICK_PERIOD_MS) as u64;
 
         let rules = build_scheduling_rules! {
             // Idle groups are processed identically in both normal and
@@ -677,7 +681,13 @@ impl<'a> Tick<'a> {
         };
 
         let mut decision = SchedulingDecision::evaluate_rules(tdev, self.sched, rules, full_tick)?;
-        self.apply(tdev, fw, &mut decision)
+        self.apply(tdev, fw, &mut decision)?;
+
+        if full_tick {
+            self.sched.last_full_tick_jiffies = now;
+        }
+
+        Ok(())
     }
 
     /// Suspends and unbinds groups not marked to be kept.
@@ -929,13 +939,10 @@ impl<'a> Tick<'a> {
         self.sched.used_csg_slot_count = decision.num_selected as u32;
         self.sched.might_have_idle_groups = decision.idle_group_count > 0;
 
-        // We only need to time-slice (reschedule periodically) if
-        // there is actual contention for the hardware.
-        let is_full = decision.num_selected == self.sched.csg_slot_count as usize;
-        let has_runnable_groups_waiting_for_slot =
-            !self.sched.runnable_groups[decision.min_priority as usize].is_empty();
+        let all_slots_busy = decision.num_selected == self.sched.csg_slot_count as usize
+            && decision.idle_group_count == 0;
 
-        if is_full && decision.idle_group_count == 0 && has_runnable_groups_waiting_for_slot {
+        if decision.needs_resched() || (all_slots_busy && self.sched.has_runnable_groups()) {
             let period = Delta::from_millis(i64::from(TICK_PERIOD_MS));
             self.sched.resched_target = Some(self.sched.last_tick + period);
             Scheduler::request_tick(tdev);

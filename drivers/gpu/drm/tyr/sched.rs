@@ -14,6 +14,7 @@ use kernel::{
         Arc, //
     },
     time::{
+        jiffies64,
         msecs_to_jiffies,
         Delta,
         Instant,
@@ -308,6 +309,10 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) resched_target: Option<Instant<Monotonic>>,
     /// When the last tick occurred.
     pub(in crate::sched) last_tick: Instant<Monotonic>,
+    /// When the last full tick occurred, measured in the same jiffies
+    /// clock the periodic tick is armed in. Only a full tick writes
+    /// it, so event ticks cannot push the next one out.
+    pub(in crate::sched) last_full_tick_jiffies: u64,
 }
 
 /// The tick to schedule after marking a group runnable.
@@ -363,9 +368,15 @@ impl Scheduler {
                 might_have_idle_groups: false,
                 resched_target: None,
                 last_tick: Instant::<Monotonic>::now(),
+                last_full_tick_jiffies: jiffies64(),
             },
             csif,
         ))
+    }
+
+    /// Returns whether any priority band has runnable groups queued.
+    pub(crate) fn has_runnable_groups(&self) -> bool {
+        self.runnable_groups.iter().any(|list| !list.is_empty())
     }
 
     /// Removes `group` from the list named by `list_state`.
