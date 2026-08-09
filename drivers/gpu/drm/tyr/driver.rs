@@ -120,8 +120,6 @@ pub(crate) mod work_id {
     pub(crate) const SYNC_UPD: u64 = 3;
     /// Periodic re-arming of the scheduler tick.
     pub(crate) const PERIODIC_TICK: u64 = 4;
-    /// Tiler heap out-of-memory growth worker.
-    pub(crate) const TILER_OOM: u64 = 5;
 }
 
 /// `Send + Sync` newtype around `OwnedQueue` so the cleanup
@@ -267,9 +265,6 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     periodic_tick_work: DelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }>,
 
-    #[pin]
-    pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
-
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -397,15 +392,14 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             return;
         }
 
-        let queued_tiler_oom = tdev
+        let _ = tdev
             .with_locked_scheduler(|sched| sched.process_csg_irqs(events, tdev))
             .inspect_err(|err| {
                 pr_err!(
                     "fw_events_work: failed to process firmware CSG IRQs: {:?}\n",
                     err
                 );
-            })
-            .unwrap_or(false);
+            });
 
         // A CSG IRQ that the firmware raised for any of the slots we
         // own is by definition an observable state change from the
@@ -414,11 +408,6 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
         // tiler heap. Arm the periodic tick so it re-evaluates
         // residency and applies any pending state transitions.
         crate::sched::Scheduler::request_tick(&this);
-
-        if queued_tiler_oom {
-            let _ = kernel::workqueue::system()
-                .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this);
-        }
     }
 }
 
@@ -612,7 +601,6 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
-                tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
                 devfreq_data,
                 opp_config <- new_mutex!(None),
         });
