@@ -235,6 +235,9 @@ pub(crate) struct Group {
     /// * The tick and `term_work` paths drain any in-flight
     ///   `Arc<Group>` references they still hold to completion before
     ///   the file's last reference is released.
+    /// * Platform unbind flushes `heap_alloc_wq` after quiescing the
+    ///   workers that enqueue on it, so no queued `tiler_oom_work`
+    ///   holds an `Arc<Group>` past unbind.
     ///
     /// By the time the device's final `ARef`
     /// drops on driver detach or last file close, every `Arc<Group>`
@@ -267,7 +270,8 @@ pub(crate) struct Group {
     /// satisfying the dma-fence signalling-section rules.
     #[pin]
     term_work: Work<Group, 1>,
-    /// Worker that services this group's pending tiler OOMs.
+    /// Worker that services this group's pending tiler OOMs on the
+    /// device's `heap_alloc_wq`.
     #[pin]
     tiler_oom_work: Work<Group, 2>,
     #[pin]
@@ -558,7 +562,10 @@ impl Group {
     /// The queued work holds an `Arc<Group>` reference until the worker
     /// runs.
     pub(crate) fn schedule_tiler_oom(self: &Arc<Self>) {
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 2>(self.clone());
+        let _ = self
+            .tdev
+            .heap_alloc_wq
+            .enqueue::<Arc<Self>, 2>(self.clone());
     }
 
     /// Parks every queue in the group.
