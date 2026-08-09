@@ -53,10 +53,10 @@ impl RangeAlloc {
             return Err(EINVAL);
         }
 
+        // The tree indexes the window with a `usize`, so on 32-bit a wider
+        // window is managed up to that limit and the rest goes unused.
         #[cfg(target_pointer_width = "32")]
-        if end - start > u32::MAX as u64 {
-            return Err(EINVAL);
-        }
+        let end = end.min(start.saturating_add(u64::from(u32::MAX)));
 
         let inner = Arc::pin_init(
             try_pin_init!(RangeAllocInner {
