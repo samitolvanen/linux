@@ -257,6 +257,9 @@ pub(crate) struct Group {
     /// satisfying the dma-fence signalling-section rules.
     #[pin]
     term_work: Work<Group, 1>,
+    /// Worker that services this group's pending tiler OOMs.
+    #[pin]
+    tiler_oom_work: Work<Group, 2>,
     #[pin]
     pub(crate) links: ListLinks,
     #[pin]
@@ -420,6 +423,7 @@ impl Group {
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
                 term_work <- new_work!("tyr-group-term"),
+                tiler_oom_work <- new_work!("tyr-group-tiler-oom"),
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
                 wait_links <- ListLinks::new(),
@@ -537,6 +541,14 @@ impl Group {
             return;
         }
         let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 1>(self.clone());
+    }
+
+    /// Schedules the group's tiler OOM worker. Safe from any context.
+    ///
+    /// The queued work holds an `Arc<Group>` reference until the worker
+    /// runs.
+    pub(crate) fn schedule_tiler_oom(self: &Arc<Self>) {
+        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 2>(self.clone());
     }
 
     /// Cancels every queue in the group with `err`.
@@ -760,6 +772,9 @@ impl Group {
 impl_has_work! {
     impl HasWork<Group, 1> for Group {
         self.term_work
+    }
+    impl HasWork<Group, 2> for Group {
+        self.tiler_oom_work
     }
 }
 
