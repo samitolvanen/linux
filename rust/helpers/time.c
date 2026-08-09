@@ -2,12 +2,18 @@
 
 #include <clocksource/arm_arch_timer.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
 
 __rust_helper void rust_helper_fsleep(unsigned long usecs)
 {
 	fsleep(usecs);
+}
+
+__rust_helper u64 rust_helper_get_jiffies_64(void)
+{
+	return get_jiffies_64();
 }
 
 __rust_helper ktime_t rust_helper_ktime_get_real(void)
