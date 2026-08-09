@@ -122,13 +122,14 @@ impl TyrIrqTrait for MmuIrq {
             if fault_bits & (1u32 << as_idx) == 0 {
                 continue;
             }
-            // Must clone: slot_data borrows as_manager, and deactivate_vm takes &mut self.
+            // Clone so the slot_data borrow of as_manager ends before
+            // disable_vm takes &mut self.
             let Some(vm_as_data) = as_manager.slot_data(as_idx).cloned() else {
                 continue;
             };
             vm_as_data.unhandled_fault.store(true, Ordering::Relaxed);
-            if let Err(e) = as_manager.deactivate_vm(&vm_as_data) {
-                pr_err!("mmu_irq: deactivate_vm({}) failed: {:?}\n", as_idx, e);
+            if let Err(e) = as_manager.disable_vm(&vm_as_data) {
+                pr_err!("mmu_irq: disable_vm({}) failed: {:?}\n", as_idx, e);
             }
         }
         drop(as_manager);
