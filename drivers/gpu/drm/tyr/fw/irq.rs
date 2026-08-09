@@ -176,9 +176,20 @@ impl TyrIrqTrait for JobIrq<'_> {
         self.state.handle(status);
 
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
-            let _ = self.global_iface.process_global_irq().inspect_err(|err| {
-                pr_err!("Failed to process firmware global IRQ: {:?}\n", err);
-            });
+            match self.global_iface.process_global_irq() {
+                Ok(pending_idle) => {
+                    if pending_idle {
+                        TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+                    }
+                }
+                Err(err) => {
+                    dev_err!(
+                        tdev.as_ref(),
+                        "Failed to process firmware global IRQ: {:?}\n",
+                        err
+                    );
+                }
+            }
         }
 
         // Defer to sleepable context via fw_events_work.
