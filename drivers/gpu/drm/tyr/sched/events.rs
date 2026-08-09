@@ -78,6 +78,18 @@ impl WorkItem<2> for Group {
     fn run(this: Self::Pointer) {
         let tdev = &this.tdev;
 
+        // Growing a heap reads the firmware interface and rings a doorbell,
+        // so skip while the device is down or a transition is in flight.
+        let Some(_active) = tdev.pm_get_if_active() else {
+            return;
+        };
+
+        // Suspend and reset both evict every slot, and eviction clears the
+        // pending request, so a skipped run leaves nothing behind.
+        if tdev.reset.in_progress() {
+            return;
+        }
+
         let pending = Scheduler::collect_pending_tiler_ooms(tdev, &this);
 
         let mut pending = match pending {
