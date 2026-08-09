@@ -24,10 +24,7 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
-        atomic::{
-            Atomic,
-            Relaxed, //
-        },
+        atomic::Atomic,
         Arc,
         LockedBy,
         Mutex, //
@@ -89,6 +86,8 @@ pub(crate) mod work_id {
     pub(crate) const TERM: u64 = 1;
     /// Final release worker on the cleanup workqueue.
     pub(crate) const RELEASE: u64 = 2;
+    /// Tiler heap out-of-memory growth worker.
+    pub(crate) const TILER_OOM: u64 = 3;
 }
 
 /// Upper bound on queues per group, set by the width of the per-queue
@@ -238,6 +237,7 @@ pub(crate) struct Group {
     /// signalling sections and must not cover a userspace copy.
     #[pin]
     submit_lock: Mutex<()>,
+    /// Pending TILER_OOM events, one bit per command stream.
     pub(crate) tiler_oom: Atomic<u32>,
     /// Number of consecutive ticks the group has remained bound to a
     /// hardware slot. Reset to zero when the group is bound and
@@ -298,6 +298,9 @@ pub(crate) struct Group {
     /// `cleanup::try_spawn_owned`.
     #[pin]
     release_work: Work<Group, { work_id::RELEASE }>,
+    /// Worker that services this group's pending tiler OOMs.
+    #[pin]
+    tiler_oom_work: Work<Group, { work_id::TILER_OOM }>,
     #[pin]
     pub(crate) links: ListLinks,
     #[pin]
@@ -454,6 +457,7 @@ impl Group {
                 queues,
                 term_work <- new_dma_fence_work!("tyr-group-term"),
                 release_work <- new_work!("tyr-group-release"),
+                tiler_oom_work <- new_work!("tyr-group-tiler-oom"),
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
                 wait_links <- ListLinks::new(),
@@ -596,6 +600,22 @@ impl Group {
             "Failed to enqueue group release_work, leaking the group\n"
         );
         core::mem::forget(group);
+    }
+
+    /// Schedules the group's tiler OOM worker. Safe from any context.
+    ///
+    /// The queued work holds an `Arc<Group>` reference until the worker
+    /// runs.
+    pub(crate) fn schedule_tiler_oom(self: &Arc<Self>) {
+        let Some(guard) = self.tdev.registration_guard() else {
+            return;
+        };
+
+        guard.registration_data_with(|reg_data| {
+            let _ = reg_data
+                .heap_wq
+                .enqueue::<Arc<Self>, { work_id::TILER_OOM }>(self.clone());
+        });
     }
 
     /// Cancels every queue in the group with `err`.
@@ -753,17 +773,6 @@ impl Group {
         syncs::SyncObj64b::write(&self.syncobjs, self.syncobj_offset(queue_index)?, value)
     }
 
-    /// Records a pending TILER_OOM event for the command stream at `cs_id`.
-    ///
-    /// The kernel atomics have no fetch_or, so the bit is merged with a compare-exchange loop.
-    pub(crate) fn set_tiler_oom(&self, cs_id: u32) {
-        let mut old = self.tiler_oom.load(Relaxed);
-
-        while let Err(current) = self.tiler_oom.cmpxchg(old, old | (1u32 << cs_id), Relaxed) {
-            old = current;
-        }
-    }
-
     pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
         *self.heap_pool.lock() = Some(pool);
     }
@@ -827,6 +836,9 @@ impl_has_dma_fence_work! {
 impl_has_work! {
     impl HasWork<Group, { work_id::RELEASE }> for Group {
         self.release_work
+    }
+    impl HasWork<Group, { work_id::TILER_OOM }> for Group {
+        self.tiler_oom_work
     }
 }
 

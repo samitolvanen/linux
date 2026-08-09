@@ -141,8 +141,6 @@ pub(crate) mod work_id {
     pub(crate) const SYNC_UPD: u64 = 3;
     /// Periodic re-arming of the scheduler tick.
     pub(crate) const PERIODIC_TICK: u64 = 4;
-    /// Tiler heap out-of-memory growth worker.
-    pub(crate) const TILER_OOM: u64 = 5;
 }
 
 /// Data owned by the DRM device.
@@ -226,10 +224,6 @@ pub(crate) struct TyrDrmDeviceData {
     /// so a long-delay timer expiry does not hold a scheduler worker.
     #[pin]
     periodic_tick_work: DelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }>,
-
-    /// Deferred tiler heap growth for CS TILER_OOM events.
-    #[pin]
-    pub(crate) tiler_oom_work: Work<TyrDrmDevice, { work_id::TILER_OOM }>,
 
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
@@ -366,7 +360,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
         };
 
         guard.registration_data_with(|reg_data| {
-            let queued_tiler_oom = tdev
+            let _ = tdev
                 .with_locked_scheduler(|sched| sched.process_csg_irqs(tdev, &reg_data.fw, events))
                 .inspect_err(|err| {
                     dev_err!(
@@ -374,14 +368,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
                         "fw_events_work: failed to process firmware CSG IRQs: {:?}\n",
                         err
                     );
-                })
-                .unwrap_or(false);
-
-            if queued_tiler_oom {
-                let _ = reg_data
-                    .heap_wq
-                    .enqueue::<ARef<TyrDrmDevice>, { work_id::TILER_OOM }>(this.clone());
-            }
+                });
         });
 
         // A CSG IRQ means firmware state changed on a slot we own. A
@@ -611,7 +598,6 @@ impl platform::Driver for TyrPlatformDriver {
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
-                tiler_oom_work <- kernel::new_work!("TyrDrmDeviceData::tiler_oom_work"),
                 devfreq_data,
                 opp_config <- new_mutex!(None),
             }? Error),

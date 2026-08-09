@@ -3,7 +3,7 @@
 //! Firmware event handling for the scheduler.
 //!
 //! CSG interrupts are decoded in the threaded job IRQ handler. The work they
-//! schedule runs from a device work item, where allocating tiler heap chunks
+//! schedule runs from per-group work items, where allocating tiler heap chunks
 //! is allowed to sleep.
 
 use kernel::{
@@ -20,7 +20,6 @@ use kernel::{
 use crate::{
     driver::{
         parent_dev,
-        work_id,
         TyrDrmDevice,
         TyrDrmDeviceData,
         TyrDrmRegistrationData, //
@@ -36,20 +35,25 @@ use crate::{
 };
 
 use super::{
-    group::Group,
+    group::{
+        work_id,
+        Group,
+        MAX_CS_PER_GROUP, //
+    },
     CsgSlotManager,
     Scheduler, //
 };
 
 struct PendingOom {
-    group: Arc<Group>,
     csg_id: usize,
     cs_id: u32,
-    saved_tiler_oom_ack: bool,
     heap_address: u64,
     vt_start: u32,
     vt_end: u32,
     frag_end: u32,
+    /// Grow-phase result, overwritten for every entry before the
+    /// firmware-write phase reads it.
+    outcome: GrowOutcome,
 }
 
 /// Result of growing a heap for a pending tiler OOM, carried from the grow
@@ -66,10 +70,6 @@ enum GrowOutcome {
     Fatal,
 }
 
-kernel::impl_has_work! {
-    impl HasWork<TyrDrmDevice, { work_id::TILER_OOM }> for TyrDrmDeviceData { self.tiler_oom_work }
-}
-
 fn slot_holds(slot_manager: &CsgSlotManager, csg_id: usize, group: &Arc<Group>) -> bool {
     matches!(
         slot_manager.slot_data(csg_id),
@@ -77,20 +77,20 @@ fn slot_holds(slot_manager: &CsgSlotManager, csg_id: usize, group: &Arc<Group>) 
     )
 }
 
-impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
-    type Pointer = ARef<TyrDrmDevice>;
+impl WorkItem<{ work_id::TILER_OOM }> for Group {
+    type Pointer = Arc<Group>;
 
     fn run(this: Self::Pointer) {
-        let tdev = &*this;
+        let tdev = &this.tdev;
 
         let Some(guard) = tdev.registration_guard() else {
             return;
         };
 
         guard.registration_data_with(|reg_data| {
-            let pending = Scheduler::collect_pending_tiler_ooms(tdev, &reg_data.fw);
+            let pending = Scheduler::collect_pending_tiler_ooms(tdev, &reg_data.fw, &this);
 
-            let pending = match pending {
+            let mut pending = match pending {
                 Ok(pending) => pending,
                 Err(err) => {
                     dev_err!(
@@ -102,8 +102,11 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
                 }
             };
 
-            let mut outcomes = KVec::new();
-            for oom in pending.iter() {
+            if pending.is_empty() {
+                return;
+            }
+
+            for oom in pending.iter_mut() {
                 let grow_result = if oom.frag_end > oom.vt_end || oom.vt_end >= oom.vt_start {
                     dev_err!(
                         tdev.as_ref(),
@@ -116,7 +119,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
                     );
                     Err(EINVAL)
                 } else {
-                    oom.group.get_heap_pool().ok_or(EINVAL).and_then(|pool| {
+                    this.get_heap_pool().ok_or(EINVAL).and_then(|pool| {
                         pool.grow_heap_context(
                             tdev,
                             reg_data,
@@ -129,29 +132,20 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
                     })
                 };
 
-                let outcome = match grow_result {
+                oom.outcome = match grow_result {
                     Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
                     Err(e) if e == ENOMEM => GrowOutcome::Reclaim,
                     Err(_) => {
-                        oom.group
-                            .with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id as usize));
-                        TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+                        this.with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id as usize));
+                        TyrDrmDeviceData::schedule_tick(tdev);
                         GrowOutcome::Fatal
                     }
                 };
-
-                if outcomes.push(outcome, GFP_KERNEL).is_err() {
-                    dev_err!(
-                        tdev.as_ref(),
-                        "tiler_oom_work: failed to store grow outcome\n"
-                    );
-                    return;
-                }
             }
 
             let _ = tdev
                 .with_locked_scheduler(|sched| {
-                    sched.finish_pending_tiler_ooms(tdev, reg_data, &pending, &outcomes)
+                    sched.finish_pending_tiler_ooms(tdev, reg_data, &this, &pending)
                 })
                 .inspect_err(|err| {
                     dev_err!(
@@ -170,18 +164,16 @@ impl Scheduler {
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         mut events: u32,
-    ) -> Result<bool> {
-        let mut queued_tiler_oom = false;
-
+    ) -> Result {
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            queued_tiler_oom |= self.process_csg_irq(tdev, fw, csg_id)?;
+            self.process_csg_irq(tdev, fw, csg_id)?;
             events &= !mask;
         }
 
-        Ok(queued_tiler_oom)
+        Ok(())
     }
 
     pub(super) fn process_csg_irq(
@@ -189,14 +181,14 @@ impl Scheduler {
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         csg_id: usize,
-    ) -> Result<bool> {
+    ) -> Result {
         // The lock order documented on `Scheduler` allows holding the
         // slot lock across the firmware reads below.
         let group = {
             let slot_manager = tdev.csg_slot_manager.lock();
             match slot_manager.slot_data(csg_id) {
                 Some(data) => data.group.clone(),
-                None => return Ok(false),
+                None => return Ok(()),
             }
         };
 
@@ -241,7 +233,7 @@ impl Scheduler {
             TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
-        let mut queued_tiler_oom = false;
+        let mut tiler_oom_mask: u32 = 0;
         let mut cs_fatal_mask: u32 = 0;
         let mut cs_inherit_fault_mask: u32 = 0;
         fw.with_csg_mut(csg_id, |csg| {
@@ -268,8 +260,7 @@ impl Scheduler {
                 let output_ack = cs.read_output_ack()?;
 
                 if input_req.tiler_oom() != output_ack.tiler_oom() {
-                    group.set_tiler_oom(cs_id);
-                    queued_tiler_oom = true;
+                    tiler_oom_mask |= 1u32 << cs_id;
                 }
 
                 let fatal_event = input_req.fatal() != output_ack.fatal();
@@ -297,6 +288,17 @@ impl Scheduler {
 
             Ok(())
         })?;
+
+        if tiler_oom_mask != 0 {
+            // The kernel atomics have no fetch_or.
+            let tiler_oom = &group.tiler_oom;
+            let mut old = tiler_oom.load(Relaxed);
+            while let Err(current) = tiler_oom.cmpxchg(old, old | tiler_oom_mask, Relaxed) {
+                old = current;
+            }
+
+            group.schedule_tiler_oom();
+        }
 
         if cs_fatal_mask != 0 {
             group.with_locked_inner(|inner| {
@@ -327,86 +329,66 @@ impl Scheduler {
         mask.insert(csg_id);
         fw.ring_csg_doorbells(mask)?;
 
-        Ok(queued_tiler_oom)
+        Ok(())
     }
 
+    /// Takes the pending tiler OOM mask and reads the heap counters of
+    /// every CS it names.
+    ///
+    /// Must be called *outside* `TyrDrmDeviceData::with_locked_scheduler`.
+    /// This takes the scheduler mutex itself and holds it across the mask
+    /// swap and the counter reads, so a tick cannot be partway through a
+    /// firmware sequence on the group's slot.
     fn collect_pending_tiler_ooms(
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
+        group: &Group,
     ) -> Result<KVec<PendingOom>> {
-        let mut pending = KVec::new();
+        // Reserve before taking the mask so an allocation failure leaves
+        // the pending bits in place for a later requeue.
+        let mut pending = KVec::with_capacity(MAX_CS_PER_GROUP, GFP_KERNEL)?;
 
-        // Snapshot the (group, oom_mask) pairs that have a pending
-        // tiler-OOM bit set. The snapshot is a fixed-capacity array, so
-        // this pass stays allocation-free under the lock.
-        let mut to_visit: [Option<(Arc<Group>, u32)>; super::MAX_CSGS] =
-            [const { None }; super::MAX_CSGS];
-        {
-            let slot_manager = tdev.csg_slot_manager.lock();
-            for (csg_id, slot) in to_visit.iter_mut().enumerate() {
-                let data = match slot_manager.slot_data(csg_id) {
-                    Some(data) => data,
-                    None => continue,
-                };
+        tdev.with_locked_scheduler(|_| {
+            let mut oom_mask = group.tiler_oom.xchg(0, Relaxed);
+            while oom_mask != 0 {
+                let cs_id = oom_mask.trailing_zeros();
+                oom_mask &= !(1u32 << cs_id);
 
-                let oom_mask = data.group.tiler_oom.xchg(0, Relaxed);
-                if oom_mask == 0 {
-                    continue;
-                }
-
-                *slot = Some((data.group.clone(), oom_mask));
-            }
-        }
-
-        for (csg_id, entry) in to_visit.into_iter().enumerate() {
-            let Some((group, oom_mask)) = entry else {
-                continue;
-            };
-            for cs_id in 0u32..32 {
-                if oom_mask & (1u32 << cs_id) == 0 {
-                    continue;
-                }
-
-                // The counters are indexed by slot, so confirm the occupant and
-                // read under one acquisition. A gone group makes the rest of its
-                // mask stale, and the firmware re-raises the event when it runs
-                // again.
-                let (saved_tiler_oom_ack, heap_address, vt_start, vt_end, frag_end) = {
+                // The counters are indexed by slot, so resolve the binding and
+                // read under one acquisition. An unbound group makes the rest
+                // of its mask stale, and the firmware re-raises the event when
+                // the group runs again.
+                let (csg_id, heap_address, vt_start, vt_end, frag_end) = {
                     let slot_manager = tdev.csg_slot_manager.lock();
-                    if !slot_holds(&slot_manager, csg_id, &group) {
+                    let Some(slot) = group.csg_seat.access(&slot_manager).slot() else {
                         break;
-                    }
+                    };
+                    let csg_id = usize::from(slot);
 
-                    fw.with_csg_mut(csg_id, |csg| {
-                        let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
-                        let ack = cs.read_output_ack()?;
-                        let heap = cs.read_heap_output_state()?;
+                    let (heap_address, vt_start, vt_end, frag_end) =
+                        fw.with_csg_mut(csg_id, |csg| {
+                            let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
+                            let heap = cs.read_heap_output_state()?;
 
-                        Ok((
-                            ack.tiler_oom(),
-                            heap.heap_address,
-                            heap.vt_start,
-                            heap.vt_end,
-                            heap.frag_end,
-                        ))
-                    })?
+                            Ok((heap.heap_address, heap.vt_start, heap.vt_end, heap.frag_end))
+                        })?;
+
+                    (csg_id, heap_address, vt_start, vt_end, frag_end)
                 };
 
-                pending.push(
-                    PendingOom {
-                        group: group.clone(),
-                        csg_id,
-                        cs_id,
-                        saved_tiler_oom_ack,
-                        heap_address,
-                        vt_start,
-                        vt_end,
-                        frag_end,
-                    },
-                    GFP_KERNEL,
-                )?;
+                pending.push_within_capacity(PendingOom {
+                    csg_id,
+                    cs_id,
+                    heap_address,
+                    vt_start,
+                    vt_end,
+                    frag_end,
+                    outcome: GrowOutcome::Reclaim,
+                })?;
             }
-        }
+
+            Ok(())
+        })?;
 
         Ok(pending)
     }
@@ -415,11 +397,11 @@ impl Scheduler {
         &mut self,
         tdev: &TyrDrmDevice,
         reg_data: &TyrDrmRegistrationData<'_>,
+        group: &Arc<Group>,
         pending: &KVec<PendingOom>,
-        outcomes: &KVec<GrowOutcome>,
     ) -> Result {
-        for (index, oom) in pending.iter().enumerate() {
-            let (new_chunk_va, cookie) = match outcomes.get(index).ok_or(EINVAL)? {
+        for oom in pending.iter() {
+            let (new_chunk_va, cookie) = match &oom.outcome {
                 GrowOutcome::Grown(va, cookie) => (*va, *cookie),
                 GrowOutcome::Reclaim => (0, 0),
                 GrowOutcome::Fatal => continue,
@@ -429,11 +411,11 @@ impl Scheduler {
             // still owns the slot before writing to its interface.
             let owned = {
                 let slot_manager = tdev.csg_slot_manager.lock();
-                slot_holds(&slot_manager, oom.csg_id, &oom.group)
+                slot_holds(&slot_manager, oom.csg_id, group)
             };
             if !owned {
                 if new_chunk_va != 0 {
-                    if let Some(pool) = oom.group.get_heap_pool() {
+                    if let Some(pool) = group.get_heap_pool() {
                         let _ = pool
                             .return_chunk(reg_data, oom.heap_address, new_chunk_va, cookie)
                             .inspect_err(|e| {
@@ -453,7 +435,8 @@ impl Scheduler {
                     let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
                     cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
 
-                    let req = cs.read_input_req()?.with_tiler_oom(oom.saved_tiler_oom_ack);
+                    let ack = cs.read_output_ack()?.tiler_oom();
+                    let req = cs.read_input_req()?.with_tiler_oom(ack);
                     cs.write_input_req(req);
                 }
 
