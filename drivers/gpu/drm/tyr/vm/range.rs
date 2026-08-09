@@ -12,6 +12,11 @@ use kernel::{
     maple_tree::MapleTreeAlloc,
     new_mutex,
     prelude::*,
+    ptr::{
+        Alignable,
+        Alignment,
+        //
+    },
     sync::{Arc, Mutex},
 };
 
@@ -65,37 +70,17 @@ impl RangeAlloc {
         Ok(Self { inner })
     }
 
-    pub(crate) fn allocate(&self, size: usize, gfp: Flags) -> Result<LiveRange> {
+    /// Reserves `size` bytes at an address aligned to `align`, or at the
+    /// first free address when no wider gap exists.
+    pub(crate) fn allocate(&self, size: usize, align: Alignment, gfp: Flags) -> Result<LiveRange> {
         let _guard = self.inner.lock.lock();
+        let offset = self.inner.alloc_aligned(size, align, gfp)?;
 
-        #[cfg(target_pointer_width = "32")]
-        {
-            let range = &self.inner.range;
-            let total_size = (range.end - range.start) as usize;
-            let offset = self.inner.maple.alloc_range(size, (), 0..total_size, gfp)?;
-
-            Ok(LiveRange {
-                inner: self.inner.clone(),
-                offset: range.start + offset as u64,
-                size,
-            })
-        }
-
-        #[cfg(target_pointer_width = "64")]
-        {
-            let maple_start = self.inner.range.start as usize;
-            let maple_end = self.inner.range.end as usize;
-            let offset = self
-                .inner
-                .maple
-                .alloc_range(size, (), maple_start..maple_end, gfp)?;
-
-            Ok(LiveRange {
-                inner: self.inner.clone(),
-                offset: offset as u64,
-                size,
-            })
-        }
+        Ok(LiveRange {
+            inner: self.inner.clone(),
+            offset,
+            size,
+        })
     }
 
     pub(crate) fn insert(&self, start: u64, end: u64, gfp: Flags) -> Result<LiveRange> {
@@ -124,6 +109,62 @@ impl RangeAlloc {
             offset: start,
             size: (end - start) as usize,
         })
+    }
+}
+
+impl RangeAllocInner {
+    /// The address that tree index zero maps to.
+    fn base(&self) -> u64 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            self.range.start
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            0
+        }
+    }
+
+    /// Reserves `size` bytes, preferring an address aligned to `align`, and
+    /// returns the address.
+    ///
+    /// # Locking
+    ///
+    /// The reservation is built in several tree operations, so the caller
+    /// must hold `lock` across the call.
+    fn alloc_aligned(&self, size: usize, align: Alignment, gfp: Flags) -> Result<u64> {
+        let base = self.base();
+        let window = (self.range.start - base) as usize..(self.range.end - base) as usize;
+        let span = size.checked_add(align.as_usize() - 1).ok_or(EINVAL)?;
+
+        let index = self.maple.alloc_range(size, (), window.clone(), gfp)?;
+        let addr = base + index as u64;
+        if addr.align_down(align) == addr {
+            return Ok(addr);
+        }
+
+        self.maple.erase(index);
+
+        // The span only locates a gap. The aligned block inside it is
+        // reserved.
+        let span_index = match self.maple.alloc_range(span, (), window, gfp) {
+            Ok(span_index) => span_index,
+            Err(_) => {
+                self.maple.insert_range(index..index + size, (), gfp)?;
+                return Ok(addr);
+            }
+        };
+
+        self.maple.erase(span_index);
+
+        let span_addr = base + span_index as u64;
+        let aligned_addr = span_addr.align_up(align).ok_or(EINVAL)?;
+        let aligned_index = span_index + (aligned_addr - span_addr) as usize;
+        self.maple
+            .insert_range(aligned_index..aligned_index + size, (), gfp)?;
+
+        Ok(aligned_addr)
     }
 }
 

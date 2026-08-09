@@ -969,7 +969,13 @@ impl Vm {
     }
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
-        self.kernel_va.allocate(size, GFP_KERNEL)
+        let align = if size >= SZ_2M {
+            Alignment::new::<SZ_2M>()
+        } else {
+            Alignment::new::<SZ_4K>()
+        };
+
+        self.kernel_va.allocate(size, align, GFP_KERNEL)
     }
 
     /// Returns the dummy GEM object whose `dma_resv` anchors this VM.
