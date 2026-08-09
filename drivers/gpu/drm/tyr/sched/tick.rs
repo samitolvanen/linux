@@ -9,6 +9,8 @@
 //! `Scheduler::request_tick`; the periodic re-arm is handled
 //! separately by `periodic_tick_work` on the system unbound workqueue.
 
+use core::sync::atomic::Ordering;
+
 use kernel::{
     list::{
         List,
@@ -320,10 +322,10 @@ impl ParkedGroups {
 
 /// Stops scheduling for a GPU reset.
 ///
-/// New ticks and firmware-event drains bail out while the reset worker
-/// is executing a claimed reset. Flush the in-flight ones, then evict
-/// every resident group through the same machinery as runtime suspend,
-/// including escalating to termination on ack timeout.
+/// The scheduler workers bail out while the reset worker is executing a
+/// claimed reset. Flush the in-flight ones, then evict every resident
+/// group through the same machinery as runtime suspend, including
+/// escalating to termination on ack timeout.
 ///
 /// The eviction leaves every group that can still run on a scheduler
 /// list, so parking the listed groups covers all of them. Groups it
@@ -807,8 +809,9 @@ impl<'a> Tick<'a> {
     }
 
     /// Rings the user doorbell of every resident queue whose ring
-    /// buffer has committed commands. Runs on the first granted tick
-    /// after a failed runtime suspend (see
+    /// buffer has committed commands and requeues the tiler OOM worker
+    /// of every resident group with pending events. Runs on the first
+    /// granted tick after a failed runtime suspend (see
     /// `Scheduler::pending_resident_kick`).
     fn kick_resident_queues(data: &ARef<TyrDrmDevice>) {
         let csg_slot_manager = data.csg_slot_manager.lock();
@@ -816,6 +819,9 @@ impl<'a> Tick<'a> {
             let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                 continue;
             };
+            if slot_data.group.tiler_oom.load(Ordering::Relaxed) != 0 {
+                slot_data.group.schedule_tiler_oom();
+            }
             for queue in slot_data.group.queues.iter() {
                 if queue.is_ringbuf_empty().unwrap_or(true) {
                     continue;
