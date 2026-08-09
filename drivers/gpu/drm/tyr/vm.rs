@@ -63,6 +63,7 @@ use kernel::{
         Alignment, //
     },
     sizes::{
+        SizeConstants,
         SZ_1G,
         SZ_2M,
         SZ_4K, //
@@ -127,7 +128,7 @@ impl Pool {
         tdev: &ARef<TyrDrmDevice>,
         requested_user_va_range: u64,
     ) -> Result<(usize, u64)> {
-        let user_va_range = normalize_user_va_range(&tdev.gpu_info, requested_user_va_range);
+        let user_va_range = normalize_user_va_range(&tdev.gpu_info, requested_user_va_range)?;
         let kernel_range = kernel_va_window(&tdev.gpu_info, user_va_range)?;
         let user_va_limit = kernel_range.start;
 
@@ -209,6 +210,8 @@ impl Pool {
 
 /// Minimum VA space every VM leaves for kernel objects.
 const MIN_KERNEL_VA_SIZE: u64 = 0x10000000;
+
+const SZ_4G: u64 = 4 * u64::SZ_1G;
 
 impl_flags!(
     /// Flags controlling virtual memory mapping behavior.
@@ -713,14 +716,36 @@ fn max_va_range(gpu_info: &GpuInfo) -> u64 {
         .get()
 }
 
-pub(crate) fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> u64 {
-    let max_va_range = max_va_range(gpu_info) - MIN_KERNEL_VA_SIZE;
-
-    if requested == 0 {
-        max_va_range
-    } else {
-        core::cmp::min(requested, max_va_range)
+/// The user VA range of a new VM, derived from the VM_CREATE request.
+///
+/// A request of zero picks a default from the task and GPU address space
+/// sizes, preferring the task size so userspace can map a buffer at the same
+/// address on the CPU and the GPU. Any other value is validated to ensure
+/// sufficient space remains for the kernel window.
+fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> Result<u64> {
+    let full_va_range = max_va_range(gpu_info);
+    if full_va_range <= MIN_KERNEL_VA_SIZE {
+        return Err(EINVAL);
     }
+
+    let max_va_range = full_va_range - MIN_KERNEL_VA_SIZE;
+    if requested != 0 {
+        if requested > max_va_range {
+            return Err(EINVAL);
+        }
+        return Ok(requested);
+    }
+
+    let task_size = current!().task_size() as u64;
+    let default = if task_size < full_va_range {
+        task_size
+    } else if full_va_range > SZ_4G {
+        full_va_range / 2
+    } else {
+        max_va_range
+    };
+
+    Ok(default.min(max_va_range))
 }
 
 /// The kernel window at the top of the VA space, given the user range.
