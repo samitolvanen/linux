@@ -57,6 +57,16 @@ pub fn msecs_to_jiffies(msecs: Msecs) -> Jiffies {
     unsafe { bindings::__msecs_to_jiffies(msecs) }
 }
 
+/// Returns the current value of the 64-bit jiffies counter.
+///
+/// On 32-bit architectures the 64-bit read is not atomic, so
+/// `get_jiffies_64()` samples a sequence counter.
+#[inline]
+pub fn jiffies64() -> u64 {
+    // SAFETY: FFI call without preconditions, valid in any context.
+    unsafe { bindings::get_jiffies_64() }
+}
+
 /// Trait for kernel clock identifiers.
 ///
 /// Selection of the clock depends on the use case. In some cases the usage of a
