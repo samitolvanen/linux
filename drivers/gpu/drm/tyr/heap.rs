@@ -205,6 +205,12 @@ impl Drop for Chunk {
 /// tiler-OOM answer path.
 const EVENT_DUMP_MAX_CHUNKS: usize = 4;
 
+/// Links a chunk-chain walk follows from the heap context head. Each
+/// link costs one uncached read of a write-combine mapping on the
+/// tiler-OOM answer path, so the walk reports a prefix of a long chain
+/// rather than paying for all of it.
+const CHAIN_WALK_MAX_LINKS: u32 = 16;
+
 /// Heaps a log dump reports, and chunk addresses per heap. The dump
 /// runs on an unhandled MMU fault, where walking every heap would push
 /// the rest of the fault report out of the log buffer.
@@ -259,6 +265,126 @@ unsafe fn read_heap_head(ctx_addr: *const u8, ctx_size: usize, ctx_off: usize) -
     }
 
     Some(head)
+}
+
+/// Reads the link word at the start of a chunk header, or `None` when
+/// the chunk's mapping cannot hold one.
+fn read_chunk_link(chunk: &Chunk) -> Option<u64> {
+    chunk.check_offset::<u64>(0).ok()?;
+
+    let vmap = chunk.vmap();
+    // SAFETY: `check_offset::<u64>` above verified that the first eight
+    // bytes are in bounds of the vmap, whose base is page-aligned and so
+    // aligned for `u64`. The mapping is shared with the GPU (volatile
+    // read).
+    Some(unsafe { core::ptr::read_volatile(vmap.addr() as *const u64) })
+}
+
+/// Classifies one chain link against the live chunks of `heap_ctx`,
+/// returning the chunk the link addresses along with its position in
+/// the chunk list.
+fn classify_link<'a>(
+    heap_ctx: &'a Context,
+    raw: u64,
+    prev_va: Option<u64>,
+) -> (trace::HeapChainClass, Option<(usize, &'a Chunk)>) {
+    let va = raw & CHUNK_SIZE_MASK;
+    if raw == 0 {
+        return (trace::HeapChainClass::Null, None);
+    }
+    if prev_va == Some(va) {
+        return (trace::HeapChainClass::SelfLink, None);
+    }
+
+    let listed =
+        heap_ctx.chunks.iter().enumerate().find(|(_, chunk)| {
+            chunk.recorded_size != 0 && chunk.recorded_va & CHUNK_SIZE_MASK == va
+        });
+
+    match listed {
+        None => (trace::HeapChainClass::Unlisted, None),
+        Some((_, chunk)) if raw & !CHUNK_SIZE_MASK != chunk.recorded_size >> 12 => {
+            (trace::HeapChainClass::BadSize, listed)
+        }
+        Some(_) => (trace::HeapChainClass::Ok, listed),
+    }
+}
+
+/// Walks the chunk chain of `heap_ctx` from the head pointer the
+/// firmware reads, reporting each link through `tyr_heap_chain_link`
+/// and closing with `tyr_heap_chain_summary`. A chunk header is read
+/// only for a link already matched to a live chunk of this context, and
+/// the walk stops on the first link that is not `Ok` or after
+/// `CHAIN_WALK_MAX_LINKS`.
+///
+/// Runs under the caller's heap XArray guard, so it takes no lock and
+/// does no allocation. Per link it scans the chunk list once and reads
+/// eight bytes of the matched chunk.
+///
+/// Downstream-only debug aid; not for upstream.
+fn walk_chunk_chain(
+    heap_ctx: &Context,
+    trigger: trace::HeapDumpTrigger,
+    group_id: u64,
+    group_uid: u64,
+    cs_id: u32,
+    heap_index: u32,
+    content: &[u8; 32],
+) {
+    let head_raw = u64::from_le_bytes([
+        content[0], content[1], content[2], content[3], content[4], content[5], content[6],
+        content[7],
+    ]);
+
+    let mut raw = head_raw;
+    let mut prev_va = None;
+    let mut links = 0;
+    let mut terminal = trace::HeapChainClass::Null;
+
+    for depth in 0..CHAIN_WALK_MAX_LINKS {
+        let va = raw & CHUNK_SIZE_MASK;
+        let (class, listed) = classify_link(heap_ctx, raw, prev_va);
+
+        let next = match (class, listed) {
+            (trace::HeapChainClass::Ok, Some((_, chunk))) => read_chunk_link(chunk),
+            _ => None,
+        };
+
+        trace::heap_chain_link(
+            trigger,
+            group_id,
+            group_uid,
+            cs_id,
+            heap_index,
+            depth,
+            raw,
+            va,
+            next.unwrap_or(0),
+            listed.map_or(u32::MAX, |(list_index, _)| list_index as u32),
+            class,
+        );
+
+        links = depth + 1;
+        terminal = class;
+
+        let Some(next) = next else {
+            break;
+        };
+        prev_va = Some(va);
+        raw = next;
+    }
+
+    trace::heap_chain_summary(
+        trigger,
+        group_id,
+        group_uid,
+        cs_id,
+        heap_index,
+        head_raw,
+        links,
+        terminal,
+        u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX),
+    );
 }
 
 #[repr(C)]
@@ -795,8 +921,11 @@ impl Pool {
     /// worker (which passes `cs_id = 0`). A `Some(trigger)` caller gets
     /// the event-driven tracepoints instead, narrowed to the heap at
     /// `heap_gpu_va` if one is given and to `EVENT_DUMP_MAX_CHUNKS`
-    /// headers per heap. The dump only runs while the tracepoints it
-    /// would emit to are enabled. When enabled, the walk:
+    /// headers per heap. Such a caller also gets `walk_chunk_chain` run
+    /// on each heap it covers, gated on that walk's own tracepoints so a
+    /// capture can take the chain without the header dumps. Each part
+    /// only runs while the tracepoints it would emit to are enabled.
+    /// When enabled, the dump:
     ///
     /// * uses `try_lock` on the heap XArray (a spinlock-backed lock)
     ///   and silently skips the dump when the lock is contended;
@@ -815,11 +944,12 @@ impl Pool {
         heap_gpu_va: Option<u64>,
         trigger: Option<trace::HeapDumpTrigger>,
     ) {
-        let enabled = match trigger {
+        let dump = match trigger {
             Some(_) => trace::heap_event_dump_enabled(),
             None => trace::heap_dump_enabled(),
         };
-        if !enabled {
+        let walk = trigger.filter(|_| trace::heap_chain_walk_enabled());
+        if !dump && walk.is_none() {
             return;
         }
 
@@ -859,6 +989,22 @@ impl Pool {
             let Some(content) = (unsafe { read_heap_head(ctx_addr, ctx_size, ctx_off) }) else {
                 continue;
             };
+
+            if let Some(trigger) = walk {
+                walk_chunk_chain(
+                    heap_ctx,
+                    trigger,
+                    group_id,
+                    group_uid,
+                    cs_id,
+                    index as u32,
+                    &content,
+                );
+            }
+
+            if !dump {
+                continue;
+            }
 
             let ctx_va = ctx_base + (index as u64) * (stride as u64);
             let chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);

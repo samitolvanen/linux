@@ -813,6 +813,40 @@ kernel::declare_trace! {
 
     /// # Safety
     ///
+    /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_heap_chain_link(
+        trigger: u32,
+        group_id: u64,
+        group_uid: u64,
+        cs_id: u32,
+        heap_index: u32,
+        depth: u32,
+        raw: u64,
+        va: u64,
+        next_raw: u64,
+        list_index: u32,
+        class: u32,
+    );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_heap_chain_summary(
+        trigger: u32,
+        group_id: u64,
+        group_uid: u64,
+        cs_id: u32,
+        heap_index: u32,
+        head_raw: u64,
+        links: u32,
+        terminal_class: u32,
+        chunk_count: u32,
+    );
+
+    /// # Safety
+    ///
     /// `mnemonic` must be a valid, nul-terminated C string pointer
     /// and `bytes` must point to at least `len` valid, readable bytes
     /// for the duration of the call.
@@ -1143,6 +1177,45 @@ pub(crate) fn heap_event_dump_enabled() -> bool {
 #[cfg(not(CONFIG_TRACEPOINTS))]
 pub(crate) fn heap_event_dump_enabled() -> bool {
     false
+}
+
+/// Returns whether the chunk-chain walk should run, i.e. whether either
+/// of its tracepoints is enabled. The walk reads one uncached word per
+/// link on the tiler-OOM answer path, so it stays off unless a capture
+/// asks for it.
+#[cfg(CONFIG_TRACEPOINTS)]
+pub(crate) fn heap_chain_walk_enabled() -> bool {
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    let link = unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_heap_chain_link,
+            kernel::bindings::tracepoint,
+            key
+        )
+    };
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    let summary = unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_heap_chain_summary,
+            kernel::bindings::tracepoint,
+            key
+        )
+    };
+    link || summary
+}
+
+/// Without `CONFIG_TRACEPOINTS` the `__tracepoint_*` symbols do not
+/// exist, so the walk can never produce trace output and is always off.
+#[cfg(not(CONFIG_TRACEPOINTS))]
+pub(crate) fn heap_chain_walk_enabled() -> bool {
+    false
+}
+
+/// Returns whether any event-driven tiler-heap tracepoint is enabled,
+/// i.e. whether the reclaim and MMU-fault sites have a reason to resolve
+/// a heap pool at all.
+pub(crate) fn heap_event_enabled() -> bool {
+    heap_event_dump_enabled() || heap_chain_walk_enabled()
 }
 
 /// Returns whether the tiler-heap readback should run, i.e. whether its
@@ -2614,6 +2687,96 @@ pub(crate) fn heap_chunk_dump(
             chunk_index,
             chunk_va,
             header.as_ptr(),
+        )
+    }
+}
+
+/// Class of one link of a tiler-heap chunk chain. Keep in sync with
+/// `TYR_HEAP_CHAIN_CLASSES` in `include/trace/events/tyr.h`.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum HeapChainClass {
+    /// The link resolves to a live chunk of the heap context.
+    Ok = 0,
+    /// The link is null, so the chain ends here.
+    Null = 1,
+    /// The link points at the chunk that carries it.
+    SelfLink = 2,
+    /// The link addresses a live chunk, but not with that chunk's size.
+    BadSize = 3,
+    /// The link addresses no live chunk of the heap context.
+    Unlisted = 4,
+}
+
+/// One link of the chunk chain reached from the heap context head.
+/// `raw` is the encoded word that pointed here, `va` the chunk address
+/// it decodes to, and `next_raw` the word read from this chunk's own
+/// header, which is 0 for a link the walk did not resolve to a chunk BO.
+/// `list_index` is the position the chunk holds in the driver's chunk
+/// list, or `u32::MAX` when no live chunk matched.
+///
+/// Downstream-only debug aid; not for upstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn heap_chain_link(
+    trigger: HeapDumpTrigger,
+    group_id: u64,
+    group_uid: u64,
+    cs_id: u32,
+    heap_index: u32,
+    depth: u32,
+    raw: u64,
+    va: u64,
+    next_raw: u64,
+    list_index: u32,
+    class: HeapChainClass,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_heap_chain_link(
+            trigger as u32,
+            group_id,
+            group_uid,
+            cs_id,
+            heap_index,
+            depth,
+            raw,
+            va,
+            next_raw,
+            list_index,
+            class as u32,
+        )
+    }
+}
+
+/// Closing record of one chunk-chain walk, carrying the head the walk
+/// started from, the number of `heap_chain_link` records it emitted, the
+/// class that ended it, and the chunk count the driver's list holds.
+///
+/// Downstream-only debug aid; not for upstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn heap_chain_summary(
+    trigger: HeapDumpTrigger,
+    group_id: u64,
+    group_uid: u64,
+    cs_id: u32,
+    heap_index: u32,
+    head_raw: u64,
+    links: u32,
+    terminal_class: HeapChainClass,
+    chunk_count: u32,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_heap_chain_summary(
+            trigger as u32,
+            group_id,
+            group_uid,
+            cs_id,
+            heap_index,
+            head_raw,
+            links,
+            terminal_class as u32,
+            chunk_count,
         )
     }
 }
