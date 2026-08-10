@@ -2163,6 +2163,28 @@ impl Scheduler {
         pool.dump_for_trace(group.handle(), group_uid, u32::MAX, None, Some(trigger));
     }
 
+    /// Returns the tiler-heap pool of the group bound to `csg_id`, or
+    /// `None` when the slot is unbound, has been recycled to a group
+    /// other than `group_uid`, or the group's `heap_pool` mutex is
+    /// contended.
+    ///
+    /// Downstream-only debug aid; not for upstream.
+    pub(crate) fn heap_pool_for_csg(
+        tdev: &TyrDrmDevice,
+        csg_id: usize,
+        group_uid: u64,
+    ) -> Option<Arc<heap::Pool>> {
+        let group = {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            slot_manager.slot_data(csg_id)?.group().clone()
+        };
+        if group.uid() != group_uid {
+            return None;
+        }
+
+        group.try_get_heap_pool()
+    }
+
     /// Returns the VM of the group bound to `csg_id`, or `None` when the
     /// slot is unbound or has been recycled to a group other than
     /// `group_uid`.
