@@ -1288,6 +1288,28 @@ pub(crate) fn cs_status_snapshot_enabled() -> bool {
     false
 }
 
+/// Returns whether the user command-stream head read should run, i.e.
+/// whether its tracepoint is enabled. The read vmaps a userspace BO on
+/// the submit path, so it stays off unless a capture asks for it.
+#[cfg(CONFIG_TRACEPOINTS)]
+pub(crate) fn user_stream_head_enabled() -> bool {
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_user_stream_head,
+            kernel::bindings::tracepoint,
+            key
+        )
+    }
+}
+
+/// Without `CONFIG_TRACEPOINTS` the `__tracepoint_*` symbols do not
+/// exist, so the read can never produce trace output.
+#[cfg(not(CONFIG_TRACEPOINTS))]
+pub(crate) fn user_stream_head_enabled() -> bool {
+    false
+}
+
 /// Direction tag for `vm_bind_syncop`. Keep in sync with
 /// `TYR_VM_BIND_SYNCOP_KINDS` in `include/trace/events/tyr.h`.
 #[repr(u32)]
