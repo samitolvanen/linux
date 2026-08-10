@@ -532,13 +532,6 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
 
-        if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
-            match uninit_ddev.create_huge_mnt(c"within_size") {
-                Ok(()) => dev_info!(pdev, "Using transparent huge pages.\n"),
-                Err(e) => dev_warn!(pdev, "Can't use transparent huge pages: {:?}\n", e),
-            }
-        }
-
         let platform: ARef<platform::Device> = pdev.into();
 
         let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
@@ -604,6 +597,13 @@ impl platform::Driver for TyrPlatformDriverData {
                 devfreq_data,
                 opp_config <- new_mutex!(None),
         });
+
+        if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
+            match uninit_ddev.create_huge_mnt(c"within_size") {
+                Ok(()) => dev_info!(pdev, "Using transparent huge pages.\n"),
+                Err(e) => dev_warn!(pdev, "Can't use transparent huge pages: {:?}\n", e),
+            }
+        }
 
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
