@@ -175,49 +175,85 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
 #[derive(Copy, Clone)]
 pub(crate) enum SelectedGroup {
     /// A hardware slot index that was chosen to be kept, its software
-    /// priority, and current firmware priority.
-    Kept(usize, Priority, u32),
+    /// priority, whether the rule that selected it matched idle
+    /// groups, and its current firmware priority.
+    Kept(usize, Priority, bool, u32),
     /// An index into the `pending_groups` array for a newly chosen
-    /// group, and its software priority.
-    Pending(usize, Priority),
+    /// group, its software priority, and whether the rule that
+    /// selected it matched idle groups.
+    Pending(usize, Priority, bool),
 }
 
 /// Coarse class used as the primary key when sorting selections within
-/// a software priority band. The class ordering depends on whether
-/// this is a full tick (rotation) or a normal tick (stability).
+/// a software priority band. Variants are declared in the order they
+/// sort.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SortClass {
-    First,
-    Second,
+    KeptActive,
+    PendingActive,
+    RotatedActive,
+    KeptIdle,
+    RotatedIdle,
+    PendingIdle,
+}
+
+/// Picks the retained selection that rotates within one software
+/// priority band, returning its index in
+/// `SchedulingDecision::selections`.
+///
+/// A full tick rotates the whole band, so the retained group holding
+/// the highest firmware priority in it rotates. A normal tick leaves
+/// the active half in its current hardware order and rotates the idle
+/// half.
+fn rotated_selection(band: &[(SelectedGroup, usize)], full_tick: bool) -> Option<usize> {
+    let mut rotated: Option<(u32, usize)> = None;
+
+    for (sel, idx) in band {
+        let SelectedGroup::Kept(_, _, is_idle, fw_prio) = sel else {
+            continue;
+        };
+
+        if !full_tick && !is_idle {
+            continue;
+        }
+
+        if rotated.is_none_or(|(highest, _)| *fw_prio > highest) {
+            rotated = Some((*fw_prio, *idx));
+        }
+    }
+
+    rotated.map(|(_, idx)| idx)
 }
 
 /// Key for ordering selections within one software priority band.
-fn sort_key(sel: &SelectedGroup, original_idx: usize, full_tick: bool) -> (SortClass, u32, usize) {
+///
+/// `rotated` is the `selections` index returned by
+/// `rotated_selection`.
+fn sort_key(
+    sel: &SelectedGroup,
+    original_idx: usize,
+    rotated: Option<usize>,
+) -> (SortClass, u32, usize) {
+    let is_rotated = rotated == Some(original_idx);
+
     match sel {
-        SelectedGroup::Pending(_, _) => {
-            if full_tick {
-                // Full tick: newly bound pending groups go first,
-                // getting the highest firmware priority.
-                (SortClass::First, 0, original_idx)
+        SelectedGroup::Pending(_, _, is_idle) => {
+            let class = if *is_idle {
+                SortClass::PendingIdle
             } else {
-                // Normal tick: pending groups go after retained groups.
-                (SortClass::Second, 0, original_idx)
-            }
+                SortClass::PendingActive
+            };
+            (class, 0, original_idx)
         }
 
-        SelectedGroup::Kept(_, _, fw_prio) => {
-            if full_tick {
-                // Full tick: retained groups go after pending, ordered
-                // from lowest to highest previous firmware priority so
-                // the worst-off gets bumped up the hardware queue
-                // this round.
-                (SortClass::Second, *fw_prio, original_idx)
-            } else {
-                // Normal tick: retained groups go first, preserving
-                // their existing firmware priority order
-                // (highest first).
-                (SortClass::First, u32::MAX - *fw_prio, original_idx)
-            }
+        SelectedGroup::Kept(_, _, is_idle, fw_prio) => {
+            let class = match (*is_idle, is_rotated) {
+                (false, false) => SortClass::KeptActive,
+                (false, true) => SortClass::RotatedActive,
+                (true, false) => SortClass::KeptIdle,
+                (true, true) => SortClass::RotatedIdle,
+            };
+            (class, u32::MAX - *fw_prio, original_idx)
         }
     }
 }
@@ -225,19 +261,20 @@ fn sort_key(sel: &SelectedGroup, original_idx: usize, full_tick: bool) -> (SortC
 impl SelectedGroup {
     fn priority(self) -> Priority {
         match self {
-            Self::Kept(_, prio, _) => prio,
-            Self::Pending(_, prio) => prio,
+            Self::Kept(_, prio, _, _) => prio,
+            Self::Pending(_, prio, _) => prio,
         }
     }
 
     /// Iterate selected groups, highest software priority first.
     ///
-    /// Within each priority, normal ticks (`!full_tick`) preserve the
-    /// previous hardware priority order: kept groups first (highest
-    /// previous fw_prio first), then pending groups. Full ticks
-    /// rotate to prevent starvation: pending groups first, then kept
-    /// groups in ascending previous fw_prio (lowest goes to the front
-    /// of the line).
+    /// Within a band, active groups come before idle ones. In each
+    /// half, retained groups sort by descending previous fw_prio
+    /// ahead of the newly bound ones. At most one group rotates. An
+    /// active one drops below the newly bound active groups, yielding
+    /// priority to work that has not run yet. An idle one drops
+    /// behind the other retained idle groups but stays ahead of the
+    /// newly bound idle groups.
     pub(crate) fn iter_prioritized(
         selections: &[Option<SelectedGroup>],
         full_tick: bool,
@@ -252,7 +289,7 @@ impl SelectedGroup {
                 // the dummy fill value is only there to give the
                 // fixed-size array a Copy initialiser.
                 let mut prio_selections =
-                    [(SelectedGroup::Pending(0, Priority::Low), 0_usize); MAX_CSGS];
+                    [(SelectedGroup::Pending(0, Priority::Low, false), 0_usize); MAX_CSGS];
                 let mut count = 0;
 
                 for (idx, selection) in selections.iter().enumerate() {
@@ -265,10 +302,9 @@ impl SelectedGroup {
                 }
 
                 let slice = &mut prio_selections[..count];
+                let rotated = rotated_selection(slice, full_tick);
 
-                slice.sort_unstable_by_key(|(s, original_idx)| {
-                    sort_key(s, *original_idx, full_tick)
-                });
+                slice.sort_unstable_by_key(|(s, original_idx)| sort_key(s, *original_idx, rotated));
 
                 // Truncate the padded array to the actual count and
                 // discard the stable-sort index.
@@ -298,7 +334,8 @@ pub(crate) struct PendingBind {
 
 /// Represents the outcome of evaluating scheduling rules.
 pub(crate) struct SchedulingDecision {
-    /// Whether this is a full tick (rotation) or a normal tick (stability).
+    /// Set on a full tick, which rotates the whole band instead of
+    /// only its idle residents.
     pub(crate) full_tick: bool,
     /// Bitmask of hardware CSG slots that will retain their currently
     /// bound group.
@@ -462,7 +499,7 @@ impl SchedulingDecision {
 
             let fw_priority = slot_data.fw_priority;
             self.selections[self.num_selected] =
-                Some(SelectedGroup::Kept(i, priority, fw_priority));
+                Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
 
             self.num_selected += 1;
 
@@ -547,7 +584,7 @@ impl SchedulingDecision {
 
             let fw_priority = slot_data.fw_priority;
             self.selections[self.num_selected] =
-                Some(SelectedGroup::Kept(i, priority, fw_priority));
+                Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
 
             self.num_selected += 1;
 
@@ -599,8 +636,11 @@ impl SchedulingDecision {
                 self.idle_group_count += count;
             }
             for i in 0..count {
-                self.selections[self.num_selected + i] =
-                    Some(SelectedGroup::Pending(self.num_pending + i, priority));
+                self.selections[self.num_selected + i] = Some(SelectedGroup::Pending(
+                    self.num_pending + i,
+                    priority,
+                    is_idle,
+                ));
             }
         }
         self.num_pending += count;
@@ -817,7 +857,7 @@ impl<'a> Tick<'a> {
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
                 match selection {
-                    SelectedGroup::Kept(slot_idx, _sw_prio, cur_fw_prio) => {
+                    SelectedGroup::Kept(slot_idx, _sw_prio, _is_idle, cur_fw_prio) => {
                         if let Some(slot_data) = csg_slot_manager.slot_data(slot_idx) {
                             slot_data
                                 .group
@@ -842,7 +882,7 @@ impl<'a> Tick<'a> {
                             );
                         }
                     }
-                    SelectedGroup::Pending(idx, _sw_prio) => {
+                    SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
                         let Some(pending) = decision.pending_groups[idx].take() else {
                             continue;
                         };
