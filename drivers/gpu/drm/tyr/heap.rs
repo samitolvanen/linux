@@ -8,12 +8,9 @@ use kernel::{
         Bound,
         Device, //
     },
-    drm::gem::BaseObject,
     io::{
         Io,
-        IoBackend,
-        IoBase,
-        SysMemBackend, //
+        IoBase, //
     },
     kvec,
     prelude::*,
@@ -61,7 +58,20 @@ struct ChunkHeader {
 impl ChunkHeader {
     const NEXT: usize = core::mem::offset_of!(Self, next);
 
+    fn zero(mem: &gem::MappedBo) -> Result {
+        mem.check_offset::<Self>(0)?;
+
+        let vmap = mem.vmap();
+        for offset in (0..core::mem::size_of::<Self>()).step_by(8) {
+            vmap.try_write64(0, offset)?;
+        }
+
+        Ok(())
+    }
+
     fn write_next(mem: &gem::MappedBo, next: u64) -> Result {
+        mem.check_offset::<Self>(0)?;
+
         mem.vmap().try_write64(next, Self::NEXT)
     }
 }
@@ -100,15 +110,7 @@ fn alloc_chunk_bo(
     let chunk_bo =
         gem::new_kernel_object(dev, ddev, vm, chunk_size as usize, flags, ddev.coherent)?;
 
-    let vmap = chunk_bo.vmap();
-    let size = vmap.owner().size();
-    let base = SysMemBackend::as_ptr(vmap.as_view()).cast::<u8>();
-    // SAFETY: `base` and `size` describe the same vmap'd GEM object, so the range is
-    // valid for reads and writes, and `u8` has no alignment requirement. The object
-    // was just created and its `Arc` has not left this function, so no other
-    // reference into the mapping exists.
-    let mem = unsafe { core::slice::from_raw_parts_mut(base, size) };
-    mem.fill(0);
+    ChunkHeader::zero(&chunk_bo)?;
 
     Ok(chunk_bo)
 }
