@@ -526,7 +526,10 @@ impl platform::Driver for TyrPlatformDriverData {
         // SAFETY: No concurrent DMA allocations or mappings can be made because
         // the device is still being probed and therefore isn't being used by
         // other threads of execution.
-        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)? };
+        unsafe {
+            pdev.dma_set_max_seg_size(u32::MAX);
+            pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)?;
+        }
 
         let coherent = pdev.as_ref().dma_coherent();
 
