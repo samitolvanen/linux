@@ -190,7 +190,7 @@ fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) 
 
 /// Reports the tiler-heap chunk the faulting address belonged to, if
 /// the pool of the group bound to the faulting AS slot still has a
-/// record of one.
+/// record of one, followed by the current state of that pool's heaps.
 fn report_heap_for_fault(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) {
     if csg_id == u32::MAX {
         return;
@@ -224,6 +224,8 @@ fn report_heap_for_fault(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr:
             );
         }
     }
+
+    pool.dump_for_log(tdev);
 }
 
 pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDrmDevice) -> Result {
