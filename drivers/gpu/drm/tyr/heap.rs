@@ -3,6 +3,7 @@
 //! Tiler heap management.
 
 use core::num::NonZero;
+use core::ops::Deref;
 
 use kernel::{
     alloc::{
@@ -12,6 +13,7 @@ use kernel::{
     drm::gem::BaseObject,
     io::Io,
     kvec,
+    new_spinlock,
     page::PAGE_SIZE,
     prelude::*,
     sync::{
@@ -19,7 +21,12 @@ use kernel::{
             Atomic,
             Relaxed, //
         },
-        Arc, //
+        Arc,
+        SpinLock, //
+    },
+    time::{
+        Instant,
+        Monotonic, //
     },
     uapi::{
         self,
@@ -29,7 +36,7 @@ use kernel::{
     xarray::{
         self,
         XArray, //
-    },
+    }, //
 };
 
 use crate::{
@@ -45,6 +52,158 @@ use crate::{
 
 pub(crate) const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
+
+/// Chunk lifetimes a pool keeps in its `ChunkLedger`.
+const CHUNK_LEDGER_ENTRIES: usize = 64;
+
+/// The lifetime of one tiler-heap chunk, as recorded by `ChunkLedger`.
+#[derive(Clone, Copy)]
+pub(crate) struct ChunkRecord {
+    pub(crate) va: u64,
+    pub(crate) size: u64,
+    /// `None` when the allocation of this chunk has aged out of the
+    /// ring and only its release was recorded.
+    pub(crate) alloc: Option<Instant<Monotonic>>,
+    /// `None` while a heap still owns the chunk.
+    pub(crate) free: Option<Instant<Monotonic>>,
+}
+
+impl ChunkRecord {
+    const EMPTY: Self = Self {
+        va: 0,
+        size: 0,
+        alloc: None,
+        free: None,
+    };
+
+    fn covers(&self, va: u64) -> bool {
+        self.size != 0 && va >= self.va && va - self.va < self.size
+    }
+}
+
+struct LedgerRing {
+    records: [ChunkRecord; CHUNK_LEDGER_ENTRIES],
+    /// Records ever appended. The ring keeps the last
+    /// `CHUNK_LEDGER_ENTRIES` of them.
+    appended: usize,
+}
+
+impl LedgerRing {
+    fn push(&mut self, record: ChunkRecord) {
+        let index = self.appended % CHUNK_LEDGER_ENTRIES;
+        self.records[index] = record;
+        self.appended += 1;
+    }
+}
+
+/// Ring of recent chunk lifetimes for one heap pool, so an address that
+/// no longer resolves to a mapping can still be attributed to a chunk
+/// the pool has since released.
+///
+/// Downstream-only debug aid; not for upstream.
+#[pin_data]
+struct ChunkLedger {
+    #[pin]
+    ring: SpinLock<LedgerRing>,
+}
+
+impl ChunkLedger {
+    fn new() -> impl PinInit<Self> {
+        pin_init!(Self {
+            ring <- new_spinlock!(LedgerRing {
+                records: [ChunkRecord::EMPTY; CHUNK_LEDGER_ENTRIES],
+                appended: 0,
+            }),
+        })
+    }
+
+    /// Records an allocation and returns the generation the caller
+    /// passes back to `record_free`.
+    fn record_alloc(&self, va: u64, size: u64) -> usize {
+        let mut ring = self.ring.lock();
+        let generation = ring.appended;
+        ring.push(ChunkRecord {
+            va,
+            size,
+            alloc: Some(Instant::now()),
+            free: None,
+        });
+
+        generation
+    }
+
+    fn record_free(&self, generation: usize, va: u64, size: u64) {
+        let now = Instant::now();
+        let mut ring = self.ring.lock();
+        // The slot still holds this chunk's record until
+        // `CHUNK_LEDGER_ENTRIES` later appends have overwritten it.
+        if generation + CHUNK_LEDGER_ENTRIES > ring.appended {
+            ring.records[generation % CHUNK_LEDGER_ENTRIES].free = Some(now);
+            return;
+        }
+
+        ring.push(ChunkRecord {
+            va,
+            size,
+            alloc: None,
+            free: Some(now),
+        });
+    }
+
+    /// Returns the newest recorded chunk covering `va`.
+    fn lookup(&self, va: u64) -> Option<ChunkRecord> {
+        let ring = self.ring.lock();
+        let count = ring.appended.min(CHUNK_LEDGER_ENTRIES);
+        (1..=count)
+            .map(|back| ring.records[(ring.appended - back) % CHUNK_LEDGER_ENTRIES])
+            .find(|record| record.covers(va))
+    }
+}
+
+/// A chunk owned by a heap context, whose allocation and release are
+/// recorded in the owning pool's `ChunkLedger`.
+struct Chunk {
+    bo: Arc<gem::MappedBo>,
+    ledger: Arc<ChunkLedger>,
+    recorded_va: u64,
+    recorded_size: u64,
+    generation: usize,
+}
+
+impl Chunk {
+    fn new(bo: Arc<gem::MappedBo>, ledger: Arc<ChunkLedger>) -> Self {
+        // A chunk with no VA is recorded with size 0, which
+        // `ChunkRecord::covers` never matches.
+        let (recorded_va, recorded_size) = match bo.kernel_va() {
+            Some(range) => (range.start, bo.size() as u64),
+            None => (0, 0),
+        };
+        let generation = ledger.record_alloc(recorded_va, recorded_size);
+
+        Self {
+            bo,
+            ledger,
+            recorded_va,
+            recorded_size,
+            generation,
+        }
+    }
+}
+
+impl Deref for Chunk {
+    type Target = gem::MappedBo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bo
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        self.ledger
+            .record_free(self.generation, self.recorded_va, self.recorded_size);
+    }
+}
 
 /// Chunk headers an event-driven dump reads per heap. The chunk BOs are
 /// write-combine mapped on a non-coherent device, so an uncapped chain
@@ -156,7 +315,7 @@ pub(crate) fn destroy_context(
 
 struct Context {
     vm: Arc<Vm>,
-    chunks: KVec<Arc<gem::MappedBo>>,
+    chunks: KVec<Chunk>,
     chunk_size: u32,
     max_chunks: u32,
     target_in_flight: u32,
@@ -165,12 +324,13 @@ struct Context {
     cookie: u64,
 }
 
-fn alloc_chunk_bo(
+fn alloc_chunk(
     tdev: &TyrDrmDevice,
     vm: &Arc<Vm>,
     chunk_size: u32,
     pt_gfp: Flags,
-) -> Result<Arc<gem::MappedBo>> {
+    ledger: &Arc<ChunkLedger>,
+) -> Result<Chunk> {
     let flags = VmMapFlags::from(VmFlag::Noexec);
     let chunk_bo =
         gem::new_kernel_object(tdev, vm, chunk_size as usize, flags, tdev.coherent, pt_gfp)?;
@@ -184,7 +344,7 @@ fn alloc_chunk_bo(
         },
     )?;
 
-    Ok(chunk_bo)
+    Ok(Chunk::new(chunk_bo, ledger.clone()))
 }
 
 impl Context {
@@ -196,7 +356,7 @@ impl Context {
             .fold(0, usize::saturating_add)
     }
 
-    fn push_chunk(&mut self, chunk_bo: Arc<gem::MappedBo>) -> Result {
+    fn push_chunk(&mut self, chunk_bo: Chunk) -> Result {
         self.chunks.reserve(1, GFP_KERNEL)?;
         self.chunks
             .insert_within_capacity(0, chunk_bo)
@@ -204,8 +364,8 @@ impl Context {
         Ok(())
     }
 
-    fn alloc_initial_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
-        let chunk_bo = alloc_chunk_bo(tdev, &self.vm, self.chunk_size, GFP_KERNEL_ACCOUNT)?;
+    fn alloc_initial_chunk(&mut self, tdev: &TyrDrmDevice, ledger: &Arc<ChunkLedger>) -> Result {
+        let chunk_bo = alloc_chunk(tdev, &self.vm, self.chunk_size, GFP_KERNEL_ACCOUNT, ledger)?;
 
         if let Some(prev) = self.chunks.first() {
             let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
@@ -236,6 +396,8 @@ pub(crate) struct Pool {
     /// Combined size of every BO this pool owns, the contexts buffer plus
     /// all heap chunks. Reported as fdinfo memory.
     pool_total_size: Atomic<usize>,
+    /// Recent chunk lifetimes of every heap in this pool.
+    chunk_ledger: Arc<ChunkLedger>,
 }
 
 impl Pool {
@@ -250,6 +412,7 @@ impl Pool {
         let gpu_contexts =
             gem::new_kernel_object(tdev, &vm, bo_size, flags, tdev.coherent, GFP_KERNEL_ACCOUNT)?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
+        let chunk_ledger = Arc::pin_init(ChunkLedger::new(), GFP_KERNEL)?;
 
         let initial = gpu_contexts.size();
 
@@ -261,7 +424,13 @@ impl Pool {
             next_id: Atomic::new(0),
             next_cookie: Atomic::new(0),
             pool_total_size: Atomic::new(initial),
+            chunk_ledger,
         })
+    }
+
+    /// Returns the newest recorded lifetime of a chunk covering `va`.
+    pub(crate) fn lookup_chunk_va(&self, va: u64) -> Option<ChunkRecord> {
+        self.chunk_ledger.lookup(va)
     }
 
     pub(crate) fn create_heap_context(
@@ -300,7 +469,7 @@ impl Pool {
         )?;
 
         for _ in 0..args.initial_chunk_count {
-            heap_ctx.alloc_initial_chunk(tdev)?;
+            heap_ctx.alloc_initial_chunk(tdev, &self.chunk_ledger)?;
         }
 
         // `alloc_initial_chunk` prepends, so `chunks.first()` is the
@@ -464,7 +633,7 @@ impl Pool {
         // Allocate outside the XArray spinlock: the BO allocation takes the
         // kernel-VA range mutex and uses GFP_KERNEL, neither of which is
         // permitted while holding a spinlock.
-        let chunk_bo = match alloc_chunk_bo(tdev, &vm, chunk_size, GFP_KERNEL) {
+        let chunk_bo = match alloc_chunk(tdev, &vm, chunk_size, GFP_KERNEL, &self.chunk_ledger) {
             Ok(chunk_bo) => chunk_bo,
             Err(e) if e == ENOSPC || e == EBUSY => return Err(ENOMEM),
             Err(e) => return Err(e),
