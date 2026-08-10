@@ -430,7 +430,7 @@ impl Scheduler {
                 continue;
             }
 
-            reg_data.fw.with_csg_mut(oom.csg_id, |csg| {
+            reg_data.fw.with_csg_mut_ring_doorbell(oom.csg_id, |csg| {
                 {
                     let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
                     cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
@@ -442,10 +442,6 @@ impl Scheduler {
 
                 csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
             })?;
-
-            let mut mask = CsgSlotMask::empty();
-            mask.insert(oom.csg_id);
-            reg_data.fw.ring_csg_doorbells(mask)?;
         }
 
         Ok(())
