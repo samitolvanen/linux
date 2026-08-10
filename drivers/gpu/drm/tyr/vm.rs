@@ -1160,6 +1160,18 @@ impl Vm {
         Ok(())
     }
 
+    /// Takes `size` bytes out of the kernel auto-VA window and holds them
+    /// for the lifetime of the VM. When it runs before any other
+    /// `alloc_kernel_range` call, every later kernel object moves up by
+    /// `size`.
+    ///
+    /// Downstream-only debug aid; not for upstream.
+    pub(crate) fn pad_kernel_range(&self, size: usize) -> Result {
+        let node = self.alloc_kernel_range(size)?;
+        self.kernel_reservations.lock().push(node, GFP_KERNEL)?;
+        Ok(())
+    }
+
     /// Acquires the lock that serializes the window from prepare to
     /// commit of an async bind on this VM.
     ///

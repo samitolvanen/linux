@@ -33,7 +33,10 @@ use kernel::{
     },
     platform,
     prelude::*,
-    sizes::SZ_8K,
+    sizes::{
+        SZ_1M,
+        SZ_8K, //
+    },
     str::CString,
     sync::{
         aref::ARef,
@@ -409,6 +412,9 @@ impl Firmware {
                 GFP_KERNEL,
             )?;
         }
+
+        // Downstream-only debug aid; not for upstream.
+        vm.pad_kernel_range(SZ_1M)?;
 
         let irq_state = irq::JobIrqState::new()?;
         let shared_section = Self::find_shared_section(&sections)?;
