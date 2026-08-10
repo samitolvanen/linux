@@ -144,7 +144,7 @@ impl WorkItem<2> for Group {
             oom.outcome = match grow_result {
                 Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
                 Err(e) if e == ENOMEM => {
-                    if trace::heap_event_dump_enabled() {
+                    if trace::heap_event_enabled() {
                         if let Some(pool) = this.get_heap_pool() {
                             pool.dump_for_trace(
                                 tdev,

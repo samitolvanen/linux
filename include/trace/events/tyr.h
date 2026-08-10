@@ -3206,6 +3206,111 @@ TRACE_EVENT(tyr_heap_event_chunk_dump,
 );
 
 /*
+ * Classes of one link of a tiler-heap chunk chain. Keep in sync with
+ * `HeapChainClass` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_HEAP_CHAIN_CLASSES		\
+	{ 0, "OK" },			\
+	{ 1, "NULL" },			\
+	{ 2, "SELF" },			\
+	{ 3, "BAD_SIZE" },		\
+	{ 4, "UNLISTED" }
+
+/*
+ * One link of the chunk chain reached from the heap context head the
+ * firmware reads, rather than from the driver's chunk list. `raw` is the
+ * encoded chunk_va|size>>12 word that pointed here and `next_raw` the
+ * word read from this chunk's own header, which is 0 for a link the walk
+ * did not resolve to a chunk BO. `list_index` is the position the chunk
+ * holds in the driver's list, or -1 when no live chunk matched, so a
+ * capture shows where in that list the firmware's chain starts.
+ */
+TRACE_EVENT(tyr_heap_chain_link,
+	TP_PROTO(u32 trigger, u64 group_id, u64 group_uid, u32 cs_id,
+		 u32 heap_index, u32 depth, u64 raw, u64 va, u64 next_raw,
+		 u32 list_index, u32 class),
+	TP_ARGS(trigger, group_id, group_uid, cs_id, heap_index, depth, raw,
+		va, next_raw, list_index, class),
+	TP_STRUCT__entry(
+		__field(u32, trigger)
+		__field(u64, group_id)
+		__field(u64, group_uid)
+		__field(u32, cs_id)
+		__field(u32, heap_index)
+		__field(u32, depth)
+		__field(u64, raw)
+		__field(u64, va)
+		__field(u64, next_raw)
+		__field(u32, list_index)
+		__field(u32, class)
+	),
+	TP_fast_assign(
+		__entry->trigger = trigger;
+		__entry->group_id = group_id;
+		__entry->group_uid = group_uid;
+		__entry->cs_id = cs_id;
+		__entry->heap_index = heap_index;
+		__entry->depth = depth;
+		__entry->raw = raw;
+		__entry->va = va;
+		__entry->next_raw = next_raw;
+		__entry->list_index = list_index;
+		__entry->class = class;
+	),
+	TP_printk("trigger=%s group=%llu group_uid=%llu cs=%u heap=%u depth=%u raw=0x%llx va=0x%llx next_raw=0x%llx list_index=%d class=%s",
+		  __print_symbolic(__entry->trigger, TYR_HEAP_DUMP_TRIGGERS),
+		  __entry->group_id, __entry->group_uid, __entry->cs_id,
+		  __entry->heap_index, __entry->depth, __entry->raw,
+		  __entry->va, __entry->next_raw, (int)__entry->list_index,
+		  __print_symbolic(__entry->class, TYR_HEAP_CHAIN_CLASSES))
+);
+
+/*
+ * Closing record of one chunk-chain walk. `links` counts the emitted
+ * tyr_heap_chain_link records, including the one that ended the walk, so
+ * a class of OK with links at the walk cap means the chain was longer
+ * than the walk followed, or that it loops. The per-link VAs separate
+ * the two. `chunk_count` is what the driver's list holds, which the walk
+ * should reach on an intact chain.
+ */
+TRACE_EVENT(tyr_heap_chain_summary,
+	TP_PROTO(u32 trigger, u64 group_id, u64 group_uid, u32 cs_id,
+		 u32 heap_index, u64 head_raw, u32 links, u32 terminal_class,
+		 u32 chunk_count),
+	TP_ARGS(trigger, group_id, group_uid, cs_id, heap_index, head_raw,
+		links, terminal_class, chunk_count),
+	TP_STRUCT__entry(
+		__field(u32, trigger)
+		__field(u64, group_id)
+		__field(u64, group_uid)
+		__field(u32, cs_id)
+		__field(u32, heap_index)
+		__field(u64, head_raw)
+		__field(u32, links)
+		__field(u32, terminal_class)
+		__field(u32, chunk_count)
+	),
+	TP_fast_assign(
+		__entry->trigger = trigger;
+		__entry->group_id = group_id;
+		__entry->group_uid = group_uid;
+		__entry->cs_id = cs_id;
+		__entry->heap_index = heap_index;
+		__entry->head_raw = head_raw;
+		__entry->links = links;
+		__entry->terminal_class = terminal_class;
+		__entry->chunk_count = chunk_count;
+	),
+	TP_printk("trigger=%s group=%llu group_uid=%llu cs=%u heap=%u head_raw=0x%llx links=%u terminal=%s chunks=%u",
+		  __print_symbolic(__entry->trigger, TYR_HEAP_DUMP_TRIGGERS),
+		  __entry->group_id, __entry->group_uid, __entry->cs_id,
+		  __entry->heap_index, __entry->head_raw, __entry->links,
+		  __print_symbolic(__entry->terminal_class,
+				   TYR_HEAP_CHAIN_CLASSES),
+		  __entry->chunk_count)
+);
+
+/*
  * When a tiler-heap read-back was taken. Keep in sync with
  * `ReadbackPhase` in drivers/gpu/drm/tyr/trace.rs.
  */
