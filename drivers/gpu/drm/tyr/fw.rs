@@ -19,9 +19,16 @@ use kernel::{
         Device, //
     },
     devres::Devres,
+    dma::{
+        sync_sgtable_for_device,
+        DataDirection, //
+    },
     drm::{
         gem::{
-            shmem::VMapOwned,
+            shmem::{
+                SGTable,
+                VMapOwned, //
+            },
             BaseObject, //
         },
         Uninit, //
@@ -225,6 +232,11 @@ pub(crate) struct Section {
     // rewrite the section without allocating a fresh vmap.
     vmap: VMapOwned<BoData>,
 
+    // Handle to the section's DMA mapping, retained so the reset path
+    // can return the section to device ownership without taking the BO
+    // lock.
+    sgt: SGTable<BoData>,
+
     // Keep the BO backing this firmware section so that both the
     // GPU mapping and CPU mapping remain valid until the Section is dropped.
     mem: gem::KernelBo,
@@ -326,6 +338,19 @@ impl Firmware {
         Ok(())
     }
 
+    /// Restores device ownership of a section buffer once its contents
+    /// have been written through the CPU mapping.
+    fn sync_section(dev: &Device, sgt: &SGTable<BoData>) -> Result {
+        let sgt = sgt.try_access().ok_or(ENODEV)?;
+
+        // SAFETY: The section BOs are created on `dev`, so `sgt` is DMA-mapped
+        // for it with `DMA_BIDIRECTIONAL`, which permits a sync in either
+        // direction. The guard keeps the mapping alive for the call.
+        unsafe { sync_sgtable_for_device(dev, &sgt, DataDirection::ToDevice) };
+
+        Ok(())
+    }
+
     fn request(
         ddev: &TyrDrmDevice<Uninit>,
         gpu_info: &GpuInfo,
@@ -373,6 +398,9 @@ impl Firmware {
 
         vm.activate()?;
 
+        // SAFETY: `new` is only called from probe, so the device is bound.
+        let dev = unsafe { pdev.as_ref().as_bound() };
+
         let mut sections = KVec::new();
         for parsed in parsed_sections {
             let ParsedSection {
@@ -404,11 +432,15 @@ impl Firmware {
             let vmap = mem.bo.owned_vmap::<0>()?;
             Self::init_section_mem(&vmap, &data, section_flags)?;
 
+            let sgt = mem.bo.owned_sg_table(dev)?;
+            Self::sync_section(pdev.as_ref(), &sgt)?;
+
             sections.push(
                 Section {
                     data,
                     section_flags,
                     vmap,
+                    sgt,
                     mem,
                 },
                 GFP_KERNEL,
@@ -617,11 +649,13 @@ impl Firmware {
     /// Rewrites every firmware section from the data retained at load
     /// time.
     ///
-    /// Writes go through the vmaps retained in `Section`, so the reset
-    /// path neither allocates nor takes BO locks.
+    /// Writes and the sync go through the vmap and scatter-gather table
+    /// retained in `Section`, so the reset path neither allocates nor
+    /// takes BO locks.
     fn reload_sections(&self) -> Result {
         for section in self.sections.iter() {
             Self::init_section_mem(&section.vmap, &section.data, section.section_flags)?;
+            Self::sync_section(self.pdev.as_ref(), &section.sgt)?;
         }
         Ok(())
     }
