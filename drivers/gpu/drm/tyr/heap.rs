@@ -14,6 +14,7 @@ use kernel::{
         Bound,
         Device, //
     },
+    drm::gem::shmem,
     io::{
         Io,
         IoBase, //
@@ -217,6 +218,55 @@ impl Drop for Chunk {
 /// walk would cost hundreds of microseconds of uncached reads on the
 /// tiler-OOM answer path.
 const EVENT_DUMP_MAX_CHUNKS: usize = 4;
+
+/// Heaps a log dump reports, and chunk addresses per heap. The dump
+/// runs on an unhandled MMU fault, where walking every heap would push
+/// the rest of the fault report out of the log buffer.
+const LOG_DUMP_MAX_HEAPS: usize = 4;
+const LOG_DUMP_MAX_CHUNK_VAS: usize = 8;
+
+/// One heap's state, taken under the heap XArray lock so that
+/// `Pool::dump_for_log` writes to the log with the lock released.
+#[derive(Clone, Copy)]
+struct HeapLogEntry {
+    index: usize,
+    ctx_va: u64,
+    chunk_count: usize,
+    head: [u8; 32],
+    chain: [u64; LOG_DUMP_MAX_CHUNK_VAS],
+    /// Entries of `chain` that were filled in.
+    listed: usize,
+}
+
+impl HeapLogEntry {
+    const EMPTY: Self = Self {
+        index: 0,
+        ctx_va: 0,
+        chunk_count: 0,
+        head: [0; 32],
+        chain: [0; LOG_DUMP_MAX_CHUNK_VAS],
+        listed: 0,
+    };
+}
+
+/// Reads the first 32 bytes of the heap context at `ctx_off`, or
+/// `None` when that range does not fit in `ctx_size`.
+fn read_heap_head(
+    ctx_vmap: &shmem::VMapOwned<gem::BoData>,
+    ctx_size: usize,
+    ctx_off: usize,
+) -> Option<[u8; 32]> {
+    if ctx_off.saturating_add(32) > ctx_size {
+        return None;
+    }
+
+    let mut head = [0u8; 32];
+    for (i, slot) in head.iter_mut().enumerate() {
+        *slot = ctx_vmap.try_read8(ctx_off + i).unwrap_or(0);
+    }
+
+    Some(head)
+}
 
 /// Header the firmware keeps at the start of every tiler heap chunk.
 ///
@@ -812,13 +862,9 @@ impl Pool {
             };
 
             let ctx_off = index.saturating_mul(stride);
-            if ctx_off.saturating_add(32) > ctx_size {
+            let Some(content) = read_heap_head(ctx_vmap, ctx_size, ctx_off) else {
                 continue;
-            }
-            let mut content = [0u8; 32];
-            for (i, slot) in content.iter_mut().enumerate() {
-                *slot = ctx_vmap.try_read8(ctx_off + i).unwrap_or(0);
-            }
+            };
 
             let ctx_va = ctx_base + (index as u64) * (stride as u64);
             let chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
@@ -860,6 +906,65 @@ impl Pool {
                     &header,
                 );
             }
+        }
+    }
+
+    /// Logs the head of each heap context in this pool and the start of
+    /// its chunk chain, bounded to `LOG_DUMP_MAX_HEAPS` heaps and
+    /// `LOG_DUMP_MAX_CHUNK_VAS` addresses per heap.
+    pub(crate) fn dump_for_log(&self) {
+        let stride = self.stride.get() as usize;
+        let Some(ctx_base) = self.gpu_contexts.kernel_va().map(|r| r.start) else {
+            return;
+        };
+        let ctx_vmap = self.gpu_contexts.vmap();
+        let ctx_size = ctx_vmap.size();
+
+        let mut entries = [HeapLogEntry::EMPTY; LOG_DUMP_MAX_HEAPS];
+        let mut dumped = 0;
+        {
+            let xa = self.xa.as_ref();
+            let Some(guard) = xa.try_lock() else {
+                pr_err!("heap dump: heap XArray contended\n");
+                return;
+            };
+
+            for index in 0..MAX_HEAPS_PER_POOL as usize {
+                if dumped == LOG_DUMP_MAX_HEAPS {
+                    break;
+                }
+                let Some(heap_ctx) = guard.get(index) else {
+                    continue;
+                };
+
+                let ctx_off = index.saturating_mul(stride);
+                let Some(head) = read_heap_head(ctx_vmap, ctx_size, ctx_off) else {
+                    continue;
+                };
+
+                let entry = &mut entries[dumped];
+                entry.index = index;
+                entry.ctx_va = ctx_base + (index as u64) * (stride as u64);
+                entry.chunk_count = heap_ctx.chunks.len();
+                entry.listed = heap_ctx.chunks.len().min(LOG_DUMP_MAX_CHUNK_VAS);
+                entry.head = head;
+                dumped += 1;
+
+                for (slot, chunk) in entry.chain.iter_mut().zip(heap_ctx.chunks.iter()) {
+                    *slot = chunk.kernel_va().map_or(0, |r| r.start);
+                }
+            }
+        }
+
+        for entry in &entries[..dumped] {
+            pr_err!(
+                "heap {} ctx 0x{:016X} chunks {}: head {:02X?}\n",
+                entry.index,
+                entry.ctx_va,
+                entry.chunk_count,
+                &entry.head[..],
+            );
+            pr_err!("  chain: {:X?}\n", &entry.chain[..entry.listed]);
         }
     }
 }
