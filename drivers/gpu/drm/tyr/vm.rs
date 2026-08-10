@@ -31,8 +31,10 @@ use kernel::{
             ExecCtx,
             Prepared, //
         },
+        gem::BaseObject,
         gpuvm::{
             DriverGpuVm,
+            GpuVa,
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
@@ -1219,6 +1221,39 @@ impl PreparedVm<'_> {
     }
 }
 
+/// One mapping of a VM, as reported by `VmExec::try_classify_va`.
+pub(crate) struct MappedRange {
+    pub(crate) va: u64,
+    pub(crate) size: u64,
+    /// Address the mapped buffer object starts at.
+    pub(crate) bo_va_base: u64,
+    pub(crate) bo_size: u64,
+}
+
+impl MappedRange {
+    fn from_va(gpuva: &GpuVa<GpuVmData>) -> Self {
+        Self {
+            va: gpuva.addr(),
+            size: gpuva.length(),
+            bo_va_base: gpuva.addr().saturating_sub(gpuva.gem_offset()),
+            bo_size: gpuva.obj().size() as u64,
+        }
+    }
+}
+
+/// Where an address sits in a VM's mapping tree, as reported by
+/// `VmExec::try_classify_va`.
+pub(crate) enum VaClass {
+    /// A mapping covers the address, `bo_offset` bytes into its buffer
+    /// object.
+    Mapped { map: MappedRange, bo_offset: u64 },
+    /// No mapping covers the address.
+    Unmapped {
+        below: Option<MappedRange>,
+        above: Option<MappedRange>,
+    },
+}
+
 impl VmExec {
     /// Pool handle assigned at insert time. Returns `0` if this is the
     /// firmware VM, or if a user VM has not yet been inserted into the
@@ -1282,6 +1317,51 @@ impl VmExec {
         self.mmu.idle_vm(&self.as_data).inspect_err(|e| {
             pr_err!("Failed to idle VM: {:?}\n", e);
         })
+    }
+
+    /// Classifies `va` against this VM's mapping tree.
+    ///
+    /// Returns `Err(())` when `gpuvm_unique` is held by another thread
+    /// or the VM is tearing down, like `try_get_bo_for_va`.
+    pub(crate) fn try_classify_va(&self, va: u64) -> Result<VaClass, ()> {
+        let guard = self.gpuvm_unique.try_lock().ok_or(())?;
+        let gpuvm = guard.as_ref().ok_or(())?;
+
+        if let Some(gpuva) = gpuvm.find_first(va, 1) {
+            return Ok(VaClass::Mapped {
+                map: MappedRange::from_va(gpuva),
+                bo_offset: gpuva.gem_offset() + (va - gpuva.addr()),
+            });
+        }
+
+        let range = gpuvm.va_range();
+        let above = (va < range.end)
+            .then(|| gpuvm.find_first(va, range.end - va))
+            .flatten()
+            .map(MappedRange::from_va);
+
+        // A scan of `[start, va)` finds a mapping for every `start` up to
+        // the last byte the nearest mapping below covers, and for none
+        // after it, so bisecting on that boundary lands on the mapping.
+        // The scan is monotone only because this VM reserves no range
+        // and creates no sparse mappings, which `find_first` would both
+        // report as a miss.
+        let mut below = None;
+        if va > range.start && gpuvm.find_first(range.start, va - range.start).is_some() {
+            let mut lo = range.start;
+            let mut hi = va;
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if gpuvm.find_first(mid, va - mid).is_some() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            below = gpuvm.find_first(lo, va - lo).map(MappedRange::from_va);
+        }
+
+        Ok(VaClass::Unmapped { below, above })
     }
 
     /// Non-blocking variant of [`get_bo_for_va`].

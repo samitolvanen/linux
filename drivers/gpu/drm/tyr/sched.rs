@@ -52,7 +52,8 @@ use crate::{
     heap,
     sched::group::GroupListState,
     slot::SlotManager,
-    trace, //
+    trace,
+    vm::Vm, //
 };
 
 use group::Group;
@@ -2068,5 +2069,22 @@ impl Scheduler {
             None,
             Some(trigger),
         );
+    }
+
+    /// Returns the VM of the group bound to `csg_id`, or `None` when the
+    /// slot is unbound or has been recycled to a group other than
+    /// `group_uid`.
+    ///
+    /// Downstream-only debug aid; not for upstream.
+    pub(crate) fn vm_for_csg(
+        tdev: &TyrDrmDevice,
+        csg_id: usize,
+        group_uid: u64,
+    ) -> Option<Arc<Vm>> {
+        let group = {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            slot_manager.slot_data(csg_id)?.group().clone()
+        };
+        (group.uid() == group_uid).then(|| group.vm.clone())
     }
 }

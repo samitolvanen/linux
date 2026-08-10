@@ -16,7 +16,8 @@ use crate::{
     },
     regs::mmu_control::mmu_as_control,
     sched::Scheduler,
-    trace, //
+    trace,
+    vm::VaClass, //
 };
 
 const EXCEPTION_MAP: &[(u32, &CStr)] = &[
@@ -138,6 +139,45 @@ fn read_cs_ringbuf_ptrs(tdev: &TyrDrmDevice, csg_id: usize) -> CsRingbufSnapshot
     }
 }
 
+/// Reports where `addr` sits in the mapping tree of the VM used by the
+/// group bound to the faulting AS slot.
+fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) {
+    if csg_id == u32::MAX {
+        pr_err!("fault VA 0x{:016X}: no group bound, VM unknown\n", addr);
+        return;
+    }
+
+    let Some(vm) = Scheduler::vm_for_csg(tdev, csg_id as usize, group_uid) else {
+        pr_err!("fault VA 0x{:016X}: group gone, VM unknown\n", addr);
+        return;
+    };
+
+    match vm.try_classify_va(addr) {
+        Err(()) => pr_err!("fault VA 0x{:016X}: gpuvm busy, not classified\n", addr),
+        Ok(VaClass::Mapped { map, bo_offset }) => pr_err!(
+            "fault VA 0x{:016X} is mapped: mapping 0x{:016X} size 0x{:X}, \
+                BO base 0x{:016X} size 0x{:X} offset 0x{:X}\n",
+            addr,
+            map.va,
+            map.size,
+            map.bo_va_base,
+            map.bo_size,
+            bo_offset,
+        ),
+        Ok(VaClass::Unmapped { below, above }) => {
+            pr_err!("fault VA 0x{:016X} is not mapped\n", addr);
+            match below {
+                Some(m) => pr_err!("  nearest below: 0x{:016X} size 0x{:X}\n", m.va, m.size),
+                None => pr_err!("  nearest below: none\n"),
+            }
+            match above {
+                Some(m) => pr_err!("  nearest above: 0x{:016X} size 0x{:X}\n", m.va, m.size),
+                None => pr_err!("  nearest above: none\n"),
+            }
+        }
+    }
+}
+
 pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDrmDevice) -> Result {
     while status != 0 {
         let as_index = (status | (status >> 16)).trailing_zeros();
@@ -227,6 +267,8 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDr
             access_type_name(fault_status_raw),
             source_id,
         );
+
+        report_fault_va(tdev, csg_id, group_uid, addr);
 
         status &= !mask;
     }
