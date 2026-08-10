@@ -195,12 +195,14 @@ fn alloc_chunk_bo(
         tdev.cleanup_wq.clone(),
     )?;
 
-    let vmap = chunk_bo.vmap();
-    let size = vmap.owner().size();
-    // SAFETY: `vmap` owns a writable CPU mapping for the BO and `size`
-    // matches the mapped object size.
-    let mem = unsafe { core::slice::from_raw_parts_mut(vmap.addr() as *mut u8, size) };
-    mem.fill(0);
+    ChunkHeader::write(
+        &chunk_bo,
+        0,
+        ChunkHeader {
+            next: 0,
+            _unknown: [0; 14],
+        },
+    )?;
 
     Ok(chunk_bo)
 }
