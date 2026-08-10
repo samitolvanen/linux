@@ -18,6 +18,10 @@ use kernel::{
         Bound,
         Device, //
     },
+    dma::{
+        sync_sgtable_for_device,
+        DataDirection, //
+    },
     drm::gem::{
         shmem::VMapOwned,
         BaseObject, //
@@ -64,6 +68,7 @@ use crate::{
     },
     gem,
     gem::{
+        Bo,
         BoData,
         KernelBo,
         KernelBoVaAlloc, //
@@ -319,6 +324,19 @@ impl<'drm> Firmware<'drm> {
         Ok(())
     }
 
+    /// Restores device ownership of a section buffer once its contents
+    /// have been written through the CPU mapping.
+    fn sync_section(dev: &Device<Bound>, bo: &Bo) -> Result {
+        let sgt = bo.sg_table(dev)?;
+
+        // SAFETY: `sg_table` returns EINVAL unless `dev` is the BO's own
+        // device, so `sgt` is DMA-mapped for `dev`, and the borrow keeps that
+        // mapping alive for the call.
+        unsafe { sync_sgtable_for_device(dev, sgt, DataDirection::ToDevice) };
+
+        Ok(())
+    }
+
     fn request(ddev: &TyrDrmDevice, gpu_info: &GpuInfo) -> Result<kernel::firmware::Firmware> {
         let gpu_id = GPU_ID::from_raw(gpu_info.gpu_id);
 
@@ -392,6 +410,7 @@ impl<'drm> Firmware<'drm> {
 
                 let vmap = mem.bo().owned_vmap::<0>()?;
                 Self::init_section_mem(dev, &vmap, &data, section_flags)?;
+                Self::sync_section(dev, mem.bo())?;
 
                 sections.push(
                     Section {
@@ -585,16 +604,15 @@ impl<'drm> Firmware<'drm> {
     /// Rewrites every firmware section from the data retained at load
     /// time.
     ///
-    /// Writes go through the vmaps retained in `Section`, so the reset
+    /// Writes go through the vmaps retained in `Section` and the sync
+    /// through the scatter-gather tables mapped at load, so the reset
     /// path neither allocates nor takes BO locks.
     fn reload_sections(&self) -> Result {
+        let dev = self.dev.as_ref();
+
         for section in self.sections.iter() {
-            Self::init_section_mem(
-                self.vm.dev(),
-                &section.vmap,
-                &section.data,
-                section.section_flags,
-            )?;
+            Self::init_section_mem(dev, &section.vmap, &section.data, section.section_flags)?;
+            Self::sync_section(dev, section.mem.bo())?;
         }
         Ok(())
     }
