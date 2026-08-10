@@ -465,14 +465,16 @@ impl Job {
                 let first = i == 0;
                 let last = i + 1 == self.pieces.len();
 
-                let (first_qword, status) = read_user_stream_head(group, piece.stream_addr);
-                trace::user_stream_head(
-                    group.handle(),
-                    self.queue_index as u32,
-                    piece.stream_addr,
-                    first_qword,
-                    status,
-                );
+                if trace::user_stream_head_enabled() {
+                    let (first_qword, status) = read_user_stream_head(group, piece.stream_addr);
+                    trace::user_stream_head(
+                        group.handle(),
+                        self.queue_index as u32,
+                        piece.stream_addr,
+                        first_qword,
+                        status,
+                    );
+                }
                 trace::wrapper_call(
                     group.handle(),
                     self.queue_index as u32,
