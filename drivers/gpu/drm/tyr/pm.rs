@@ -166,7 +166,7 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     // reload instead of the fast resident-section reboot.
     let pending_reset = tdev.reset.claim_pending();
 
-    let hw = if pending_reset {
+    let hw = if pending_reset || tdev.fw.needs_reload() {
         resume_hw_components(dev, data, true)
     } else {
         resume_hw_components(dev, data, false).or_else(|e| {
