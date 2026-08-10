@@ -437,6 +437,17 @@ impl Firmware {
         self.global_iface.ring_csg_doorbells(csg_mask)
     }
 
+    /// Like `with_csg_mut` followed by `ring_csg_doorbells` for the same
+    /// slot, but holds the firmware interface lock across `f` and the
+    /// doorbell-request toggle. `f` must not sleep or take the scheduler
+    /// or `csg_slot_manager` mutexes.
+    pub(crate) fn with_csg_mut_ring_doorbell<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut global::CsgInterface) -> Result<R>,
+    {
+        self.global_iface.with_csg_mut_ring_doorbell(csg_idx, f)
+    }
+
     /// Waits for the firmware to acknowledge every bit in `mask` for the
     /// `CSG_REQ` word at `csg_idx`.
     ///

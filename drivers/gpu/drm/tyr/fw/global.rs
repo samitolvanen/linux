@@ -311,6 +311,29 @@ impl GlobalInterface {
         self.ring_doorbell(0)
     }
 
+    /// Like `with_csg_mut` followed by `ring_csg_doorbells` for the same
+    /// slot, but runs `f` and the `GLB_DB_REQ` toggle under a single hold
+    /// of the interface lock, then rings the global doorbell after
+    /// releasing it.
+    pub(super) fn with_csg_mut_ring_doorbell<F, R>(&self, csg_idx: usize, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut csg::CsgInterface) -> Result<R>,
+    {
+        let ret = {
+            let mut inner = self.inner.lock();
+            let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
+            let ret = f(csg)?;
+
+            let mut mask = CsgSlotMask::empty();
+            mask.insert(csg_idx);
+            inner.toggle_glb_db_req(mask)?;
+            ret
+        };
+
+        self.ring_doorbell(0)?;
+        Ok(ret)
+    }
+
     fn ring_doorbell(&self, doorbell_id: usize) -> Result {
         // SAFETY: Firmware global interface access only happens after the device is bound.
         let dev = unsafe { self.pdev.as_ref().as_bound() };
