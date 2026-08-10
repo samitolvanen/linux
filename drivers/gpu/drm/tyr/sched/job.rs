@@ -8,7 +8,11 @@
 
 use kernel::{
     alloc::KVec,
-    bits::genmask_checked_u64,
+    bits::{
+        genmask_checked_u64,
+        genmask_u32,
+        //
+    },
     prelude::*,
     transmute::FromBytes,
     uaccess::UserSlice,
@@ -127,7 +131,8 @@ struct StreamPiece {
     stream_size: u32,
     /// FLUSH_ID counter snapshot the userspace ABI passes through so the
     /// wrapper's `FLUSH_CACHE2` is conditional on the GPU not having
-    /// already flushed at or beyond this point.
+    /// already flushed at or beyond this point. Validated as having
+    /// bits 30:24 clear by `RawQueueSubmit::validate`.
     latest_flush: u32,
 }
 
@@ -183,6 +188,10 @@ impl RawQueueSubmit {
         }
 
         if self.0.stream_addr & 63 != 0 || self.0.stream_size & 7 != 0 {
+            return Err(EINVAL);
+        }
+
+        if self.0.latest_flush & genmask_u32(24..=30) != 0 {
             return Err(EINVAL);
         }
 
