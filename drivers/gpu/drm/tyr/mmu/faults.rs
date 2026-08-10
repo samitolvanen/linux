@@ -7,7 +7,17 @@
 //! path report faults without forcing the top-level MMU or driver code to know
 //! the raw register layout.
 
-use kernel::{c_str, devres::Devres, io::register::Array, io::Io, prelude::*, str::CStr};
+use kernel::{
+    c_str,
+    devres::Devres,
+    io::{
+        register::Array,
+        Io, //
+    },
+    prelude::*,
+    str::CStr,
+    time::Delta, //
+};
 
 use crate::{
     driver::{
@@ -178,6 +188,44 @@ fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) 
     }
 }
 
+/// Reports the tiler-heap chunk the faulting address belonged to, if
+/// the pool of the group bound to the faulting AS slot still has a
+/// record of one.
+fn report_heap_for_fault(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) {
+    if csg_id == u32::MAX {
+        return;
+    }
+
+    let Some(pool) = Scheduler::heap_pool_for_csg(tdev, csg_id as usize, group_uid) else {
+        pr_err!(
+            "fault VA 0x{:016X}: no heap pool, or its lock is contended\n",
+            addr
+        );
+        return;
+    };
+
+    match pool.lookup_chunk_va(addr) {
+        None => pr_err!("fault VA 0x{:016X}: in no recorded heap chunk\n", addr),
+        Some(record) => {
+            let (state, age) = match record.free {
+                Some(free) => ("freed", free.elapsed()),
+                None => (
+                    "LIVE, allocated",
+                    record.alloc.map_or(Delta::ZERO, |a| a.elapsed()),
+                ),
+            };
+            pr_err!(
+                "fault VA 0x{:016X} in heap chunk 0x{:016X} size 0x{:X}, {} {}us ago\n",
+                addr,
+                record.va,
+                record.size,
+                state,
+                age.as_micros_ceil(),
+            );
+        }
+    }
+}
+
 pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDrmDevice) -> Result {
     while status != 0 {
         let as_index = (status | (status >> 16)).trailing_zeros();
@@ -269,6 +317,7 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDr
         );
 
         report_fault_va(tdev, csg_id, group_uid, addr);
+        report_heap_for_fault(tdev, csg_id, group_uid, addr);
 
         status &= !mask;
     }
