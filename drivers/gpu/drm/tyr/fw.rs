@@ -259,6 +259,24 @@ impl PinnedDrop for Firmware {
     }
 }
 
+/// Why the MCU did not reach a requested `MCU_STATUS` value.
+enum McuWaitError {
+    /// The poll gave up with the MCU in this state.
+    Timeout(McuStatus),
+
+    /// The request or the read failed, so no state is reported.
+    Failed(Error),
+}
+
+impl From<McuWaitError> for Error {
+    fn from(e: McuWaitError) -> Self {
+        match e {
+            McuWaitError::Timeout(_) => ETIMEDOUT,
+            McuWaitError::Failed(e) => e,
+        }
+    }
+}
+
 impl Firmware {
     fn find_shared_section(sections: &KVec<Section>) -> Result<&Section> {
         sections
@@ -426,7 +444,9 @@ impl Firmware {
         target: McuStatus,
         interval: time::Delta,
         timeout: time::Delta,
-    ) -> Result {
+    ) -> Result<(), McuWaitError> {
+        let mut last = None;
+
         poll::read_poll_timeout(
             || {
                 iomem
@@ -434,11 +454,18 @@ impl Firmware {
                     .ok_or(ENODEV)
                     .map(|io| io.read(MCU_STATUS))
             },
-            |status| status.value() == target,
+            |status| {
+                last = Some(status.value());
+                status.value() == target
+            },
             interval,
             timeout,
         )
         .map(|_| ())
+        .map_err(|e| match last {
+            Some(status) if e == ETIMEDOUT => McuWaitError::Timeout(status),
+            _ => McuWaitError::Failed(e),
+        })
     }
 
     pub(crate) fn boot(&self) -> Result {
@@ -453,16 +480,16 @@ impl Firmware {
             time::Delta::from_millis(1),
             time::Delta::from_millis(100),
         ) {
-            let io = self.iomem.try_access().ok_or(ENODEV)?;
-            let status = io.read(MCU_STATUS);
-            pr_err!("MCU failed to boot, status: {:?}", status.value());
-            return Err(e);
+            if let McuWaitError::Timeout(status) = e {
+                pr_err!("MCU failed to boot, status: {:?}\n", status);
+            }
+            return Err(e.into());
         }
         Ok(())
     }
 
-    fn halt_mcu(&self) -> Result {
-        self.global_iface.halt_mcu()?;
+    fn halt_mcu(&self) -> Result<(), McuWaitError> {
+        self.global_iface.halt_mcu().map_err(McuWaitError::Failed)?;
 
         Self::wait_for_mcu_status(
             &self.iomem,
@@ -501,11 +528,18 @@ impl Firmware {
     /// slot for resume to reprogram.
     pub(crate) fn suspend(&self, tdev: &TyrDrmDevice, dev: &Device<Bound>) {
         if let Err(e) = self.halt_mcu() {
-            dev_warn!(
-                self.pdev.as_ref(),
-                "Failed to cleanly halt the MCU: {:?}\n",
-                e
-            );
+            match e {
+                McuWaitError::Timeout(status) => dev_warn!(
+                    self.pdev.as_ref(),
+                    "Failed to cleanly halt the MCU, status: {:?}\n",
+                    status
+                ),
+                McuWaitError::Failed(e) => dev_warn!(
+                    self.pdev.as_ref(),
+                    "Failed to cleanly halt the MCU: {:?}\n",
+                    e
+                ),
+            }
             self.unclean_stop.store(true, Release);
         }
 
