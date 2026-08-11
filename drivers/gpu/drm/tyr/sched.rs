@@ -955,19 +955,9 @@ impl Scheduler {
             Ok::<_, Error>(())
         })?;
 
-        // Publish each captured sync-wait onto its queue. Empty
-        // ringbuffer probes hit firmware-shared memory and don't take
-        // the firmware lock, so they go in this pre-pass too.
-        let mut empty_queues: u32 = 0;
-        for cs_id in 0..queue_count {
-            let queue = &group.queues[cs_id];
-            if let Some((gpu_va, ref_val, sync64, gt)) = sync_waits[cs_id].take() {
-                queue.set_syncwait(gpu_va, ref_val, sync64, gt);
-            }
-            if blocked_reasons[cs_id] == Some(CsBlockedReason::Unblocked)
-                && queue.is_ringbuf_empty().unwrap_or(false)
-            {
-                empty_queues |= 1u32 << cs_id;
+        for (cs_id, sync_wait) in sync_waits.iter_mut().enumerate().take(queue_count) {
+            if let Some((gpu_va, ref_val, sync64, gt)) = sync_wait.take() {
+                group.queues[cs_id].set_syncwait(gpu_va, ref_val, sync64, gt);
             }
         }
 
@@ -982,8 +972,11 @@ impl Scheduler {
                 let mut blocked = false;
 
                 match blocked_reasons[cs_id] {
+                    // `is_ringbuf_empty` reads firmware-shared memory directly, not
+                    // through the firmware lock, so probing it here under `inner` is safe.
                     Some(CsBlockedReason::Unblocked)
-                        if (empty_queues & (1u32 << cs_id)) != 0 && scoreboards[cs_id] == 0 =>
+                        if scoreboards[cs_id] == 0
+                            && group.queues[cs_id].is_ringbuf_empty().unwrap_or(false) =>
                     {
                         idle = true;
                     }
