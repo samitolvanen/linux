@@ -9,8 +9,6 @@
 //! `Scheduler::request_tick`; the periodic re-arm is handled
 //! separately by `periodic_tick_work` on the system unbound workqueue.
 
-use core::sync::atomic::Ordering;
-
 use kernel::{
     list::{
         List,
@@ -67,11 +65,9 @@ enum Action {
     /// Retain currently bound groups that match the rule criteria.
     Keep,
     /// Retain currently bound groups that match the rule criteria,
-    /// except for the one with the highest `bound_tick_counter` at
-    /// this priority. Used on full ticks to rotate at most one
-    /// bound group per priority and leave a single slot for a
-    /// subsequent `Take`.
-    KeepExceptOldest,
+    /// except the rotating one, whose slot is left to a subsequent
+    /// `Take`.
+    KeepExceptRotated,
     /// Bind new, unbound groups from the software queues that match
     /// the rule criteria.
     Take,
@@ -197,45 +193,49 @@ enum SortClass {
     PendingIdle,
 }
 
-/// Picks the retained selection that rotates within one software
-/// priority band, returning its index in
-/// `SchedulingDecision::selections`.
+/// Finds the slot holding the group that rotates in each software
+/// priority band.
 ///
-/// A full tick rotates the whole band, so the retained group holding
-/// the highest firmware priority in it rotates. A normal tick leaves
-/// the active half in its current hardware order and rotates the idle
-/// half.
-fn rotated_selection(band: &[(SelectedGroup, usize)], full_tick: bool) -> Option<usize> {
-    let mut rotated: Option<(u32, usize)> = None;
+/// The resident holding the highest firmware priority in a band
+/// rotates. Ties resolve to the lowest slot index. A normal tick
+/// only considers idle or non-runnable residents, so an active,
+/// runnable resident can only rotate on a full tick.
+fn find_rotated_slots(
+    csg_slot_manager: &CsgSlotManager,
+    slot_count: usize,
+    full_tick: bool,
+) -> [Option<usize>; Priority::num_priorities()] {
+    let mut rotated = [const { None }; Priority::num_priorities()];
+    let mut highest = [0u32; Priority::num_priorities()];
 
-    for (sel, idx) in band {
-        let SelectedGroup::Kept(_, _, is_idle, fw_prio) = sel else {
+    for i in 0..slot_count {
+        let Some(slot_data) = csg_slot_manager.slot_data(i) else {
             continue;
         };
 
-        if !full_tick && !is_idle {
+        let status = slot_data.group.status();
+        if !full_tick && !status.is_idle && status.can_run {
             continue;
         }
 
-        if rotated.is_none_or(|(highest, _)| *fw_prio > highest) {
-            rotated = Some((*fw_prio, *idx));
+        let band = slot_data.group.priority as usize;
+        if rotated[band].is_none() || slot_data.fw_priority > highest[band] {
+            rotated[band] = Some(i);
+            highest[band] = slot_data.fw_priority;
         }
     }
 
-    rotated.map(|(_, idx)| idx)
+    rotated
 }
 
 /// Key for ordering selections within one software priority band.
 ///
-/// `rotated` is the `selections` index returned by
-/// `rotated_selection`.
+/// `rotated` is the band's entry in `SchedulingDecision::rotated_slots`.
 fn sort_key(
     sel: &SelectedGroup,
     original_idx: usize,
     rotated: Option<usize>,
 ) -> (SortClass, u32, usize) {
-    let is_rotated = rotated == Some(original_idx);
-
     match sel {
         SelectedGroup::Pending(_, _, is_idle) => {
             let class = if *is_idle {
@@ -246,8 +246,8 @@ fn sort_key(
             (class, 0, original_idx)
         }
 
-        SelectedGroup::Kept(_, _, is_idle, fw_prio) => {
-            let class = match (*is_idle, is_rotated) {
+        SelectedGroup::Kept(slot_idx, _, is_idle, fw_prio) => {
+            let class = match (*is_idle, rotated == Some(*slot_idx)) {
                 (false, false) => SortClass::KeptActive,
                 (false, true) => SortClass::RotatedActive,
                 (true, false) => SortClass::KeptIdle,
@@ -277,7 +277,7 @@ impl SelectedGroup {
     /// newly bound idle groups.
     pub(crate) fn iter_prioritized(
         selections: &[Option<SelectedGroup>],
-        full_tick: bool,
+        rotated_slots: [Option<usize>; Priority::num_priorities()],
     ) -> impl Iterator<Item = SelectedGroup> + '_ {
         (0..Priority::num_priorities())
             .rev()
@@ -301,10 +301,10 @@ impl SelectedGroup {
                     }
                 }
 
-                let slice = &mut prio_selections[..count];
-                let rotated = rotated_selection(slice, full_tick);
+                let rotated = rotated_slots[sw_prio as usize];
 
-                slice.sort_unstable_by_key(|(s, original_idx)| sort_key(s, *original_idx, rotated));
+                prio_selections[..count]
+                    .sort_unstable_by_key(|(s, original_idx)| sort_key(s, *original_idx, rotated));
 
                 // Truncate the padded array to the actual count and
                 // discard the stable-sort index.
@@ -334,9 +334,9 @@ pub(crate) struct PendingBind {
 
 /// Represents the outcome of evaluating scheduling rules.
 pub(crate) struct SchedulingDecision {
-    /// Set on a full tick, which rotates the whole band instead of
-    /// only its idle residents.
-    pub(crate) full_tick: bool,
+    /// Slot holding the group that rotates in each software priority
+    /// band, as returned by `find_rotated_slots`.
+    pub(crate) rotated_slots: [Option<usize>; Priority::num_priorities()],
     /// Bitmask of hardware CSG slots that will retain their currently
     /// bound group.
     pub(crate) keep_mask: u32,
@@ -373,8 +373,17 @@ impl SchedulingDecision {
         rules: impl IntoIterator<Item = Rule>,
         full_tick: bool,
     ) -> Result<Self> {
+        // Hold the slot-manager lock once across the whole rule loop
+        // so a slot's bound group cannot change between the rotation
+        // scan and the `Keep` rules that consume it.
+        // `find_rotated_slots` and `keep_bound` only read through
+        // `slot_data()` and `take_unbound` does not access the slot
+        // manager, so holding it for the full pass is safe.
+        let csg_slot_manager = tdev.csg_slot_manager.lock();
+        let slot_count = csg_slot_manager.slot_count();
+
         let mut decision = Self {
-            full_tick,
+            rotated_slots: find_rotated_slots(&csg_slot_manager, slot_count, full_tick),
             keep_mask: 0,
             all_idle: true,
             idle_group_count: 0,
@@ -385,24 +394,15 @@ impl SchedulingDecision {
             selections: [const { None }; MAX_CSGS],
         };
 
-        // Hold the slot-manager lock once across the whole rule loop
-        // so a slot's bound group cannot change between consecutive
-        // `Keep` rules. `keep_bound` only reads through `slot_data()`
-        // and `take_unbound` does not access the slot manager, so
-        // holding it for the full pass is safe.
-        let csg_slot_manager = tdev.csg_slot_manager.lock();
-        let slot_count = csg_slot_manager.slot_count();
         for rule in rules {
             match rule.action {
-                Action::Keep => {
-                    decision.keep_bound(&csg_slot_manager, slot_count, rule.priority, rule.is_idle);
-                }
-                Action::KeepExceptOldest => {
-                    decision.keep_bound_except_oldest(
+                Action::Keep | Action::KeepExceptRotated => {
+                    decision.keep_bound(
                         &csg_slot_manager,
                         slot_count,
                         rule.priority,
                         rule.is_idle,
+                        matches!(rule.action, Action::KeepExceptRotated),
                     );
                 }
                 Action::Take => {
@@ -468,121 +468,54 @@ impl SchedulingDecision {
     }
 
     /// Selects currently bound groups matching the priority and idle
-    /// state to be retained.
+    /// state to be retained, in descending firmware priority order.
+    ///
+    /// The rotating group is retained last, or not at all when
+    /// `skip_rotated` is set. When a band has more eligible groups than
+    /// slots, the highest-priority ones are kept and the rest are
+    /// dropped.
     fn keep_bound(
         &mut self,
         csg_slot_manager: &CsgSlotManager,
         slot_count: usize,
         priority: Priority,
         is_idle: bool,
+        skip_rotated: bool,
     ) {
+        let rotated = self.rotated_slots[priority as usize];
+        let mut candidates = [(0u32, 0usize); MAX_CSGS];
+        let mut count = 0;
+
         for i in 0..slot_count {
+            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                continue;
+            };
+
+            let status = slot_data.group.status();
+            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
+            {
+                continue;
+            }
+
+            if (self.keep_mask & (1u32 << i)) != 0 || (skip_rotated && rotated == Some(i)) {
+                continue;
+            }
+
+            candidates[count] = (slot_data.fw_priority, i);
+            count += 1;
+        }
+
+        candidates[..count].sort_unstable_by_key(|&(fw_priority, i)| {
+            (rotated == Some(i), u32::MAX - fw_priority, i)
+        });
+
+        for &(fw_priority, i) in &candidates[..count] {
             if self.num_selected >= slot_count {
                 break;
             }
 
-            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
-                continue;
-            };
-
-            let status = slot_data.group.status();
-            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
-            {
-                continue;
-            }
-
-            if (self.keep_mask & (1u32 << i)) != 0 {
-                continue;
-            }
-
             self.keep_mask |= 1u32 << i;
 
-            let fw_priority = slot_data.fw_priority;
-            self.selections[self.num_selected] =
-                Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
-
-            self.num_selected += 1;
-
-            if !is_idle {
-                self.all_idle = false;
-                self.nonidle_group_counts[priority as usize] += 1;
-            } else {
-                self.idle_group_count += 1;
-            }
-        }
-    }
-
-    /// Like `Self::keep_bound`, but excludes the longest-resident
-    /// eligible group at `priority` so a subsequent `Take` can rotate
-    /// it out.
-    ///
-    /// Among bound groups matching `(priority, is_idle)` whose status
-    /// allows them to run, the one with the highest
-    /// `bound_tick_counter` is left unselected; ties resolve to the
-    /// lowest slot index. All other eligible groups are retained
-    /// with the same bookkeeping as `keep_bound`. If there is only
-    /// one eligible group, none are retained here; the trailing
-    /// `Keep` re-adds it when `Take` did not consume the freed slot.
-    fn keep_bound_except_oldest(
-        &mut self,
-        csg_slot_manager: &CsgSlotManager,
-        slot_count: usize,
-        priority: Priority,
-        is_idle: bool,
-    ) {
-        let mut oldest_slot: Option<usize> = None;
-        let mut oldest_counter: u32 = 0;
-        for i in 0..slot_count {
-            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
-                continue;
-            };
-
-            let status = slot_data.group.status();
-            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
-            {
-                continue;
-            }
-
-            if (self.keep_mask & (1u32 << i)) != 0 {
-                continue;
-            }
-
-            let counter = slot_data.group.bound_tick_counter.load(Ordering::Relaxed);
-            if oldest_slot.is_none() || counter > oldest_counter {
-                oldest_slot = Some(i);
-                oldest_counter = counter;
-            }
-        }
-
-        let Some(skip) = oldest_slot else {
-            return;
-        };
-
-        for i in 0..slot_count {
-            if i == skip {
-                continue;
-            }
-            if self.num_selected >= slot_count {
-                break;
-            }
-
-            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
-                continue;
-            };
-
-            let status = slot_data.group.status();
-            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
-            {
-                continue;
-            }
-
-            if (self.keep_mask & (1u32 << i)) != 0 {
-                continue;
-            }
-
-            self.keep_mask |= 1u32 << i;
-
-            let fw_priority = slot_data.fw_priority;
             self.selections[self.num_selected] =
                 Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
 
@@ -702,19 +635,13 @@ impl<'a> Tick<'a> {
                 Keep Medium,   Take Medium,
                 Keep Low,      Take Low,
             ],
-            // A full tick rotates at most one bound group per
-            // priority. `KeepExceptOldest` retains every eligible
-            // bound group except the longest-resident one, freeing a
-            // single slot for the subsequent `Take` to fill from the
-            // runnable queue. The trailing `Keep` re-admits the
-            // excluded group when no runnable group claimed the
-            // slot, so a steady-state set still time-slices fairly
-            // without evicting groups that have nowhere else to go.
+            // The trailing `Keep` re-admits the rotating group when no
+            // runnable group claimed the slot it left.
             if full_tick => [
-                KeepExceptOldest RealTime, Take RealTime, Keep RealTime,
-                KeepExceptOldest High,     Take High,     Keep High,
-                KeepExceptOldest Medium,   Take Medium,   Keep Medium,
-                KeepExceptOldest Low,      Take Low,      Keep Low,
+                KeepExceptRotated RealTime, Take RealTime, Keep RealTime,
+                KeepExceptRotated High,     Take High,     Keep High,
+                KeepExceptRotated Medium,   Take Medium,   Keep Medium,
+                KeepExceptRotated Low,      Take Low,      Keep Low,
             ],
             // A normal tick prefers to keep currently bound active
             // groups running to minimise context-switching overhead.
@@ -851,19 +778,13 @@ impl<'a> Tick<'a> {
 
             for selection in SelectedGroup::iter_prioritized(
                 &decision.selections[..decision.num_selected],
-                decision.full_tick,
+                decision.rotated_slots,
             ) {
                 let fw_prio = next_fw_prio;
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
                 match selection {
                     SelectedGroup::Kept(slot_idx, _sw_prio, _is_idle, cur_fw_prio) => {
-                        if let Some(slot_data) = csg_slot_manager.slot_data(slot_idx) {
-                            slot_data
-                                .group
-                                .bound_tick_counter
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
                         if cur_fw_prio == fw_prio {
                             continue;
                         }
@@ -914,7 +835,6 @@ impl<'a> Tick<'a> {
                             continue;
                         }
 
-                        group.bound_tick_counter.store(0, Ordering::Relaxed);
                         drop(pending.list_arc);
                     }
                 }
