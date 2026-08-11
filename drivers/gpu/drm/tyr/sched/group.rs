@@ -295,9 +295,9 @@ pub(crate) struct Group {
     #[allow(dead_code)]
     pub(super) max_tiler_cores: u8,
     #[allow(dead_code)]
-    pub(super) suspend_buf: Arc<gem::MappedBo>,
+    pub(super) suspend_buf: gem::KernelBo,
     #[allow(dead_code)]
-    pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
+    pub(super) protm_suspend_buf: gem::KernelBo,
     _syncobjs: Arc<gem::MappedBo>,
     #[pin]
     heap_pool: Mutex<Option<Arc<heap::Pool>>>,

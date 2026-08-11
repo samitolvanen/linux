@@ -504,10 +504,10 @@ impl Firmware {
         &self,
         tdev: &TyrDrmDevice,
         suspend_size: usize,
-    ) -> Result<Arc<gem::MappedBo>> {
+    ) -> Result<gem::KernelBo> {
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
-        gem::new_kernel_object(
+        gem::new_kernel_object_no_vmap(
             tdev,
             &self.vm,
             suspend_size,
