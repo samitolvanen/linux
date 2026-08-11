@@ -648,7 +648,7 @@ impl platform::Driver for TyrPlatformDriver {
 
             firmware.enable_global_interface(core_clk.rate().as_hz() as u64, io)?;
 
-            let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware)?;
+            let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware, &mmu)?;
             unreg_dev.sched.lock().enable(scheduler);
 
             let wq = Arc::new(
