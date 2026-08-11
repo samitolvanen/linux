@@ -815,6 +815,22 @@ kernel::declare_trace! {
     ///
     /// Always safe to call.
     #[allow(clippy::too_many_arguments)]
+    unsafe fn tyr_heap_chunk_canary(
+        group_id: u64,
+        group_uid: u64,
+        heap_index: u32,
+        chunk_index: u32,
+        chunk_va: u64,
+        offset: u32,
+        expected: u32,
+        found: u32,
+        bad_mask: u32,
+    );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn tyr_heap_chain_link(
         trigger: u32,
         group_id: u64,
@@ -2709,6 +2725,41 @@ pub(crate) fn heap_chunk_dump(
             chunk_index,
             chunk_va,
             header.as_ptr(),
+        )
+    }
+}
+
+/// A tiler-heap chunk header whose software-defined words no longer
+/// carry the canary written at allocation. `bad_mask` has bit `i` set
+/// for word `i` of the 14-word reserved region, and `offset` is the byte
+/// offset into the header of the first word that differs, sampled by
+/// `expected` and `found`.
+///
+/// Downstream-only debug aid; not for upstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn heap_chunk_canary(
+    group_id: u64,
+    group_uid: u64,
+    heap_index: u32,
+    chunk_index: u32,
+    chunk_va: u64,
+    offset: u32,
+    expected: u32,
+    found: u32,
+    bad_mask: u32,
+) {
+    // SAFETY: Always safe to call.
+    unsafe {
+        tyr_heap_chunk_canary(
+            group_id,
+            group_uid,
+            heap_index,
+            chunk_index,
+            chunk_va,
+            offset,
+            expected,
+            found,
+            bad_mask,
         )
     }
 }

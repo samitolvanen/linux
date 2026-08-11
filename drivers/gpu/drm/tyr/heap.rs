@@ -387,6 +387,81 @@ fn walk_chunk_chain(
     );
 }
 
+/// Recognizable base pattern for the canary in a chunk header.
+const CHUNK_CANARY_MAGIC: u32 = 0x4352_5954;
+
+/// Byte offset of the reserved region of a chunk header.
+const CHUNK_CANARY_OFFSET: usize = 8;
+
+/// First word of that region the canary fills. From it up the words are
+/// software-defined, which the hardware neither reads nor writes.
+const CHUNK_CANARY_FIRST_WORD: usize = 12;
+
+/// Canary word for word `index` of the reserved region of the header of
+/// the chunk at `chunk_va`. Mixing in the address and the index means a
+/// header copied from another chunk, or shifted within this one, does
+/// not read back as intact.
+///
+/// Downstream-only debug aid; not for upstream.
+fn canary_word(chunk_va: u64, index: usize) -> u32 {
+    CHUNK_CANARY_MAGIC ^ (chunk_va as u32) ^ (index as u32)
+}
+
+/// Compares the software-defined words of a chunk header against the
+/// canary written at allocation and reports the first that differs,
+/// along with a mask of every word that does.
+///
+/// Downstream-only debug aid; not for upstream.
+fn check_chunk_canary(
+    group_id: u64,
+    group_uid: u64,
+    heap_index: u32,
+    chunk_index: u32,
+    chunk_va: u64,
+    header: &[u8; 64],
+) {
+    let Some(reserved) = header.get(CHUNK_CANARY_OFFSET..) else {
+        return;
+    };
+
+    let mut first_bad = None;
+    let mut bad_mask = 0;
+    for (index, word) in reserved
+        .chunks_exact(4)
+        .enumerate()
+        .skip(CHUNK_CANARY_FIRST_WORD)
+    {
+        let Ok(bytes) = <[u8; 4]>::try_from(word) else {
+            continue;
+        };
+
+        let found = u32::from_le_bytes(bytes);
+        let expected = canary_word(chunk_va, index);
+        if found == expected {
+            continue;
+        }
+
+        bad_mask |= 1u32 << index;
+        first_bad.get_or_insert((index, expected, found));
+    }
+
+    let Some((index, expected, found)) = first_bad else {
+        return;
+    };
+
+    trace::heap_chunk_canary(
+        group_id,
+        group_uid,
+        heap_index,
+        chunk_index,
+        chunk_va,
+        (CHUNK_CANARY_OFFSET + index * 4) as u32,
+        expected,
+        found,
+        bad_mask,
+    );
+}
+
 #[repr(C)]
 pub(crate) struct ChunkHeader {
     // Written to GPU-visible memory through `write`; never read back.
@@ -396,6 +471,25 @@ pub(crate) struct ChunkHeader {
 }
 
 impl ChunkHeader {
+    /// Header for the chunk at `chunk_va`, with the software-defined
+    /// words carrying that chunk's canary.
+    fn new(next: u64, chunk_va: u64) -> Self {
+        let mut header = Self {
+            next,
+            _unknown: [0; 14],
+        };
+        for (index, word) in header
+            ._unknown
+            .iter_mut()
+            .enumerate()
+            .skip(CHUNK_CANARY_FIRST_WORD)
+        {
+            *word = canary_word(chunk_va, index);
+        }
+
+        header
+    }
+
     fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
         mem.check_offset::<Self>(offset)?;
 
@@ -562,14 +656,8 @@ fn alloc_chunk(
         tdev.cleanup_wq.clone(),
     )?;
 
-    ChunkHeader::write(
-        &chunk_bo,
-        0,
-        ChunkHeader {
-            next: 0,
-            _unknown: [0; 14],
-        },
-    )?;
+    let chunk_va = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
+    ChunkHeader::write(&chunk_bo, 0, ChunkHeader::new(0, chunk_va))?;
 
     Ok(Chunk::new(chunk_bo, ledger.clone()))
 }
@@ -589,14 +677,8 @@ impl Context {
         if let Some(prev) = self.chunks.first() {
             let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
                 | (u64::from(self.chunk_size) >> 12);
-            ChunkHeader::write(
-                &chunk_bo,
-                0,
-                ChunkHeader {
-                    next,
-                    _unknown: [0; 14],
-                },
-            )?;
+            let chunk_va = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
+            ChunkHeader::write(&chunk_bo, 0, ChunkHeader::new(next, chunk_va))?;
         }
 
         self.push_chunk(chunk_bo)
@@ -1047,6 +1129,15 @@ impl Pool {
                     group_id,
                     group_uid,
                     cs_id,
+                    index as u32,
+                    chunk_index as u32,
+                    chunk_va,
+                    &header,
+                );
+
+                check_chunk_canary(
+                    group_id,
+                    group_uid,
                     index as u32,
                     chunk_index as u32,
                     chunk_va,
