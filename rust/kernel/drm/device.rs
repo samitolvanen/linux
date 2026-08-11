@@ -232,7 +232,8 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
     }
 
     const GEM_FOPS: bindings::file_operations = {
-        let mut fops = drm::gem::create_fops();
+        let mut fops =
+            drm::gem::create_fops(crate::module::this_module::<T::OwnerModule>().as_ptr());
         fops.mmap = Some(Self::mmap_callback);
         if T::HAS_SHOW_FDINFO {
             fops.show_fdinfo = Some(bindings::drm_show_fdinfo);
