@@ -47,6 +47,9 @@ pub(crate) struct LiveRange {
     inner: Arc<RangeAllocInner>,
     offset: u64,
     size: usize,
+    /// Whether `Drop` keeps the reservation instead of returning it to
+    /// the allocator.
+    leaked: bool,
 }
 
 impl RangeAlloc {
@@ -82,6 +85,7 @@ impl RangeAlloc {
             inner: self.inner.clone(),
             offset,
             size,
+            leaked: false,
         })
     }
 
@@ -110,6 +114,7 @@ impl RangeAlloc {
             inner: self.inner.clone(),
             offset: start,
             size: (end - start) as usize,
+            leaked: false,
         })
     }
 }
@@ -198,11 +203,23 @@ impl LiveRange {
     pub(crate) fn range(&self) -> Range<u64> {
         self.start()..self.end()
     }
+
+    /// Keeps the range reserved for the life of the allocator.
+    ///
+    /// The caller could not tear down what occupies the range, so its
+    /// addresses must never be handed out again.
+    pub(crate) fn leak(mut self) {
+        self.leaked = true;
+    }
 }
 
 impl Drop for LiveRange {
     #[cfg(target_pointer_width = "32")]
     fn drop(&mut self) {
+        if self.leaked {
+            return;
+        }
+
         let _guard = self.inner.lock.lock();
 
         if let Some(range) = self.inner.maple_range(self.start(), self.end()) {
@@ -212,6 +229,10 @@ impl Drop for LiveRange {
 
     #[cfg(target_pointer_width = "64")]
     fn drop(&mut self) {
+        if self.leaked {
+            return;
+        }
+
         let _guard = self.inner.lock.lock();
         self.inner.maple.erase(self.offset as usize);
     }

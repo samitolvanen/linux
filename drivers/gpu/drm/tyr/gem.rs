@@ -356,8 +356,9 @@ pub(crate) struct KernelBo {
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`. Dropped from the
     /// deferred cleanup once `Vm::unmap_range` has torn the mapping
-    /// down. `None` when the VA is managed externally, as on the
-    /// firmware load path.
+    /// down, or leaked if the unmap fails and a live mapping still
+    /// covers the address. `None` when the VA is managed externally,
+    /// as on the firmware load path.
     kernel_node: Option<range::LiveRange>,
 }
 
@@ -502,18 +503,27 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
         size,
         kernel_node,
     } = captures;
-    if let Err(e) = vm.unmap_range(va, size) {
-        pr_err!(
-            "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-            va,
-            va + size,
-            e
-        );
-    }
-    // Order: drop `bo` first (just a refcount), then `kernel_node`
-    // which releases the VA back to the pool. The unmap above must
-    // complete first so the next allocation handed this VA does not
-    // observe stale PTEs.
+    let unmapped = vm
+        .unmap_range(va, size)
+        .inspect_err(|e| {
+            dev_err!(
+                vm.dev(),
+                "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
+                va,
+                va + size,
+                e
+            );
+        })
+        .is_ok();
     drop(bo);
-    drop(kernel_node);
+    release_kernel_va(kernel_node, unmapped);
+}
+
+/// Frees the kernel-VA reservation, or keeps it out of the pool when the
+/// unmap failed and a live mapping still covers the address.
+fn release_kernel_va(node: Option<range::LiveRange>, unmapped: bool) {
+    match node {
+        Some(node) if !unmapped => node.leak(),
+        node => drop(node),
+    }
 }
