@@ -3206,6 +3206,50 @@ TRACE_EVENT(tyr_heap_event_chunk_dump,
 );
 
 /*
+ * A tiler-heap chunk header whose software-defined words no longer carry
+ * the canary written at allocation. `bad_mask` has bit i set for word i of
+ * the 14-word reserved region at header offset 8, so only bits 12 and 13
+ * can be set, standing for offsets 0x38 and 0x3c. The hardware neither
+ * reads nor writes those two words, so a difference there is unambiguous.
+ * `offset` is the byte offset into the header of the first word that
+ * differs, with `expected` and `found` sampling it. Emitted from the
+ * chunk-header dump above, so it costs no extra read.
+ */
+TRACE_EVENT(tyr_heap_chunk_canary,
+	TP_PROTO(u64 group_id, u64 group_uid, u32 heap_index, u32 chunk_index,
+		 u64 chunk_va, u32 offset, u32 expected, u32 found,
+		 u32 bad_mask),
+	TP_ARGS(group_id, group_uid, heap_index, chunk_index, chunk_va, offset,
+		expected, found, bad_mask),
+	TP_STRUCT__entry(
+		__field(u64, group_id)
+		__field(u64, group_uid)
+		__field(u32, heap_index)
+		__field(u32, chunk_index)
+		__field(u64, chunk_va)
+		__field(u32, offset)
+		__field(u32, expected)
+		__field(u32, found)
+		__field(u32, bad_mask)
+	),
+	TP_fast_assign(
+		__entry->group_id = group_id;
+		__entry->group_uid = group_uid;
+		__entry->heap_index = heap_index;
+		__entry->chunk_index = chunk_index;
+		__entry->chunk_va = chunk_va;
+		__entry->offset = offset;
+		__entry->expected = expected;
+		__entry->found = found;
+		__entry->bad_mask = bad_mask;
+	),
+	TP_printk("group=%llu group_uid=%llu heap=%u chunk=%u va=0x%llx offset=0x%x expected=0x%08x found=0x%08x bad_mask=0x%04x",
+		  __entry->group_id, __entry->group_uid, __entry->heap_index,
+		  __entry->chunk_index, __entry->chunk_va, __entry->offset,
+		  __entry->expected, __entry->found, __entry->bad_mask)
+);
+
+/*
  * Classes of one link of a tiler-heap chunk chain. Keep in sync with
  * `HeapChainClass` in drivers/gpu/drm/tyr/trace.rs.
  */
