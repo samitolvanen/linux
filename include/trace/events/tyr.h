@@ -3355,6 +3355,52 @@ TRACE_EVENT(tyr_heap_chain_summary,
 );
 
 /*
+ * Outcome of retrying a fault address with a single high bit cleared.
+ * Keep in sync with `FaultBitProbeResult` in
+ * drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_FAULT_BIT_PROBE_RESULTS	\
+	{ 0, "MISS" },			\
+	{ 1, "LIVE_CHUNK" },		\
+	{ 2, "FREED_CHUNK" },		\
+	{ 3, "MAPPED" }
+
+/*
+ * An unhandled fault address that resolves to neither a mapping nor a
+ * recorded tiler-heap chunk, retried with each candidate injected bit it
+ * carries cleared. An address carrying no candidate bit produces no
+ * record. `mask` is the bit that resolved, and `base_va` plus `offset`
+ * locate the chunk or mapping the masked address lands in; on MISS every
+ * field but `fault_va` is 0. A hit separates a fault address built from a
+ * mis-read descriptor from a valid address carrying one spurious bit.
+ */
+TRACE_EVENT(tyr_fault_va_bit_probe,
+	TP_PROTO(u64 fault_va, u64 mask, u64 masked_va, u64 base_va, u64 offset,
+		 u32 result),
+	TP_ARGS(fault_va, mask, masked_va, base_va, offset, result),
+	TP_STRUCT__entry(
+		__field(u64, fault_va)
+		__field(u64, mask)
+		__field(u64, masked_va)
+		__field(u64, base_va)
+		__field(u64, offset)
+		__field(u32, result)
+	),
+	TP_fast_assign(
+		__entry->fault_va = fault_va;
+		__entry->mask = mask;
+		__entry->masked_va = masked_va;
+		__entry->base_va = base_va;
+		__entry->offset = offset;
+		__entry->result = result;
+	),
+	TP_printk("fault_va=0x%llx mask=0x%llx masked_va=0x%llx base_va=0x%llx offset=0x%llx result=%s",
+		  __entry->fault_va, __entry->mask, __entry->masked_va,
+		  __entry->base_va, __entry->offset,
+		  __print_symbolic(__entry->result, TYR_FAULT_BIT_PROBE_RESULTS))
+);
+
+/*
  * When a tiler-heap read-back was taken. Keep in sync with
  * `ReadbackPhase` in drivers/gpu/drm/tyr/trace.rs.
  */
