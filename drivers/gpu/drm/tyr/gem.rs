@@ -139,7 +139,7 @@ impl MappedBo {
     }
 
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
-        self.kernel_bo.kernel_node_range()
+        self.kernel_bo.kernel_va()
     }
 
     /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
@@ -437,11 +437,35 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
     coherent: bool,
     cleanup_wq: Arc<CleanupQueue>,
 ) -> Result<Arc<MappedBo>> {
+    MappedBo::new(new_kernel_object_no_vmap(
+        dev, vm, size, flags, coherent, cleanup_wq,
+    )?)
+}
+
+/// Creates a kernel-owned GEM object mapped into the VM, without a vmap
+/// for CPU access.
+///
+/// Prefer this over `new_kernel_object` for buffers touched only by the GPU or
+/// firmware touch. On a non-coherent device, the CPU vmap would be
+/// write-combined while the GPU mapping is cacheable. Accessing memory
+/// through mismatched attributes is architecturally unpredictable on
+/// arm64.
+///
+/// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
+/// VM BO blocks operations on the others.
+pub(crate) fn new_kernel_object_no_vmap<Ctx: DeviceContext>(
+    dev: &TyrDrmDevice<Ctx>,
+    vm: &Arc<Vm>,
+    size: usize,
+    flags: VmMapFlags,
+    coherent: bool,
+    cleanup_wq: Arc<CleanupQueue>,
+) -> Result<KernelBo> {
     let aligned_size = size.next_multiple_of(1 << 12);
     let node = vm.alloc_kernel_range(aligned_size)?;
     let va = node.start();
 
-    let kernel_bo = KernelBo::new(
+    Ok(KernelBo::new(
         dev,
         vm.as_arc_borrow(),
         aligned_size as u64,
@@ -450,9 +474,7 @@ pub(crate) fn new_kernel_object<Ctx: DeviceContext>(
         coherent,
         cleanup_wq,
     )?
-    .with_va_reservation(node);
-
-    MappedBo::new(kernel_bo)
+    .with_va_reservation(node))
 }
 
 /// VA allocation strategy for kernel buffer objects.
@@ -557,15 +579,15 @@ impl KernelBo {
     /// was created against `Vm::alloc_kernel_range`. `None` for
     /// firmware-load BOs whose VA is owned by
     /// `Vm::reserve_kernel_range`.
-    fn kernel_node_range(&self) -> Option<Range<u64>> {
+    pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
         self.kernel_node.as_ref().map(|node| node.range())
     }
 
     /// Attaches a kernel-VA pool reservation to this buffer so that the
     /// VA cannot be reused until the deferred unmap in `Drop` has
-    /// actually run. Only used by `new_kernel_object`; the firmware
-    /// load path leaves the reservation `None` and manages its VA via
-    /// `Vm::reserve_kernel_range` instead.
+    /// actually run. Only used by `new_kernel_object_no_vmap`; the
+    /// firmware load path leaves the reservation `None` and manages its
+    /// VA via `Vm::reserve_kernel_range` instead.
     fn with_va_reservation(mut self, node: range::LiveRange) -> Self {
         self.kernel_node = Some(node);
         self
