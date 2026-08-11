@@ -1108,6 +1108,23 @@ impl Scheduler {
             return SubmitTick::None;
         }
 
+        self.resume_tick()
+    }
+
+    /// Decides which tick a submit to a resident group schedules after it
+    /// feeds a queue that was idle. An armed tick already re-evaluates
+    /// residency, so only a stopped one restarts.
+    pub(crate) fn resident_submit_tick(&mut self) -> SubmitTick {
+        if self.resched_target.is_some() {
+            return SubmitTick::None;
+        }
+
+        self.resume_tick()
+    }
+
+    /// Restarts a stopped tick at the rotation deadline, or now once that
+    /// deadline has passed or a slot is free.
+    fn resume_tick(&mut self) -> SubmitTick {
         let period_ms = i64::from(tick::TICK_PERIOD_MS);
         self.resched_target = Some(self.last_tick + Delta::from_millis(period_ms));
 

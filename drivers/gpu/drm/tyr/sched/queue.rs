@@ -868,12 +868,16 @@ impl QueueOps for TyrQueueOps {
         // outside the lock would race an eviction and fail the kick for
         // committed ringbuf bytes.
         let group = &job.job.group;
-        let (active, kick_err) = group.with_locked_inner(|inner| {
+        let queue_index = job.job.queue_index;
+        let (active, kick_err, resume_tick) = group.with_locked_inner(|inner| {
             if inner.csg_id.is_none() || inner.state != State::Active {
-                return (false, Ok(()));
+                return (false, Ok(()), false);
             }
+            let group_idle = inner.is_idle();
+            let blocked = inner.blocked_queues() & (1u32 << queue_index) != 0;
+            let queue_idle = inner.set_queue_idle(queue_index, false);
             let kick_res = self.data.kick();
-            (true, kick_res)
+            (true, kick_res, group_idle && queue_idle && !blocked)
         });
 
         if active {
@@ -881,8 +885,18 @@ impl QueueOps for TyrQueueOps {
                 self.data.signal_submit_fence(done_seqno, Err(err));
                 return Err(err);
             }
-            // No tick runs for a resumed queue, so record the busy edge here.
+            // This path does not always schedule a tick, so record the busy
+            // edge here.
             group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
+
+            if resume_tick {
+                if let Ok(tick) = group
+                    .tdev
+                    .with_locked_scheduler(|sched| Ok(sched.resident_submit_tick()))
+                {
+                    tick.dispatch(&group.tdev);
+                }
+            }
         } else {
             // A concurrent eviction requeues by live ring state, so the
             // bytes committed above are still kicked.
