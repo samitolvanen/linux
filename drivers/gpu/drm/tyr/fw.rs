@@ -535,11 +535,11 @@ impl<'drm> Firmware<'drm> {
         &self,
         ddev: &TyrDrmDevice,
         suspend_size: usize,
-    ) -> Result<Arc<gem::MappedBo>> {
+    ) -> Result<gem::KernelBo> {
         let dev = self.dev.as_ref();
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
-        gem::new_kernel_object(dev, ddev, &self.vm, suspend_size, flags, ddev.coherent)
+        gem::new_kernel_object_no_vmap(dev, ddev, &self.vm, suspend_size, flags, ddev.coherent)
     }
 }
 

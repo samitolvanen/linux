@@ -315,8 +315,8 @@ pub(crate) struct Group {
     pub(super) max_compute_cores: u8,
     pub(super) max_fragment_cores: u8,
     pub(super) max_tiler_cores: u8,
-    pub(super) suspend_buf: Arc<gem::MappedBo>,
-    pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
+    pub(super) suspend_buf: gem::KernelBo,
+    pub(super) protm_suspend_buf: gem::KernelBo,
     syncobjs: Arc<gem::MappedBo>,
     #[pin]
     heap_pool: Mutex<Option<Arc<heap::Pool>>>,
