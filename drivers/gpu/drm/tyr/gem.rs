@@ -514,10 +514,11 @@ pub(crate) struct KernelBo {
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`, for BOs whose
     /// VA was handed out by `Vm::alloc_kernel_range`. Dropped from
-    /// the deferred cleanup closure so the VA cannot be reused before
-    /// the deferred `Vm::unmap_range` has actually torn the mapping
-    /// down. `None` for BOs with externally managed reservations (the
-    /// firmware load path, which uses `Vm::reserve_kernel_range`).
+    /// the deferred cleanup closure once `Vm::unmap_range` has torn
+    /// the mapping down. Leaked instead if the unmap fails, since a
+    /// live mapping still covers the address. `None` for BOs with
+    /// externally managed reservations (the firmware load path,
+    /// which uses `Vm::reserve_kernel_range`).
     kernel_node: Option<range::LiveRange>,
     /// Cleanup workqueue used by `Drop` to defer the GPU unmap out
     /// of any dma-fence signalling section the drop may run under.
@@ -696,20 +697,22 @@ impl Drop for KernelBo {
                 size,
                 kernel_node,
             } = KBox::into_inner(boxed);
-            if let Err(e) = vm.unmap_range(va, size) {
-                pr_err!(
-                    "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-                    va,
-                    va + size,
-                    e
-                );
-            }
-            // Force the closure to capture `bo` so its drop runs on
-            // the cleanup workqueue, not back here on the dma-fence
-            // signalling path. Likewise hold the kernel-VA reservation
-            // until the unmap above has actually torn down the mapping.
+            let unmapped = vm
+                .unmap_range(va, size)
+                .inspect_err(|e| {
+                    pr_err!(
+                        "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
+                        va,
+                        va + size,
+                        e
+                    );
+                })
+                .is_ok();
+            // Force the closure to capture `bo` so its drop runs on the
+            // cleanup workqueue, not back here on the dma-fence
+            // signalling path.
             drop(bo);
-            drop(kernel_node);
+            release_kernel_va(kernel_node, unmapped);
         });
 
         if let Err(e) = res {
@@ -744,18 +747,26 @@ fn inline_kernel_bo_unmap(captures: KernelBoCleanup) {
         size,
         kernel_node,
     } = captures;
-    if let Err(e) = vm.unmap_range(va, size) {
-        pr_err!(
-            "Failed to inline-unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-            va,
-            va + size,
-            e
-        );
-    }
-    // Order: drop `bo` first (just a refcount), then `kernel_node`
-    // which releases the VA back to the pool. The unmap above must
-    // complete first so the next allocation handed this VA does not
-    // observe stale PTEs.
+    let unmapped = vm
+        .unmap_range(va, size)
+        .inspect_err(|e| {
+            pr_err!(
+                "Failed to inline-unmap KernelBo range {:#x}..{:#x}: {:?}\n",
+                va,
+                va + size,
+                e
+            );
+        })
+        .is_ok();
     drop(bo);
-    drop(kernel_node);
+    release_kernel_va(kernel_node, unmapped);
+}
+
+/// Frees the kernel-VA reservation, or keeps it out of the pool when the
+/// unmap failed and a live mapping still covers the address.
+fn release_kernel_va(node: Option<range::LiveRange>, unmapped: bool) {
+    match node {
+        Some(node) if !unmapped => node.leak(),
+        node => drop(node),
+    }
 }
