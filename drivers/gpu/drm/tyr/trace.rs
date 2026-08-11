@@ -1126,6 +1126,18 @@ kernel::declare_trace! {
         read_start: u64,
         read_end: u64,
     );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_fault_va_bit_probe(
+        fault_va: u64,
+        mask: u64,
+        masked_va: u64,
+        base_va: u64,
+        offset: u64,
+        result: u32,
+    );
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -2852,6 +2864,39 @@ pub(crate) fn heap_chain_summary(
             chunk_count,
         )
     }
+}
+
+/// Outcome of retrying a fault address with a single high bit cleared.
+/// Keep in sync with `TYR_FAULT_BIT_PROBE_RESULTS` in
+/// `include/trace/events/tyr.h`.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum FaultBitProbeResult {
+    /// No candidate bit resolved to a chunk or a mapping.
+    Miss = 0,
+    /// The masked address falls in a chunk the heap still owns.
+    LiveChunk = 1,
+    /// The masked address falls in a chunk the pool has released.
+    FreedChunk = 2,
+    /// The masked address is mapped, but in no recorded chunk.
+    Mapped = 3,
+}
+
+/// One retry of an unhandled fault address with a candidate injected bit
+/// cleared. `base_va` and `offset` locate the chunk or mapping the
+/// masked address lands in.
+///
+/// Downstream-only debug aid; not for upstream.
+pub(crate) fn fault_va_bit_probe(
+    fault_va: u64,
+    mask: u64,
+    masked_va: u64,
+    base_va: u64,
+    offset: u64,
+    result: FaultBitProbeResult,
+) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_fault_va_bit_probe(fault_va, mask, masked_va, base_va, offset, result as u32) }
 }
 
 /// Returns a short mnemonic for a Mali CSF instruction opcode (the
