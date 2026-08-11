@@ -24,6 +24,7 @@ use crate::{
         IoMem,
         TyrDrmDevice, //
     },
+    heap,
     regs::mmu_control::mmu_as_control,
     sched::Scheduler,
     trace,
@@ -150,30 +151,37 @@ fn read_cs_ringbuf_ptrs(tdev: &TyrDrmDevice, csg_id: usize) -> CsRingbufSnapshot
 }
 
 /// Reports where `addr` sits in the mapping tree of the VM used by the
-/// group bound to the faulting AS slot.
-fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) {
+/// group bound to the faulting AS slot. Returns whether a mapping covers
+/// it, reporting an unknown mapping state as false.
+fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) -> bool {
     if csg_id == u32::MAX {
         pr_err!("fault VA 0x{:016X}: no group bound, VM unknown\n", addr);
-        return;
+        return false;
     }
 
     let Some(vm) = Scheduler::vm_for_csg(tdev, csg_id as usize, group_uid) else {
         pr_err!("fault VA 0x{:016X}: group gone, VM unknown\n", addr);
-        return;
+        return false;
     };
 
     match vm.try_classify_va(addr) {
-        Err(()) => pr_err!("fault VA 0x{:016X}: gpuvm busy, not classified\n", addr),
-        Ok(VaClass::Mapped { map, bo_offset }) => pr_err!(
-            "fault VA 0x{:016X} is mapped: mapping 0x{:016X} size 0x{:X}, \
+        Err(()) => {
+            pr_err!("fault VA 0x{:016X}: gpuvm busy, not classified\n", addr);
+            false
+        }
+        Ok(VaClass::Mapped { map, bo_offset }) => {
+            pr_err!(
+                "fault VA 0x{:016X} is mapped: mapping 0x{:016X} size 0x{:X}, \
                 BO base 0x{:016X} size 0x{:X} offset 0x{:X}\n",
-            addr,
-            map.va,
-            map.size,
-            map.bo_va_base,
-            map.bo_size,
-            bo_offset,
-        ),
+                addr,
+                map.va,
+                map.size,
+                map.bo_va_base,
+                map.bo_size,
+                bo_offset,
+            );
+            true
+        }
         Ok(VaClass::Unmapped { below, above }) => {
             pr_err!("fault VA 0x{:016X} is not mapped\n", addr);
             match below {
@@ -184,14 +192,108 @@ fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) 
                 Some(m) => pr_err!("  nearest above: 0x{:016X} size 0x{:X}\n", m.va, m.size),
                 None => pr_err!("  nearest above: none\n"),
             }
+            false
         }
     }
+}
+
+/// High bits a fault address is retried without, one at a time. A chunk
+/// address comes from the kernel window at the top of the VA space and
+/// carries neither bit, so a ledger hit is strong evidence. User
+/// mappings can carry both, so a mapping hit is not.
+const CANDIDATE_BITS: [u32; 2] = [36, 37];
+
+/// Name for the object a retry resolved to, for the fault report line.
+fn probe_result_name(result: trace::FaultBitProbeResult) -> &'static str {
+    match result {
+        trace::FaultBitProbeResult::Miss => "nothing",
+        trace::FaultBitProbeResult::LiveChunk => "LIVE heap chunk",
+        trace::FaultBitProbeResult::FreedChunk => "freed heap chunk",
+        trace::FaultBitProbeResult::Mapped => "mapping",
+    }
+}
+
+/// Retries the chunk ledger and the mapping tree with each of
+/// `CANDIDATE_BITS` cleared from `addr`, reporting the first bit that
+/// resolves. An address that carries a candidate bit but matches nothing
+/// gets an explicit miss record; one that carries neither gets no record
+/// at all.
+///
+/// Costs one ledger scan and one mapping lookup per candidate bit.
+///
+/// Downstream-only debug aid; not for upstream.
+fn probe_injected_bits(
+    tdev: &TyrDrmDevice,
+    csg_id: u32,
+    group_uid: u64,
+    pool: &heap::Pool,
+    addr: u64,
+) {
+    if !CANDIDATE_BITS
+        .into_iter()
+        .any(|bit| addr & (1u64 << bit) != 0)
+    {
+        return;
+    }
+
+    let vm = Scheduler::vm_for_csg(tdev, csg_id as usize, group_uid);
+
+    for bit in CANDIDATE_BITS {
+        let mask = 1u64 << bit;
+        if addr & mask == 0 {
+            continue;
+        }
+
+        let masked = addr & !mask;
+        let hit = match pool.lookup_chunk_va(masked) {
+            Some(record) if record.free.is_some() => {
+                Some((record.va, trace::FaultBitProbeResult::FreedChunk))
+            }
+            Some(record) => Some((record.va, trace::FaultBitProbeResult::LiveChunk)),
+            None => vm
+                .as_ref()
+                .and_then(|vm| vm.try_classify_va(masked).ok())
+                .and_then(|class| match class {
+                    VaClass::Mapped { map, .. } => {
+                        Some((map.va, trace::FaultBitProbeResult::Mapped))
+                    }
+                    VaClass::Unmapped { .. } => None,
+                }),
+        };
+
+        let Some((base, result)) = hit else {
+            continue;
+        };
+
+        pr_err!(
+            "fault VA 0x{:016X}: clearing bit {} gives 0x{:016X}, in {} 0x{:016X} offset 0x{:X}\n",
+            addr,
+            bit,
+            masked,
+            probe_result_name(result),
+            base,
+            masked - base,
+        );
+        trace::fault_va_bit_probe(addr, mask, masked, base, masked - base, result);
+        return;
+    }
+
+    pr_err!("fault VA 0x{:016X}: no injected bit resolves it\n", addr);
+    trace::fault_va_bit_probe(addr, 0, 0, 0, 0, trace::FaultBitProbeResult::Miss);
 }
 
 /// Reports the tiler-heap chunk the faulting address belonged to, if
 /// the pool of the group bound to the faulting AS slot still has a
 /// record of one, followed by the current state of that pool's heaps.
-fn report_heap_for_fault(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) {
+/// An address that `mapped` reports outside every mapping and that no
+/// chunk record covers is handed to `probe_injected_bits`.
+fn report_heap_for_fault(
+    tdev: &TyrDrmDevice,
+    csg_id: u32,
+    group_uid: u64,
+    addr: u64,
+    mapped: bool,
+) {
     if csg_id == u32::MAX {
         return;
     }
@@ -205,7 +307,12 @@ fn report_heap_for_fault(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr:
     };
 
     match pool.lookup_chunk_va(addr) {
-        None => pr_err!("fault VA 0x{:016X}: in no recorded heap chunk\n", addr),
+        None => {
+            pr_err!("fault VA 0x{:016X}: in no recorded heap chunk\n", addr);
+            if !mapped {
+                probe_injected_bits(tdev, csg_id, group_uid, &pool, addr);
+            }
+        }
         Some(record) => {
             let (state, age) = match record.free {
                 Some(free) => ("freed", free.elapsed()),
@@ -318,8 +425,8 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>, tdev: &TyrDr
             source_id,
         );
 
-        report_fault_va(tdev, csg_id, group_uid, addr);
-        report_heap_for_fault(tdev, csg_id, group_uid, addr);
+        let mapped = report_fault_va(tdev, csg_id, group_uid, addr);
+        report_heap_for_fault(tdev, csg_id, group_uid, addr, mapped);
 
         status &= !mask;
     }
