@@ -665,6 +665,14 @@ impl Group {
         self.queues.len()
     }
 
+    /// Returns the mask of the group's queue indices.
+    pub(crate) fn queue_mask(&self) -> u32 {
+        let count = u32::try_from(self.queues.len()).unwrap_or(u32::MAX);
+        u32::MAX
+            .checked_shr(u32::BITS.saturating_sub(count))
+            .unwrap_or(0)
+    }
+
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
     /// is satisfied.
     ///

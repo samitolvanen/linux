@@ -188,54 +188,65 @@ impl Scheduler {
         fw: &Firmware<'_>,
         csg_id: usize,
     ) -> Result {
-        // The lock order documented on `Scheduler` allows holding the
-        // slot lock across the firmware reads below.
-        let group = {
-            let slot_manager = tdev.csg_slot_manager.lock();
-            match slot_manager.slot_data(csg_id) {
-                Some(data) => data.group.clone(),
-                None => return Ok(()),
-            }
-        };
+        // Callers walk the whole slot array, which can be wider than the
+        // slot count the firmware reports.
+        if csg_id >= self.csg_slot_count as usize {
+            return Ok(());
+        }
 
         let pending_mask =
             CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
 
-        let (idle_event, sync_event, progress_event) = fw.with_csg_mut(csg_id, |csg| {
+        let (pending, pending_cs_irqs) = fw.with_csg_mut(csg_id, |csg| {
             let req = csg.read_input_req()?.into_raw();
             let ack = csg.read_output_ack()?.into_raw();
+            let irq_req = csg.read_output_irq_req()?.mask();
+            let irq_ack = csg.read_input_irq_ack()?;
             let pending = (req ^ ack) & pending_mask;
+            let pending_cs_irqs = irq_req ^ irq_ack.mask();
+
             if pending != 0 {
                 csg.update_input_req(CSG_REQ::from_raw(ack & pending), CSG_REQ::from_raw(pending))?;
             }
-            Ok((
-                pending & CSG_REQ::IDLE_MASK != 0,
-                pending & CSG_REQ::SYNC_UPDATE_MASK != 0,
-                pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0,
-            ))
+            if pending_cs_irqs != 0 {
+                csg.write_input_irq_ack(irq_ack.with_mask(irq_req));
+            }
+
+            Ok((pending, pending_cs_irqs))
         })?;
+
+        if pending == 0 && pending_cs_irqs == 0 {
+            return Ok(());
+        }
 
         let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
 
-        if idle_event {
+        let group = {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            slot_manager
+                .slot_data(csg_id)
+                .map(|data| data.group.clone())
+        };
+
+        if pending & CSG_REQ::IDLE_MASK != 0 {
             // At least one resident group may now be idle.
             self.might_have_idle_groups = true;
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
-
-        if progress_event {
+        if pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0 {
             // Progress-timer expiry: the firmware-imposed forward-progress
             // window elapsed without the group advancing.
-            group.with_locked_inner(|inner| {
-                if inner.fatal_error.is_none() {
-                    inner.fatal_error = Some(ETIMEDOUT);
-                }
-            });
             dev_warn!(tdev.as_ref(), "CSG slot {} progress timeout\n", csg_id);
+            if let Some(group) = &group {
+                group.with_locked_inner(|inner| {
+                    if inner.fatal_error.is_none() {
+                        inner.fatal_error = Some(ETIMEDOUT);
+                    }
+                });
+            }
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
-
-        if sync_event {
+        if pending & CSG_REQ::SYNC_UPDATE_MASK != 0 {
             TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
@@ -245,20 +256,11 @@ impl Scheduler {
         let mut cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP] = [None; MAX_CS_PER_GROUP];
         let mut ring_cs_db_mask: u32 = 0;
         fw.with_csg_mut(csg_id, |csg| {
-            let irq_req = csg.read_output_irq_req()?.mask();
-            let irq_ack = csg.read_input_irq_ack()?;
-            let pending_cs_irqs = irq_req ^ irq_ack.mask();
+            let mut cs_irqs = pending_cs_irqs;
 
-            if pending_cs_irqs == 0 {
-                return Ok(());
-            }
-
-            csg.write_input_irq_ack(irq_ack.with_mask(irq_req));
-
-            for cs_id in 0..group.queue_count() as u32 {
-                if pending_cs_irqs & (1u32 << cs_id) == 0 {
-                    continue;
-                }
+            while cs_irqs != 0 {
+                let cs_id = cs_irqs.trailing_zeros();
+                cs_irqs &= !(1u32 << cs_id);
 
                 let cs = match csg.cs_mut(cs_id as usize) {
                     Some(cs) => cs,
@@ -281,7 +283,9 @@ impl Scheduler {
 
                 if fault_event {
                     cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?;
-                    let queue = group.queues.get(cs_id as usize);
+                    let queue = group
+                        .as_deref()
+                        .and_then(|group| group.queues.get(cs_id as usize));
                     let extract = cs_fault_extract.get_mut(cs_id as usize);
                     if let (Some(queue), Some(extract)) = (queue, extract) {
                         *extract = queue.read_extract().ok();
@@ -300,31 +304,46 @@ impl Scheduler {
             Ok(())
         })?;
 
-        if tiler_oom_mask != 0 {
-            // The kernel atomics have no fetch_or.
-            let tiler_oom = &group.tiler_oom;
-            let mut old = tiler_oom.load(Relaxed);
-            while let Err(current) = tiler_oom.cmpxchg(old, old | tiler_oom_mask, Relaxed) {
-                old = current;
+        if let Some(group) = &group {
+            let queue_mask = group.queue_mask();
+            let stray_mask = (tiler_oom_mask | cs_fatal_mask) & !queue_mask;
+            if stray_mask != 0 {
+                dev_warn!(
+                    tdev.as_ref(),
+                    "CSG slot {}: fatal or tiler OOM event on CS mask {:#x} with no queue\n",
+                    csg_id,
+                    stray_mask
+                );
+            }
+            tiler_oom_mask &= queue_mask;
+            cs_fatal_mask &= queue_mask;
+
+            if tiler_oom_mask != 0 {
+                // The kernel atomics have no fetch_or.
+                let tiler_oom = &group.tiler_oom;
+                let mut old = tiler_oom.load(Relaxed);
+                while let Err(current) = tiler_oom.cmpxchg(old, old | tiler_oom_mask, Relaxed) {
+                    old = current;
+                }
+
+                group.schedule_tiler_oom();
             }
 
-            group.schedule_tiler_oom();
-        }
+            if cs_fatal_mask != 0 {
+                group.with_locked_inner(|inner| {
+                    let mut mask = cs_fatal_mask;
+                    while mask != 0 {
+                        let cs_id = mask.trailing_zeros() as usize;
+                        mask &= !(1u32 << cs_id);
+                        inner.set_queue_fatal(cs_id);
+                    }
+                });
+            }
 
-        if cs_fatal_mask != 0 {
-            group.with_locked_inner(|inner| {
-                let mut mask = cs_fatal_mask;
-                while mask != 0 {
-                    let cs_id = mask.trailing_zeros() as usize;
-                    mask &= !(1u32 << cs_id);
-                    inner.set_queue_fatal(cs_id);
+            for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
+                if let Some(extract) = extract {
+                    queue.fail_job_at_extract(extract, EINVAL);
                 }
-            });
-        }
-
-        for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
-            if let Some(extract) = extract {
-                queue.fail_job_at_extract(extract, EINVAL);
             }
         }
 
