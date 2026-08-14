@@ -16,9 +16,14 @@ use crate::{
         Bound,
         Device, //
     },
+    devres::DevresLt,
     error::to_result,
     io::PhysAddr,
-    prelude::*, //
+    prelude::*,
+    types::{
+        CovariantForLt,
+        ForLt, //
+    }, //
 };
 
 use bindings::io_pgtable_fmt;
@@ -68,6 +73,33 @@ pub struct IoPageTable<'a, F: IoPageTableFmt> {
 unsafe impl<F: IoPageTableFmt> Send for IoPageTable<'_, F> {}
 // SAFETY: `struct io_pgtable_ops` may be accessed concurrently.
 unsafe impl<F: IoPageTableFmt> Sync for IoPageTable<'_, F> {}
+
+impl<F: IoPageTableFmt> ForLt for IoPageTable<'static, F> {
+    type Of<'a> = IoPageTable<'a, F>;
+}
+
+// SAFETY: `IoPageTable<'a, F>` is covariant over `'a` because it holds
+// `PhantomData<&'a Device<Bound>>`, which is covariant.
+unsafe impl<F: IoPageTableFmt> CovariantForLt for IoPageTable<'static, F> {}
+
+/// A device-managed io page table.
+///
+/// See [`IoPageTable::new_devres`].
+pub type DevresIoPageTable<F> = DevresLt<IoPageTable<'static, F>>;
+
+impl<F: IoPageTableFmt> IoPageTable<'static, F> {
+    /// Create a new device-managed `IoPageTable`.
+    ///
+    /// The returned [`DevresIoPageTable`] can outlive the borrow of `dev` and be stored in driver
+    /// data. Unbinding the device revokes access to the page table and frees it, so hardware
+    /// programmed with the page table's address must have stopped using it by then.
+    #[inline]
+    pub fn new_devres(dev: &Device<Bound>, config: Config) -> Result<DevresIoPageTable<F>> {
+        // SAFETY: The page table keeps `dev` for its DMA operations and stays valid until
+        // `DevresLt` frees it at unbind, which happens before the device's DMA ops are torn down.
+        unsafe { DevresLt::new(dev, IoPageTable::<F>::new(dev, config)) }
+    }
+}
 
 /// The format used by this page table.
 pub trait IoPageTableFmt: 'static {
