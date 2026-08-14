@@ -7,7 +7,6 @@
 //! Each virtual memory (VM) area is backed by ARM64 LPAE Stage 1 page tables and can be
 //! mapped into hardware address space (AS) slots for GPU execution.
 
-use core::marker::PhantomData;
 use core::ops::Range;
 
 use kernel::{
@@ -41,6 +40,7 @@ use kernel::{
         ARM64LPAES1, //
     },
     new_mutex,
+    platform,
     prelude::*,
     sizes::{
         SZ_1G,
@@ -155,19 +155,21 @@ impl TryFrom<u32> for VmMapFlags {
 }
 
 /// Arguments for a virtual memory map operation.
-struct VmMapArgs<'drm> {
+struct VmMapArgs<'a> {
     /// Access permissions and caching behavior for the mapping.
     flags: VmMapFlags,
     /// GEM buffer object registered with the GPUVM framework.
-    vm_bo: ARef<GpuVmBo<GpuVmData<'drm>>>,
+    vm_bo: ARef<GpuVmBo<GpuVmData>>,
     /// Offset in bytes from the start of the buffer object.
     bo_offset: u64,
+    /// Device the buffer object is mapped for.
+    dev: &'a Device<Bound>,
 }
 
 /// Type of virtual memory operation.
-enum VmOpType<'drm> {
+enum VmOpType<'a> {
     /// Map a GEM buffer object into the virtual address space.
-    Map(VmMapArgs<'drm>),
+    Map(VmMapArgs<'a>),
     /// Unmap a region from the virtual address space.
     Unmap,
 }
@@ -177,37 +179,40 @@ enum VmOpType<'drm> {
 /// VM operations may require allocating new GPUVA objects to track mappings.
 /// To avoid allocation failures during the operation, preallocate the
 /// maximum number of GPUVAs that might be needed.
-struct VmOpResources<'drm> {
+struct VmOpResources {
     /// Preallocated GPUVA objects for remap operations.
     ///
     /// Partial unmap requests or map requests overlapping existing mappings
     /// will trigger a remap call, which needs to register up to three VA
     /// objects (one for the new mapping, and two for the previous and next
     /// mappings).
-    preallocated_gpuvas: [Option<GpuVaAlloc<GpuVmData<'drm>>>; 3],
+    preallocated_gpuvas: [Option<GpuVaAlloc<GpuVmData>>; 3],
 }
 
 /// Request to execute a virtual memory operation.
-struct VmOpRequest<'drm> {
+struct VmOpRequest<'a> {
     /// Request type.
-    op_type: VmOpType<'drm>,
+    op_type: VmOpType<'a>,
 
     /// Region of the virtual address space covered by this request.
     region: Range<u64>,
 }
 
 /// Arguments for a page table map operation.
-struct PtMapArgs {
+struct PtMapArgs<'a> {
     /// Memory protection flags describing allowed accesses for this mapping.
     ///
     /// This is directly derived from [`VmMapFlags`] via [`VmMapFlags::to_prot`].
     prot: u32,
+
+    /// Device used to DMA-map the buffer object and to reach the page table.
+    dev: &'a Device<Bound>,
 }
 
 /// Type of page table operation.
-enum PtOpType {
+enum PtOpType<'a> {
     /// Map pages into the page table.
-    Map(PtMapArgs),
+    Map(PtMapArgs<'a>),
     /// Unmap pages from the page table.
     Unmap,
 }
@@ -218,44 +223,44 @@ enum PtOpType {
 /// automatically flushes changes when dropped. It ensures that the
 /// Memory Management Unit (MMU) state is properly managed and Translation
 /// Lookaside Buffer (TLB) entries are flushed.
-pub(crate) struct PtUpdateContext<'ctx, 'drm> {
-    /// Device used for DMA-mapping GEM shmem SG tables.
-    dev: &'ctx Device<Bound>,
+pub(crate) struct PtUpdateContext<'ctx> {
+    /// Device used for logging.
+    dev: &'ctx Device,
 
     /// Page table.
     pt: &'ctx DevresIoPageTable<ARM64LPAES1>,
 
     /// MMU manager.
-    mmu: &'ctx Mmu<'drm>,
+    mmu: &'ctx Mmu,
 
     /// Reference to the address space data to pass to the MMU functions.
-    as_data: &'ctx VmAsData<'drm>,
+    as_data: &'ctx VmAsData,
 
     /// Region of the virtual address space covered by this request.
     region: Range<u64>,
 
     /// Operation type.
-    op_type: PtOpType,
+    op_type: PtOpType<'ctx>,
 
     /// Preallocated resources that can be used when executing the request.
-    resources: &'ctx mut VmOpResources<'drm>,
+    resources: &'ctx mut VmOpResources,
 }
 
-impl<'ctx, 'drm> PtUpdateContext<'ctx, 'drm> {
+impl<'ctx> PtUpdateContext<'ctx> {
     /// Creates a new page table update context.
     ///
     /// This prepares the MMU for a page table update.
     /// The context will automatically flush the TLB and
     /// complete the update when dropped.
     fn new(
-        dev: &'ctx Device<Bound>,
+        dev: &'ctx Device,
         pt: &'ctx DevresIoPageTable<ARM64LPAES1>,
-        mmu: &'ctx Mmu<'drm>,
-        as_data: &'ctx VmAsData<'drm>,
+        mmu: &'ctx Mmu,
+        as_data: &'ctx VmAsData,
         region: Range<u64>,
-        op_type: PtOpType,
-        resources: &'ctx mut VmOpResources<'drm>,
-    ) -> Result<PtUpdateContext<'ctx, 'drm>> {
+        op_type: PtOpType<'ctx>,
+        resources: &'ctx mut VmOpResources,
+    ) -> Result<PtUpdateContext<'ctx>> {
         mmu.start_vm_update(as_data, &region)?;
 
         Ok(Self {
@@ -270,7 +275,7 @@ impl<'ctx, 'drm> PtUpdateContext<'ctx, 'drm> {
     }
 
     /// Finds one of our pre-allocated VAs.
-    fn preallocated_gpuva(&mut self) -> Result<GpuVaAlloc<GpuVmData<'drm>>> {
+    fn preallocated_gpuva(&mut self) -> Result<GpuVaAlloc<GpuVmData>> {
         self.resources
             .preallocated_gpuvas
             .iter_mut()
@@ -280,7 +285,7 @@ impl<'ctx, 'drm> PtUpdateContext<'ctx, 'drm> {
 
     /// Returns an unused GPUVA object to the preallocated pool.
     /// If the pool is already full, the unused allocation is simply dropped.
-    fn return_preallocated_gpuva(&mut self, gpuva: GpuVaAlloc<GpuVmData<'drm>>) {
+    fn return_preallocated_gpuva(&mut self, gpuva: GpuVaAlloc<GpuVmData>) {
         if let Some(slot) = self
             .resources
             .preallocated_gpuvas
@@ -292,7 +297,7 @@ impl<'ctx, 'drm> PtUpdateContext<'ctx, 'drm> {
     }
 }
 
-impl Drop for PtUpdateContext<'_, '_> {
+impl Drop for PtUpdateContext<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.mmu.end_vm_update(self.as_data) {
             dev_err!(self.dev, "Failed to end VM update {:?}", e);
@@ -308,42 +313,40 @@ impl Drop for PtUpdateContext<'_, '_> {
 ///
 /// Implements [`DriverGpuVm`] to provide VM operation callbacks (map, unmap, remap)
 /// and associated types for buffer objects, virtual addresses, and contexts.
-pub(crate) struct GpuVmData<'drm> {
-    _phantom: PhantomData<&'drm ()>,
-}
+pub(crate) struct GpuVmData;
 
 /// GPU virtual address space.
 ///
 /// Each VM can be mapped into a hardware address space slot.
 #[pin_data]
-pub(crate) struct Vm<'drm> {
+pub(crate) struct Vm {
     /// Data referenced by an AS when the VM is active
-    as_data: Arc<VmAsData<'drm>>,
+    as_data: Arc<VmAsData>,
     /// MMU manager.
-    mmu: Arc<Mmu<'drm>>,
-    /// Parent device used for DMA mapping and page-table operations.
-    dev: &'drm Device<Bound>,
+    mmu: Arc<Mmu>,
+    /// Parent device used for logging.
+    pdev: ARef<platform::Device>,
     /// DRM GPUVM core for managing virtual address space.
     #[pin]
-    gpuvm_unique: Mutex<UniqueRefGpuVm<GpuVmData<'drm>>>,
+    gpuvm_unique: Mutex<UniqueRefGpuVm<GpuVmData>>,
     /// Non-core part of the GPUVM. Can be used for stuff that doesn't modify the
     /// internal mapping tree, like GpuVm::obtain()
-    gpuvm: ARef<GpuVm<GpuVmData<'drm>>>,
+    gpuvm: ARef<GpuVm<GpuVmData>>,
     /// VA range for this VM.
     va_range: Range<u64>,
 }
 
-impl<'drm> Vm<'drm> {
+impl Vm {
     /// Creates a new GPU virtual address space.
     ///
     /// The VM is initialized with a page table configured according to the GPU's
     /// address translation capabilities and registered with the GPUVM framework.
     pub(crate) fn new(
-        dev: &'drm Device<Bound>,
+        pdev: &platform::Device<Bound>,
         ddev: &TyrDrmDevice,
-        mmu: ArcBorrow<'_, Mmu<'drm>>,
+        mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
-    ) -> Result<Arc<Vm<'drm>>> {
+    ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
         let pa_bits = mmu_features.pa_bits().get();
@@ -353,7 +356,7 @@ impl<'drm> Vm<'drm> {
 
         // dummy_obj is used to initialize the GPUVM tree.
         let dummy_obj = gem::new_dummy_object(ddev).inspect_err(|e| {
-            dev_err!(dev, "Failed to create dummy GEM object: {:?}", e);
+            dev_err!(pdev, "Failed to create dummy GEM object: {:?}", e);
         })?;
 
         let gpuvm_unique = GpuVm::new::<Error, _>(
@@ -362,21 +365,22 @@ impl<'drm> Vm<'drm> {
             &*dummy_obj,
             range.clone(),
             reserve_range,
-            GpuVmData::<'drm> {
-                _phantom: PhantomData::<&()>,
-            },
+            GpuVmData,
         )
         .inspect_err(|e| {
-            dev_err!(dev, "Failed to create GpuVm: {:?}", e);
+            dev_err!(pdev, "Failed to create GpuVm: {:?}", e);
         })?;
         let gpuvm = ARef::from(&*gpuvm_unique);
 
-        let as_data = Arc::pin_init(VmAsData::new(&mmu, dev, va_bits, pa_bits), GFP_KERNEL)?;
+        let as_data = Arc::pin_init(
+            VmAsData::new(&mmu, pdev.as_ref(), va_bits, pa_bits),
+            GFP_KERNEL,
+        )?;
 
         let vm = Arc::pin_init(
             pin_init!(Self{
                 as_data,
-                dev,
+                pdev: pdev.into(),
                 mmu: mmu.into(),
                 gpuvm,
                 gpuvm_unique <- new_mutex!(gpuvm_unique),
@@ -388,9 +392,9 @@ impl<'drm> Vm<'drm> {
         Ok(vm)
     }
 
-    /// Returns the parent device used by this VM for DMA mapping and page-table operations.
-    pub(crate) fn dev(&self) -> &'drm Device<Bound> {
-        self.dev
+    /// Returns the parent device of this VM.
+    pub(crate) fn dev(&self) -> &Device {
+        self.pdev.as_ref()
     }
 
     /// Activate the VM in a hardware address space slot.
@@ -398,14 +402,14 @@ impl<'drm> Vm<'drm> {
         self.mmu
             .activate_vm(self.as_data.as_arc_borrow())
             .inspect_err(|e| {
-                dev_err!(self.dev, "Failed to activate VM: {:?}", e);
+                dev_err!(self.dev(), "Failed to activate VM: {:?}", e);
             })
     }
 
     /// Deactivate the VM by evicting it from its address space slot.
     fn deactivate(&self) -> Result {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
-            dev_err!(self.dev, "Failed to deactivate VM: {:?}", e);
+            dev_err!(self.dev(), "Failed to deactivate VM: {:?}", e);
         })
     }
 
@@ -416,7 +420,11 @@ impl<'drm> Vm<'drm> {
         let _ = self
             .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
             .inspect_err(|e| {
-                dev_err!(self.dev, "Failed to unmap range during deactivate: {:?}", e);
+                dev_err!(
+                    self.dev(),
+                    "Failed to unmap range during deactivate: {:?}",
+                    e
+                );
             });
     }
 
@@ -424,24 +432,25 @@ impl<'drm> Vm<'drm> {
     ///
     /// This handles both map and unmap operations by coordinating between the
     /// GPUVM framework and the hardware page table.
-    fn exec_op<'a>(
+    fn exec_op(
         &self,
-        gpuvm_unique: &mut UniqueRefGpuVm<GpuVmData<'drm>>,
-        req: VmOpRequest<'drm>,
-        resources: &'a mut VmOpResources<'drm>,
+        gpuvm_unique: &mut UniqueRefGpuVm<GpuVmData>,
+        req: VmOpRequest<'_>,
+        resources: &mut VmOpResources,
     ) -> Result {
         let pt = &self.as_data.page_table;
 
         match req.op_type {
             VmOpType::Map(args) => {
                 let mut pt_upd = PtUpdateContext::new(
-                    self.dev,
+                    self.dev(),
                     pt,
                     &self.mmu,
                     &self.as_data,
                     req.region,
                     PtOpType::Map(PtMapArgs {
                         prot: args.flags.to_prot(),
+                        dev: args.dev,
                     }),
                     resources,
                 )?;
@@ -457,7 +466,7 @@ impl<'drm> Vm<'drm> {
             }
             VmOpType::Unmap => {
                 let mut pt_upd = PtUpdateContext::new(
-                    self.dev,
+                    self.dev(),
                     pt,
                     &self.mmu,
                     &self.as_data,
@@ -484,6 +493,7 @@ impl<'drm> Vm<'drm> {
     /// caching behavior specified in `flags`.
     pub(crate) fn map_bo_range(
         &self,
+        dev: &Device<Bound>,
         bo: &Bo,
         bo_offset: u64,
         map_size: u64,
@@ -503,7 +513,7 @@ impl<'drm> Vm<'drm> {
 
         if bo_end > bo_size {
             dev_err!(
-                self.dev,
+                self.dev(),
                 "BO mapping range {:#x}..{:#x} exceeds BO size {:#x}",
                 bo_offset,
                 bo_end,
@@ -519,14 +529,15 @@ impl<'drm> Vm<'drm> {
                 vm_bo: self.gpuvm.obtain(bo, ())?,
                 flags,
                 bo_offset,
+                dev,
             }),
             region: va..va_end,
         };
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<GpuVmData<'drm>>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData<'drm>>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData<'drm>>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
         };
         let result = {
@@ -553,7 +564,7 @@ impl<'drm> Vm<'drm> {
 
         if va < self.va_range.start || end > self.va_range.end {
             dev_err!(
-                self.dev,
+                self.dev(),
                 "Unmap range {:#x}..{:#x} exceeds VM range {:#x}..{:#x}",
                 va,
                 end,
@@ -577,9 +588,9 @@ impl<'drm> Vm<'drm> {
                 [None, None, None]
             } else {
                 [
-                    Some(GpuVaAlloc::<GpuVmData<'drm>>::new(GFP_KERNEL)?),
-                    Some(GpuVaAlloc::<GpuVmData<'drm>>::new(GFP_KERNEL)?),
-                    Some(GpuVaAlloc::<GpuVmData<'drm>>::new(GFP_KERNEL)?),
+                    Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                    Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                    Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 ]
             },
         };
@@ -595,13 +606,13 @@ impl<'drm> Vm<'drm> {
     }
 }
 
-impl<'drm> DriverGpuVm for GpuVmData<'drm> {
+impl DriverGpuVm for GpuVmData {
     type Driver = TyrDrmDriver;
     type Object = Bo;
     type VmBoData = ();
     type VaData = ();
     type SmContext<'ctx>
-        = PtUpdateContext<'ctx, 'drm>
+        = PtUpdateContext<'ctx>
     where
         Self: 'ctx;
 
@@ -630,15 +641,16 @@ impl<'drm> DriverGpuVm for GpuVmData<'drm> {
             return Err(EINVAL);
         }
 
-        let sgt = op.obj().sg_table(context.dev).inspect_err(|e| {
-            dev_err!(context.dev, "Failed to get sg_table: {:?}", e);
-        })?;
-        let prot = match &context.op_type {
-            PtOpType::Map(args) => args.prot,
+        let (prot, dev) = match &context.op_type {
+            PtOpType::Map(args) => (args.prot, args.dev),
             _ => {
                 return Err(EINVAL);
             }
         };
+
+        let sgt = op.obj().sg_table(dev).inspect_err(|e| {
+            dev_err!(context.dev, "Failed to get sg_table: {:?}", e);
+        })?;
 
         for sgt_entry in sgt.iter() {
             // Expressly convert to u64 to work with arm 32-bit builds.
@@ -665,7 +677,7 @@ impl<'drm> DriverGpuVm for GpuVmData<'drm> {
 
             let len = u64::min(sgt_entry_length, bytes_left_to_map);
 
-            let segment_mapped = match pt_map(context.dev, context.pt, iova, paddr, len, prot) {
+            let segment_mapped = match pt_map(dev, context.pt, iova, paddr, len, prot) {
                 Ok(segment_mapped) => segment_mapped,
                 Err(e) => {
                     // clean up any successful mappings from previous SGT entries.

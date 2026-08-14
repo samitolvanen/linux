@@ -7,6 +7,10 @@
 use core::ops::Range;
 
 use kernel::{
+    device::{
+        Bound,
+        Device, //
+    },
     drm::gem::{
         self,
         shmem, //
@@ -86,30 +90,31 @@ pub(crate) enum KernelBoVaAlloc {
 /// a GEM object with automatic GPU virtual address (VA) space mapping and cleanup.
 ///
 /// When dropped, the buffer is automatically unmapped from the GPU VA space.
-pub(crate) struct KernelBo<'drm> {
+pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
     bo: ARef<Bo>,
     /// The GPU VM this buffer is mapped into.
-    vm: Arc<Vm<'drm>>,
+    vm: Arc<Vm>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
 }
 
-impl<'drm> KernelBo<'drm> {
+impl KernelBo {
     /// Creates a new kernel-owned buffer object and maps it into GPU VA space.
     ///
     /// This function allocates a new shmem-backed GEM object and immediately maps
     /// it into the specified GPU virtual memory space. The mapping is automatically
     /// cleaned up when the [`KernelBo`] is dropped.
     pub(crate) fn new(
+        dev: &Device<Bound>,
         ddev: &TyrDrmDevice,
-        vm: Arc<Vm<'drm>>,
+        vm: Arc<Vm>,
         size: u64,
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
     ) -> Result<Self> {
         if size == 0 {
-            dev_err!(vm.dev(), "Cannot create KernelBo with size 0");
+            dev_err!(dev, "Cannot create KernelBo with size 0");
             return Err(EINVAL);
         }
 
@@ -128,7 +133,7 @@ impl<'drm> KernelBo<'drm> {
             BoCreateArgs { flags: 0 },
         )?;
 
-        vm.map_bo_range(&bo, 0, size, va, flags)?;
+        vm.map_bo_range(dev, &bo, 0, size, va, flags)?;
 
         Ok(KernelBo {
             bo,
@@ -147,7 +152,7 @@ impl<'drm> KernelBo<'drm> {
     }
 }
 
-impl Drop for KernelBo<'_> {
+impl Drop for KernelBo {
     fn drop(&mut self) {
         let va = self.va_range.start;
         let size = self.va_range.end - self.va_range.start;

@@ -169,10 +169,10 @@ impl platform::Driver for TyrPlatformDriver {
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev, Ok(()))?;
 
-        let mmu = Mmu::new(pdev.as_ref(), iomem.clone(), &gpu_info)?;
+        let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info)?;
 
         let firmware = Firmware::new(
-            pdev.as_ref(),
+            pdev,
             iomem.clone(),
             &unreg_dev,
             mmu.as_arc_borrow(),
