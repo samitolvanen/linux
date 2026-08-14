@@ -22,6 +22,7 @@ use kernel::{
     },
     iommu::pgtable::{
         Config,
+        DevresIoPageTable,
         IoPageTable,
         ARM64LPAES1, //
     },
@@ -82,7 +83,7 @@ pub(crate) struct VmAsData<'drm> {
 
     /// The page table which maps GPU virtual addresses to physical addresses for this VM.
     #[pin]
-    pub(crate) page_table: IoPageTable<'drm, ARM64LPAES1>,
+    pub(crate) page_table: DevresIoPageTable<ARM64LPAES1>,
 }
 
 impl<'drm> VmAsData<'drm> {
@@ -101,7 +102,7 @@ impl<'drm> VmAsData<'drm> {
             coherent_walk: false,
         };
 
-        let page_table_init = IoPageTable::new(dev, pt_config);
+        let page_table_init = IoPageTable::new_devres(dev, pt_config);
 
         try_pin_init!(Self {
             as_seat: LockedBy::new(&mmu.as_manager, Seat::NoSeat),
@@ -112,7 +113,7 @@ impl<'drm> VmAsData<'drm> {
 
     /// Computes the hardware configuration for this address space.
     fn as_config(&self) -> Result<AddressSpaceConfig> {
-        let pt = &self.page_table;
+        let pt = self.page_table.try_access().ok_or(ENODEV)?;
         // The hardware computes the valid input address range as:
         //   INA_BITS_VALID = min(HW_INA_BITS, 55 - INA_BITS)
         // To configure our desired va_bits, we solve for INA_BITS:
@@ -137,8 +138,10 @@ impl<'drm> VmAsData<'drm> {
             // SAFETY: The SlotManager holds an `Arc<VmAsData>` as SlotData while this
             // TTBR is programmed and stores that Arc in the active slot before
             // returning. Eviction flushes and disables the slot before releasing
-            // the Arc; if eviction fails, the slot retains it. Therefore the page
-            // table cannot be dropped while the GPU is using it.
+            // the Arc. A failed eviction leaves the slot holding it. The page table
+            // is otherwise freed only at unbind, where the driver core drops the
+            // driver's private data before releasing devres resources, so
+            // `Firmware::drop()` stops the MCU first.
             transtab: unsafe { pt.ttbr() },
             memattr: MEMATTR::from_mair(pt.mair()).into_raw(),
         })

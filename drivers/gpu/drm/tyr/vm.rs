@@ -37,7 +37,7 @@ use kernel::{
     io::PhysAddr,
     iommu::pgtable::{
         prot,
-        IoPageTable,
+        DevresIoPageTable,
         ARM64LPAES1, //
     },
     new_mutex,
@@ -223,7 +223,7 @@ pub(crate) struct PtUpdateContext<'ctx, 'drm> {
     dev: &'ctx Device<Bound>,
 
     /// Page table.
-    pt: &'ctx IoPageTable<'drm, ARM64LPAES1>,
+    pt: &'ctx DevresIoPageTable<ARM64LPAES1>,
 
     /// MMU manager.
     mmu: &'ctx Mmu<'drm>,
@@ -249,7 +249,7 @@ impl<'ctx, 'drm> PtUpdateContext<'ctx, 'drm> {
     /// complete the update when dropped.
     fn new(
         dev: &'ctx Device<Bound>,
-        pt: &'ctx IoPageTable<'drm, ARM64LPAES1>,
+        pt: &'ctx DevresIoPageTable<ARM64LPAES1>,
         mmu: &'ctx Mmu<'drm>,
         as_data: &'ctx VmAsData<'drm>,
         region: Range<u64>,
@@ -826,13 +826,14 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 ///
 /// Returns the number of bytes successfully mapped.
 fn pt_map(
-    dev: &Device,
-    pt: &IoPageTable<'_, ARM64LPAES1>,
+    dev: &Device<Bound>,
+    page_table: &DevresIoPageTable<ARM64LPAES1>,
     iova: u64,
     paddr: u64,
     len: u64,
     prot: u32,
 ) -> Result<u64> {
+    let pt = page_table.access(dev)?;
     let mut segment_mapped = 0u64;
     while segment_mapped < len {
         let remaining = len - segment_mapped;
@@ -854,7 +855,7 @@ fn pt_map(
                 );
 
                 if segment_mapped > 0 {
-                    let _ = pt_unmap(dev, pt, iova..(iova + segment_mapped));
+                    let _ = pt_unmap(dev, page_table, iova..(iova + segment_mapped));
                 }
 
                 return Err(EOVERFLOW);
@@ -883,7 +884,7 @@ fn pt_map(
             // only updates the mapped value after the entire request succeeds.
             dev_err!(dev, "pt.map_pages failed at iova {:#x}: {:?}", curr_iova, e);
             if segment_mapped > 0 {
-                let _ = pt_unmap(dev, pt, iova..(iova + segment_mapped));
+                let _ = pt_unmap(dev, page_table, iova..(iova + segment_mapped));
             }
             return Err(e);
         }
@@ -891,7 +892,7 @@ fn pt_map(
         if mapped == 0 {
             dev_err!(dev, "Failed to map any pages at iova {:#x}", curr_iova);
             if segment_mapped > 0 {
-                let _ = pt_unmap(dev, pt, iova..(iova + segment_mapped));
+                let _ = pt_unmap(dev, page_table, iova..(iova + segment_mapped));
             }
             return Err(ENOMEM);
         }
@@ -906,7 +907,11 @@ fn pt_map(
 ///
 /// This function removes all page table entries in the specified range,
 /// automatically handling different page sizes that may be present.
-fn pt_unmap(dev: &Device, pt: &IoPageTable<'_, ARM64LPAES1>, range: Range<u64>) -> Result {
+fn pt_unmap(
+    dev: &Device,
+    page_table: &DevresIoPageTable<ARM64LPAES1>,
+    range: Range<u64>,
+) -> Result {
     let mut iova = range.start;
     let mut bytes_left_to_unmap = range.end - range.start;
 
@@ -928,6 +933,14 @@ fn pt_unmap(dev: &Device, pt: &IoPageTable<'_, ARM64LPAES1>, range: Range<u64>) 
             );
             EOVERFLOW
         })?;
+
+        // The guard is taken per chunk so the RCU read-side section covers a single
+        // `unmap_pages()` call. The page table is freed when the device is unbound, leaving
+        // nothing to unmap. Rollback calls from `pt_map()` never observe that, since
+        // `pt_map()` holds a `&Device<Bound>`.
+        let Some(pt) = page_table.try_access() else {
+            return Ok(());
+        };
 
         // SAFETY:
         // No other io-pgtable operation can currently access this range because Tyr holds
