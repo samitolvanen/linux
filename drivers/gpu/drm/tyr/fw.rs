@@ -30,6 +30,7 @@ use kernel::{
     },
     new_mutex,
     num::Bounded,
+    platform,
     prelude::*,
     sizes::SZ_2M,
     str::CString,
@@ -156,27 +157,30 @@ impl SectionFlags {
 }
 
 /// A parsed section of the firmware binary.
-pub(crate) struct Section<'drm> {
+pub(crate) struct Section {
     // Raw firmware section data for reset purposes
     #[expect(dead_code)]
     data: KVec<u8>,
 
     // Keep the BO backing this firmware section so that both the
     // GPU mapping and CPU mapping remain valid until the Section is dropped.
-    mem: gem::KernelBo<'drm>,
+    mem: gem::KernelBo,
 }
 
 /// Loaded firmware with sections mapped into MCU VM.
 pub(crate) struct Firmware<'drm> {
+    /// The bound device the firmware sections are mapped for.
+    dev: &'drm platform::Device<Bound>,
+
     /// Device-managed handle to the GPU MMIO register mapping, held so
     /// `Drop` can stop the MCU.
     iomem: Arc<DevresIoMem<SZ_2M>>,
 
     /// MCU VM.
-    vm: Arc<Vm<'drm>>,
+    vm: Arc<Vm>,
 
     /// List of firmware sections.
-    sections: KVec<Section<'drm>>,
+    sections: KVec<Section>,
 
     /// A condvar representing a wait on a firmware event.
     pub(crate) ready_wait: Arc<Wait>,
@@ -191,7 +195,7 @@ pub(crate) struct Firmware<'drm> {
 impl<'drm> Drop for Firmware<'drm> {
     fn drop(&mut self) {
         // Stop the MCU before releasing its firmware mappings and memory.
-        if let Ok(io) = self.iomem.access(self.vm.dev()) {
+        if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
             let _ = self.stop(io);
         }
 
@@ -201,7 +205,7 @@ impl<'drm> Drop for Firmware<'drm> {
 }
 
 impl<'drm> Firmware<'drm> {
-    fn init_section_mem(dev: &Device, mem: &mut KernelBo<'drm>, data: &KVec<u8>) -> Result {
+    fn init_section_mem(dev: &Device, mem: &mut KernelBo, data: &KVec<u8>) -> Result {
         if data.is_empty() {
             return Ok(());
         }
@@ -248,13 +252,14 @@ impl<'drm> Firmware<'drm> {
 
     /// Load firmware and map sections into MCU VM.
     pub(crate) fn new(
-        dev: &'drm Device<Bound>,
+        pdev: &'drm platform::Device<Bound>,
         iomem: Arc<DevresIoMem<SZ_2M>>,
         ddev: &TyrDrmDevice,
-        mmu: ArcBorrow<'_, Mmu<'drm>>,
+        mmu: ArcBorrow<'_, Mmu>,
         gpu_info: &GpuInfo,
     ) -> Result<Firmware<'drm>> {
-        let vm = Vm::new(dev, ddev, mmu, gpu_info)?;
+        let dev = pdev.as_ref();
+        let vm = Vm::new(pdev, ddev, mmu, gpu_info)?;
 
         let result = (|| {
             let (fw, parsed_sections) = Self::load(dev, ddev, gpu_info)?;
@@ -265,6 +270,7 @@ impl<'drm> Firmware<'drm> {
                 let va = u64::from(parsed.va.start);
 
                 let mut mem = KernelBo::new(
+                    dev,
                     ddev,
                     vm.clone(),
                     size,
@@ -289,6 +295,7 @@ impl<'drm> Firmware<'drm> {
             vm.activate()?;
 
             Ok(Firmware {
+                dev: pdev,
                 iomem,
                 vm: vm.clone(),
                 sections,
@@ -306,13 +313,13 @@ impl<'drm> Firmware<'drm> {
     }
 
     /// Get the shared memory section containing firmware interface structures.
-    pub(crate) fn shared_section(&self) -> Result<&Section<'drm>> {
+    pub(crate) fn shared_section(&self) -> Result<&Section> {
         self.sections
             .iter()
             .find(|section| section.mem.va_range().start == u64::from(CSF_MCU_SHARED_REGION_START))
             .ok_or_else(|| {
                 dev_err!(
-                    self.vm.dev(),
+                    self.dev,
                     "CSF shared section not found at 0x{:08x}",
                     CSF_MCU_SHARED_REGION_START
                 );
@@ -330,11 +337,7 @@ impl<'drm> Firmware<'drm> {
             time::Delta::from_millis(100),
         ) {
             let status = io.read(MCU_STATUS);
-            dev_err!(
-                self.vm.dev(),
-                "MCU failed to boot, status: {:?}",
-                status.value()
-            );
+            dev_err!(self.dev, "MCU failed to boot, status: {:?}", status.value());
             return Err(e);
         }
 
@@ -351,11 +354,7 @@ impl<'drm> Firmware<'drm> {
             time::Delta::from_millis(100),
         ) {
             let status = io.read(MCU_STATUS);
-            dev_err!(
-                self.vm.dev(),
-                "MCU failed to stop, status: {:?}",
-                status.value()
-            );
+            dev_err!(self.dev, "MCU failed to stop, status: {:?}", status.value());
             return Err(e);
         }
 

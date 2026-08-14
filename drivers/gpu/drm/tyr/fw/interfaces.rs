@@ -1839,7 +1839,7 @@ impl GlobalInterface {
         &mut self,
         dev: &Device,
         iomem: &IoMem<'_>,
-        shared_section: &Section<'_>,
+        shared_section: &Section,
         gpu_info: &GpuInfo,
         core_clk: &Clk,
         event_wait: &Wait,
@@ -2053,7 +2053,7 @@ impl GlobalInterface {
     /// Initialize CSG interfaces.
     ///
     /// This uses the previously read CSG count to create and enable each CSG interface.
-    fn init_csg(&mut self, dev: &Device, shared_section: &Section<'_>) -> Result {
+    fn init_csg(&mut self, dev: &Device, shared_section: &Section) -> Result {
         let enabled = match &mut self.state {
             GlobalInterfaceState::Enabled(e) => e,
             GlobalInterfaceState::Disabled => return Err(EINVAL),
@@ -2126,7 +2126,7 @@ impl CsgInterface {
     fn enable(
         &mut self,
         dev: &Device,
-        shared_section: &Section<'_>,
+        shared_section: &Section,
         csg_idx: usize,
         csg_stride: usize,
     ) -> Result {
@@ -2221,7 +2221,7 @@ impl CsgInterface {
     fn init_cs(
         &mut self,
         dev: &Device,
-        shared_section: &Section<'_>,
+        shared_section: &Section,
         csg_control_offset: usize,
     ) -> Result {
         let enabled = match &mut self.state {
@@ -2297,7 +2297,7 @@ impl CsInterface {
     fn enable(
         &mut self,
         dev: &Device,
-        shared_section: &Section<'_>,
+        shared_section: &Section,
         csg_control_offset: usize,
         cs_idx: usize,
         cs_stride: usize,

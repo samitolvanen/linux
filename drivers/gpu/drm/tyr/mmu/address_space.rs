@@ -27,12 +27,14 @@ use kernel::{
         ARM64LPAES1, //
     },
     num::Bounded,
+    platform,
     prelude::*,
     sizes::{
         SZ_2M,
         SZ_4K, //
     },
     sync::{
+        aref::ARef,
         Arc,
         ArcBorrow,
         LockedBy, //
@@ -73,10 +75,10 @@ struct AddressSpaceConfig {
 
 /// Virtual memory (VM) address space data for use in MMU operations.
 #[pin_data]
-pub(crate) struct VmAsData<'drm> {
+pub(crate) struct VmAsData {
     /// This address-space seat tracks this VM's binding to a hardware address space slot.
     /// It can only be accessed when holding the `Mmu::as_manager` lock.
-    as_seat: LockedSeat<AddressSpaceManager<'drm>, MAX_AS>,
+    as_seat: LockedSeat<AddressSpaceManager, MAX_AS>,
 
     /// Virtual address bits for this address space.
     va_bits: u8,
@@ -86,14 +88,14 @@ pub(crate) struct VmAsData<'drm> {
     pub(crate) page_table: DevresIoPageTable<ARM64LPAES1>,
 }
 
-impl<'drm> VmAsData<'drm> {
+impl VmAsData {
     /// Creates VM address space data by initializing all of its fields.
     pub(crate) fn new<'a>(
-        mmu: &'a Mmu<'drm>,
-        dev: &'drm Device<Bound>,
+        mmu: &'a Mmu,
+        dev: &Device<Bound>,
         va_bits: u32,
         pa_bits: u32,
-    ) -> impl pin_init::PinInit<VmAsData<'drm>, Error> + 'a {
+    ) -> impl pin_init::PinInit<VmAsData, Error> + 'a {
         let pt_config = Config {
             quirks: 0,
             pgsize_bitmap: SZ_4K | SZ_2M,
@@ -150,37 +152,41 @@ impl<'drm> VmAsData<'drm> {
 
 /// Coordinates all hardware-level address space operations through MMIO register
 /// operations including enabling, disabling, flushing, and updating address spaces.
-pub(crate) struct AddressSpaceManager<'drm> {
+pub(crate) struct AddressSpaceManager {
     /// Parent device used for logging.
-    dev: &'drm Device<Bound>,
+    pdev: ARef<platform::Device>,
 
     /// Memory-mapped I/O region for GPU register access.
+    ///
+    /// Access goes through the RCU read-side lock, so a guard is only ever held across register
+    /// accesses, never across a command wait.
     iomem: Arc<DevresIoMem<SZ_2M>>,
 
     /// Bitmask of present address space slots from GPU_AS_PRESENT register.
     as_present: u32,
 }
 
-impl<'drm> AddressSpaceManager<'drm> {
+impl AddressSpaceManager {
     /// Creates a new address space manager.
     ///
     /// Initializes the manager with references to the platform device and
     /// I/O memory region, along with the bitmask of available AS slots.
     pub(super) fn new(
-        dev: &'drm Device<Bound>,
+        pdev: &platform::Device<Bound>,
         iomem: Arc<DevresIoMem<SZ_2M>>,
         as_present: u32,
-    ) -> Result<AddressSpaceManager<'drm>> {
+    ) -> Result<AddressSpaceManager> {
         if as_present.trailing_ones() != as_present.count_ones() {
             dev_err!(
-                dev,
+                pdev,
                 "Sparse AS_PRESENT mask is unsupported: {:#x}",
                 as_present
             );
             return Err(EINVAL);
         }
+
         Ok(Self {
-            dev,
+            pdev: pdev.into(),
             iomem,
             as_present,
         })
@@ -195,7 +201,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     fn validate_as_slot(&self, as_nr: usize) -> Result {
         if as_nr >= MAX_AS {
             dev_err!(
-                self.dev,
+                &self.pdev,
                 "AS slot {} out of valid range (max {})",
                 as_nr,
                 MAX_AS
@@ -205,7 +211,7 @@ impl<'drm> AddressSpaceManager<'drm> {
 
         if (self.as_present & (1 << as_nr)) == 0 {
             dev_err!(
-                self.dev,
+                &self.pdev,
                 "AS slot {} not present in hardware (AS_PRESENT={:#x})",
                 as_nr,
                 self.as_present
@@ -219,8 +225,8 @@ impl<'drm> AddressSpaceManager<'drm> {
     ///
     /// Returns an error if polling times out after 10ms or if register access fails.
     fn as_wait_ready(&self, as_nr: usize) -> Result {
-        let io = self.iomem.access(self.dev)?;
         let op = || {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
             let status_reg = STATUS::try_at(as_nr).ok_or(EINVAL)?;
             Ok(io.read(status_reg))
         };
@@ -235,7 +241,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// Returns an error if waiting for ready times out or if register write fails.
     fn as_send_cmd(&mut self, as_nr: usize, cmd: MmuCommand) -> Result {
         self.as_wait_ready(as_nr)?;
-        let io = self.iomem.access(self.dev)?;
+        let io = self.iomem.try_access().ok_or(ENODEV)?;
         let command_reg = COMMAND::try_at(as_nr).ok_or(EINVAL)?;
         io.write(command_reg, COMMAND::zeroed().with_command(cmd));
         Ok(())
@@ -256,37 +262,39 @@ impl<'drm> AddressSpaceManager<'drm> {
     fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
         self.validate_as_slot(as_nr)?;
 
-        let io = self.iomem.access(self.dev)?;
+        {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
 
-        let transtab = as_config.transtab;
-        io.write(
-            TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSTAB_LO::from_raw(transtab as u32),
-        );
-        io.write(
-            TRANSTAB_HI::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSTAB_HI::from_raw((transtab >> 32) as u32),
-        );
+            let transtab = as_config.transtab;
+            io.write(
+                TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSTAB_LO::from_raw(transtab as u32),
+            );
+            io.write(
+                TRANSTAB_HI::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSTAB_HI::from_raw((transtab >> 32) as u32),
+            );
 
-        let transcfg = as_config.transcfg;
-        io.write(
-            TRANSCFG_LO::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSCFG_LO::from_raw(transcfg as u32),
-        );
-        io.write(
-            TRANSCFG_HI::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSCFG_HI::from_raw((transcfg >> 32) as u32),
-        );
+            let transcfg = as_config.transcfg;
+            io.write(
+                TRANSCFG_LO::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSCFG_LO::from_raw(transcfg as u32),
+            );
+            io.write(
+                TRANSCFG_HI::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSCFG_HI::from_raw((transcfg >> 32) as u32),
+            );
 
-        let memattr = as_config.memattr;
-        io.write(
-            MEMATTR_LO::try_at(as_nr).ok_or(EINVAL)?,
-            MEMATTR_LO::from_raw(memattr as u32),
-        );
-        io.write(
-            MEMATTR_HI::try_at(as_nr).ok_or(EINVAL)?,
-            MEMATTR_HI::from_raw((memattr >> 32) as u32),
-        );
+            let memattr = as_config.memattr;
+            io.write(
+                MEMATTR_LO::try_at(as_nr).ok_or(EINVAL)?,
+                MEMATTR_LO::from_raw(memattr as u32),
+            );
+            io.write(
+                MEMATTR_HI::try_at(as_nr).ok_or(EINVAL)?,
+                MEMATTR_HI::from_raw((memattr >> 32) as u32),
+            );
+        }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
 
@@ -302,38 +310,40 @@ impl<'drm> AddressSpaceManager<'drm> {
         // Flush AS before disabling
         self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushMem)?;
 
-        let io = self.iomem.access(self.dev)?;
+        {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
 
-        io.write(
-            TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSTAB_LO::from_raw(0),
-        );
-        io.write(
-            TRANSTAB_HI::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSTAB_HI::from_raw(0),
-        );
+            io.write(
+                TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSTAB_LO::from_raw(0),
+            );
+            io.write(
+                TRANSTAB_HI::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSTAB_HI::from_raw(0),
+            );
 
-        io.write(
-            MEMATTR_LO::try_at(as_nr).ok_or(EINVAL)?,
-            MEMATTR_LO::from_raw(0),
-        );
-        io.write(
-            MEMATTR_HI::try_at(as_nr).ok_or(EINVAL)?,
-            MEMATTR_HI::from_raw(0),
-        );
+            io.write(
+                MEMATTR_LO::try_at(as_nr).ok_or(EINVAL)?,
+                MEMATTR_LO::from_raw(0),
+            );
+            io.write(
+                MEMATTR_HI::try_at(as_nr).ok_or(EINVAL)?,
+                MEMATTR_HI::from_raw(0),
+            );
 
-        let transcfg = TRANSCFG::zeroed()
-            .with_mode(AddressSpaceMode::Unmapped)
-            .into_raw();
+            let transcfg = TRANSCFG::zeroed()
+                .with_mode(AddressSpaceMode::Unmapped)
+                .into_raw();
 
-        io.write(
-            TRANSCFG_LO::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSCFG_LO::from_raw(transcfg as u32),
-        );
-        io.write(
-            TRANSCFG_HI::try_at(as_nr).ok_or(EINVAL)?,
-            TRANSCFG_HI::from_raw((transcfg >> 32) as u32),
-        );
+            io.write(
+                TRANSCFG_LO::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSCFG_LO::from_raw(transcfg as u32),
+            );
+            io.write(
+                TRANSCFG_HI::try_at(as_nr).ok_or(EINVAL)?,
+                TRANSCFG_HI::from_raw((transcfg >> 32) as u32),
+            );
+        }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
 
@@ -397,8 +407,6 @@ impl<'drm> AddressSpaceManager<'drm> {
         // because log2(32 KiB) = 15.
         let lockaddr_size = lock_region_log2 - 1;
 
-        let io = self.iomem.access(self.dev)?;
-
         // The LOCKADDR base field stores address bits 63:12, so remove the low 12 bits
         // before passing this value to the register macro helper.
         // These bits are guaranteed to be zero anyway because of the minimum
@@ -409,14 +417,18 @@ impl<'drm> AddressSpaceManager<'drm> {
             .try_with_base(lockaddr_base_field)?
             .into_raw();
 
-        io.write(
-            LOCKADDR_LO::try_at(as_nr).ok_or(EINVAL)?,
-            LOCKADDR_LO::from_raw(lockaddr_val as u32),
-        );
-        io.write(
-            LOCKADDR_HI::try_at(as_nr).ok_or(EINVAL)?,
-            LOCKADDR_HI::from_raw((lockaddr_val >> 32) as u32),
-        );
+        {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
+
+            io.write(
+                LOCKADDR_LO::try_at(as_nr).ok_or(EINVAL)?,
+                LOCKADDR_LO::from_raw(lockaddr_val as u32),
+            );
+            io.write(
+                LOCKADDR_HI::try_at(as_nr).ok_or(EINVAL)?,
+                LOCKADDR_HI::from_raw((lockaddr_val >> 32) as u32),
+            );
+        }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Lock)
     }
@@ -439,9 +451,9 @@ impl<'drm> AddressSpaceManager<'drm> {
     }
 }
 
-impl<'drm> SlotOperations<MAX_AS> for AddressSpaceManager<'drm> {
+impl SlotOperations<MAX_AS> for AddressSpaceManager {
     /// VM address space data associated with a hardware slot.
-    type SlotData = Arc<VmAsData<'drm>>;
+    type SlotData = Arc<VmAsData>;
 
     fn seat(slot_data: &Self::SlotData) -> &LockedSeat<Self, MAX_AS> {
         &slot_data.as_seat
@@ -461,13 +473,9 @@ impl<'drm> SlotOperations<MAX_AS> for AddressSpaceManager<'drm> {
     }
 }
 
-impl<'drm> AsSlotManager<'drm> {
+impl AsSlotManager {
     /// Locks a region for translation table updates if the VM has an active slot.
-    pub(super) fn start_vm_update(
-        &mut self,
-        vm_as_data: &VmAsData<'drm>,
-        region: &Range<u64>,
-    ) -> Result {
+    pub(super) fn start_vm_update(&mut self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
         let seat = vm_as_data.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {
@@ -479,7 +487,7 @@ impl<'drm> AsSlotManager<'drm> {
     }
 
     /// Completes translation table updates and unlocks the region.
-    pub(super) fn end_vm_update(&mut self, vm_as_data: &VmAsData<'drm>) -> Result {
+    pub(super) fn end_vm_update(&mut self, vm_as_data: &VmAsData) -> Result {
         let seat = vm_as_data.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {
@@ -491,7 +499,7 @@ impl<'drm> AsSlotManager<'drm> {
     }
 
     /// Flushes the translation table cache if the VM has an active slot.
-    pub(super) fn flush_vm(&mut self, vm_as_data: &VmAsData<'drm>) -> Result {
+    pub(super) fn flush_vm(&mut self, vm_as_data: &VmAsData) -> Result {
         let seat = vm_as_data.as_seat.access(self);
         match seat.slot() {
             Some(slot) => {
@@ -503,12 +511,12 @@ impl<'drm> AsSlotManager<'drm> {
     }
 
     /// Activates a VM by assigning it to a hardware slot.
-    pub(super) fn activate_vm(&mut self, vm_as_data: ArcBorrow<'_, VmAsData<'drm>>) -> Result {
+    pub(super) fn activate_vm(&mut self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
         self.activate(vm_as_data.into())
     }
 
     /// Deactivates a VM by evicting it from its hardware slot.
-    pub(super) fn deactivate_vm(&mut self, vm_as_data: &VmAsData<'drm>) -> Result {
+    pub(super) fn deactivate_vm(&mut self, vm_as_data: &VmAsData) -> Result {
         self.evict(&vm_as_data.as_seat)
     }
 }
