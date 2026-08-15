@@ -60,7 +60,11 @@ use crate::{
     gpu::GpuInfo,
     mmap,
     mmu::Mmu,
-    regs::gpu_control::*, //
+    regs::gpu_control::*,
+    sched::{
+        Scheduler,
+        SchedulerState, //
+    }, //
 };
 
 pub(crate) type IoMem<'a> = kernel::io::mem::IoMem<'a, SZ_2M>;
@@ -76,9 +80,25 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Normal> = drm::Device<TyrDrmDriver, Ctx>
 /// `registration_guard()` exists only on `Device<T, Ioctl>`, so driver callbacks running in the
 /// `Normal` context, such as the mmap hook, cannot reach `TyrDrmRegistrationData`. The data
 /// they need lives here.
+#[pin_data]
 pub(crate) struct TyrDrmDeviceData {
     /// Physical address of the GPU MMIO window.
     pub(crate) mmio_phys_addr: u64,
+
+    /// The scheduler logic.
+    #[pin]
+    sched: Mutex<SchedulerState>,
+}
+
+impl TyrDrmDeviceData {
+    #[expect(dead_code)]
+    pub(crate) fn with_locked_scheduler<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Scheduler) -> Result<R>,
+    {
+        let mut sched = self.sched.lock();
+        f(sched.enabled_mut()?)
+    }
 }
 
 pub(crate) struct TyrPlatformDriver;
@@ -189,7 +209,10 @@ impl platform::Driver for TyrPlatformDriver {
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
-            Ok(TyrDrmDeviceData { mmio_phys_addr }),
+            try_pin_init!(TyrDrmDeviceData {
+                mmio_phys_addr,
+                sched <- new_mutex!(SchedulerState::Disabled),
+            }? Error),
         )?;
 
         let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info)?;
@@ -224,6 +247,8 @@ impl platform::Driver for TyrPlatformDriver {
             .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
         firmware.enable_global_interface(&gpu_info, &core_clk, io)?;
+
+        unreg_dev.sched.lock().init(&unreg_dev)?;
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
