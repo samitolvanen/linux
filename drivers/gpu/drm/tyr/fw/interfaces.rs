@@ -2078,6 +2078,16 @@ impl GlobalInterface {
 
         enabled.csg.get(index)
     }
+
+    #[expect(dead_code)]
+    pub(crate) fn csg_slot_count(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            GlobalInterfaceState::Enabled(e) => e,
+            GlobalInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_num as u32)
+    }
 }
 
 /// State of a CSG interface.
@@ -2274,6 +2284,26 @@ impl CsgInterface {
 
         Ok((suspend_size, protm_suspend_size))
     }
+
+    #[expect(dead_code)]
+    pub(crate) fn cs(&self, index: usize) -> Option<&CsInterface> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return None,
+        };
+
+        enabled.cs.get(index)
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn cs_slot_count(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_num as u32)
+    }
 }
 
 /// State of a CS interface.
@@ -2281,14 +2311,12 @@ enum CsInterfaceState {
     /// Interface is not yet initialized.
     Disabled,
     /// Interface is initialized and operational.
-    #[expect(dead_code)]
     Enabled(EnabledCsInterface),
 }
 
 /// When enabled, a CS Interface has control, input, and output system memory interfaces.
 struct EnabledCsInterface {
     /// Control block interface - provides CS capabilities and configuration.
-    #[expect(dead_code)]
     cs_control: FwInterface<Region<CS_CONTROL_BLOCK_SIZE>>,
     /// Input block interface - driver writes CS requests here.
     #[expect(dead_code)]
@@ -2376,5 +2404,33 @@ impl CsInterface {
         self.state = CsInterfaceState::Enabled(enabled);
 
         Ok(())
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn work_regs(&self) -> Result<u32> {
+        use cs::control::STREAM_FEATURES;
+
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled
+            .cs_control
+            .read(STREAM_FEATURES)
+            .work_registers()
+            .get())
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn scoreboards(&self) -> Result<u32> {
+        use cs::control::STREAM_FEATURES;
+
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.cs_control.read(STREAM_FEATURES).scoreboards().get())
     }
 }
