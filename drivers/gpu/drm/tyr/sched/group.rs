@@ -26,6 +26,7 @@ use crate::{
     gem,
     pool,
     vm::{
+        Vm,
         VmFlag,
         VmMapFlags, //
     }, //
@@ -39,6 +40,8 @@ use super::{
 pub(crate) struct Group {
     pub(crate) fatal_queues: Atomic<u32>,
     pub(crate) queues: KVec<Queue>,
+    #[expect(dead_code)]
+    pub(super) vm: Arc<Vm>,
     #[expect(dead_code)]
     pub(super) priority: u8,
     #[expect(dead_code)]
@@ -131,6 +134,7 @@ impl Group {
             Self {
                 fatal_queues: Atomic::new(0),
                 queues,
+                vm,
                 priority: group_args.priority,
                 compute_core_mask: group_args.compute_core_mask,
                 fragment_core_mask: group_args.fragment_core_mask,
