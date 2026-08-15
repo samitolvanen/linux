@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::ops::Range;
+
 use kernel::{
     prelude::*,
+    sizes::SZ_4K,
     sync::Arc, //
 };
 
@@ -27,6 +30,10 @@ pub(crate) struct Queue {
     ringbuf: Arc<gem::MappedBo>,
     #[expect(dead_code)]
     iface_mem: Arc<gem::MappedBo>,
+    #[expect(dead_code)]
+    iface_input_va: Range<u64>,
+    #[expect(dead_code)]
+    iface_output_va: Range<u64>,
 }
 
 impl Queue {
@@ -45,11 +52,16 @@ impl Queue {
             flags,
         )?;
         let iface_mem = reg_data.fw.alloc_queue_mem(tdev)?;
+        let iface_input_va = iface_mem.kernel_va().ok_or(EINVAL)?;
+        let iface_output_start = iface_input_va.start + SZ_4K as u64;
+        let iface_output_va = iface_output_start..(iface_output_start + SZ_4K as u64);
 
         Ok(Self {
             priority: queue_args.priority(),
             ringbuf,
             iface_mem,
+            iface_input_va,
+            iface_output_va,
         })
     }
 }
