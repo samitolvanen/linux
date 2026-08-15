@@ -57,9 +57,9 @@ pub(crate) struct Group {
     #[expect(dead_code)]
     pub(super) max_tiler_cores: u8,
     #[expect(dead_code)]
-    suspend_buf: Arc<gem::MappedBo>,
+    pub(super) suspend_buf: Arc<gem::MappedBo>,
     #[expect(dead_code)]
-    protm_suspend_buf: Arc<gem::MappedBo>,
+    pub(super) protm_suspend_buf: Arc<gem::MappedBo>,
     #[expect(dead_code)]
     syncobjs: Arc<gem::MappedBo>,
 }
