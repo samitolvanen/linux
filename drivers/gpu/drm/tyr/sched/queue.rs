@@ -4,11 +4,16 @@ use core::ops::Range;
 
 use kernel::{
     io::{
+        mem::DevresIoMem,
+        register::Array,
         Io,
         IoBase, //
     },
     prelude::*,
-    sizes::SZ_4K,
+    sizes::{
+        SZ_2M,
+        SZ_4K, //
+    },
     sync::{
         barrier::{
             smp_mb,
@@ -25,6 +30,7 @@ use crate::{
     },
     file::QueueCreate,
     gem,
+    regs::doorbell_block,
     vm::{
         Vm,
         VmFlag,
@@ -38,6 +44,8 @@ pub(crate) struct Queue {
     priority: u8,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
+    doorbell_id: Option<usize>,
+    iomem: Arc<DevresIoMem<SZ_2M>>,
 }
 
 impl Queue {
@@ -62,6 +70,8 @@ impl Queue {
             priority: queue_args.priority(),
             ringbuf,
             interfaces,
+            doorbell_id: None,
+            iomem: reg_data.iomem.clone(),
         })
     }
 
@@ -104,6 +114,18 @@ impl Queue {
         self.interfaces.write_input(ringbuf_input)?;
         smp_mb(Write);
         Ok(())
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn kick(&self) -> Result {
+        let io = self.iomem.try_access().ok_or(ENODEV)?;
+        let doorbell_reg =
+            doorbell_block::DOORBELL::try_at(self.doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
+
+        io.try_write(
+            doorbell_reg,
+            doorbell_block::DOORBELL::zeroed().with_ring(true),
+        )
     }
 }
 
