@@ -15,6 +15,10 @@ use kernel::{
         SZ_4K, //
     },
     sync::{
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         barrier::{
             smp_mb,
             Write, //
@@ -38,13 +42,15 @@ use crate::{
     }, //
 };
 
+const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
+
 /// A minimal hardware queue object owned by a scheduling group.
 pub(crate) struct Queue {
     #[expect(dead_code)]
     pub(super) priority: u8,
     pub(super) ringbuf: Arc<gem::MappedBo>,
     pub(super) interfaces: Interfaces,
-    pub(super) doorbell_id: Option<usize>,
+    doorbell_id: Atomic<usize>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
 }
 
@@ -70,9 +76,24 @@ impl Queue {
             priority: queue_args.priority(),
             ringbuf,
             interfaces,
-            doorbell_id: None,
+            doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
             iomem: reg_data.iomem.clone(),
         })
+    }
+
+    pub(super) fn doorbell_id(&self) -> Option<usize> {
+        let doorbell_id = self.doorbell_id.load(Relaxed);
+
+        if doorbell_id == UNASSIGNED_DOORBELL_ID {
+            None
+        } else {
+            Some(doorbell_id)
+        }
+    }
+
+    pub(super) fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
+        self.doorbell_id
+            .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
     #[expect(dead_code)]
@@ -120,7 +141,7 @@ impl Queue {
     pub(crate) fn kick(&self) -> Result {
         let io = self.iomem.try_access().ok_or(ENODEV)?;
         let doorbell_reg =
-            doorbell_block::DOORBELL::try_at(self.doorbell_id.ok_or(EINVAL)?).ok_or(EINVAL)?;
+            doorbell_block::DOORBELL::try_at(self.doorbell_id().ok_or(EINVAL)?).ok_or(EINVAL)?;
 
         io.try_write(
             doorbell_reg,
