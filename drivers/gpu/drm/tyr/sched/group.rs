@@ -175,6 +175,9 @@ impl Pool {
         queue_args: KVec<QueueCreate>,
     ) -> Result<usize> {
         let group = Group::create(ddev, reg_data, file, groupcreate, queue_args)?;
+
+        ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
+
         self.0.insert(group)
     }
 
