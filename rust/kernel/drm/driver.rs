@@ -10,7 +10,10 @@ use crate::{
     drm,
     error::to_result,
     prelude::*,
-    sync::aref::ARef, //
+    sync::{
+        aref::ARef,
+        atomic::Release, //
+    }, //
 };
 use core::{
     marker::PhantomPinned,
@@ -219,6 +222,11 @@ impl<'a, T: Driver> Registration<'a, T> {
                     // concurrent access to `registration_data` is possible at this point.
                     unsafe { *drm.registration_data.get() = NonNull::dangling() };
                 })?;
+
+                // Tell holders of a `Normal` device handle that the device reached registration.
+                // The release pairs with the acquire in `Device::<T, Normal>::registration_guard()`
+                // and publishes the registration data stored above.
+                drm.registered.store(true, Release);
             },
         })
     }
