@@ -49,6 +49,13 @@ use crate::{
 
 const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
 
+/// Returns the Job IRQ sources the driver services.
+fn job_irq_sources() -> JOB_IRQ_MASK {
+    JOB_IRQ_MASK::zeroed()
+        .with_const_csg::<CSG_IRQ_MASK>()
+        .with_glb(true)
+}
+
 /// Wait state shared between the Job IRQ handler and the firmware.
 #[derive(Clone)]
 pub(crate) struct JobIrqState {
@@ -112,9 +119,7 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     iomem: Arc<DevresIoMem<SZ_2M>>,
     state: JobIrqState,
 ) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>, Error> + 'drm> {
-    let mask = JOB_IRQ_MASK::zeroed()
-        .with_const_csg::<CSG_IRQ_MASK>()
-        .with_glb(true);
+    let mask = job_irq_sources();
 
     let io = iomem.access(pdev.as_ref())?;
     io.write_reg(JOB_IRQ_CLEAR::from_raw(mask.into_raw()));
@@ -136,11 +141,7 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn reenable(&self, io: &IoMem<'_>) {
-        io.write_reg(
-            JOB_IRQ_MASK::zeroed()
-                .with_const_csg::<CSG_IRQ_MASK>()
-                .with_glb(true),
-        );
+        io.write_reg(job_irq_sources());
     }
 
     fn read_raw_status(&self, io: &IoMem<'_>) -> u32 {
@@ -152,10 +153,7 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn mask(&self) -> u32 {
-        JOB_IRQ_MASK::zeroed()
-            .with_const_csg::<CSG_IRQ_MASK>()
-            .with_glb(true)
-            .into_raw()
+        job_irq_sources().into_raw()
     }
 
     fn handle(&self, _tdev: &TyrDrmDevice, _io: &IoMem<'_>, status: u32) {
