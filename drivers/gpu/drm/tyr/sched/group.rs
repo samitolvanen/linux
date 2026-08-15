@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
+    drm::gem::BaseObject,
+    io::IoBase,
     prelude::*,
     sync::{
         atomic::{
@@ -22,10 +24,17 @@ use crate::{
         TyrDrmFile, //
     },
     gem,
-    pool, //
+    pool,
+    vm::{
+        VmFlag,
+        VmMapFlags, //
+    }, //
 };
 
-use super::queue::Queue;
+use super::{
+    queue::Queue,
+    syncs, //
+};
 
 pub(crate) struct Group {
     pub(crate) fatal_queues: Atomic<u32>,
@@ -34,6 +43,8 @@ pub(crate) struct Group {
     suspend_buf: Arc<gem::MappedBo>,
     #[expect(dead_code)]
     protm_suspend_buf: Arc<gem::MappedBo>,
+    #[expect(dead_code)]
+    syncobjs: Arc<gem::MappedBo>,
 }
 
 impl Group {
@@ -82,6 +93,17 @@ impl Group {
             .fw
             .alloc_suspend_buf(ddev, protm_suspend_buf_size as usize)?;
 
+        let num_syncs =
+            group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
+        let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
+        let dev = reg_data.pdev.as_ref();
+        let syncobjs = gem::new_kernel_object(dev, ddev, &vm, num_syncs, flags)?;
+
+        let vmap = syncobjs.vmap();
+        let size = vmap.owner().size();
+        // SAFETY: `vmap` owns a valid writable mapping for `size` bytes.
+        unsafe { core::ptr::write_bytes(vmap.as_view().as_ptr().cast::<u8>(), 0, size) };
+
         let mut queues = KVec::new();
 
         for queue_arg in queue_args.iter() {
@@ -97,6 +119,7 @@ impl Group {
                 queues,
                 suspend_buf,
                 protm_suspend_buf,
+                syncobjs,
             },
             GFP_KERNEL,
         )?)

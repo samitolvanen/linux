@@ -2,3 +2,4 @@
 
 pub(crate) mod group;
 pub(crate) mod queue;
+pub(crate) mod syncs;
