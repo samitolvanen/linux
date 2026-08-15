@@ -153,6 +153,7 @@ pub(crate) struct PreparedQueueSubmit {
 impl PreparedQueueSubmit {
     pub(crate) fn commit(self, group: &Group) -> Result<ARef<PublicDmaFence>> {
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
+        let mut prepared = self.prepared;
 
         if self.has_stream {
             let seqno = queue.claim_seqno();
@@ -164,9 +165,11 @@ impl PreparedQueueSubmit {
                     pad: 0,
                 },
             )?;
+        } else if let Some(fence) = queue.last_submit_fence() {
+            prepared.add_dep(fence)?;
         }
 
-        let submit_fence = queue.commit_job(self.prepared);
+        let submit_fence = queue.commit_job(prepared);
 
         for signal in self.signals.into_iter() {
             signal.publish(&submit_fence);
@@ -231,7 +234,10 @@ impl Job {
         let deps = deps::wait_fences(file, &self.syncs)?;
         let signals = deps::signal_syncs(file, &self.syncs)?;
         let has_stream = !self.stream.is_empty();
-        let prepared = queue.prepare_job(QueueJob::new(self.stream), &deps)?;
+
+        // The extra slot holds the prior-work dependency that commit adds.
+        let extra_dep_capacity = usize::from(!has_stream);
+        let prepared = queue.prepare_job(QueueJob::new(self.stream), &deps, extra_dep_capacity)?;
 
         Ok(PreparedQueueSubmit {
             queue_index: self.queue_index,

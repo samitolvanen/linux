@@ -50,6 +50,16 @@ const UNBOUND_CSG_ID: usize = usize::MAX;
 
 #[pin_data]
 pub(crate) struct Group {
+    /// Serializes a submit's prepare-to-commit window on this group, so
+    /// every queue claims its pipeline slots and fence seqnos in the
+    /// same order.
+    ///
+    /// Lock order `submit_lock > job queue`, with nothing else held
+    /// when it is taken. The window allocates, so the lock is off limits
+    /// to dma-fence signalling sections and must not cover a userspace
+    /// copy.
+    #[pin]
+    submit_lock: Mutex<()>,
     pub(crate) fatal_queues: Atomic<u32>,
     pub(crate) tiler_oom: Atomic<u32>,
     csg_id: Atomic<usize>,
@@ -137,6 +147,7 @@ impl Group {
 
         Arc::pin_init(
             pin_init!(Self {
+                submit_lock <- new_mutex!(()),
                 fatal_queues: Atomic::new(0),
                 tiler_oom: Atomic::new(0),
                 csg_id: Atomic::new(UNBOUND_CSG_ID),
@@ -222,6 +233,8 @@ impl Group {
     pub(super) fn submit(&self, queue_submits: KVec<QueueSubmit>, file: &TyrDrmFile) -> Result {
         let jobs = Job::from_queue_submits(queue_submits)?;
         let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
+
+        let _submit_lock = self.submit_lock.lock();
 
         for job in jobs.into_iter() {
             prepared_jobs.push(job.prepare(self, file)?, GFP_KERNEL)?;
