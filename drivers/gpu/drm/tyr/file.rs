@@ -375,7 +375,7 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn group_create(
-        _ddev: &TyrDrmDevice<Registered>,
+        ddev: &TyrDrmDevice<Registered>,
         reg_data: &TyrDrmRegistrationData<'_>,
         groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
@@ -396,15 +396,21 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let mut queue_args = KVec::new();
+
         for _ in 0..groupcreate.queues.count {
             let queue: QueueCreate = reader.read()?;
             queue.validate()?;
+            queue_args.push(queue, GFP_KERNEL)?;
         }
 
-        let handle = file
-            .inner()
-            .group_pool()
-            .create_group(reg_data, groupcreate, file)?;
+        let handle = file.inner().group_pool().create_group(
+            ddev,
+            reg_data,
+            groupcreate,
+            file,
+            queue_args,
+        )?;
 
         groupcreate.group_handle = handle as u32;
 
@@ -619,7 +625,7 @@ struct VmBindOp(uapi::drm_panthor_vm_bind_op);
 unsafe impl FromBytes for VmBindOp {}
 
 #[repr(transparent)]
-struct QueueCreate(uapi::drm_panthor_queue_create);
+pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for QueueCreate {}
@@ -642,6 +648,14 @@ impl QueueCreate {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn priority(&self) -> u8 {
+        self.0.priority
+    }
+
+    pub(crate) fn ringbuf_size(&self) -> u32 {
+        self.0.ringbuf_size
     }
 }
 
