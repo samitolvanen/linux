@@ -41,10 +41,10 @@ use crate::{
 /// A minimal hardware queue object owned by a scheduling group.
 pub(crate) struct Queue {
     #[expect(dead_code)]
-    priority: u8,
-    ringbuf: Arc<gem::MappedBo>,
-    interfaces: Interfaces,
-    doorbell_id: Option<usize>,
+    pub(super) priority: u8,
+    pub(super) ringbuf: Arc<gem::MappedBo>,
+    pub(super) interfaces: Interfaces,
+    pub(super) doorbell_id: Option<usize>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
 }
 
@@ -156,9 +156,9 @@ impl RingBufferOutput {
 pub(crate) struct Interfaces {
     mem: Arc<gem::MappedBo>,
     #[expect(dead_code)]
-    input_va: Range<u64>,
+    pub(super) input_va: Range<u64>,
     #[expect(dead_code)]
-    output_va: Range<u64>,
+    pub(super) output_va: Range<u64>,
     input_offset: usize,
     output_offset: usize,
 }
