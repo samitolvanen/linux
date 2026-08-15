@@ -96,15 +96,19 @@ impl Queue {
             .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
-    #[expect(dead_code)]
-    pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
+    pub(crate) fn append_instrs(&self, instrs: &[u8]) -> Result {
         let mut ringbuf_input = self.interfaces.read_input()?;
 
         let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.size();
+        let ringbuf_output = self.interfaces.read_output()?;
 
         if instrs.len() > size {
             return Err(ENOSPC);
+        }
+
+        if ringbuf_input.insert != ringbuf_output.extract {
+            return Err(EBUSY);
         }
 
         let cs_insert = (ringbuf_input.insert & (size as u64 - 1)) as usize;
@@ -128,7 +132,6 @@ impl Queue {
 
         smp_mb(Write);
 
-        let ringbuf_output = self.interfaces.read_output()?;
         ringbuf_input.extract_init = ringbuf_output.extract;
         ringbuf_input.insert += instrs.len() as u64;
 
@@ -137,7 +140,6 @@ impl Queue {
         Ok(())
     }
 
-    #[expect(dead_code)]
     pub(crate) fn kick(&self) -> Result {
         let io = self.iomem.try_access().ok_or(ENODEV)?;
         let doorbell_reg =
@@ -199,7 +201,7 @@ impl Interfaces {
         })
     }
 
-    pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
+    pub(super) fn read_input(&self) -> Result<RingBufferInput> {
         let vmap = self.mem.vmap();
 
         Ok(RingBufferInput {
@@ -208,7 +210,7 @@ impl Interfaces {
         })
     }
 
-    pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
+    pub(super) fn write_input(&self, value: RingBufferInput) -> Result {
         let vmap = self.mem.vmap();
 
         vmap.try_write64(
@@ -218,7 +220,7 @@ impl Interfaces {
         vmap.try_write64(value.insert, self.input_offset + RingBufferInput::INSERT)
     }
 
-    pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
+    pub(super) fn read_output(&self) -> Result<RingBufferOutput> {
         Ok(RingBufferOutput {
             extract: self
                 .mem

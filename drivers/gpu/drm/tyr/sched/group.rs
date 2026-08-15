@@ -21,6 +21,8 @@ use crate::{
     },
     file::{
         QueueCreate,
+        QueueSubmit,
+        SyncOp,
         TyrDrmFile, //
     },
     gem,
@@ -172,6 +174,38 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    pub(super) fn submit(&self, syncs: KVec<SyncOp>, queue_submits: KVec<QueueSubmit>) -> Result {
+        if !syncs.is_empty() {
+            return Err(ENOTSUPP);
+        }
+
+        let mut kicked_queues = KVec::new();
+
+        for queue_submit in queue_submits.iter() {
+            let queue_index = queue_submit.queue_index();
+
+            if kicked_queues.contains(&queue_index) {
+                return Err(ENOTSUPP);
+            }
+
+            if !queue_submit.has_stream() {
+                continue;
+            }
+
+            let stream = queue_submit.copy_stream()?;
+            let queue = self.queues.get(queue_index).ok_or(EINVAL)?;
+            queue.append_instrs(&stream)?;
+            kicked_queues.push(queue_index, GFP_KERNEL)?;
+        }
+
+        for &queue_index in kicked_queues.iter() {
+            let queue = self.queues.get(queue_index).ok_or(EINVAL)?;
+            queue.kick()?;
+        }
+
+        Ok(())
     }
 }
 
