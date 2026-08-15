@@ -32,7 +32,10 @@ use kernel::{
     platform,
     prelude::*,
     register,
-    sizes::SZ_2M,
+    sizes::{
+        SZ_2M,
+        SZ_8K, //
+    },
     str::CString,
     sync::{
         atomic::{
@@ -402,6 +405,14 @@ impl<'drm> Firmware<'drm> {
         let csg = global_iface.csg(0).ok_or(EINVAL)?;
 
         csg.suspend_buf_sizes()
+    }
+
+    /// Allocate a CS ring-buffer interface in the FW VM (AS0).
+    pub(crate) fn alloc_queue_mem(&self, ddev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
+        let dev = self.dev.as_ref();
+        let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
+
+        gem::new_kernel_object(dev, ddev, &self.vm, SZ_8K, flags)
     }
 
     pub(crate) fn alloc_suspend_buf(
