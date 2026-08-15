@@ -24,8 +24,7 @@ use kernel::{
             Release, //
         },
         Arc, //
-    },
-    workqueue, //
+    }, //
 };
 
 use crate::{
@@ -186,7 +185,13 @@ impl TyrIrqTrait for JobIrq<'_> {
                 .unwrap_or(false);
 
             if queued_tiler_oom {
-                let _ = workqueue::system_dfl().enqueue::<ARef<TyrDrmDevice>, 4>(ARef::from(tdev));
+                if let Some(guard) = tdev.registration_guard() {
+                    guard.registration_data_with(|reg_data| {
+                        let _ = reg_data
+                            .heap_wq
+                            .enqueue::<ARef<TyrDrmDevice>, 4>(ARef::from(tdev));
+                    });
+                }
             }
         }
     }
