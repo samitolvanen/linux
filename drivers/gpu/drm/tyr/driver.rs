@@ -247,7 +247,7 @@ impl platform::Driver for TyrPlatformDriver {
 
         firmware.enable_global_interface(&gpu_info, &core_clk, io)?;
 
-        unreg_dev.sched.lock().init(&unreg_dev)?;
+        let csif_info = unreg_dev.sched.lock().init(&unreg_dev, &firmware)?;
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
@@ -265,7 +265,7 @@ impl platform::Driver for TyrPlatformDriver {
                 }),
                 iomem,
                 gpu_info,
-                csif_info <- new_mutex!(gpu::CsifInfo::default()),
+                csif_info <- new_mutex!(csif_info),
         });
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is

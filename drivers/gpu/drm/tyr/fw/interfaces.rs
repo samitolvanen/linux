@@ -2079,7 +2079,6 @@ impl GlobalInterface {
         enabled.csg.get(index)
     }
 
-    #[expect(dead_code)]
     pub(crate) fn csg_slot_count(&self) -> Result<u32> {
         let enabled = match &self.state {
             GlobalInterfaceState::Enabled(e) => e,
@@ -2285,7 +2284,6 @@ impl CsgInterface {
         Ok((suspend_size, protm_suspend_size))
     }
 
-    #[expect(dead_code)]
     pub(crate) fn cs(&self, index: usize) -> Option<&CsInterface> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
@@ -2295,7 +2293,6 @@ impl CsgInterface {
         enabled.cs.get(index)
     }
 
-    #[expect(dead_code)]
     pub(crate) fn cs_slot_count(&self) -> Result<u32> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
@@ -2406,7 +2403,6 @@ impl CsInterface {
         Ok(())
     }
 
-    #[expect(dead_code)]
     pub(crate) fn work_regs(&self) -> Result<u32> {
         use cs::control::STREAM_FEATURES;
 
@@ -2422,7 +2418,6 @@ impl CsInterface {
             .get())
     }
 
-    #[expect(dead_code)]
     pub(crate) fn scoreboards(&self) -> Result<u32> {
         use cs::control::STREAM_FEATURES;
 

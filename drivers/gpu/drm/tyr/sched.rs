@@ -13,7 +13,9 @@ use crate::{
         QueueSubmit,
         SyncOp,
         TyrDrmFile, //
-    }, //
+    },
+    fw::Firmware,
+    gpu::CsifInfo, //
 };
 
 use group::Group;
@@ -34,10 +36,10 @@ pub(crate) enum SchedulerState {
 }
 
 impl SchedulerState {
-    pub(crate) fn init(&mut self, tdev: &TyrDrmDevice) -> Result {
-        let scheduler = Scheduler::init(tdev)?;
+    pub(crate) fn init(&mut self, tdev: &TyrDrmDevice, fw: &Firmware<'_>) -> Result<CsifInfo> {
+        let (scheduler, csif) = Scheduler::init(tdev, fw)?;
         *self = Self::Enabled(scheduler);
-        Ok(())
+        Ok(csif)
     }
 
     pub(crate) fn enabled_mut(&mut self) -> Result<&mut Scheduler> {
@@ -54,10 +56,24 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    pub(crate) fn init(_tdev: &TyrDrmDevice) -> Result<Self> {
-        Ok(Self {
-            idle_groups: [const { KVec::new() }; GROUP_PRIORITY_COUNT],
-        })
+    pub(crate) fn init(_tdev: &TyrDrmDevice, fw: &Firmware<'_>) -> Result<(Self, CsifInfo)> {
+        let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
+            fw.csif_info_counts()?;
+
+        let csif = CsifInfo(uapi::drm_panthor_csif_info {
+            csg_slot_count,
+            cs_slot_count,
+            cs_reg_count,
+            scoreboard_slot_count,
+            ..Default::default()
+        });
+
+        Ok((
+            Self {
+                idle_groups: [const { KVec::new() }; GROUP_PRIORITY_COUNT],
+            },
+            csif,
+        ))
     }
 
     pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, _group: Arc<Group>) -> Result {
