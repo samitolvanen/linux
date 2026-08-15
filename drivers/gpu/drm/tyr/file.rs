@@ -360,7 +360,7 @@ impl TyrDrmFileData {
                 let prepared = vm.prepare_bind_job(job, &deps)?;
 
                 vm.with_prepared_vm(1, |mut prepared_vm| {
-                    let fence = vm.commit_bind_job(prepared);
+                    let fence = vm.commit_bind_job(prepared)?;
                     prepared_vm.resv_add_fence(
                         &fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
