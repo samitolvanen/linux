@@ -43,7 +43,6 @@ pub(crate) struct Group {
     pub(crate) fatal_queues: Atomic<u32>,
     csg_id: Atomic<usize>,
     pub(crate) queues: KVec<Queue>,
-    #[expect(dead_code)]
     pub(super) vm: Arc<Vm>,
     pub(super) priority: u8,
     #[expect(dead_code)]

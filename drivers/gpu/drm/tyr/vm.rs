@@ -535,7 +535,7 @@ impl Vm {
     }
 
     /// Deactivate the VM by evicting it from its address space slot.
-    fn deactivate(&self) -> Result {
+    pub(crate) fn deactivate(&self) -> Result {
         self.mmu.deactivate_vm(&self.as_data).inspect_err(|e| {
             dev_err!(self.dev(), "Failed to deactivate VM: {:?}", e);
         })
