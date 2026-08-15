@@ -435,7 +435,7 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn group_submit(
-        _ddev: &TyrDrmDevice<Registered>,
+        ddev: &TyrDrmDevice<Registered>,
         _reg_data: &TyrDrmRegistrationData<'_>,
         groupsubmit: &mut uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
@@ -466,6 +466,9 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let mut queue_submits = KVec::new();
+        let mut syncs = KVec::new();
+
         for _ in 0..groupsubmit.queue_submits.count {
             let queue: QueueSubmit = reader.read()?;
             queue.validate(group.queue_count())?;
@@ -479,10 +482,15 @@ impl TyrDrmFileData {
             for _ in 0..queue.0.syncs.count {
                 let sync: SyncOp = sync_reader.read()?;
                 sync.validate()?;
+                syncs.push(sync, GFP_KERNEL)?;
             }
+
+            queue_submits.push(queue, GFP_KERNEL)?;
         }
 
-        Err(ENOTSUPP)
+        ddev.with_locked_scheduler(|sched| sched.submit(syncs, group, queue_submits, file))?;
+
+        Ok(0)
     }
 
     pub(crate) fn group_get_state(
@@ -660,7 +668,7 @@ impl QueueCreate {
 }
 
 #[repr(transparent)]
-struct QueueSubmit(uapi::drm_panthor_queue_submit);
+pub(crate) struct QueueSubmit(uapi::drm_panthor_queue_submit);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for QueueSubmit {}
@@ -692,7 +700,7 @@ impl QueueSubmit {
 }
 
 #[repr(transparent)]
-struct SyncOp(uapi::drm_panthor_sync_op);
+pub(crate) struct SyncOp(uapi::drm_panthor_sync_op);
 
 // SAFETY: this struct is safe to be transmuted from a byte slice.
 unsafe impl FromBytes for SyncOp {}

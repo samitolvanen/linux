@@ -91,7 +91,6 @@ pub(crate) struct TyrDrmDeviceData {
 }
 
 impl TyrDrmDeviceData {
-    #[expect(dead_code)]
     pub(crate) fn with_locked_scheduler<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Scheduler) -> Result<R>,
