@@ -25,6 +25,8 @@ pub(crate) struct Queue {
     priority: u8,
     #[expect(dead_code)]
     ringbuf: Arc<gem::MappedBo>,
+    #[expect(dead_code)]
+    iface_mem: Arc<gem::MappedBo>,
 }
 
 impl Queue {
@@ -42,10 +44,12 @@ impl Queue {
             queue_args.ringbuf_size() as usize,
             flags,
         )?;
+        let iface_mem = reg_data.fw.alloc_queue_mem(tdev)?;
 
         Ok(Self {
             priority: queue_args.priority(),
             ringbuf,
+            iface_mem,
         })
     }
 }
