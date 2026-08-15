@@ -38,7 +38,11 @@ use kernel::{
         Mutex, //
     },
     time,
-    workqueue::Work, //
+    workqueue::{
+        OwnedQueue,
+        Queue,
+        Work, //
+    }, //
 };
 
 use crate::{
@@ -138,6 +142,11 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Workqueue for work items that may signal DMA fences.
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
+
+    /// Workqueue for deferred tiler heap growth.
+    ///
+    /// Freed after the IRQ registrations, so no handler can queue work into it by then.
+    pub(crate) heap_wq: OwnedQueue,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -278,6 +287,8 @@ impl platform::Driver for TyrPlatformDriver {
                 GFP_KERNEL,
             )?;
 
+            let heap_wq = Queue::new_unbound().build(c"tyr-heap")?;
+
             Ok(try_pin_init!(TyrPlatformDriverData {
                 // SAFETY: `_reg` is stored in `TyrPlatformDriverData` and dropped when the
                 // driver is unbound; it is never forgotten.
@@ -291,6 +302,7 @@ impl platform::Driver for TyrPlatformDriver {
                         _job_irq: job_irq,
                         _mmu_irq: mmu_irq,
                         wq,
+                        heap_wq,
                         clks <- new_mutex!(Clocks {
                             core: core_clk,
                             stacks: stacks_clk,
