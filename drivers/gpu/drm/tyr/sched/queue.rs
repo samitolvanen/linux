@@ -147,6 +147,8 @@ pub(crate) struct QueueData {
     iomem: Arc<DevresIoMem<SZ_2M>>,
     #[pin]
     pending_submit_fences: Mutex<KVec<PendingSubmitFence>>,
+    #[pin]
+    last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
 }
 
 impl QueueData {
@@ -319,6 +321,10 @@ impl QueueData {
         let ringbuf_output = self.interfaces.read_output()?;
         self.signal_submit_fences_up_to(ringbuf_output.extract, Ok(()));
         Ok(())
+    }
+
+    pub(super) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
+        self.last_submit_fence.lock().clone()
     }
 }
 
@@ -525,6 +531,7 @@ impl Queue {
                 next_seqno: Atomic::new(0),
                 iomem: reg_data.iomem.clone(),
                 pending_submit_fences <- new_mutex!(KVec::new()),
+                last_submit_fence <- new_mutex!(None),
             }),
             GFP_KERNEL,
         )?;
@@ -550,12 +557,16 @@ impl Queue {
         &self,
         job: QueueJob,
         deps: &[ARef<PublicDmaFence>],
+        extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
-        self.job_queue.prepare(job, deps, 0, QueueFenceData)
+        self.job_queue
+            .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
-        self.job_queue.commit(prepared)
+        let submit_fence = self.job_queue.commit(prepared);
+        *self.data.last_submit_fence.lock() = Some(submit_fence.clone());
+        submit_fence
     }
 }
 
