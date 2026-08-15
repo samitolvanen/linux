@@ -53,12 +53,18 @@ impl SchedulerState {
 /// Minimal scheduler shell.
 pub(crate) struct Scheduler {
     idle_groups: [KVec<Arc<Group>>; GROUP_PRIORITY_COUNT],
+    csg_slots: KVec<Option<Arc<Group>>>,
 }
 
 impl Scheduler {
     pub(crate) fn init(_tdev: &TyrDrmDevice, fw: &Firmware<'_>) -> Result<(Self, CsifInfo)> {
         let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
             fw.csif_info_counts()?;
+        let mut csg_slots = KVec::with_capacity(csg_slot_count as usize, GFP_KERNEL)?;
+
+        for _ in 0..csg_slot_count {
+            csg_slots.push(None, GFP_KERNEL)?;
+        }
 
         let csif = CsifInfo(uapi::drm_panthor_csif_info {
             csg_slot_count,
@@ -71,12 +77,38 @@ impl Scheduler {
         Ok((
             Self {
                 idle_groups: [const { KVec::new() }; GROUP_PRIORITY_COUNT],
+                csg_slots,
             },
             csif,
         ))
     }
 
-    pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, _group: Arc<Group>) -> Result {
+    pub(crate) fn bind(&mut self, _tdev: &TyrDrmDevice, group: Arc<Group>) -> Result {
+        if self.csg_slots.iter().any(|slot| {
+            slot.as_ref()
+                .map(|other| Arc::ptr_eq(other, &group))
+                .unwrap_or(false)
+        }) {
+            return Ok(());
+        }
+
+        let csg_slot = self
+            .csg_slots
+            .iter_mut()
+            .position(|slot| slot.is_none())
+            .ok_or(ENOSPC)?;
+        let idle_groups = self
+            .idle_groups
+            .get_mut(group.priority as usize)
+            .ok_or(EINVAL)?;
+        let idle_pos = idle_groups
+            .iter()
+            .position(|other| Arc::ptr_eq(other, &group))
+            .ok_or(EINVAL)?;
+        let group = idle_groups.remove(idle_pos)?;
+        let slot = self.csg_slots.get_mut(csg_slot).ok_or(EINVAL)?;
+        *slot = Some(group);
+
         Ok(())
     }
 
@@ -90,6 +122,15 @@ impl Scheduler {
     }
 
     pub(crate) fn remove_group(&mut self, group: Arc<Group>) -> Result {
+        if let Some(csg_slot) = self.csg_slots.iter_mut().find(|slot| {
+            slot.as_ref()
+                .map(|other| Arc::ptr_eq(other, &group))
+                .unwrap_or(false)
+        }) {
+            *csg_slot = None;
+            return Ok(());
+        }
+
         let groups = self
             .idle_groups
             .get_mut(group.priority as usize)
