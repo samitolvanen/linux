@@ -42,7 +42,6 @@ pub(crate) struct Group {
     pub(crate) queues: KVec<Queue>,
     #[expect(dead_code)]
     pub(super) vm: Arc<Vm>,
-    #[expect(dead_code)]
     pub(super) priority: u8,
     #[expect(dead_code)]
     pub(super) compute_core_mask: u64,
