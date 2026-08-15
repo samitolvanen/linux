@@ -50,10 +50,14 @@ impl SchedulerState {
     }
 }
 
+struct CommandStreamGroupSlot {
+    group: Arc<Group>,
+}
+
 /// Minimal scheduler shell.
 pub(crate) struct Scheduler {
     idle_groups: [KVec<Arc<Group>>; GROUP_PRIORITY_COUNT],
-    csg_slots: KVec<Option<Arc<Group>>>,
+    csg_slots: KVec<Option<CommandStreamGroupSlot>>,
 }
 
 impl Scheduler {
@@ -108,7 +112,7 @@ impl Scheduler {
         for queue in group.queues.iter() {
             queue.set_doorbell_id(Some(csg_slot + 1));
         }
-        *slot = Some(group);
+        *slot = Some(CommandStreamGroupSlot { group });
 
         Ok(())
     }
@@ -125,11 +129,12 @@ impl Scheduler {
     pub(crate) fn remove_group(&mut self, group: Arc<Group>) -> Result {
         if let Some(csg_id) = group.csg_id() {
             let csg_slot = self.csg_slots.get_mut(csg_id).ok_or(EINVAL)?;
-            group.vm.deactivate()?;
-            for queue in group.queues.iter() {
+            let slot = csg_slot.as_mut().ok_or(EINVAL)?;
+            slot.group.vm.deactivate()?;
+            for queue in slot.group.queues.iter() {
                 queue.set_doorbell_id(None);
             }
-            group.set_csg_id(None);
+            slot.group.set_csg_id(None);
             *csg_slot = None;
             return Ok(());
         }
