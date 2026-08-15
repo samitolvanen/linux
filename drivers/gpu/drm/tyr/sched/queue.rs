@@ -3,10 +3,20 @@
 use core::ops::Range;
 
 use kernel::{
-    io::Io,
+    drm::gem::BaseObject,
+    io::{
+        Io,
+        IoBase, //
+    },
     prelude::*,
     sizes::SZ_4K,
-    sync::Arc, //
+    sync::{
+        barrier::{
+            smp_mb,
+            Write, //
+        },
+        Arc, //
+    }, //
 };
 
 use crate::{
@@ -27,9 +37,7 @@ use crate::{
 pub(crate) struct Queue {
     #[expect(dead_code)]
     priority: u8,
-    #[expect(dead_code)]
     ringbuf: Arc<gem::MappedBo>,
-    #[expect(dead_code)]
     interfaces: Interfaces,
 }
 
@@ -56,6 +64,38 @@ impl Queue {
             ringbuf,
             interfaces,
         })
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
+        let mut ringbuf_input = self.interfaces.read_input()?;
+        let ringbuf_sz = self.ringbuf.size() as u64;
+
+        let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
+
+        let ringbuf = self.ringbuf.vmap();
+        let size = ringbuf.owner().size();
+        // SAFETY: `ringbuf` owns a writable CPU mapping for the queue ring buffer
+        // and `size` matches the mapped object size.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(ringbuf.as_view().as_ptr().cast::<u8>(), size)
+        };
+
+        let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
+        bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
+        if first_chunk < instrs.len() {
+            bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
+        }
+
+        smp_mb(Write);
+
+        let ringbuf_output = self.interfaces.read_output()?;
+        ringbuf_input.extract_init = ringbuf_output.extract;
+        ringbuf_input.insert += instrs.len() as u64;
+
+        self.interfaces.write_input(ringbuf_input)?;
+        smp_mb(Write);
+        Ok(())
     }
 }
 
@@ -108,7 +148,6 @@ impl Interfaces {
         })
     }
 
-    #[expect(dead_code)]
     pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
         let vmap = self.mem.vmap();
 
@@ -118,7 +157,6 @@ impl Interfaces {
         })
     }
 
-    #[expect(dead_code)]
     pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
         let vmap = self.mem.vmap();
 
@@ -129,7 +167,6 @@ impl Interfaces {
         vmap.try_write64(value.insert, self.input_offset + RingBufferInput::INSERT)
     }
 
-    #[expect(dead_code)]
     pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
         Ok(RingBufferOutput {
             extract: self
