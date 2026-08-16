@@ -63,7 +63,6 @@ use super::{
 pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 
 /// The group's lifecycle state.
-#[expect(dead_code)]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub(crate) enum State {
     Created,
@@ -405,7 +404,6 @@ impl Group {
         self.inner.lock().state
     }
 
-    #[expect(dead_code)]
     pub(crate) fn set_state(&self, new_state: State) {
         self.with_locked_inner(|inner| {
             inner.state = new_state;
@@ -592,7 +590,7 @@ impl Pool {
         let mut ctx = super::CsgUpdateContext::new();
         ddev.with_locked_scheduler(|sched| {
             sched.bind(ddev, &reg_data.fw, group.clone(), &mut ctx)?;
-            sched.apply_csg_updates(&reg_data.fw, &mut ctx)
+            sched.apply_csg_updates(ddev, &reg_data.fw, &mut ctx)
         })?;
         group.submit(queue_submits, file)
     }

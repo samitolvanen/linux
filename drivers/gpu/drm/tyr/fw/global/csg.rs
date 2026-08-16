@@ -371,6 +371,18 @@ impl CsgInterface {
         Ok(())
     }
 
+    /// Reads the live `CSG_EP_REQ` input register.
+    ///
+    /// Returns `EINVAL` if the interface is not enabled.
+    pub(crate) fn read_input_ep_req(&self) -> Result<CSG_EP_REQ> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled.csg_input.read(CSG_EP_REQ))
+    }
+
     /// Read-modify-write the CSG_REQ input register, performing one
     /// "set" pass and one "toggle" pass in a single MMIO read-write
     /// cycle.
@@ -487,8 +499,7 @@ impl CsgInterface {
         }
     }
 
-    #[expect(dead_code)]
-    pub(in super::super) fn read_output_ack(&self) -> Result<CSG_ACK> {
+    pub(crate) fn read_output_ack(&self) -> Result<CSG_ACK> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
             CsgInterfaceState::Disabled => return Err(EINVAL),

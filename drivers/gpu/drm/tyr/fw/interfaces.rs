@@ -125,6 +125,7 @@ pub(in crate::fw) use self::{
 // apply step (`Scheduler::apply_csg_updates`) construct typed bitfield
 // values for these registers without otherwise depending on the rest of
 // the `crate::fw` module.
+pub(crate) use self::cs::CsState;
 pub(crate) use self::csg::{
     input::{
         CSG_CONFIG,
@@ -1268,7 +1269,7 @@ mod cs {
     /// CS execution state (cs_state_t in spec).
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsState {
+    pub(crate) enum CsState {
         /// Stop the command stream.
         /// The execution of command stream instructions stops and any job active from the
         /// command stream runs to completion (unless terminated at the CSG level) before

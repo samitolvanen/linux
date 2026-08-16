@@ -17,6 +17,7 @@ use kernel::{
 
 use super::SharedSectionInfo;
 use crate::fw::interfaces::{
+    CsState,
     FwInterface,
     CS_ACK,
     CS_CONTROL_BLOCK_SIZE,
@@ -174,6 +175,25 @@ impl CsInterface {
         if let CsInterfaceState::Enabled(enabled) = &self.state {
             enabled.cs_input.write(CS_REQ, req);
         }
+    }
+
+    /// Clears the `CS_REQ.state` field (sets it to `CsState::Stop`).
+    ///
+    /// No doorbell is rung. The reset takes effect on the next
+    /// `CSG_REQ.state = Start` transition.
+    ///
+    /// Returns `EINVAL` if the interface is not enabled.
+    pub(crate) fn clear_input_req_state(&self) -> Result {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let cur = enabled.cs_input.read(CS_REQ);
+        enabled
+            .cs_input
+            .write(CS_REQ, cur.with_state(CsState::Stop));
+        Ok(())
     }
 
     pub(in super::super) fn write_tiler_heap(
