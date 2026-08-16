@@ -15,8 +15,16 @@ use crate::{
     driver::TyrDrmDevice,
     fw::{
         self,
-        global::csg::Priority,
-        Firmware, //
+        global::{
+            csg::Priority,
+            CsgActivateInputs, //
+        },
+        CsgExecutionState,
+        CsgSlotMask,
+        Firmware,
+        CSG_CONFIG,
+        CSG_EP_REQ,
+        CSG_REQ, //
     },
     gpu::CsifInfo,
     sched::group::GroupListState,
@@ -37,6 +45,9 @@ const GROUP_PRIORITY_COUNT: usize = Priority::num_priorities();
 /// Bounds the fixed-capacity per-tick accumulator so tick callbacks
 /// never allocate.
 pub(crate) const MAX_CSGS: usize = fw::MAX_CSG;
+
+/// Highest firmware priority value assignable to a CSG (`CSG_EP_REQ.priority` field).
+pub(crate) const MAX_CSG_PRIO: u32 = 0xf;
 
 pub(crate) mod deps;
 pub(crate) mod events;
@@ -71,15 +82,109 @@ pub(crate) struct CsgSlotData {
     /// The group that currently owns the slot.
     pub(in crate::sched) group: Arc<Group>,
     /// CSG firmware priority programmed into `CSG_EP_REQ.priority`.
-    #[expect(dead_code)]
     pub(in crate::sched) fw_priority: u32,
+}
+
+/// Per-tick accumulator for CSG slot programming.
+///
+/// CSG slot operations need to coalesce multiple per-slot writes into a
+/// single CSG_REQ word, ring the per-CSG doorbell once, then wait for
+/// the firmware to acknowledge the resulting state transitions.
+/// `Scheduler::program_csg_activate` stages into this accumulator while
+/// the slot-manager mutex is held. `Scheduler::apply_csg_updates` then
+/// drives the firmware-visible side of the transaction. The
+/// slot-manager mutex is dropped around the firmware ack wait so other
+/// slot accessors can run. The scheduler mutex stays held.
+pub(crate) struct CsgUpdateContext {
+    pub(crate) req_value: [CSG_REQ; MAX_CSGS],
+    pub(crate) req_mask: [CSG_REQ; MAX_CSGS],
+    /// Per-slot bits acknowledged by the firmware in response to this
+    /// tick's `req_value` writes. Bits in `req_mask` missing from here
+    /// mark the slot as timed out (see `timedout_mask`).
+    pub(crate) acked_reqs: [CSG_REQ; MAX_CSGS],
+    #[expect(dead_code)]
+    db_toggle: [u32; MAX_CSGS],
+    pub(crate) update_mask: CsgSlotMask,
+    /// Bitmask of CSG slot indices whose request timed out during the
+    /// most recent apply cycle.
+    pub(crate) timedout_mask: CsgSlotMask,
+}
+
+/// CSG_REQ::state field mask (bits 2:0). The firmware transitions all
+/// three bits as a unit.
+const CSG_REQ_STATE_MASK: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::STATE_MASK);
+/// CSG_REQ::ep_cfg bit (4:4). Endpoint-configuration toggle.
+const CSG_REQ_EP_CFG: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::EP_CFG_MASK);
+/// CSG_REQ::status_update bit (5:5). Status-update toggle.
+#[expect(dead_code)]
+const CSG_REQ_STATUS_UPDATE: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::STATUS_UPDATE_MASK);
+
+impl CsgUpdateContext {
+    /// Bits that the firmware expects to be toggled instead of set.
+    ///
+    /// Both `ep_cfg` and `status_update` are notification-style bits.
+    /// The driver flips the request bit, the firmware mirrors the
+    /// flip in `CSG_ACK`, and the request and ack bits stay matched
+    /// across cycles. Pure-set bits would race with the firmware's
+    /// own writes.
+    pub(crate) const TOGGLE_BITS: CSG_REQ =
+        CSG_REQ::from_raw(CSG_REQ::EP_CFG_MASK | CSG_REQ::STATUS_UPDATE_MASK);
+
+    /// Creates an empty accumulator.
+    pub(crate) fn new() -> Self {
+        const ZERO: CSG_REQ = CSG_REQ::from_raw(0);
+        Self {
+            req_value: [ZERO; MAX_CSGS],
+            req_mask: [ZERO; MAX_CSGS],
+            acked_reqs: [ZERO; MAX_CSGS],
+            db_toggle: [0; MAX_CSGS],
+            update_mask: CsgSlotMask::empty(),
+            timedout_mask: CsgSlotMask::empty(),
+        }
+    }
+
+    /// Stages an update of `mask` bits in `CSG_REQ` for `csg_idx` to
+    /// the corresponding bits in `value`.
+    ///
+    /// Subsequent stages on the same slot replace the bits in `mask`,
+    /// and the union of all `mask`s passed for a slot is what
+    /// `Scheduler::apply_csg_updates` will toggle in `CSG_REQ` and
+    /// wait for.
+    pub(crate) fn queue_reqs(&mut self, csg_idx: usize, value: CSG_REQ, mask: CSG_REQ) {
+        debug_assert!(csg_idx < MAX_CSGS);
+        debug_assert!(!mask.is_empty());
+
+        self.req_value[csg_idx] = (self.req_value[csg_idx] & !mask) | (value & mask);
+        self.req_mask[csg_idx] |= mask;
+        self.update_mask.insert(csg_idx);
+    }
+
+    /// Stages a toggle of `toggle_bit` in `CSG_REQ` for `csg_idx`.
+    ///
+    /// `toggle_bit` must be a subset of `Self::TOGGLE_BITS`. The
+    /// `apply_csg_updates` partition assumes set and toggle bits never
+    /// overlap.
+    pub(crate) fn toggle_reqs(&mut self, csg_idx: usize, toggle_bit: CSG_REQ) {
+        debug_assert!((toggle_bit & !Self::TOGGLE_BITS).is_empty());
+        self.queue_reqs(csg_idx, toggle_bit, toggle_bit);
+    }
+
+    /// Stages a `CSG_REQ.state` transition to `state` for `csg_idx`.
+    pub(crate) fn set_state(&mut self, csg_idx: usize, state: CsgExecutionState) {
+        self.queue_reqs(
+            csg_idx,
+            CSG_REQ::zeroed().with_state(state),
+            CSG_REQ_STATE_MASK,
+        );
+    }
 }
 
 /// CSG slot operations.
 ///
 /// `activate` makes the group's VM resident in a hardware AS slot.
-/// `evict` releases that binding. Programming CSG_REQ and waiting for
-/// firmware acknowledgements happens elsewhere.
+/// `evict` releases that binding. The CSG_INPUT programming, the
+/// firmware-visible `CSG_REQ` write, the doorbell ring and the ack
+/// wait are driven by the scheduler.
 pub(crate) struct CsgSlotOps;
 
 impl SlotOperations<MAX_CSGS> for CsgSlotOps {
@@ -174,7 +279,13 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn bind(&mut self, tdev: &TyrDrmDevice, group: Arc<Group>) -> Result {
+    pub(crate) fn bind(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        fw: &Firmware<'_>,
+        group: Arc<Group>,
+        ctx: &mut CsgUpdateContext,
+    ) -> Result {
         let mut slot_manager = tdev.csg_slot_manager.lock();
 
         // Already resident; nothing to do.
@@ -215,11 +326,37 @@ impl Scheduler {
 
         slot_manager.activate(slot_data)?;
 
+        let slot_idx = group.csg_seat.access(&slot_manager).slot().ok_or(EINVAL)? as usize;
+        let fw_priority = slot_manager.slot_data(slot_idx).ok_or(EINVAL)?.fw_priority;
+
+        // The programming runs on every bind, including one where the slot
+        // manager reused the seat's slot and skipped the activate callback.
+        // The slot manager has recorded the binding, so a failure below
+        // has to release it again to leave the group unbound.
+        if let Err(e) = Self::program_csg_activate(fw, &group, slot_idx, fw_priority, ctx) {
+            if let Err(err) = slot_manager.evict(&group.csg_seat) {
+                pr_err!(
+                    "CSG slot {} activate rollback: evict failed: {}\n",
+                    slot_idx,
+                    err.to_errno()
+                );
+                // A failed hardware eviction keeps the seat bound, so the
+                // group would look resident with no firmware programming
+                // behind it.
+                group.with_locked_inner(|inner| {
+                    inner.state = group::State::Unknown;
+                    if inner.fatal_error.is_none() {
+                        inner.fatal_error = Some(err);
+                    }
+                });
+            }
+            return Err(e);
+        }
+
         // Cache the CSG doorbell id on each queue so submit-side kicks
         // can find it without reaching back into the slot manager. The
         // doorbells wired here remain stable for as long as the slot
         // is active.
-        let slot_idx = group.csg_seat.access(&slot_manager).slot().ok_or(EINVAL)? as usize;
         for queue in group.queues.iter() {
             queue.set_doorbell_id(Some(slot_idx + 1));
         }
@@ -268,6 +405,172 @@ impl Scheduler {
 
         let _ = self.remove_group_from_list(&group, priority, list_state);
 
+        Ok(())
+    }
+
+    /// Programs the static CSG_INPUT registers for a slot the manager
+    /// has just bound, and stages the matching CSG_REQ transition.
+    ///
+    /// Every fallible step runs before anything is staged into
+    /// `context`, so a failure leaves the accumulator untouched.
+    fn program_csg_activate(
+        fw: &Firmware<'_>,
+        group: &Group,
+        slot_idx: usize,
+        fw_priority: u32,
+        context: &mut CsgUpdateContext,
+    ) -> Result {
+        let as_slot = group.vm.as_slot().ok_or(EINVAL)?;
+        let suspend_va = group.suspend_buf.kernel_va().ok_or(EINVAL)?.start;
+        let protm_suspend_va = group.protm_suspend_buf.kernel_va().ok_or(EINVAL)?.start;
+
+        let ep_req = CSG_EP_REQ::zeroed()
+            .with_compute_ep(group.max_compute_cores)
+            .with_fragment_ep(group.max_fragment_cores)
+            .try_with_tiler_ep(group.max_tiler_cores)?
+            .try_with_priority(fw_priority)?;
+        let config = CSG_CONFIG::zeroed().try_with_jasid(u32::from(as_slot))?;
+
+        let inputs = CsgActivateInputs {
+            allow_compute: group.compute_core_mask,
+            allow_fragment: group.fragment_core_mask,
+            // `tiler_core_mask` is u64 in the UAPI. The firmware only
+            // exposes a 32-bit allow mask for "other" endpoints, so
+            // the upper bits are silently dropped.
+            allow_other: group.tiler_core_mask as u32,
+            ep_req,
+            suspend_buf: suspend_va,
+            protm_suspend_buf: protm_suspend_va,
+            config,
+        };
+
+        fw.with_csg_mut(slot_idx, |csg| csg.program_activate_inputs(&inputs))?;
+
+        let state = match group.state() {
+            group::State::Suspended => CsgExecutionState::Resume,
+            _ => CsgExecutionState::Start,
+        };
+        context.set_state(slot_idx, state);
+        context.toggle_reqs(slot_idx, CSG_REQ_EP_CFG);
+        Ok(())
+    }
+
+    /// Apply accumulated CSG updates.
+    ///
+    /// Writes the per-slot CSG_REQ delta, rings the per-CSG
+    /// doorbells, waits for firmware acks. Returns `ETIMEDOUT` if
+    /// any slot's request was not fully acked.
+    ///
+    /// # Locking
+    ///
+    /// `Firmware::wait_csg_acks` takes the firmware inner mutex
+    /// briefly. Callers must not pre-hold it. The scheduler mutex
+    /// may be held throughout.
+    pub(crate) fn apply_csg_updates(
+        &mut self,
+        fw: &Firmware<'_>,
+        context: &mut CsgUpdateContext,
+    ) -> Result {
+        if context.update_mask.is_empty() {
+            return Ok(());
+        }
+
+        const CSG_REQ_ACK_TIMEOUT_MS: u32 = 100;
+
+        for csg_id in 0..MAX_CSGS {
+            if !context.update_mask.contains(csg_id) {
+                continue;
+            }
+            let req_mask = context.req_mask[csg_id];
+            if req_mask.is_empty() {
+                continue;
+            }
+            let set_mask = req_mask & !CsgUpdateContext::TOGGLE_BITS;
+            let toggle_mask = req_mask & CsgUpdateContext::TOGGLE_BITS;
+            let req_value = context.req_value[csg_id] & !CsgUpdateContext::TOGGLE_BITS;
+            fw.with_csg_mut(csg_id, |csg| {
+                csg.update_and_toggle_input_req(req_value, set_mask, toggle_mask)
+            })?;
+        }
+
+        fw.ring_csg_doorbells(context.update_mask)?;
+
+        for csg_id in 0..MAX_CSGS {
+            if !context.update_mask.contains(csg_id) {
+                continue;
+            }
+            let req_mask = context.req_mask[csg_id];
+            match fw.wait_csg_acks(csg_id, req_mask, CSG_REQ_ACK_TIMEOUT_MS) {
+                Ok(acked) => {
+                    context.acked_reqs[csg_id] = acked;
+                    if acked != req_mask {
+                        pr_err!(
+                            "CSG {}: firmware ack timeout: req_mask=0x{:x} acked=0x{:x}\n",
+                            csg_id,
+                            req_mask,
+                            acked
+                        );
+                        context.timedout_mask.insert(csg_id);
+                    }
+                }
+                Err(e) => {
+                    pr_err!("wait_csg_acks {} failed: {}\n", csg_id, e.to_errno());
+                    context.timedout_mask.insert(csg_id);
+                }
+            }
+        }
+
+        if !context.timedout_mask.is_empty() {
+            return Err(ETIMEDOUT);
+        }
+
+        Ok(())
+    }
+
+    /// Stages a firmware-priority update for CSG slot `csg_idx`.
+    ///
+    /// Caller must hold the slot-manager lock.
+    #[expect(dead_code)]
+    pub(crate) fn update_csg_slot_priority(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        fw: &Firmware<'_>,
+        csg_slot_manager: &CsgSlotManager,
+        csg_idx: usize,
+        fw_prio: u32,
+        context: &mut CsgUpdateContext,
+    ) -> Result {
+        if fw_prio > MAX_CSG_PRIO {
+            dev_err!(
+                tdev.as_ref(),
+                "update_csg_slot_priority: invalid fw priority {}\n",
+                fw_prio
+            );
+            return Err(EINVAL);
+        }
+
+        if csg_idx >= MAX_CSGS {
+            dev_err!(
+                tdev.as_ref(),
+                "update_csg_slot_priority: invalid csg {}\n",
+                csg_idx
+            );
+            return Err(EINVAL);
+        }
+
+        let slot_data = csg_slot_manager.slot_data(csg_idx).ok_or(EINVAL)?;
+        let group = slot_data.group.clone();
+
+        fw.with_csg_mut(csg_idx, |csg| {
+            let ep_req = CSG_EP_REQ::zeroed()
+                .with_compute_ep(group.max_compute_cores)
+                .with_fragment_ep(group.max_fragment_cores)
+                .try_with_tiler_ep(group.max_tiler_cores)?
+                .try_with_priority(fw_prio)?;
+            csg.write_input_ep_req(ep_req)
+        })?;
+
+        context.toggle_reqs(csg_idx, CSG_REQ_EP_CFG);
         Ok(())
     }
 }

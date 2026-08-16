@@ -12,7 +12,6 @@ use kernel::{
         },
         Arc,
         CondVar,
-        CondVarTimeoutResult,
         Mutex, //
     },
     time::msecs_to_jiffies, //
@@ -70,8 +69,8 @@ impl Wait {
     /// cheap and must not call back into code that can notify this wait object.
     ///
     /// Returns [`ETIMEDOUT`] if the deadline is reached without the condition
-    /// becoming true, or [`ERESTARTSYS`] if interrupted by a signal.
-    pub(crate) fn wait_interruptible_timeout<F>(&self, timeout_ms: u32, mut on_woken: F) -> Result
+    /// becoming true.
+    pub(crate) fn wait_timeout<F>(&self, timeout_ms: u32, mut on_woken: F) -> Result
     where
         F: FnMut() -> Result<WaitResult>,
     {
@@ -86,22 +85,18 @@ impl Wait {
                 return Ok(());
             }
 
-            match self
-                .cond
-                .wait_interruptible_timeout(&mut guard, remaining_time)
-            {
-                CondVarTimeoutResult::Woken { jiffies } => match on_woken()? {
-                    WaitResult::Done => return Ok(()),
-                    WaitResult::Retry => remaining_time = jiffies,
-                },
-                CondVarTimeoutResult::Timeout => {
+            match self.cond.wait_timeout(&mut guard, remaining_time) {
+                0 => {
                     // One final check before giving up.
                     if let WaitResult::Done = on_woken()? {
                         return Ok(());
                     }
                     return Err(ETIMEDOUT);
                 }
-                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                jiffies => match on_woken()? {
+                    WaitResult::Done => return Ok(()),
+                    WaitResult::Retry => remaining_time = jiffies,
+                },
             }
         }
     }
