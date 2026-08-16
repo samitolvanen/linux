@@ -718,14 +718,13 @@ impl Vm {
         va: u64,
         flags: VmMapFlags,
     ) -> Result {
-        self.map_bo_range_inner(dev, bo, bo_offset, map_size, va, flags)?;
+        let result = self.map_bo_range_inner(dev, bo, bo_offset, map_size, va, flags);
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
         self.flush_deferred_cleanup();
-
-        Ok(())
+        result
     }
 
     /// Unmaps a virtual address range from the VM.
@@ -776,14 +775,13 @@ impl Vm {
     }
 
     pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
-        self.unmap_range_inner(va, size)?;
+        let result = self.unmap_range_inner(va, size);
 
         // We flush the defer cleanup list now. Things will be different in
         // the asynchronous VM_BIND path, where we want the cleanup to
         // happen outside the DMA signalling path.
         self.flush_deferred_cleanup();
-
-        Ok(())
+        result
     }
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
