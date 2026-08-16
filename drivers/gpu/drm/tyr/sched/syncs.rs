@@ -8,19 +8,28 @@
 #![expect(dead_code)]
 
 use kernel::{
-    drm::gem::BaseObject,
-    io::IoBase,
+    io::Io,
     prelude::*, //
 };
 
 use crate::gem;
 
+/// Minimal 32-bit firmware sync object layout.
 #[repr(C)]
 pub(crate) struct SyncObj32b {
-    pub(crate) seqno: u32,
-    pub(crate) status: u32,
+    seqno: u32,
+    status: u32,
 }
 
+impl SyncObj32b {
+    const SEQNO: usize = core::mem::offset_of!(Self, seqno);
+
+    pub(super) fn read_seqno(mem: &gem::MappedBo, offset: usize) -> Result<u32> {
+        mem.vmap().try_read32(offset + Self::SEQNO)
+    }
+}
+
+/// Minimal 64-bit firmware sync object layout.
 #[repr(C)]
 pub(crate) struct SyncObj64b {
     pub(crate) seqno: u64,
@@ -28,68 +37,20 @@ pub(crate) struct SyncObj64b {
     pub(crate) pad: u32,
 }
 
-pub(crate) enum SyncObj {
-    SyncObj32(SyncObj32b),
-    SyncObj64(SyncObj64b),
+impl SyncObj64b {
+    const SEQNO: usize = core::mem::offset_of!(Self, seqno);
+    const STATUS: usize = core::mem::offset_of!(Self, status);
+    const PAD: usize = core::mem::offset_of!(Self, pad);
+
+    pub(super) fn read_seqno(mem: &gem::MappedBo, offset: usize) -> Result<u64> {
+        mem.vmap().try_read64(offset + Self::SEQNO)
+    }
+
+    pub(super) fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
+        let vmap = mem.vmap();
+
+        vmap.try_write32(value.pad, offset + Self::PAD)?;
+        vmap.try_write32(value.status, offset + Self::STATUS)?;
+        vmap.try_write64(value.seqno, offset + Self::SEQNO)
+    }
 }
-
-macro_rules! impl_sync_rw {
-    ($type:ty) => {
-        impl $type {
-            pub(super) fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
-                let end = offset
-                    .checked_add(core::mem::size_of::<Self>())
-                    .ok_or(EINVAL)?;
-
-                if end > mem.size() {
-                    return Err(EINVAL);
-                }
-
-                let vmap = mem.vmap();
-                // SAFETY: `offset..end` was bounds-checked against the mapped object size,
-                // so the computed pointer is valid for a single sync-object read.
-                let ptr = unsafe {
-                    vmap.as_view()
-                        .as_ptr()
-                        .cast::<u8>()
-                        .add(offset)
-                        .cast::<Self>()
-                };
-
-                // SAFETY: `ptr` points into the mapped sync-object storage and is valid
-                // for one volatile read of `Self`.
-                Ok(unsafe { core::ptr::read_volatile(ptr) })
-            }
-
-            pub(super) fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
-                let end = offset
-                    .checked_add(core::mem::size_of::<Self>())
-                    .ok_or(EINVAL)?;
-
-                if end > mem.size() {
-                    return Err(EINVAL);
-                }
-
-                let vmap = mem.vmap();
-                // SAFETY: `offset..end` was bounds-checked against the mapped object size,
-                // so the computed pointer is valid for a single sync-object write.
-                let ptr = unsafe {
-                    vmap.as_view()
-                        .as_ptr()
-                        .cast::<u8>()
-                        .add(offset)
-                        .cast::<Self>()
-                };
-
-                // SAFETY: `ptr` points into the mapped sync-object storage and is valid
-                // for one volatile write of `Self`.
-                unsafe { core::ptr::write_volatile(ptr, value) };
-
-                Ok(())
-            }
-        }
-    };
-}
-
-impl_sync_rw!(SyncObj32b);
-impl_sync_rw!(SyncObj64b);
