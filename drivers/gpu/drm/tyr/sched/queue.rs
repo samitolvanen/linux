@@ -73,6 +73,7 @@ use crate::{
         TyrDrmDeviceData,
         TyrDrmRegistrationData, //
     },
+    fw::CsWaitCondition,
     gem,
     regs::doorbell_block,
     vm::{
@@ -152,6 +153,9 @@ pub(crate) struct QueueData {
     pending_submit_fences: Mutex<KVec<PendingSubmitFence>>,
     #[pin]
     last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
+    /// Active GPU sync-wait captured for this queue.
+    #[pin]
+    syncwait: Mutex<SyncWait>,
 }
 
 impl QueueData {
@@ -342,6 +346,72 @@ impl QueueData {
         {
             entry.fence.set_error(err);
         }
+    }
+
+    /// Returns a clone of the active sync-wait snapshot.
+    pub(crate) fn syncwait_snapshot(&self) -> SyncWait {
+        self.syncwait.lock().clone()
+    }
+
+    /// Updates the firmware-reported fields of the active sync-wait
+    /// snapshot. The cached BO resolution is keyed independently by
+    /// its own `(gpu_va, sync64)`. `Group::eval_syncwait` detects
+    /// when the live wait has moved to a different key and rebuilds.
+    pub(crate) fn set_syncwait(
+        &self,
+        gpu_va: u64,
+        ref_val: u64,
+        sync64: bool,
+        condition: Option<CsWaitCondition>,
+    ) {
+        let mut wait = self.syncwait.lock();
+        wait.gpu_va = gpu_va;
+        wait.ref_val = ref_val;
+        wait.sync64 = sync64;
+        wait.condition = condition;
+    }
+
+    /// Stores a resolved BO cache on the active sync-wait snapshot if
+    /// `gpu_va` and `sync64` still match.
+    ///
+    /// Both `gpu_va` and `sync64` are re-checked under the lock so a
+    /// concurrent `set_syncwait` that reuses the same address with a
+    /// different sync-object width does not install a stale resolution
+    /// that would later be read with the wrong type. Returns `true` if
+    /// the cache was applied.
+    pub(crate) fn cache_syncwait_bo(
+        &self,
+        gpu_va: u64,
+        sync64: bool,
+        bo: Arc<gem::BoVmap>,
+        offset: usize,
+    ) -> bool {
+        let mut wait = self.syncwait.lock();
+        if wait.gpu_va != gpu_va || wait.sync64 != sync64 {
+            return false;
+        }
+        wait.cached = Some(CachedBo {
+            gpu_va,
+            sync64,
+            bo,
+            offset,
+        });
+        true
+    }
+
+    /// Removes and returns the cached BO resolution from the active
+    /// sync-wait snapshot.
+    pub(crate) fn take_syncwait_bo(&self) -> Option<Arc<gem::BoVmap>> {
+        let mut wait = self.syncwait.lock();
+        wait.cached.take().map(|c| c.bo)
+    }
+
+    /// Returns `true` if the firmware-visible ring buffer is currently
+    /// empty (`INSERT == EXTRACT`).
+    pub(crate) fn is_ringbuf_empty(&self) -> Result<bool> {
+        let input = self.interfaces.read_input()?;
+        let output = self.interfaces.read_output()?;
+        Ok(input.insert == output.extract)
     }
 
     pub(super) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
@@ -545,6 +615,45 @@ impl QueueJob {
     }
 }
 
+/// Per-queue snapshot of the active GPU sync-wait. Populated when the
+/// firmware reports `BlockedReason::SyncWait` for the queue's CS.
+///
+/// `cached` carries a BO resolution from a prior evaluation. It
+/// stores its own `(gpu_va, sync64)` so the next evaluation can
+/// detect when the live wait has moved on and rebuild rather than
+/// read from a stale BO.
+#[derive(Default, Clone)]
+pub(crate) struct SyncWait {
+    /// GPU virtual address of the awaited sync object.
+    pub(crate) gpu_va: u64,
+    /// Reference value the wait compares against.
+    pub(crate) ref_val: u64,
+    /// Whether the awaited sync object is 64-bit (`true`) or 32-bit.
+    pub(crate) sync64: bool,
+    /// Wait condition, or `None` for a reserved encoding.
+    pub(crate) condition: Option<CsWaitCondition>,
+    /// Memoized BO resolution from a prior evaluation, keyed by its
+    /// own `(gpu_va, sync64)`.
+    ///
+    /// Only populated when the awaited sync object lives in a
+    /// userspace-mapped BO reached via `Vm::get_bo_for_va`. Sync
+    /// waits targeting the group's own per-queue syncobjs pool do
+    /// not allocate this cache.
+    pub(crate) cached: Option<CachedBo>,
+}
+
+/// Memoized BO resolution for a foreign-BO sync-wait. Keyed by its
+/// own `(gpu_va, sync64)` so an evaluation against a wait whose live
+/// `(gpu_va, sync64)` no longer matches falls through to a fresh
+/// gpuvm walk instead of reading from a stale BO.
+#[derive(Clone)]
+pub(crate) struct CachedBo {
+    pub(crate) gpu_va: u64,
+    pub(crate) sync64: bool,
+    pub(crate) bo: Arc<gem::BoVmap>,
+    pub(crate) offset: usize,
+}
+
 struct PendingSubmitFence {
     completion_point: u64,
     fence: DriverDmaFence<QueueFenceData, Published>,
@@ -586,6 +695,7 @@ impl Queue {
                 iomem: reg_data.iomem.clone(),
                 pending_submit_fences <- new_mutex!(KVec::new()),
                 last_submit_fence <- new_mutex!(None),
+                syncwait <- new_mutex!(SyncWait::default()),
             }),
             GFP_KERNEL,
         )?;

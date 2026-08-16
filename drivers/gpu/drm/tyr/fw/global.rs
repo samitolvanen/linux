@@ -79,6 +79,7 @@ use crate::{
     }, //
 };
 
+pub(crate) use self::cs::CsStatusWait;
 pub(crate) use self::csg::{
     CsgActivateInputs,
     CsgInterface, //

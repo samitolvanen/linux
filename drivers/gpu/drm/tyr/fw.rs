@@ -88,6 +88,8 @@ mod region;
 // firmware module. The bitfield definitions themselves stay private
 // to `crate::fw`. The apply path only depends on these typed views.
 pub(crate) use interfaces::{
+    CsBlockedReason,
+    CsWaitCondition,
     CsgExecutionState,
     CSG_CONFIG,
     CSG_EP_REQ,

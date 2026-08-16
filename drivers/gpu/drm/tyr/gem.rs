@@ -77,30 +77,18 @@ impl gem::DriverObject for BoData {
 pub(crate) type Bo = gem::shmem::Object<BoData>;
 
 /// A mapped kernel-owned buffer object with an always-valid kernel mapping.
+///
+/// `vmap` owns its mapping and GEM reference, so it stays valid after
+/// `kernel_bo` drops.
 pub(crate) struct MappedBo {
     kernel_bo: KernelBo,
-    /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when shipping the vmap to the cleanup
-    /// workqueue.
-    vmap: Option<shmem::VMapOwned<BoData>>,
+    vmap: BoVmap,
 }
 
 impl MappedBo {
     pub(crate) fn new(kernel_bo: KernelBo) -> Result<Arc<Self>> {
-        let vmap = kernel_bo.bo.owned_vmap::<0>()?;
-        Ok(Arc::new(
-            Self {
-                kernel_bo,
-                vmap: Some(vmap),
-            },
-            GFP_KERNEL,
-        )?)
-    }
-
-    pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        self.vmap
-            .as_ref()
-            .expect("MappedBo::vmap accessed after drop")
+        let vmap = BoVmap::new(kernel_bo.bo(), kernel_bo.cleanup_wq.clone())?;
+        Ok(Arc::new(Self { kernel_bo, vmap }, GFP_KERNEL)?)
     }
 
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
@@ -109,6 +97,69 @@ impl MappedBo {
 }
 
 impl core::ops::Deref for MappedBo {
+    type Target = BoVmap;
+
+    fn deref(&self) -> &BoVmap {
+        &self.vmap
+    }
+}
+
+/// An owned CPU mapping of a GPU buffer object.
+///
+/// The BO must be pinned (i.e. it has at least one live GPU mapping)
+/// for the vmap to be safe.
+///
+/// The vmap's `owner` is the only GEM reference this type holds.
+/// `Drop` ships the vmap to the cleanup workqueue, so the final GEM put,
+/// whose `free_callback` tears down the cached sg table under
+/// `dma_resv_lock`, never runs on the dropping context, which may be
+/// a dma-fence signalling section.
+pub(crate) struct BoVmap {
+    /// `Some` for the entire lifetime of the value; taken to `None`
+    /// only by `Drop` when shipping the vmap to the cleanup
+    /// workqueue.
+    vmap: Option<shmem::VMapOwned<BoData>>,
+    cleanup_wq: Arc<CleanupQueue>,
+}
+
+impl BoVmap {
+    pub(crate) fn new(bo: &Bo, cleanup_wq: Arc<CleanupQueue>) -> Result<Self> {
+        let vmap = bo.owned_vmap::<0>()?;
+        Ok(Self {
+            vmap: Some(vmap),
+            cleanup_wq,
+        })
+    }
+
+    pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
+        self.vmap
+            .as_ref()
+            .expect("BoVmap::vmap accessed after drop")
+    }
+
+    /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
+    /// mapping and that `offset` is aligned for `T`.
+    pub(crate) fn check_offset<T>(&self, offset: usize) -> Result {
+        if offset % core::mem::align_of::<T>() != 0 {
+            return Err(EINVAL);
+        }
+
+        let end = offset
+            .checked_add(core::mem::size_of::<T>())
+            .ok_or(EINVAL)?;
+        if end > self.size() {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.vmap().owner().size()
+    }
+}
+
+impl core::ops::Deref for BoVmap {
     type Target = Bo;
 
     fn deref(&self) -> &Bo {
@@ -120,25 +171,25 @@ impl core::ops::Deref for MappedBo {
 /// cleanup closure. Only the closure (success) or this Drop body
 /// (failure) calls KBox::from_raw on the inner pointer.
 #[repr(transparent)]
-struct MappedBoCleanupPtr(*mut shmem::VMapOwned<BoData>);
+struct BoVmapCleanupPtr(*mut shmem::VMapOwned<BoData>);
 
 // SAFETY: The pointer is produced by KBox::into_raw and reclaimed by
 // KBox::from_raw exactly once, on whichever side observes it first
 // (closure on success, this Drop body on failure).
-unsafe impl Send for MappedBoCleanupPtr {}
+unsafe impl Send for BoVmapCleanupPtr {}
 
-impl Drop for MappedBo {
+impl Drop for BoVmap {
     fn drop(&mut self) {
         let Some(vmap) = self.vmap.take() else {
             return;
         };
-        let cleanup_wq = self.kernel_bo.cleanup_wq.clone();
+        let cleanup_wq = self.cleanup_wq.clone();
 
         let slot: KBox<MaybeUninit<shmem::VMapOwned<BoData>>> = match KBox::new_uninit(GFP_NOWAIT) {
             Ok(s) => s,
             Err(_) => {
                 pr_warn_once!(
-                    "MappedBo cleanup-state allocation failed; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
+                    "BoVmap cleanup-state allocation failed; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
                 );
                 core::mem::forget(vmap);
                 return;
@@ -146,13 +197,13 @@ impl Drop for MappedBo {
         };
         let boxed = KBox::write(slot, vmap);
         let ptr = KBox::into_raw(boxed);
-        let send_ptr = MappedBoCleanupPtr(ptr);
+        let send_ptr = BoVmapCleanupPtr(ptr);
 
         let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
             // Force `Send` capture of the wrapper, see `KernelBo`.
             let send_ptr = send_ptr;
             // SAFETY: `send_ptr.0` was produced by `KBox::into_raw`
-            // in the matching `MappedBo::drop` body and is only
+            // in the matching `BoVmap::drop` body and is only
             // reclaimed by `KBox::from_raw` once: by this closure on
             // the success path, or by the `Drop` body on the
             // enqueue-failure path. The cleanup workqueue runs
@@ -163,7 +214,7 @@ impl Drop for MappedBo {
 
         if let Err(e) = res {
             pr_warn_once!(
-                "MappedBo cleanup_wq enqueue failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
+                "BoVmap cleanup_wq enqueue failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
             );
             // SAFETY: `try_spawn` returned `Err`, so the closure was
             // dropped without observing `ptr`. Ownership remains
@@ -172,7 +223,7 @@ impl Drop for MappedBo {
             // signalling section that prompted the deferral.
             let boxed = unsafe { KBox::from_raw(ptr) };
             core::mem::forget(KBox::into_inner(boxed));
-            pr_err!("Failed to enqueue MappedBo vmap cleanup: {:?}\n", e);
+            pr_err!("Failed to enqueue BoVmap vmap cleanup: {:?}\n", e);
         }
     }
 }
