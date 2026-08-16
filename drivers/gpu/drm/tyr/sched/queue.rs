@@ -323,6 +323,24 @@ impl QueueData {
         Ok(())
     }
 
+    /// Returns the firmware's current `EXTRACT` offset.
+    pub(super) fn read_extract(&self) -> Result<u64> {
+        Ok(self.interfaces.read_output()?.extract)
+    }
+
+    /// Stages `err` on the pending submit fence of the job whose ring range
+    /// holds `extract`. The in-order drain signals the fence once the job
+    /// retires.
+    pub(in crate::sched) fn fail_job_at_extract(&self, extract: u64, err: Error) {
+        let mut pending = self.pending_submit_fences.lock();
+        if let Some(entry) = pending
+            .iter_mut()
+            .find(|entry| entry.completion_point > extract)
+        {
+            entry.fence.set_error(err);
+        }
+    }
+
     pub(super) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
         self.last_submit_fence.lock().clone()
     }

@@ -77,7 +77,7 @@ const EXCEPTION_MAP: &[(u32, &CStr)] = &[
     (0xeb, c"MEM_ATTR_FAULT_3"),
 ];
 
-fn get_exception_name(code: u32) -> &'static CStr {
+pub(crate) fn get_exception_name(code: u32) -> &'static CStr {
     for &(exception_code, name) in EXCEPTION_MAP {
         if exception_code == code {
             return name;

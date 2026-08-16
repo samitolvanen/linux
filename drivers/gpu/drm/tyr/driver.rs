@@ -6,6 +6,7 @@ use kernel::{
         OptionalClk, //
     },
     device::{
+        self,
         Bound,
         Core,
         Device,
@@ -96,6 +97,11 @@ pub(crate) struct TyrDrmDriver;
 
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type TyrDrmDevice<Ctx = drm::Normal> = drm::Device<TyrDrmDriver, Ctx>;
+
+/// Returns the parent device of a Tyr DRM device.
+pub(crate) fn parent_dev(tdev: &TyrDrmDevice) -> &device::Device {
+    tdev.as_ref().as_ref()
+}
 
 /// Newtype that keeps the cleanup workqueue type-distinct from
 /// `DmaFenceWorkqueue`. A drop path that has to take `dma_resv_lock`
