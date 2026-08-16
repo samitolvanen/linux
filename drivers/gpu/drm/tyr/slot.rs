@@ -433,7 +433,6 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     }
 
     /// Returns a mutable borrow of the per-slot driver data for `slot_idx`.
-    #[expect(dead_code)]
     pub(crate) fn slot_data_mut(&mut self, slot_idx: usize) -> Option<&mut T::SlotData> {
         if slot_idx >= self.slot_count {
             return None;

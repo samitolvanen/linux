@@ -458,16 +458,21 @@ impl Scheduler {
     /// Apply accumulated CSG updates.
     ///
     /// Writes the per-slot CSG_REQ delta, rings the per-CSG
-    /// doorbells, waits for firmware acks. Returns `ETIMEDOUT` if
-    /// any slot's request was not fully acked.
+    /// doorbells, waits for firmware acks, then runs the post-ack
+    /// sync pass. Returns `ETIMEDOUT` if any slot's request was
+    /// not fully acked.
     ///
     /// # Locking
     ///
     /// `Firmware::wait_csg_acks` takes the firmware inner mutex
     /// briefly. Callers must not pre-hold it. The scheduler mutex
     /// may be held throughout.
+    ///
+    /// The post-ack sync pass takes the `csg_slot_manager` mutex.
+    /// Callers must not pre-hold it.
     pub(crate) fn apply_csg_updates(
         &mut self,
+        tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         context: &mut CsgUpdateContext,
     ) -> Result {
@@ -504,7 +509,8 @@ impl Scheduler {
                 Ok(acked) => {
                     context.acked_reqs[csg_id] = acked;
                     if acked != req_mask {
-                        pr_err!(
+                        dev_err!(
+                            tdev.as_ref(),
                             "CSG {}: firmware ack timeout: req_mask=0x{:x} acked=0x{:x}\n",
                             csg_id,
                             req_mask,
@@ -514,9 +520,33 @@ impl Scheduler {
                     }
                 }
                 Err(e) => {
-                    pr_err!("wait_csg_acks {} failed: {}\n", csg_id, e.to_errno());
+                    dev_err!(
+                        tdev.as_ref(),
+                        "wait_csg_acks {} failed: {}\n",
+                        csg_id,
+                        e.to_errno()
+                    );
                     context.timedout_mask.insert(csg_id);
                 }
+            }
+        }
+
+        // Take the slot manager and dispatch by which acked bits
+        // the firmware reported. The guard is held mutably so
+        // `sync_csg_slot_priority` can write back the acknowledged
+        // firmware priority into the per-slot `CsgSlotData`.
+        let mut csg_slot_manager = tdev.csg_slot_manager.lock();
+        for csg_id in 0..MAX_CSGS {
+            if !context.update_mask.contains(csg_id) {
+                continue;
+            }
+            let acked_reqs = context.acked_reqs[csg_id];
+
+            if !(acked_reqs & CSG_REQ_EP_CFG).is_empty() {
+                self.sync_csg_slot_priority(fw, &mut csg_slot_manager, csg_id)?;
+            }
+            if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
+                self.sync_csg_slot_state(fw, &csg_slot_manager, csg_id)?;
             }
         }
 
@@ -571,6 +601,80 @@ impl Scheduler {
         })?;
 
         context.toggle_reqs(csg_idx, CSG_REQ_EP_CFG);
+        Ok(())
+    }
+
+    /// Refreshes `CsgSlotData::fw_priority` from the
+    /// firmware-acknowledged `CSG_EP_REQ.priority` value.
+    fn sync_csg_slot_priority(
+        &mut self,
+        fw: &Firmware<'_>,
+        csg_slot_manager: &mut CsgSlotManager,
+        csg_idx: usize,
+    ) -> Result {
+        let Some(slot_data) = csg_slot_manager.slot_data_mut(csg_idx) else {
+            return Ok(());
+        };
+        let ep_req = fw.with_csg_mut(csg_idx, |csg| csg.read_input_ep_req())?;
+        slot_data.fw_priority = ep_req.priority().get();
+        Ok(())
+    }
+
+    /// Refreshes the resident group's recorded `group::State` from
+    /// `CSG_ACK.state`. Transitions into `Suspend` also refresh the
+    /// per-CS queue state. Transitions out of `Active` clear per-CS
+    /// `CS_REQ.state` so a subsequent re-bind starts clean.
+    fn sync_csg_slot_state(
+        &mut self,
+        fw: &Firmware<'_>,
+        csg_slot_manager: &CsgSlotManager,
+        csg_idx: usize,
+    ) -> Result {
+        let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
+            return Ok(());
+        };
+        let group = slot_data.group.clone();
+
+        let old_state = group.state();
+
+        let ack = fw.with_csg_mut(csg_idx, |csg| csg.read_output_ack())?;
+
+        let new_state = match ack.state() {
+            Ok(CsgExecutionState::Start) | Ok(CsgExecutionState::Resume) => group::State::Active,
+            Ok(CsgExecutionState::Terminate) => group::State::Terminated,
+            Ok(CsgExecutionState::Suspend) => group::State::Suspended,
+            Err(_) => group::State::Unknown,
+        };
+
+        if old_state == new_state {
+            return Ok(());
+        }
+
+        if new_state == group::State::Unknown {
+            group.with_locked_inner(|inner| {
+                if inner.fatal_error.is_none() {
+                    inner.fatal_error = Some(EINVAL);
+                }
+            });
+        }
+
+        if old_state == group::State::Active {
+            // Reset the per-CS request state so a future `Start`/
+            // `Resume` on this slot does not pick up the previous
+            // group's CS_REQ bits. No doorbell is needed, because the
+            // firmware re-evaluates CS_REQ when the next CSG state
+            // transition completes.
+            fw.with_csg_mut(csg_idx, |csg| {
+                let mut i = 0;
+                while let Some(cs) = csg.cs_mut(i) {
+                    let _ = cs.clear_input_req_state();
+                    i += 1;
+                }
+                Ok(())
+            })?;
+        }
+
+        group.set_state(new_state);
         Ok(())
     }
 }
