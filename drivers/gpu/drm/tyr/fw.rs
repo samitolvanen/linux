@@ -60,15 +60,12 @@ use crate::{
 
     mmu::Mmu,
     new_wait,
-    regs::{
-        gpu_control::{
-            McuControlMode,
-            McuStatus,
-            GPU_ID,
-            MCU_CONTROL,
-            MCU_STATUS, //
-        }, //
-        job_control::JOB_IRQ_CLEAR, //
+    regs::gpu_control::{
+        McuControlMode,
+        McuStatus,
+        GPU_ID,
+        MCU_CONTROL,
+        MCU_STATUS, //
     },
     vm::Vm,
     wait::{
@@ -291,9 +288,6 @@ impl<'drm> Firmware<'drm> {
 
     pub(crate) fn boot(&self) -> Result {
         let io = &self.iomem;
-
-        // Discard any stale global interrupt.
-        io.write_reg(JOB_IRQ_CLEAR::zeroed().with_glb(true));
 
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
 
