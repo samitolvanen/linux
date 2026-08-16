@@ -211,7 +211,6 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     /// Always in `1..=MAX_SLOTS`. Callers that walk slot indices should
     /// bound their iteration by this value rather than `MAX_SLOTS` to
     /// avoid touching slots the hardware does not report.
-    #[expect(dead_code)]
     pub(crate) fn slot_count(&self) -> usize {
         self.slot_count
     }
