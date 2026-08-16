@@ -5,8 +5,6 @@
 //! Groups allocate firmware sync objects per queue, and later scheduler-side
 //! dependency handling needs typed accessors for those shared slots.
 
-#![expect(dead_code)]
-
 use kernel::{
     io::Io,
     prelude::*, //
@@ -24,7 +22,9 @@ pub(crate) struct SyncObj32b {
 impl SyncObj32b {
     const SEQNO: usize = core::mem::offset_of!(Self, seqno);
 
-    pub(super) fn read_seqno(mem: &gem::MappedBo, offset: usize) -> Result<u32> {
+    pub(super) fn read_seqno(mem: &gem::BoVmap, offset: usize) -> Result<u32> {
+        mem.check_offset::<Self>(offset)?;
+
         mem.vmap().try_read32(offset + Self::SEQNO)
     }
 }
@@ -42,11 +42,14 @@ impl SyncObj64b {
     const STATUS: usize = core::mem::offset_of!(Self, status);
     const PAD: usize = core::mem::offset_of!(Self, pad);
 
-    pub(super) fn read_seqno(mem: &gem::MappedBo, offset: usize) -> Result<u64> {
+    pub(super) fn read_seqno(mem: &gem::BoVmap, offset: usize) -> Result<u64> {
+        mem.check_offset::<Self>(offset)?;
+
         mem.vmap().try_read64(offset + Self::SEQNO)
     }
 
-    pub(super) fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
+    pub(super) fn write(mem: &gem::BoVmap, offset: usize, value: Self) -> Result {
+        mem.check_offset::<Self>(offset)?;
         let vmap = mem.vmap();
 
         vmap.try_write32(value.pad, offset + Self::PAD)?;

@@ -32,7 +32,11 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     file::TyrDrmFile,
-    fw::global::csg::Priority,
+    fw::{
+        global::csg::Priority,
+        CsBlockedReason,
+        Firmware, //
+    },
     gem,
     heap,
     pool,
@@ -60,7 +64,6 @@ use super::{
 
 /// Upper bound on queues per group, set by the width of the per-queue
 /// bitmasks (`blocked_queues`, `idle_queues`, `fatal_queues`).
-#[expect(dead_code)]
 pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 
 /// The group's lifecycle state.
@@ -145,7 +148,6 @@ impl GroupInner {
     }
 
     /// Sets a queue as blocked or unblocked.
-    #[expect(dead_code)]
     pub(crate) fn set_queue_blocked(&mut self, queue_idx: usize, blocked: bool) {
         let mask = 1 << queue_idx;
 
@@ -159,7 +161,6 @@ impl GroupInner {
     /// Sets a queue as idle or active.
     ///
     /// Returns true if the queue was previously idle.
-    #[expect(dead_code)]
     pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
         let mask = 1 << queue_idx;
         let was_idle = (self.idle_queues & mask) != 0;
@@ -447,6 +448,114 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
+    /// is satisfied.
+    ///
+    /// Reads the queue's `SyncWait` snapshot and applies the captured
+    /// comparison. The awaited object sits either in the group's own
+    /// `syncobjs` or in a foreign BO reached through `Vm::get_bo_for_va`.
+    ///
+    /// On a malformed snapshot the caller should treat the queue as
+    /// still blocked and surface the error.
+    ///
+    /// A foreign-BO resolution is memoized on the `SyncWait` snapshot,
+    /// keyed by its own `(gpu_va, sync64)`, so a later evaluation skips
+    /// the gpuvm walk and rebuilds only when the key stops matching.
+    ///
+    /// Must not be called from a dma-fence signalling section. The
+    /// foreign-BO path takes `dma_resv_lock` and `GFP_KERNEL`-vmaps.
+    #[expect(dead_code)]
+    pub(crate) fn eval_syncwait(&self, fw: &Firmware<'_>, queue_idx: usize) -> Result<bool> {
+        let queue = self.queues.get(queue_idx).ok_or(EINVAL)?;
+        let syncwait = queue.syncwait_snapshot();
+
+        if syncwait.gpu_va == 0 {
+            return Ok(false);
+        }
+
+        // The firmware preserves CS_STATUS_WAIT_SYNC_POINTER across
+        // CS state transitions, so the snapshot captured by an
+        // earlier sync_csg_slot_queues_state pass can outlive the
+        // wait itself. Re-read the firmware's current
+        // CS_STATUS_BLOCKED_REASON to confirm the wait is still live
+        // before resolving the awaited address.
+        let csg_id = self.with_locked_inner(|inner| inner.csg_id);
+        if let Some(csg_id) = csg_id {
+            let still_waiting = fw.with_csg_mut(csg_id, |csg| match csg.cs_mut(queue_idx) {
+                Some(cs) => Ok(cs.read_status_blocked_reason()? == CsBlockedReason::SyncWait),
+                None => Ok(true),
+            });
+            if matches!(still_waiting, Ok(false)) {
+                return Ok(true);
+            }
+        }
+
+        let syncobjs_va = self.syncobjs.kernel_va().ok_or(EINVAL)?;
+
+        // Resolve the awaited sync object's CPU mapping.
+        let value = if syncwait.gpu_va >= syncobjs_va.start && syncwait.gpu_va < syncobjs_va.end {
+            let offset = (syncwait.gpu_va - syncobjs_va.start) as usize;
+            if syncwait.sync64 {
+                syncs::SyncObj64b::read_seqno(&self.syncobjs, offset)?
+            } else {
+                u64::from(syncs::SyncObj32b::read_seqno(&self.syncobjs, offset)?)
+            }
+        } else if let Some(cached) = syncwait
+            .cached
+            .as_ref()
+            .filter(|c| c.gpu_va == syncwait.gpu_va && c.sync64 == syncwait.sync64)
+        {
+            if syncwait.sync64 {
+                syncs::SyncObj64b::read_seqno(&cached.bo, cached.offset)?
+            } else {
+                u64::from(syncs::SyncObj32b::read_seqno(&cached.bo, cached.offset)?)
+            }
+        } else {
+            let (bo, bo_offset) = self.vm.get_bo_for_va(syncwait.gpu_va).ok_or(EINVAL)?;
+            let mapped_bo = Arc::new(
+                gem::BoVmap::new(&bo, self.tdev.cleanup_wq.clone())?,
+                GFP_KERNEL,
+            )?;
+            let bo_offset = bo_offset as usize;
+
+            // Memoize the resolved BO so subsequent re-evaluations
+            // of the same wait take the cached-BO path.
+            // `cache_syncwait_bo` re-checks that the snapshot still
+            // names the same `(gpu_va, sync64)` before installing
+            // the cache. If it returns false, `set_syncwait` ran
+            // concurrently and changed either the address or the
+            // sync-object width, so abandon this evaluation and let
+            // the next cycle handle the new wait rather than reading
+            // from a stale BO or with the wrong type.
+            if !queue.cache_syncwait_bo(
+                syncwait.gpu_va,
+                syncwait.sync64,
+                mapped_bo.clone(),
+                bo_offset,
+            ) {
+                return Ok(false);
+            }
+
+            if syncwait.sync64 {
+                syncs::SyncObj64b::read_seqno(&mapped_bo, bo_offset)?
+            } else {
+                u64::from(syncs::SyncObj32b::read_seqno(&mapped_bo, bo_offset)?)
+            }
+        };
+
+        let satisfied = if syncwait.gt {
+            value > syncwait.ref_val
+        } else {
+            value <= syncwait.ref_val
+        };
+        if satisfied {
+            // Drop the cached BO resolution so the next wait does a
+            // fresh gpuvm walk.
+            drop(queue.take_syncwait_bo());
+        }
+        Ok(satisfied)
     }
 
     fn syncobj_offset(&self, queue_index: usize) -> Result<usize> {
