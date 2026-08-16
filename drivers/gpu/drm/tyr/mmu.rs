@@ -103,6 +103,17 @@ impl Mmu {
         self.as_manager.lock().deactivate_vm(vm_as_data)
     }
 
+    /// Returns the AS slot index the VM is currently bound to, or `None`
+    /// if it is not resident.
+    ///
+    /// The returned value is a snapshot taken under the AS slot manager
+    /// mutex. Callers that act on the slot id must serialize their use
+    /// against `Mmu::deactivate_vm`. Otherwise the AS slot manager
+    /// may evict the VM in between.
+    pub(crate) fn vm_as_slot(&self, vm_as_data: &VmAsData) -> Option<u8> {
+        self.as_manager.lock().vm_as_slot(vm_as_data)
+    }
+
     /// Flush MMU translation caches after a VM update.
     pub(crate) fn flush_vm(&self, vm_as_data: &VmAsData) -> Result {
         self.as_manager.lock().flush_vm(vm_as_data)

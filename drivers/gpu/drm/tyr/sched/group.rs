@@ -401,7 +401,6 @@ impl Group {
         self.inner.lock().fatal_queues()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn state(&self) -> State {
         self.inner.lock().state
     }
@@ -564,6 +563,7 @@ impl Pool {
     pub(crate) fn submit_group(
         &self,
         ddev: &TyrDrmDevice,
+        reg_data: &TyrDrmRegistrationData<'_>,
         groupsubmit: &uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result {
@@ -589,7 +589,11 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        ddev.with_locked_scheduler(|sched| sched.bind(ddev, group.clone()))?;
+        let mut ctx = super::CsgUpdateContext::new();
+        ddev.with_locked_scheduler(|sched| {
+            sched.bind(ddev, &reg_data.fw, group.clone(), &mut ctx)?;
+            sched.apply_csg_updates(&reg_data.fw, &mut ctx)
+        })?;
         group.submit(queue_submits, file)
     }
 

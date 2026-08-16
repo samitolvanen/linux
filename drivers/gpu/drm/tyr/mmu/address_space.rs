@@ -519,4 +519,14 @@ impl AsSlotManager {
     pub(super) fn deactivate_vm(&mut self, vm_as_data: &VmAsData) -> Result {
         self.evict(&vm_as_data.as_seat)
     }
+
+    /// Returns the AS slot index the VM is currently assigned to, or `None`
+    /// if the VM is not resident.
+    ///
+    /// The slot binding is only stable for as long as the caller holds
+    /// the AS slot manager mutex. Once dropped, another caller may
+    /// evict the VM.
+    pub(super) fn vm_as_slot(&self, vm_as_data: &VmAsData) -> Option<u8> {
+        vm_as_data.as_seat.access(self).slot()
+    }
 }
