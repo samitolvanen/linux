@@ -165,12 +165,12 @@ impl TyrIrqTrait for JobIrq<'_> {
     }
 
     fn handle(&self, _tdev: &TyrDrmDevice, _io: &IoMem<'_>, status: u32) {
+        self.state.handle(status);
+
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
             let _ = self.global_iface.process_global_irq().inspect_err(|err| {
                 pr_err!("Failed to process firmware global IRQ: {:?}\n", err);
             });
         }
-
-        self.state.handle(status);
     }
 }
