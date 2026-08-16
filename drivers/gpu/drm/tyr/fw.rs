@@ -413,10 +413,6 @@ impl<'drm> Firmware<'drm> {
         self.global_iface.with_csg_mut(csg_idx, f)
     }
 
-    pub(crate) fn ring_csg_doorbell(&self, csg_idx: usize) -> Result {
-        self.global_iface.ring_csg_doorbell(csg_idx)
-    }
-
     /// Toggles the per-CSG doorbells for every slot set in `csg_mask`
     /// and rings the global doorbell to make the firmware re-evaluate
     /// the requested slots.
