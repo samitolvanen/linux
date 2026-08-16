@@ -80,9 +80,13 @@ use crate::{
     },
     regs::gpu_control::*,
     sched::{
+        CsgSlotManager,
+        CsgSlotOps,
         Scheduler,
-        SchedulerState, //
-    }, //
+        SchedulerState,
+        MAX_CSGS, //
+    },
+    slot::SlotManager, //
 };
 
 pub(crate) type IoMem<'a> = kernel::io::mem::IoMem<'a, SZ_2M>;
@@ -148,6 +152,19 @@ pub(crate) struct TyrDrmDeviceData {
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
+
+    /// Slot manager for the firmware-visible CSG slots.
+    ///
+    /// Pinned at probe time with `MAX_CSGS` as an upper bound so the
+    /// per-group `LockedBy<Seat, CsgSlotManager>` has a stable owner
+    /// address from the moment the device data is initialized.
+    /// `Scheduler::init` narrows it to the real slot count once the
+    /// firmware has reported one.
+    ///
+    /// Lock ordering is `sched > csg_slot_manager`. Callers holding
+    /// `sched` may take this mutex, never the other way round.
+    #[pin]
+    pub(crate) csg_slot_manager: Mutex<CsgSlotManager>,
 
     /// Outstanding firmware-events bits accumulated by IRQ handlers.
     ///
@@ -263,7 +280,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 
         guard.registration_data_with(|reg_data| {
             let queued_tiler_oom = tdev
-                .with_locked_scheduler(|sched| sched.process_csg_irqs(events, &reg_data.fw))
+                .with_locked_scheduler(|sched| sched.process_csg_irqs(tdev, &reg_data.fw, events))
                 .inspect_err(|err| {
                     dev_err!(
                         reg_data.pdev,
@@ -418,6 +435,8 @@ impl platform::Driver for TyrPlatformDriver {
         )?;
         let device_cleanup_wq = cleanup_wq.clone();
 
+        let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(CsgSlotOps, MAX_CSGS)?;
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
@@ -425,6 +444,7 @@ impl platform::Driver for TyrPlatformDriver {
                 coherent,
                 cleanup_wq: device_cleanup_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
+                csg_slot_manager <- new_mutex!(csg_slot_manager),
                 fw_events: Atomic::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),

@@ -18,6 +18,7 @@ use kernel::{
             Relaxed, //
         },
         Arc,
+        LockedBy,
         Mutex, //
     },
     uaccess::UserSlice,
@@ -34,6 +35,8 @@ use crate::{
     gem,
     heap,
     pool,
+    sched::CsgSlotManager,
+    slot::Seat,
     vm::{
         Vm,
         VmFlag,
@@ -100,7 +103,12 @@ pub(crate) struct GroupStatus {
 pub(crate) struct GroupInner {
     pub(crate) state: State,
     pub(crate) list_state: GroupListState,
-    /// CSG slot id when the group is bound, otherwise `None`.
+    /// Coarse bound-vs-unbound marker. Holds the slot id when the
+    /// group is bound, otherwise `None`. `Group::csg_seat` is the
+    /// authoritative slot binding and is only readable under the
+    /// slot-manager mutex. This mirror is maintained alongside it and
+    /// read under the group inner mutex so the submit path can tell
+    /// bound from unbound without acquiring the slot-manager mutex.
     pub(crate) csg_id: Option<usize>,
     blocked_queues: u32,
     idle_queues: u32,
@@ -199,6 +207,15 @@ pub(crate) struct Group {
     #[pin]
     submit_lock: Mutex<()>,
     pub(crate) tiler_oom: Atomic<u32>,
+    /// CSG slot manager seat for this group.
+    ///
+    /// The owner is the per-device `CsgSlotManager` mutex. Callers
+    /// must hold that lock to look the seat up, e.g.
+    /// `group.csg_seat.access(&slot_manager).slot()` to retrieve the
+    /// slot index when the seat is currently
+    /// `Seat::Active`, or `None` when the
+    /// group is idle or has never been bound.
+    pub(crate) csg_seat: LockedBy<Seat, CsgSlotManager>,
     /// The group's queues.
     ///
     /// The container is immutable for the lifetime of the group. The
@@ -345,6 +362,7 @@ impl Group {
                 }),
                 submit_lock <- new_mutex!(()),
                 tiler_oom: Atomic::new(0),
+                csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
@@ -381,14 +399,6 @@ impl Group {
 
     pub(crate) fn fatal_queues(&self) -> u32 {
         self.inner.lock().fatal_queues()
-    }
-
-    pub(super) fn csg_id(&self) -> Option<usize> {
-        self.inner.lock().csg_id
-    }
-
-    pub(super) fn set_csg_id(&self, csg_id: Option<usize>) {
-        self.inner.lock().csg_id = csg_id;
     }
 
     #[expect(dead_code)]
@@ -609,7 +619,7 @@ impl Pool {
     fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
         let group = self.0.get(index).ok_or(EINVAL)?;
 
-        ddev.with_locked_scheduler(|sched| sched.remove_group(group))?;
+        ddev.with_locked_scheduler(|sched| sched.remove_group(ddev, group))?;
 
         self.0.remove(index)?;
         Ok(())
