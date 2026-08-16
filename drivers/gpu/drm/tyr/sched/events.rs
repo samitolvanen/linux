@@ -25,6 +25,7 @@ use crate::{
         TyrDrmDeviceData, //
     },
     fw::{
+        CsgSlotMask,
         Firmware,
         CSG_REQ, //
     },
@@ -159,15 +160,26 @@ impl Scheduler {
         let pending_mask =
             CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
 
-        let progress_event = fw.with_csg_mut(csg_id, |csg| {
+        let (idle_event, sync_event, progress_event) = fw.with_csg_mut(csg_id, |csg| {
             let req = csg.read_input_req()?.into_raw();
             let ack = csg.read_output_ack()?.into_raw();
             let pending = (req ^ ack) & pending_mask;
             if pending != 0 {
                 csg.update_input_req(CSG_REQ::from_raw(ack & pending), CSG_REQ::from_raw(pending))?;
             }
-            Ok(pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0)
+            Ok((
+                pending & CSG_REQ::IDLE_MASK != 0,
+                pending & CSG_REQ::SYNC_UPDATE_MASK != 0,
+                pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0,
+            ))
         })?;
+
+        let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
+
+        if idle_event {
+            // At least one resident group may now be idle.
+            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+        }
 
         if progress_event {
             // Progress-timer expiry: the firmware-imposed forward-progress
@@ -177,6 +189,12 @@ impl Scheduler {
                     inner.fatal_error = Some(ETIMEDOUT);
                 }
             });
+            dev_warn!(tdev.as_ref(), "CSG slot {} progress timeout\n", csg_id);
+            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+        }
+
+        if sync_event {
+            TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
         let mut queued_tiler_oom = false;
@@ -259,7 +277,7 @@ impl Scheduler {
         }
 
         if cs_fatal_mask != 0 {
-            TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+            TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
 
         if ring_cs_db_mask != 0 {
@@ -272,9 +290,11 @@ impl Scheduler {
                 ));
                 Ok(())
             })?;
-
-            fw.ring_csg_doorbell(csg_id)?;
         }
+
+        let mut mask = CsgSlotMask::empty();
+        mask.insert(csg_id);
+        fw.ring_csg_doorbells(mask)?;
 
         Ok(queued_tiler_oom)
     }
@@ -397,7 +417,9 @@ impl Scheduler {
                 Ok(())
             })?;
 
-            fw.ring_csg_doorbell(oom.csg_id)?;
+            let mut mask = CsgSlotMask::empty();
+            mask.insert(oom.csg_id);
+            fw.ring_csg_doorbells(mask)?;
         }
 
         Ok(())

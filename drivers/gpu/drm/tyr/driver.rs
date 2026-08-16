@@ -289,7 +289,6 @@ impl TyrDrmDeviceData {
 
     /// Schedules the sync-update worker. Safe from any context, and repeated
     /// calls coalesce.
-    #[expect(dead_code)]
     pub(crate) fn schedule_sync_upd(tdev: &ARef<TyrDrmDevice>) {
         let _ = workqueue::system_dfl()
             .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());
