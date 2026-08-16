@@ -23,6 +23,7 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     file::TyrDrmFile,
+    fw::global::csg::Priority,
     gem,
     heap,
     pool,
@@ -189,7 +190,8 @@ pub(crate) struct Group {
     /// callers do not need the group's `inner` lock to operate on it.
     pub(crate) queues: KVec<Queue>,
     pub(super) vm: Arc<Vm>,
-    pub(super) priority: u8,
+    /// Software-visible scheduling priority.
+    pub(crate) priority: Priority,
     pub(super) compute_core_mask: u64,
     pub(super) fragment_core_mask: u64,
     pub(super) tiler_core_mask: u64,
@@ -220,6 +222,8 @@ impl Group {
         {
             return Err(EINVAL);
         }
+
+        let priority = Priority::try_from(group_args.priority)?;
 
         if (group_args.compute_core_mask & !reg_data.gpu_info.shader_present) != 0
             || (group_args.fragment_core_mask & !reg_data.gpu_info.shader_present) != 0
@@ -295,7 +299,7 @@ impl Group {
                 tiler_oom: Atomic::new(0),
                 queues,
                 vm,
-                priority: group_args.priority,
+                priority,
                 compute_core_mask: group_args.compute_core_mask,
                 fragment_core_mask: group_args.fragment_core_mask,
                 tiler_core_mask: group_args.tiler_core_mask,
