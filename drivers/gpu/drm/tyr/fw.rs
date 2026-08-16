@@ -84,7 +84,7 @@ mod parser;
 mod region;
 
 /// Maximum number of CSG interfaces supported by hardware.
-const MAX_CSG: usize = 16;
+pub(crate) const MAX_CSG: usize = 16;
 
 /// Minimum number of CSG interfaces the firmware must report.
 const MIN_CSG: usize = 3;

@@ -15,8 +15,8 @@
 //! Hardware-specific behavior is customized by implementing the [`SlotOperations`]
 //! trait, which allows callbacks when slots are activated or evicted.
 //!
-//! This is currently used for managing address space slots in the GPU, and it will
-//! also be used to manage Command Stream Group (CSG) interface slots in the future.
+//! This is used for managing address space slots in the GPU and Command Stream
+//! Group (CSG) interface slots.
 //!
 //! [SlotOperations]: crate::slot::SlotOperations
 //! [SlotManager]: crate::slot::SlotManager
@@ -185,6 +185,35 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
             slots: [const { Slot::Free }; MAX_SLOTS],
             use_seqno: 1,
         })
+    }
+
+    /// Updates the active slot count.
+    ///
+    /// Lets callers that don't know the hardware slot count at
+    /// `SlotManager::new` time (e.g. because firmware boot has to
+    /// happen first) resize the manager once that information becomes
+    /// available. The new count must be in `1..=MAX_SLOTS` and is
+    /// only safe to call before any seat has been activated, which the
+    /// caller is responsible for ensuring.
+    ///
+    /// Returns `EINVAL` if `slot_count` is zero or exceeds
+    /// `MAX_SLOTS`.
+    pub(crate) fn set_slot_count(&mut self, slot_count: usize) -> Result {
+        if slot_count == 0 || slot_count > MAX_SLOTS {
+            return Err(EINVAL);
+        }
+        self.slot_count = slot_count;
+        Ok(())
+    }
+
+    /// Returns the number of slots currently exposed by the manager.
+    ///
+    /// Always in `1..=MAX_SLOTS`. Callers that walk slot indices should
+    /// bound their iteration by this value rather than `MAX_SLOTS` to
+    /// avoid touching slots the hardware does not report.
+    #[expect(dead_code)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slot_count
     }
 
     /// Records a newly activated slot for the given seat.
@@ -386,6 +415,33 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         }
 
         Ok(())
+    }
+
+    /// Returns the per-slot driver data for `slot_idx`.
+    ///
+    /// Returns `Some(&data)` when the slot is allocated to a group
+    /// (states `Slot::Active` and `Slot::Idle`), and `None` when
+    /// the index is out of range or the slot has no group assigned.
+    pub(crate) fn slot_data(&self, slot_idx: usize) -> Option<&T::SlotData> {
+        if slot_idx >= self.slot_count {
+            return None;
+        }
+        match &self.slots[slot_idx] {
+            Slot::Active(info) | Slot::Idle(info) => Some(&info.slot_data),
+            _ => None,
+        }
+    }
+
+    /// Returns a mutable borrow of the per-slot driver data for `slot_idx`.
+    #[expect(dead_code)]
+    pub(crate) fn slot_data_mut(&mut self, slot_idx: usize) -> Option<&mut T::SlotData> {
+        if slot_idx >= self.slot_count {
+            return None;
+        }
+        match &mut self.slots[slot_idx] {
+            Slot::Active(info) | Slot::Idle(info) => Some(&mut info.slot_data),
+            _ => None,
+        }
     }
 }
 

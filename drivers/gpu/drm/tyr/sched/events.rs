@@ -58,8 +58,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
         };
 
         guard.registration_data_with(|reg_data| {
-            let pending =
-                tdev.with_locked_scheduler(|sched| sched.collect_pending_tiler_ooms(&reg_data.fw));
+            let pending = Scheduler::collect_pending_tiler_ooms(tdev, &reg_data.fw);
 
             let pending = match pending {
                 Ok(pending) => pending,
@@ -100,7 +99,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
 
             let _ = tdev
                 .with_locked_scheduler(|sched| {
-                    sched.finish_pending_tiler_ooms(&reg_data.fw, &pending, &chunk_vas)
+                    sched.finish_pending_tiler_ooms(tdev, &reg_data.fw, &pending, &chunk_vas)
                 })
                 .inspect_err(|err| {
                     dev_err!(
@@ -114,24 +113,40 @@ impl WorkItem<{ work_id::TILER_OOM }> for TyrDrmDeviceData {
 }
 
 impl Scheduler {
-    pub(crate) fn process_csg_irqs(&mut self, mut events: u32, fw: &Firmware<'_>) -> Result<bool> {
+    pub(crate) fn process_csg_irqs(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        fw: &Firmware<'_>,
+        mut events: u32,
+    ) -> Result<bool> {
         let mut queued_tiler_oom = false;
 
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            queued_tiler_oom |= self.process_csg_irq(fw, csg_id)?;
+            queued_tiler_oom |= self.process_csg_irq(tdev, fw, csg_id)?;
             events &= !mask;
         }
 
         Ok(queued_tiler_oom)
     }
 
-    fn process_csg_irq(&mut self, fw: &Firmware<'_>, csg_id: usize) -> Result<bool> {
-        let group = match self.csg_slots.get(csg_id).and_then(Option::as_ref) {
-            Some(slot) => slot.group.clone(),
-            None => return Ok(false),
+    fn process_csg_irq(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        fw: &Firmware<'_>,
+        csg_id: usize,
+    ) -> Result<bool> {
+        // Holding slot-manager across with_csg_mut() would order it
+        // ahead of fw.inner, but other paths take fw.inner standalone.
+        // Introducing that order would risk ABBA.
+        let group = {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            match slot_manager.slot_data(csg_id) {
+                Some(data) => data.group.clone(),
+                None => return Ok(false),
+            }
         };
 
         let mut queued_tiler_oom = false;
@@ -170,20 +185,44 @@ impl Scheduler {
         Ok(queued_tiler_oom)
     }
 
-    fn collect_pending_tiler_ooms(&mut self, fw: &Firmware<'_>) -> Result<KVec<PendingOom>> {
+    fn collect_pending_tiler_ooms(
+        tdev: &TyrDrmDevice,
+        fw: &Firmware<'_>,
+    ) -> Result<KVec<PendingOom>> {
         let mut pending = KVec::new();
 
-        for (csg_id, slot) in self.csg_slots.iter().enumerate() {
-            let slot = match slot.as_ref() {
-                Some(slot) => slot,
-                None => continue,
-            };
+        // Snapshot the (group, oom_mask) pairs that have a pending
+        // tiler-OOM bit set, then drop the slot-manager lock before
+        // we read the per-CS OOM state from the firmware. Holding
+        // slot-manager across with_csg_mut() would order it ahead of
+        // fw.inner, but other paths take fw.inner standalone.
+        // Introducing that order would risk ABBA. The snapshot is a
+        // fixed-capacity array so this stays allocation-free under the
+        // lock. The pending KVec is built afterwards with no scheduler
+        // or slot-manager lock held.
+        let mut to_visit: [Option<(Arc<Group>, u32)>; super::MAX_CSGS] =
+            [const { None }; super::MAX_CSGS];
+        {
+            let slot_manager = tdev.csg_slot_manager.lock();
+            for (csg_id, slot) in to_visit.iter_mut().enumerate() {
+                let data = match slot_manager.slot_data(csg_id) {
+                    Some(data) => data,
+                    None => continue,
+                };
 
-            let oom_mask = slot.group.tiler_oom.xchg(0, Relaxed);
-            if oom_mask == 0 {
-                continue;
+                let oom_mask = data.group.tiler_oom.xchg(0, Relaxed);
+                if oom_mask == 0 {
+                    continue;
+                }
+
+                *slot = Some((data.group.clone(), oom_mask));
             }
+        }
 
+        for (csg_id, entry) in to_visit.into_iter().enumerate() {
+            let Some((group, oom_mask)) = entry else {
+                continue;
+            };
             for cs_id in 0u32..32 {
                 if oom_mask & (1u32 << cs_id) == 0 {
                     continue;
@@ -206,7 +245,7 @@ impl Scheduler {
 
                 pending.push(
                     PendingOom {
-                        group: slot.group.clone(),
+                        group: group.clone(),
                         csg_id,
                         cs_id,
                         saved_tiler_oom_ack,
@@ -225,14 +264,23 @@ impl Scheduler {
 
     fn finish_pending_tiler_ooms(
         &mut self,
+        tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         pending: &KVec<PendingOom>,
         chunk_vas: &KVec<u64>,
     ) -> Result {
         for (index, oom) in pending.iter().enumerate() {
-            match self.csg_slots.get(oom.csg_id).and_then(Option::as_ref) {
-                Some(slot) if Arc::ptr_eq(&slot.group, &oom.group) => {}
-                _ => continue,
+            // The collect phase dropped the slot-manager lock so that
+            // the firmware MMIO below can run without ordering
+            // slot-manager ahead of fw.inner (which other paths take
+            // standalone). Confirm the slot is still owned by the
+            // same group.
+            {
+                let slot_manager = tdev.csg_slot_manager.lock();
+                match slot_manager.slot_data(oom.csg_id) {
+                    Some(data) if Arc::ptr_eq(&data.group, &oom.group) => {}
+                    _ => continue,
+                }
             }
 
             let new_chunk_va = *chunk_vas.get(index).ok_or(EINVAL)?;
