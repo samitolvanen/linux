@@ -54,11 +54,12 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     fw_ready: Arc<Atomic<bool>>,
     ready_wait: Arc<Wait>,
 ) -> impl PinInit<ThreadedRegistration<'drm, TyrIrq<JobIrq<'drm>>>, Error> + 'drm {
-    iomem.write_reg(
-        JOB_IRQ_MASK::zeroed()
-            .with_const_csg::<CSG_IRQ_MASK>()
-            .with_glb(true),
-    );
+    let mask = JOB_IRQ_MASK::zeroed()
+        .with_const_csg::<CSG_IRQ_MASK>()
+        .with_glb(true);
+
+    iomem.write_reg(JOB_IRQ_CLEAR::from_raw(mask.into_raw()));
+    iomem.write_reg(mask);
 
     let job_irq = JobIrq {
         iomem: iomem.clone(),
