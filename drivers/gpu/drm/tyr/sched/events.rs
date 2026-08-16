@@ -19,11 +19,16 @@ use kernel::{
 
 use crate::{
     driver::{
+        parent_dev,
         work_id,
         TyrDrmDevice,
         TyrDrmDeviceData, //
     },
-    fw::Firmware,
+    fw::{
+        CsFaultExceptionType,
+        Firmware,
+        CSG_REQ, //
+    },
     heap, //
 };
 
@@ -149,7 +154,32 @@ impl Scheduler {
             }
         };
 
+        let pending_mask =
+            CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
+
+        let progress_event = fw.with_csg_mut(csg_id, |csg| {
+            let req = csg.read_input_req()?.into_raw();
+            let ack = csg.read_output_ack()?.into_raw();
+            let pending = (req ^ ack) & pending_mask;
+            if pending != 0 {
+                csg.update_input_req(CSG_REQ::from_raw(ack & pending), CSG_REQ::from_raw(pending))?;
+            }
+            Ok(pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0)
+        })?;
+
+        if progress_event {
+            // Progress-timer expiry: the firmware-imposed forward-progress
+            // window elapsed without the group advancing.
+            group.with_locked_inner(|inner| {
+                if inner.fatal_error.is_none() {
+                    inner.fatal_error = Some(ETIMEDOUT);
+                }
+            });
+        }
+
         let mut queued_tiler_oom = false;
+        let mut cs_fatal_mask: u32 = 0;
+        let mut cs_inherit_fault_mask: u32 = 0;
         fw.with_csg_mut(csg_id, |csg| {
             let irq_req = csg.read_output_irq_req()?.mask();
             let irq_ack = csg.read_input_irq_ack()?;
@@ -161,7 +191,7 @@ impl Scheduler {
 
             csg.write_input_irq_ack(irq_ack.with_mask(irq_req));
 
-            for cs_id in 0u32..32 {
+            for cs_id in 0..group.queue_count() as u32 {
                 if pending_cs_irqs & (1u32 << cs_id) == 0 {
                     continue;
                 }
@@ -177,10 +207,56 @@ impl Scheduler {
                     group.set_tiler_oom(cs_id);
                     queued_tiler_oom = true;
                 }
+
+                let fatal_event = input_req.fatal() != output_ack.fatal();
+                let fault_event = input_req.fault() != output_ack.fault();
+
+                if fatal_event {
+                    let _ = cs.decode_fatal(parent_dev(tdev), csg_id, cs_id)?;
+                    cs_fatal_mask |= 1u32 << cs_id;
+                }
+
+                if fault_event
+                    && cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?
+                        == CsFaultExceptionType::CsInheritFault as u32
+                {
+                    cs_inherit_fault_mask |= 1u32 << cs_id;
+                }
+
+                if fatal_event || fault_event {
+                    let new_req = input_req
+                        .with_fatal(output_ack.fatal())
+                        .with_fault(output_ack.fault());
+                    cs.write_input_req(new_req);
+                }
             }
 
             Ok(())
         })?;
+
+        if cs_fatal_mask != 0 {
+            group.with_locked_inner(|inner| {
+                let mut mask = cs_fatal_mask;
+                while mask != 0 {
+                    let cs_id = mask.trailing_zeros() as usize;
+                    mask &= !(1u32 << cs_id);
+                    inner.set_queue_fatal(cs_id);
+                }
+            });
+        }
+
+        let mut mask = cs_inherit_fault_mask;
+        while mask != 0 {
+            let cs_id = mask.trailing_zeros() as usize;
+            mask &= !(1u32 << cs_id);
+            if let Some(queue) = group.queues.get(cs_id) {
+                queue.fail_inflight_submit_fences(EINVAL)?;
+            }
+        }
+
+        if cs_fatal_mask != 0 {
+            TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
+        }
 
         Ok(queued_tiler_oom)
     }

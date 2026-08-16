@@ -304,8 +304,7 @@ impl CsgInterface {
         enabled.cs.get_mut(index)
     }
 
-    #[expect(dead_code)]
-    pub(in super::super) fn read_input_req(&self) -> Result<CSG_REQ> {
+    pub(crate) fn read_input_req(&self) -> Result<CSG_REQ> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
             CsgInterfaceState::Disabled => return Err(EINVAL),
@@ -345,7 +344,6 @@ impl CsgInterface {
     /// race with the IRQ-side bits the firmware can flip concurrently.
     ///
     /// Returns `EINVAL` if the interface is not enabled.
-    #[expect(dead_code)]
     pub(crate) fn update_input_req(&self, value: CSG_REQ, mask: CSG_REQ) -> Result {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,

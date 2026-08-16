@@ -12,15 +12,22 @@ use kernel::{
         Io,
         Region, //
     },
-    prelude::*, //
+    prelude::*,
+    str::CStr, //
 };
 
 use super::SharedSectionInfo;
 use crate::fw::interfaces::{
+    CsBlockedReason,
     CsState,
+    CsWaitCondition,
     FwInterface,
     CS_ACK,
     CS_CONTROL_BLOCK_SIZE,
+    CS_FATAL,
+    CS_FATAL_INFO,
+    CS_FAULT,
+    CS_FAULT_INFO,
     CS_HEAP_ADDRESS,
     CS_HEAP_FRAG_END,
     CS_HEAP_VT_END,
@@ -28,6 +35,12 @@ use crate::fw::interfaces::{
     CS_KERNEL_INPUT_BLOCK_SIZE,
     CS_KERNEL_OUTPUT_BLOCK_SIZE,
     CS_REQ,
+    CS_STATUS_BLOCKED_REASON,
+    CS_STATUS_SCOREBOARDS,
+    CS_STATUS_WAIT,
+    CS_STATUS_WAIT_SYNC_POINTER,
+    CS_STATUS_WAIT_SYNC_VALUE,
+    CS_STATUS_WAIT_SYNC_VALUE_HI,
     CS_TILER_HEAP_END,
     CS_TILER_HEAP_START,
     STREAM_FEATURES,
@@ -35,6 +48,45 @@ use crate::fw::interfaces::{
     STREAM_OUTPUT_VA, //
 };
 use crate::fw::region::FwRegion;
+use crate::regs::join_u64;
+
+/// Names for `CS_FATAL.exception_type` codes, used by `CsInterface::decode_fatal`.
+const FATAL_EXCEPTION_NAMES: &[(u32, &CStr)] = &[
+    (0x00, c"OK"),
+    (0x40, c"CS_CONFIG_FAULT"),
+    (0x41, c"CS_UNRECOVERABLE"),
+    (0x44, c"CS_ENDPOINT_FAULT"),
+    (0x48, c"CS_BUS_FAULT"),
+    (0x49, c"CS_INVALID_INSTRUCTION"),
+    (0x4A, c"CS_CALL_STACK_OVERFLOW"),
+    (0x68, c"FIRMWARE_INTERNAL_ERROR"),
+];
+
+/// Names for `CS_FAULT.exception_type` codes, used by `CsInterface::decode_fault`.
+const FAULT_EXCEPTION_NAMES: &[(u32, &CStr)] = &[
+    (0x00, c"OK"),
+    (0x05, c"KABOOM"),
+    (0x0F, c"CS_RESOURCE_TERMINATED"),
+    (0x48, c"CS_BUS_FAULT"),
+    (0x4B, c"CS_INHERIT_FAULT"),
+    (0x50, c"INSTR_INVALID_PC"),
+    (0x51, c"INSTR_INVALID_ENC"),
+    (0x55, c"INSTR_BARRIER_FAULT"),
+    (0x58, c"DATA_INVALID_FAULT"),
+    (0x59, c"TILE_RANGE_FAULT"),
+    (0x5A, c"ADDR_RANGE_FAULT"),
+    (0x5B, c"IMPRECISE_FAULT"),
+    (0x69, c"RESOURCE_EVICTION_TIMEOUT"),
+];
+
+fn exception_name(table: &[(u32, &'static CStr)], code: u32) -> &'static CStr {
+    for &(c, name) in table {
+        if c == code {
+            return name;
+        }
+    }
+    c"UNKNOWN"
+}
 
 /// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
 const CS_CONTROL_OFFSET: usize = 0x40;
@@ -74,6 +126,22 @@ pub(crate) struct HeapOutputState {
     pub(crate) vt_start: u32,
     pub(crate) vt_end: u32,
     pub(crate) frag_end: u32,
+}
+
+/// Snapshot of the per-CS sync-wait state captured from
+/// `CS_STATUS_WAIT` and the matching `CS_STATUS_WAIT_SYNC_*` words.
+pub(crate) struct CsStatusWait {
+    /// Wait condition (`Le` or `Gt`).
+    pub(crate) condition: CsWaitCondition,
+    /// Whether the wait observes a 64-bit (`true`) or 32-bit (`false`)
+    /// sync object.
+    pub(crate) sync64: bool,
+    /// GPU virtual address of the awaited sync object.
+    pub(crate) sync_ptr: u64,
+    /// Reference value the wait compares against, assembled from the
+    /// low half (`CS_STATUS_WAIT_SYNC_VALUE`) and, for 64-bit waits,
+    /// the high half (`CS_STATUS_WAIT_SYNC_VALUE_HI`).
+    pub(crate) ref_val: u64,
 }
 
 impl CsInterface {
@@ -235,5 +303,138 @@ impl CsInterface {
             vt_end: enabled.cs_output.read(CS_HEAP_VT_END).value().get(),
             frag_end: enabled.cs_output.read(CS_HEAP_FRAG_END).value().get(),
         })
+    }
+
+    pub(crate) fn read_status_blocked_reason(&self) -> Result<CsBlockedReason> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        enabled.cs_output.read(CS_STATUS_BLOCKED_REASON).reason()
+    }
+
+    /// Reads `CS_STATUS_SCOREBOARDS.nonzero`.
+    ///
+    /// A non-zero return means the CS is still observing one or more
+    /// in-flight scoreboard entries.
+    pub(crate) fn read_status_scoreboards(&self) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok(enabled
+            .cs_output
+            .read(CS_STATUS_SCOREBOARDS)
+            .nonzero()
+            .get())
+    }
+
+    /// Reads the active `CS_STATUS_WAIT_SYNC_*` snapshot when the CS is
+    /// blocked on a `SYNC_WAIT` instruction.
+    pub(crate) fn read_status_wait_sync(&self) -> Result<CsStatusWait> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let wait = enabled.cs_output.read(CS_STATUS_WAIT);
+        let condition = wait.sync_wait_condition()?;
+        let sync64 = wait.sync_wait_size();
+
+        let sync_ptr = enabled
+            .cs_output
+            .read(CS_STATUS_WAIT_SYNC_POINTER)
+            .pointer()
+            .get();
+        let lo = enabled
+            .cs_output
+            .read(CS_STATUS_WAIT_SYNC_VALUE)
+            .value()
+            .get();
+        let ref_val = if sync64 {
+            let hi = enabled
+                .cs_output
+                .read(CS_STATUS_WAIT_SYNC_VALUE_HI)
+                .value()
+                .get();
+            join_u64(lo, hi)
+        } else {
+            u64::from(lo)
+        };
+
+        Ok(CsStatusWait {
+            condition,
+            sync64,
+            sync_ptr,
+            ref_val,
+        })
+    }
+
+    /// Logs the contents of `CS_FATAL` / `CS_FATAL_INFO` and returns the
+    /// raw exception-type code from `CS_FATAL.exception_type`.
+    ///
+    /// Returns `EINVAL` if the interface is not enabled.
+    pub(crate) fn decode_fatal(&self, dev: &Device, csg_id: usize, cs_id: u32) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let fatal = enabled.cs_output.read(CS_FATAL).into_raw();
+        let info = enabled.cs_output.read(CS_FATAL_INFO).into_raw();
+        let exception_type = fatal & 0xFF;
+        let exception_data = (fatal >> 8) & 0x00FF_FFFF;
+        let name = exception_name(FATAL_EXCEPTION_NAMES, exception_type);
+
+        dev_err!(
+            dev,
+            "CSG slot: {} CS slot: {}\n\
+             CS_FATAL.EXCEPTION_TYPE: 0x{:x} ({})\n\
+             CS_FATAL.EXCEPTION_DATA: 0x{:x}\n\
+             CS_FATAL_INFO: 0x{:x}\n",
+            csg_id,
+            cs_id,
+            exception_type,
+            name.to_str().unwrap_or("UNKNOWN"),
+            exception_data,
+            info,
+        );
+
+        Ok(exception_type)
+    }
+
+    /// Logs the contents of `CS_FAULT` / `CS_FAULT_INFO` and returns the
+    /// raw exception-type code from `CS_FAULT.exception_type`.
+    ///
+    /// Returns `EINVAL` if the interface is not enabled.
+    pub(crate) fn decode_fault(&self, dev: &Device, csg_id: usize, cs_id: u32) -> Result<u32> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let fault = enabled.cs_output.read(CS_FAULT).into_raw();
+        let info = enabled.cs_output.read(CS_FAULT_INFO).into_raw();
+        let exception_type = fault & 0xFF;
+        let exception_data = (fault >> 8) & 0x00FF_FFFF;
+        let name = exception_name(FAULT_EXCEPTION_NAMES, exception_type);
+
+        dev_err!(
+            dev,
+            "CSG slot: {} CS slot: {}\n\
+             CS_FAULT.EXCEPTION_TYPE: 0x{:x} ({})\n\
+             CS_FAULT.EXCEPTION_DATA: 0x{:x}\n\
+             CS_FAULT_INFO: 0x{:x}\n",
+            csg_id,
+            cs_id,
+            exception_type,
+            name.to_str().unwrap_or("UNKNOWN"),
+            exception_data,
+            info,
+        );
+
+        Ok(exception_type)
     }
 }
