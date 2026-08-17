@@ -52,6 +52,7 @@ use crate::{
         Firmware, //
     },
     gem,
+    gpu::CsifInfo,
     heap,
     pool,
     sched::CsgSlotManager,
@@ -678,6 +679,16 @@ impl Group {
         Ok(queue_index * core::mem::size_of::<syncs::SyncObj64b>())
     }
 
+    /// GPU virtual address of the per-queue syncobj for `queue_index`.
+    ///
+    /// Errors with `EINVAL` if `queue_index` is out of range or the
+    /// syncobjs BO has no kernel-side VA bound.
+    pub(super) fn syncobj_va(&self, queue_index: usize) -> Result<u64> {
+        let offset = self.syncobj_offset(queue_index)?;
+        let syncobjs_va = self.syncobjs.kernel_va().ok_or(EINVAL)?;
+        Ok(syncobjs_va.start + offset as u64)
+    }
+
     #[expect(dead_code)]
     pub(super) fn read_syncobj(&self, queue_index: usize) -> Result<u64> {
         syncs::SyncObj64b::read_seqno(&self.syncobjs, self.syncobj_offset(queue_index)?)
@@ -708,6 +719,7 @@ impl Group {
 
     pub(super) fn submit(
         self: &Arc<Self>,
+        csif: &CsifInfo,
         queue_submits: KVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
@@ -717,7 +729,7 @@ impl Group {
         let _submit_lock = self.submit_lock.lock();
 
         for job in jobs.into_iter() {
-            prepared_jobs.push(job.prepare(self, file)?, GFP_KERNEL)?;
+            prepared_jobs.push(job.prepare(self, csif, file)?, GFP_KERNEL)?;
         }
 
         self.vm
@@ -840,6 +852,7 @@ impl Pool {
 
     pub(crate) fn submit_group(
         &self,
+        csif: &CsifInfo,
         groupsubmit: &uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result {
@@ -865,7 +878,7 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        group.submit(queue_submits, file)
+        group.submit(csif, queue_submits, file)
     }
 
     pub(crate) fn get_group_state(
