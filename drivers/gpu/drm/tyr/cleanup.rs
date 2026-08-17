@@ -35,8 +35,9 @@ global_lock! {
 
 /// Registration of the module-wide cleanup workqueue.
 ///
-/// Creating it builds the queue and publishes it to `Handoff::spawn`.
-/// Dropping it destroys the queue, which drains every item still queued.
+/// Creating it builds the queue and publishes it to `enqueue` and
+/// `Handoff::spawn`. Dropping it destroys the queue, which drains every item
+/// still queued.
 pub(crate) struct Registration(());
 
 impl Registration {
@@ -61,6 +62,21 @@ impl Drop for Registration {
         // so take it out of the static first.
         let wq = CLEANUP_WQ.lock().take();
         drop(wq);
+    }
+}
+
+/// Enqueues a work item on the cleanup workqueue.
+///
+/// Must not be called before the module has created the `Registration`.
+/// The item comes back in the error when it is already pending or the
+/// module has destroyed the queue.
+pub(crate) fn enqueue<W, const ID: u64>(w: W) -> Result<(), W>
+where
+    W: workqueue::RawWorkItem<ID, EnqueueOutput = Result<(), W>> + Send + 'static,
+{
+    match CLEANUP_WQ.lock().as_ref() {
+        Some(wq) => wq.enqueue(w),
+        None => Err(w),
     }
 }
 
