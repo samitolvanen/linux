@@ -28,6 +28,11 @@ use crate::{
     }, //
 };
 
+/// Number of CS work registers the kernel reserves at the top of the
+/// register file for its own wrapper prologue/epilogue. Per the CSF
+/// programming manual. The value is constant across all current CSF chips.
+pub(crate) const UNPRESERVED_CS_REG_COUNT: u32 = 4;
+
 /// CSIF (Command Stream Interface) information.
 ///
 /// # Invariants
@@ -36,6 +41,24 @@ use crate::{
 #[repr(transparent)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CsifInfo(pub(crate) uapi::drm_panthor_csif_info);
+
+impl CsifInfo {
+    pub(crate) fn new(
+        csg_slot_count: u32,
+        cs_slot_count: u32,
+        cs_reg_count: u32,
+        scoreboard_slot_count: u32,
+    ) -> Self {
+        Self(uapi::drm_panthor_csif_info {
+            csg_slot_count,
+            cs_slot_count,
+            cs_reg_count,
+            scoreboard_slot_count,
+            unpreserved_cs_reg_count: UNPRESERVED_CS_REG_COUNT,
+            ..Default::default()
+        })
+    }
+}
 
 impl Deref for CsifInfo {
     type Target = uapi::drm_panthor_csif_info;

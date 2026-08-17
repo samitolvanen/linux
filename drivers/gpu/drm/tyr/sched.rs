@@ -14,8 +14,7 @@ use kernel::{
         msecs_to_jiffies,
         Instant,
         Monotonic, //
-    },
-    uapi, //
+    }, //
 };
 
 use crate::{
@@ -305,13 +304,12 @@ impl Scheduler {
         let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
             fw.csif_info_counts()?;
 
-        let csif = CsifInfo(uapi::drm_panthor_csif_info {
+        let csif = CsifInfo::new(
             csg_slot_count,
             cs_slot_count,
             cs_reg_count,
             scoreboard_slot_count,
-            ..Default::default()
-        });
+        );
 
         // Narrow the manager's iteration bound now that the firmware
         // has reported the real slot count.
