@@ -473,11 +473,13 @@ impl TyrDrmFileData {
 
     pub(crate) fn group_submit(
         _ddev: &TyrDrmDevice<Registered>,
-        _reg_data: &TyrDrmRegistrationData<'_>,
+        reg_data: &TyrDrmRegistrationData<'_>,
         groupsubmit: &mut uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner().group_pool().submit_group(groupsubmit, file)?;
+        file.inner()
+            .group_pool()
+            .submit_group(&reg_data.csif_info, groupsubmit, file)?;
 
         Ok(0)
     }
