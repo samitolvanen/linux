@@ -48,6 +48,7 @@ use crate::fw::{
         GROUP_SUSPEND_SIZE, //
     },
     region::FwRegion,
+    CsDbMask,
     MAX_CS, //
 };
 
@@ -467,6 +468,7 @@ impl CsgInterface {
         Ok(())
     }
 
+    #[expect(dead_code)]
     pub(crate) fn read_input_db_req(&self) -> Result<CSG_DB_REQ> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
@@ -476,10 +478,36 @@ impl CsgInterface {
         Ok(enabled.csg_input.read(CSG_DB_REQ))
     }
 
+    #[expect(dead_code)]
     pub(crate) fn write_input_db_req(&self, req: CSG_DB_REQ) {
         if let CsgInterfaceState::Enabled(enabled) = &self.state {
             enabled.csg_input.write(CSG_DB_REQ, req);
         }
+    }
+
+    /// Toggles the bits in `mask` of `CSG_DB_REQ` against the current
+    /// `CSG_DB_ACK`, requesting a per-CS doorbell ring on the next
+    /// global doorbell write.
+    ///
+    /// The flip is taken against `CSG_DB_ACK` (not the live
+    /// `CSG_DB_REQ` input) so the firmware always sees `req != ack`
+    /// for the toggled bits and is guaranteed to consume the event.
+    ///
+    /// Returns `EINVAL` if the interface is not enabled.
+    pub(crate) fn toggle_input_db_req(&self, mask: CsDbMask) -> Result {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(e) => e,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let mask = mask.into_raw();
+        let cur_req = enabled.csg_input.read(CSG_DB_REQ).into_raw();
+        let cur_ack = enabled.csg_output.read(CSG_DB_ACK).into_raw();
+        let new = (cur_req & !mask) | ((cur_ack ^ mask) & mask);
+        enabled
+            .csg_input
+            .write(CSG_DB_REQ, CSG_DB_REQ::from_raw(new));
+        Ok(())
     }
 
     pub(crate) fn read_input_irq_ack(&self) -> Result<CSG_IRQ_ACK> {
@@ -506,7 +534,8 @@ impl CsgInterface {
         Ok(enabled.csg_output.read(CSG_ACK))
     }
 
-    pub(crate) fn read_output_db_ack(&self) -> Result<CSG_DB_ACK> {
+    #[expect(dead_code)]
+    pub(in super::super) fn read_output_db_ack(&self) -> Result<CSG_DB_ACK> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,
             CsgInterfaceState::Disabled => return Err(EINVAL),

@@ -27,9 +27,11 @@ use crate::{
         self,
         global::{
             csg::Priority,
+            CsActivateInputs,
             CsgActivateInputs, //
         },
         CsBlockedReason,
+        CsDbMask,
         CsWaitCondition,
         CsgExecutionState,
         CsgSlotMask,
@@ -115,8 +117,13 @@ pub(crate) struct CsgUpdateContext {
     /// tick's `req_value` writes. Bits in `req_mask` missing from here
     /// mark the slot as timed out (see `timedout_mask`).
     pub(crate) acked_reqs: [CSG_REQ; MAX_CSGS],
-    #[expect(dead_code)]
-    db_toggle: [u32; MAX_CSGS],
+    /// CSG_DB_REQ bits to toggle per slot (per-CS doorbell ring requests).
+    ///
+    /// One bit per CS in the group; flipped against `CSG_DB_ACK` by
+    /// `apply_csg_updates` before the global doorbell ring so the
+    /// firmware kicks the matching streams when it processes the
+    /// per-CSG doorbell event.
+    pub(crate) db_toggle: [CsDbMask; MAX_CSGS],
     pub(crate) update_mask: CsgSlotMask,
     /// Bitmask of CSG slot indices whose request timed out during the
     /// most recent apply cycle.
@@ -149,7 +156,7 @@ impl CsgUpdateContext {
             req_value: [ZERO; MAX_CSGS],
             req_mask: [ZERO; MAX_CSGS],
             acked_reqs: [ZERO; MAX_CSGS],
-            db_toggle: [0; MAX_CSGS],
+            db_toggle: [CsDbMask::empty(); MAX_CSGS],
             update_mask: CsgSlotMask::empty(),
             timedout_mask: CsgSlotMask::empty(),
         }
@@ -188,6 +195,23 @@ impl CsgUpdateContext {
             CSG_REQ::zeroed().with_state(state),
             CSG_REQ_STATE_MASK,
         );
+    }
+
+    /// Adds `mask` to the per-CS doorbell-ring set for `csg_idx`.
+    ///
+    /// Each bit in `mask` corresponds to a CS within the CSG. The
+    /// `apply_csg_updates` step flips the matching `CSG_DB_REQ` bits
+    /// against `CSG_DB_ACK` before ringing the per-CSG doorbell.
+    /// Calling this also marks the slot as having pending updates so
+    /// the apply loop visits it even if no `CSG_REQ` bits were staged.
+    pub(crate) fn add_db_toggle(&mut self, csg_idx: usize, mask: CsDbMask) {
+        debug_assert!(csg_idx < MAX_CSGS);
+        if mask.is_empty() {
+            return;
+        }
+        let raw = self.db_toggle[csg_idx].into_raw() | mask.into_raw();
+        self.db_toggle[csg_idx] = CsDbMask::from_raw(raw);
+        self.update_mask.insert(csg_idx);
     }
 }
 
@@ -393,12 +417,15 @@ impl Scheduler {
         TyrDrmDeviceData::schedule_periodic_tick(tdev, msecs_to_jiffies(tick::TICK_PERIOD_MS));
     }
 
-    /// Programs the static CSG_INPUT registers for a slot the manager
-    /// has just bound, publishes the binding, and stages the matching
-    /// CSG_REQ transition.
+    /// Programs the static CSG_INPUT and per-CS CS_INPUT registers for
+    /// a slot the manager has just bound, publishes the binding, and
+    /// stages the matching CSG_REQ transition and per-CS doorbell
+    /// rings.
     ///
     /// Every fallible step runs before anything is published or staged,
     /// so a failure leaves both the group and the accumulator untouched.
+    /// Partially written firmware registers and shared memory stay
+    /// inert until a doorbell ring, which only a staged slot receives.
     ///
     /// The caller must hold the slot-manager mutex. The manager has
     /// already recorded the binding by this point, so a caller that
@@ -434,7 +461,34 @@ impl Scheduler {
             config,
         };
 
-        fw.with_csg_mut(slot_idx, |csg| csg.program_activate_inputs(&inputs))?;
+        // Per-CS doorbells follow the slot index (`slot_idx + 1`) and
+        // remain stable for as long as the slot is active.
+        let cs_doorbell = (slot_idx as u32) + 1;
+
+        // Stage per-CS inputs on the stack so a per-queue EINVAL bails
+        // before any firmware write, and to keep the activate path
+        // allocation-free.
+        let mut cs_inputs: [Option<CsActivateInputs>; group::MAX_CS_PER_GROUP] =
+            [const { None }; group::MAX_CS_PER_GROUP];
+        for (cs_idx, queue) in group.queues.iter().enumerate() {
+            cs_inputs[cs_idx] = Some(queue.cs_activate_inputs(cs_doorbell)?);
+        }
+
+        for queue in group.queues.iter() {
+            queue.sync_extract_init()?;
+        }
+
+        let mut db_mask = CsDbMask::empty();
+        fw.with_csg_mut(slot_idx, |csg| {
+            csg.program_activate_inputs(&inputs)?;
+            for (cs_idx, cs_input) in cs_inputs.iter().enumerate() {
+                let Some(cs_input) = cs_input else { break };
+                let cs = csg.cs_mut(cs_idx).ok_or(EINVAL)?;
+                cs.program_activate_inputs(cs_input)?;
+                db_mask.insert(cs_idx);
+            }
+            Ok(())
+        })?;
 
         // Publish the per-queue doorbell ids and the bound CSG slot
         // index in one `inner` critical section. `TyrQueueOps::submit`
@@ -456,6 +510,7 @@ impl Scheduler {
         };
         context.set_state(slot_idx, state);
         context.toggle_reqs(slot_idx, CSG_REQ_EP_CFG);
+        context.add_db_toggle(slot_idx, db_mask);
         Ok(())
     }
 
@@ -500,6 +555,17 @@ impl Scheduler {
             fw.with_csg_mut(csg_id, |csg| {
                 csg.update_and_toggle_input_req(req_value, set_mask, toggle_mask)
             })?;
+        }
+
+        for csg_id in 0..MAX_CSGS {
+            if !context.update_mask.contains(csg_id) {
+                continue;
+            }
+            let db_mask = context.db_toggle[csg_id];
+            if db_mask.is_empty() {
+                continue;
+            }
+            fw.with_csg_mut(csg_id, |csg| csg.toggle_input_db_req(db_mask))?;
         }
 
         fw.ring_csg_doorbells(context.update_mask)?;
@@ -682,6 +748,26 @@ impl Scheduler {
                 }
                 Ok(())
             })?;
+        }
+
+        // On the bind-side `Start`/`Resume` ack, ring the per-CS user
+        // doorbell on every queue whose ringbuf already has commands.
+        // `Scheduler::program_csg_activate` publishes `doorbell_id`
+        // before this point.
+        if new_state == group::State::Active {
+            for queue in slot_data.group.queues.iter() {
+                if queue.is_ringbuf_empty().unwrap_or(true) {
+                    continue;
+                }
+                if let Err(e) = queue.kick() {
+                    dev_err!(
+                        group.tdev.as_ref(),
+                        "CSG {}: user-doorbell kick on bind failed: {}\n",
+                        csg_idx,
+                        e.to_errno()
+                    );
+                }
+            }
         }
 
         group.set_state(new_state);

@@ -33,6 +33,10 @@ use kernel::{
         SZ_2M, //
     },
     sync::{
+        barrier::{
+            mb,
+            Write, //
+        },
         Arc,
         Mutex, //
     },
@@ -79,6 +83,7 @@ use crate::{
     }, //
 };
 
+pub(crate) use self::cs::CsActivateInputs;
 pub(crate) use self::csg::{
     CsgActivateInputs,
     CsgInterface, //
@@ -378,6 +383,9 @@ impl<'drm> GlobalInterface<'drm> {
     fn ring_doorbell(&self, doorbell_id: usize) -> Result {
         let doorbell = DOORBELL::try_at(doorbell_id).ok_or(EINVAL)?;
 
+        // Ensure prior writes to firmware-shared memory (CSG_REQ, GLB_DB_REQ,
+        // ring buffers) reach the firmware before the doorbell.
+        mb(Write);
         self.iomem
             .access(self.dev)?
             .try_write(doorbell, DOORBELL::zeroed().with_ring(true))

@@ -49,9 +49,15 @@ pub(in crate::fw) use self::{
             STREAM_OUTPUT_VA, //
         },
         input::{
+            CS_ACK_IRQ_MASK,
+            CS_BASE,
+            CS_CONFIG,
             CS_REQ,
+            CS_SIZE,
             CS_TILER_HEAP_END,
-            CS_TILER_HEAP_START, //
+            CS_TILER_HEAP_START,
+            CS_USER_INPUT,
+            CS_USER_OUTPUT, //
         },
         output::{
             CS_ACK,

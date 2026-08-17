@@ -72,6 +72,7 @@ use crate::{
         TyrDrmDeviceData,
         TyrDrmRegistrationData, //
     },
+    fw::global::CsActivateInputs,
     gem,
     regs::doorbell_block,
     vm::{
@@ -414,6 +415,39 @@ impl QueueData {
         let input = self.interfaces.read_input()?;
         let output = self.interfaces.read_output()?;
         Ok(input.insert == output.extract)
+    }
+
+    /// Synchronizes the queue's `input.extract_init` from the firmware's
+    /// current `output.extract` value.
+    ///
+    /// Must be called before staging `CS_REQ.state = Start` at CSG-bind
+    /// time so the firmware sees a consistent `(insert, extract_init)`
+    /// snapshot when it starts reading the per-queue ringbuf mailbox.
+    ///
+    /// The read-modify-write preserves `insert` and updates only
+    /// `extract_init`.
+    pub(crate) fn sync_extract_init(&self) -> Result {
+        let ringbuf_output = self.interfaces.read_output()?;
+        let mut ringbuf_input = self.interfaces.read_input()?;
+        ringbuf_input.extract_init = ringbuf_output.extract;
+        self.interfaces.write_input(ringbuf_input)?;
+        Ok(())
+    }
+
+    /// Builds the `CsActivateInputs` needed to program this queue's
+    /// CS slot at CSG-bind time.
+    ///
+    /// `doorbell_id` is the per-CS doorbell index assigned by the
+    /// caller (in practice `slot_idx + 1`).
+    pub(crate) fn cs_activate_inputs(&self, doorbell_id: u32) -> Result<CsActivateInputs> {
+        Ok(CsActivateInputs {
+            ringbuf_base: self.ringbuf.kernel_va().ok_or(EINVAL)?.start,
+            ringbuf_size: self.ringbuf.size() as u32,
+            ringbuf_input_va: self.interfaces.input_va.start,
+            ringbuf_output_va: self.interfaces.output_va.start,
+            priority: self.priority,
+            doorbell_id,
+        })
     }
 
     pub(super) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
@@ -787,9 +821,7 @@ impl RingBufferOutput {
 /// The firmware-owned input and output blocks of a single queue.
 pub(crate) struct Interfaces {
     mem: Arc<gem::MappedBo>,
-    #[expect(dead_code)]
     pub(super) input_va: Range<u64>,
-    #[expect(dead_code)]
     pub(super) output_va: Range<u64>,
     input_offset: usize,
     output_offset: usize,

@@ -23,6 +23,9 @@ use crate::fw::interfaces::{
     CsWaitCondition,
     FwInterface,
     CS_ACK,
+    CS_ACK_IRQ_MASK,
+    CS_BASE,
+    CS_CONFIG,
     CS_CONTROL_BLOCK_SIZE,
     CS_FATAL,
     CS_FATAL_INFO,
@@ -35,6 +38,7 @@ use crate::fw::interfaces::{
     CS_KERNEL_INPUT_BLOCK_SIZE,
     CS_KERNEL_OUTPUT_BLOCK_SIZE,
     CS_REQ,
+    CS_SIZE,
     CS_STATUS_BLOCKED_REASON,
     CS_STATUS_SCOREBOARDS,
     CS_STATUS_WAIT,
@@ -43,6 +47,8 @@ use crate::fw::interfaces::{
     CS_STATUS_WAIT_SYNC_VALUE_HI,
     CS_TILER_HEAP_END,
     CS_TILER_HEAP_START,
+    CS_USER_INPUT,
+    CS_USER_OUTPUT,
     STREAM_FEATURES,
     STREAM_INPUT_VA,
     STREAM_OUTPUT_VA, //
@@ -126,6 +132,30 @@ pub(crate) struct HeapOutputState {
     pub(crate) vt_start: u32,
     pub(crate) vt_end: u32,
     pub(crate) frag_end: u32,
+}
+
+/// Inputs for `CsInterface::program_activate_inputs`.
+///
+/// Bundles the static CS_INPUT state programmed once per CS-slot
+/// activation: ringbuffer base / size, kernel-visible input / output
+/// page VAs, the user-mode input / output VAs, the `CS_CONFIG`
+/// priority and per-CS doorbell id, and the matching
+/// `CS_ACK_IRQ_MASK`.
+pub(crate) struct CsActivateInputs {
+    /// GPU VA of the start of the queue's ringbuffer.
+    pub(crate) ringbuf_base: u64,
+    /// Ringbuffer size in bytes.
+    pub(crate) ringbuf_size: u32,
+    /// GPU VA of the kernel-visible queue input page (carries
+    /// `INSERT` and `EXTRACT_INIT`).
+    pub(crate) ringbuf_input_va: u64,
+    /// GPU VA of the kernel-visible queue output page (carries
+    /// `EXTRACT` and `ACTIVE`).
+    pub(crate) ringbuf_output_va: u64,
+    /// Per-queue priority (0..=15).
+    pub(crate) priority: u8,
+    /// Doorbell id assigned to this CS by the slot manager.
+    pub(crate) doorbell_id: u32,
 }
 
 /// Snapshot of the per-CS sync-wait state captured from
@@ -261,6 +291,61 @@ impl CsInterface {
         enabled
             .cs_input
             .write(CS_REQ, cur.with_state(CsState::Stop));
+        Ok(())
+    }
+
+    /// Programs the static CS_INPUT state for one CS slot.
+    ///
+    /// `CS_REQ.state` is set to `Start` with the `idle_sync_wait` and
+    /// `idle_empty` IDLE-event sources enabled, so the firmware raises
+    /// the CSG_IRQ idle event on a sync-wait stall or a drained
+    /// ringbuf. The IRQ-driven scheduler relies on both.
+    ///
+    /// Returns `EINVAL` if the interface is not enabled, or
+    /// `EOVERFLOW` if `priority` exceeds `CS_CONFIG.priority`'s
+    /// 4-bit range or `doorbell_id` exceeds the 8-bit field.
+    pub(crate) fn program_activate_inputs(&self, inputs: &CsActivateInputs) -> Result {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        enabled
+            .cs_input
+            .write(CS_BASE, CS_BASE::zeroed().with_pointer(inputs.ringbuf_base));
+        enabled
+            .cs_input
+            .write(CS_SIZE, CS_SIZE::zeroed().with_size(inputs.ringbuf_size));
+        enabled.cs_input.write(
+            CS_USER_INPUT,
+            CS_USER_INPUT::zeroed().with_pointer(inputs.ringbuf_input_va),
+        );
+        enabled.cs_input.write(
+            CS_USER_OUTPUT,
+            CS_USER_OUTPUT::zeroed().with_pointer(inputs.ringbuf_output_va),
+        );
+        let config = CS_CONFIG::zeroed()
+            .try_with_priority(u32::from(inputs.priority))?
+            .try_with_user_doorbell(inputs.doorbell_id)?;
+        enabled.cs_input.write(CS_CONFIG, config);
+        // Set CS_ACK_IRQ_MASK to ~0 so the firmware delivers every
+        // CS_ACK bit transition.
+        enabled
+            .cs_input
+            .write(CS_ACK_IRQ_MASK, CS_ACK_IRQ_MASK::from_raw(!0u32));
+
+        const ACTIVATE_MASK: u32 =
+            CS_REQ::STATE_MASK | CS_REQ::IDLE_SYNC_WAIT_MASK | CS_REQ::IDLE_EMPTY_MASK;
+        let activate_val = CS_REQ::zeroed()
+            .with_state(CsState::Start)
+            .with_idle_sync_wait(true)
+            .with_idle_empty(true)
+            .into_raw();
+        let cur = enabled.cs_input.read(CS_REQ).into_raw();
+        enabled.cs_input.write(
+            CS_REQ,
+            CS_REQ::from_raw((cur & !ACTIVATE_MASK) | activate_val),
+        );
         Ok(())
     }
 
