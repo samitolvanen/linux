@@ -510,10 +510,15 @@ impl QueueOps for TyrQueueOps {
                 return Err(err);
             }
         } else {
-            // Group is unbound, so ask the scheduler to bind it. The
-            // per-CS doorbell ring that the bind stages picks up the
-            // instructions we just committed, and the framework's
-            // existing completion-stage polling drives forward progress.
+            // Group is unbound. Mark it runnable so the rule engine sees
+            // it on the tick scheduled below.
+            if let Err(err) = group.tdev.with_locked_scheduler(|sched| {
+                sched.mark_group_runnable(group);
+                Ok(())
+            }) {
+                self.data.signal_submit_fence(completion_point, Err(err));
+                return Err(err);
+            }
             TyrDrmDeviceData::schedule_tick(&group.tdev);
         }
 
