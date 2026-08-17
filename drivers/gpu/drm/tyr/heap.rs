@@ -16,6 +16,7 @@ use kernel::{
         SysMemBackend, //
     },
     kvec,
+    page::PAGE_SIZE,
     prelude::*,
     sync::{
         atomic::{
@@ -268,7 +269,9 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        if args.chunk_size != args.chunk_size.next_multiple_of(4096) {
+        let size = args.chunk_size as usize;
+        let aligned = size.checked_next_multiple_of(PAGE_SIZE).ok_or(EINVAL)?;
+        if size != aligned {
             return Err(EINVAL);
         }
 
