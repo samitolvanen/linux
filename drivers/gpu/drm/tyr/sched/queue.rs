@@ -3,7 +3,6 @@
 use core::ops::Range;
 
 use kernel::{
-    drm::gem::BaseObject,
     io::{
         Io,
         IoBase, //
@@ -69,22 +68,31 @@ impl Queue {
     #[expect(dead_code)]
     pub(crate) fn append_instrs(&mut self, instrs: &[u8]) -> Result {
         let mut ringbuf_input = self.interfaces.read_input()?;
-        let ringbuf_sz = self.ringbuf.size() as u64;
-
-        let cs_insert = (ringbuf_input.insert & (ringbuf_sz - 1)) as usize;
 
         let ringbuf = self.ringbuf.vmap();
-        let size = ringbuf.owner().size();
-        // SAFETY: `ringbuf` owns a writable CPU mapping for the queue ring buffer
-        // and `size` matches the mapped object size.
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(ringbuf.as_view().as_ptr().cast::<u8>(), size)
-        };
+        let size = ringbuf.size();
+
+        if instrs.len() > size {
+            return Err(ENOSPC);
+        }
+
+        let cs_insert = (ringbuf_input.insert & (size as u64 - 1)) as usize;
 
         let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
-        bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
-        if first_chunk < instrs.len() {
-            bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
+        let dst = ringbuf.as_view().as_ptr().cast::<u8>();
+        // SAFETY: `dst` is the writable CPU mapping of the ring buffer, valid
+        // for `size` bytes, and `instrs` is a separate allocation. The mask
+        // puts `cs_insert` below `size`, and `first_chunk` is at most
+        // `size - cs_insert`, so the first copy stays inside the mapping. An
+        // append larger than the ring is rejected, so the wrapped remainder
+        // `instrs.len() - first_chunk` is at most `size`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(instrs.as_ptr(), dst.add(cs_insert), first_chunk);
+            core::ptr::copy_nonoverlapping(
+                instrs.as_ptr().add(first_chunk),
+                dst,
+                instrs.len() - first_chunk,
+            );
         }
 
         smp_mb(Write);
