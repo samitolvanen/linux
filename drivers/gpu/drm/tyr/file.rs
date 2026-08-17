@@ -18,7 +18,10 @@ use kernel::{
         AsBytes,
         FromBytes, //
     },
-    uaccess::UserSlice,
+    uaccess::{
+        UserSlice,
+        UserSliceReader, //
+    },
     uapi, //
 };
 
@@ -46,6 +49,9 @@ use crate::{
     },
 };
 
+/// GPU MMU page size is fixed at 4 KiB regardless of host page size.
+const GPU_PAGE_MASK: u64 = (1 << 12) - 1;
+
 fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
     let bytes = obj.as_bytes();
     let kern_size = bytes.len();
@@ -68,6 +74,61 @@ fn set_uobj<T: AsBytes>(usr_ptr: u64, usr_size: u32, obj: &T) -> Result {
     }
 
     Ok(())
+}
+
+/// Verifies that the next `len` bytes of `reader` are all zero, advancing the
+/// reader past them. Mirrors `copy_struct_from_user`. A larger user stride is
+/// accepted only if its trailing bytes are zero, otherwise the call is
+/// rejected with `E2BIG`.
+fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
+    let mut buf = [0u8; 64];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len());
+        reader.read_slice(&mut buf[..chunk])?;
+        if buf[..chunk].iter().any(|&b| b != 0) {
+            return Err(E2BIG);
+        }
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+/// Validate a single `drm_panthor_vm_bind_op` at the ioctl entry, before any
+/// state is mutated or any job is queued. Rejects `EINVAL` if `va`, `size`,
+/// or `bo_offset` is not GPU-page-aligned, if `[va, va + size)` falls outside
+/// the VM's user VA range, and for `MAP` ops if `bo_handle` is invalid or
+/// `bo_offset + size` is out of bounds for the target BO.
+///
+/// For `MAP` ops, returns the looked-up `Bo` so the caller can perform the
+/// bind against the same BO that was validated, avoiding a TOCTOU window.
+fn validate_bind_op(
+    op: &VmBindOp,
+    file: &TyrDrmFile,
+    vm: &vm::Vm,
+) -> Result<Option<ARef<gem::Bo>>> {
+    if (op.0.va | op.0.size | op.0.bo_offset) & GPU_PAGE_MASK != 0 {
+        return Err(EINVAL);
+    }
+
+    if !vm.in_user_va_range(op.0.va, op.0.size) {
+        return Err(EINVAL);
+    }
+
+    let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+    if op.0.flags as i32 & type_mask
+        == uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP
+    {
+        let bo = gem::lookup_handle(file, op.0.bo_handle).map_err(|_| EINVAL)?;
+        let bo_size = bo.size() as u64;
+        // Check size first to avoid underflow in the subtraction.
+        if op.0.size > bo_size || op.0.bo_offset > bo_size - op.0.size {
+            return Err(EINVAL);
+        }
+        return Ok(Some(bo));
+    }
+
+    Ok(None)
 }
 
 #[pin_data(PinnedDrop)]
@@ -246,12 +307,13 @@ impl TyrDrmFileData {
             return Self::vm_bind_async(ddev, reg_data, vmbind, file);
         }
 
-        if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
-            return Err(ENOTSUPP);
+        let op_size = core::mem::size_of::<uapi::drm_panthor_vm_bind_op>();
+        let stride = vmbind.ops.stride as usize;
+        if stride < op_size {
+            return Err(EINVAL);
         }
 
         let count = vmbind.ops.count as usize;
-        let stride = vmbind.ops.stride as usize;
         let vm = file
             .inner()
             .vm_pool()
@@ -260,13 +322,14 @@ impl TyrDrmFileData {
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(vmbind.ops.array as usize),
-            stride * count,
+            stride.checked_mul(count).ok_or(EINVAL)?,
         )
         .reader();
 
         for i in 0..count {
             let res = {
                 let op: VmBindOp = reader.read()?;
+                read_padding_zero(&mut reader, stride - op_size)?;
                 let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -278,13 +341,11 @@ impl TyrDrmFileData {
                     Err(EINVAL)?;
                 }
 
-                if !vm.in_user_va_range(op.0.va, op.0.size) {
-                    Err(EINVAL)?;
-                }
+                let validated_bo = validate_bind_op(&op, file, &vm)?;
 
                 match op.0.flags as i32 & type_mask {
                     uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP => {
-                        let bo = gem::lookup_handle(file, op.0.bo_handle)?;
+                        let bo = validated_bo.ok_or(EINVAL)?;
 
                         if op.0.flags & !((type_mask as u32) | map_flags) != 0 {
                             Err(EINVAL)?;
@@ -333,12 +394,13 @@ impl TyrDrmFileData {
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        if vmbind.ops.stride as usize != core::mem::size_of::<uapi::drm_panthor_vm_bind_op>() {
-            return Err(ENOTSUPP);
+        let op_size = core::mem::size_of::<uapi::drm_panthor_vm_bind_op>();
+        let stride = vmbind.ops.stride as usize;
+        if stride < op_size {
+            return Err(EINVAL);
         }
 
         let count = vmbind.ops.count as usize;
-        let stride = vmbind.ops.stride as usize;
         let vm = file
             .inner()
             .vm_pool()
@@ -351,19 +413,16 @@ impl TyrDrmFileData {
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(vmbind.ops.array as usize),
-            stride * count,
+            stride.checked_mul(count).ok_or(EINVAL)?,
         )
         .reader();
 
         for i in 0..count {
             let res = {
                 let op: VmBindOp = reader.read()?;
-
-                if !vm.in_user_va_range(op.0.va, op.0.size) {
-                    Err(EINVAL)?;
-                }
-
-                let (job, syncs) = op.capture(reg_data.pdev.as_ref(), file, &vm, true)?;
+                read_padding_zero(&mut reader, stride - op_size)?;
+                let validated_bo = validate_bind_op(&op, file, &vm)?;
+                let (job, syncs) = op.capture(reg_data.pdev.as_ref(), &vm, true, validated_bo)?;
                 let deps = deps::wait_fences(file, &syncs)?;
                 let signals = deps::signal_syncs(file, &syncs)?;
                 let prepared = vm.prepare_bind_job(job, &deps)?;
@@ -412,6 +471,10 @@ impl TyrDrmFileData {
         bocreate: &mut uapi::drm_panthor_bo_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
+        if bocreate.pad != 0 {
+            return Err(EINVAL);
+        }
+
         if bocreate.flags & !uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
             dev_err!(
                 ddev.as_ref(),
@@ -443,7 +506,15 @@ impl TyrDrmFileData {
         bommap: &mut uapi::drm_panthor_bo_mmap_offset,
         file: &TyrDrmFile,
     ) -> Result<u32> {
+        if bommap.pad != 0 {
+            return Err(EINVAL);
+        }
+
         let bo = gem::lookup_handle(file, bommap.handle)?;
+
+        if bo.create_flags() & uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
+            return Err(EPERM);
+        }
 
         bommap.offset = bo.create_mmap_offset()?;
 
@@ -586,9 +657,9 @@ impl VmBindOp {
     fn capture(
         &self,
         dev: &Device<Bound>,
-        file: &TyrDrmFile,
         vm: &vm::Vm,
         is_async: bool,
+        validated_bo: Option<ARef<gem::Bo>>,
     ) -> Result<(vm::VmBindJob, KVec<deps::SyncOp>)> {
         let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
         let map_flags = (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
@@ -612,7 +683,7 @@ impl VmBindOp {
 
         match self.0.flags as i32 & type_mask {
             uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP => {
-                let bo = gem::lookup_handle(file, self.0.bo_handle)?;
+                let bo = validated_bo.ok_or(EINVAL)?;
 
                 if self.0.flags & !((type_mask as u32) | map_flags) != 0 {
                     return Err(EINVAL);
