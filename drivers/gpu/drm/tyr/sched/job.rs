@@ -423,23 +423,27 @@ impl Job {
             KVec::new()
         };
 
+        // Claim one per-queue seqno per emitted wrapper, in a single
+        // atomic step, only after every fallible prepare step that can
+        // still run before `prepare_job` has succeeded. An earlier
+        // `claim_seqnos` followed by a failure would advance
+        // `next_seqno` without ever queueing the matching wrappers,
+        // leaving a gap that `cancel_queues` would then mark dead with
+        // the wrong upper bound. Stream-less jobs never reach the GPU
+        // and so do not consume a seqno.
+        let done_seqno = if has_stream {
+            Some(queue.claim_seqnos(self.pieces.len()))
+        } else {
+            None
+        };
+
         // The extra slot holds the prior-work dependency that commit adds.
         let extra_dep_capacity = usize::from(!has_stream);
         let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, group.clone()),
+            QueueJob::new(wrapped, done_seqno, group.clone(), self.queue_index),
             &deps,
             extra_dep_capacity,
         )?;
-
-        // Claim one per-queue seqno per emitted wrapper, in a single
-        // atomic step, only after every fallible prepare step has
-        // succeeded. An earlier `claim_seqnos` followed by a failure
-        // in `prepare_job` would advance `next_seqno` without ever
-        // queueing the matching wrappers, leaving a gap that
-        // `cancel_queues` would then mark dead with the wrong upper
-        // bound. Stream-less jobs never reach the GPU and so do not
-        // consume a seqno.
-        queue.claim_seqnos(self.pieces.len());
 
         Ok(PreparedQueueSubmit {
             queue_index: self.queue_index,

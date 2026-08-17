@@ -364,7 +364,16 @@ impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
 impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
+    /// After draining completions, re-evaluate the wait list in three
+    /// phases: snapshot under the scheduler mutex, evaluate without it (so
+    /// gpuvm_unique and dma_resv_lock stay outside the mutex), then apply,
+    /// re-validating against the live wait list before promoting groups.
     fn run(this: Self::Pointer) {
+        // The drain runs before the guard so an unplug racing this worker
+        // cannot strand pending submit fences. It touches no
+        // registration-owned state.
+        Scheduler::drain_resident_queue_completions(&this);
+
         let Some(guard) = this.registration_guard() else {
             return;
         };

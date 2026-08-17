@@ -689,7 +689,6 @@ impl Group {
         Ok(syncobjs_va.start + offset as u64)
     }
 
-    #[expect(dead_code)]
     pub(super) fn read_syncobj(&self, queue_index: usize) -> Result<u64> {
         syncs::SyncObj64b::read_seqno(&self.syncobjs, self.syncobj_offset(queue_index)?)
     }
