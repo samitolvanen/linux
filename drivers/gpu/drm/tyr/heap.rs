@@ -10,6 +10,7 @@ use kernel::{
     },
     drm::gem::BaseObject,
     io::{
+        Io,
         IoBackend,
         IoBase,
         SysMemBackend, //
@@ -47,52 +48,20 @@ use crate::{
 const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
 
+/// Header the firmware keeps at the start of every tiler heap chunk.
+///
+/// The driver only ever sets `next`, the link to the following chunk.
+#[repr(C)]
 struct ChunkHeader {
     next: u64,
     _unknown: [u32; 14],
 }
 
 impl ChunkHeader {
-    fn read(mem: &gem::MappedBo, offset: usize) -> Result<Self> {
-        if offset > mem.size() {
-            return Err(EINVAL);
-        }
+    const NEXT: usize = core::mem::offset_of!(Self, next);
 
-        let vmap = mem.vmap();
-        // SAFETY: `offset <= mem.size()` was checked above and the view points
-        // to the mapped BO backing storage for this header.
-        let ptr = unsafe {
-            vmap.as_view()
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset)
-                .cast::<Self>()
-        };
-
-        // SAFETY: `ptr` points to a properly aligned header inside the mapped BO.
-        Ok(unsafe { core::ptr::read_volatile(ptr) })
-    }
-
-    fn write(mem: &gem::MappedBo, offset: usize, value: Self) -> Result {
-        if offset > mem.size() {
-            return Err(EINVAL);
-        }
-
-        let vmap = mem.vmap();
-        // SAFETY: `offset <= mem.size()` was checked above and the view points
-        // to the mapped BO backing storage for this header.
-        let ptr = unsafe {
-            vmap.as_view()
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset)
-                .cast::<Self>()
-        };
-
-        // SAFETY: `ptr` points to a properly aligned header inside the mapped BO.
-        unsafe { core::ptr::write_volatile(ptr, value) };
-
-        Ok(())
+    fn write_next(mem: &gem::MappedBo, next: u64) -> Result {
+        mem.vmap().try_write64(next, Self::NEXT)
     }
 }
 
@@ -136,10 +105,9 @@ impl Context {
         };
 
         if let Some(last) = self.chunks.last() {
-            let mut last_hdr = ChunkHeader::read(last, 0)?;
-            last_hdr.next = (chunk_bo.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
+            let next = (chunk_bo.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
                 | (chunk_bo.size() as u64 >> 12);
-            ChunkHeader::write(last, 0, last_hdr)?;
+            ChunkHeader::write_next(last, next)?;
         }
 
         self.chunks.push(chunk_bo, GFP_KERNEL)?;
