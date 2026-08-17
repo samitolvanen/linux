@@ -3,7 +3,7 @@
 use core::ops::Range;
 
 use kernel::{
-    io::IoBase,
+    io::Io,
     prelude::*,
     sizes::SZ_4K,
     sync::Arc, //
@@ -59,18 +59,27 @@ impl Queue {
     }
 }
 
-#[allow(dead_code)]
+/// Firmware layout of the queue input block.
 #[repr(C)]
 pub(super) struct RingBufferInput {
     insert: u64,
     extract_init: u64,
 }
 
-#[allow(dead_code)]
+impl RingBufferInput {
+    const INSERT: usize = core::mem::offset_of!(Self, insert);
+    const EXTRACT_INIT: usize = core::mem::offset_of!(Self, extract_init);
+}
+
+/// Firmware layout of the queue output block. It stops at `extract`,
+/// since the driver never reads the word that follows.
 #[repr(C)]
 pub(super) struct RingBufferOutput {
     extract: u64,
-    active: u32,
+}
+
+impl RingBufferOutput {
+    const EXTRACT: usize = core::mem::offset_of!(Self, extract);
 }
 
 /// The firmware-owned input and output blocks of a single queue.
@@ -102,52 +111,31 @@ impl Interfaces {
     #[expect(dead_code)]
     pub(super) fn read_input(&mut self) -> Result<RingBufferInput> {
         let vmap = self.mem.vmap();
-        // SAFETY: `input_offset` selects the queue input structure inside the
-        // writable CPU mapping owned by `mem`.
-        let input = unsafe {
-            vmap.as_view()
-                .as_ptr()
-                .cast::<u8>()
-                .add(self.input_offset)
-                .cast::<RingBufferInput>()
-                .read_volatile()
-        };
 
-        Ok(input)
+        Ok(RingBufferInput {
+            insert: vmap.try_read64(self.input_offset + RingBufferInput::INSERT)?,
+            extract_init: vmap.try_read64(self.input_offset + RingBufferInput::EXTRACT_INIT)?,
+        })
     }
 
     #[expect(dead_code)]
     pub(super) fn write_input(&mut self, value: RingBufferInput) -> Result {
         let vmap = self.mem.vmap();
 
-        // SAFETY: `input_offset` selects the queue input structure inside the
-        // writable CPU mapping owned by `mem`.
-        unsafe {
-            vmap.as_view()
-                .as_ptr()
-                .cast::<u8>()
-                .add(self.input_offset)
-                .cast::<RingBufferInput>()
-                .write_volatile(value)
-        };
-
-        Ok(())
+        vmap.try_write64(
+            value.extract_init,
+            self.input_offset + RingBufferInput::EXTRACT_INIT,
+        )?;
+        vmap.try_write64(value.insert, self.input_offset + RingBufferInput::INSERT)
     }
 
     #[expect(dead_code)]
     pub(super) fn read_output(&mut self) -> Result<RingBufferOutput> {
-        let vmap = self.mem.vmap();
-        // SAFETY: `output_offset` selects the queue output structure inside the
-        // writable CPU mapping owned by `mem`.
-        let output = unsafe {
-            vmap.as_view()
-                .as_ptr()
-                .cast::<u8>()
-                .add(self.output_offset)
-                .cast::<RingBufferOutput>()
-                .read_volatile()
-        };
-
-        Ok(output)
+        Ok(RingBufferOutput {
+            extract: self
+                .mem
+                .vmap()
+                .try_read64(self.output_offset + RingBufferOutput::EXTRACT)?,
+        })
     }
 }
