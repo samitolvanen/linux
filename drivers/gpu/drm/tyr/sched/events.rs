@@ -25,6 +25,7 @@ use crate::{
         TyrDrmDeviceData, //
     },
     fw::{
+        CsDbMask,
         CsgSlotMask,
         Firmware,
         CSG_REQ, //
@@ -282,13 +283,7 @@ impl Scheduler {
 
         if ring_cs_db_mask != 0 {
             fw.with_csg_mut(csg_id, |csg| {
-                let db_req = csg.read_input_db_req()?;
-                let db_ack = csg.read_output_db_ack()?;
-                csg.write_input_db_req(db_req.with_mask(
-                    (db_req.mask() & !ring_cs_db_mask)
-                        | ((db_ack.mask() ^ ring_cs_db_mask) & ring_cs_db_mask),
-                ));
-                Ok(())
+                csg.toggle_input_db_req(CsDbMask::from_raw(ring_cs_db_mask))
             })?;
         }
 
@@ -408,13 +403,7 @@ impl Scheduler {
                     cs.write_input_req(req);
                 }
 
-                let bit = 1u32 << oom.cs_id;
-                let db_req = csg.read_input_db_req()?;
-                let db_ack = csg.read_output_db_ack()?;
-                csg.write_input_db_req(
-                    db_req.with_mask((db_req.mask() & !bit) | ((db_ack.mask() ^ bit) & bit)),
-                );
-                Ok(())
+                csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
             })?;
 
             let mut mask = CsgSlotMask::empty();
