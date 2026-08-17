@@ -142,6 +142,12 @@ pub(crate) struct TyrDrmDeviceData {
     /// cacheability policy in `crate::gem::should_map_wc`.
     pub(crate) coherent: bool,
 
+    /// Dedicated unbound workqueue for the per-group `term_work`, whose
+    /// worker waits on in-flight hardware fences. Flushed at unbind.
+    /// It sits on the device because a file release can terminate
+    /// groups after unbind, with no registration data left to hold it.
+    pub(crate) term_wq: DmaFenceWorkqueue,
+
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
@@ -393,7 +399,7 @@ pub(crate) struct TyrPlatformDriver;
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData<'bound> {
-    _reg: drm::Registration<'bound, TyrDrmDriver>,
+    reg: drm::Registration<'bound, TyrDrmDriver>,
 }
 
 /// Data owned by the DRM [`Registration`].
@@ -513,6 +519,8 @@ impl platform::Driver for TyrPlatformDriver {
 
         let coherent = pdev.as_ref().dma_coherent();
 
+        let term_wq = DmaFenceWorkqueue::new_unbound(c"tyr-group-term")?;
+
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(CsgSlotOps, MAX_CSGS)?;
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
@@ -520,6 +528,7 @@ impl platform::Driver for TyrPlatformDriver {
             try_pin_init!(TyrDrmDeviceData {
                 mmio_phys_addr,
                 coherent,
+                term_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
                 csg_slot_manager <- new_mutex!(csg_slot_manager),
                 fw_events: Atomic::new(0),
@@ -613,7 +622,7 @@ impl platform::Driver for TyrPlatformDriver {
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), unreg_dev, reg_data, 0)? };
 
-        let driver = TyrPlatformDriverData { _reg: reg };
+        let driver = TyrPlatformDriverData { reg };
 
         dev_dbg!(pdev, "Tyr initialized correctly.");
         Ok(driver)
@@ -622,7 +631,11 @@ impl platform::Driver for TyrPlatformDriver {
 
 #[pinned_drop]
 impl PinnedDrop for TyrPlatformDriverData<'_> {
-    fn drop(self: Pin<&mut Self>) {}
+    fn drop(self: Pin<&mut Self>) {
+        // Let the queued terminations hand their groups to the cleanup
+        // workqueue before the module can exit.
+        self.reg.device().term_wq.flush();
+    }
 }
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with

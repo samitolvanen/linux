@@ -216,8 +216,8 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
         // `doorbell_id`, then release the AS slot. This makes no
         // assumption about firmware state. Only
         // `Tick::halt_and_unbind_evicted_groups` stages a halt and waits
-        // for the ack before evicting. The bind rollback and
-        // `Scheduler::remove_group` evict without staging one.
+        // for the ack before evicting. The bind rollback evicts without
+        // staging one.
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);
@@ -379,36 +379,6 @@ impl Scheduler {
         });
 
         self.idle_groups[priority].push_back(list_arc);
-        Ok(())
-    }
-
-    pub(crate) fn remove_group(&mut self, tdev: &TyrDrmDevice, group: Arc<Group>) -> Result {
-        let mut slot_manager = tdev.csg_slot_manager.lock();
-
-        if group.csg_seat.access(&slot_manager).slot().is_some() {
-            for queue in group.queues.iter() {
-                queue.set_doorbell_id(None);
-            }
-
-            slot_manager.evict(&group.csg_seat)?;
-            return Ok(());
-        }
-
-        // Drop the slot-manager lock before we touch the scheduler's
-        // own idle queues. We don't take any other lock from the slot
-        // manager callbacks, but releasing it here keeps the lock
-        // ordering (sched > csg_slot_manager) one-directional.
-        drop(slot_manager);
-
-        let priority = group.priority as usize;
-        let list_state = group.with_locked_inner(|inner| {
-            let state = inner.list_state;
-            inner.list_state = GroupListState::None;
-            state
-        });
-
-        let _ = self.remove_group_from_list(&group, priority, list_state);
-
         Ok(())
     }
 

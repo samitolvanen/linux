@@ -7,7 +7,6 @@ use core::ops::{
 
 use kernel::{
     alloc::KVec,
-    bindings,
     dma_buf::dma_fence::{
         DmaFenceSignallingAnnotation,
         DmaFenceWorkqueue,
@@ -201,6 +200,11 @@ impl QueueData {
 
     pub(super) fn claim_seqno(&self) -> u64 {
         self.next_seqno.fetch_add(1, Relaxed) + 1
+    }
+
+    /// Returns the highest seqno claimed so far on this queue.
+    pub(crate) fn next_seqno(&self) -> u64 {
+        self.next_seqno.load(Relaxed)
     }
 
     pub(super) fn append_instrs(&self, instrs: &[u8]) -> Result<u64> {
@@ -564,10 +568,8 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
 
     fn teardown(&self, job: &QueueJob, _counter: u64) {
         if let Some(completion_point) = job.completion_point() {
-            self.data.signal_submit_fence(
-                completion_point,
-                Err(Error::from_errno(-(bindings::ECANCELED as i32))),
-            );
+            self.data
+                .signal_submit_fence(completion_point, Err(ECANCELED));
         }
     }
 }
@@ -738,6 +740,16 @@ impl Queue {
         let submit_fence = self.job_queue.commit(prepared);
         *self.data.last_submit_fence.lock() = Some(submit_fence.clone());
         submit_fence
+    }
+
+    /// Cancels every job tracked by this queue and signals all
+    /// remaining pending submit fences with `err`.
+    ///
+    /// `cancel_all` may sleep waiting for in-flight hardware fences, so
+    /// this must be called from process context.
+    pub(crate) fn cancel(&self, err: Error) {
+        self.job_queue.cancel_all();
+        self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
     }
 }
 
