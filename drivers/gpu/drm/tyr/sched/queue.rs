@@ -45,10 +45,8 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::{
-            Acquire,
             Atomic,
-            Relaxed,
-            Release, //
+            Relaxed, //
         },
         barrier::{
             mb,
@@ -212,11 +210,11 @@ impl QueueData {
         self.next_seqno.load(Relaxed)
     }
 
-    /// Copies `instrs` into the ringbuffer at the current `INSERT`. The
-    /// returned completion point is the `INSERT` value
+    /// Copies `instrs` into the ringbuffer at the current `INSERT` and returns
+    /// the ring offsets they occupy. The range end is the `INSERT` value
     /// `Self::commit_ringbuf_range` will publish once the caller has
     /// registered the matching pending submit fence.
-    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64> {
+    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<Range<u64>> {
         let ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let completion_point = ringbuf_input
             .insert
@@ -246,12 +244,12 @@ impl QueueData {
             );
         }
 
-        Ok(completion_point)
+        Ok(ringbuf_start..completion_point)
     }
 
     /// Publishes a previously claimed ringbuffer range to the firmware.
     ///
-    /// `completion_point` must equal the value returned from the matching
+    /// `completion_point` must equal the range end returned by the matching
     /// `claim_ringbuf_range`. The leading `mb(Write)` orders the ringbuffer
     /// writes before the `INSERT` write. The trailing `mb(Write)` orders `INSERT`
     /// before the doorbell ring.
@@ -288,11 +286,13 @@ impl QueueData {
 
     fn add_pending_submit_fence(
         &self,
-        completion_point: u64,
+        done_seqno: u64,
+        ringbuf_range: Range<u64>,
         fence: DriverDmaFence<QueueFenceData, Published>,
     ) -> core::result::Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
         let pending_fence = PendingSubmitFence {
-            completion_point,
+            done_seqno,
+            ringbuf_range,
             fence,
         };
 
@@ -306,13 +306,13 @@ impl QueueData {
         }
     }
 
-    fn signal_submit_fences_up_to(&self, completion_point: u64, result: Result) {
+    fn signal_submit_fences_up_to(&self, up_to_seqno: u64, result: Result) {
         loop {
             let pending_fence = {
                 let mut pending = self.pending_submit_fences.lock();
 
                 match pending.first() {
-                    Some(pending_fence) if pending_fence.completion_point <= completion_point => {
+                    Some(pending_fence) if pending_fence.done_seqno <= up_to_seqno => {
                         pending.remove(0).ok()
                     }
                     _ => None,
@@ -328,13 +328,58 @@ impl QueueData {
         }
     }
 
-    fn signal_submit_fence(&self, completion_point: u64, result: Result) -> bool {
+    /// Drains every leading entry of `pending_submit_fences` whose
+    /// `done_seqno` is `<= up_to_seqno` into a local vec, then
+    /// signals each drained fence with `Ok(())` with no driver lock
+    /// held.
+    fn complete_pending_fences_up_to(&self, up_to_seqno: u64) {
+        let drained = {
+            let mut pending = self.pending_submit_fences.lock();
+
+            let mut k = 0usize;
+            for entry in pending.iter() {
+                if entry.done_seqno > up_to_seqno {
+                    break;
+                }
+                k += 1;
+            }
+
+            let mut drained = match KVec::with_capacity(k, GFP_KERNEL) {
+                Ok(v) => v,
+                Err(_) => {
+                    pr_err!("Tyr queue: drain allocation failed; deferring drain\n");
+                    return;
+                }
+            };
+
+            // Reverse once so the leading prefix is at the tail. Pop
+            // returns the original head-first sequence in O(1) each.
+            // Reverse the surviving suffix back after the pop loop.
+            pending.reverse();
+            for _ in 0..k {
+                let Some(entry) = pending.pop() else {
+                    break;
+                };
+                let _ = drained.push_within_capacity(entry);
+            }
+            pending.reverse();
+
+            drained
+        };
+
+        for pending_fence in drained.into_iter() {
+            let _annotation = DmaFenceSignallingAnnotation::new();
+            pending_fence.fence.signal(Ok(()));
+        }
+    }
+
+    fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
         let pending_fence = {
             let mut pending = self.pending_submit_fences.lock();
             let mut position = None;
 
             for (index, pending_fence) in pending.iter().enumerate() {
-                if pending_fence.completion_point == completion_point {
+                if pending_fence.done_seqno == done_seqno {
                     position = Some(index);
                     break;
                 }
@@ -352,10 +397,20 @@ impl QueueData {
         true
     }
 
-    fn complete_submit_fences(&self) -> Result {
-        let ringbuf_output = self.interfaces.read_output()?;
-        self.signal_submit_fences_up_to(ringbuf_output.extract, Ok(()));
-        Ok(())
+    /// Signals every leading pending submit fence whose stored
+    /// `done_seqno` is at or below `syncobj_seqno`, which the caller
+    /// reads with `Group::read_syncobj`.
+    ///
+    /// The syncobj is the completion gate rather than the firmware's
+    /// `EXTRACT` pointer. Each wrapper bumps it only after
+    /// `WAIT(all scoreboards)`, so every async sub-job the piece
+    /// dispatched has landed. `EXTRACT` would race them.
+    ///
+    /// Used by both `QueueCompletionStage::process` (its progress-poll
+    /// path) and the IRQ-driven completion path on the scheduler
+    /// side.
+    pub(in crate::sched) fn complete_submit_fences(&self, syncobj_seqno: u64) {
+        self.complete_pending_fences_up_to(syncobj_seqno);
     }
 
     /// Returns the firmware's current `EXTRACT` offset.
@@ -370,7 +425,7 @@ impl QueueData {
         let mut pending = self.pending_submit_fences.lock();
         if let Some(entry) = pending
             .iter_mut()
-            .find(|entry| entry.completion_point > extract)
+            .find(|entry| entry.ringbuf_range.contains(&extract))
         {
             entry.fence.set_error(err);
         }
@@ -530,23 +585,29 @@ impl QueueOps for TyrQueueOps {
             return Err(err);
         }
 
-        let completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
-            Ok(completion_point) => completion_point,
+        let ringbuf_range = match self.data.claim_ringbuf_range(&job.job.stream) {
+            Ok(range) => range,
             Err(err) => {
                 fence.signal(Err(err));
                 return Err(err);
             }
         };
 
-        job.job.set_completion_point(completion_point);
+        let Some(done_seqno) = job.job.done_seqno() else {
+            fence.signal(Err(EINVAL));
+            return Err(EINVAL);
+        };
 
-        if let Err((err, fence)) = self.data.add_pending_submit_fence(completion_point, fence) {
+        if let Err((err, fence)) =
+            self.data
+                .add_pending_submit_fence(done_seqno, ringbuf_range.clone(), fence)
+        {
             fence.signal(Err(err));
             return Err(err);
         }
 
-        if let Err(err) = self.data.commit_ringbuf_range(completion_point) {
-            self.data.signal_submit_fence(completion_point, Err(err));
+        if let Err(err) = self.data.commit_ringbuf_range(ringbuf_range.end) {
+            self.data.signal_submit_fence(done_seqno, Err(err));
             return Err(err);
         }
 
@@ -574,7 +635,7 @@ impl QueueOps for TyrQueueOps {
 
         if bound {
             if let Err(err) = kick_err {
-                self.data.signal_submit_fence(completion_point, Err(err));
+                self.data.signal_submit_fence(done_seqno, Err(err));
                 return Err(err);
             }
         } else {
@@ -584,7 +645,7 @@ impl QueueOps for TyrQueueOps {
                 sched.mark_group_runnable(group);
                 Ok(())
             }) {
-                self.data.signal_submit_fence(completion_point, Err(err));
+                self.data.signal_submit_fence(done_seqno, Err(err));
                 return Err(err);
             }
             TyrDrmDeviceData::schedule_tick(&group.tdev);
@@ -606,11 +667,14 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::Advance;
         }
 
-        if let Err(err) = self.data.complete_submit_fences() {
-            if let Some(completion_point) = ctx.job.completion_point() {
-                self.data.signal_submit_fence(completion_point, Err(err));
+        match ctx.job.group.read_syncobj(ctx.job.queue_index) {
+            Ok(syncobj_seqno) => self.data.complete_submit_fences(syncobj_seqno),
+            Err(err) => {
+                if let Some(done_seqno) = ctx.job.done_seqno() {
+                    self.data.signal_submit_fence(done_seqno, Err(err));
+                }
+                return StageAdvance::TimedOut(err);
             }
-            return StageAdvance::TimedOut(err);
         }
 
         if ctx.submit_fence.is_signaled() {
@@ -620,9 +684,8 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
         let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
         if elapsed >= self.timeout {
             pr_err!("Tyr queue job {} timed out\n", ctx.counter);
-            if let Some(completion_point) = ctx.job.completion_point() {
-                self.data
-                    .signal_submit_fence(completion_point, Err(ETIMEDOUT));
+            if let Some(done_seqno) = ctx.job.done_seqno() {
+                self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));
             }
             return StageAdvance::TimedOut(ETIMEDOUT);
         }
@@ -631,9 +694,8 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
     }
 
     fn teardown(&self, job: &QueueJob, _counter: u64) {
-        if let Some(completion_point) = job.completion_point() {
-            self.data
-                .signal_submit_fence(completion_point, Err(ECANCELED));
+        if let Some(done_seqno) = job.done_seqno() {
+            self.data.signal_submit_fence(done_seqno, Err(ECANCELED));
         }
     }
 }
@@ -656,31 +718,40 @@ impl DriverDmaFenceOps for QueueFenceData {
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    completion_point: Atomic<u64>,
+    /// Per-queue syncobj seqno value at which this job is complete.
+    /// `Some(v)` for stream-bearing jobs; `None` for sync-only jobs
+    /// that emit no `SYNC_ADD64` and thus do not advance the syncobj.
+    /// Set at prepare time from `QueueData::claim_seqnos` so the
+    /// submit and timeout paths can look up the matching pending
+    /// fence by the same key the firmware's `SYNC_ADD64` will produce.
+    done_seqno: Option<u64>,
     /// Back-reference to the owning group; used by
     /// `TyrQueueOps::submit` to reach the scheduler workqueue when
     /// no CSG doorbell has been assigned to the queue yet.
     pub(super) group: Arc<Group>,
+    /// Index of the owning queue inside `Group::queues`. Captured
+    /// at prepare time so the timeout stage can read the per-queue
+    /// syncobj without an extra lookup.
+    queue_index: usize,
 }
 
 impl QueueJob {
-    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>) -> Self {
+    pub(super) fn new(
+        stream: KVec<u8>,
+        done_seqno: Option<u64>,
+        group: Arc<Group>,
+        queue_index: usize,
+    ) -> Self {
         Self {
             stream,
-            completion_point: Atomic::new(0),
+            done_seqno,
             group,
+            queue_index,
         }
     }
 
-    fn completion_point(&self) -> Option<u64> {
-        match self.completion_point.load(Acquire) {
-            0 => None,
-            completion_point => Some(completion_point),
-        }
-    }
-
-    fn set_completion_point(&self, completion_point: u64) {
-        self.completion_point.store(completion_point, Release);
+    fn done_seqno(&self) -> Option<u64> {
+        self.done_seqno
     }
 }
 
@@ -724,7 +795,15 @@ pub(crate) struct CachedBo {
 }
 
 struct PendingSubmitFence {
-    completion_point: u64,
+    /// Per-queue syncobj seqno value at or above which this fence is
+    /// considered complete. Matches the highest seqno claimed by
+    /// `QueueData::claim_seqnos` for the wrapped job. The firmware's
+    /// `SYNC_ADD64` retires after the per-piece `WAIT(all scoreboards)`
+    /// so the syncobj only reaches this value once every dispatched
+    /// async sub-job has landed in memory.
+    done_seqno: u64,
+    /// Ring buffer offsets of the job's wrapped stream.
+    ringbuf_range: Range<u64>,
     fence: DriverDmaFence<QueueFenceData, Published>,
 }
 
