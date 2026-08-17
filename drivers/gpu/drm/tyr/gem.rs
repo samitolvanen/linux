@@ -238,6 +238,9 @@ pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> 
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
+///
+/// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
+/// VM BO blocks operations on the others.
 pub(crate) fn new_kernel_object(
     dev: &Device<Bound>,
     ddev: &TyrDrmDevice,
@@ -349,7 +352,7 @@ impl KernelBo {
             bo_size,
             shmem::ObjectConfig {
                 map_wc: should_map_wc(coherent),
-                parent_resv_obj: None,
+                parent_resv_obj: Some(vm.root_gem()),
             },
             BoCreateArgs { flags: 0 },
         )?;
