@@ -97,8 +97,9 @@ fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Result {
 /// Validate a single `drm_panthor_vm_bind_op` at the ioctl entry, before any
 /// state is mutated or any job is queued. Rejects `EINVAL` if `va`, `size`,
 /// or `bo_offset` is not GPU-page-aligned, if `[va, va + size)` falls outside
-/// the VM's user VA range, and for `MAP` ops if `bo_handle` is invalid or
-/// `bo_offset + size` is out of bounds for the target BO.
+/// the VM's user VA range, and for `MAP` ops if `bo_handle` is invalid, if
+/// `bo_offset + size` is out of bounds for the target BO, or if the BO is
+/// exclusive to a VM other than `vm`.
 ///
 /// For `MAP` ops, returns the looked-up `Bo` so the caller can perform the
 /// bind against the same BO that was validated, avoiding a TOCTOU window.
@@ -124,6 +125,11 @@ fn validate_bind_op(
         // Check size first to avoid underflow in the subtraction.
         if op.0.size > bo_size || op.0.bo_offset > bo_size - op.0.size {
             return Err(EINVAL);
+        }
+        if let Some(root) = bo.exclusive_vm_root_gem() {
+            if !core::ptr::eq(root, vm.root_gem()) {
+                return Err(EINVAL);
+            }
         }
         return Ok(Some(bo));
     }
@@ -481,12 +487,24 @@ impl TyrDrmFileData {
             return Err(EINVAL);
         }
 
+        let exclusive_vm = if bocreate.exclusive_vm_id != 0 {
+            Some(
+                file.inner()
+                    .vm_pool()
+                    .get_vm(bocreate.exclusive_vm_id as usize)
+                    .ok_or(EINVAL)?,
+            )
+        } else {
+            None
+        };
+
         let bo = gem::new_bo(
             reg_data.pdev.as_ref(),
             ddev,
             bocreate.size as usize,
             bocreate.flags,
             ddev.coherent,
+            exclusive_vm.as_deref(),
         )?;
         let handle = bo.create_handle(file)?;
 

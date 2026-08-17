@@ -43,11 +43,17 @@ use crate::{
 #[pin_data]
 pub(crate) struct BoData {
     flags: u32,
+    /// Root GEM object of the VM whose `dma_resv` this BO shares, if any.
+    exclusive_vm_root_gem: Option<ARef<Bo>>,
 }
 
 impl BoData {
     pub(crate) fn create_flags(&self) -> u32 {
         self.flags
+    }
+
+    pub(crate) fn exclusive_vm_root_gem(&self) -> Option<&Bo> {
+        self.exclusive_vm_root_gem.as_deref()
     }
 }
 
@@ -55,6 +61,8 @@ impl BoData {
 /// as required by the gem::DriverObject trait.
 pub(crate) struct BoCreateArgs {
     flags: u32,
+    /// Root GEM object of the VM whose `dma_resv` this BO shares, if any.
+    exclusive_vm_root_gem: Option<ARef<Bo>>,
 }
 
 impl gem::DriverObject for BoData {
@@ -62,11 +70,25 @@ impl gem::DriverObject for BoData {
     type Args = BoCreateArgs;
 
     fn new(_dev: &TyrDrmDevice, _size: usize, args: BoCreateArgs) -> impl PinInit<Self, Error> {
-        try_pin_init!(Self { flags: args.flags })
+        try_pin_init!(Self {
+            flags: args.flags,
+            exclusive_vm_root_gem: args.exclusive_vm_root_gem,
+        })
     }
 
     fn create_imported(_dev: &TyrDrmDevice, _size: usize) -> impl PinInit<Self, Error> {
-        try_pin_init!(Self { flags: 0 })
+        try_pin_init!(Self {
+            flags: 0,
+            exclusive_vm_root_gem: None,
+        })
+    }
+
+    fn export(obj: &Bo, _flags: c_int) -> Result {
+        if obj.exclusive_vm_root_gem.is_some() {
+            return Err(EINVAL);
+        }
+
+        Ok(())
     }
 }
 
@@ -203,7 +225,10 @@ pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice, coherent: bool) -> Result<AR
             map_wc: should_map_wc(coherent),
             parent_resv_obj: None,
         },
-        BoCreateArgs { flags: 0 },
+        BoCreateArgs {
+            flags: 0,
+            exclusive_vm_root_gem: None,
+        },
     )?;
 
     Ok(bo)
@@ -215,6 +240,7 @@ pub(crate) fn new_bo(
     size: usize,
     flags: u32,
     coherent: bool,
+    exclusive_vm: Option<&Vm>,
 ) -> Result<ARef<Bo>> {
     if size == 0 {
         return Err(EINVAL);
@@ -227,9 +253,12 @@ pub(crate) fn new_bo(
         aligned_size,
         shmem::ObjectConfig {
             map_wc,
-            parent_resv_obj: None,
+            parent_resv_obj: exclusive_vm.map(|vm| vm.root_gem()),
         },
-        BoCreateArgs { flags },
+        BoCreateArgs {
+            flags,
+            exclusive_vm_root_gem: exclusive_vm.map(|vm| vm.root_gem().into()),
+        },
     )?;
 
     if map_wc {
@@ -343,7 +372,10 @@ impl KernelBo {
                 map_wc: should_map_wc(coherent),
                 parent_resv_obj: Some(vm.root_gem()),
             },
-            BoCreateArgs { flags: 0 },
+            BoCreateArgs {
+                flags: 0,
+                exclusive_vm_root_gem: Some(vm.root_gem().into()),
+            },
         )?;
 
         vm.map_bo_range(dev, &bo, 0, size, va, flags)?;
