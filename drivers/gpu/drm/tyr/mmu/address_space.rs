@@ -13,7 +13,7 @@
 //! [`SlotOperations`]: crate::slot::SlotOperations
 
 use core::ops::Range;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel::{
     device::{
@@ -719,6 +719,7 @@ impl AsSlotManager {
                 }
             }
             self.activate(&vm.as_seat, vm.into(), &mut ())?;
+            vm.unhandled_fault.store(false, Ordering::Relaxed);
         }
         *vm.as_active_users.access_mut(self) += 1;
         Ok(())
