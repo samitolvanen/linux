@@ -1091,9 +1091,6 @@ impl Queue {
     /// Cancels every job tracked by this queue and signals all
     /// remaining pending submit fences with `err`.
     ///
-    /// The caller must have made the group unrunnable first, so no
-    /// fresh job reaches the queue while this runs.
-    ///
     /// Must be called from process context: `cancel_all` may sleep
     /// waiting for in-flight HW fences.
     pub(crate) fn cancel(&self, err: Error) {

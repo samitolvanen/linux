@@ -81,6 +81,9 @@
 //!   This lets the driver call back into the queue from its `submit()`
 //!   implementation (e.g. to query fence state) without deadlocking.
 //!
+//! - **`fifo`**: the XArray's own `xa_lock` spinlock. Orders a
+//!   [`JobQueue::commit`] insertion against the terminal-cancel latch.
+//!
 //! - **Done** — Entries are removed from the XArray and dropped in process
 //!   context via `cleanup_work` so that `JobEntry` is never freed in IRQ or
 //!   atomic context.
@@ -99,20 +102,25 @@
 //!   [`PipelineBuilder::set_cancel_timeout`] to bound this wait.
 //! - The driver's [`QueueOps`] methods are never called again after drop returns.
 //!
-//! These guarantees require that no [`PreparedJob`] is outstanding when the
-//! queue is dropped. An outstanding reservation stops the drain, so jobs
-//! reserved behind it never enter a stage and [`JobQueue::cancel_all`] does
-//! not see them. Jobs committed behind it keep an unsignaled submit fence
-//! until the last reference to the queue goes away. Dropping the
-//! outstanding [`PreparedJob`] afterwards schedules a tick that can still
-//! call [`QueueOps`] methods.
-//!
 //! Together these guarantees make teardown straightforward to reason about: no
 //! fence callback or scheduled work item can fire against hardware or firmware
 //! state that has already been freed. In the common synchronous case this
 //! holds directly — the queue is fully quiesced before the surrounding driver
 //! struct's destructor can free any of that state. For async teardown the same
 //! invariant must be maintained by the driver; see below.
+//!
+//! ### Terminal cancel
+//!
+//! [`JobQueue::cancel_all`] latches the queue under `fifo` before it drains,
+//! and [`JobQueue::commit`] inserts under the same lock. A racing commit
+//! either lands before the drain or observes the latch and is refused.
+//!
+//! A [`PreparedJob`] still outstanding at cancel time is covered the same way.
+//! Its reserved index stops the drain, and committing in prepare order keeps a
+//! live job from being stranded behind it.
+//!
+//! No job reaches [`QueueOps`] once `cancel_all` returns, so a later tick
+//! finds no live job.
 //!
 //! ### Async teardown
 //!
@@ -171,7 +179,16 @@ use crate::{
     impl_has_dma_fence_work,
     pr_err_once, //
     prelude::*,
-    sync::{aref::ARef, Arc, LockClassKey, Mutex},
+    sync::{
+        aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
+        Arc,
+        LockClassKey,
+        Mutex, //
+    },
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
     xarray::{AllocKind, ReservedIndex, XArray, XaLimit},
 };
@@ -773,6 +790,9 @@ struct JobQueueInner<T: QueueOps> {
     /// ticks have to be manually triggered. This allows batching multiple fence
     /// signals into a single tick.
     coalesce: AtomicBool,
+
+    /// Set by [`JobQueue::cancel_all`] under `fifo`, and never cleared.
+    cancelled: Atomic<bool>,
 
     /// All pipeline stages in order: `[WaitingForDeps, WaitingForExec, <driver
     /// stages or Executing>]`. Built once at construction time.
@@ -1408,6 +1428,12 @@ impl<T: QueueOps> JobQueueInner<T> {
     fn schedule_cleanup(self: &Arc<Self>) {
         let _ = self.aux_wq.enqueue::<Arc<Self>, 3>(self.clone());
     }
+
+    /// Marks the queue terminal, so [`JobQueue::commit`] refuses later jobs.
+    fn latch_cancelled(&self) {
+        let _guard = self.fifo.lock();
+        self.cancelled.store(true, Relaxed);
+    }
 }
 
 /// A process-context job queue that manages job dependencies, driver
@@ -1575,6 +1601,7 @@ impl<T: QueueOps> JobQueue<T> {
                 fence_ctx: DmaFenceContext::new(0),
                 job_counter: AtomicU64::new(0),
                 coalesce: AtomicBool::new(false),
+                cancelled: Atomic::new(false),
                 stages: all_stages,
                 pipeline_timeout,
                 cancel_timeout,
@@ -1707,6 +1734,16 @@ impl<T: QueueOps> JobQueue<T> {
     /// Callers must commit jobs in the order they prepared them, and callers
     /// sharing a queue must serialize from prepare to commit. Interleaving
     /// would signal one fence context out of seqno order.
+    ///
+    /// A queue latched by [`cancel_all`](Self::cancel_all) refuses the job
+    /// and returns a fence already signaled with `ECANCELED`.
+    ///
+    /// A refusal is the one sanctioned break in seqno order. The refused
+    /// fence can signal while an earlier fence on the same context is still
+    /// pending, so `dma_resv_add_fence` can replace that fence. The drain
+    /// signals it before `cancel_all` returns. This is safe only while the
+    /// fences carry `BOOKKEEP` usage, which implicit sync never reads. A
+    /// caller must not wait on its own reservation object at `BOOKKEEP`.
     pub fn commit(&self, mut prepared: PreparedJob<T>) -> ARef<PublicDmaFence> {
         let xa_index = prepared
             .xa_index
@@ -1759,30 +1796,43 @@ impl<T: QueueOps> JobQueue<T> {
         let (submit_fence_drv, submit_fence) = uninit_fence.init(ctx, seqno);
 
         // Phase 3: transition Reserved → Live in-place — no allocation.
-        {
+        let refused = {
             let mut guard = self.inner.fifo.lock();
-            let entry = guard
-                .get_mut(xa_index.index())
-                .expect("BUG: XaEntry vanished between commit phases");
-            *entry = XaEntry::Live(JobEntry {
-                job,
-                submit_fence: submit_fence.clone(),
-                submit_fence_drv: Some(submit_fence_drv),
-                counter,
-                deps: JobDependencies {
-                    fences: deps,
-                    current_idx: 0,
-                    active_cb: None,
-                    prealloc_cbs,
-                },
-                progress_cb: None,
-                stage_entered_at: Instant::now(),
-                pipeline_entered_at: Instant::now(),
-                stage_wake_cb: None,
-                prealloc_progress_cb,
-                prealloc_stage_cb,
-                timed_out: false,
-            });
+            if self.inner.cancelled.load(Relaxed) {
+                let reserved = guard
+                    .remove(xa_index.index())
+                    .expect("BUG: XaEntry vanished between commit phases");
+                Some((submit_fence_drv, reserved))
+            } else {
+                let entry = guard
+                    .get_mut(xa_index.index())
+                    .expect("BUG: XaEntry vanished between commit phases");
+                *entry = XaEntry::Live(JobEntry {
+                    job,
+                    submit_fence: submit_fence.clone(),
+                    submit_fence_drv: Some(submit_fence_drv),
+                    counter,
+                    deps: JobDependencies {
+                        fences: deps,
+                        current_idx: 0,
+                        active_cb: None,
+                        prealloc_cbs,
+                    },
+                    progress_cb: None,
+                    stage_entered_at: Instant::now(),
+                    pipeline_entered_at: Instant::now(),
+                    stage_wake_cb: None,
+                    prealloc_progress_cb,
+                    prealloc_stage_cb,
+                    timed_out: false,
+                });
+                None
+            }
+        };
+
+        if let Some((fence, reserved)) = refused {
+            fence.signal(Err(ECANCELED));
+            drop(reserved);
         }
 
         self.inner.maybe_check_progress();
@@ -1858,7 +1908,11 @@ impl<T: QueueOps> JobQueue<T> {
         self.inner.maybe_check_progress();
     }
 
-    /// Cancel all pending and running jobs. Waits for HW jobs to drain.
+    /// Cancel all pending and running jobs, and stop accepting new ones.
+    /// Waits for HW jobs to drain.
+    ///
+    /// The cancel is terminal. Every later [`commit`](Self::commit) is refused.
+    /// [`park`](Self::park) and [`unpark`](Self::unpark) are unaffected.
     ///
     /// Must be called from process context (it may sleep while waiting for
     /// hardware fences).
@@ -1866,6 +1920,8 @@ impl<T: QueueOps> JobQueue<T> {
         // WaitingForExec is always at index 1; stages beyond it have been
         // handed to hardware and need their fences waited on before cancel.
         const EXEC_STAGE_IDX: usize = 1;
+
+        self.inner.latch_cancelled();
 
         // check_progress() takes state from a signalling section, so don't
         // allocate or wait on fences while holding it.
