@@ -1141,7 +1141,7 @@ impl Queue {
         self.job_queue.unpark();
     }
 
-    /// Retires every job left in the pipeline.
+    /// Retires every job left in the pipeline and refuses later commits.
     ///
     /// Waits for the last committed job first, so a job committed before the
     /// drain is not canceled before its dependencies signal. Waits on
