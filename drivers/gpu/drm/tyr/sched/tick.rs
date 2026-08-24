@@ -795,7 +795,7 @@ impl<'a> Tick<'a> {
                 (slot_data.group.clone(), slot_data.group.can_run())
             };
 
-            if let Err(e) = csg_slot_manager.evict(&group.csg_seat) {
+            if let Err(e) = csg_slot_manager.evict_forced(&group.csg_seat) {
                 dev_err!(tdev.as_ref(), "evict {} failed: {}\n", i, e.to_errno());
                 if ret.is_ok() {
                     ret = Err(e);
