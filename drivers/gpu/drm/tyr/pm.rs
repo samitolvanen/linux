@@ -190,7 +190,9 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
 impl PMOps<platform::Adapter<TyrPlatformDriver>> for TyrPmOps {
     type DeviceType = platform::Device<Bound>;
     type RuntimePayloadType = TyrPmPayload;
-    type SleepData = ();
+    type SleepData = ARef<TyrDrmDevice>;
+
+    const SYSTEM_SLEEP: bool = true;
 
     fn runtime_suspend<'a>(
         _dev: &'a Self::DeviceType,
@@ -210,6 +212,14 @@ impl PMOps<platform::Adapter<TyrPlatformDriver>> for TyrPmOps {
             Ok(()) => Ok(data),
             Err(e) => Err((data, e)),
         }
+    }
+
+    fn system_resume_done(_dev: &Self::DeviceType, data: Option<&ARef<TyrDrmDevice>>) {
+        let Some(tdev) = data else {
+            return;
+        };
+
+        sched::tick::resume_after_system_sleep(tdev);
     }
 }
 

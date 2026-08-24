@@ -772,16 +772,18 @@ impl platform::Driver for TyrPlatformDriver {
         let mut pm_configs = KVec::<PMConfig>::with_capacity(1, GFP_KERNEL)?;
         pm_configs.push(PMConfig::AutoSuspendDelay(AUTOSUSPEND_DELAY_MS), GFP_KERNEL)?;
 
-        let pm_registration = pm::Registration::<platform::Adapter<Self>, TyrPmOps>::new(
-            pdev.as_ref(),
-            pm::DevPMOps::for_driver(),
-            None,
-            Some(pm_configs),
-            Some(TyrPmPayload {
-                tdev: ARef::from(&*unreg_dev),
-                devfreq: devfreq_registration.clone(),
-            }),
-        )?;
+        let pm_registration =
+            pm::Registration::<platform::Adapter<Self>, TyrPmOps>::new_with_sleep_data(
+                pdev.as_ref(),
+                pm::DevPMOps::for_driver(),
+                None,
+                Some(pm_configs),
+                Some(TyrPmPayload {
+                    tdev: ARef::from(&*unreg_dev),
+                    devfreq: devfreq_registration.clone(),
+                }),
+                Some(ARef::from(&*unreg_dev)),
+            )?;
         let pm = pm_registration.ctx().clone();
 
         // The device is already powered, so runtime PM starts resumed.
