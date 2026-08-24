@@ -207,6 +207,7 @@ impl Pools {
             target_in_flight: heapcreate.target_in_flight,
         };
 
+        let _awake = ddev.resume_for_vm_update(reg_data, &vm.as_data)?;
         let pool = self.get_or_create_pool(ddev, reg_data, vm_id, vm)?;
         let created_context = pool.create_heap_context(ddev, reg_data, args)?;
 

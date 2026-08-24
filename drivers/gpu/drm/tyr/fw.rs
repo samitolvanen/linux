@@ -63,7 +63,10 @@ use crate::{
     },
     gpu::GpuInfo,
 
-    mmu::Mmu,
+    mmu::{
+        address_space::VmAsData,
+        Mmu, //
+    },
     regs::gpu_control::{
         McuControlMode,
         McuStatus,
@@ -471,6 +474,11 @@ impl<'drm> Firmware<'drm> {
             time::Delta::from_micros(10),
             time::Delta::from_millis(1000),
         )
+    }
+
+    /// Returns the address space data of the MCU VM.
+    pub(crate) fn vm_as_data(&self) -> &VmAsData {
+        &self.vm.as_data
     }
 
     /// Halts and stops the MCU for runtime suspend, releasing the firmware AS

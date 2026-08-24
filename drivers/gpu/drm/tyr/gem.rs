@@ -483,10 +483,23 @@ impl Drop for KernelBo {
         // Firmware sections are dropped only by probe and unbind, outside any
         // signalling section.
         match self.handoff.take() {
-            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap),
+            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap_deferred),
             None => kernel_bo_unmap(captures),
         }
     }
+}
+
+/// Runs `kernel_bo_unmap` from the hand-off, resuming the device first if the
+/// VM kept its AS slot across a runtime suspend.
+fn kernel_bo_unmap_deferred(captures: KernelBoCleanup) {
+    let tdev = captures.bo.dev();
+    let _awake = tdev.registration_guard().and_then(|guard| {
+        guard.registration_data_with(|reg_data| {
+            tdev.resume_for_vm_update(reg_data, &captures.vm.as_data)
+                .ok()
+        })
+    });
+    kernel_bo_unmap(captures);
 }
 
 /// Tears down a `KernelBo` mapping and then releases the VA
