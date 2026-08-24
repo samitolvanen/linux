@@ -252,6 +252,9 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) pm: SetOnce<PMContext<platform::Adapter<TyrPlatformDriver>, TyrPmOps>>,
 
     #[pin]
+    pub(crate) user_mmio: Mutex<mmap::UserMmio>,
+
+    #[pin]
     pub(crate) opp_config: Mutex<Option<ConfigToken>>,
 }
 
@@ -640,6 +643,7 @@ impl platform::Driver for TyrPlatformDriver {
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 devfreq_data,
                 pm: SetOnce::new(),
+                user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
             }? Error),
         )?;
