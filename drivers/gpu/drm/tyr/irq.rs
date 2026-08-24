@@ -26,6 +26,11 @@ use kernel::{
     sizes::SZ_2M,
     sync::{
         aref::ARef,
+        atomic::{
+            Acquire,
+            Atomic,
+            Release, //
+        },
         Arc, //
     }, //
 };
@@ -51,6 +56,11 @@ pub(crate) struct TyrIrq<'drm, T: TyrIrqTrait> {
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     irq: T,
+    /// Set while runtime suspend holds this line quiesced. The hard
+    /// handler then leaves the shared line to its other users without
+    /// touching a register, and the threaded handler leaves the line
+    /// masked on exit.
+    suspended: Atomic<bool>,
     #[pin]
     _pin: PhantomPinned,
 }
@@ -77,16 +87,25 @@ impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
             tdev,
             iomem,
             irq,
+            suspended: Atomic::new(false),
             _pin: PhantomPinned,
         });
 
         // SAFETY: The caller guarantees that the registration is not leaked.
         unsafe { pdev.request_threaded_irq_by_name(Flags::SHARED, name, name, handler) }
     }
+
+    fn set_suspended(&self, suspended: bool) {
+        self.suspended.store(suspended, Release);
+    }
 }
 
 impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
     fn handle(&self) -> ThreadedIrqReturn {
+        if self.suspended.load(Acquire) {
+            return ThreadedIrqReturn::None;
+        }
+
         let Ok(io) = self.iomem.access(self.dev) else {
             return ThreadedIrqReturn::None;
         };
@@ -96,6 +115,7 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
             return ThreadedIrqReturn::None;
         }
         self.irq.disable_all(io);
+
         ThreadedIrqReturn::WakeThread
     }
 
@@ -115,7 +135,39 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
             ret = IrqReturn::Handled;
         }
 
-        self.irq.reenable(io);
+        if !self.suspended.load(Acquire) {
+            self.irq.reenable(io);
+        }
         ret
     }
+}
+
+/// Stops one IRQ line for runtime suspend. Masks the line through `mask`,
+/// sets a per-line suspended flag, and waits for the in-flight threaded
+/// handler.
+///
+/// The line is masked before the flag is set, so the hard handler starts
+/// declining only once the sources are masked. The mask is rewritten after
+/// the synchronize because a handler that raced the flag re-enables it on
+/// exit. The flag stays set until the matching resume clears it.
+#[expect(dead_code)]
+pub(crate) fn quiesce<T: TyrIrqTrait>(
+    reg: &ThreadedRegistration<'_, TyrIrq<'_, T>>,
+    io: &IoMem<'_>,
+    mask: impl Fn(&IoMem<'_>),
+) {
+    mask(io);
+    reg.handler().set_suspended(true);
+    reg.synchronize();
+    mask(io);
+}
+
+/// Clears the suspended flag on one IRQ line.
+///
+/// A flag left set stops the hard handler from handling the line again.
+/// Call this before unmasking the line, or an interrupt taken in between
+/// goes unclaimed.
+#[expect(dead_code)]
+pub(crate) fn clear_suspended<T: TyrIrqTrait>(reg: &ThreadedRegistration<'_, TyrIrq<'_, T>>) {
+    reg.handler().set_suspended(false);
 }

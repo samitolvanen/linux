@@ -65,6 +65,12 @@ pub(crate) fn gpu_irq_enable(io: &IoMem<'_>) {
     io.write_reg(sources);
 }
 
+/// Masks all GPU IRQ sources.
+#[expect(dead_code)]
+pub(crate) fn gpu_irq_disable(io: &IoMem<'_>) {
+    io.write_reg(gpu_control::GPU_IRQ_MASK::from_raw(0));
+}
+
 /// Registers the GPU IRQ handler with the sources masked.
 ///
 /// # Safety
