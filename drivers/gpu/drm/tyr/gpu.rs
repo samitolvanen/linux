@@ -23,7 +23,14 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
+    driver::{
+        IoMem,
+        TyrDrmRegistrationData, //
+    },
+    irq::{
+        clear_suspended,
+        quiesce, //
+    },
     regs::{
         gpu_control::*,
         join_u64, //
@@ -217,9 +224,38 @@ const GPU_MODELS: [GpuModels; 1] = [GpuModels {
     prod_major: 7,
 }];
 
+/// Timeout for an L2 power transition to complete.
+const L2_TRANSITION_TIMEOUT: Delta = Delta::from_millis(20);
+
+/// Waits for an L2 power transition in progress to complete.
+fn l2_wait_transition(io: &IoMem<'_>) -> Result {
+    poll::read_poll_timeout(
+        || Ok(io.read(L2_PWRTRANS_LO)),
+        |status| status.changing() == 0,
+        Delta::from_micros(100),
+        L2_TRANSITION_TIMEOUT,
+    )?;
+
+    Ok(())
+}
+
+/// Powers off the L2 block.
+pub(crate) fn l2_power_off(dev: &Device, io: &IoMem<'_>) -> Result {
+    l2_wait_transition(io).inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
+
+    io.write_reg(L2_PWROFF_LO::zeroed().with_const_request::<1>());
+
+    l2_wait_transition(io).inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
+
+    Ok(())
+}
+
 /// Powers on the l2 block.
 pub(crate) fn l2_power_on(dev: &Device, io: &IoMem<'_>) -> Result {
     io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(CoherencyMode::None));
+
+    l2_wait_transition(io).inspect_err(|_| dev_err!(dev, "Failed to power on the GPU.\n"))?;
+
     io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
 
     poll::read_poll_timeout(
@@ -231,4 +267,19 @@ pub(crate) fn l2_power_on(dev: &Device, io: &IoMem<'_>) -> Result {
     .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."))?;
 
     Ok(())
+}
+
+/// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
+#[expect(dead_code)]
+pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
+    quiesce(&reg_data.gpu_irq, io, irq::gpu_irq_disable);
+    let _ = l2_power_off(reg_data.pdev.as_ref(), io);
+}
+
+/// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
+#[expect(dead_code)]
+pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) -> Result {
+    clear_suspended(&reg_data.gpu_irq);
+    irq::gpu_irq_enable(io);
+    l2_power_on(reg_data.pdev.as_ref(), io)
 }
