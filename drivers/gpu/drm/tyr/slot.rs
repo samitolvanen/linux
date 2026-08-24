@@ -331,22 +331,30 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         Ok(())
     }
 
-    /// Evicts an active or idle slot: calls the eviction callback and marks the slot as free
-    /// and the seat as NoSeat.
-    fn evict_slot(&mut self, slot_idx: usize, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
-        match &self.slots[slot_idx] {
+    /// Evicts an active or idle slot.
+    ///
+    /// On eviction-callback failure the slot is freed only when `force` is set.
+    fn evict_slot(
+        &mut self,
+        slot_idx: usize,
+        locked_seat: &LockedSeat<T, MAX_SLOTS>,
+        force: bool,
+    ) -> Result {
+        let res = match &self.slots[slot_idx] {
             Slot::Active(slot_info) | Slot::Idle(slot_info) => {
-                // If hardware eviction fails (e.g. times out), the slot retains
-                // its SlotData so that any resources still referenced by the hardware
-                // will remain alive. This prevents use-after-free errors.
-                self.manager.evict(slot_idx, &slot_info.slot_data)?;
-                mem::take(&mut self.slots[slot_idx]);
+                self.manager.evict(slot_idx, &slot_info.slot_data)
             }
-            _ => (),
-        }
+            _ => Ok(()),
+        };
 
-        *locked_seat.access_mut(self) = Seat::NoSeat;
-        Ok(())
+        // Unless forced, a failed eviction leaves the slot holding its
+        // `SlotData`, so resources the hardware may still reference stay
+        // alive. This prevents use-after-free errors.
+        if res.is_ok() || force {
+            mem::take(&mut self.slots[slot_idx]);
+            *locked_seat.access_mut(self) = Seat::NoSeat;
+        }
+        res
     }
 
     /// Checks that the seat state matches the slot's state.
@@ -422,13 +430,28 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     }
 
     /// Evict a resource from its slot.
+    ///
+    /// On eviction-callback failure the slot stays occupied, so a slot with
+    /// live hardware state is never reused.
     pub(crate) fn evict(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
+        self.evict_common(locked_seat, false)
+    }
+
+    /// Like `evict`, but frees the slot even when the eviction callback fails,
+    /// for teardown paths that must leave nothing bound. The caller must justify
+    /// freeing a slot whose callback failed. `CsgSlotOps::evict` clears the
+    /// binding before its first fallible step.
+    pub(crate) fn evict_forced(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
+        self.evict_common(locked_seat, true)
+    }
+
+    fn evict_common(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>, force: bool) -> Result {
         self.check_seat(locked_seat);
 
         match locked_seat.access(self) {
             Seat::Active(seat_info) | Seat::Idle(seat_info) => {
                 let slot_idx = seat_info.slot as usize;
-                self.evict_slot(slot_idx, locked_seat)?;
+                self.evict_slot(slot_idx, locked_seat, force)?;
             }
             _ => (),
         }
