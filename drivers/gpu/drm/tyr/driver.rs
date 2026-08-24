@@ -731,6 +731,7 @@ impl platform::Driver for TyrPlatformDriver {
                     core: core_clk,
                     stacks: stacks_clk,
                     coregroup: coregroup_clk,
+                    gated: false,
                 }),
                 regulators <- new_mutex!(Regulators {
                     _mali: mali_regulator,
@@ -845,13 +846,50 @@ struct Clocks {
     core: Clk,
     stacks: OptionalClk,
     coregroup: OptionalClk,
+    /// Whether the clocks are currently gated by runtime suspend.
+    gated: bool,
+}
+
+impl Clocks {
+    /// Disables and unprepares the clocks for runtime suspend.
+    #[expect(dead_code)]
+    pub(crate) fn gate(&mut self) {
+        if self.gated {
+            return;
+        }
+        self.coregroup.disable_unprepare();
+        self.stacks.disable_unprepare();
+        self.core.disable_unprepare();
+        self.gated = true;
+    }
+
+    /// Re-enables the clocks on runtime resume.
+    #[expect(dead_code)]
+    pub(crate) fn ungate(&mut self) -> Result {
+        if !self.gated {
+            return Ok(());
+        }
+        let clks: [&Clk; 3] = [&self.core, &self.stacks, &self.coregroup];
+        for (i, clk) in clks.iter().enumerate() {
+            if let Err(e) = clk.prepare_enable() {
+                for prev in clks[..i].iter().rev() {
+                    prev.disable_unprepare();
+                }
+                return Err(e);
+            }
+        }
+        self.gated = false;
+        Ok(())
+    }
 }
 
 impl Drop for Clocks {
     fn drop(&mut self) {
-        self.core.disable_unprepare();
-        self.stacks.disable_unprepare();
-        self.coregroup.disable_unprepare();
+        if !self.gated {
+            self.coregroup.disable_unprepare();
+            self.stacks.disable_unprepare();
+            self.core.disable_unprepare();
+        }
     }
 }
 
