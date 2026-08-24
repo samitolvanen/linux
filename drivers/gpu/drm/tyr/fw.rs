@@ -36,6 +36,11 @@ use kernel::{
     },
     str::CString,
     sync::{
+        atomic::{
+            Acquire,
+            Atomic,
+            Release, //
+        },
         Arc,
         ArcBorrow, //
     },
@@ -62,7 +67,10 @@ use crate::{
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
-
+    irq::{
+        clear_suspended,
+        quiesce, //
+    },
     mmu::{
         address_space::VmAsData,
         Mmu, //
@@ -241,6 +249,10 @@ pub(crate) struct Firmware<'drm> {
     /// Firmware IRQ state, including readiness and event wait objects.
     irq_state: irq::JobIrqState,
 
+    /// Set from `boot` until `stop`. The GPU may be powered off after a stop,
+    /// so `Drop` stops the MCU only while this is set.
+    mcu_running: Atomic<bool>,
+
     /// The global FW interface.
     global_iface: Arc<GlobalInterface<'drm>>,
 }
@@ -248,8 +260,10 @@ pub(crate) struct Firmware<'drm> {
 impl<'drm> Drop for Firmware<'drm> {
     fn drop(&mut self) {
         // Stop the MCU before releasing its firmware mappings and memory.
-        if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
-            let _ = self.stop(io);
+        if self.mcu_running.load(Acquire) {
+            if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
+                let _ = self.stop(io);
+            }
         }
 
         // AS slots retain a VM ref, we need to kill the circular ref manually.
@@ -404,6 +418,7 @@ impl<'drm> Firmware<'drm> {
                 vm: vm.clone(),
                 sections,
                 irq_state,
+                mcu_running: Atomic::new(false),
                 global_iface,
             })
         })();
@@ -432,6 +447,7 @@ impl<'drm> Firmware<'drm> {
     }
 
     pub(crate) fn boot(&self, io: &IoMem<'_>) -> Result {
+        self.mcu_running.store(true, Release);
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
 
         if let Err(e) = Self::wait_for_mcu_status(
@@ -449,6 +465,7 @@ impl<'drm> Firmware<'drm> {
     }
 
     fn stop(&self, io: &IoMem<'_>) -> Result {
+        self.mcu_running.store(false, Release);
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Disable));
 
         if let Err(e) = Self::wait_for_mcu_status(
@@ -483,17 +500,14 @@ impl<'drm> Firmware<'drm> {
 
     /// Halts and stops the MCU for runtime suspend, releasing the firmware AS
     /// slot for resume to reprogram.
-    #[expect(dead_code)]
-    pub(crate) fn suspend(&self, io: &IoMem<'_>) {
+    pub(crate) fn suspend(&self, job_irq: &irq::JobIrqRegistration<'_>, io: &IoMem<'_>) {
         if let Err(e) = self.halt_mcu(io) {
             dev_warn!(self.dev, "Failed to cleanly halt the MCU: {:?}\n", e);
         }
 
-        irq::job_irq_disable(io);
-
         let _ = self.stop(io);
+        quiesce(job_irq, io, irq::job_irq_disable);
         self.global_iface.suspend();
-
         let _ = self.vm.deactivate();
     }
 
@@ -502,8 +516,14 @@ impl<'drm> Firmware<'drm> {
     ///
     /// The sections live in system RAM and survive the suspend, so they are
     /// not reloaded.
-    #[expect(dead_code)]
-    pub(crate) fn resume(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
+    pub(crate) fn resume(
+        &self,
+        job_irq: &irq::JobIrqRegistration<'_>,
+        core_clk_rate: u64,
+        io: &IoMem<'_>,
+    ) -> Result {
+        clear_suspended(job_irq);
+
         self.vm.activate()?;
         self.irq_state.clear_ready();
 

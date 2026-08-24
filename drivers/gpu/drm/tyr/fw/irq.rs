@@ -118,6 +118,8 @@ pub(crate) struct JobIrq<'drm> {
     global_iface: Arc<GlobalInterface<'drm>>,
 }
 
+pub(crate) type JobIrqRegistration<'drm> = ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>;
+
 /// Clears the latched job IRQs the driver services and unmasks them.
 pub(crate) fn job_irq_enable(io: &IoMem<'_>) {
     let sources = job_irq_sources();
@@ -143,7 +145,7 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     iomem: Arc<DevresIoMem<SZ_2M>>,
     state: JobIrqState,
     global_iface: Arc<GlobalInterface<'drm>>,
-) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>, Error> + 'drm> {
+) -> Result<impl PinInit<JobIrqRegistration<'drm>, Error> + 'drm> {
     // The caller unmasks the sources once the handler is registered.
     iomem
         .access(pdev.as_ref())?
