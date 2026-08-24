@@ -88,7 +88,7 @@ use crate::{
         irq::{
             job_irq_enable,
             job_irq_init,
-            JobIrq, //
+            JobIrqRegistration, //
         },
         Firmware, //
     },
@@ -114,6 +114,7 @@ use crate::{
     },
     pm::{
         TyrPmOps,
+        TyrPmPayload,
         AUTOSUSPEND_DELAY_MS, //
     },
     regs::gpu_control::*,
@@ -290,7 +291,6 @@ impl TyrDrmDeviceData {
     /// Returns whether any firmware-events bits are pending, a hint for
     /// rescheduling the drain worker. The drain itself synchronizes through
     /// `fw_events_take`.
-    #[expect(dead_code)]
     pub(crate) fn fw_events_pending(&self) -> bool {
         self.fw_events.load(Relaxed) != 0
     }
@@ -349,6 +349,20 @@ impl TyrDrmDeviceData {
         self.tick_work.inner.flush();
     }
 
+    /// Waits for the tick and firmware-events workers to finish.
+    ///
+    /// Both block bounded. Not callable under the scheduler or CSG
+    /// slot-manager mutexes, nor in a dma-fence signalling section. The
+    /// per-group tiler OOM workers are not flushed. They re-check slot
+    /// ownership and read the acknowledgment from the live interface
+    /// under the scheduler mutex before writing to the firmware. A
+    /// failed heap growth can still queue a fresh tick after this
+    /// returns, so callers gate the tick first.
+    pub(crate) fn drain_sched_work(&self) {
+        self.tick_work.inner.flush();
+        self.fw_events_work.inner.flush();
+    }
+
     /// Re-arms the scheduler tick `delay` jiffies from now.
     ///
     /// If a periodic tick is already pending, `delay` is ignored.
@@ -382,6 +396,13 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         let tdev = &*this;
+
+        // Processing events ACKs them through CSG doorbells. If the
+        // device is runtime suspended, leave the events latched in
+        // `fw_events`. The resume path reschedules this worker.
+        let Some(_active) = tdev.sched_pm_get_if_active() else {
+            return;
+        };
 
         let events = tdev.fw_events_take();
         if events == 0 {
@@ -509,7 +530,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
     /// stops.
-    pub(crate) job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq<'drm>>>>>,
+    pub(crate) job_irq: Pin<KBox<JobIrqRegistration<'drm>>>,
 
     /// MMU IRQ registration. Freed after `mmu`, so faults raised during teardown are still
     /// reported.
@@ -533,7 +554,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     pub(crate) heap_wq: OwnedQueue,
 
     #[pin]
-    clks: Mutex<Clocks>,
+    pub(crate) clks: Mutex<Clocks>,
 
     #[pin]
     regulators: Mutex<Regulators>,
@@ -756,7 +777,10 @@ impl platform::Driver for TyrPlatformDriver {
             pm::DevPMOps::for_driver(),
             None,
             Some(pm_configs),
-            Some(devfreq_registration.clone()),
+            Some(TyrPmPayload {
+                tdev: ARef::from(&*unreg_dev),
+                devfreq: devfreq_registration.clone(),
+            }),
         )?;
         let pm = pm_registration.ctx().clone();
 
@@ -842,8 +866,8 @@ impl drm::Driver for TyrDrmDriver {
     }
 }
 
-struct Clocks {
-    core: Clk,
+pub(crate) struct Clocks {
+    pub(crate) core: Clk,
     stacks: OptionalClk,
     coregroup: OptionalClk,
     /// Whether the clocks are currently gated by runtime suspend.
@@ -852,7 +876,6 @@ struct Clocks {
 
 impl Clocks {
     /// Disables and unprepares the clocks for runtime suspend.
-    #[expect(dead_code)]
     pub(crate) fn gate(&mut self) {
         if self.gated {
             return;
@@ -864,7 +887,6 @@ impl Clocks {
     }
 
     /// Re-enables the clocks on runtime resume.
-    #[expect(dead_code)]
     pub(crate) fn ungate(&mut self) -> Result {
         if !self.gated {
             return Ok(());

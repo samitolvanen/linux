@@ -61,7 +61,10 @@ use crate::{
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
-
+    irq::{
+        clear_suspended,
+        quiesce, //
+    },
     mmu::Mmu,
     regs::gpu_control::{
         McuControlMode,
@@ -467,17 +470,14 @@ impl<'drm> Firmware<'drm> {
 
     /// Halts and stops the MCU for runtime suspend, releasing the firmware AS
     /// slot for resume to reprogram.
-    #[expect(dead_code)]
-    pub(crate) fn suspend(&self, io: &IoMem<'_>) {
+    pub(crate) fn suspend(&self, job_irq: &irq::JobIrqRegistration<'_>, io: &IoMem<'_>) {
         if let Err(e) = self.halt_mcu(io) {
             dev_warn!(self.dev, "Failed to cleanly halt the MCU: {:?}\n", e);
         }
 
-        irq::job_irq_disable(io);
-
         let _ = self.stop(io);
+        quiesce(job_irq, io, irq::job_irq_disable);
         self.global_iface.suspend();
-
         let _ = self.vm.deactivate();
     }
 
@@ -486,8 +486,14 @@ impl<'drm> Firmware<'drm> {
     ///
     /// The sections live in system RAM and survive the suspend, so they are
     /// not reloaded.
-    #[expect(dead_code)]
-    pub(crate) fn resume(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
+    pub(crate) fn resume(
+        &self,
+        job_irq: &irq::JobIrqRegistration<'_>,
+        core_clk_rate: u64,
+        io: &IoMem<'_>,
+    ) -> Result {
+        clear_suspended(job_irq);
+
         self.vm.activate()?;
         self.irq_state.clear_ready();
 

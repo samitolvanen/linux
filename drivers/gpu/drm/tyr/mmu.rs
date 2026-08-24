@@ -197,14 +197,12 @@ impl Mmu {
 
 /// Releases the resident AS slots and stops the MMU IRQ for runtime
 /// suspend.
-#[expect(dead_code)]
 pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
     reg_data.mmu.suspend();
     quiesce(&reg_data.mmu_irq, io, irq::mmu_irq_disable);
 }
 
 /// Re-enables the MMU IRQ for runtime resume.
-#[expect(dead_code)]
 pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
     clear_suspended(&reg_data.mmu_irq);
     irq::mmu_irq_enable(io);
