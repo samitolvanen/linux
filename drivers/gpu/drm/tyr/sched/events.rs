@@ -24,7 +24,9 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     fw::{
+        global::CsgInterface,
         CsDbMask,
+        CsFatalExceptionType,
         CsgSlotMask,
         Firmware,
         CSG_REQ, //
@@ -63,6 +65,68 @@ enum GrowOutcome {
     /// The grow failed for an unexpected reason. The queue is marked fatal
     /// and the firmware write is skipped.
     Fatal,
+}
+
+/// CS events collected from one CSG interrupt.
+#[derive(Default)]
+struct CsIrqEvents {
+    tiler_oom_mask: u32,
+    cs_fatal_mask: u32,
+    cs_unrecoverable: bool,
+    /// `EXTRACT` of each faulted queue, read before the fault is acknowledged.
+    cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP],
+}
+
+impl CsIrqEvents {
+    /// Collects the events of CS `cs_id` and acknowledges its fatal and
+    /// fault events. Returns `true` if a fault was acknowledged.
+    fn process_cs_irq(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        csg: &mut CsgInterface,
+        csg_id: usize,
+        cs_id: u32,
+        group: Option<&Group>,
+    ) -> Result<bool> {
+        let Some(cs) = csg.cs_mut(cs_id as usize) else {
+            return Ok(false);
+        };
+        let input_req = cs.read_input_req()?;
+        let output_ack = cs.read_output_ack()?;
+
+        if input_req.tiler_oom() != output_ack.tiler_oom() {
+            self.tiler_oom_mask |= 1u32 << cs_id;
+        }
+
+        let fatal_event = input_req.fatal() != output_ack.fatal();
+        let fault_event = input_req.fault() != output_ack.fault();
+
+        if fatal_event {
+            let exception_type = cs.decode_fatal(parent_dev(tdev), csg_id, cs_id)?;
+            if exception_type == CsFatalExceptionType::CsUnrecoverable as u32 {
+                self.cs_unrecoverable = true;
+            }
+            self.cs_fatal_mask |= 1u32 << cs_id;
+        }
+
+        if fault_event {
+            cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?;
+            let queue = group.and_then(|group| group.queues.get(cs_id as usize));
+            let extract = self.cs_fault_extract.get_mut(cs_id as usize);
+            if let (Some(queue), Some(extract)) = (queue, extract) {
+                *extract = queue.read_extract().ok();
+            }
+        }
+
+        if fatal_event || fault_event {
+            let new_req = input_req
+                .with_fatal(output_ack.fatal())
+                .with_fault(output_ack.fault());
+            cs.write_input_req(new_req);
+        }
+
+        Ok(fault_event)
+    }
 }
 
 fn slot_holds(slot_manager: &CsgSlotManager, csg_id: usize, group: &Arc<Group>) -> bool {
@@ -250,59 +314,36 @@ impl Scheduler {
             TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
-        let mut tiler_oom_mask: u32 = 0;
-        let mut cs_fatal_mask: u32 = 0;
-        // `EXTRACT` of each faulted queue, read before the fault is acknowledged.
-        let mut cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP] = [None; MAX_CS_PER_GROUP];
-        let mut ring_cs_db_mask: u32 = 0;
-        fw.with_csg_mut(csg_id, |csg| {
+        let mut events = CsIrqEvents::default();
+        let ring_cs_db_mask = fw.with_csg_mut(csg_id, |csg| {
             let mut cs_irqs = pending_cs_irqs;
+            let mut ring_cs_db_mask = 0u32;
 
             while cs_irqs != 0 {
                 let cs_id = cs_irqs.trailing_zeros();
                 cs_irqs &= !(1u32 << cs_id);
 
-                let cs = match csg.cs_mut(cs_id as usize) {
-                    Some(cs) => cs,
-                    None => continue,
-                };
-                let input_req = cs.read_input_req()?;
-                let output_ack = cs.read_output_ack()?;
-
-                if input_req.tiler_oom() != output_ack.tiler_oom() {
-                    tiler_oom_mask |= 1u32 << cs_id;
-                }
-
-                let fatal_event = input_req.fatal() != output_ack.fatal();
-                let fault_event = input_req.fault() != output_ack.fault();
-
-                if fatal_event {
-                    let _ = cs.decode_fatal(parent_dev(tdev), csg_id, cs_id)?;
-                    cs_fatal_mask |= 1u32 << cs_id;
-                }
-
-                if fault_event {
-                    cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?;
-                    let queue = group
-                        .as_deref()
-                        .and_then(|group| group.queues.get(cs_id as usize));
-                    let extract = cs_fault_extract.get_mut(cs_id as usize);
-                    if let (Some(queue), Some(extract)) = (queue, extract) {
-                        *extract = queue.read_extract().ok();
-                    }
-                    ring_cs_db_mask |= 1u32 << cs_id;
-                }
-
-                if fatal_event || fault_event {
-                    let new_req = input_req
-                        .with_fatal(output_ack.fatal())
-                        .with_fault(output_ack.fault());
-                    cs.write_input_req(new_req);
+                match events.process_cs_irq(tdev, csg, csg_id, cs_id, group.as_deref()) {
+                    Ok(true) => ring_cs_db_mask |= 1u32 << cs_id,
+                    Ok(false) => {}
+                    Err(e) => dev_err!(
+                        tdev.as_ref(),
+                        "Failed to process the CSG slot {} CS {} IRQ: {:?}\n",
+                        csg_id,
+                        cs_id,
+                        e
+                    ),
                 }
             }
 
-            Ok(())
+            Ok(ring_cs_db_mask)
         })?;
+        let CsIrqEvents {
+            mut tiler_oom_mask,
+            mut cs_fatal_mask,
+            cs_unrecoverable,
+            cs_fault_extract,
+        } = events;
 
         if let Some(group) = &group {
             let queue_mask = group.queue_mask();
@@ -347,19 +388,31 @@ impl Scheduler {
             }
         }
 
+        if cs_unrecoverable {
+            tdev.reset.schedule();
+        }
+
         if cs_fatal_mask != 0 {
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
 
         if ring_cs_db_mask != 0 {
-            fw.with_csg_mut(csg_id, |csg| {
-                csg.toggle_input_db_req(CsDbMask::from_raw(ring_cs_db_mask))
+            fw.with_csg_mut_ring_doorbell(csg_id, |csg| {
+                if let Err(e) = csg.toggle_input_db_req(CsDbMask::from_raw(ring_cs_db_mask)) {
+                    dev_err!(
+                        tdev.as_ref(),
+                        "Failed to toggle the CSG slot {} CS doorbell requests: {:?}\n",
+                        csg_id,
+                        e
+                    );
+                }
+                Ok(())
             })?;
+        } else {
+            let mut mask = CsgSlotMask::empty();
+            mask.insert(csg_id);
+            fw.ring_csg_doorbells(mask)?;
         }
-
-        let mut mask = CsgSlotMask::empty();
-        mask.insert(csg_id);
-        fw.ring_csg_doorbells(mask)?;
 
         Ok(())
     }

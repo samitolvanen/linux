@@ -748,7 +748,7 @@ impl Scheduler {
                 self.sync_csg_slot_priority(fw, &mut csg_slot_manager, csg_id)?;
             }
             if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
-                self.sync_csg_slot_state(fw, &csg_slot_manager, csg_id)?;
+                self.sync_csg_slot_state(tdev, fw, &csg_slot_manager, csg_id)?;
             }
             if !(acked_reqs & CSG_REQ_STATUS_UPDATE).is_empty() {
                 self.sync_csg_slot_queues_state(fw, &csg_slot_manager, csg_id)?;
@@ -829,6 +829,7 @@ impl Scheduler {
     /// credit, except for the queues in `Group::blocked_idle_queues`.
     fn sync_csg_slot_state(
         &mut self,
+        tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         csg_slot_manager: &CsgSlotManager,
         csg_idx: usize,
@@ -859,6 +860,7 @@ impl Scheduler {
                     inner.fatal_error = Some(EINVAL);
                 }
             });
+            tdev.reset.schedule();
         }
 
         if new_state == group::State::Suspended {
@@ -906,7 +908,7 @@ impl Scheduler {
                 }
                 if let Err(e) = queue.kick() {
                     dev_err!(
-                        group.tdev.as_ref(),
+                        tdev.as_ref(),
                         "CSG {}: user-doorbell kick on bind failed: {}\n",
                         csg_idx,
                         e.to_errno()

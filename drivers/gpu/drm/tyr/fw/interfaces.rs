@@ -156,6 +156,7 @@ pub(crate) use self::cs::output::{
     CS_FAULT,
     CS_FAULT_INFO, //
 };
+pub(crate) use self::cs::CsFatalExceptionType;
 
 /// Generic firmware interface infrastructure.
 ///
@@ -1520,7 +1521,7 @@ pub(super) mod cs {
     /// CS_FATAL exception type.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
-    pub(super) enum CsFatalExceptionType {
+    pub(crate) enum CsFatalExceptionType {
         /// No error.
         Ok = 0x00,
         /// Command stream config invalid.
