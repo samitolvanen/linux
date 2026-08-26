@@ -76,7 +76,6 @@ impl HwGate {
     }
 
     /// Enters a hardware-access read section, parking while the gate is closed.
-    #[expect(dead_code)]
     pub(crate) fn read(&self) -> HwReadGuard<'_> {
         loop {
             let guard = self.srcu.read_lock();
