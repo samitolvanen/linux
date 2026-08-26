@@ -141,6 +141,10 @@ macro_rules! build_scheduling_rules {
 /// Otherwise the tick stays idle until something requests it via
 /// `Scheduler::request_tick`.
 pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result {
+    if tdev.is_unusable() {
+        return Ok(());
+    }
+
     // The token blocks a suspend mid-tick without itself resuming. When the
     // device is down the tick defers, holding a usage reference for any
     // runnable work so the asynchronous resume reissues the tick.
@@ -318,6 +322,18 @@ pub(crate) fn resume_after_system_sleep(tdev: &ARef<TyrDrmDevice>) {
     if kick {
         TyrDrmDeviceData::schedule_tick(tdev);
     }
+}
+
+/// Marks the device unusable and terminates every group at unbind.
+///
+/// Runs after the halt or after the suspend that already evicted every
+/// resident group.
+pub(crate) fn unbind(tdev: &ARef<TyrDrmDevice>) {
+    let _ = tdev.with_locked_scheduler(|sched| {
+        tdev.mark_unusable();
+        sched.fail_all_groups();
+        Ok(())
+    });
 }
 
 /// The groups `pre_reset` parked, handed back to `post_reset`.

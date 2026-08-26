@@ -1061,7 +1061,13 @@ impl Pool {
 
         let group = Group::create(ddev, reg_data, file, groupcreate, queue_args)?;
 
-        ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
+        ddev.with_locked_scheduler(|sched| {
+            if ddev.is_unusable() {
+                return Err(ENODEV);
+            }
+
+            sched.add_group(group.clone())
+        })?;
 
         let handle = match self.0.insert(group.clone()) {
             Ok(handle) => handle,

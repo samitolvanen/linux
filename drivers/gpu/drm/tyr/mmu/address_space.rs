@@ -193,10 +193,11 @@ impl VmAsData {
             // TTBR is programmed and stores that Arc in the active slot before
             // returning. Eviction flushes and disables the slot before releasing
             // the Arc. A failed eviction leaves the slot holding it until a
-            // completed reset or a power cycle clears the slot. The page table
-            // is otherwise freed only at unbind, where the driver core drops
-            // the driver's private data before releasing devres resources, so
-            // `Firmware::drop()` stops the MCU first.
+            // completed reset or a power cycle clears the slot, or unbind
+            // halts the GPU. The page table is otherwise freed only at
+            // unbind, where the driver core drops the driver's private data
+            // before releasing devres resources, so `Firmware::drop()` stops
+            // the MCU first.
             transtab: unsafe { pt.ttbr() },
             memattr: MEMATTR::from_mair(pt.mair()).into_raw(),
         })
@@ -843,10 +844,12 @@ impl AsSlotManager {
         self.suspended = true;
     }
 
-    /// Accepts AS commands again, releasing every binding.
-    pub(super) fn resume(&mut self) {
+    /// Accepts AS commands again, releasing every binding if `release` is set.
+    pub(super) fn resume(&mut self, release: bool) {
         self.suspended = false;
-        self.release_vms();
+        if release {
+            self.release_vms();
+        }
     }
 
     /// Returns whether the VM kept its AS slot across a runtime suspend.
