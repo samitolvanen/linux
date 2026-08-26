@@ -225,6 +225,10 @@ pub(crate) fn post_reset(
     reset_failed: bool,
 ) {
     if !reset_failed {
+        // The reset worker holds the closed gate here, so the release must not
+        // take a VM op lock and goes through the AS slot manager directly. A
+        // span parked on the closed gate re-checks residency when it resumes,
+        // so releasing the binding is enough.
         let mut as_manager = reg_data.mmu.as_manager.lock();
         as_manager.release_vms();
     }
