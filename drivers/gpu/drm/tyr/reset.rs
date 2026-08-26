@@ -31,8 +31,6 @@
 //! A readiness gate holds a request recorded during probe at `Pending`
 //! until `set_ready` enqueues the worker.
 
-mod hw_gate;
-
 use kernel::{
     devres::Devres,
     new_mutex,
@@ -67,6 +65,10 @@ use crate::{
     mmu,
     sched::tick, //
 };
+
+pub(crate) mod hw_gate;
+
+use hw_gate::HwGate;
 
 /// Lifecycle state of the reset worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +105,9 @@ struct Controller {
     /// recorded before that are held back until it is set.
     #[pin]
     ready: Mutex<bool>,
+    /// Gate closed around the reset so VM updates and address-space
+    /// operations drain before the hardware is wiped.
+    gate: Arc<HwGate>,
     /// Work item backing async reset processing.
     #[pin]
     work: Work<Controller>,
@@ -123,12 +128,14 @@ impl workqueue::WorkItem for Controller {
 impl Controller {
     /// Creates an `Arc<Controller>` ready for use.
     fn new(pdev: ARef<platform::Device>) -> Result<Arc<Self>> {
+        let gate = Arc::pin_init(HwGate::new(), GFP_KERNEL)?;
         Arc::pin_init(
             try_pin_init!(Self {
                 pdev,
                 ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
                 ready <- new_mutex!(false),
+                gate,
                 work <- kernel::new_work!("tyr::reset"),
             }),
             GFP_KERNEL,
@@ -236,7 +243,7 @@ impl Controller {
 
         let reset_result = guard.registration_data_with(|reg_data| {
             let parked = tick::pre_reset(&tdev, reg_data);
-            let reset_result = run_hw_reset(reg_data);
+            let reset_result = run_hw_reset(reg_data, &self.gate);
             tick::post_reset(&tdev, parked, reset_result.is_err());
 
             match reset_result {
@@ -259,18 +266,24 @@ impl Controller {
 
 /// Runs the hardware half of a reset cycle.
 ///
-/// Shared by the reset worker and the resume path that completes a reset
-/// latched while the device was suspended, so both run the identical
-/// sequence.
+/// The hardware-access gate is closed around the register wipe so in-flight
+/// readers drain first. Shared by the reset worker and the resume path that
+/// completes a reset latched while the device was suspended, so both run the
+/// identical sequence.
 ///
 /// The firmware reboot is attempted even when the soft reset reports a
 /// failure, since only the combined outcome decides whether the cycle
 /// failed.
-pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>) -> Result {
+pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>, gate: &HwGate) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
     reg_data.fw.pre_reset(&reg_data.job_irq, io);
     mmu::pre_reset(reg_data, io);
+
+    // A span parked on the closed gate holds a VM op lock while it waits.
+    // Taking an op lock here would deadlock against such a span, so this
+    // path takes none while the gate is closed.
+    let hw = gate.close();
 
     let reset_result = gpu::reset(reg_data.pdev.as_ref(), io);
     if let Err(e) = &reset_result {
@@ -278,6 +291,9 @@ pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>) -> Result {
     }
 
     mmu::post_reset(reg_data, io);
+
+    // Reopen before fw.post_reset reactivates the MCU VM through the gate.
+    drop(hw);
 
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     let reboot_result = reg_data.fw.post_reset(&reg_data.job_irq, core_clk_rate, io);
@@ -341,6 +357,14 @@ impl ResetHandle {
     /// scheduler itself after claiming the reset.
     pub(crate) fn in_progress(&self) -> bool {
         self.inner.controller.is_in_progress()
+    }
+
+    /// Returns a handle to the reset hardware-access gate.
+    ///
+    /// Readers acquire it around reset-sensitive hardware access so the
+    /// reset worker can drain them before wiping the hardware.
+    pub(crate) fn hw_gate(&self) -> Arc<HwGate> {
+        self.inner.controller.gate.clone()
     }
 
     /// Waits for an in-flight reset worker to finish.

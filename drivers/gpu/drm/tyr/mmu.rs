@@ -214,6 +214,10 @@ pub(crate) fn pre_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 /// The MMU IRQ is then re-enabled with a full mask rewrite.
 pub(crate) fn post_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
     {
+        // The reset worker holds the closed gate here, so eviction must not
+        // take a VM op lock and goes through the AS slot manager directly. A
+        // span parked on the closed gate re-checks residency when it resumes,
+        // so releasing the binding is enough.
         let mut as_manager = reg_data.mmu.as_manager.lock();
         for as_idx in 0..reg_data.mmu.as_slot_count {
             // Clone the VM here because slot_data borrows as_manager and
