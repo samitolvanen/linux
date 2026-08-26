@@ -35,7 +35,8 @@ use crate::{
     gpu::GpuInfo,
     irq::{
         clear_suspended,
-        quiesce, //
+        quiesce,
+        unquiesce, //
     },
     mmu::address_space::{
         AddressSpaceManager,
@@ -195,6 +196,43 @@ impl Mmu {
     pub(crate) fn end_vm_update(&self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
         self.as_manager.lock().end_vm_update(vm_as_data, region)
     }
+}
+
+/// Stops the MMU for a GPU reset.
+///
+/// Only the MMU IRQ is suspended. No AS commands are issued. The reset
+/// may have been scheduled because an AS command or cache flush is
+/// stuck.
+pub(crate) fn pre_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
+    quiesce(&reg_data.mmu_irq, io, irq::mmu_irq_disable);
+}
+
+/// Restores the MMU after a GPU reset.
+///
+/// The reset left every AS slot unprogrammed, so every recorded
+/// binding is released and the next activation reprograms the slot.
+/// The MMU IRQ is then re-enabled with a full mask rewrite.
+pub(crate) fn post_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
+    {
+        let mut as_manager = reg_data.mmu.as_manager.lock();
+        for as_idx in 0..reg_data.mmu.as_slot_count {
+            // Clone the VM here because slot_data borrows as_manager and
+            // deactivate_vm takes &mut self.
+            let Some(vm) = as_manager.slot_data(as_idx).cloned() else {
+                continue;
+            };
+            if let Err(e) = as_manager.deactivate_vm(&vm) {
+                dev_err!(
+                    reg_data.pdev,
+                    "post_reset: releasing AS slot {} failed: {:?}\n",
+                    as_idx,
+                    e
+                );
+            }
+        }
+    }
+
+    unquiesce(&reg_data.mmu_irq, io, irq::mmu_irq_enable);
 }
 
 /// Releases the resident AS slots and stops the MMU IRQ for runtime

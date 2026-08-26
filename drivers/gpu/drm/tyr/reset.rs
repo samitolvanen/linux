@@ -64,6 +64,7 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     gpu,
+    mmu,
     sched::tick, //
 };
 
@@ -269,11 +270,14 @@ pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
     reg_data.fw.pre_reset(&reg_data.job_irq, io);
+    mmu::pre_reset(reg_data, io);
 
     let reset_result = gpu::reset(reg_data.pdev.as_ref(), io);
     if let Err(e) = &reset_result {
         dev_err!(reg_data.pdev, "GPU reset failed: {:?}\n", e);
     }
+
+    mmu::post_reset(reg_data, io);
 
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     let reboot_result = reg_data.fw.post_reset(&reg_data.job_irq, core_clk_rate, io);

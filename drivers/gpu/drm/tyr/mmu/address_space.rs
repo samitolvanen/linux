@@ -609,6 +609,11 @@ impl SlotOperations<MAX_AS> for AddressSpaceManager {
 
     /// Evicts a VM from a hardware slot.
     fn evict(&mut self, slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
+        // The reset may have been scheduled for a stuck AS command, and it
+        // leaves the slot unprogrammed anyway, so release only the bookkeeping.
+        if self.reset.in_progress() {
+            return Ok(());
+        }
         self.as_disable(slot_idx)?;
         Ok(())
     }
