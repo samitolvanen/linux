@@ -59,7 +59,10 @@ use kernel::{
 };
 
 use crate::{
-    driver::TyrDrmDevice,
+    driver::{
+        TyrDrmDevice,
+        TyrDrmRegistrationData, //
+    },
     gpu,
     sched::tick, //
 };
@@ -231,29 +234,8 @@ impl Controller {
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
         let reset_result = guard.registration_data_with(|reg_data| {
-            let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
             let parked = tick::pre_reset(&tdev, reg_data);
-            reg_data.fw.pre_reset(&reg_data.job_irq, io);
-
-            let reset_result = gpu::reset(reg_data.pdev.as_ref(), io);
-            if let Err(e) = &reset_result {
-                dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
-            }
-
-            let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
-            let reboot_result = reg_data.fw.post_reset(&reg_data.job_irq, core_clk_rate, io);
-            if let Err(e) = &reboot_result {
-                dev_err!(
-                    self.pdev.as_ref(),
-                    "Firmware reboot after reset failed: {:?}\n",
-                    e
-                );
-
-                // TODO: Unplug the GPU.
-                // There is no API for unplugging the GPU.
-            }
-
-            let reset_result = reset_result.and(reboot_result);
+            let reset_result = run_hw_reset(reg_data);
             tick::post_reset(&tdev, parked, reset_result.is_err());
 
             match reset_result {
@@ -272,6 +254,41 @@ impl Controller {
             tick::resume(&tdev);
         }
     }
+}
+
+/// Runs the hardware half of a reset cycle.
+///
+/// Shared by the reset worker and the resume path that completes a reset
+/// latched while the device was suspended, so both run the identical
+/// sequence.
+///
+/// The firmware reboot is attempted even when the soft reset reports a
+/// failure, since only the combined outcome decides whether the cycle
+/// failed.
+pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>) -> Result {
+    let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
+
+    reg_data.fw.pre_reset(&reg_data.job_irq, io);
+
+    let reset_result = gpu::reset(reg_data.pdev.as_ref(), io);
+    if let Err(e) = &reset_result {
+        dev_err!(reg_data.pdev, "GPU reset failed: {:?}\n", e);
+    }
+
+    let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
+    let reboot_result = reg_data.fw.post_reset(&reg_data.job_irq, core_clk_rate, io);
+    if let Err(e) = &reboot_result {
+        dev_err!(
+            reg_data.pdev,
+            "Firmware reboot after reset failed: {:?}\n",
+            e
+        );
+
+        // TODO: Unplug the GPU.
+        // There is no API for unplugging the GPU.
+    }
+
+    reset_result.and(reboot_result)
 }
 
 /// User-facing handle for scheduling resets.
@@ -340,6 +357,21 @@ impl ResetHandle {
         drop(ddev);
     }
 
+    /// Claims a reset request recorded while the device was suspended.
+    ///
+    /// Returns `true` if a pending request was claimed. The caller then
+    /// performs the reset work itself (the resume path completes it
+    /// with a full firmware reload) and closes the cycle with
+    /// `Self::complete_claimed`.
+    pub(crate) fn claim_pending(&self) -> bool {
+        self.controller.claim_pending()
+    }
+
+    /// Completes a reset cycle claimed with `Self::claim_pending`.
+    pub(crate) fn complete_claimed(&self) {
+        self.controller.finish_reset()
+    }
+
     /// Publishes the DRM device reference the reset worker resolves.
     ///
     /// Called once probe has created the device. Devres revokes the
@@ -360,15 +392,16 @@ impl ResetHandle {
 
     /// Schedules a GPU reset on the dedicated workqueue.
     ///
-    /// If a reset is already pending or in progress the call is a no-op.
+    /// A reset that is already pending or in progress absorbs new requests.
     #[expect(dead_code)]
     pub(crate) fn schedule(&self) {
         let Some(tdev) = self.controller.device() else {
             return;
         };
 
-        // Keep only one reset request running or queued. If one is already
-        // pending, we ignore new schedule requests.
+        // Record before the enqueue below so a worker already queued but not
+        // yet started observes and claims the request. A duplicate enqueue is
+        // rejected harmlessly.
         if !self.controller.record_request() {
             // Probe is still bringing the device up, so `set_ready` runs the
             // request once it is done.
@@ -376,13 +409,13 @@ impl ResetHandle {
         }
 
         let Some(_active) = tdev.pm_get_if_active() else {
-            // The GPU is (or is about to be) powered off, so the recorded
-            // request stays pending without a queued worker.
+            // The GPU is (or is about to be) powered off, so the resume path
+            // claims the recorded request.
             return;
         };
 
-        // An enqueue failure means the work item is already queued. That run
-        // claims the pending request.
+        // Queue a worker even when a request is already pending, since a
+        // request recorded while the device was inactive has no worker.
         let _ = self.wq.enqueue(self.controller.clone());
     }
 }
