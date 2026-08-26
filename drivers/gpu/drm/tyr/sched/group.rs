@@ -244,13 +244,15 @@ pub(crate) struct Group {
     ///
     /// The device reaches groups through the scheduler lists and the
     /// `CsgSlotManager`, and every group holds an `ARef` back, so the
-    /// refcounts form a cycle. Two paths break it without waiting on
+    /// refcounts form a cycle. Three paths break it without waiting on
     /// the device:
     ///
     /// * File close empties the per-file `group::Pool`.
     /// * `Group::schedule_term` takes a reference for `term_work`,
     ///   which hands it to `release_work` for the drop on the cleanup
     ///   workqueue.
+    /// * Unbind flushes `heap_alloc_wq` after quiescing its producers,
+    ///   so no `tiler_oom_work` outlives it.
     pub(crate) tdev: ARef<TyrDrmDevice>,
     /// CSG slot manager seat for this group.
     ///
@@ -289,7 +291,8 @@ pub(crate) struct Group {
     /// The item is embedded in the group, so the enqueue allocates nothing.
     #[pin]
     release_work: Work<Group, { work_id::RELEASE }>,
-    /// Worker that services this group's pending tiler OOMs.
+    /// Worker that services this group's pending tiler OOMs on the
+    /// device's `heap_alloc_wq`.
     #[pin]
     tiler_oom_work: Work<Group, { work_id::TILER_OOM }>,
     #[pin]
@@ -620,15 +623,10 @@ impl Group {
     /// The queued work holds an `Arc<Group>` reference until the worker
     /// runs.
     pub(crate) fn schedule_tiler_oom(self: &Arc<Self>) {
-        let Some(guard) = self.tdev.registration_guard() else {
-            return;
-        };
-
-        guard.registration_data_with(|reg_data| {
-            let _ = reg_data
-                .heap_wq
-                .enqueue::<Arc<Self>, { work_id::TILER_OOM }>(self.clone());
-        });
+        let _ = self
+            .tdev
+            .heap_alloc_wq
+            .enqueue::<Arc<Self>, { work_id::TILER_OOM }>(self.clone());
     }
 
     /// Parks every queue in the group.
