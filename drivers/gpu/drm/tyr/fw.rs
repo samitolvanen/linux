@@ -51,7 +51,8 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice, //
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
     },
     fw::{
         global::GlobalInterface,
@@ -553,6 +554,7 @@ impl<'drm> Firmware<'drm> {
     /// input block, so no explicit `set_mcu_active` is needed.
     pub(crate) fn post_reset(
         &self,
+        tdev: &TyrDrmDevice,
         job_irq: &irq::JobIrqRegistration<'_>,
         core_clk_rate: u64,
         io: &IoMem<'_>,
@@ -573,7 +575,7 @@ impl<'drm> Firmware<'drm> {
             )
         })?;
 
-        self.reenable_global_interface(core_clk_rate, io)
+        self.reenable_global_interface(tdev, core_clk_rate, io)
     }
 
     /// Cold-boots the firmware from the retained sections after a power
@@ -581,12 +583,13 @@ impl<'drm> Firmware<'drm> {
     /// suspended state so bring-up starts from a known point.
     pub(crate) fn reload(
         &self,
+        tdev: &TyrDrmDevice,
         job_irq: &irq::JobIrqRegistration<'_>,
         core_clk_rate: u64,
         io: &IoMem<'_>,
     ) -> Result {
         self.pre_reset(job_irq, io);
-        self.post_reset(job_irq, core_clk_rate, io)
+        self.post_reset(tdev, job_irq, core_clk_rate, io)
     }
 
     /// Rewrites every firmware section from the data retained at load
@@ -613,6 +616,7 @@ impl<'drm> Firmware<'drm> {
     /// not reloaded.
     pub(crate) fn resume(
         &self,
+        tdev: &TyrDrmDevice,
         job_irq: &irq::JobIrqRegistration<'_>,
         core_clk_rate: u64,
         io: &IoMem<'_>,
@@ -629,7 +633,7 @@ impl<'drm> Firmware<'drm> {
         self.wait_ready(1000)
             .inspect_err(|_| dev_err!(self.dev, "Timed out waiting for firmware to be ready.\n"))?;
 
-        self.reenable_global_interface(core_clk_rate, io)
+        self.reenable_global_interface(tdev, core_clk_rate, io)
     }
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.
@@ -645,15 +649,38 @@ impl<'drm> Firmware<'drm> {
         self.global_iface.clone()
     }
 
+    /// Pings the firmware and waits up to `timeout_ms` for the ack.
+    ///
+    /// Returns `Err` if the firmware does not respond in time. The caller
+    /// must only ping while the device is powered and no reset owns the
+    /// firmware interface.
+    pub(crate) fn ping(&self, timeout_ms: u32) -> Result {
+        self.global_iface.ping(timeout_ms)
+    }
+
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
-        self.global_iface.enable(core_clk_rate, io)
+    pub(crate) fn enable_global_interface(
+        &self,
+        tdev: &TyrDrmDevice,
+        core_clk_rate: u64,
+        io: &IoMem<'_>,
+    ) -> Result {
+        self.global_iface.enable(core_clk_rate, io)?;
+        TyrDrmDeviceData::arm_fw_ping(&tdev.into());
+        Ok(())
     }
 
     /// Re-enables the global interface after a runtime resume or a GPU
     /// reset.
-    fn reenable_global_interface(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
-        self.global_iface.reenable(core_clk_rate, io)
+    fn reenable_global_interface(
+        &self,
+        tdev: &TyrDrmDevice,
+        core_clk_rate: u64,
+        io: &IoMem<'_>,
+    ) -> Result {
+        self.global_iface.reenable(core_clk_rate, io)?;
+        TyrDrmDeviceData::arm_fw_ping(&tdev.into());
+        Ok(())
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {

@@ -86,16 +86,24 @@ fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
 
 /// Brings the hardware components up for runtime resume, the reverse of
 /// `suspend_hw_components`.
-fn resume_hw_components(reg_data: &TyrDrmRegistrationData<'_>, reload: bool) -> Result {
+fn resume_hw_components(
+    tdev: &TyrDrmDevice,
+    reg_data: &TyrDrmRegistrationData<'_>,
+    reload: bool,
+) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
     gpu::resume(reg_data, io)?;
     mmu::resume(reg_data, io);
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     if reload {
-        reg_data.fw.reload(&reg_data.job_irq, core_clk_rate, io)
+        reg_data
+            .fw
+            .reload(tdev, &reg_data.job_irq, core_clk_rate, io)
     } else {
-        reg_data.fw.resume(&reg_data.job_irq, core_clk_rate, io)
+        reg_data
+            .fw
+            .resume(tdev, &reg_data.job_irq, core_clk_rate, io)
     }
 }
 
@@ -155,6 +163,8 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
 
     tdev.reset.flush();
 
+    tdev.cancel_fw_ping();
+
     guard.registration_data_with(|reg_data| {
         sched::tick::suspend(tdev, reg_data);
         // Drain any worker that raced the gate before halting the hardware.
@@ -192,15 +202,15 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         let pending_reset = tdev.reset.claim_pending();
 
         let hw = if pending_reset {
-            resume_hw_components(reg_data, true)
+            resume_hw_components(tdev, reg_data, true)
         } else {
-            resume_hw_components(reg_data, false).or_else(|e| {
+            resume_hw_components(tdev, reg_data, false).or_else(|e| {
                 dev_err!(
                     reg_data.pdev,
                     "Resume failed, retrying with a full firmware reload: {:?}\n",
                     e
                 );
-                resume_hw_components(reg_data, true)
+                resume_hw_components(tdev, reg_data, true)
             })
         };
 
@@ -216,7 +226,7 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         // claim, so no worker will pick it up. Complete it before the rebind.
         if tdev.reset.claim_pending() {
             let gate = tdev.reset.hw_gate();
-            let reset_res = reset::run_hw_reset(reg_data, &gate);
+            let reset_res = reset::run_hw_reset(tdev, reg_data, &gate);
             tdev.reset.complete_claimed();
 
             if let Err(e) = reset_res {
@@ -301,6 +311,13 @@ impl TyrDrmDeviceData {
     /// before the end of probe, when the device is still powered.
     pub(crate) fn pm_suspended(&self) -> bool {
         self.pm_context().is_some_and(|ctx| ctx.suspended())
+    }
+
+    /// Returns whether the recorded runtime PM state is active, i.e. the
+    /// device is powered with no transition in flight. `true` before the
+    /// end of probe, when the device is still powered.
+    pub(crate) fn pm_active(&self) -> bool {
+        self.pm_context().is_none_or(|ctx| ctx.active())
     }
 
     /// Returns whether the runtime PM callbacks have the device powered down.
