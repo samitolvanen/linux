@@ -27,33 +27,39 @@
 //!
 //!   - Idle/Pending/InProgress -> ShuttingDown
 //! ```
+//!
+//! A readiness gate holds a request recorded during probe at `Pending`
+//! until `set_ready` enqueues the worker.
 
 mod hw_gate;
 
 use kernel::{
-    io::mem::DevresIoMem,
+    devres::Devres,
+    new_mutex,
     platform,
     prelude::*,
-    sizes::SZ_2M,
     sync::{
         aref::ARef,
         atomic::{
             Atomic,
             AtomicType,
             Full,
+            Relaxed,
             Release, //
         },
-        Arc, //
+        Arc,
+        Mutex, //
     },
     workqueue::{
         self,
         OwnedQueue,
         Queue,
         Work, //
-    },
+    }, //
 };
 
 use crate::{
+    driver::TyrDrmDevice,
     gpu, //
 };
 
@@ -81,10 +87,17 @@ unsafe impl AtomicType for ResetState {
 #[pin_data]
 struct Controller {
     pdev: ARef<platform::Device>,
-    /// Mapped register space needed for reset operations.
-    iomem: Arc<DevresIoMem<SZ_2M>>,
+    /// DRM device reference, set once probe has created the device and
+    /// revoked by devres at unbind. Resolving it through `Devres` keeps
+    /// the back-reference from pinning the refcount cycle past unbind.
+    #[pin]
+    ddev: Mutex<Option<Devres<ARef<TyrDrmDevice>>>>,
     /// Lifecycle state of the reset worker.
     state: Atomic<ResetState>,
+    /// Set once probe has finished bringing the device up. Requests
+    /// recorded before that are held back until it is set.
+    #[pin]
+    ready: Mutex<bool>,
     /// Work item backing async reset processing.
     #[pin]
     work: Work<Controller>,
@@ -104,12 +117,13 @@ impl workqueue::WorkItem for Controller {
 
 impl Controller {
     /// Creates an `Arc<Controller>` ready for use.
-    fn new(pdev: ARef<platform::Device>, iomem: Arc<DevresIoMem<SZ_2M>>) -> Result<Arc<Self>> {
+    fn new(pdev: ARef<platform::Device>) -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
                 pdev,
-                iomem,
+                ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
+                ready <- new_mutex!(false),
                 work <- kernel::new_work!("tyr::reset"),
             }),
             GFP_KERNEL,
@@ -121,10 +135,26 @@ impl Controller {
         self.state.cmpxchg(from, to, Full).is_ok()
     }
 
-    #[inline]
-    fn record_request(&self) {
+    /// Records a reset request and returns whether the worker may run it.
+    ///
+    /// A request recorded before probe opens the reset path stays pending
+    /// until `set_ready` enqueues a worker for it.
+    fn record_request(&self) -> bool {
+        let ready = self.ready.lock();
         // A request lands only from Idle. Other states leave the machine as is.
         let _ = self.try_change_state(ResetState::Idle, ResetState::Pending);
+        *ready
+    }
+
+    /// Opens the reset path and returns whether a request is waiting.
+    ///
+    /// Both this and `record_request` run under the `ready` lock. Either
+    /// this call sees the recorded request, or the recording call sees the
+    /// open path and queues a worker itself.
+    fn set_ready(&self) -> bool {
+        let mut ready = self.ready.lock();
+        *ready = true;
+        self.state.load(Relaxed) == ResetState::Pending
     }
 
     #[inline]
@@ -137,6 +167,14 @@ impl Controller {
         let _ = self.try_change_state(ResetState::InProgress, ResetState::Idle);
     }
 
+    /// Closes a pending request the worker cannot run.
+    #[inline]
+    fn consume_request(&self) {
+        if self.claim_pending() {
+            self.finish_reset();
+        }
+    }
+
     fn begin_teardown(&self) {
         // Every other writer is an edge-checked CAS from a specific state.
         // After this store none of them matches, so the state is final and
@@ -144,30 +182,64 @@ impl Controller {
         self.state.store(ResetState::ShuttingDown, Release);
     }
 
+    /// Resolves the DRM device backing this controller.
+    ///
+    /// Returns `None` before probe wires the reference and after unbind
+    /// revokes it. The `ARef` is cloned out of the revocable guard so the
+    /// guard's RCU read-side critical section does not span the worker's
+    /// sleeps.
+    fn device(&self) -> Option<ARef<TyrDrmDevice>> {
+        let slot = self.ddev.lock();
+        let guard = slot.as_ref()?.try_access()?;
+        Some((*guard).clone())
+    }
+
     /// Processes one scheduled reset request.
     ///
     /// If the pending reset cannot be claimed, the worker returns immediately.
     fn reset_work(self: &Arc<Self>) {
+        let Some(tdev) = self.device() else {
+            self.consume_request();
+            return;
+        };
+
+        // The registration data owns the register mapping the reset
+        // below needs. Registration ends at unbind, which also empties
+        // the device slot, so treat a missing guard like a missing
+        // device.
+        let Some(guard) = tdev.registration_guard() else {
+            self.consume_request();
+            return;
+        };
+
+        // The token blocks a suspend when runtime PM can hold a reference. A
+        // reset must not run against a powered-off GPU, so a denied token
+        // leaves the request pending across the suspend cycle.
+        let Some(_active) = tdev.pm_get_if_active() else {
+            return;
+        };
+
         if !self.claim_pending() {
             return;
         }
 
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
-        match self
-            .iomem
-            .try_access()
-            .ok_or(ENODEV)
-            .and_then(|io| gpu::reset(self.pdev.as_ref(), &io))
-        {
-            Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
-            Err(e) => {
-                dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
+        guard.registration_data_with(|reg_data| {
+            let Ok(io) = reg_data.iomem.access(reg_data.pdev.as_ref()) else {
+                return;
+            };
 
-                // TODO: Unplug the GPU.
-                // There is no API for unplugging the GPU.
+            match gpu::reset(reg_data.pdev.as_ref(), io) {
+                Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
+                Err(e) => {
+                    dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
+
+                    // TODO: Unplug the GPU.
+                    // There is no API for unplugging the GPU.
+                }
             }
-        }
+        });
 
         self.finish_reset();
     }
@@ -192,14 +264,59 @@ impl Drop for ResetHandle {
 }
 
 impl ResetHandle {
-    pub(crate) fn new(
-        pdev: ARef<platform::Device>,
-        iomem: Arc<DevresIoMem<SZ_2M>>,
-    ) -> Result<Self> {
+    pub(crate) fn new(pdev: ARef<platform::Device>) -> Result<Self> {
         Ok(Self {
-            controller: Controller::new(pdev, iomem)?,
+            controller: Controller::new(pdev)?,
             wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
         })
+    }
+
+    /// Waits for an in-flight reset worker to finish.
+    pub(crate) fn flush(&self) {
+        self.controller.work.flush();
+    }
+
+    /// Cancels the reset worker at unbind.
+    ///
+    /// Empties the device slot so requests resolve no device from here
+    /// on, then drains an in-flight worker. Unbind runs before devres
+    /// teardown, so the drained worker still holds a live register
+    /// mapping. A work item enqueued by a racing `schedule` finds the
+    /// slot empty and consumes the request without hardware access.
+    pub(crate) fn unbind(&self) {
+        self.clear_device();
+        self.flush();
+    }
+
+    /// Empties the device slot.
+    ///
+    /// Probe calls this on its failure path while it still holds a
+    /// device reference. If devres empties the slot instead, the
+    /// revocation drops the last reference and the device teardown
+    /// deadlocks in the same `Devres`.
+    pub(crate) fn clear_device(&self) {
+        // Dropping the entry can wait for a concurrent revocation, so take
+        // it out of the slot first.
+        let ddev = self.controller.ddev.lock().take();
+        drop(ddev);
+    }
+
+    /// Publishes the DRM device reference the reset worker resolves.
+    ///
+    /// Called once probe has created the device. Devres revokes the
+    /// reference at unbind.
+    pub(crate) fn set_device(&self, ddev: Devres<ARef<TyrDrmDevice>>) {
+        *self.controller.ddev.lock() = Some(ddev);
+    }
+
+    /// Opens the reset path once probe has brought the device up.
+    ///
+    /// A request recorded during probe has no worker queued for it, so
+    /// this queues one.
+    pub(crate) fn set_ready(&self) {
+        if self.controller.set_ready() {
+            let _ = self.wq.enqueue(self.controller.clone());
+        }
     }
 
     /// Schedules a GPU reset on the dedicated workqueue.
@@ -207,10 +324,26 @@ impl ResetHandle {
     /// If a reset is already pending or in progress the call is a no-op.
     #[expect(dead_code)]
     pub(crate) fn schedule(&self) {
-        // Keep only one reset request running or queued. If one is already pending,
-        // we ignore new schedule requests. An enqueue failure means the work
-        // item is already queued. That run claims the pending request.
-        self.controller.record_request();
+        let Some(tdev) = self.controller.device() else {
+            return;
+        };
+
+        // Keep only one reset request running or queued. If one is already
+        // pending, we ignore new schedule requests.
+        if !self.controller.record_request() {
+            // Probe is still bringing the device up, so `set_ready` runs the
+            // request once it is done.
+            return;
+        }
+
+        let Some(_active) = tdev.pm_get_if_active() else {
+            // The GPU is (or is about to be) powered off, so the recorded
+            // request stays pending without a queued worker.
+            return;
+        };
+
+        // An enqueue failure means the work item is already queued. That run
+        // claims the pending request.
         let _ = self.wq.enqueue(self.controller.clone());
     }
 }
