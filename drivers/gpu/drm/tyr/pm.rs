@@ -130,6 +130,8 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
         dev_warn!(tdev.as_ref(), "Failed to suspend devfreq: {:?}\n", e);
     }
 
+    tdev.pm_powered_down.store(true, Relaxed);
+
     tdev.user_mmio.lock().set_powered(tdev, false);
 
     guard.registration_data_with(|reg_data| {
@@ -171,6 +173,11 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
             reg_data.clks.lock().gate();
             return Err(e);
         }
+
+        // The work reissued below tests this flag, so clear it first. A failed
+        // resume returns before this point, and the flag stays set until a
+        // later resume succeeds.
+        tdev.pm_powered_down.store(false, Relaxed);
 
         sched::tick::resume(tdev);
 
@@ -246,6 +253,11 @@ impl TyrDrmDeviceData {
         self.pm_context().is_some_and(|ctx| ctx.suspended())
     }
 
+    /// Returns whether the runtime PM callbacks have the device powered down.
+    pub(crate) fn pm_powered_down(&self) -> bool {
+        self.pm_powered_down.load(Relaxed)
+    }
+
     /// Takes an asynchronous runtime-PM usage reference for the scheduler.
     ///
     /// Returns `None` when runtime PM is unavailable, in which case the caller
@@ -273,11 +285,9 @@ impl TyrDrmDeviceData {
             Ok(None) => None,
             // `get_if_active` errors only when runtime PM is disabled, i.e.
             // under `CONFIG_PM=n` or inside the force-suspend window. A
-            // disabled device reads as active, so the driver-owned flag tells
-            // the two apart.
-            Err(_) => {
-                (!self.sched_suspended.load(Relaxed)).then_some(ActiveDevice { _scope: None })
-            }
+            // disabled device reads as active, so the driver-owned
+            // powered-down flag tells the two apart.
+            Err(_) => (!self.pm_powered_down()).then_some(ActiveDevice { _scope: None }),
         }
     }
 
