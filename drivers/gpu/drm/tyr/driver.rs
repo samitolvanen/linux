@@ -159,10 +159,9 @@ pub(crate) mod work_id {
 pub(crate) struct TyrDrmDeviceData {
     /// Handle for scheduling asynchronous GPU resets.
     ///
-    /// Dropping it drains queued and running reset work. The drain can run after
-    /// the registration data releases the clocks and regulators, but a late reset
-    /// worker cannot touch the hardware because the controller's register mapping
-    /// is revoked at unbind.
+    /// Once unbind has emptied the device slot, this field holds the
+    /// last handle clone. Dropping it tears down the worker queue,
+    /// which unbind has already drained.
     pub(crate) reset: reset::ResetHandle,
 
     /// Physical address of the GPU MMIO window.
@@ -651,6 +650,8 @@ impl platform::Driver for TyrPlatformDriver {
 
         let reset = reset::ResetHandle::new(pdev.into())?;
 
+        let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info, reset.clone())?;
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
@@ -681,8 +682,6 @@ impl platform::Driver for TyrPlatformDriver {
 
         let reset_dev = ARef::from(&*unreg_dev);
         let reset_guard = ScopeGuard::new(move || reset_dev.reset.clear_device());
-
-        let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info)?;
 
         let firmware = Firmware::new(
             pdev,
