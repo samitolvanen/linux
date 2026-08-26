@@ -37,6 +37,7 @@ use crate::{
     },
     gpu,
     mmu,
+    reset,
     sched, //
 };
 
@@ -82,13 +83,17 @@ fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
 
 /// Brings the hardware components up for runtime resume, the reverse of
 /// `suspend_hw_components`.
-fn resume_hw_components(reg_data: &TyrDrmRegistrationData<'_>) -> Result {
+fn resume_hw_components(reg_data: &TyrDrmRegistrationData<'_>, reload: bool) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
     gpu::resume(reg_data, io)?;
     mmu::resume(reg_data, io);
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
-    reg_data.fw.resume(&reg_data.job_irq, core_clk_rate, io)
+    if reload {
+        reg_data.fw.reload(&reg_data.job_irq, core_clk_rate, io)
+    } else {
+        reg_data.fw.resume(&reg_data.job_irq, core_clk_rate, io)
+    }
 }
 
 /// Latches a failed resume so the tick keeps asking for another resume,
@@ -106,6 +111,20 @@ fn latch_resume_failure(
             e
         );
     }
+    e
+}
+
+/// Failure path of `resume`. The device is returned to the suspended
+/// state so a later resume retries from a known point. Suspends the
+/// hardware first so nothing touches the gated block.
+fn fail_resume(
+    tdev: &ARef<TyrDrmDevice>,
+    reg_data: &TyrDrmRegistrationData<'_>,
+    e: Error,
+) -> Error {
+    let e = latch_resume_failure(tdev, reg_data, e);
+    suspend_hw_components(reg_data);
+    reg_data.clks.lock().gate();
     e
 }
 
@@ -133,6 +152,8 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
     // Nothing below fails. Once the governor is paused, the device
     // always reaches the suspended state.
     tdev.user_mmio.lock().set_powered(tdev, false);
+
+    tdev.reset.flush();
 
     guard.registration_data_with(|reg_data| {
         sched::tick::suspend(tdev, reg_data);
@@ -165,13 +186,41 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
             return Err(latch_resume_failure(tdev, reg_data, e));
         }
 
-        if let Err(e) = resume_hw_components(reg_data) {
-            // The unwind returns the hardware to the suspended state so a
-            // later resume retries from a known point.
-            let e = latch_resume_failure(tdev, reg_data, e);
-            suspend_hw_components(reg_data);
-            reg_data.clks.lock().gate();
-            return Err(e);
+        // A reset recorded while the device was suspended means the firmware state
+        // cannot be trusted, so complete the reset here with a full firmware
+        // reload instead of the fast resident-section reboot.
+        let pending_reset = tdev.reset.claim_pending();
+
+        let hw = if pending_reset {
+            resume_hw_components(reg_data, true)
+        } else {
+            resume_hw_components(reg_data, false).or_else(|e| {
+                dev_err!(
+                    reg_data.pdev,
+                    "Resume failed, retrying with a full firmware reload: {:?}\n",
+                    e
+                );
+                resume_hw_components(reg_data, true)
+            })
+        };
+
+        if pending_reset {
+            tdev.reset.complete_claimed();
+        }
+
+        if let Err(e) = hw {
+            return Err(fail_resume(tdev, reg_data, e));
+        }
+
+        // A request recorded during the reboot arrived after the earlier
+        // claim, so no worker will pick it up. Complete it before the rebind.
+        if tdev.reset.claim_pending() {
+            let reset_res = reset::run_hw_reset(reg_data);
+            tdev.reset.complete_claimed();
+
+            if let Err(e) = reset_res {
+                return Err(fail_resume(tdev, reg_data, e));
+            }
         }
 
         // The work reissued below tests this flag, so clear it first. A failed

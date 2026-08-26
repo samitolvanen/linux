@@ -544,6 +544,19 @@ impl<'drm> Firmware<'drm> {
         self.reenable_global_interface(core_clk_rate, io)
     }
 
+    /// Cold-boots the firmware from the retained sections after a power
+    /// cycle or wedge. The stop step forces the interface through the
+    /// suspended state so bring-up starts from a known point.
+    pub(crate) fn reload(
+        &self,
+        job_irq: &irq::JobIrqRegistration<'_>,
+        core_clk_rate: u64,
+        io: &IoMem<'_>,
+    ) -> Result {
+        self.pre_reset(job_irq, io);
+        self.post_reset(job_irq, core_clk_rate, io)
+    }
+
     /// Rewrites every firmware section from the data retained at load
     /// time.
     ///
