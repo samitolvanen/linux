@@ -191,10 +191,10 @@ impl VmAsData {
             // TTBR is programmed and stores that Arc in the active slot before
             // returning. Eviction flushes and disables the slot before releasing
             // the Arc. A failed eviction leaves the slot holding it until a
-            // power cycle clears the slot. The page table is otherwise freed
-            // only at unbind, where the driver core drops the driver's private
-            // data before releasing devres resources, so `Firmware::drop()`
-            // stops the MCU first.
+            // completed reset or a power cycle clears the slot. The page table
+            // is otherwise freed only at unbind, where the driver core drops
+            // the driver's private data before releasing devres resources, so
+            // `Firmware::drop()` stops the MCU first.
             transtab: unsafe { pt.ttbr() },
             memattr: MEMATTR::from_mair(pt.mair()).into_raw(),
         })
@@ -390,6 +390,7 @@ impl AddressSpaceManager {
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
         self.faulty[as_nr] = false;
+        self.lock_pending[as_nr] = false;
 
         Ok(())
     }

@@ -56,10 +56,10 @@ pub(crate) struct TyrIrq<'drm, T: TyrIrqTrait> {
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     irq: T,
-    /// Set while runtime suspend holds this line quiesced. The hard
-    /// handler then leaves the shared line to its other users without
-    /// touching a register, and the threaded handler leaves the line
-    /// masked on exit.
+    /// Set while the driver holds this line quiesced for a GPU reset or a
+    /// runtime suspend. The hard handler then leaves the shared line to
+    /// its other users without touching a register, and the threaded
+    /// handler leaves the line masked on exit.
     suspended: Atomic<bool>,
     #[pin]
     _pin: PhantomPinned,
@@ -142,9 +142,9 @@ impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
     }
 }
 
-/// Stops one IRQ line for runtime suspend. Masks the line through `mask`,
-/// sets a per-line suspended flag, and waits for the in-flight threaded
-/// handler.
+/// Stops one IRQ line for runtime suspend or a GPU reset. Masks the line
+/// through `mask`, sets a per-line suspended flag, and waits for the
+/// in-flight threaded handler.
 ///
 /// The line is masked before the flag is set, so the hard handler starts
 /// declining only once the sources are masked. The mask is rewritten after
@@ -168,4 +168,14 @@ pub(crate) fn quiesce<T: TyrIrqTrait>(
 /// goes unclaimed.
 pub(crate) fn clear_suspended<T: TyrIrqTrait>(reg: &ThreadedRegistration<'_, TyrIrq<'_, T>>) {
     reg.handler().set_suspended(false);
+}
+
+/// Clears the suspended flag and unmasks one IRQ line, reversing `quiesce`.
+pub(crate) fn unquiesce<T: TyrIrqTrait>(
+    reg: &ThreadedRegistration<'_, TyrIrq<'_, T>>,
+    io: &IoMem<'_>,
+    unmask: impl FnOnce(&IoMem<'_>),
+) {
+    clear_suspended(reg);
+    unmask(io);
 }
