@@ -56,9 +56,10 @@ pub(crate) struct TyrIrq<'drm, T: TyrIrqTrait> {
     tdev: ARef<TyrDrmDevice>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     irq: T,
-    /// Set while the driver holds this line quiesced for a GPU reset or a
-    /// runtime suspend. The hard handler then leaves the shared line to
-    /// its other users without touching a register, and the threaded
+    /// Set while the driver holds this line quiesced. The line is created
+    /// quiesced and probe clears the flag. A GPU reset and a runtime
+    /// suspend set it again. The hard handler then leaves the shared line
+    /// to its other users without touching a register, and the threaded
     /// handler leaves the line masked on exit.
     suspended: Atomic<bool>,
     #[pin]
@@ -82,12 +83,14 @@ impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
     where
         T: 'drm,
     {
+        // The line starts suspended, so an interrupt taken before the caller
+        // clears the flag is left to the other users of the shared line.
         let handler = try_pin_init!(Self {
             dev: pdev.as_ref(),
             tdev,
             iomem,
             irq,
-            suspended: Atomic::new(false),
+            suspended: Atomic::new(true),
             _pin: PhantomPinned,
         });
 

@@ -34,7 +34,6 @@ use crate::{
     },
     gpu::GpuInfo,
     irq::{
-        clear_suspended,
         quiesce,
         unquiesce, //
     },
@@ -271,6 +270,5 @@ pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 
 /// Re-enables the MMU IRQ for runtime resume.
 pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
-    clear_suspended(&reg_data.mmu_irq);
-    irq::mmu_irq_enable(io);
+    unquiesce(&reg_data.mmu_irq, io, irq::mmu_irq_enable);
 }

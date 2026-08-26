@@ -99,7 +99,10 @@ use crate::{
         },
         GpuInfo, //
     },
-    irq::TyrIrq,
+    irq::{
+        unquiesce,
+        TyrIrq, //
+    },
     mmap,
     mmu::{
         irq::{
@@ -776,7 +779,7 @@ impl platform::Driver for TyrPlatformDriver {
             unsafe { gpu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
             GFP_KERNEL,
         )?;
-        gpu_irq_enable(io);
+        unquiesce(&gpu_irq, io, gpu_irq_enable);
 
         // SAFETY: The registration is owned by `mmu_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
@@ -785,7 +788,7 @@ impl platform::Driver for TyrPlatformDriver {
             unsafe { mmu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
             GFP_KERNEL,
         )?;
-        mmu_irq_enable(io);
+        unquiesce(&mmu_irq, io, mmu_irq_enable);
 
         // SAFETY: The registration is owned by `job_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
@@ -802,7 +805,7 @@ impl platform::Driver for TyrPlatformDriver {
             }?,
             GFP_KERNEL,
         )?;
-        job_irq_enable(io);
+        unquiesce(&job_irq, io, job_irq_enable);
 
         let devfreq_registration = devfreq::init(&unreg_dev, pdev.as_ref(), &core_clk)?;
         let devfreq_registration = Arc::pin_init(new_mutex!(devfreq_registration), GFP_KERNEL)?;

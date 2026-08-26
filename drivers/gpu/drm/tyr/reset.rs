@@ -62,6 +62,7 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     gpu,
+    irq::unquiesce,
     mmu,
     sched::tick, //
 };
@@ -296,6 +297,8 @@ pub(crate) fn run_hw_reset(
     }
 
     mmu::post_reset(reg_data, io);
+
+    unquiesce(&reg_data.gpu_irq, io, gpu::irq::gpu_irq_enable);
 
     // Reopen before fw.post_reset reactivates the MCU VM through the gate.
     drop(hw);

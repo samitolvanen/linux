@@ -28,8 +28,8 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     irq::{
-        clear_suspended,
-        quiesce, //
+        quiesce,
+        unquiesce, //
     },
     regs::{
         gpu_control::*,
@@ -292,7 +292,6 @@ pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
 pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) -> Result {
-    clear_suspended(&reg_data.gpu_irq);
-    irq::gpu_irq_enable(io);
+    unquiesce(&reg_data.gpu_irq, io, irq::gpu_irq_enable);
     l2_power_on(reg_data.pdev.as_ref(), io)
 }
