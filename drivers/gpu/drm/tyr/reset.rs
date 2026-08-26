@@ -60,7 +60,8 @@ use kernel::{
 
 use crate::{
     driver::TyrDrmDevice,
-    gpu, //
+    gpu,
+    sched::tick, //
 };
 
 /// Lifecycle state of the reset worker.
@@ -133,6 +134,11 @@ impl Controller {
     #[inline]
     fn try_change_state(&self, from: ResetState, to: ResetState) -> bool {
         self.state.cmpxchg(from, to, Full).is_ok()
+    }
+
+    #[inline]
+    fn is_in_progress(&self) -> bool {
+        self.state.load(Relaxed) == ResetState::InProgress
     }
 
     /// Records a reset request and returns whether the worker may run it.
@@ -224,11 +230,9 @@ impl Controller {
 
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
-        guard.registration_data_with(|reg_data| {
-            let Ok(io) = reg_data.iomem.access(reg_data.pdev.as_ref()) else {
-                return;
-            };
-
+        let reset_result = guard.registration_data_with(|reg_data| {
+            let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
+            let parked = tick::pre_reset(&tdev, reg_data);
             reg_data.fw.pre_reset(&reg_data.job_irq, io);
 
             let reset_result = gpu::reset(reg_data.pdev.as_ref(), io);
@@ -249,13 +253,24 @@ impl Controller {
                 // There is no API for unplugging the GPU.
             }
 
-            match reset_result.and(reboot_result) {
+            let reset_result = reset_result.and(reboot_result);
+            tick::post_reset(&tdev, parked, reset_result.is_err());
+
+            match reset_result {
                 Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
                 Err(_) => dev_err!(self.pdev.as_ref(), "GPU reset cycle failed.\n"),
             }
+
+            reset_result
         });
 
         self.finish_reset();
+
+        if reset_result.is_ok() {
+            // With the machine back to idle, rebind the evicted groups and
+            // drain the firmware events that arrived during the reset.
+            tick::resume(&tdev);
+        }
     }
 }
 
@@ -283,6 +298,16 @@ impl ResetHandle {
             controller: Controller::new(pdev)?,
             wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
         })
+    }
+
+    /// Returns whether the reset worker is executing a claimed reset.
+    ///
+    /// Scheduler workers check this to stay off the CSG slots while the reset
+    /// worker owns them. A merely pending request does not gate them. It can
+    /// stay pending across a whole active period, and the worker stops the
+    /// scheduler itself after claiming the reset.
+    pub(crate) fn in_progress(&self) -> bool {
+        self.controller.is_in_progress()
     }
 
     /// Waits for an in-flight reset worker to finish.
