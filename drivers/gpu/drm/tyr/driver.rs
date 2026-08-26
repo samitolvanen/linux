@@ -195,6 +195,14 @@ pub(crate) struct TyrDrmDeviceData {
     /// groups after unbind, with no registration data left to hold it.
     pub(crate) term_wq: DmaFenceWorkqueue,
 
+    /// Dedicated unbound workqueue for the per-group tiler OOM workers.
+    /// Heap growth allocates with `GFP_KERNEL` and can block in reclaim,
+    /// so these workers get their own queue rather than sharing the
+    /// system workqueues. Unbind flushes the queue, so the drop-time
+    /// destruction finds it empty even when the device data outlives the
+    /// binding.
+    pub(crate) heap_alloc_wq: OwnedQueue,
+
     /// The scheduler logic.
     #[pin]
     sched: Mutex<SchedulerState>,
@@ -655,11 +663,6 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// queue so the scheduler can keep up with firmware acks under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
-    /// Workqueue for deferred tiler heap growth.
-    ///
-    /// Freed after the IRQ registrations, so no handler can queue work into it by then.
-    pub(crate) heap_wq: OwnedQueue,
-
     #[pin]
     pub(crate) clks: Mutex<Clocks>,
 
@@ -735,6 +738,8 @@ impl platform::Driver for TyrPlatformDriver {
 
         let term_wq = DmaFenceWorkqueue::new_unbound(c"tyr-group-term")?;
 
+        let heap_alloc_wq = Queue::new_unbound().build(c"tyr-heap-alloc")?;
+
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(CsgSlotOps, MAX_CSGS)?;
 
         let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
@@ -750,6 +755,7 @@ impl platform::Driver for TyrPlatformDriver {
                 mmio_phys_addr,
                 coherent,
                 term_wq,
+                heap_alloc_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
                 sched_suspended: Atomic::new(false),
                 csg_slot_manager <- new_mutex!(csg_slot_manager),
@@ -846,8 +852,6 @@ impl platform::Driver for TyrPlatformDriver {
 
         let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
 
-        let heap_wq = Queue::new_unbound().build(c"tyr-heap")?;
-
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
                 mmu,
@@ -857,7 +861,6 @@ impl platform::Driver for TyrPlatformDriver {
                 gpu_irq,
                 wq,
                 sched_wq,
-                heap_wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
@@ -935,6 +938,9 @@ impl PinnedDrop for TyrPlatformDriverData<'_> {
         // Let the queued terminations hand their groups to the cleanup
         // workqueue before the module can exit.
         self.reg.device().term_wq.flush();
+        // The workers that enqueue tiler OOM works are drained and their
+        // gates reject later runs, so the queue stays empty from here.
+        self.reg.device().heap_alloc_wq.flush();
         // Cancel the watchdog last. The halt cancels it too, but the halt is
         // skipped when the device is already suspended.
         self.reg.device().cancel_fw_ping();
