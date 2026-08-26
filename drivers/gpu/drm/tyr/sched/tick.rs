@@ -331,6 +331,18 @@ pub(crate) fn resume_after_system_sleep(tdev: &ARef<TyrDrmDevice>) {
     }
 }
 
+/// Releases the scheduler's usage reference at unbind.
+///
+/// Runs at unbind, after the halt or after the suspend that already
+/// evicted every resident group. A reference taken from here on would
+/// only arm a resume, and resume is refused.
+pub(crate) fn unbind(tdev: &ARef<TyrDrmDevice>) {
+    let _ = tdev.with_locked_scheduler(|sched| {
+        sched.pm_ref = None;
+        Ok(())
+    });
+}
+
 /// The groups `pre_reset` parked, handed back to `post_reset`.
 #[must_use]
 pub(crate) struct ParkedGroups(KVec<Arc<Group>>);

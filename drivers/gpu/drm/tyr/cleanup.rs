@@ -16,6 +16,10 @@
 //! the queue. The module creates it before the platform driver registers
 //! and destroys it after the driver has unregistered, which drains the
 //! drops deferred after unbind.
+//!
+//! An unmap that runs after unbind finds the hardware already stopped, and
+//! once devres revokes the register mapping the address-space manager's
+//! `try_access` fails closed.
 
 use core::mem::MaybeUninit;
 

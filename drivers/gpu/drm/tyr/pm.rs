@@ -19,7 +19,11 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
-        atomic::Relaxed,
+        atomic::{
+            Acquire,
+            Relaxed,
+            Release, //
+        },
         Arc, //
     }, //
 };
@@ -136,6 +140,24 @@ fn fail_resume(
     e
 }
 
+/// Stops every driver path that reaches the GPU, then powers the hardware
+/// components down. Shared by runtime suspend and unbind. A second call is
+/// a no-op, since the powered-down flag latches the halt.
+fn quiesce_and_suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationData<'_>) {
+    if tdev.pm_powered_down() {
+        return;
+    }
+    tdev.pm_powered_down.store(true, Relaxed);
+
+    tdev.user_mmio.lock().set_powered(tdev, false);
+    tdev.reset.flush();
+    tdev.cancel_fw_ping();
+    sched::tick::suspend(tdev, reg_data);
+    // Drain any worker that raced the gate before halting the hardware.
+    tdev.drain_sched_work();
+    suspend_hw_components(reg_data);
+}
+
 /// Powers the GPU down for runtime suspend.
 fn suspend(data: Option<&TyrPmPayload>) -> Result {
     let Some(data) = data else {
@@ -158,21 +180,10 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
         return Err(e);
     }
 
-    tdev.pm_powered_down.store(true, Relaxed);
-
     // Nothing below fails. Once the governor is paused, the device
     // always reaches the suspended state.
-    tdev.user_mmio.lock().set_powered(tdev, false);
-
-    tdev.reset.flush();
-
-    tdev.cancel_fw_ping();
-
     guard.registration_data_with(|reg_data| {
-        sched::tick::suspend(tdev, reg_data);
-        // Drain any worker that raced the gate before halting the hardware.
-        tdev.drain_sched_work();
-        suspend_hw_components(reg_data);
+        quiesce_and_suspend(tdev, reg_data);
         reg_data.clks.lock().gate();
     });
     Ok(())
@@ -184,6 +195,12 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         return Ok(());
     };
     let tdev = &data.tdev;
+
+    // Unbind stopped the hardware and the firmware memory is about to be
+    // freed, so refuse before touching any of it.
+    if tdev.unbinding() {
+        return Err(ENODEV);
+    }
 
     // Probe arms autosuspend before it registers the DRM device. The device
     // is still powered in that window, so there is nothing to resume.
@@ -240,7 +257,7 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         // The work reissued below tests this flag, so clear it first. A failed
         // resume returns before this point, and the flag stays set until a
         // later resume succeeds.
-        tdev.pm_powered_down.store(false, Relaxed);
+        tdev.pm_powered_down.store(false, Release);
 
         sched::tick::resume(tdev);
 
@@ -293,6 +310,49 @@ impl PMOps<platform::Adapter<TyrPlatformDriver>> for TyrPmOps {
     }
 }
 
+/// Runs the unbind halt on a powered device.
+fn halt_at_unbind(tdev: &ARef<TyrDrmDevice>) {
+    // `reg` drops after this runs, so the registration is still live.
+    let Some(guard) = tdev.registration_guard() else {
+        return;
+    };
+
+    // The last resume armed the ping watchdog and mapped the user MMIO
+    // page, so run the software steps too, not only the hardware halt.
+    guard.registration_data_with(|reg_data| quiesce_and_suspend(tdev, reg_data));
+}
+
+/// Halts the hardware at platform unbind and suspends the device.
+///
+/// Unbind is the last point at which the driver can reach the registers.
+/// The registration data drop frees the firmware sections next, and
+/// devres revokes the mapping after that. The caller sets `unbinding`
+/// first, so no resume can restart what this stops.
+pub(crate) fn suspend_at_unbind(tdev: &TyrDrmDevice) {
+    // Unbind only follows a successful probe, which publishes the
+    // context.
+    let Some(ctx) = tdev.pm_context() else {
+        return;
+    };
+
+    // The driver core dropped its usage reference before unbind, so take
+    // one for the halt and wait out any transition in flight. A suspended
+    // device fails here, since the resume it needs is refused.
+    let awake = ctx.get(PMProfile::new()).ok();
+
+    let tdev = ARef::from(tdev);
+
+    // A sticky runtime error or disabled runtime PM fails the call even
+    // on a powered device. The powered-down latch inside the halt covers
+    // those. Neither state allows a runtime suspend, so nothing can race
+    // the halt.
+    if awake.is_some() || ctx.active() {
+        halt_at_unbind(&tdev);
+    }
+
+    sched::tick::unbind(&tdev);
+}
+
 /// Permission token for hardware access.
 ///
 /// The `AwakeScope`-backed variant holds a usage reference that keeps the
@@ -325,27 +385,42 @@ impl TyrDrmDeviceData {
 
     /// Returns whether the runtime PM callbacks have the device powered down.
     pub(crate) fn pm_powered_down(&self) -> bool {
-        self.pm_powered_down.load(Relaxed)
+        self.pm_powered_down.load(Acquire)
+    }
+
+    /// Returns whether unbind has taken over the device power state.
+    pub(crate) fn unbinding(&self) -> bool {
+        self.unbinding.load(Relaxed)
+    }
+
+    /// Records that unbind has taken over the device power state.
+    pub(crate) fn set_unbinding(&self) {
+        self.unbinding.store(true, Relaxed);
     }
 
     /// Takes an asynchronous runtime-PM usage reference for the scheduler.
     ///
-    /// Returns `None` when runtime PM is unavailable, in which case the caller
-    /// runs without a reference.
+    /// Returns `None` when runtime PM is unavailable, or once unbind has
+    /// begun. The caller then runs without a reference.
     pub(crate) fn sched_pm_get(&self) -> Option<AwakeScope> {
+        if self.unbinding() {
+            return None;
+        }
         self.pm_context()?.get(ASYNC_PROFILE).ok()
     }
 
     /// Returns an `ActiveDevice` token if the device is powered, `None` if it
-    /// is runtime suspended or a transition is in flight. While runtime PM is
-    /// disabled, the driver-owned powered-down flag decides the outcome, and
-    /// a granted token holds no reference.
+    /// is runtime suspended or a transition is in flight. The driver-owned
+    /// powered-down flag vetoes the token, since unbind halts the hardware
+    /// without changing the PM core's recorded state. While runtime PM is
+    /// disabled that flag decides on its own, and a granted token holds no
+    /// reference.
     ///
     /// Callers that program the hardware take this token instead of resuming
     /// the device. Some run in a dma-fence signalling section, where an
     /// inline resume would run the heavyweight resume callback. On `None`,
-    /// callers skip the hardware access and rely on the resume path to
-    /// reissue the work.
+    /// callers skip the hardware access and leave the work to any later
+    /// resume.
     pub(crate) fn pm_get_if_active(&self) -> Option<ActiveDevice> {
         let Some(ctx) = self.pm_context() else {
             // The device is powered for the whole probe window. The
@@ -354,7 +429,9 @@ impl TyrDrmDeviceData {
         };
 
         match ctx.get_if_active(ASYNC_PROFILE) {
-            Ok(scope @ Some(_)) => Some(ActiveDevice { _scope: scope }),
+            Ok(Some(scope)) => (!self.pm_powered_down()).then_some(ActiveDevice {
+                _scope: Some(scope),
+            }),
             Ok(None) => None,
             // `get_if_active` errors only when runtime PM is disabled, i.e.
             // under `CONFIG_PM=n` or inside the force-suspend window. A
