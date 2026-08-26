@@ -364,10 +364,10 @@ impl ParkedGroups {
 
 /// Stops scheduling for a GPU reset.
 ///
-/// New ticks and firmware-event drains bail out while the reset worker
-/// is executing a claimed reset. Flush the in-flight ones, then evict
-/// every resident group through the same machinery as runtime suspend,
-/// including escalating to termination on ack timeout.
+/// The scheduler workers bail out while the reset worker is executing a
+/// claimed reset. Flush the in-flight ones, then evict every resident
+/// group through the same machinery as runtime suspend, including
+/// escalating to termination on ack timeout.
 ///
 /// The eviction leaves every group that can still run on a scheduler
 /// list, so parking the listed groups covers all of them. Groups it
