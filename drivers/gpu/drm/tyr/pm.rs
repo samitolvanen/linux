@@ -221,7 +221,7 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         // reload instead of the fast resident-section reboot.
         let pending_reset = tdev.reset.claim_pending();
 
-        let hw = if pending_reset {
+        let hw = if pending_reset || reg_data.fw.needs_reload() {
             resume_hw_components(tdev, reg_data, true)
         } else {
             resume_hw_components(tdev, reg_data, false).or_else(|e| {

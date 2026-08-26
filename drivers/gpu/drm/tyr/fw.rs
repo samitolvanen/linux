@@ -37,6 +37,11 @@ use kernel::{
     },
     str::CString,
     sync::{
+        atomic::{
+            Acquire,
+            Atomic,
+            Release, //
+        },
         Arc,
         ArcBorrow, //
     },
@@ -243,6 +248,12 @@ pub(crate) struct Firmware<'drm> {
     /// Firmware IRQ state, including readiness and event wait objects.
     irq_state: irq::JobIrqState,
 
+    /// Set when the MCU was disabled without reaching the halted state.
+    /// The resident sections may only be reused after a clean halt, so the
+    /// next boot reloads them. Cleared once `post_reset` completes, so a
+    /// reload that fails part way keeps it set.
+    unclean_stop: Atomic<bool>,
+
     /// The global FW interface.
     global_iface: Arc<GlobalInterface<'drm>>,
 }
@@ -414,6 +425,7 @@ impl<'drm> Firmware<'drm> {
                 vm: vm.clone(),
                 sections,
                 irq_state,
+                unclean_stop: Atomic::new(false),
                 global_iface,
             })
         })();
@@ -486,11 +498,17 @@ impl<'drm> Firmware<'drm> {
         )
     }
 
+    /// Returns whether the next boot has to reload the firmware sections.
+    pub(crate) fn needs_reload(&self) -> bool {
+        self.unclean_stop.load(Acquire)
+    }
+
     /// Halts and stops the MCU for runtime suspend, releasing the firmware AS
     /// slot for resume to reprogram.
     pub(crate) fn suspend(&self, job_irq: &irq::JobIrqRegistration<'_>, io: &IoMem<'_>) {
         if let Err(e) = self.halt_mcu(io) {
             dev_warn!(self.dev, "Failed to cleanly halt the MCU: {:?}\n", e);
+            self.unclean_stop.store(true, Release);
         }
 
         let _ = self.stop(io);
@@ -544,7 +562,10 @@ impl<'drm> Firmware<'drm> {
             )
         })?;
 
-        self.reenable_global_interface(tdev, core_clk_rate, io)
+        self.reenable_global_interface(tdev, core_clk_rate, io)?;
+        self.unclean_stop.store(false, Release);
+
+        Ok(())
     }
 
     /// Cold-boots the firmware from the retained sections after a power
@@ -582,7 +603,7 @@ impl<'drm> Firmware<'drm> {
     /// suspend.
     ///
     /// The sections live in system RAM and survive the suspend, so they are
-    /// not reloaded.
+    /// not reloaded. Only valid while `needs_reload` returns false.
     pub(crate) fn resume(
         &self,
         tdev: &TyrDrmDevice,
