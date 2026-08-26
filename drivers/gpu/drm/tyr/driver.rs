@@ -58,7 +58,10 @@ use kernel::{
         Mutex,
         SetOnce, //
     },
-    time::Jiffies,
+    time::{
+        msecs_to_jiffies,
+        Jiffies, //
+    },
     types::ScopeGuard,
     workqueue::{
         self,
@@ -137,6 +140,13 @@ pub(crate) fn parent_dev(tdev: &TyrDrmDevice) -> &device::Device {
     tdev.as_ref().as_ref()
 }
 
+/// Interval between firmware liveness pings.
+const PING_INTERVAL_MS: u32 = 12_000;
+
+/// Time the firmware is given to acknowledge a ping before the watchdog
+/// triggers a GPU reset.
+const PING_TIMEOUT_MS: u32 = 100;
+
 /// Per-device work-slot identifiers used as the `WORK_ID` const
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
@@ -149,6 +159,8 @@ pub(crate) mod work_id {
     pub(crate) const SYNC_UPD: u64 = 3;
     /// Periodic re-arming of the scheduler tick.
     pub(crate) const PERIODIC_TICK: u64 = 4;
+    /// Firmware liveness ping watchdog.
+    pub(crate) const FW_PING: u64 = 5;
 }
 
 /// Data owned by the DRM device.
@@ -246,6 +258,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// so a long-delay timer expiry does not hold a scheduler worker.
     #[pin]
     periodic_tick_work: DelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }>,
+
+    /// Firmware liveness ping watchdog on `system_dfl()`.
+    #[pin]
+    fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
 
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
@@ -383,6 +399,26 @@ impl TyrDrmDeviceData {
         let _ = workqueue::system_dfl()
             .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
     }
+
+    /// Arms the firmware ping watchdog `PING_INTERVAL_MS` from now.
+    ///
+    /// Called at global-interface enable and re-arm, so the watchdog only
+    /// runs while the firmware interface is live.
+    pub(crate) fn arm_fw_ping(tdev: &ARef<TyrDrmDevice>) {
+        let _ = workqueue::system_dfl()
+            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::FW_PING }>(
+                tdev.clone(),
+                msecs_to_jiffies(PING_INTERVAL_MS),
+            );
+    }
+
+    /// Cancels the firmware ping watchdog and waits for an in-flight ping.
+    ///
+    /// Called before the firmware is halted for a suspend or reset so no
+    /// ping reaches a stopped MCU. Must run in process context.
+    pub(crate) fn cancel_fw_ping(&self) {
+        let _ = self.fw_ping_work.cancel_sync();
+    }
 }
 
 impl_has_dma_fence_work! {
@@ -399,6 +435,10 @@ kernel::impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }> for TyrDrmDeviceData { self.periodic_tick_work }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::FW_PING }> for TyrDrmDeviceData { self.fw_ping_work }
 }
 
 impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
@@ -512,6 +552,42 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         Self::schedule_tick(&this);
+    }
+}
+
+impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        let tdev = &*this;
+
+        // A reset is in progress and owns the firmware interface, so skip
+        // the ping and the re-arm. The reset path re-arms the watchdog
+        // when it re-enables the global interface.
+        if tdev.reset.in_progress() {
+            return;
+        }
+
+        // The device is runtime suspended (or a transition is in flight),
+        // so the clocks are gated and the firmware MMIO is unreachable.
+        // The resume path, or an aborted suspend, re-arms the watchdog.
+        if !tdev.pm_active() {
+            return;
+        }
+
+        let Some(guard) = tdev.registration_guard() else {
+            return;
+        };
+
+        guard.registration_data_with(|reg_data| {
+            if reg_data.fw.ping(PING_TIMEOUT_MS).is_err() {
+                dev_err!(reg_data.pdev, "FW ping timeout, scheduling a reset\n");
+                tdev.reset.schedule();
+                return;
+            }
+
+            Self::arm_fw_ping(&this);
+        });
     }
 }
 
@@ -668,6 +744,7 @@ impl platform::Driver for TyrPlatformDriver {
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
+                fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
@@ -736,7 +813,12 @@ impl platform::Driver for TyrPlatformDriver {
             .wait_ready(1000)
             .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
-        firmware.enable_global_interface(core_clk.rate().as_hz() as u64, io)?;
+        firmware.enable_global_interface(&unreg_dev, core_clk.rate().as_hz() as u64, io)?;
+
+        // enable_global_interface armed the firmware watchdog. Cancel it if
+        // probe fails past this point so no ping outlives a failed bring-up.
+        let ping_dev = ARef::from(&*unreg_dev);
+        let ping_guard = ScopeGuard::new(move || ping_dev.cancel_fw_ping());
 
         let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware)?;
         unreg_dev.sched.lock().enable(scheduler);
@@ -819,6 +901,7 @@ impl platform::Driver for TyrPlatformDriver {
         };
 
         dev_dbg!(pdev, "Tyr initialized correctly.");
+        ping_guard.dismiss();
         reset_guard.dismiss();
         Ok(driver)
     }
@@ -828,6 +911,9 @@ impl platform::Driver for TyrPlatformDriver {
 impl PinnedDrop for TyrPlatformDriverData<'_> {
     fn drop(self: Pin<&mut Self>) {
         self.reg.device().reset.unbind();
+        // Cancel the watchdog after the reset worker has drained, since a
+        // reset re-arms it when it re-enables the global interface.
+        self.reg.device().cancel_fw_ping();
         drop(self.devfreq_registration.lock().take());
         // Let the queued terminations hand their groups to the cleanup
         // workqueue before the module can exit.

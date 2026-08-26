@@ -241,9 +241,10 @@ impl Controller {
 
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
+        tdev.cancel_fw_ping();
         let reset_result = guard.registration_data_with(|reg_data| {
             let parked = tick::pre_reset(&tdev, reg_data);
-            let reset_result = run_hw_reset(reg_data, &self.gate);
+            let reset_result = run_hw_reset(&tdev, reg_data, &self.gate);
             tick::post_reset(&tdev, parked, reset_result.is_err());
 
             match reset_result {
@@ -274,7 +275,11 @@ impl Controller {
 /// The firmware reboot is attempted even when the soft reset reports a
 /// failure, since only the combined outcome decides whether the cycle
 /// failed.
-pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>, gate: &HwGate) -> Result {
+pub(crate) fn run_hw_reset(
+    tdev: &TyrDrmDevice,
+    reg_data: &TyrDrmRegistrationData<'_>,
+    gate: &HwGate,
+) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
     reg_data.fw.pre_reset(&reg_data.job_irq, io);
@@ -296,7 +301,9 @@ pub(crate) fn run_hw_reset(reg_data: &TyrDrmRegistrationData<'_>, gate: &HwGate)
     drop(hw);
 
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
-    let reboot_result = reg_data.fw.post_reset(&reg_data.job_irq, core_clk_rate, io);
+    let reboot_result = reg_data
+        .fw
+        .post_reset(tdev, &reg_data.job_irq, core_clk_rate, io);
     if let Err(e) = &reboot_result {
         dev_err!(
             reg_data.pdev,
