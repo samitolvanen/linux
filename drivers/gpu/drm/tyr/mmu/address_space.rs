@@ -228,6 +228,11 @@ pub(crate) struct AddressSpaceManager {
     /// is programmed again.
     faulty: [bool; MAX_AS],
 
+    /// Whether hardware AS slot N stopped completing commands. A command
+    /// timeout sets it. A reset releases the slot binding, and the next
+    /// activation to land on the slot clears it.
+    stuck: [bool; MAX_AS],
+
     /// Reset handle for escalating stuck AS commands and cache flushes.
     reset: ResetHandle,
 }
@@ -258,6 +263,7 @@ impl AddressSpaceManager {
             as_present,
             lock_pending: [false; MAX_AS],
             faulty: [false; MAX_AS],
+            stuck: [false; MAX_AS],
             reset,
         })
     }
@@ -293,24 +299,32 @@ impl AddressSpaceManager {
 
     /// Waits for an AS slot to become ready (not active).
     ///
-    /// Returns an error if polling times out or if register access fails.
-    fn as_wait_ready(&self, as_nr: usize) -> Result {
+    /// Returns an error if the slot is invalid, if polling times out, or if
+    /// register access fails. A slot already known to be stuck fails without
+    /// polling.
+    fn as_wait_ready(&mut self, as_nr: usize) -> Result {
+        self.validate_as_slot(as_nr)?;
+
+        if self.stuck[as_nr] {
+            return Err(ETIMEDOUT);
+        }
+
         let op = || {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
             let status_reg = STATUS::try_at(as_nr).ok_or(EINVAL)?;
             Ok(io.read(status_reg))
         };
         let cond = |status: &STATUS| -> bool { !status.active_ext() };
-        poll::read_poll_timeout(op, cond, Delta::from_micros(50), Delta::from_millis(100))
-            .inspect_err(|e| {
-                // A stuck AS_ACTIVE bit only clears with a GPU reset.
-                if *e == ETIMEDOUT {
-                    dev_err!(&self.pdev, "AS_ACTIVE bit stuck\n");
-                    self.reset.schedule();
-                }
-            })?;
+        let res =
+            poll::read_poll_timeout(op, cond, Delta::from_micros(50), Delta::from_millis(100));
+        if matches!(res, Err(e) if e == ETIMEDOUT) {
+            // A stuck AS_ACTIVE bit only clears with a GPU reset.
+            dev_err!(&self.pdev, "AS_ACTIVE bit stuck\n");
+            self.reset.schedule();
+            self.stuck[as_nr] = true;
+        }
 
-        Ok(())
+        res.map(|_| ())
     }
 
     /// Sends a command to an AS slot.
@@ -373,6 +387,9 @@ impl AddressSpaceManager {
             );
         }
 
+        // Cleared before the command because `as_wait_ready` would
+        // otherwise fail it.
+        self.stuck[as_nr] = false;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
         self.faulty[as_nr] = false;
 
