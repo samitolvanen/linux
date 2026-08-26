@@ -1161,6 +1161,20 @@ impl Queue {
         fence
     }
 
+    /// Stops the pipeline from handing any further job to the
+    /// firmware and from failing one. Jobs keep resolving their
+    /// dependencies and pile up in front of the exec stage, and the
+    /// per-job deadline stops being evaluated until the unpark.
+    pub(crate) fn park(&self) {
+        self.job_queue.park();
+    }
+
+    /// Releases a park and rechecks the pipeline, so jobs that piled
+    /// up behind it are submitted without waiting for another event.
+    pub(crate) fn unpark(&self) {
+        self.job_queue.unpark();
+    }
+
     /// Signals every pending submit fence with `err`.
     ///
     /// The caller must have made the group unrunnable first, so the jobs
