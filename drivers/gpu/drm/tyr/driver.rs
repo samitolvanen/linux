@@ -12,6 +12,7 @@ use kernel::{
         Core,
         DeviceContext, //
     },
+    devres::Devres,
     dma::{
         Device as DmaDevice,
         DmaMask, //
@@ -58,6 +59,7 @@ use kernel::{
         SetOnce, //
     },
     time::Jiffies,
+    types::ScopeGuard,
     workqueue::{
         self,
         impl_has_delayed_work,
@@ -409,7 +411,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
         // Processing events ACKs them through CSG doorbells. If the
         // device is runtime suspended, leave the events latched in
         // `fw_events`. The resume path reschedules this worker.
-        let Some(_active) = tdev.sched_pm_get_if_active() else {
+        let Some(_active) = tdev.pm_get_if_active() else {
             return;
         };
 
@@ -641,7 +643,7 @@ impl platform::Driver for TyrPlatformDriver {
 
         let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
 
-        let reset = reset::ResetHandle::new(pdev.into(), iomem.clone())?;
+        let reset = reset::ResetHandle::new(pdev.into())?;
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
@@ -666,6 +668,13 @@ impl platform::Driver for TyrPlatformDriver {
                 opp_config <- new_mutex!(None),
             }? Error),
         )?;
+
+        unreg_dev
+            .reset
+            .set_device(Devres::new(pdev.as_ref(), ARef::from(&*unreg_dev))?);
+
+        let reset_dev = ARef::from(&*unreg_dev);
+        let reset_guard = ScopeGuard::new(move || reset_dev.reset.clear_device());
 
         let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info)?;
 
@@ -796,6 +805,8 @@ impl platform::Driver for TyrPlatformDriver {
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), unreg_dev, reg_data, 0)? };
 
+        reg.device().reset.set_ready();
+
         let driver = TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
@@ -803,6 +814,7 @@ impl platform::Driver for TyrPlatformDriver {
         };
 
         dev_dbg!(pdev, "Tyr initialized correctly.");
+        reset_guard.dismiss();
         Ok(driver)
     }
 }
@@ -810,6 +822,7 @@ impl platform::Driver for TyrPlatformDriver {
 #[pinned_drop]
 impl PinnedDrop for TyrPlatformDriverData<'_> {
     fn drop(self: Pin<&mut Self>) {
+        self.reg.device().reset.unbind();
         drop(self.devfreq_registration.lock().take());
         // Let the queued terminations hand their groups to the cleanup
         // workqueue before the module can exit.

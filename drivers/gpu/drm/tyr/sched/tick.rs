@@ -138,7 +138,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
     // The token blocks a suspend mid-tick without itself resuming. When the
     // device is down the tick defers, holding a usage reference for any
     // runnable work so the asynchronous resume reissues the tick.
-    let Some(_active) = tdev.sched_pm_get_if_active() else {
+    let Some(_active) = tdev.pm_get_if_active() else {
         let (resume_pending, kick_pending, resume_failed) =
             tdev.with_locked_scheduler(|sched| {
                 // A reference taken against a failing resume arms nothing, so
