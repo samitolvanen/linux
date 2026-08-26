@@ -203,10 +203,9 @@ impl Controller {
             return;
         };
 
-        // The registration data owns the register mapping the reset
-        // below needs. Registration ends at unbind, which also empties
-        // the device slot, so treat a missing guard like a missing
-        // device.
+        // The registration data owns the firmware the reboot below needs.
+        // Registration ends at unbind, which also empties the device slot,
+        // so treat a missing guard like a missing device.
         let Some(guard) = tdev.registration_guard() else {
             self.consume_request();
             return;
@@ -230,14 +229,29 @@ impl Controller {
                 return;
             };
 
-            match gpu::reset(reg_data.pdev.as_ref(), io) {
-                Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
-                Err(e) => {
-                    dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
+            reg_data.fw.pre_reset(&reg_data.job_irq, io);
 
-                    // TODO: Unplug the GPU.
-                    // There is no API for unplugging the GPU.
-                }
+            let reset_result = gpu::reset(reg_data.pdev.as_ref(), io);
+            if let Err(e) = &reset_result {
+                dev_err!(self.pdev.as_ref(), "GPU reset failed: {:?}\n", e);
+            }
+
+            let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
+            let reboot_result = reg_data.fw.post_reset(&reg_data.job_irq, core_clk_rate, io);
+            if let Err(e) = &reboot_result {
+                dev_err!(
+                    self.pdev.as_ref(),
+                    "Firmware reboot after reset failed: {:?}\n",
+                    e
+                );
+
+                // TODO: Unplug the GPU.
+                // There is no API for unplugging the GPU.
+            }
+
+            match reset_result.and(reboot_result) {
+                Ok(()) => dev_info!(self.pdev.as_ref(), "GPU reset completed.\n"),
+                Err(_) => dev_err!(self.pdev.as_ref(), "GPU reset cycle failed.\n"),
             }
         });
 

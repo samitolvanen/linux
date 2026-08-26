@@ -18,8 +18,9 @@ use kernel::{
         Bound,
         Device, //
     },
-    drm::{
-        gem::BaseObject, //
+    drm::gem::{
+        shmem::VMapOwned,
+        BaseObject, //
     },
     firmware,
     io::{
@@ -57,6 +58,7 @@ use crate::{
     },
     gem,
     gem::{
+        BoData,
         KernelBo,
         KernelBoVaAlloc, //
     },
@@ -206,8 +208,15 @@ pub(super) const CSF_MCU_SHARED_REGION_SIZE: u32 = 0x04000000;
 /// A parsed section of the firmware binary.
 pub(crate) struct Section {
     // Raw firmware section data for reset purposes
-    #[expect(dead_code)]
     data: KVec<u8>,
+
+    // Section flags, retained so a reset reload reproduces the zero
+    // tail of the initial load.
+    section_flags: SectionFlags,
+
+    // CPU mapping of the section, retained so the reset path can
+    // rewrite the section without allocating a fresh vmap.
+    vmap: VMapOwned<BoData>,
 
     // Keep the BO backing this firmware section so that both the
     // GPU mapping and CPU mapping remain valid until the Section is dropped.
@@ -227,7 +236,6 @@ pub(crate) struct Firmware<'drm> {
     vm: Arc<Vm>,
 
     /// Firmware sections, held to keep their mappings alive while the MCU runs.
-    #[expect(dead_code)]
     sections: KVec<Section>,
 
     /// Firmware IRQ state, including readiness and event wait objects.
@@ -266,7 +274,7 @@ impl<'drm> Firmware<'drm> {
 
     fn init_section_mem(
         dev: &Device,
-        mem: &mut KernelBo,
+        vmap: &VMapOwned<BoData>,
         data: &KVec<u8>,
         flags: SectionFlags,
     ) -> Result {
@@ -276,8 +284,7 @@ impl<'drm> Firmware<'drm> {
             return Ok(());
         }
 
-        let vmap = mem.bo().vmap::<0>()?;
-        let size = mem.bo().size();
+        let size = vmap.owner().size();
 
         if data.len() > size {
             dev_err!(dev, "fw section {} bigger than BO {}", data.len(), size);
@@ -354,7 +361,7 @@ impl<'drm> Firmware<'drm> {
                 let va = u64::from(va.start);
                 let end = va + size;
 
-                let mut mem = KernelBo::new(
+                let mem = KernelBo::new(
                     dev,
                     ddev,
                     vm.clone(),
@@ -370,9 +377,18 @@ impl<'drm> Firmware<'drm> {
                     vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
                 }
 
-                Self::init_section_mem(dev, &mut mem, &data, section_flags)?;
+                let vmap = mem.bo().owned_vmap::<0>()?;
+                Self::init_section_mem(dev, &vmap, &data, section_flags)?;
 
-                sections.push(Section { data, mem }, GFP_KERNEL)?;
+                sections.push(
+                    Section {
+                        data,
+                        section_flags,
+                        vmap,
+                        mem,
+                    },
+                    GFP_KERNEL,
+                )?;
             }
 
             let irq_state = irq::JobIrqState::new()?;
@@ -481,6 +497,70 @@ impl<'drm> Firmware<'drm> {
         let _ = self.vm.deactivate();
     }
 
+    /// Stops the firmware for a GPU reset.
+    ///
+    /// The reset runs because the firmware stopped responding, so it
+    /// is force-stopped and the subsequent `post_reset` does a
+    /// full reload.
+    ///
+    /// The firmware VM is left resident so page-table updates on it keep
+    /// issuing cache and TLB maintenance up to the soft reset. It is released
+    /// after the soft reset by `mmu::post_reset`, together with the user VMs.
+    pub(crate) fn pre_reset(&self, job_irq: &irq::JobIrqRegistration<'_>, io: &IoMem<'_>) {
+        quiesce(job_irq, io, irq::job_irq_disable);
+
+        let _ = self.stop(io);
+        self.global_iface.suspend();
+    }
+
+    /// Reboots the MCU after a GPU reset.
+    ///
+    /// The hang may have corrupted firmware memory, so every section is
+    /// rewritten from the data retained at load time before the MCU
+    /// restarts. The reload also clears the halt request in the global
+    /// input block, so no explicit `set_mcu_active` is needed.
+    pub(crate) fn post_reset(
+        &self,
+        job_irq: &irq::JobIrqRegistration<'_>,
+        core_clk_rate: u64,
+        io: &IoMem<'_>,
+    ) -> Result {
+        clear_suspended(job_irq);
+
+        self.vm.activate()?;
+        self.reload_sections()?;
+        self.irq_state.clear_ready();
+
+        irq::job_irq_enable(io);
+
+        self.boot(io)?;
+        self.wait_ready(1000).inspect_err(|_| {
+            dev_err!(
+                self.dev,
+                "Timed out waiting for firmware to be ready after reset.\n"
+            )
+        })?;
+
+        self.reenable_global_interface(core_clk_rate, io)
+    }
+
+    /// Rewrites every firmware section from the data retained at load
+    /// time.
+    ///
+    /// Writes go through the vmaps retained in `Section`, so the reset
+    /// path neither allocates nor takes BO locks.
+    fn reload_sections(&self) -> Result {
+        for section in self.sections.iter() {
+            Self::init_section_mem(
+                self.vm.dev(),
+                &section.vmap,
+                &section.data,
+                section.section_flags,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Boots the MCU from the resident firmware sections after a runtime
     /// suspend.
     ///
@@ -525,7 +605,8 @@ impl<'drm> Firmware<'drm> {
         self.global_iface.enable(core_clk_rate, io)
     }
 
-    /// Re-enables the global interface after a runtime resume.
+    /// Re-enables the global interface after a runtime resume or a GPU
+    /// reset.
     fn reenable_global_interface(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
         self.global_iface.reenable(core_clk_rate, io)
     }

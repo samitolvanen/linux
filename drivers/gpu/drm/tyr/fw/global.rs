@@ -283,8 +283,8 @@ impl<'drm> GlobalInterface<'drm> {
     /// Re-enables a suspended interface in place.
     ///
     /// The MCU rebooted from the resident sections, so the interface views
-    /// from `enable` stay valid and reusing them keeps the resume path
-    /// allocation-free.
+    /// from `enable` stay valid and reusing them keeps the resume and reset
+    /// paths allocation-free.
     pub(crate) fn reenable(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
         // Clone the retained views out so the firmware ack wait below
         // runs without `inner` held. The GLB IRQ path takes `inner` and
@@ -308,7 +308,7 @@ impl<'drm> GlobalInterface<'drm> {
 
         let request_field = GlobalInterfaceRequests::new(&glb_input, &glb_output);
         if let Err(e) = request_field.wait_acks(ack_mask, &self.event_wait, 1000) {
-            pr_err!("CSF firmware failed to ACK the GLB config after resume\n");
+            dev_err!(self.dev, "CSF firmware failed to ACK the GLB config\n");
             return Err(e);
         }
 
@@ -740,7 +740,7 @@ impl InnerGlobalInterface {
     }
 
     /// Returns a suspended interface to the enabled state once the
-    /// resume path has reconfigured and re-acknowledged it.
+    /// re-enable path has reconfigured and re-acknowledged it.
     fn resume_enabled(&mut self) {
         self.state = match core::mem::replace(&mut self.state, GlobalInterfaceState::Disabled) {
             GlobalInterfaceState::Enabled(e) | GlobalInterfaceState::Suspended(e) => {
