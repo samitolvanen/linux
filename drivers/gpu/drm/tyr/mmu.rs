@@ -49,7 +49,13 @@ use crate::{
         },
         MAX_AS, //
     },
-    reset::ResetHandle,
+    reset::{
+        hw_gate::{
+            HwGate,
+            HwReadGuard, //
+        },
+        ResetHandle, //
+    },
     slot::SlotManager, //
 };
 
@@ -64,6 +70,10 @@ pub(crate) type AsSlotManager = SlotManager<AddressSpaceManager, MAX_AS>;
 pub(crate) struct Mmu {
     /// Total number of hardware AS slots reported by the GPU.
     as_slot_count: usize,
+
+    /// Gate serializing reset-sensitive AS operations against the reset
+    /// worker. Shared with the reset controller that closes it.
+    hw_gate: Arc<HwGate>,
 
     /// Slot Manager instance used to allocate hardware slots and write to MMU registers.
     #[pin]
@@ -81,6 +91,7 @@ impl Mmu {
         let present = AS_PRESENT::from_raw(gpu_info.as_present).present().get();
         let slot_count: usize = present.count_ones().try_into()?;
 
+        let hw_gate = reset.hw_gate();
         let address_space_manager = AddressSpaceManager::new(pdev, iomem, present, reset)?;
         let as_slot_manager =
             SlotManager::new(address_space_manager, slot_count).inspect_err(|e| {
@@ -93,6 +104,7 @@ impl Mmu {
             })?;
         let mmu_init = try_pin_init!(Self{
             as_slot_count: slot_count,
+            hw_gate,
             as_manager <- new_mutex!(as_slot_manager),
         });
         Arc::pin_init(mmu_init, GFP_KERNEL)
@@ -104,6 +116,15 @@ impl Mmu {
     /// count of slots available to user VMs is `as_slot_count() - 1`.
     pub(crate) fn as_slot_count(&self) -> usize {
         self.as_slot_count
+    }
+
+    /// Enters a read section on the reset hardware-access gate.
+    ///
+    /// Held across reset-sensitive AS MMIO so the reset worker drains it
+    /// before wiping the hardware. Acquired outside the AS manager lock, so a
+    /// caller parked on a closed gate never holds it.
+    pub(crate) fn begin_hw_access(&self) -> HwReadGuard<'_> {
+        self.hw_gate.read()
     }
 
     /// Assign a VM to an AS slot, provide a translation table,
@@ -119,6 +140,7 @@ impl Mmu {
             return Ok(());
         }
         let _op = vm_as_data.lock_ops();
+        let _hw = self.begin_hw_access();
         self.as_manager.lock().activate_vm(vm_as_data)
     }
 
@@ -136,6 +158,7 @@ impl Mmu {
     /// an in-flight page-table update on the same VM.
     pub(crate) fn deactivate_vm(&self, vm_as_data: &VmAsData) -> Result {
         let _op = vm_as_data.lock_ops();
+        let _hw = self.begin_hw_access();
         self.as_manager.lock().deactivate_vm(vm_as_data)
     }
 
