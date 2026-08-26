@@ -210,6 +210,10 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
             .inspect_err(|_| Scheduler::request_tick(tdev))
     });
 
+    if result == Err(ETIMEDOUT) {
+        tdev.reset.schedule();
+    }
+
     // schedule_term needs no scheduler state, so drain after the mutex
     // is released, keeping the tick's critical section short.
     for slot in teardown_groups.iter_mut() {

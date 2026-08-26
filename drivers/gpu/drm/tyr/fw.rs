@@ -95,6 +95,7 @@ mod region;
 // to `crate::fw`. The apply path only depends on these typed views.
 pub(crate) use interfaces::{
     CsBlockedReason,
+    CsFatalExceptionType,
     CsFaultExceptionType,
     CsWaitCondition,
     CsgExecutionState,
