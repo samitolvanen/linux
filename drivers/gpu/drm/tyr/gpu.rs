@@ -134,6 +134,10 @@ impl GpuInfo {
                 io.read(TILER_PRESENT_HI).into_raw(),
             ),
             core_features: io.read(CORE_FEATURES).into_raw(),
+            gpu_features: join_u64(
+                io.read(GPU_FEATURES_LO).into_raw(),
+                io.read(GPU_FEATURES_HI).into_raw(),
+            ),
             // Zero unsupported and newly added UAPI fields.
             ..pin_init::zeroed()
         })
