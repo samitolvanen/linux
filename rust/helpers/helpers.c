@@ -51,6 +51,7 @@
 #include "build_bug.c"
 #include "capability.c"
 #include "clk.c"
+#include "compat.c"
 #include "completion.c"
 #include "cpu.c"
 #include "cpufreq.c"
