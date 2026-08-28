@@ -270,6 +270,10 @@ impl TyrDrmFileData {
                     Err(EINVAL)?;
                 }
 
+                if !vm.in_user_va_range(op.0.va, op.0.size) {
+                    Err(EINVAL)?;
+                }
+
                 match op.0.flags as i32 & type_mask {
                     uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP => {
                         let bo = gem::lookup_handle(file, op.0.bo_handle)?;
@@ -345,6 +349,11 @@ impl TyrDrmFileData {
         for i in 0..count {
             let res = {
                 let op: VmBindOp = reader.read()?;
+
+                if !vm.in_user_va_range(op.0.va, op.0.size) {
+                    Err(EINVAL)?;
+                }
+
                 let (job, syncs) = op.capture(file, true)?;
                 let deps = deps::wait_fences(file, &syncs)?;
                 let signals = deps::signal_syncs(file, &syncs)?;
