@@ -164,6 +164,24 @@ impl<T: DriverObject> Object<T> {
         self.obj.get()
     }
 
+    /// Returns whether the object's backing pages are currently present, i.e.
+    /// [`drm_gem_shmem_object::pages`] is non-NULL.
+    ///
+    /// This is a lockless read. The value may change concurrently, so a stale
+    /// result is possible. That is acceptable for the fdinfo memory accounting
+    /// this serves, where the read must not sleep or take a lock.
+    ///
+    /// [`drm_gem_shmem_object::pages`]: srctree/include/drm/drm_gem_shmem_helper.h
+    #[inline]
+    pub fn pages_present(&self) -> bool {
+        let shmem = self.as_raw_shmem();
+
+        // SAFETY: `shmem` points to the embedded `drm_gem_shmem_object`, which
+        // is valid for the lifetime of `self` per the type invariant. The
+        // volatile read tolerates a concurrent write from the page put path.
+        !unsafe { core::ptr::read_volatile(&raw const (*shmem).pages) }.is_null()
+    }
+
     /// Returns the `Device` that owns this GEM object.
     pub fn dev(&self) -> &Device<T::Driver> {
         // SAFETY: `dev` will have been initialized in `Self::new()` by `drm_gem_shmem_init()`.
