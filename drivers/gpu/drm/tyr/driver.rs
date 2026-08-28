@@ -90,6 +90,7 @@ use kernel::{
 
 use crate::{
     cleanup,
+    debugfs::VmRegistry,
     devfreq::{
         self,
         TyrDevfreq,
@@ -409,6 +410,9 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
+
+    /// Device-wide registry of live VMs backing the `gpuvas` debugfs file.
+    pub(crate) vm_registry: Arc<VmRegistry>,
 }
 
 impl TyrDrmDeviceData {
@@ -1120,6 +1124,7 @@ impl platform::Driver for TyrPlatformDriver {
                     unbinding: Atomic::new(false),
                     unusable: Atomic::new(false),
                     user_mmio <- new_mutex!(mmap::UserMmio::new()?),
+                    vm_registry: Arc::pin_init(VmRegistry::new(), GFP_KERNEL)?,
                 }? Error),
             )?;
 
