@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! Device-wide VM registry backing the `gpuvas` debugfs file.
+//! Device-wide VM registry and the `gpuvas` debugfs file.
 //!
-//! The registry tracks live VMs without referencing them, so a debugfs file
+//! The registry tracks live VMs without referencing them, so the debugfs file
 //! can dump them without walking per-file state. Without `CONFIG_DEBUG_FS`
 //! the registry does nothing.
 
 #[cfg(not(CONFIG_DEBUG_FS))]
 pub(crate) use self::disabled::VmRegistry;
 #[cfg(CONFIG_DEBUG_FS)]
-pub(crate) use self::enabled::VmRegistry;
+pub(crate) use self::enabled::{
+    GpuvasShow,
+    VmRegistry, //
+};
 
 #[cfg(CONFIG_DEBUG_FS)]
 mod enabled {
     use core::ptr::NonNull;
 
     use kernel::{
+        debugfs::SeqShow,
         list::{
             impl_list_arc_safe,
             impl_list_item,
@@ -25,10 +29,17 @@ mod enabled {
         },
         pr_warn_once,
         prelude::*,
+        seq_file::{
+            seq_print,
+            SeqFile, //
+        },
         sync::Mutex, //
     };
 
-    use crate::vm::Vm;
+    use crate::{
+        driver::TyrDrmRegistrationData,
+        vm::Vm, //
+    };
 
     /// One registry entry, holding a non-owning pointer to a live VM.
     #[pin_data]
@@ -117,6 +128,27 @@ mod enabled {
                 }
                 cursor.move_next();
             }
+        }
+
+        fn print_gpuvas(&self, m: &SeqFile) -> Result {
+            let vms = self.vms.lock();
+            for entry in vms.iter() {
+                // SAFETY: `entry.vm` points to a live VM, because every VM
+                // unregisters under this lock before its owner drops it.
+                let vm = unsafe { entry.vm.as_ref() };
+                vm.show_gpuvas(m)?;
+                seq_print!(m, "\n");
+            }
+            Ok(())
+        }
+    }
+
+    /// The `gpuvas` debugfs file, a device-wide dump of every VM's GPU VA space.
+    pub(crate) struct GpuvasShow;
+
+    impl SeqShow<TyrDrmRegistrationData<'_>> for GpuvasShow {
+        fn show(reg_data: &TyrDrmRegistrationData<'_>, m: &SeqFile) -> Result {
+            reg_data.vm_registry.print_gpuvas(m)
         }
     }
 }
