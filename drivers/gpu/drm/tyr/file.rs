@@ -120,10 +120,10 @@ pub(crate) fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Res
 
 /// Validate a single `drm_panthor_vm_bind_op` at the ioctl entry, before any
 /// state is mutated or any job is queued. Rejects `EINVAL` if `va`, `size`,
-/// or `bo_offset` is not GPU-page-aligned, if `va + size` overflows, and for
-/// `MAP` ops if `bo_handle` is invalid, if `bo_offset + size` is out of
-/// bounds for the target BO, or if the BO is exclusive to a VM other than
-/// `vm`.
+/// or `bo_offset` is not GPU-page-aligned, if `[va, va + size)` falls outside
+/// the VM's user VA range, and for `MAP` ops if `bo_handle` is invalid, if
+/// `bo_offset + size` is out of bounds for the target BO, or if the BO is
+/// exclusive to a VM other than `vm`.
 ///
 /// For `MAP` ops, returns the looked-up `Bo` so the caller can perform the
 /// bind against the same BO that was validated, avoiding a TOCTOU window.
@@ -136,7 +136,9 @@ fn validate_bind_op(
         return Err(EINVAL);
     }
 
-    op.0.va.checked_add(op.0.size).ok_or(EINVAL)?;
+    if !vm.in_user_va_range(op.0.va, op.0.size) {
+        return Err(EINVAL);
+    }
 
     let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
     if op.0.flags as i32 & type_mask

@@ -851,6 +851,8 @@ pub(crate) struct Vm {
     bind_lock: Mutex<()>,
     /// VA range for this VM.
     va_range: Range<u64>,
+    /// Exclusive upper bound on what user space may bind.
+    user_va_limit: u64,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
     kernel_va: range::RangeAlloc,
     /// Kernel VA reservations that must live as long as the VM.
@@ -931,6 +933,7 @@ impl Vm {
                 bind_queue,
                 bind_lock <- new_mutex!(()),
                 va_range: total_range,
+                user_va_limit: kernel_range.start,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
                 root_gem: dummy_obj,
@@ -1017,6 +1020,12 @@ impl Vm {
         };
 
         self.kernel_va.allocate(size, align, GFP_KERNEL)
+    }
+
+    /// Returns whether `[va, va + size)` lies wholly below the exclusive
+    /// user VA limit.
+    pub(crate) fn in_user_va_range(&self, va: u64, size: u64) -> bool {
+        va < self.user_va_limit && size <= self.user_va_limit - va
     }
 
     /// Returns the dummy GEM object whose `dma_resv` anchors this VM.
