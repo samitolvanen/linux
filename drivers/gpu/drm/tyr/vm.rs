@@ -125,6 +125,9 @@ use crate::{
     }, //
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::seq_file::SeqFile;
+
 // SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
 // static is never dropped.
 static VM_BIND_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -1313,6 +1316,16 @@ impl Vm {
     /// Returns the GEM object that this VM's sparse mappings are bound over.
     pub(crate) fn sparse_bo(&self) -> Option<&Bo> {
         self.sparse_bo.as_deref()
+    }
+
+    /// Dumps this VM's GPU VA space to `m`, holding the lock that guards the
+    /// VA tree against concurrent bind and unbind.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn show_gpuvas(&self, m: &SeqFile) -> Result {
+        match self.exec.gpuvm_unique.lock().as_ref() {
+            Some(unique) => unique.dump_gpuva_info(m),
+            None => Ok(()),
+        }
     }
 
     /// Locks this VM's reservation together with those of every external
