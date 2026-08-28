@@ -636,6 +636,8 @@ pub(crate) struct VmExec {
 pub(crate) struct Vm {
     exec: Arc<VmExec>,
     bind_queue: Option<JobQueue<VmBindQueueOps>>,
+    /// Exclusive upper bound on what user space may bind.
+    user_va_limit: u64,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
     kernel_va: range::RangeAlloc,
     /// Kernel VA reservations that must live as long as the VM.
@@ -720,6 +722,7 @@ impl Vm {
             pin_init!(Self {
                 exec,
                 bind_queue,
+                user_va_limit: kernel_range.start,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
             }),
@@ -773,6 +776,12 @@ impl Vm {
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
         self.kernel_va.allocate(size, GFP_KERNEL)
+    }
+
+    /// Returns whether `[va, va + size)` lies wholly below the exclusive
+    /// user VA limit.
+    pub(crate) fn in_user_va_range(&self, va: u64, size: u64) -> bool {
+        va < self.user_va_limit && size <= self.user_va_limit - va
     }
 
     #[expect(dead_code)]
