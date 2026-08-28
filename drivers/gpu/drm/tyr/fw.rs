@@ -54,6 +54,7 @@ use kernel::{
 };
 
 use crate::{
+    debugfs::VmRegistry,
     driver::{
         IoMem,
         TyrDrmDevice,
@@ -262,6 +263,10 @@ pub(crate) struct Firmware<'drm> {
     /// MCU VM.
     vm: Arc<Vm>,
 
+    /// Device-wide registry of live VMs, which lists the MCU VM while the
+    /// firmware is loaded.
+    vm_registry: Arc<VmRegistry>,
+
     /// Firmware sections, held to keep their mappings alive while the MCU runs.
     sections: KVec<Section>,
 
@@ -286,6 +291,8 @@ impl<'drm> Drop for Firmware<'drm> {
     fn drop(&mut self) {
         // Stop the MCU before releasing its firmware mappings and memory.
         self.stop_mcu();
+
+        self.vm_registry.unregister(&self.vm);
 
         // AS slots retain a VM ref, we need to kill the circular ref manually.
         self.vm.kill();
@@ -473,6 +480,7 @@ impl<'drm> Firmware<'drm> {
     #[inline(never)]
     fn build_firmware(
         pdev: &'drm platform::Device<Bound>,
+        ddev: &TyrDrmDevice,
         iomem: Arc<DevresIoMem<SZ_2M>>,
         vm: &Arc<Vm>,
         gpu_info: &GpuInfo,
@@ -497,6 +505,7 @@ impl<'drm> Firmware<'drm> {
             dev: pdev,
             iomem,
             vm: vm.clone(),
+            vm_registry: ddev.vm_registry.clone(),
             sections,
             irq_state,
             unclean_stop: Atomic::new(false),
@@ -527,13 +536,18 @@ impl<'drm> Firmware<'drm> {
 
         let result = Self::load(dev, ddev, gpu_info)
             .and_then(|parsed| Self::load_sections(dev, ddev, &vm, coherent, parsed))
-            .and_then(|sections| Self::build_firmware(pdev, iomem, &vm, gpu_info, sections));
+            .and_then(|sections| Self::build_firmware(pdev, ddev, iomem, &vm, gpu_info, sections));
 
-        if result.is_err() {
-            vm.kill();
+        match result {
+            Ok(firmware) => {
+                firmware.vm_registry.register(&firmware.vm);
+                Ok(firmware)
+            }
+            Err(e) => {
+                vm.kill();
+                Err(e)
+            }
         }
-
-        result
     }
 
     /// Polls `MCU_STATUS` until it reaches `target` and `acked` returns
