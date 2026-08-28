@@ -178,7 +178,12 @@ impl Pool {
             self.sparse_bo.clone(),
         )?;
 
-        let index = self.entries.insert(vm)?;
+        // Register before the pool can reach the VM by index, so a concurrent
+        // destroy never races ahead of the registration.
+        ddev.vm_registry.register(&vm);
+        let index = self.entries.insert(vm.clone()).inspect_err(|_| {
+            ddev.vm_registry.unregister(&vm);
+        })?;
 
         Ok((index, user_va_limit))
     }
@@ -221,6 +226,9 @@ impl Pool {
 
     fn destroy_vm_index(&self, tdev: &TyrDrmDevice, index: usize) -> Result {
         let vm = self.entries.remove(index)?;
+
+        // Unregister while the removed `Arc` still holds the VM alive.
+        tdev.vm_registry.unregister(&vm);
 
         vm.mark_unusable();
         if vm.as_slot().is_some() {
