@@ -152,6 +152,11 @@ use crate::{
     slot::SlotManager, //
 };
 
+#[cfg(CONFIG_DEBUG_FS)]
+use crate::debugfs::GpuvasShow;
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::debugfs::ScopeRef;
+
 pub(crate) type IoMem<'a> = kernel::io::mem::IoMem<'a, SZ_2M>;
 pub(crate) type TyrRegisters = kernel::io::Region<SZ_2M>;
 
@@ -375,6 +380,7 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
 
     /// Device-wide registry of live VMs backing the `gpuvas` debugfs file.
+    /// Shared with the registration data, which the debugfs file receives.
     pub(crate) vm_registry: Arc<VmRegistry>,
 }
 
@@ -840,6 +846,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Command stream interface information reported to userspace.
     pub(crate) csif_info: gpu::CsifInfo,
+
+    /// Device-wide registry of live VMs, dumped by the `gpuvas` debugfs file.
+    pub(crate) vm_registry: Arc<VmRegistry>,
 }
 
 kernel::of_device_table!(
@@ -984,6 +993,9 @@ impl platform::Driver for TyrPlatformDriver {
 
         let mmu = Mmu::new(pdev, iomem.clone(), &gpu_info, reset.clone())?;
 
+        let vm_registry = Arc::pin_init(VmRegistry::new(), GFP_KERNEL)?;
+        let dev_vm_registry = vm_registry.clone();
+
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(
             pdev,
             try_pin_init!(TyrDrmDeviceData {
@@ -1015,7 +1027,7 @@ impl platform::Driver for TyrPlatformDriver {
                 unbinding: Atomic::new(false),
                 unusable: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
-                vm_registry: Arc::pin_init(VmRegistry::new(), GFP_KERNEL)?,
+                vm_registry: dev_vm_registry,
             }? Error),
         )?;
 
@@ -1168,6 +1180,7 @@ impl platform::Driver for TyrPlatformDriver {
                 iomem,
                 gpu_info,
                 csif_info,
+                vm_registry,
         });
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
@@ -1316,6 +1329,11 @@ impl drm::Driver for TyrDrmDriver {
         printer.fdinfo_print_size(c"panthor", c"resident", c"memory", mem.resident);
         printer.fdinfo_print_size(c"panthor", c"active", c"memory", mem.active);
         file.show_memory_stats(printer);
+    }
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    fn debugfs_init(dir: &ScopeRef<'_, TyrDrmRegistrationData<'_>>) {
+        dir.seq_file::<GpuvasShow>(c"gpuvas");
     }
 }
 
