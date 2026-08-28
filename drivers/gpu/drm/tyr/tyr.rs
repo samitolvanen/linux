@@ -17,6 +17,7 @@ use kernel::{
 use crate::driver::TyrPlatformDriver;
 
 mod cleanup;
+mod debugfs;
 mod devfreq;
 mod driver;
 mod file;
