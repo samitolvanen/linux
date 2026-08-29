@@ -119,6 +119,11 @@ use crate::{
         TyrPmPayload,
         AUTOSUSPEND_DELAY_MS, //
     },
+    pwr::{
+        pwr_irq_enable,
+        pwr_irq_init,
+        PwrIrq, //
+    },
     regs::gpu_control::*,
     reset,
     sched::{
@@ -770,6 +775,10 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// handler outlives them.
     pub(crate) gpu_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, GpuIrq>>>>,
 
+    /// Second registration on the "gpu" interrupt line, for the PWR block. `None` on hardware
+    /// without PWR_CONTROL.
+    pub(crate) pwr_irq: Option<Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, PwrIrq>>>>>,
+
     /// Workqueue for work items that may signal DMA fences.
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
@@ -956,6 +965,21 @@ impl platform::Driver for TyrPlatformDriver {
         )?;
         unquiesce(&gpu_irq, io, gpu_irq_enable);
 
+        let pwr_irq = match hw_ops {
+            HwOps::V14 { .. } => {
+                // SAFETY: The registration is owned by `pwr_irq` and then by
+                // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so
+                // it is never forgotten.
+                let pwr_irq = KBox::pin_init(
+                    unsafe { pwr_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
+                    GFP_KERNEL,
+                )?;
+                unquiesce(&pwr_irq, io, pwr_irq_enable);
+                Some(pwr_irq)
+            }
+            HwOps::V10 => None,
+        };
+
         // SAFETY: The registration is owned by `mmu_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
         // is never forgotten.
@@ -1058,6 +1082,7 @@ impl platform::Driver for TyrPlatformDriver {
                 job_irq,
                 mmu_irq,
                 gpu_irq,
+                pwr_irq,
                 wq,
                 sched_wq,
                 clks <- new_mutex!(clks),
