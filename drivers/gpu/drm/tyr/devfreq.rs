@@ -174,7 +174,7 @@ impl opp::ConfigOps for OppConfigOps {}
 /// from the callback data before the config is released.
 struct OppSetup {
     data: Arc<TyrDevfreqData>,
-    _config: opp::ConfigToken,
+    _config: Option<opp::ConfigToken>,
 }
 
 impl Drop for OppSetup {
@@ -215,9 +215,14 @@ pub(crate) fn init(
 
     let names = kvec![CString::try_from(c"mali")?]?;
 
-    let config_token = opp::Config::<OppConfigOps>::new()
+    let config = match opp::Config::<OppConfigOps>::new()
         .set_regulator_names(names)?
-        .set(pdev)?;
+        .set(pdev)
+    {
+        Ok(config_token) => Some(config_token),
+        Err(e) if e == ENODEV => None,
+        Err(e) => return Err(e),
+    };
 
     let dev: ARef<Device> = pdev.into();
     let table = match opp::Table::from_of(&dev, 0) {
@@ -246,7 +251,7 @@ pub(crate) fn init(
     tdev.devfreq_data.opp_table.lock().as_mut().set(Some(table));
     let opp_setup = OppSetup {
         data: tdev.devfreq_data.clone(),
-        _config: config_token,
+        _config: config,
     };
 
     let cur_freq = core_clk.rate();
