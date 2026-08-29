@@ -43,7 +43,6 @@ use kernel::{
     },
     prelude::*,
     regulator,
-    regulator::Regulator,
     sizes::SZ_2M,
     sync::{
         aref::ARef,
@@ -765,9 +764,6 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     #[pin]
     pub(crate) clks: Mutex<Clocks>,
 
-    #[pin]
-    regulators: Mutex<Regulators>,
-
     /// Device-managed handle to the GPU MMIO register mapping.
     pub(crate) iomem: Arc<DevresIoMem<SZ_2M>>,
 
@@ -816,7 +812,11 @@ impl platform::Driver for TyrPlatformDriver {
         };
         clks.ungate()?;
 
-        let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
+        match regulator::devm_enable_optional(pdev.as_ref(), c"mali") {
+            Ok(()) => {}
+            Err(e) if e == ENODEV => {}
+            Err(e) => return Err(e),
+        }
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
         let mmio_phys_addr = request.start();
@@ -1013,7 +1013,7 @@ impl platform::Driver for TyrPlatformDriver {
             return Err(EBUSY);
         }
 
-        // The clocks and the regulator move into the data below.
+        // The clocks move into the data below.
         power_guard.dismiss();
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
@@ -1026,9 +1026,6 @@ impl platform::Driver for TyrPlatformDriver {
                 wq,
                 sched_wq,
                 clks <- new_mutex!(clks),
-                regulators <- new_mutex!(Regulators {
-                    _mali: mali_regulator,
-                }),
                 iomem,
                 gpu_info,
                 csif_info,
@@ -1183,8 +1180,4 @@ impl Drop for Clocks {
             self.core.disable_unprepare();
         }
     }
-}
-
-struct Regulators {
-    _mali: Regulator<regulator::Enabled>,
 }
