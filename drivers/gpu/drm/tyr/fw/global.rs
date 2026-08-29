@@ -124,6 +124,10 @@ fn has_glb_state(version: GLB_VERSION) -> bool {
     (version.major().get(), version.minor().get()) >= (4, 1)
 }
 
+fn has_64bit_ep_req(version: GLB_VERSION) -> bool {
+    (version.major().get(), version.minor().get()) >= (4, 0)
+}
+
 /// Request/acknowledge communication between Tyr and CSF.
 struct GlobalInterfaceRequests<'a> {
     /// Global input block where driver writes requests.
@@ -651,11 +655,19 @@ impl InnerGlobalInterface {
             return Err(EINVAL);
         }
 
+        let has_64bit_ep_req = has_64bit_ep_req(version);
         let mut csg = KVec::with_capacity(csg_num, GFP_KERNEL)?;
         for csg_idx in 0..csg_num {
             let first_cs = csg.first().and_then(|first: &CsgInterface| first.cs(0));
             let mut entry = CsgInterface::new(csg_idx)?;
-            entry.enable(dev, shared_section, csg_idx, csg_stride, first_cs)?;
+            entry.enable(
+                dev,
+                shared_section,
+                csg_idx,
+                csg_stride,
+                has_64bit_ep_req,
+                first_cs,
+            )?;
 
             if csg.first().is_some_and(|first| !entry.matches(first)) {
                 dev_err!(dev, "CSG {} does not match CSG 0\n", csg_idx);
