@@ -92,6 +92,7 @@ pub(in crate::fw) use self::{
             CSG_ALLOW_FRAGMENT,
             CSG_ALLOW_OTHER,
             CSG_DB_REQ,
+            CSG_EP_REQ2,
             CSG_IRQ_ACK,
             CSG_PROTM_SUSPEND_BUF,
             CSG_SUSPEND_BUF, //
@@ -1079,6 +1080,26 @@ mod csg {
             ///
             /// Configures the allowed requests for each type of endpoint for this CSG.
             pub CSG_EP_REQ(u32) @ 0x34 {
+                /// Maximum number of endpoints which can run compute jobs.
+                7:0 compute_ep;
+                /// Maximum number of endpoints which can run fragment jobs.
+                15:8 fragment_ep;
+                /// Maximum number of endpoints which can run tiler jobs.
+                19:16 tiler_ep;
+                /// Endpoint exclusively runs compute jobs.
+                20:20 exclusive_compute => bool;
+                /// Endpoint exclusively runs fragment jobs.
+                21:21 exclusive_fragment => bool;
+                /// Priority of the CSG with respect to other CSGs (higher value = higher priority).
+                31:28 priority;
+            }
+
+            /// Endpoint allocation request, 64-bit form.
+            ///
+            /// CSF interface 4.0 moved the endpoint request into this wider
+            /// register and stopped reading `CSG_EP_REQ`. The low 32 bits keep
+            /// the `CSG_EP_REQ` field layout.
+            pub CSG_EP_REQ2(u64) @ 0x38 {
                 /// Maximum number of endpoints which can run compute jobs.
                 7:0 compute_ep;
                 /// Maximum number of endpoints which can run fragment jobs.
