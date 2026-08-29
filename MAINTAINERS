@@ -20095,6 +20095,8 @@ F:	drivers/nvmem/
 F:	include/dt-bindings/nvmem/
 F:	include/linux/nvmem-consumer.h
 F:	include/linux/nvmem-provider.h
+F:	rust/helpers/nvmem.c
+F:	rust/kernel/nvmem.rs
 
 NXP BLUETOOTH WIRELESS DRIVERS
 M:	Song Xue <song.xue_1@nxp.com>
