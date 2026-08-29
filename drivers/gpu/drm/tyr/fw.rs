@@ -932,6 +932,7 @@ impl<const N: usize> ModInfoBuilder<N> {
         "arm/mali/arch11.8/mali_csffw.bin",
         "arm/mali/arch12.8/mali_csffw.bin",
         "arm/mali/arch13.8/mali_csffw.bin",
+        "arm/mali/arch14.8/mali_csffw.bin",
     ];
 
     pub(crate) const fn create(
