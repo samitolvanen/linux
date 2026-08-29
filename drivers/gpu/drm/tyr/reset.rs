@@ -65,6 +65,7 @@ use crate::{
     gpu,
     irq::unquiesce,
     mmu,
+    pwr,
     sched::tick, //
 };
 
@@ -319,6 +320,9 @@ pub(crate) fn run_hw_reset(
     mmu::post_reset(reg_data, io, reset_result.is_err());
 
     unquiesce(&reg_data.gpu_irq, io, gpu::irq::gpu_irq_enable);
+    if let Some(pwr_irq) = &reg_data.pwr_irq {
+        unquiesce(pwr_irq, io, pwr::pwr_irq_enable);
+    }
 
     // Reopen before fw.post_reset reactivates the MCU VM through the gate.
     drop(hw);
