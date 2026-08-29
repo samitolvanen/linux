@@ -511,21 +511,24 @@ impl<'drm> Firmware<'drm> {
         result
     }
 
-    /// Polls `MCU_STATUS` until it reaches `target` or the timeout elapses.
+    /// Polls `MCU_STATUS` until it reaches `target` and `acked` returns
+    /// true, or the timeout elapses.
     fn wait_for_mcu_status(
         io: &IoMem<'_>,
         target: McuStatus,
+        acked: impl Fn() -> bool,
         interval: time::Delta,
         timeout: time::Delta,
     ) -> Result<(), McuWaitError> {
         let mut last = None;
 
         poll::read_poll_timeout(
-            || Ok(io.read(MCU_STATUS)),
-            |status| {
+            || {
+                let status = io.read(MCU_STATUS);
                 last = Some(status.value());
-                status.value() == target
+                Ok(status.value() == target && acked())
             },
+            |reached| *reached,
             interval,
             timeout,
         )
@@ -543,6 +546,7 @@ impl<'drm> Firmware<'drm> {
         if let Err(e) = Self::wait_for_mcu_status(
             io,
             McuStatus::Enabled,
+            || true,
             time::Delta::from_millis(1),
             time::Delta::from_millis(100),
         ) {
@@ -562,6 +566,7 @@ impl<'drm> Firmware<'drm> {
         if let Err(e) = Self::wait_for_mcu_status(
             io,
             McuStatus::Disabled,
+            || true,
             time::Delta::from_micros(10),
             time::Delta::from_millis(100),
         ) {
@@ -580,6 +585,7 @@ impl<'drm> Firmware<'drm> {
         Self::wait_for_mcu_status(
             io,
             McuStatus::Halt,
+            || self.global_iface.halt_acked(),
             time::Delta::from_micros(10),
             time::Delta::from_millis(1000),
         )
