@@ -126,6 +126,7 @@ pub(in crate::fw) use self::{
             GLB_ACK,
             GLB_DB_ACK, //
         },
+        GlbState,
         TimestampSource,
         GLB_CONTROL_BLOCK_SIZE,
         GLB_INPUT_BLOCK_SIZE,
@@ -401,6 +402,36 @@ mod glb {
         }
     }
 
+    /// MCU state values for the `GLB_REQ` and `GLB_ACK` state field.
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    #[repr(u32)]
+    pub(in crate::fw) enum GlbState {
+        Active = 0,
+        Halt = 1,
+        Sleep = 2,
+        Suspend = 3,
+    }
+
+    impl TryFrom<Bounded<u32, 3>> for GlbState {
+        type Error = Error;
+
+        fn try_from(val: Bounded<u32, 3>) -> Result<Self, Self::Error> {
+            match val.get() {
+                0 => Ok(GlbState::Active),
+                1 => Ok(GlbState::Halt),
+                2 => Ok(GlbState::Sleep),
+                3 => Ok(GlbState::Suspend),
+                _ => Err(EINVAL),
+            }
+        }
+    }
+
+    impl From<GlbState> for Bounded<u32, 3> {
+        fn from(state: GlbState) -> Self {
+            Bounded::try_new(state as u32).unwrap()
+        }
+    }
+
     /// GLB_CONTROL_BLOCK - Global interface control and capabilities.
     ///
     /// These macros represent virtualized registers for the global interface control block.
@@ -482,6 +513,7 @@ mod glb {
     /// Only Tyr updates these registers; CSF has read-only access.
     pub(super) mod input {
         use super::{
+            GlbState,
             TimestampSource,
             GLB_INPUT_BLOCK_SIZE, //
         };
@@ -519,6 +551,8 @@ mod glb {
                 9:9 firmware_config_update => bool;
                 /// Enable idle state reporting.
                 10:10 idle_enable => bool;
+                /// Requested MCU state (CSF interface 4.1 and later).
+                14:12 state ?=> GlbState;
                 /// Inactive compute iterator event.
                 20:20 inactive_compute => bool;
                 /// Inactive fragment iterator event.
@@ -564,6 +598,8 @@ mod glb {
                 9:9 firmware_config_update => bool;
                 /// Enable idle state reporting.
                 10:10 idle_enable => bool;
+                /// MCU state change (CSF interface 4.1 and later).
+                14:12 state;
                 /// Inactive compute iterator event.
                 20:20 inactive_compute => bool;
                 /// Inactive fragment iterator event.
@@ -699,6 +735,7 @@ mod glb {
     /// Only the CSF updates registers in this area; Tyr has read-only access.
     pub(super) mod output {
         use super::{
+            GlbState,
             HaltStatus,
             GLB_OUTPUT_BLOCK_SIZE, //
         };
@@ -735,6 +772,8 @@ mod glb {
                 9:9 firmware_config_update => bool;
                 /// Enable idle state reporting.
                 10:10 idle_enable => bool;
+                /// Current MCU state (CSF interface 4.1 and later).
+                14:12 state ?=> GlbState;
                 /// Inactive compute iterator event.
                 20:20 inactive_compute => bool;
                 /// Inactive fragment iterator event.
