@@ -828,6 +828,8 @@ impl platform::Driver for TyrPlatformDriver {
         };
         clks.ungate()?;
 
+        pm::attach_domains(pdev.as_ref(), pm::DomainAttachFlags::DEV_LINK_ON)?;
+
         match regulator::devm_enable_optional(pdev.as_ref(), c"mali") {
             Ok(()) => {}
             Err(e) if e == ENODEV => {}
