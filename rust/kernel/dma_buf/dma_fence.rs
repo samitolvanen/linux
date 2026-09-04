@@ -1218,6 +1218,28 @@ impl DmaFenceWorkqueue {
     {
         self.0.enqueue(w)
     }
+
+    /// Enqueues a delayed work item.
+    ///
+    /// This may fail if the work item is already enqueued in a workqueue.
+    ///
+    /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    ///
+    /// The queue must not be dropped from a work item running on it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep this [`DmaFenceWorkqueue`] alive until the delayed work item has run
+    /// or been canceled. Dropping it destroys the backing [`OwnedQueue`], whose drop does not
+    /// wait for an item still on its timer.
+    pub unsafe fn enqueue_delayed<W, const ID: u64>(&self, w: W, delay: Jiffies) -> W::EnqueueOutput
+    where
+        W: RawDmaFenceDelayedWorkItem<ID> + Send + 'static,
+    {
+        // SAFETY: The caller keeps this workqueue alive until the work item has run or been
+        // canceled.
+        unsafe { self.0.enqueue_delayed_unchecked(w, delay) }
+    }
 }
 
 /// Trait used for drivers signalling their DMA-fences from a threaded IRQ handler.
