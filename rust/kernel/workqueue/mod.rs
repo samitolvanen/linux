@@ -312,12 +312,39 @@ impl Queue {
     ///
     /// This may fail if the work item is already enqueued in a workqueue.
     ///
-    /// This is only valid for global workqueues (with static lifetimes) because those are the only
-    /// ones that outlive all possible delayed work items.
+    /// This is only valid for global workqueues (with static lifetimes) because a `'static` queue
+    /// provably outlives any delayed work item. See [`Self::enqueue_delayed_unchecked`] when that
+    /// lifetime is not available.
     ///
     /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    #[inline]
     pub fn enqueue_delayed<W, const ID: u64>(
         &'static self,
+        w: W,
+        delay: Jiffies,
+    ) -> W::EnqueueOutput
+    where
+        W: RawDelayedWorkItem<ID> + Send + 'static,
+    {
+        // SAFETY: The `'static` lifetime of `self` proves that this queue outlives the work item.
+        unsafe { self.enqueue_delayed_unchecked(w, delay) }
+    }
+
+    /// Enqueues a delayed work item without requiring a `'static` queue.
+    ///
+    /// This may fail if the work item is already enqueued in a workqueue.
+    ///
+    /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    ///
+    /// The queue must not be dropped from a work item running on it. Destroying a workqueue waits
+    /// for its in-flight items, so such a drop deadlocks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep this queue alive until the delayed work item has run or been canceled.
+    /// `destroy_workqueue()` does not wait for an item still on its timer.
+    pub unsafe fn enqueue_delayed_unchecked<W, const ID: u64>(
+        &self,
         w: W,
         delay: Jiffies,
     ) -> W::EnqueueOutput
@@ -339,6 +366,9 @@ impl Queue {
         // `bindings::queue_delayed_work_on` will have returned true. In this case, `__enqueue`
         // promises that the raw pointer will stay valid until we call the function pointer in the
         // `work_struct`, so the access is ok.
+        //
+        // The caller keeps this queue alive until the work item has run or been canceled, so
+        // `queue_ptr` is still valid when the timer fires.
         unsafe {
             w.__enqueue(move |work_ptr| {
                 bindings::queue_delayed_work_on(
@@ -371,7 +401,7 @@ impl Queue {
 
 /// An owned kernel work queue.
 ///
-/// Dropping a workqueue blocks on all pending work.
+/// Dropping a workqueue blocks on all queued and running work.
 ///
 /// # Invariants
 ///
@@ -397,9 +427,10 @@ impl Deref for OwnedQueue {
 impl Drop for OwnedQueue {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: This `OwnedQueue` owns a valid workqueue, so we can destroy it. There is no
-        // delayed work scheduled on this queue that may attempt to use it after this call, as
-        // scheduling delayed work requires a 'static reference.
+        // SAFETY: This `OwnedQueue` owns a valid workqueue, so we can destroy it. A safe delayed
+        // enqueue needs a `&'static Queue`, which cannot borrow from an `OwnedQueue` that is
+        // dropped. `enqueue_delayed_unchecked` requires the caller to keep the queue alive until
+        // the item has run or been canceled. No delayed work is still on its timer here.
         unsafe { bindings::destroy_workqueue(self.queue.as_ptr().cast()) }
     }
 }
