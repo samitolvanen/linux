@@ -512,6 +512,59 @@ impl Request {
     }
 }
 
+/// The bus device and registration data borrowed by a PM callback.
+type CallbackData<'a, D, T> = (
+    &'a <T as PMOps<D>>::DeviceType,
+    Pin<&'a RegistrationData<D, T>>,
+);
+
+/// Looks up the PM registration data installed for `dev`.
+///
+/// Rebuilds the Rust device reference, recovers the bus device, and borrows
+/// the device's PM registration data. Returns `None` when no registration is
+/// installed.
+///
+/// # Safety
+///
+/// `dev` must be a valid `struct device *` provided by the PM core for a
+/// device whose PM callback table and PM registration data were both created
+/// for `(D, T)`. `dev` and the registration data must stay alive for the
+/// duration of the returned borrow.
+unsafe fn registration_data<'a, D, T>(dev: *mut bindings::device) -> Option<CallbackData<'a, D, T>>
+where
+    D: driver::DriverLayout,
+    T: PMOps<D>,
+{
+    let dev: &'a device::Device<device::Bound> =
+        // SAFETY: By the function contract, `dev` is valid for the duration
+        // of the borrow.
+        unsafe { device::Device::from_raw(dev) };
+
+    // SAFETY: By the function contract, `dev` is valid for the duration of
+    // the borrow. `dev->p` is allocated during `device_add()`, so it is
+    // non-null for a device the PM core can call back into.
+    let ptr = unsafe { (*(*dev.as_raw()).p).rust_private };
+
+    if ptr.is_null() {
+        return None;
+    }
+
+    // SAFETY: A non-null `rust_private` was stored by a `Registration<D, T>`
+    // constructor as a foreign-owned `RegistrationData<D, T>`, which the
+    // caller guarantees stays alive for the duration of the borrow.
+    let data: Pin<&'a RegistrationData<D, T>> =
+        unsafe { <Pin<KBox<RegistrationData<D, T>>> as ForeignOwnable>::borrow(ptr) };
+
+    let pm_dev: &'a T::DeviceType =
+        // SAFETY: The generated `dev_pm_ops` for `T` is installed on devices whose
+        // bus-specific type is `T::DeviceType`. Therefore the base `Device<Bound>`
+        // passed by the PM core is embedded in a valid `T::DeviceType`; the
+        // `AsBusDevice` implementation supplies the correct offset for this cast.
+        unsafe { T::DeviceType::from_device(dev) };
+
+    Some((pm_dev, data))
+}
+
 /// Common runtime PM callback entry point.
 ///
 /// The generated extern "C" callbacks call into this helper with the raw
@@ -527,33 +580,13 @@ where
         Option<<T as PMOps<D>>::RuntimePayloadType>,
     ) -> PMCallbackResult<<T as PMOps<D>>::RuntimePayloadType>,
 {
-    let dev: &device::Device<device::Bound>  =
-             // SAFETY: `dev` is provided by the PM core and remains
-             // valid for the duration of the callback.
-            unsafe { device::Device::from_raw(dev) };
-
-    // SAFETY: `dev` is provided by the PM core and remains
-    // valid for the duration of the callback.
-    let ptr = unsafe { (*(*dev.as_raw()).p).rust_private };
-
-    if ptr.is_null() {
+    // SAFETY: The PM core passes a valid `struct device *` to a runtime PM
+    // callback generated for `(D, T)`, and the registration keeps the stored
+    // data alive until runtime PM is disabled and in-flight callbacks have
+    // drained.
+    let Some((pm_dev, payload)) = (unsafe { registration_data::<D, T>(dev) }) else {
         return Err(ENODEV);
-    }
-
-    // SAFETY: The runtime PM callback can only be triggered for bound device
-    // and once the runtime PM is enabled.
-    // `rust_private` is guaranteed to be valid and points to
-    // associated RegistrationData<T> type object at least for the duration
-    // of this call.
-    let payload: Pin<&RegistrationData<D, T>> =
-        unsafe { <Pin<KBox<RegistrationData<D, T>>> as ForeignOwnable>::borrow(ptr) };
-
-    let pm_dev: &T::DeviceType =
-        // SAFETY: The generated `dev_pm_ops` for `T` is installed on devices whose
-        // bus-specific type is `T::DeviceType`. Therefore the base `Device<Bound>`
-        // passed by the PM core is embedded in a valid `T::DeviceType`; the
-        // `AsBusDevice` implementation supplies the correct offset for this cast.
-        unsafe { T::DeviceType::from_device(dev) };
+    };
 
     payload.data.transition(|payload| cb(pm_dev, payload))
 }
@@ -617,16 +650,41 @@ unsafe extern "C" fn system_sleep_suspend(dev: *mut bindings::device) -> c_int {
 /// System-sleep resume wrapper for the resume, thaw, and restore slots.
 ///
 /// Runs the device's runtime-resume callback via `pm_runtime_force_resume`,
-/// as `DEFINE_RUNTIME_DEV_PM_OPS` does.
+/// as `DEFINE_RUNTIME_DEV_PM_OPS` does. On success it then calls
+/// [`PMOps::system_resume_done`] with a borrow of the registration's
+/// system-sleep data.
 ///
 /// # Safety
 ///
-/// `dev` must be a valid `struct device *` provided by the PM core.
+/// `dev` must be a valid `struct device *` provided by the PM core for a
+/// device whose PM callback table and PM registration data were both created
+/// for `(D, T)`, and the registration data must stay alive for the duration
+/// of the call.
 #[cfg(CONFIG_PM_SLEEP)]
-unsafe extern "C" fn system_sleep_resume(dev: *mut bindings::device) -> c_int {
+unsafe extern "C" fn system_sleep_resume<D, T>(dev: *mut bindings::device) -> c_int
+where
+    D: driver::DriverLayout,
+    T: PMOps<D>,
+{
     // SAFETY: The PM core passes a valid `struct device *` to a system-sleep
     // callback and it stays valid for the duration of the call.
-    unsafe { bindings::pm_runtime_force_resume(dev) }
+    let ret = unsafe { bindings::pm_runtime_force_resume(dev) };
+    if ret != 0 {
+        return ret;
+    }
+
+    if !T::HAS_SYSTEM_RESUME_DONE {
+        return 0;
+    }
+
+    // SAFETY: The PM core passes a valid `struct device *` to a system-sleep
+    // callback generated for `(D, T)`. The registration data is removed only
+    // when the registration drops on unbind, which runs under the device
+    // lock, and the PM core holds the device lock across this callback.
+    if let Some((pm_dev, data)) = unsafe { registration_data::<D, T>(dev) } {
+        T::system_resume_done(pm_dev, data.sleep_data.as_ref());
+    }
+    0
 }
 
 /// Builds the base `dev_pm_ops` carrying the six system-sleep/hibernation
@@ -636,15 +694,20 @@ unsafe extern "C" fn system_sleep_resume(dev: *mut bindings::device) -> c_int {
 /// force-resume wrappers. Otherwise they stay `None`, matching the
 /// `pm_sleep_ptr()` gating in C. The runtime slots are filled by the caller.
 const fn system_sleep_base<D: driver::DriverLayout, T: PMOps<D>>() -> bindings::dev_pm_ops {
+    const_assert!(
+        T::SYSTEM_SLEEP || !T::HAS_SYSTEM_RESUME_DONE,
+        "PMOps::system_resume_done requires PMOps::SYSTEM_SLEEP"
+    );
+
     #[cfg(CONFIG_PM_SLEEP)]
     if T::SYSTEM_SLEEP {
         return bindings::dev_pm_ops {
             suspend: Some(system_sleep_suspend),
-            resume: Some(system_sleep_resume),
+            resume: Some(system_sleep_resume::<D, T>),
             freeze: Some(system_sleep_suspend),
-            thaw: Some(system_sleep_resume),
+            thaw: Some(system_sleep_resume::<D, T>),
             poweroff: Some(system_sleep_suspend),
-            restore: Some(system_sleep_resume),
+            restore: Some(system_sleep_resume::<D, T>),
             ..PMOPS_NONE
         };
     }
@@ -721,6 +784,11 @@ pub trait PMOps<D: driver::DriverLayout>: Sized {
     /// Type of the payload moved through runtime PM transitions.
     type RuntimePayloadType: Send;
 
+    /// Type of the registration-scoped data borrowed by
+    /// [`PMOps::system_resume_done`]. Use `()` when the hook is not
+    /// implemented.
+    type SleepData: Send + Sync;
+
     /// Opt-in for system-sleep and hibernation support.
     ///
     /// When `true`, the generated `PM_OPS` fills the system-sleep and
@@ -728,6 +796,24 @@ pub trait PMOps<D: driver::DriverLayout>: Sized {
     /// that reuse the runtime PM callbacks. The slots stay unset under
     /// `CONFIG_PM_SLEEP=n`.
     const SYSTEM_SLEEP: bool = false;
+
+    /// Called after a system-sleep resume, thaw, or restore has
+    /// re-enabled runtime PM for the device.
+    ///
+    /// Runtime PM requests issued during a system-sleep transition fail,
+    /// because runtime PM is disabled for its duration. This hook is where
+    /// a driver reissues the work those requests would have started. It
+    /// receives a borrow of the system-sleep data stored at registration,
+    /// or `None` if the registration carries none.
+    ///
+    /// The hook runs in process context with the device lock held and
+    /// outside any runtime PM transition. It may sleep and may issue
+    /// runtime PM requests. The device is not necessarily runtime-active.
+    /// It is not called when the resume fails. Implementing it without
+    /// [`PMOps::SYSTEM_SLEEP`] fails the build.
+    // The call site guards on a const at runtime, so `build_error!` would
+    // depend on the optimizer.
+    fn system_resume_done(_dev: &Self::DeviceType, _data: Option<&Self::SleepData>) {}
 
     /// Runtime resume callback.
     fn runtime_resume<'a>(
@@ -1137,6 +1223,8 @@ pub enum PMConfig {
 struct RegistrationData<D: driver::DriverLayout, T: PMOps<D>> {
     #[pin]
     data: PMPayload<T::RuntimePayloadType>,
+    /// System-sleep data borrowed by [`PMOps::system_resume_done`].
+    sleep_data: Option<T::SleepData>,
     _marker: PhantomData<fn() -> (D, T)>,
 }
 
@@ -1163,12 +1251,31 @@ impl<'bound, D: driver::DriverLayout, T: PMOps<D>> Registration<'bound, D, T> {
     ///
     /// The device must use the callback represented by `ops`, generated
     /// for the same bus adapter and driver pair `(D, T)`.
+    #[inline]
     pub fn new(
         dev: &'bound device::Device<device::Core<'_>>,
         ops: DevPMOps<D, T>,
         profiles: Option<KVec<PMProfile>>,
         configs: Option<KVec<PMConfig>>,
         payload: Option<T::RuntimePayloadType>,
+    ) -> Result<Self> {
+        Self::new_with_sleep_data(dev, ops, profiles, configs, payload, None)
+    }
+
+    /// Creates a runtime PM registration for `dev` with system-sleep data.
+    ///
+    /// Like [`Registration::new`], but also stores `sleep_data` for
+    /// [`PMOps::system_resume_done`] to borrow. The data is immutable for the
+    /// lifetime of the registration. Drop the registration from the driver's
+    /// unbind path, where the device lock excludes a concurrent system-sleep
+    /// callback.
+    pub fn new_with_sleep_data(
+        dev: &'bound device::Device<device::Core<'_>>,
+        ops: DevPMOps<D, T>,
+        profiles: Option<KVec<PMProfile>>,
+        configs: Option<KVec<PMConfig>>,
+        payload: Option<T::RuntimePayloadType>,
+        sleep_data: Option<T::SleepData>,
     ) -> Result<Self> {
         // SAFETY: For the duration of this call, `dev` is a valid `Device<Core>`,
         // and so is its raw `struct device` pointer.
@@ -1185,6 +1292,7 @@ impl<'bound, D: driver::DriverLayout, T: PMOps<D>> Registration<'bound, D, T> {
                     in_flight: AtomicFlag::new(false),
                     inner: UnsafeCell::new(payload),
                 },
+                sleep_data,
                 _marker: PhantomData,
             },
             GFP_KERNEL,
@@ -1246,9 +1354,10 @@ impl<D: driver::DriverLayout, T: PMOps<D>> Drop for Registration<'_, D, T> {
         // SAFETY: The pointer, if non-null, was stored by `Registration::new`
         // using `Pin<KBox<RegistrationData<T>>>::into_foreign`. Runtime PM has
         // been disabled and drained above, so generated callbacks can no longer
-        // borrow this data. `'bound` confines the registration to probe or to
-        // the driver's bus device private data, and both are dropped under the
-        // device lock, which excludes the system-sleep callbacks. Clearing
+        // borrow this data. System-sleep callbacks are excluded instead by the
+        // device lock. The PM core holds it across the callback, and `'bound`
+        // confines the registration to probe or to the driver's bus device
+        // private data, both dropped under the same lock. Clearing
         // `rust_private` prevents later lookup, and `from_foreign` reconstructs
         // the owning allocation so it is dropped.
         unsafe {
