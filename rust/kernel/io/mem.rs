@@ -73,6 +73,7 @@ impl<'a> IoRequest<'a> {
     /// impl platform::Driver for SampleDriver {
     ///    # type IdInfo = ();
     ///    # type Data<'bound> = Self;
+    ///    # type PmOps = ();
     ///
     ///    fn probe<'bound>(
     ///       pdev: &'bound platform::Device<Core<'_>>,
@@ -133,6 +134,7 @@ impl<'a> IoRequest<'a> {
     /// impl platform::Driver for SampleDriver {
     ///    # type IdInfo = ();
     ///    # type Data<'bound> = Self;
+    ///    # type PmOps = ();
     ///
     ///    fn probe<'bound>(
     ///       pdev: &'bound platform::Device<Core<'_>>,

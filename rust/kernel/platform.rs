@@ -199,6 +199,7 @@ macro_rules! module_platform_driver {
 /// impl platform::Driver for MyDriver {
 ///     type IdInfo = ();
 ///     type Data<'bound> = Self;
+///     type PmOps = ();
 ///
 ///     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 ///     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = Some(&ACPI_TABLE);
@@ -223,6 +224,19 @@ pub trait Driver {
     /// The type of the driver's bus device private data.
     type Data<'bound>: Send + 'bound;
 
+    /// The type implementing the driver's runtime PM callbacks.
+    ///
+    /// [`dev_pm_ops`] returns the callback table built for this type. Use `()` for a driver
+    /// without runtime PM callbacks.
+    ///
+    /// [`dev_pm_ops`]: Driver::dev_pm_ops
+    // TODO: Use associated_type_defaults once stabilized:
+    //
+    // ```
+    // type PmOps = ();
+    // ```
+    type PmOps;
+
     /// The table of OF device ids supported by the driver.
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = None;
 
@@ -230,7 +244,7 @@ pub trait Driver {
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = None;
 
     /// Provides driver's PM callbacks, if any.
-    fn dev_pm_ops() -> Option<crate::pm::DevPMOps<Adapter<Self>, Self>>
+    fn dev_pm_ops() -> Option<crate::pm::DevPMOps<Adapter<Self>, Self::PmOps>>
     where
         Self: Sized,
     {
@@ -605,15 +619,38 @@ unsafe impl Sync for Device<device::Bound> {}
 #[allow(clippy::new_without_default)]
 impl<T> crate::pm::DevPMOps<Adapter<T>, T>
 where
-    T: Driver + crate::pm::PMOps<Adapter<T>, DeviceType = Device<device::Bound>>,
+    T: Driver<PmOps = T> + crate::pm::PMOps<Adapter<T>, DeviceType = Device<device::Bound>>,
 {
     /// Creates a platform driver's runtime PM callbacks for `T`.
     ///
-    /// This constructor is available only when `T` is a platform driver and
-    /// its runtime PM callbacks accept a bound platform device.
+    /// This constructor is available only when `T` is a platform driver that
+    /// names itself as its [`Driver::PmOps`], and its runtime PM callbacks
+    /// accept a bound platform device.
     pub const fn new() -> Self {
         // SAFETY: `Adapter<T>` is the platform bus adapter for `T`, and the
         // bound above forces PM callbacks to receive a platform bound device.
+        // `Driver<PmOps = T>` means registering `T` installs the table built
+        // for `T`, or no table at all, and `pm::Registration`'s constructors
+        // reject the latter by requiring `(*drv).pm` to equal this table.
+        unsafe { crate::pm::DevPMOps::new_unchecked() }
+    }
+}
+
+impl<T, U> crate::pm::DevPMOps<Adapter<T>, U>
+where
+    T: Driver<PmOps = U>,
+    U: crate::pm::PMOps<Adapter<T>, DeviceType = Device<device::Bound>>,
+{
+    /// Creates a platform driver's runtime PM callbacks implemented by its [`Driver::PmOps`].
+    ///
+    /// This constructor is available only when `T` is a platform driver whose `PmOps` is `U`,
+    /// and the runtime PM callbacks of `U` accept a bound platform device.
+    pub const fn for_driver() -> Self {
+        // SAFETY: `Adapter<T>` is the platform bus adapter for `T`, and the
+        // bound above forces PM callbacks to receive a platform bound device.
+        // `Driver<PmOps = U>` means registering `T` installs the table built
+        // for `U`, or no table at all, and `pm::Registration`'s constructors
+        // reject the latter by requiring `(*drv).pm` to equal this table.
         unsafe { crate::pm::DevPMOps::new_unchecked() }
     }
 }

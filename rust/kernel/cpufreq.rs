@@ -902,6 +902,7 @@ pub trait Driver {
 /// impl platform::Driver for SampleDriver {
 ///     type IdInfo = ();
 ///     type Data<'bound> = Self;
+///     type PmOps = ();
 ///     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = None;
 ///
 ///     fn probe<'bound>(

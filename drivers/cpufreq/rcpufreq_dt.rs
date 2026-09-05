@@ -208,6 +208,7 @@ kernel::of_device_table!(
 impl platform::Driver for CPUFreqDTDriver {
     type IdInfo = ();
     type Data<'bound> = Self;
+    type PmOps = ();
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
