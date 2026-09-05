@@ -550,6 +550,58 @@ where
 pub(crate) const PMOPS_NONE: bindings::dev_pm_ops =
     unsafe { core::mem::MaybeUninit::<bindings::dev_pm_ops>::zeroed().assume_init() };
 
+/// System-sleep suspend wrapper for the suspend, freeze, and poweroff slots.
+///
+/// Runs the device's runtime-suspend callback via `pm_runtime_force_suspend`,
+/// as `DEFINE_RUNTIME_DEV_PM_OPS` does.
+///
+/// # Safety
+///
+/// `dev` must be a valid `struct device *` provided by the PM core.
+#[cfg(CONFIG_PM_SLEEP)]
+unsafe extern "C" fn system_sleep_suspend(dev: *mut bindings::device) -> c_int {
+    // SAFETY: The PM core passes a valid `struct device *` to a system-sleep
+    // callback and it stays valid for the duration of the call.
+    unsafe { bindings::pm_runtime_force_suspend(dev) }
+}
+
+/// System-sleep resume wrapper for the resume, thaw, and restore slots.
+///
+/// Runs the device's runtime-resume callback via `pm_runtime_force_resume`,
+/// as `DEFINE_RUNTIME_DEV_PM_OPS` does.
+///
+/// # Safety
+///
+/// `dev` must be a valid `struct device *` provided by the PM core.
+#[cfg(CONFIG_PM_SLEEP)]
+unsafe extern "C" fn system_sleep_resume(dev: *mut bindings::device) -> c_int {
+    // SAFETY: The PM core passes a valid `struct device *` to a system-sleep
+    // callback and it stays valid for the duration of the call.
+    unsafe { bindings::pm_runtime_force_resume(dev) }
+}
+
+/// Builds the base `dev_pm_ops` carrying the six system-sleep/hibernation
+/// slots when the driver opts in via [`PMOps::SYSTEM_SLEEP`].
+///
+/// Under `CONFIG_PM_SLEEP` the slots point at the generic force-suspend and
+/// force-resume wrappers. Otherwise they stay `None`, matching the
+/// `pm_sleep_ptr()` gating in C. The runtime slots are filled by the caller.
+const fn system_sleep_base<D: driver::DriverLayout, T: PMOps<D>>() -> bindings::dev_pm_ops {
+    #[cfg(CONFIG_PM_SLEEP)]
+    if T::SYSTEM_SLEEP {
+        return bindings::dev_pm_ops {
+            suspend: Some(system_sleep_suspend),
+            resume: Some(system_sleep_resume),
+            freeze: Some(system_sleep_suspend),
+            thaw: Some(system_sleep_resume),
+            poweroff: Some(system_sleep_suspend),
+            restore: Some(system_sleep_resume),
+            ..PMOPS_NONE
+        };
+    }
+    PMOPS_NONE
+}
+
 /// Runtime PM ops for a driver.
 ///
 /// Parameterized by:
@@ -619,6 +671,14 @@ pub trait PMOps<D: driver::DriverLayout>: Sized {
 
     /// Type of the payload moved through runtime PM transitions.
     type RuntimePayloadType: Send;
+
+    /// Opt-in for system-sleep and hibernation support.
+    ///
+    /// When `true`, the generated `PM_OPS` fills the system-sleep and
+    /// hibernation slots with force-suspend and force-resume wrappers
+    /// that reuse the runtime PM callbacks. The slots stay unset under
+    /// `CONFIG_PM_SLEEP=n`.
+    const SYSTEM_SLEEP: bool = false;
 
     /// Runtime resume callback.
     fn runtime_resume<'a>(
@@ -758,7 +818,7 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
         } else {
             None
         },
-        ..PMOPS_NONE
+        ..system_sleep_base::<D, T>()
     };
 
     /// Enable runtime PM.
