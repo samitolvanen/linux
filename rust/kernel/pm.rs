@@ -68,11 +68,11 @@ impl From<Mode> for core::ffi::c_int {
 #[repr(i32)]
 pub enum RuntimePMState {
     /// Runtime PM has not been initialized for this device yet.
-    UNKNOWN = bindings::rpm_status_RPM_INVALID,
+    Unknown = bindings::rpm_status_RPM_INVALID,
     /// The device is expected to be runtime active and in it's normal operating state
-    RESUMED = bindings::rpm_status_RPM_ACTIVE,
+    Resumed = bindings::rpm_status_RPM_ACTIVE,
     /// The device is expected to be suspended, unavailable for normal operations
-    SUSPENDED = bindings::rpm_status_RPM_SUSPENDED,
+    Suspended = bindings::rpm_status_RPM_SUSPENDED,
 }
 
 /// Runtime power transition scope.
@@ -767,8 +767,8 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
         }
         Self::apply_config(self.inner.dev, &self.inner.configs);
         match state {
-            RuntimePMState::RESUMED => Request::mark_active(self.inner.dev),
-            RuntimePMState::SUSPENDED => Request::mark_suspended(self.inner.dev),
+            RuntimePMState::Resumed => Request::mark_active(self.inner.dev),
+            RuntimePMState::Suspended => Request::mark_suspended(self.inner.dev),
             _ => Err(EINVAL),
         }.inspect_err(|_| self.inner.enabled.store(false, ordering::Release))?;
         Request::runtime_enable(self.inner.dev);
