@@ -810,8 +810,11 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
         f()
     }
     /// Runs a closure while holding an `AwakeScope`.
+    ///
+    /// Async and nowait profiles are rejected, since the closure needs a
+    /// device that has finished resuming.
     pub fn with_get<R>(&self, profile: PMProfile, f: impl FnOnce() -> Result<R>) -> Result<R> {
-        if profile.0.contains(ModeFlag::Async) {
+        if profile.0.contains_any(ModeFlag::Async | ModeFlag::Nowait) {
             return Err(EINVAL);
         }
         let _scope = self.get(profile)?;
