@@ -36,6 +36,7 @@ kernel::acpi_device_table!(
 impl platform::Driver for SampleSocDriver {
     type IdInfo = ();
     type Data<'bound> = Self;
+    type PmOps = ();
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = Some(&ACPI_TABLE);
 
