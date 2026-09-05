@@ -336,15 +336,7 @@ impl Group {
             group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let dev = reg_data.pdev.as_ref();
-        let syncobjs = gem::new_kernel_object(
-            dev,
-            ddev,
-            &vm,
-            num_syncs,
-            flags,
-            ddev.coherent,
-            ddev.cleanup_wq.clone(),
-        )?;
+        let syncobjs = gem::new_kernel_object(dev, ddev, &vm, num_syncs, flags, ddev.coherent)?;
 
         let vmap = syncobjs.vmap();
         let size = vmap.owner().size();
@@ -511,10 +503,7 @@ impl Group {
             }
         } else {
             let (bo, bo_offset) = self.vm.get_bo_for_va(syncwait.gpu_va).ok_or(EINVAL)?;
-            let mapped_bo = Arc::new(
-                gem::BoVmap::new(&bo, self.tdev.cleanup_wq.clone())?,
-                GFP_KERNEL,
-            )?;
+            let mapped_bo = Arc::new(gem::BoVmap::new(&bo)?, GFP_KERNEL)?;
             let bo_offset = bo_offset as usize;
 
             // Memoize the resolved BO so subsequent re-evaluations

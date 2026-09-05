@@ -5,8 +5,18 @@
 //! The name "Tyr" is inspired by Norse mythology, reflecting Arm's tradition of
 //! naming their GPUs after Nordic mythological figures and places.
 
+use kernel::{
+    driver::Registration,
+    platform,
+    prelude::*,
+    InPlaceModule,
+    ModuleMetadata,
+    ThisModule, //
+};
+
 use crate::driver::TyrPlatformDriver;
 
+mod cleanup;
 mod driver;
 mod file;
 mod fw;
@@ -23,8 +33,30 @@ mod slot;
 mod vm;
 mod wait;
 
-kernel::module_platform_driver! {
-    type: TyrPlatformDriver,
+/// The Tyr module.
+///
+/// The fields drop in declaration order, so the platform driver unregisters
+/// before the cleanup workqueue is destroyed.
+#[pin_data]
+struct TyrModule {
+    #[pin]
+    _driver: Registration<platform::Adapter<TyrPlatformDriver>>,
+    _cleanup: cleanup::Registration,
+}
+
+impl InPlaceModule for TyrModule {
+    fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            // SAFETY: The module initializer runs once per load, before the
+            // driver registers.
+            _cleanup: unsafe { cleanup::Registration::new() }?,
+            _driver <- Registration::new(<Self as ModuleMetadata>::NAME, module),
+        })
+    }
+}
+
+module! {
+    type: TyrModule,
     name: "tyr",
     authors: ["The Tyr driver authors"],
     description: "Arm Mali Tyr DRM driver",

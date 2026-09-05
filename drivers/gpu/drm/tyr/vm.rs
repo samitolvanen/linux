@@ -87,8 +87,8 @@ use kernel::{
 };
 
 use crate::{
+    cleanup,
     driver::{
-        CleanupQueue,
         TyrDrmDevice,
         TyrDrmDriver,
         TyrDrmRegistrationData, //
@@ -686,10 +686,6 @@ pub(crate) struct VmExec {
     unusable: Atomic<bool>,
     /// VA range for this VM.
     va_range: Range<u64>,
-    /// Cleanup workqueue used by `Drop` to defer the final
-    /// `drm_gpuvm_put` out of any dma-fence signalling section the drop
-    /// may run under.
-    cleanup_wq: Arc<CleanupQueue>,
 }
 
 #[pinned_drop]
@@ -712,17 +708,20 @@ impl PinnedDrop for VmExec {
         // signalling path. `None` only on the impossible contended case,
         // in which the inner reference drops inline with the mutex.
         let gpuvm_unique = this.gpuvm_unique.try_lock().and_then(|mut g| g.take());
+        let Err(e) = cleanup::try_spawn_owned((gpuvm, gpuvm_unique), drop) else {
+            return;
+        };
 
-        let res = this.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
-            drop(gpuvm);
-            drop(gpuvm_unique);
-        });
-
-        if res.is_err() {
-            pr_warn_once!(
-                "VmExec cleanup_wq enqueue failed under memory pressure; performing inline gpuvm teardown (lockdep cycle may fire)\n",
-            );
-        }
+        let captures = match e {
+            cleanup::SpawnError::QueueGone(captures) => captures,
+            cleanup::SpawnError::NoMemory(captures) => {
+                pr_warn_once!(
+                    "VmExec cleanup hand-off failed under memory pressure; performing inline gpuvm teardown (lockdep cycle may fire)\n",
+                );
+                captures
+            }
+        };
+        drop(captures);
     }
 }
 
@@ -755,7 +754,6 @@ impl Vm {
         kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
         coherent: bool,
-        cleanup_wq: Arc<CleanupQueue>,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
@@ -796,7 +794,6 @@ impl Vm {
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: Atomic::new(false),
                 va_range: total_range,
-                cleanup_wq,
             }),
             GFP_KERNEL,
         )?;
@@ -833,7 +830,6 @@ impl Vm {
     /// Callers must reserve any explicit-VA sections inside the window with
     /// `reserve_kernel_range` before
     /// `alloc_kernel_range` is called.
-    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_fw(
         pdev: &platform::Device<Bound>,
         ddev: &TyrDrmDevice,
@@ -842,7 +838,6 @@ impl Vm {
         auto_kernel_va_start: u64,
         auto_kernel_va_size: u64,
         coherent: bool,
-        cleanup_wq: Arc<CleanupQueue>,
     ) -> Result<Arc<Vm>> {
         let total_range = 0..max_va_range(gpu_info);
         let kernel_range = auto_kernel_va_start..(auto_kernel_va_start + auto_kernel_va_size);
@@ -856,7 +851,6 @@ impl Vm {
             kernel_range,
             None,
             coherent,
-            cleanup_wq,
         )
     }
 
@@ -887,7 +881,6 @@ impl Vm {
             kernel_range,
             Some(bind_wq),
             ddev.coherent,
-            ddev.cleanup_wq.clone(),
         )
     }
 
