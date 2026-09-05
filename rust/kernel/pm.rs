@@ -116,7 +116,10 @@ pub struct AwakeScope<'a>(Scope<'a, Awake>);
 /// Prevents the device from getting suspended by holding the usage reference
 /// count.
 ///
-/// On drop, calls `pm_runtime_put_noidle()`.
+/// Releasing the scope, through `release()` or `Drop`, marks the device busy
+/// and then calls `pm_runtime_put()`. It may take `dev->power.lock`, a
+/// sleeping lock on `PREEMPT_RT`, so it must not happen under a raw spinlock
+/// or in hardirq context.
 #[must_use = "dropping this guard releases its runtime PM hold"]
 pub struct RetainScope<'a>(Scope<'a, Retain>);
 
@@ -242,23 +245,26 @@ impl<'a> RetainScope<'a> {
         }))
     }
 
-    fn release_inner(&self) {
-        Request::put_noidle(self.0.dev);
+    fn release_inner(&self) -> Result {
+        Request::mark_last_busy(self.0.dev);
+        Request::put(self.0.dev)
     }
 
-    /// Explicitly release the scope
-    /// This should be used in favor of regular drop
-    /// when error handling is required.
+    /// Explicitly releases the scope, reporting the outcome of the queued
+    /// idle request.
+    ///
+    /// The usage reference is dropped either way, so an error here leaves
+    /// no hold behind and a teardown path can ignore it.
     pub fn release(self) -> Result {
-        self.release_inner();
+        let result = self.release_inner();
         core::mem::forget(self);
-        Ok(())
+        result
     }
 }
 
 impl<'a> Drop for RetainScope<'a> {
     fn drop(&mut self) {
-        self.release_inner();
+        let _ = self.release_inner();
     }
 }
 
@@ -298,6 +304,13 @@ impl Request {
         // `struct device` for the duration of the call.
         // The `Device<Bound>` reference provides that guarantee.
         to_result(unsafe { bindings::__pm_runtime_idle(dev.as_raw(), mode.into()) })
+    }
+
+    /// Drops a usage reference and queues an idle notification, like
+    /// `pm_runtime_put()`.
+    #[inline]
+    fn put(dev: &device::Device<device::Bound>) -> Result {
+        Self::idle(dev, ModeFlag::Acquire | ModeFlag::Async)
     }
 
     #[inline]
@@ -377,6 +390,12 @@ impl Request {
     #[inline]
     fn idle(_dev: &device::Device<device::Bound>, _mode: Mode) -> Result {
         Err(ENOSYS)
+    }
+
+    // `pm_runtime_put()` discards the `ENOSYS` of the `__pm_runtime_idle()` stub.
+    #[inline]
+    fn put(_dev: &device::Device<device::Bound>) -> Result {
+        Ok(())
     }
 
     #[inline]
