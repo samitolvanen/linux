@@ -65,7 +65,6 @@ use kernel::{
     },
     new_mutex,
     platform,
-    pr_warn_once,
     prelude::*,
     sizes::{
         SZ_1G,
@@ -87,8 +86,8 @@ use kernel::{
 };
 
 use crate::{
+    cleanup,
     driver::{
-        CleanupQueue,
         TyrDrmDevice,
         TyrDrmDriver,
         TyrDrmRegistrationData, //
@@ -672,24 +671,40 @@ pub(crate) struct VmExec {
     /// DRM GPUVM core for managing virtual address space.
     ///
     /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when handing the gpuvm reference to the cleanup
-    /// workqueue.
+    /// only by `Drop`.
     #[pin]
     gpuvm_unique: Mutex<Option<UniqueRefGpuVm<GpuVmData>>>,
     /// Non-core part of the GPUVM. Can be used for stuff that doesn't modify the
     /// internal mapping tree, like GpuVm::obtain()
     ///
-    /// Wrapped in `ManuallyDrop` so `Drop` can move this reference into
-    /// the cleanup workqueue closure rather than dropping it inline.
+    /// Wrapped in `ManuallyDrop` so `Drop` can pass this reference to
+    /// `release_gpuvm`.
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
     /// VA range for this VM.
     va_range: Range<u64>,
-    /// Cleanup workqueue used by `Drop` to defer the final
-    /// `drm_gpuvm_put` out of any dma-fence signalling section the drop
-    /// may run under.
-    cleanup_wq: Arc<CleanupQueue>,
+    /// Passes the gpuvm references to the cleanup workqueue. `None` for the
+    /// firmware VM. Taken by `Drop`.
+    handoff: Option<cleanup::Handoff<GpuVmRelease>>,
+}
+
+/// References that `VmExec::drop` passes to `release_gpuvm`.
+struct GpuVmRelease {
+    gpuvm: ARef<GpuVm<GpuVmData>>,
+    unique: Option<UniqueRefGpuVm<GpuVmData>>,
+}
+
+/// Flushes the deferred `vm_bo` list, then drops the gpuvm references
+/// that `VmExec::drop` moved out.
+///
+/// The flush takes the gpuvm reservation lock, so `VmExec::drop` defers
+/// it to the cleanup workqueue, except for the firmware VM.
+fn release_gpuvm(release: GpuVmRelease) {
+    let GpuVmRelease { gpuvm, unique } = release;
+    gpuvm.deferred_cleanup();
+    drop(unique);
+    drop(gpuvm);
 }
 
 #[pinned_drop]
@@ -697,31 +712,28 @@ impl PinnedDrop for VmExec {
     fn drop(self: Pin<&mut Self>) {
         // SAFETY: We do not move out of any structurally pinned field.
         // The `Mutex` is only accessed through `try_lock` in place, and
-        // the only field moved out is `gpuvm`, which is not `#[pin]`.
+        // the only fields moved out are `gpuvm` and `handoff`, neither of
+        // which is `#[pin]`.
         let this = unsafe { self.get_unchecked_mut() };
 
         // SAFETY: `Drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `gpuvm`. The field is never read again
-        // afterward. Moving out the reference here (rather than dropping
-        // it inline) keeps the final `drm_gpuvm_put`, which frees the
-        // GPUVM's r_obj GEM under `dma_resv_lock`, off the dma-fence
-        // signalling section this drop may run under.
+        // afterward.
         let gpuvm = unsafe { ManuallyDrop::take(&mut this.gpuvm) };
         // The last `VmExec` reference is dropping, so nothing else can
         // hold the lock and `try_lock` cannot block here on the
         // signalling path. `None` only on the impossible contended case,
         // in which the inner reference drops inline with the mutex.
         let gpuvm_unique = this.gpuvm_unique.try_lock().and_then(|mut g| g.take());
-
-        let res = this.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
-            drop(gpuvm);
-            drop(gpuvm_unique);
-        });
-
-        if res.is_err() {
-            pr_warn_once!(
-                "VmExec cleanup_wq enqueue failed under memory pressure; performing inline gpuvm teardown (lockdep cycle may fire)\n",
-            );
+        let release = GpuVmRelease {
+            gpuvm,
+            unique: gpuvm_unique,
+        };
+        // The firmware VM is dropped only by probe, unbind and the cleanup
+        // workqueue, outside any signalling section.
+        match this.handoff.take() {
+            Some(handoff) => handoff.spawn(release, release_gpuvm),
+            None => release_gpuvm(release),
         }
     }
 }
@@ -742,6 +754,8 @@ pub(crate) struct Vm {
     /// Kernel VA reservations that must live as long as the VM.
     #[pin]
     kernel_reservations: Mutex<KVec<range::LiveRange>>,
+    /// Declared last, so the device outlives the drop of every other field.
+    ddev: ARef<TyrDrmDevice>,
 }
 
 impl Vm {
@@ -755,7 +769,7 @@ impl Vm {
         kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
         coherent: bool,
-        cleanup_wq: Arc<CleanupQueue>,
+        fw: bool,
     ) -> Result<Arc<Vm>> {
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
@@ -786,6 +800,11 @@ impl Vm {
             GFP_KERNEL,
         )?;
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
+        let handoff = if fw {
+            None
+        } else {
+            Some(cleanup::Handoff::new(())?)
+        };
 
         let exec = Arc::pin_init(
             pin_init!(VmExec {
@@ -796,7 +815,7 @@ impl Vm {
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: Atomic::new(false),
                 va_range: total_range,
-                cleanup_wq,
+                handoff,
             }),
             GFP_KERNEL,
         )?;
@@ -821,6 +840,7 @@ impl Vm {
                 user_va_limit: kernel_range.start,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
+                ddev: ddev.into(),
             }),
             GFP_KERNEL,
         )?;
@@ -833,7 +853,6 @@ impl Vm {
     /// Callers must reserve any explicit-VA sections inside the window with
     /// `reserve_kernel_range` before
     /// `alloc_kernel_range` is called.
-    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_fw(
         pdev: &platform::Device<Bound>,
         ddev: &TyrDrmDevice,
@@ -842,7 +861,6 @@ impl Vm {
         auto_kernel_va_start: u64,
         auto_kernel_va_size: u64,
         coherent: bool,
-        cleanup_wq: Arc<CleanupQueue>,
     ) -> Result<Arc<Vm>> {
         let total_range = 0..max_va_range(gpu_info);
         let kernel_range = auto_kernel_va_start..(auto_kernel_va_start + auto_kernel_va_size);
@@ -856,7 +874,7 @@ impl Vm {
             kernel_range,
             None,
             coherent,
-            cleanup_wq,
+            true,
         )
     }
 
@@ -887,7 +905,7 @@ impl Vm {
             kernel_range,
             Some(bind_wq),
             ddev.coherent,
-            ddev.cleanup_wq.clone(),
+            false,
         )
     }
 

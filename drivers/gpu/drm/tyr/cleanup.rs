@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: GPL-2.0 or MIT
+
+//! Module-wide cleanup workqueue.
+//!
+//! Carries deferred drops from objects whose `Drop` would otherwise run
+//! inside a dma-fence signalling section. The queue is deliberately not a
+//! `DmaFenceWorkqueue`: its work runs outside a signalling section, so it
+//! may take `dma_resv_lock` and the per-VM gpuvm mutex, and allocate with
+//! `GFP_KERNEL`.
+//!
+//! The queue lock is a plain spinlock, so every entry point must be called
+//! from process context.
+//!
+//! A queued item may drop the last reference to a device, and destroying a
+//! workqueue from one of its own workers deadlocks, so no device owns the
+//! queue. The module destroys it after the driver unregisters, which drains
+//! the drops deferred after unbind.
+
+use kernel::{
+    prelude::*,
+    sync::global_lock,
+    workqueue::{
+        self,
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
+    },
+};
+
+global_lock! {
+    // SAFETY: Initialized by `Registration::new` before any other use.
+    unsafe(uninit) static CLEANUP_WQ: SpinLock<Option<workqueue::OwnedQueue>> = None;
+}
+
+/// Registration of the module-wide cleanup workqueue.
+///
+/// Creating it builds the queue and publishes it to `Handoff::spawn`.
+/// Dropping it destroys the queue, which drains every item still queued.
+pub(crate) struct Registration(());
+
+impl Registration {
+    /// Creates the cleanup workqueue.
+    ///
+    /// # Safety
+    ///
+    /// Must be called at most once per module load, before any other use of
+    /// the cleanup workqueue.
+    pub(crate) unsafe fn new() -> Result<Self> {
+        // SAFETY: The caller calls this at most once, before any other use.
+        unsafe { CLEANUP_WQ.init() };
+        let wq = workqueue::Queue::new_unbound().build(c"tyr-cleanup")?;
+        *CLEANUP_WQ.lock() = Some(wq);
+        Ok(Self(()))
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // Destroying the queue sleeps and runs items that may enqueue again,
+        // so take it out of the static first.
+        let wq = CLEANUP_WQ.lock().take();
+        drop(wq);
+    }
+}
+
+/// A deferred drop whose work item is allocated ahead of time.
+///
+/// Queuing the work item does not allocate, so it cannot fail in a dma-fence
+/// signalling section.
+pub(crate) struct Handoff<T, K = ()>(Pin<KBox<HandoffWork<T, K>>>);
+
+#[pin_data]
+struct HandoffWork<T, K> {
+    #[pin]
+    work: Work<HandoffWork<T, K>>,
+    keep: K,
+    /// Set by `Handoff::spawn`.
+    value: Option<(T, fn(T))>,
+}
+
+impl_has_work! {
+    impl{T, K} HasWork<Self> for HandoffWork<T, K> { self.work }
+}
+
+impl<T: Send + 'static, K: Send + 'static> WorkItem for HandoffWork<T, K> {
+    type Pointer = Pin<KBox<Self>>;
+
+    fn run(mut this: Pin<KBox<Self>>) {
+        if let Some((value, f)) = this.as_mut().project().value.take() {
+            f(value);
+        }
+    }
+}
+
+impl<T: Send + 'static, K: Send + 'static> Handoff<T, K> {
+    /// Allocates the work item with `GFP_KERNEL`. `keep` is dropped after the
+    /// deferred drop has run.
+    pub(crate) fn new(keep: K) -> Result<Self> {
+        let work = KBox::pin_init(
+            pin_init!(HandoffWork {
+                work <- new_work!("cleanup::Handoff"),
+                keep,
+                value: None,
+            }),
+            GFP_KERNEL,
+        )?;
+
+        Ok(Self(work))
+    }
+
+    /// Runs `f(value)` on the cleanup workqueue, then drops `keep`.
+    ///
+    /// Must not be called before the module has created the `Registration`.
+    /// Once the module has destroyed the queue, runs both inline. No dma-fence
+    /// signalling section calls this after unbind.
+    pub(crate) fn spawn(self, value: T, f: fn(T)) {
+        let mut work = self.0;
+        *work.as_mut().project().value = Some((value, f));
+
+        let work = match CLEANUP_WQ.lock().as_ref() {
+            Some(wq) => return wq.enqueue(work),
+            None => work,
+        };
+        HandoffWork::run(work);
+    }
+}

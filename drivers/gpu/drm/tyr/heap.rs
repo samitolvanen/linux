@@ -94,15 +94,8 @@ fn alloc_chunk_bo(
     chunk_size: u32,
 ) -> Result<Arc<gem::MappedBo>> {
     let flags = VmMapFlags::from(VmFlag::Noexec);
-    let chunk_bo = gem::new_kernel_object(
-        dev,
-        ddev,
-        vm,
-        chunk_size as usize,
-        flags,
-        ddev.coherent,
-        ddev.cleanup_wq.clone(),
-    )?;
+    let chunk_bo =
+        gem::new_kernel_object(dev, ddev, vm, chunk_size as usize, flags, ddev.coherent)?;
 
     let vmap = chunk_bo.vmap();
     let size = vmap.owner().size();
@@ -250,7 +243,6 @@ impl Pool {
             bo_size,
             flags,
             ddev.coherent,
-            ddev.cleanup_wq.clone(),
         )?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc1), GFP_KERNEL)?;
 

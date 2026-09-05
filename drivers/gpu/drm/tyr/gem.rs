@@ -4,10 +4,7 @@
 //! This module provides buffer object (BO) management functionality using
 //! DRM's GEM subsystem with shmem backing.
 
-use core::mem::{
-    ManuallyDrop,
-    MaybeUninit, //
-};
+use core::mem::ManuallyDrop;
 use core::ops::Range;
 
 use kernel::{
@@ -20,7 +17,6 @@ use kernel::{
         shmem,
         BaseObject, //
     },
-    pr_warn_once,
     prelude::*,
     sync::{
         aref::ARef,
@@ -29,8 +25,8 @@ use kernel::{
 };
 
 use crate::{
+    cleanup,
     driver::{
-        CleanupQueue,
         TyrDrmDevice,
         TyrDrmDriver, //
     },
@@ -87,7 +83,7 @@ pub(crate) struct MappedBo {
 
 impl MappedBo {
     pub(crate) fn new(kernel_bo: KernelBo) -> Result<Arc<Self>> {
-        let vmap = BoVmap::new(kernel_bo.bo(), kernel_bo.cleanup_wq.clone())?;
+        let vmap = BoVmap::new(kernel_bo.bo())?;
         Ok(Arc::new(Self { kernel_bo, vmap }, GFP_KERNEL)?)
     }
 
@@ -115,26 +111,26 @@ impl core::ops::Deref for MappedBo {
 /// `dma_resv_lock`, never runs on the dropping context, which may be
 /// a dma-fence signalling section.
 pub(crate) struct BoVmap {
-    /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when shipping the vmap to the cleanup
+    /// Taken only by `Drop` when passing the vmap to the cleanup
     /// workqueue.
-    vmap: Option<shmem::VMapOwned<BoData>>,
-    cleanup_wq: Arc<CleanupQueue>,
+    vmap: ManuallyDrop<shmem::VMapOwned<BoData>>,
+    /// Passes the vmap to the cleanup workqueue and keeps the device alive
+    /// for its final GEM put. Taken by `Drop` with `vmap`.
+    handoff: ManuallyDrop<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl BoVmap {
-    pub(crate) fn new(bo: &Bo, cleanup_wq: Arc<CleanupQueue>) -> Result<Self> {
+    pub(crate) fn new(bo: &Bo) -> Result<Self> {
+        let handoff = cleanup::Handoff::new(bo.dev().into())?;
         let vmap = bo.owned_vmap::<0>()?;
         Ok(Self {
-            vmap: Some(vmap),
-            cleanup_wq,
+            vmap: ManuallyDrop::new(vmap),
+            handoff: ManuallyDrop::new(handoff),
         })
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        self.vmap
-            .as_ref()
-            .expect("BoVmap::vmap accessed after drop")
+        &self.vmap
     }
 
     /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
@@ -167,64 +163,18 @@ impl core::ops::Deref for BoVmap {
     }
 }
 
-/// Send raw-pointer wrapper used to hand a heap-parked vmap to the
-/// cleanup closure. Only the closure (success) or this Drop body
-/// (failure) calls KBox::from_raw on the inner pointer.
-#[repr(transparent)]
-struct BoVmapCleanupPtr(*mut shmem::VMapOwned<BoData>);
-
-// SAFETY: The pointer is produced by KBox::into_raw and reclaimed by
-// KBox::from_raw exactly once, on whichever side observes it first
-// (closure on success, this Drop body on failure).
-unsafe impl Send for BoVmapCleanupPtr {}
-
 impl Drop for BoVmap {
     fn drop(&mut self) {
-        let Some(vmap) = self.vmap.take() else {
-            return;
+        // SAFETY: `drop` runs once, so this is the only take of either
+        // field, and they are not used afterward.
+        let (vmap, handoff) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.vmap),
+                ManuallyDrop::take(&mut self.handoff),
+            )
         };
-        let cleanup_wq = self.cleanup_wq.clone();
 
-        let slot: KBox<MaybeUninit<shmem::VMapOwned<BoData>>> = match KBox::new_uninit(GFP_NOWAIT) {
-            Ok(s) => s,
-            Err(_) => {
-                pr_warn_once!(
-                    "BoVmap cleanup-state allocation failed; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
-                );
-                core::mem::forget(vmap);
-                return;
-            }
-        };
-        let boxed = KBox::write(slot, vmap);
-        let ptr = KBox::into_raw(boxed);
-        let send_ptr = BoVmapCleanupPtr(ptr);
-
-        let res = cleanup_wq.try_spawn(GFP_NOWAIT, move || {
-            // Force `Send` capture of the wrapper, see `KernelBo`.
-            let send_ptr = send_ptr;
-            // SAFETY: `send_ptr.0` was produced by `KBox::into_raw`
-            // in the matching `BoVmap::drop` body and is only
-            // reclaimed by `KBox::from_raw` once: by this closure on
-            // the success path, or by the `Drop` body on the
-            // enqueue-failure path. The cleanup workqueue runs
-            // outside any dma-fence signalling section, so taking
-            // `dma_resv_lock` from the vmap destructor is safe here.
-            drop(unsafe { KBox::from_raw(send_ptr.0) });
-        });
-
-        if let Err(e) = res {
-            pr_warn_once!(
-                "BoVmap cleanup_wq enqueue failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
-            );
-            // SAFETY: `try_spawn` returned `Err`, so the closure was
-            // dropped without observing `ptr`. Ownership remains
-            // here. Leak the box, because dropping it would invoke the vmap
-            // destructor and take `dma_resv_lock` from the
-            // signalling section that prompted the deferral.
-            let boxed = unsafe { KBox::from_raw(ptr) };
-            core::mem::forget(KBox::into_inner(boxed));
-            pr_err!("Failed to enqueue BoVmap vmap cleanup: {:?}\n", e);
-        }
+        handoff.spawn(vmap, drop);
     }
 }
 
@@ -296,7 +246,6 @@ pub(crate) fn new_kernel_object(
     size: usize,
     flags: VmMapFlags,
     coherent: bool,
-    cleanup_wq: Arc<CleanupQueue>,
 ) -> Result<Arc<MappedBo>> {
     let aligned_size = size.next_multiple_of(1 << 12);
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -310,7 +259,7 @@ pub(crate) fn new_kernel_object(
         KernelBoVaAlloc::Explicit(va),
         flags,
         coherent,
-        cleanup_wq,
+        KernelBoOwner::User,
     )?
     .with_va_reservation(node);
 
@@ -324,6 +273,14 @@ pub(crate) enum KernelBoVaAlloc {
     Explicit(u64),
 }
 
+/// Owner of a `KernelBo`.
+pub(crate) enum KernelBoOwner {
+    /// A firmware section.
+    Firmware,
+    /// A group, queue or heap object.
+    User,
+}
+
 /// A kernel-owned buffer object with automatic GPU virtual address mapping.
 ///
 /// This structure represents a buffer object that is created and managed entirely
@@ -335,13 +292,16 @@ pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
     ///
     /// Wrapped in `ManuallyDrop` so `Drop` can move the single owning
-    /// reference into the deferred cleanup. The GEM object's final drop
+    /// reference into `kernel_bo_unmap`. The GEM object's final drop
     /// runs `Object::free_callback`, whose cached sg-table teardown
     /// takes `dma_resv_lock`, so it must not run on the dma-fence
     /// signalling path that may be dropping this `KernelBo`.
     bo: ManuallyDrop<ARef<Bo>>,
     /// The GPU VM this buffer is mapped into.
-    vm: Arc<Vm>,
+    ///
+    /// `ManuallyDrop` so `Drop` can move the reference into
+    /// `kernel_bo_unmap`.
+    vm: ManuallyDrop<Arc<Vm>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`. Dropped from the
@@ -349,9 +309,9 @@ pub(crate) struct KernelBo {
     /// down. `None` when the VA is managed externally, as on the
     /// firmware load path.
     kernel_node: Option<range::LiveRange>,
-    /// Cleanup workqueue used by `Drop` to defer the GPU unmap out
-    /// of any dma-fence signalling section the drop may run under.
-    cleanup_wq: Arc<CleanupQueue>,
+    /// Passes the unmap to the cleanup workqueue. `None` for a firmware
+    /// section. Taken by `Drop`.
+    handoff: Option<cleanup::Handoff<KernelBoCleanup>>,
 }
 
 impl KernelBo {
@@ -369,7 +329,7 @@ impl KernelBo {
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
         coherent: bool,
-        cleanup_wq: Arc<CleanupQueue>,
+        owner: KernelBoOwner,
     ) -> Result<Self> {
         if size == 0 {
             dev_err!(dev, "Cannot create KernelBo with size 0");
@@ -380,6 +340,10 @@ impl KernelBo {
 
         let bo_size = usize::try_from(size).map_err(|_| EOVERFLOW)?;
         let va_end = va.checked_add(size).ok_or(EINVAL)?;
+        let handoff = match owner {
+            KernelBoOwner::Firmware => None,
+            KernelBoOwner::User => Some(cleanup::Handoff::new(())?),
+        };
 
         let bo = Bo::new(
             ddev,
@@ -395,10 +359,10 @@ impl KernelBo {
 
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
-            vm,
+            vm: ManuallyDrop::new(vm),
             va_range: va..va_end,
             kernel_node: None,
-            cleanup_wq,
+            handoff,
         })
     }
 
@@ -428,12 +392,7 @@ impl KernelBo {
     }
 }
 
-/// Heap-parked captures for the `KernelBo::drop` hand-off to the
-/// cleanup workqueue.
-///
-/// Keeping them off the closure lets `Drop` recover them and unmap
-/// inline when enqueue fails. Dropping the closure in place would skip
-/// the unmap and leave stale PTEs for the next user of the VA.
+/// The captures that `KernelBo::drop` passes to `kernel_bo_unmap`.
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
@@ -444,121 +403,40 @@ struct KernelBoCleanup {
     kernel_node: Option<range::LiveRange>,
 }
 
-/// `Send` raw-pointer wrapper used to hand a `KernelBoCleanup` box
-/// to the cleanup closure. Ownership transfers to whichever side
-/// observes `KBox::from_raw` first. That is the closure on the
-/// success path and the `Drop` body on the enqueue-failure path.
-#[repr(transparent)]
-struct KernelBoCleanupPtr(*mut KernelBoCleanup);
-
-// SAFETY: The pointer is produced by `KBox::into_raw` and is never
-// duplicated. The closure captures one copy by value, and the
-// `Drop` body retains a sibling copy that it only converts back to
-// a `KBox` on the enqueue-failure branch, where `try_spawn` has
-// already dropped the closure without observing the pointer.
-unsafe impl Send for KernelBoCleanupPtr {}
-
 impl Drop for KernelBo {
     fn drop(&mut self) {
         let va = self.va_range.start;
         let size = self.va_range.end - self.va_range.start;
-        let vm = self.vm.clone();
+        // SAFETY: `drop` runs once, this is the only take of `self.vm`,
+        // and the field is not read afterward.
+        let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
         // SAFETY: `Drop::drop` runs at most once, this is the only
         // `ManuallyDrop::take` of `self.bo`, and the field is never
         // read again afterward.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
         let kernel_node = self.kernel_node.take();
 
-        let slot: KBox<MaybeUninit<KernelBoCleanup>> = match KBox::new_uninit(GFP_NOWAIT) {
-            Ok(s) => s,
-            Err(_) => {
-                pr_warn_once!(
-                    "KernelBo cleanup-state allocation failed; performing inline unmap (lockdep cycle may fire)\n",
-                );
-                inline_kernel_bo_unmap(KernelBoCleanup {
-                    vm,
-                    bo,
-                    va,
-                    size,
-                    kernel_node,
-                });
-                return;
-            }
+        let captures = KernelBoCleanup {
+            vm,
+            bo,
+            va,
+            size,
+            kernel_node,
         };
-        let boxed = KBox::write(
-            slot,
-            KernelBoCleanup {
-                vm,
-                bo,
-                va,
-                size,
-                kernel_node,
-            },
-        );
-        let ptr = KBox::into_raw(boxed);
-        let send_ptr = KernelBoCleanupPtr(ptr);
 
-        let res = self.cleanup_wq.try_spawn(GFP_NOWAIT, move || {
-            // Force the closure to capture the whole `Send` wrapper
-            // by value rather than disjointly capturing the `*mut`
-            // field. Capturing just the field would make the closure
-            // non-`Send`.
-            let send_ptr = send_ptr;
-            // SAFETY: `send_ptr.0` was produced by `KBox::into_raw`
-            // in the matching `KernelBo::drop` body and is only
-            // reclaimed by `KBox::from_raw` once: by this closure on
-            // the success path, or by the `Drop` body on the
-            // enqueue-failure path. `try_spawn` runs the closure at
-            // most once and only when enqueue succeeded.
-            let boxed = unsafe { KBox::from_raw(send_ptr.0) };
-            let KernelBoCleanup {
-                vm,
-                bo,
-                va,
-                size,
-                kernel_node,
-            } = KBox::into_inner(boxed);
-            if let Err(e) = vm.unmap_range(va, size) {
-                pr_err!(
-                    "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-                    va,
-                    va + size,
-                    e
-                );
-            }
-            // Force the closure to capture `bo` so its drop runs on
-            // the cleanup workqueue, not back here on the dma-fence
-            // signalling path. Likewise hold the kernel-VA reservation
-            // until the unmap above has actually torn down the mapping.
-            drop(bo);
-            drop(kernel_node);
-        });
-
-        if let Err(e) = res {
-            pr_warn_once!(
-                "KernelBo cleanup_wq enqueue failed under memory pressure; performing inline unmap (lockdep cycle may fire)\n",
-            );
-            // SAFETY: `try_spawn` returned `Err`, so the closure was
-            // dropped without observing `ptr`. Ownership of the
-            // boxed captures therefore remains with this thread.
-            let boxed = unsafe { KBox::from_raw(ptr) };
-            let captures = KBox::into_inner(boxed);
-            pr_err!(
-                "Failed to enqueue KernelBo cleanup for {:#x}..{:#x}: {:?}\n",
-                captures.va,
-                captures.va + captures.size,
-                e,
-            );
-            inline_kernel_bo_unmap(captures);
+        // Firmware sections are dropped only by probe and unbind, outside any
+        // signalling section.
+        match self.handoff.take() {
+            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap),
+            None => kernel_bo_unmap(captures),
         }
     }
 }
 
-/// Inline fallback for `KernelBo::drop` when the cleanup workqueue
-/// hand-off cannot be set up. Runs the unmap and then releases the VA
-/// reservation. Taking `gpuvm_unique` here may trigger a lockdep
-/// splat if Drop fired from a dma-fence signalling path.
-fn inline_kernel_bo_unmap(captures: KernelBoCleanup) {
+/// Tears down a `KernelBo` mapping and then releases the VA
+/// reservation. Runs on the cleanup workqueue, or inline for a firmware
+/// section.
+fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
         bo,
@@ -568,7 +446,7 @@ fn inline_kernel_bo_unmap(captures: KernelBoCleanup) {
     } = captures;
     if let Err(e) = vm.unmap_range(va, size) {
         pr_err!(
-            "Failed to inline-unmap KernelBo range {:#x}..{:#x}: {:?}\n",
+            "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
             va,
             va + size,
             e
