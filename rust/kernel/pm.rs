@@ -822,6 +822,27 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
         AwakeScope::new(self.inner.dev, profile.0 | ModeFlag::Acquire)
     }
 
+    /// Creates an `AwakeScope` only if the device is runtime-active.
+    ///
+    /// Never resumes the device, mirroring `pm_runtime_get_if_active()`, so
+    /// it can be called where the resume callback must not run inline. The
+    /// usage reference blocks runtime suspend until the scope is dropped.
+    ///
+    /// Returns `Ok(None)` when the device is not runtime-active and
+    /// `Err(EINVAL)` when runtime PM is disabled for the device.
+    #[inline]
+    pub fn get_if_active(&self, profile: PMProfile) -> Result<Option<AwakeScope<'a>>> {
+        match Request::get_if_active(self.inner.dev) {
+            Ok(()) => Ok(Some(AwakeScope(Scope::<Awake> {
+                dev: self.inner.dev,
+                mode: profile.0 | ModeFlag::Acquire,
+                _tag: PhantomData,
+            }))),
+            Err(e) if e == EAGAIN => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Creates a `RetainScope` for this device.
     pub fn hold(&self) -> Result<RetainScope<'a>> {
         RetainScope::new(self.inner.dev)
