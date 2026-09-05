@@ -547,7 +547,7 @@ where
 // SAFETY: `bindings::dev_pm_ops` is `#[repr(C)]` and consists of nullable
 // function pointers only, so it has no padding and the all-zero bit pattern
 // is a valid value.
-pub const PMOPS_NONE: bindings::dev_pm_ops =
+pub(crate) const PMOPS_NONE: bindings::dev_pm_ops =
     unsafe { core::mem::MaybeUninit::<bindings::dev_pm_ops>::zeroed().assume_init() };
 
 /// Runtime PM ops for a driver.
@@ -747,7 +747,7 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
     /// transition. On failure, it returns the payload together
     /// with the error so the previous, or otherwise sane state
     /// can be preserved.
-    pub const PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+    pub(crate) const PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
         runtime_resume: if T::HAS_RUNTIME_RESUME {
             Some(runtime_resume_callback::<D, T>)
         } else {
