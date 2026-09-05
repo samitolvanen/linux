@@ -17,15 +17,24 @@ use crate::{
         VTABLE_DEFAULT_ERROR, //
     },
     prelude::*,
-    sync::atomic::{
-        ordering,
-        AtomicFlag, //
+    sync::{
+        aref::ARef,
+        atomic::{
+            ordering,
+            Atomic,
+            AtomicFlag,
+            AtomicType, //
+        },
+        Arc, //
     },
-    sync::Arc,
     types::ForeignOwnable, //
 };
 
-use core::{cell::UnsafeCell, marker::PhantomData};
+use core::{
+    cell::UnsafeCell,
+    marker::PhantomData,
+    mem::ManuallyDrop, //
+};
 
 kernel::impl_flags! {
     /// Runtime Power Management modes that determine how a particular PM
@@ -76,8 +85,8 @@ pub enum RuntimePMState {
 }
 
 /// Runtime power transition scope.
-pub struct Scope<'a, Tag> {
-    dev: &'a device::Device<device::Bound>,
+pub struct Scope<Tag> {
+    dev: ARef<device::Device>,
     mode: Mode,
     _tag: PhantomData<Tag>,
 }
@@ -103,7 +112,7 @@ pub struct Retain;
 /// The guard must be dropped from a context matching the requested transition
 /// mode: sync vs async.
 #[must_use = "dropping this guard issues the matching runtime PM release request"]
-pub struct ResumeScope<'a>(Scope<'a, Resume>);
+pub struct ResumeScope(Scope<Resume>);
 
 /// Acquires a runtime-PM usage reference and keeps the device powered.
 ///
@@ -111,7 +120,7 @@ pub struct ResumeScope<'a>(Scope<'a, Resume>);
 /// The guard must be dropped from a context matching the requested transition
 /// mode: sync vs async.
 #[must_use = "dropping this guard releases its runtime PM hold"]
-pub struct AwakeScope<'a>(Scope<'a, Awake>);
+pub struct AwakeScope(Scope<Awake>);
 
 /// Prevents the device from getting suspended by holding the usage reference
 /// count.
@@ -121,10 +130,65 @@ pub struct AwakeScope<'a>(Scope<'a, Awake>);
 /// sleeping lock on `PREEMPT_RT`, so it must not happen under a raw spinlock
 /// or in hardirq context.
 #[must_use = "dropping this guard releases its runtime PM hold"]
-pub struct RetainScope<'a>(Scope<'a, Retain>);
+pub struct RetainScope(Scope<Retain>);
 
-impl<'a> ResumeScope<'a> {
-    fn new(dev: &'a device::Device<device::Bound>, mode: Mode) -> Result<Self> {
+/// A scope wrapper whose `Drop` issues the release request for its inner
+/// [`Scope`].
+///
+/// # Safety
+///
+/// `scope()` must return a reference to a [`Scope`] field of `self`.
+unsafe trait ScopeWrapper: Sized {
+    /// The scope tag.
+    type Tag;
+
+    /// Returns the wrapped scope.
+    fn scope(&self) -> &Scope<Self::Tag>;
+}
+
+/// Moves the inner scope out of `wrapper` without running the wrapper's
+/// `Drop`. Dropping the returned scope releases the device reference.
+#[inline]
+fn take_scope<W: ScopeWrapper>(wrapper: W) -> Scope<W::Tag> {
+    let wrapper = ManuallyDrop::new(wrapper);
+    // SAFETY: By the `ScopeWrapper` contract, `scope()` returns a field of
+    // `wrapper`, which is `ManuallyDrop`, so the field is never dropped
+    // through it. Reading it out here moves it exactly once.
+    unsafe { core::ptr::read(wrapper.scope()) }
+}
+
+// SAFETY: `scope()` returns the wrapper's own field.
+unsafe impl ScopeWrapper for ResumeScope {
+    type Tag = Resume;
+
+    #[inline]
+    fn scope(&self) -> &Scope<Resume> {
+        &self.0
+    }
+}
+
+// SAFETY: `scope()` returns the wrapper's own field.
+unsafe impl ScopeWrapper for AwakeScope {
+    type Tag = Awake;
+
+    #[inline]
+    fn scope(&self) -> &Scope<Awake> {
+        &self.0
+    }
+}
+
+// SAFETY: `scope()` returns the wrapper's own field.
+unsafe impl ScopeWrapper for RetainScope {
+    type Tag = Retain;
+
+    #[inline]
+    fn scope(&self) -> &Scope<Retain> {
+        &self.0
+    }
+}
+
+impl ResumeScope {
+    fn new(dev: ARef<device::Device>, mode: Mode) -> Result<Self> {
         if mode.contains(ModeFlag::Acquire) {
             // ModeFlag::Acquire is intended to be used with Awake scope
             // Avoid mixing the modes.
@@ -132,7 +196,7 @@ impl<'a> ResumeScope<'a> {
         }
 
         // ModeFlag::Idle is internal so strip it off before passing further
-        Request::resume(dev, mode & !ModeFlag::Idle).map(|()| {
+        Request::resume(&dev, mode & !ModeFlag::Idle).map(|()| {
             Self(Scope::<Resume> {
                 dev,
                 mode,
@@ -146,14 +210,14 @@ impl<'a> ResumeScope<'a> {
 
         match self.0.mode {
             mode if mode.contains(ModeFlag::Idle) => Request::idle(
-                self.0.dev,
+                &self.0.dev,
                 scope_mode & (ModeFlag::Async | ModeFlag::Nowait),
             ),
             mode if mode.contains(ModeFlag::Auto) => {
-                Request::mark_last_busy(self.0.dev);
-                Request::suspend(self.0.dev, scope_mode)
+                Request::mark_last_busy(&self.0.dev);
+                Request::suspend(&self.0.dev, scope_mode)
             }
-            _ => Request::suspend(self.0.dev, scope_mode),
+            _ => Request::suspend(&self.0.dev, scope_mode),
         }
     }
 
@@ -163,31 +227,31 @@ impl<'a> ResumeScope<'a> {
     /// when error handling is required.
     pub fn release(self) -> Result {
         let result = self.release_inner();
-        core::mem::forget(self);
+        drop(take_scope(self));
         result
     }
 }
 
-impl<'a> Drop for ResumeScope<'a> {
+impl Drop for ResumeScope {
     fn drop(&mut self) {
         let _ = self.release_inner();
     }
 }
 
-impl<'a> AwakeScope<'a> {
-    fn new(dev: &'a device::Device<device::Bound>, mode: Mode) -> Result<Self> {
+impl AwakeScope {
+    fn new(dev: ARef<device::Device>, mode: Mode) -> Result<Self> {
         if !mode.contains(ModeFlag::Acquire) {
             return Err(EINVAL);
         }
         // ModeFlag::Idle is internal so strip it off before passing further
-        match Request::resume(dev, mode & !ModeFlag::Idle) {
+        match Request::resume(&dev, mode & !ModeFlag::Idle) {
             Ok(()) => {}
             // For async/nowait requests, `EINPROGRESS` means the resume is in
             // flight and the usage reference already keeps the device active.
             Err(e) if e == EINPROGRESS && mode.contains_any(ModeFlag::Async | ModeFlag::Nowait) => {
             }
             Err(e) => {
-                Request::put_noidle(dev);
+                Request::put_noidle(&dev);
                 return Err(e);
             }
         }
@@ -202,12 +266,12 @@ impl<'a> AwakeScope<'a> {
     fn release_inner(&self) -> Result {
         let scope_mode = self.0.mode & !ModeFlag::Idle;
         match self.0.mode {
-            mode if mode.contains(ModeFlag::Idle) => Request::idle(self.0.dev, scope_mode),
+            mode if mode.contains(ModeFlag::Idle) => Request::idle(&self.0.dev, scope_mode),
             mode if mode.contains(ModeFlag::Auto) => {
-                Request::mark_last_busy(self.0.dev);
-                Request::suspend(self.0.dev, scope_mode)
+                Request::mark_last_busy(&self.0.dev);
+                Request::suspend(&self.0.dev, scope_mode)
             }
-            _ => Request::suspend(self.0.dev, scope_mode),
+            _ => Request::suspend(&self.0.dev, scope_mode),
         }
     }
 
@@ -217,20 +281,20 @@ impl<'a> AwakeScope<'a> {
     /// when error handling is required.
     pub fn release(self) -> Result {
         let result = self.release_inner();
-        core::mem::forget(self);
+        drop(take_scope(self));
         result
     }
 }
 
-impl<'a> Drop for AwakeScope<'a> {
+impl Drop for AwakeScope {
     fn drop(&mut self) {
         let _ = self.release_inner();
     }
 }
 
-impl<'a> RetainScope<'a> {
-    fn new(dev: &'a device::Device<device::Bound>) -> Result<Self> {
-        Request::get_noresume(dev);
+impl RetainScope {
+    fn new(dev: ARef<device::Device>) -> Result<Self> {
+        Request::get_noresume(&dev);
         Ok(Self(Scope::<Retain> {
             dev,
             mode: Mode(ModeFlag::Sync as u32),
@@ -238,8 +302,8 @@ impl<'a> RetainScope<'a> {
         }))
     }
 
-    fn try_new(dev: &'a device::Device<device::Bound>) -> Result<Self> {
-        Request::get_if_active(dev)?;
+    fn try_new(dev: ARef<device::Device>) -> Result<Self> {
+        Request::get_if_active(&dev)?;
         Ok(Self(Scope::<Retain> {
             dev,
             mode: Mode(ModeFlag::Sync as u32),
@@ -248,8 +312,8 @@ impl<'a> RetainScope<'a> {
     }
 
     fn release_inner(&self) -> Result {
-        Request::mark_last_busy(self.0.dev);
-        Request::put(self.0.dev)
+        Request::mark_last_busy(&self.0.dev);
+        Request::put(&self.0.dev)
     }
 
     /// Explicitly releases the scope, reporting the outcome of the queued
@@ -259,85 +323,77 @@ impl<'a> RetainScope<'a> {
     /// no hold behind and a teardown path can ignore it.
     pub fn release(self) -> Result {
         let result = self.release_inner();
-        core::mem::forget(self);
+        drop(take_scope(self));
         result
     }
 }
 
-impl<'a> Drop for RetainScope<'a> {
+impl Drop for RetainScope {
     fn drop(&mut self) {
         let _ = self.release_inner();
     }
 }
 
 /// Runtime PM helpers - wrappers around C runtime PM interface.
-/// All methods require a reference to a bound device.
 struct Request;
 
 #[cfg(CONFIG_PM)]
 impl Request {
     #[inline]
-    fn active(dev: &device::Device<device::Bound>) -> bool {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn active(dev: &ARef<device::Device>) -> bool {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe { bindings::pm_runtime_active(dev.as_raw()) }
     }
 
     #[inline]
-    fn suspended(dev: &device::Device<device::Bound>) -> bool {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn suspended(dev: &ARef<device::Device>) -> bool {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe { bindings::pm_runtime_suspended(dev.as_raw()) }
     }
 
     #[inline]
-    fn resume(dev: &device::Device<device::Bound>, mode: Mode) -> Result {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn resume(dev: &ARef<device::Device>, mode: Mode) -> Result {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         to_result(unsafe { bindings::__pm_runtime_resume(dev.as_raw(), mode.into()) })
     }
 
     #[inline]
-    fn idle(dev: &device::Device<device::Bound>, mode: Mode) -> Result {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn idle(dev: &ARef<device::Device>, mode: Mode) -> Result {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         to_result(unsafe { bindings::__pm_runtime_idle(dev.as_raw(), mode.into()) })
     }
 
     /// Drops a usage reference and queues an idle notification, like
     /// `pm_runtime_put()`.
     #[inline]
-    fn put(dev: &device::Device<device::Bound>) -> Result {
+    fn put(dev: &ARef<device::Device>) -> Result {
         Self::idle(dev, ModeFlag::Acquire | ModeFlag::Async)
     }
 
     #[inline]
-    fn mark_last_busy(dev: &device::Device<device::Bound>) {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn mark_last_busy(dev: &ARef<device::Device>) {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe {
             bindings::pm_runtime_mark_last_busy(dev.as_raw());
         }
     }
 
     #[inline]
-    fn suspend(dev: &device::Device<device::Bound>, mode: Mode) -> Result {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn suspend(dev: &ARef<device::Device>, mode: Mode) -> Result {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         to_result(unsafe { bindings::__pm_runtime_suspend(dev.as_raw(), mode.into()) })
     }
 
     #[inline]
-    fn get_if_active(dev: &device::Device<device::Bound>) -> Result {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn get_if_active(dev: &ARef<device::Device>) -> Result {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         match unsafe { bindings::pm_runtime_get_if_active(dev.as_raw()) } {
             ret if ret < 0 => Err(Error::from_errno(ret)),
             0 => Err(EAGAIN),
@@ -346,26 +402,23 @@ impl Request {
     }
 
     #[inline]
-    fn runtime_enable(dev: &device::Device<device::Bound>) {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn runtime_enable(dev: &ARef<device::Device>) {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe { bindings::pm_runtime_enable(dev.as_raw()) }
     }
 
     #[inline]
-    fn runtime_disable(dev: &device::Device<device::Bound>) {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn runtime_disable(dev: &ARef<device::Device>) {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe { bindings::__pm_runtime_disable(dev.as_raw(), true) };
     }
 
     #[inline]
-    fn barrier(dev: &device::Device<device::Bound>) {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn barrier(dev: &ARef<device::Device>) {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe {
             bindings::pm_runtime_barrier(dev.as_raw());
         }
@@ -375,89 +428,85 @@ impl Request {
 #[cfg(not(CONFIG_PM))]
 impl Request {
     #[inline]
-    fn active(_dev: &device::Device<device::Bound>) -> bool {
+    fn active(_dev: &ARef<device::Device>) -> bool {
         true
     }
 
     #[inline]
-    fn suspended(_dev: &device::Device<device::Bound>) -> bool {
+    fn suspended(_dev: &ARef<device::Device>) -> bool {
         false
     }
 
     #[inline]
-    fn resume(_dev: &device::Device<device::Bound>, _mode: Mode) -> Result {
+    fn resume(_dev: &ARef<device::Device>, _mode: Mode) -> Result {
         Ok(())
     }
 
     #[inline]
-    fn idle(_dev: &device::Device<device::Bound>, _mode: Mode) -> Result {
+    fn idle(_dev: &ARef<device::Device>, _mode: Mode) -> Result {
         Err(ENOSYS)
     }
 
     // `pm_runtime_put()` discards the `ENOSYS` of the `__pm_runtime_idle()` stub.
     #[inline]
-    fn put(_dev: &device::Device<device::Bound>) -> Result {
+    fn put(_dev: &ARef<device::Device>) -> Result {
         Ok(())
     }
 
     #[inline]
-    fn mark_last_busy(_dev: &device::Device<device::Bound>) {}
+    fn mark_last_busy(_dev: &ARef<device::Device>) {}
 
     #[inline]
-    fn suspend(_dev: &device::Device<device::Bound>, _mode: Mode) -> Result {
+    fn suspend(_dev: &ARef<device::Device>, _mode: Mode) -> Result {
         Err(ENOSYS)
     }
 
     #[inline]
-    fn get_if_active(_dev: &device::Device<device::Bound>) -> Result {
+    fn get_if_active(_dev: &ARef<device::Device>) -> Result {
         Err(EINVAL)
     }
 
     #[inline]
-    fn runtime_enable(_dev: &device::Device<device::Bound>) {}
+    fn runtime_enable(_dev: &ARef<device::Device>) {}
 
     #[inline]
-    fn runtime_disable(_dev: &device::Device<device::Bound>) {}
+    fn runtime_disable(_dev: &ARef<device::Device>) {}
 
     #[inline]
-    fn barrier(_dev: &device::Device<device::Bound>) {}
+    fn barrier(_dev: &ARef<device::Device>) {}
 }
 
 impl Request {
     #[inline]
-    fn get_noresume(dev: &device::Device<device::Bound>) {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn get_noresume(dev: &ARef<device::Device>) {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe { bindings::pm_runtime_get_noresume(dev.as_raw()) };
     }
 
     #[inline]
-    fn put_noidle(dev: &device::Device<device::Bound>) {
-        // SAFETY: `dev.as_raw()` must provide a valid pointer to
-        // `struct device` for the duration of the call.
-        // The `Device<Bound>` reference provides that guarantee.
+    fn put_noidle(dev: &ARef<device::Device>) {
+        // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+        // valid pointer for the duration of this call.
         unsafe { bindings::pm_runtime_put_noidle(dev.as_raw()) };
     }
 
     #[allow(unused)]
     #[inline]
-    fn mark_active(dev: &device::Device<device::Bound>) -> Result {
+    fn mark_active(dev: &ARef<device::Device>) -> Result {
         to_result(
-            // SAFETY: `dev.as_raw()` must provide a valid pointer to
-            // `struct device` for the duration of the call.
-            // The `Device<Bound>` reference provides that guarantee.
+            // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+            // valid pointer for the duration of this call.
             unsafe { bindings::pm_runtime_set_active(dev.as_raw()) },
         )
     }
 
     #[allow(unused)]
     #[inline]
-    fn mark_suspended(dev: &device::Device<device::Bound>) -> Result {
+    fn mark_suspended(dev: &ARef<device::Device>) -> Result {
         to_result(
-            // SAFETY: `dev.as_raw()` must provide a valid pointer to
-            // `struct device` for the duration of the call.
-            // The `Device<Bound>` reference provides that guarantee.
+            // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+            // valid pointer for the duration of this call.
             unsafe { bindings::pm_runtime_set_suspended(dev.as_raw()) },
         )
     }
@@ -496,8 +545,8 @@ where
     // `rust_private` is guaranteed to be valid and points to
     // associated RegistrationData<T> type object at least for the duration
     // of this call.
-    let payload: Pin<&RegistrationData<'_, D, T>> =
-        unsafe { <Pin<KBox<RegistrationData<'_, D, T>>> as ForeignOwnable>::borrow(ptr) };
+    let payload: Pin<&RegistrationData<D, T>> =
+        unsafe { <Pin<KBox<RegistrationData<D, T>>> as ForeignOwnable>::borrow(ptr) };
 
     let pm_dev: &T::DeviceType =
         // SAFETY: The generated `dev_pm_ops` for `T` is installed on devices whose
@@ -773,9 +822,28 @@ impl<P> PMPayload<P> {
 // access to the payload, and `PayloadGuard` clears the flag when the access ends.
 unsafe impl<P: Send> Sync for PMPayload<P> {}
 
-struct PMContextInner<'a, D: driver::DriverLayout, T: PMOps<D>> {
-    dev: &'a device::Device<device::Bound>,
-    enabled: AtomicFlag,
+/// Runtime PM state of a [`PMContext`].
+///
+/// The state alternates between `Disabled` and `Enabled` until
+/// `Registration::drop` sets `Dead`, which is final.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum PMContextState {
+    Disabled = 0,
+    Enabled = 1,
+    Dead = 2,
+}
+
+// SAFETY: `PMContextState` and `i32` have the same size and alignment, and
+// `PMContextState` is round-trip transmutable to `i32`.
+unsafe impl AtomicType for PMContextState {
+    type Repr = i32;
+}
+
+struct PMContextInner<D: driver::DriverLayout, T: PMOps<D>> {
+    dev: ARef<device::Device>,
+    /// A context outliving its registration cannot enable or disable runtime PM.
+    state: Atomic<PMContextState>,
     /// Optional driver-selected runtime PM request PMProfiles.
     ///
     /// Set of runtime PM predefined PMProfiles that can be used by the driver
@@ -789,14 +857,14 @@ struct PMContextInner<'a, D: driver::DriverLayout, T: PMOps<D>> {
 }
 
 /// Runtime PM context tied to a device.
-pub struct PMContext<'a, D: driver::DriverLayout, T: PMOps<D>> {
+pub struct PMContext<D: driver::DriverLayout, T: PMOps<D>> {
     // Preferably, PMContext could be shared via borrowed reference over
     // a pm Registration's lifetime but that bears complications on its own
     // when the context needs to be shared across different Registration types.
-    inner: Arc<PMContextInner<'a, D, T>>,
+    inner: Arc<PMContextInner<D, T>>,
 }
 
-impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
+impl<D: driver::DriverLayout, T: PMOps<D>> PMContext<D, T> {
     /// Driver-provided runtime PM operations.
     ///
     /// A driver implements this trait to handle runtime PM
@@ -822,64 +890,79 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
     };
 
     /// Enable runtime PM.
+    ///
+    /// Fails with `EINVAL` once the registration has been dropped.
     pub fn enable(&self, state: RuntimePMState) -> Result {
-        if self
-            .inner
-            .enabled
-            .cmpxchg(false, true, ordering::Full)
-            .is_err()
-        {
-            return Err(EBUSY);
+        match self.inner.state.cmpxchg(
+            PMContextState::Disabled,
+            PMContextState::Enabled,
+            ordering::Full,
+        ) {
+            Ok(_) => (),
+            Err(PMContextState::Enabled) => return Err(EBUSY),
+            Err(_) => return Err(EINVAL),
         }
-        Self::apply_config(self.inner.dev, &self.inner.configs);
+        Self::apply_config(&self.inner.dev, &self.inner.configs);
         match state {
-            RuntimePMState::Resumed => Request::mark_active(self.inner.dev),
-            RuntimePMState::Suspended => Request::mark_suspended(self.inner.dev),
+            RuntimePMState::Resumed => Request::mark_active(&self.inner.dev),
+            RuntimePMState::Suspended => Request::mark_suspended(&self.inner.dev),
             _ => Err(EINVAL),
         }
-        .inspect_err(|_| self.inner.enabled.store(false, ordering::Release))?;
-        Request::runtime_enable(self.inner.dev);
+        .inspect_err(|_| {
+            let _ = self.inner.state.cmpxchg(
+                PMContextState::Enabled,
+                PMContextState::Disabled,
+                ordering::Full,
+            );
+        })?;
+        Request::runtime_enable(&self.inner.dev);
         Ok(())
     }
     /// Disable runtime PM.
+    ///
+    /// Fails with `EINVAL` once the registration has been dropped.
     pub fn disable(&self) -> Result {
         if self
             .inner
-            .enabled
-            .cmpxchg(true, false, ordering::Full)
+            .state
+            .cmpxchg(
+                PMContextState::Enabled,
+                PMContextState::Disabled,
+                ordering::Full,
+            )
             .is_err()
         {
             return Err(EINVAL);
         }
-        Self::apply_config(self.inner.dev, &[PMConfig::AutoSuspend(false)]);
-        Request::runtime_disable(self.inner.dev);
+        Self::apply_config(&self.inner.dev, &[PMConfig::AutoSuspend(false)]);
+        Request::runtime_disable(&self.inner.dev);
         Ok(())
     }
 
     /// Returns whether the runtime PM state is active.
     #[inline]
     pub fn active(&self) -> bool {
-        Request::active(self.inner.dev)
+        Request::active(&self.inner.dev)
     }
 
     /// Returns whether the runtime PM state is suspended.
     #[inline]
     pub fn suspended(&self) -> bool {
-        Request::suspended(self.inner.dev)
+        Request::suspended(&self.inner.dev)
     }
 
     /// Creates a `ResumeScope` for the given PMProfile.
     #[inline]
-    pub fn resume(&self, profile: PMProfile) -> Result<ResumeScope<'a>> {
-        ResumeScope::new(self.inner.dev, profile.0)
+    pub fn resume(&self, profile: PMProfile) -> Result<ResumeScope> {
+        ResumeScope::new(self.inner.dev.clone(), profile.0)
     }
 
     /// Creates an `AwakeScope` for the given PMProfile.
     /// Note that for ASYNC request this does not guarantee
     /// the device has been resumed at the time this function returns.
     #[inline]
-    pub fn get(&self, profile: PMProfile) -> Result<AwakeScope<'a>> {
-        AwakeScope::new(self.inner.dev, profile.0 | ModeFlag::Acquire)
+    pub fn get(&self, profile: PMProfile) -> Result<AwakeScope> {
+        AwakeScope::new(self.inner.dev.clone(), profile.0 | ModeFlag::Acquire)
     }
 
     /// Creates an `AwakeScope` only if the device is runtime-active.
@@ -891,10 +974,10 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
     /// Returns `Ok(None)` when the device is not runtime-active and
     /// `Err(EINVAL)` when runtime PM is disabled for the device.
     #[inline]
-    pub fn get_if_active(&self, profile: PMProfile) -> Result<Option<AwakeScope<'a>>> {
-        match Request::get_if_active(self.inner.dev) {
+    pub fn get_if_active(&self, profile: PMProfile) -> Result<Option<AwakeScope>> {
+        match Request::get_if_active(&self.inner.dev) {
             Ok(()) => Ok(Some(AwakeScope(Scope::<Awake> {
-                dev: self.inner.dev,
+                dev: self.inner.dev.clone(),
                 mode: profile.0 | ModeFlag::Acquire,
                 _tag: PhantomData,
             }))),
@@ -904,13 +987,13 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
     }
 
     /// Creates a `RetainScope` for this device.
-    pub fn hold(&self) -> Result<RetainScope<'a>> {
-        RetainScope::new(self.inner.dev)
+    pub fn hold(&self) -> Result<RetainScope> {
+        RetainScope::new(self.inner.dev.clone())
     }
 
     /// Creates a `RetainScope` for an active device.
-    pub fn try_hold_active(&self) -> Result<RetainScope<'a>> {
-        RetainScope::try_new(self.inner.dev)
+    pub fn try_hold_active(&self) -> Result<RetainScope> {
+        RetainScope::try_new(self.inner.dev.clone())
     }
 
     /// Runs a closure while holding a `ResumeScope`.
@@ -943,36 +1026,31 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
     ///
     /// Options are applied in the order provided. The currently supported
     /// options do not report per-option failures.
-    fn apply_config(dev: &device::Device<device::Bound>, opts: &[PMConfig]) {
+    fn apply_config(dev: &ARef<device::Device>, opts: &[PMConfig]) {
         #[cfg(not(CONFIG_PM))]
         let _ = opts;
         let _ = dev;
         #[cfg(CONFIG_PM)]
         for opt in opts {
             match opt {
-                // SAFETY: `self.dev` is a valid `&ARef<Device>`, so the underlying `Device` is
-                // guaranteed to be alive and `as_raw()` yields a valid pointer for the
-                // duration of this call.
+                // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+                // valid pointer for the duration of this call.
                 PMConfig::IgnoreChildren(v) => unsafe {
                     bindings::pm_suspend_ignore_children(dev.as_raw(), *v)
                 },
-                // SAFETY: `self.dev` is a valid `&ARef<Device>`, so the underlying `Device` is
-                // guaranteed to be alive and `as_raw()` yields a valid pointer for the
-                // duration of this call.
+                // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+                // valid pointer for the duration of this call.
                 PMConfig::NoCallbacks => unsafe { bindings::pm_runtime_no_callbacks(dev.as_raw()) },
-                // SAFETY: `self.dev` is a valid `&ARef<Device>`, so the underlying `Device` is
-                // guaranteed to be alive and `as_raw()` yields a valid pointer for the
-                // duration of this call.
+                // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+                // valid pointer for the duration of this call.
                 PMConfig::IrqSafe => unsafe { bindings::pm_runtime_irq_safe(dev.as_raw()) },
-                // SAFETY: `self.dev` is a valid `&ARef<Device>`, so the underlying `Device` is
-                // guaranteed to be alive and `as_raw()` yields a valid pointer for the
-                // duration of this call.
+                // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+                // valid pointer for the duration of this call.
                 PMConfig::AutoSuspend(v) => unsafe {
                     bindings::__pm_runtime_use_autosuspend(dev.as_raw(), *v);
                 },
-                // SAFETY: `self.dev` is a valid `&ARef<Device>`, so the underlying `Device` is
-                // guaranteed to be alive and `as_raw()` yields a valid pointer for the
-                // duration of this call.
+                // SAFETY: The `ARef` keeps the device alive, so `as_raw()` yields a
+                // valid pointer for the duration of this call.
                 PMConfig::AutoSuspendDelay(v) => unsafe {
                     bindings::pm_runtime_set_autosuspend_delay(dev.as_raw(), *v as i32);
                     bindings::__pm_runtime_use_autosuspend(dev.as_raw(), true);
@@ -995,7 +1073,7 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
 // Preferably, PMContext could be shared via borrowed reference over
 // a pm Registration's lifetime but that bears complications on its own
 // when the context needs to be shared across different Registration types.
-impl<D: driver::DriverLayout, T: PMOps<D>> Clone for PMContext<'_, D, T> {
+impl<D: driver::DriverLayout, T: PMOps<D>> Clone for PMContext<D, T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -1056,10 +1134,10 @@ pub enum PMConfig {
 /// by the Registration itself.
 #[repr(C)]
 #[pin_data]
-struct RegistrationData<'a, D: driver::DriverLayout, T: PMOps<D>> {
+struct RegistrationData<D: driver::DriverLayout, T: PMOps<D>> {
     #[pin]
     data: PMPayload<T::RuntimePayloadType>,
-    _marker: PhantomData<&'a mut (D, T)>,
+    _marker: PhantomData<fn() -> (D, T)>,
 }
 
 /// Runtime PM registration for a device.
@@ -1068,12 +1146,15 @@ struct RegistrationData<'a, D: driver::DriverLayout, T: PMOps<D>> {
 /// generated [`PMOps`] callbacks and owns the corresponding teardown.
 ///
 /// Dropping the registration disables runtime PM, waits for in-flight runtime PM
-/// callbacks to complete, and then removes the stored registration data.
-pub struct Registration<'a, D: driver::DriverLayout, T: PMOps<D>> {
-    ctx: PMContext<'a, D, T>,
+/// callbacks to complete, and then removes the stored registration data. The
+/// `'bound` lifetime confines the registration to one driver binding, so it is
+/// dropped during probe or at unbind, with the device lock held.
+pub struct Registration<'bound, D: driver::DriverLayout, T: PMOps<D>> {
+    ctx: PMContext<D, T>,
+    _bound: PhantomData<&'bound ()>,
 }
 
-impl<'a, D: driver::DriverLayout, T: PMOps<D>> Registration<'a, D, T> {
+impl<'bound, D: driver::DriverLayout, T: PMOps<D>> Registration<'bound, D, T> {
     /// Creates a runtime PM registration for `dev`.
     ///
     /// The provided profiles and configuration are stored in the associated
@@ -1083,7 +1164,7 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> Registration<'a, D, T> {
     /// The device must use the callback represented by `ops`, generated
     /// for the same bus adapter and driver pair `(D, T)`.
     pub fn new(
-        dev: &'a device::Device<device::Core<'_>>,
+        dev: &'bound device::Device<device::Core<'_>>,
         ops: DevPMOps<D, T>,
         profiles: Option<KVec<PMProfile>>,
         configs: Option<KVec<PMConfig>>,
@@ -1111,8 +1192,8 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> Registration<'a, D, T> {
 
         let inner_ctx = Arc::new(
             PMContextInner {
-                dev,
-                enabled: AtomicFlag::new(false),
+                dev: dev.into(),
+                state: Atomic::new(PMContextState::Disabled),
                 profiles: profiles.unwrap_or_default(),
                 configs: configs.unwrap_or_default(),
                 _marker: PhantomData,
@@ -1135,15 +1216,16 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> Registration<'a, D, T> {
 
         Ok(Self {
             ctx: PMContext { inner: inner_ctx },
+            _bound: PhantomData,
         })
     }
     /// Returns the runtime PM context associated with this registration.
-    pub fn ctx(&self) -> &PMContext<'a, D, T> {
+    pub fn ctx(&self) -> &PMContext<D, T> {
         &self.ctx
     }
 }
 
-impl<'a, D: driver::DriverLayout, T: PMOps<D>> Drop for Registration<'a, D, T> {
+impl<D: driver::DriverLayout, T: PMOps<D>> Drop for Registration<'_, D, T> {
     fn drop(&mut self) {
         // `self.ctx.inner.dev` is the device this registration was
         // created for. Runtime PM is disabled first, and `pm_runtime_barrier`
@@ -1152,26 +1234,29 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> Drop for Registration<'a, D, T> {
         if self
             .ctx
             .inner
-            .enabled
-            .cmpxchg(true, false, ordering::Full)
-            .is_ok()
+            .state
+            .xchg(PMContextState::Dead, ordering::Full)
+            == PMContextState::Enabled
         {
-            PMContext::<D, T>::apply_config(self.ctx.inner.dev, &[PMConfig::AutoSuspend(false)]);
-            Request::runtime_disable(self.ctx.inner.dev);
+            PMContext::<D, T>::apply_config(&self.ctx.inner.dev, &[PMConfig::AutoSuspend(false)]);
+            Request::runtime_disable(&self.ctx.inner.dev);
         }
-        Request::barrier(self.ctx.inner.dev);
+        Request::barrier(&self.ctx.inner.dev);
 
         // SAFETY: The pointer, if non-null, was stored by `Registration::new`
         // using `Pin<KBox<RegistrationData<T>>>::into_foreign`. Runtime PM has
         // been disabled and drained above, so generated callbacks can no longer
-        // borrow this data. Clearing `rust_private` prevents later lookup, and
-        // `from_foreign` reconstructs the owning allocation so it is dropped.
+        // borrow this data. `'bound` confines the registration to probe or to
+        // the driver's bus device private data, and both are dropped under the
+        // device lock, which excludes the system-sleep callbacks. Clearing
+        // `rust_private` prevents later lookup, and `from_foreign` reconstructs
+        // the owning allocation so it is dropped.
         unsafe {
             let ptr = (*(*self.ctx.inner.dev.as_raw()).p).rust_private;
 
             if !ptr.is_null() {
                 (*(*self.ctx.inner.dev.as_raw()).p).rust_private = core::ptr::null_mut();
-                Pin::<KBox<RegistrationData<'_, D, T>>>::from_foreign(ptr);
+                Pin::<KBox<RegistrationData<D, T>>>::from_foreign(ptr);
             }
         }
     }
