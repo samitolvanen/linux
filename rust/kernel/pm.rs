@@ -38,7 +38,7 @@ kernel::impl_flags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Mode(u32);
 
-    /// Single RPM mode
+    /// Single RPM mode.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum ModeFlag {
         /// Synchronous PM operations - default.
@@ -57,21 +57,21 @@ kernel::impl_flags! {
     }
 }
 
-impl From<Mode> for core::ffi::c_int {
+impl From<Mode> for c_int {
     #[inline]
-    fn from(mode: Mode) -> core::ffi::c_int {
-        mode.0 as core::ffi::c_int
+    fn from(mode: Mode) -> c_int {
+        mode.0 as c_int
     }
 }
 
-/// Device's runtime power management status
+/// Device's runtime power management status.
 #[repr(i32)]
 pub enum RuntimePMState {
     /// Runtime PM has not been initialized for this device yet.
     Unknown = bindings::rpm_status_RPM_INVALID,
-    /// The device is expected to be runtime active and in it's normal operating state
+    /// The device is expected to be runtime active and in its normal operating state.
     Resumed = bindings::rpm_status_RPM_ACTIVE,
-    /// The device is expected to be suspended, unavailable for normal operations
+    /// The device is expected to be suspended, unavailable for normal operations.
     Suspended = bindings::rpm_status_RPM_SUSPENDED,
 }
 
@@ -82,11 +82,11 @@ pub struct Scope<'a, Tag> {
     _tag: PhantomData<Tag>,
 }
 
-/// Device resumed without incrementing the device's usage count
+/// Device resumed without incrementing the device's usage count.
 pub struct Resume;
-/// Device resumed with the device's usage count being incremented
+/// Device resumed with the device's usage count being incremented.
 pub struct Awake;
-/// Device with increased usage reference
+/// Device with increased usage reference.
 pub struct Retain;
 
 /// Resumes the device without acquiring the usage reference.
@@ -96,7 +96,7 @@ pub struct Retain;
 ///
 /// On drop:
 /// - If `ModeFlag::Idle`, calls `__pm_runtime_idle()`:
-///   triggers idle notification before attempting to suspend
+///   triggers idle notification before attempting to suspend.
 /// - If `ModeFlag::Auto`, marks last busy then calls `__pm_runtime_suspend()`.
 /// - Otherwise calls `__pm_runtime_suspend()`.
 ///
@@ -131,7 +131,7 @@ impl<'a> ResumeScope<'a> {
             return Err(EINVAL);
         }
 
-        // ModeFlag::Idle is internal so strip it of before passing further
+        // ModeFlag::Idle is internal so strip it off before passing further
         Request::resume(dev, mode & !ModeFlag::Idle).map(|()| {
             Self(Scope::<Resume> {
                 dev,
@@ -157,7 +157,8 @@ impl<'a> ResumeScope<'a> {
         }
     }
 
-    /// Explicitly release the scope
+    /// Explicitly release the scope.
+    ///
     /// This should be used in favor of regular drop
     /// when error handling is required.
     pub fn release(self) -> Result {
@@ -178,7 +179,7 @@ impl<'a> AwakeScope<'a> {
         if !mode.contains(ModeFlag::Acquire) {
             return Err(EINVAL);
         }
-        // ModeFlag::Idle is internal so strip it of before passing further
+        // ModeFlag::Idle is internal so strip it off before passing further
         match Request::resume(dev, mode & !ModeFlag::Idle) {
             Ok(()) => {}
             // For async/nowait requests, `EINPROGRESS` means the resume is in
@@ -210,7 +211,8 @@ impl<'a> AwakeScope<'a> {
         }
     }
 
-    /// Explicitly release the scope
+    /// Explicitly release the scope.
+    ///
     /// This should be used in favor of regular drop
     /// when error handling is required.
     pub fn release(self) -> Result {
@@ -461,7 +463,7 @@ impl Request {
     }
 }
 
-/// Common runtime PM callback entry point
+/// Common runtime PM callback entry point.
 ///
 /// The generated extern "C" callbacks call into this helper with the raw
 /// `struct device *` provided by the PM core. It rebuilds the Rust device
@@ -515,7 +517,7 @@ where
 /// whose runtime PM callbacks and PM registration data were both created
 /// for `T`.
 #[allow(unused)]
-unsafe extern "C" fn runtime_resume_callback<D, T>(dev: *mut bindings::device) -> core::ffi::c_int
+unsafe extern "C" fn runtime_resume_callback<D, T>(dev: *mut bindings::device) -> c_int
 where
     D: driver::DriverLayout,
     T: PMOps<D>,
@@ -532,7 +534,7 @@ where
 /// whose runtime PM callbacks and PM registration data were both created
 /// for `T`.
 #[allow(unused)]
-unsafe extern "C" fn runtime_suspend_callback<D, T>(dev: *mut bindings::device) -> core::ffi::c_int
+unsafe extern "C" fn runtime_suspend_callback<D, T>(dev: *mut bindings::device) -> c_int
 where
     D: driver::DriverLayout,
     T: PMOps<D>,
@@ -541,11 +543,10 @@ where
         .map(|()| 0)
         .unwrap_or_else(|e| e.to_errno())
 }
-/// SAFETY:
-/// bindings::dev_pm_ops is #[repr(C)], implements Default
-/// and the struct itself is all nullable function pointers.
-/// There is no padding and all zero bit-pattern is valid
-///
+/// A `dev_pm_ops` with no callbacks set.
+// SAFETY: `bindings::dev_pm_ops` is `#[repr(C)]` and consists of nullable
+// function pointers only, so it has no padding and the all-zero bit pattern
+// is a valid value.
 pub const PMOPS_NONE: bindings::dev_pm_ops =
     unsafe { core::mem::MaybeUninit::<bindings::dev_pm_ops>::zeroed().assume_init() };
 
@@ -730,7 +731,7 @@ struct PMContextInner<'a, D: driver::DriverLayout, T: PMOps<D>> {
 /// Runtime PM context tied to a device.
 pub struct PMContext<'a, D: driver::DriverLayout, T: PMOps<D>> {
     // Preferably, PMContext could be shared via borrowed reference over
-    // a pm Registration's lifetime but that bares complications on its own
+    // a pm Registration's lifetime but that bears complications on its own
     // when the context needs to be shared across different Registration types.
     inner: Arc<PMContextInner<'a, D, T>>,
 }
@@ -760,9 +761,14 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
         ..PMOPS_NONE
     };
 
-    /// Enable runtime PM
+    /// Enable runtime PM.
     pub fn enable(&self, state: RuntimePMState) -> Result {
-        if self.inner.enabled.cmpxchg(false, true, ordering::Full).is_err() {
+        if self
+            .inner
+            .enabled
+            .cmpxchg(false, true, ordering::Full)
+            .is_err()
+        {
             return Err(EBUSY);
         }
         Self::apply_config(self.inner.dev, &self.inner.configs);
@@ -770,13 +776,19 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
             RuntimePMState::Resumed => Request::mark_active(self.inner.dev),
             RuntimePMState::Suspended => Request::mark_suspended(self.inner.dev),
             _ => Err(EINVAL),
-        }.inspect_err(|_| self.inner.enabled.store(false, ordering::Release))?;
+        }
+        .inspect_err(|_| self.inner.enabled.store(false, ordering::Release))?;
         Request::runtime_enable(self.inner.dev);
         Ok(())
     }
-    /// Disable runtime PM
+    /// Disable runtime PM.
     pub fn disable(&self) -> Result {
-        if self.inner.enabled.cmpxchg(true, false, ordering::Full).is_err() {
+        if self
+            .inner
+            .enabled
+            .cmpxchg(true, false, ordering::Full)
+            .is_err()
+        {
             return Err(EINVAL);
         }
         Self::apply_config(self.inner.dev, &[PMConfig::AutoSuspend(false)]);
@@ -888,19 +900,19 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> PMContext<'a, D, T> {
         }
     }
 
-    /// Get a borrowed reference to PM profiles associated with the PM context
+    /// Get a borrowed reference to PM profiles associated with the PM context.
     pub fn profiles(&self) -> &[PMProfile] {
         &self.inner.profiles
     }
 
-    /// Get a borrowed reference to PM configs associated with the PM context
+    /// Get a borrowed reference to PM configs associated with the PM context.
     pub fn configs(&self) -> &[PMConfig] {
         &self.inner.configs
     }
 }
 
 // Preferably, PMContext could be shared via borrowed reference over
-// a pm Registration's lifetime but that bares complications on its own
+// a pm Registration's lifetime but that bears complications on its own
 // when the context needs to be shared across different Registration types.
 impl<D: driver::DriverLayout, T: PMOps<D>> Clone for PMContext<'_, D, T> {
     fn clone(&self) -> Self {
@@ -922,7 +934,7 @@ impl PMProfile {
     pub const fn r#async(self) -> Self {
         Self(Mode(self.0 .0 | ModeFlag::Async as u32))
     }
-    /// Use autosuspend
+    /// Use autosuspend.
     pub const fn auto(self) -> Self {
         Self(Mode(self.0 .0 | ModeFlag::Auto as u32))
     }
@@ -956,12 +968,11 @@ pub enum PMConfig {
     AutoSuspendDelay(u32),
 }
 
-/// Runtime PM data stored within the `struct device_private' during
+/// Runtime PM data stored within the `struct device_private` during
 /// runtime PM registration.
 ///
 /// The data is associated with PM transitions and it's conceptually owned
 /// by the Registration itself.
-///
 #[repr(C)]
 #[pin_data]
 struct RegistrationData<'a, D: driver::DriverLayout, T: PMOps<D>> {
@@ -1057,7 +1068,13 @@ impl<'a, D: driver::DriverLayout, T: PMOps<D>> Drop for Registration<'a, D, T> {
         // created for. Runtime PM is disabled first, and `pm_runtime_barrier`
         // waits for pending runtime PM work/callbacks before the callback data
         // is removed below.
-        if self.ctx.inner.enabled.cmpxchg(true, false, ordering::Full).is_ok() {
+        if self
+            .ctx
+            .inner
+            .enabled
+            .cmpxchg(true, false, ordering::Full)
+            .is_ok()
+        {
             PMContext::<D, T>::apply_config(self.ctx.inner.dev, &[PMConfig::AutoSuspend(false)]);
             Request::runtime_disable(self.ctx.inner.dev);
         }
