@@ -26,7 +26,8 @@ use kernel::{
     io::{
         mem::DevresIoMem,
         poll,
-        Io, //
+        Io,
+        IoBase, //
     },
     platform,
     prelude::*,
@@ -273,9 +274,11 @@ impl<'drm> Firmware<'drm> {
             return Err(EINVAL);
         }
 
-        for (i, &byte) in data.iter().enumerate() {
-            vmap.try_write8(byte, i)?;
-        }
+        let dst = vmap.as_view().as_ptr().cast::<u8>();
+        // SAFETY: `dst` is the section BO's writable CPU mapping, valid for
+        // `size` bytes, and the check above bounds `data.len()` by `size`.
+        // `data` is a separate allocation.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
 
         Ok(())
     }
