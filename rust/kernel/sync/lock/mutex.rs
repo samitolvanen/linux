@@ -35,6 +35,7 @@ pub use new_mutex;
 ///
 /// ```
 /// use kernel::sync::{new_mutex, Mutex};
+/// use kernel::prelude::*;
 ///
 /// struct Inner {
 ///     a: u32,
@@ -49,8 +50,8 @@ pub use new_mutex;
 /// }
 ///
 /// impl Example {
-///     fn new() -> impl PinInit<Self> {
-///         pin_init!(Self {
+///     fn new() -> impl PinInit<Self, Error> {
+///         try_pin_init!(Self {
 ///             c: 10,
 ///             d <- new_mutex!(Inner { a: 20, b: 30 }),
 ///         })
@@ -58,7 +59,7 @@ pub use new_mutex;
 /// }
 ///
 /// // Allocate a boxed `Example`.
-/// let e = KBox::pin_init(Example::new(), GFP_KERNEL)?;
+/// let e = KBox::try_pin_init(Example::new(), GFP_KERNEL)?;
 /// assert_eq!(e.c, 10);
 /// assert_eq!(e.d.lock().a, 20);
 /// assert_eq!(e.d.lock().b, 30);

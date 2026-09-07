@@ -4,10 +4,7 @@
 //!
 //! This module allows Rust code to use the kernel's `spinlock_t`.
 use super::*;
-use crate::{
-    interrupt::LocalInterruptDisabled,
-    prelude::*, //
-};
+use crate::interrupt::LocalInterruptDisabled;
 
 /// Creates a [`SpinLock`] initialiser with the given name and a newly-created lock class.
 ///
@@ -38,6 +35,7 @@ pub use new_spinlock;
 ///
 /// ```
 /// use kernel::sync::{new_spinlock, SpinLock};
+/// use kernel::prelude::*;
 ///
 /// struct Inner {
 ///     a: u32,
@@ -52,8 +50,8 @@ pub use new_spinlock;
 /// }
 ///
 /// impl Example {
-///     fn new() -> impl PinInit<Self> {
-///         pin_init!(Self {
+///     fn new() -> impl PinInit<Self, Error> {
+///         try_pin_init!(Self {
 ///             c: 10,
 ///             d <- new_spinlock!(Inner { a: 20, b: 30 }),
 ///         })
@@ -184,6 +182,7 @@ pub use new_spinlock_irq;
 ///
 /// ```
 /// use kernel::sync::{new_spinlock_irq, SpinLockIrq};
+/// use kernel::prelude::*;
 ///
 /// struct Inner {
 ///     a: u32,
@@ -199,8 +198,8 @@ pub use new_spinlock_irq;
 /// }
 ///
 /// impl Example {
-///     fn new() -> impl PinInit<Self> {
-///         pin_init!(Self {
+///     fn new() -> impl PinInit<Self, Error> {
+///         try_pin_init!(Self {
 ///             c <- new_spinlock_irq!(Inner { a: 0, b: 10 }),
 ///             d <- new_spinlock_irq!(Inner { a: 20, b: 30 }),
 ///         })
@@ -232,6 +231,7 @@ pub use new_spinlock_irq;
 /// ```
 /// use kernel::sync::{new_spinlock_irq, SpinLockIrq};
 /// use kernel::interrupt::*;
+/// use kernel::prelude::*;
 ///
 /// struct Inner {
 ///     a: u32,
@@ -244,8 +244,8 @@ pub use new_spinlock_irq;
 /// }
 ///
 /// impl Example {
-///     fn new() -> impl PinInit<Self> {
-///         pin_init!(Self {
+///     fn new() -> impl PinInit<Self, Error> {
+///         try_pin_init!(Self {
 ///             inner <- new_spinlock_irq!(Inner { a: 20 }),
 ///         })
 ///     }
