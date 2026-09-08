@@ -1432,7 +1432,8 @@ macro_rules! impl_sysmem_io_capable {
 impl_sysmem_io_capable!(u8);
 impl_sysmem_io_capable!(u16);
 impl_sysmem_io_capable!(u32);
-#[cfg(CONFIG_64BIT)]
+// Unlike MMIO, a system memory access is a plain volatile load or store, which has no width
+// restriction.
 impl_sysmem_io_capable!(u64);
 
 impl IoCopyable for SysMemBackend {
