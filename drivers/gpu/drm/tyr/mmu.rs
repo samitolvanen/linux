@@ -18,8 +18,10 @@ use kernel::{
         Bound,
         Device, //
     },
+    io::mem::DevresIoMem,
     new_mutex,
     prelude::*,
+    sizes::SZ_2M,
     sync::{
         Arc,
         ArcBorrow,
@@ -28,7 +30,6 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
     gpu::GpuInfo,
     mmu::address_space::{
         AddressSpaceManager,
@@ -57,13 +58,13 @@ impl<'drm> Mmu<'drm> {
     /// Create an MMU component for this device.
     pub(crate) fn new(
         dev: &'drm Device<Bound>,
-        iomem: ArcBorrow<'_, IoMem<'drm>>,
+        iomem: Arc<DevresIoMem<SZ_2M>>,
         gpu_info: &GpuInfo,
     ) -> Result<Arc<Mmu<'drm>>> {
         let present = AS_PRESENT::from_raw(gpu_info.as_present).present().get();
         let slot_count = present.count_ones().try_into()?;
 
-        let address_space_manager = AddressSpaceManager::new(dev, iomem.into(), present)?;
+        let address_space_manager = AddressSpaceManager::new(dev, iomem, present)?;
         let as_slot_manager =
             SlotManager::new(address_space_manager, slot_count).inspect_err(|e| {
                 dev_err!(
