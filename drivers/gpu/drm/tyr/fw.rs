@@ -23,6 +23,7 @@ use kernel::{
         gem::BaseObject, //
     },
     io::{
+        mem::DevresIoMem,
         poll,
         Io, //
     },
@@ -30,6 +31,7 @@ use kernel::{
     num::Bounded,
     prelude::*,
     register,
+    sizes::SZ_2M,
     str::CString,
     sync::{
         atomic::{
@@ -170,8 +172,9 @@ pub(crate) struct Section<'drm> {
 
 /// Loaded firmware with sections mapped into MCU VM.
 pub(crate) struct Firmware<'drm> {
-    /// Iomem need to access registers.
-    iomem: Arc<IoMem<'drm>>,
+    /// Device-managed handle to the GPU MMIO register mapping, held so
+    /// `Drop` can stop the MCU.
+    iomem: Arc<DevresIoMem<SZ_2M>>,
 
     /// MCU VM.
     vm: Arc<Vm<'drm>>,
@@ -192,7 +195,9 @@ pub(crate) struct Firmware<'drm> {
 impl<'drm> Drop for Firmware<'drm> {
     fn drop(&mut self) {
         // Stop the MCU before releasing its firmware mappings and memory.
-        let _ = self.stop();
+        if let Ok(io) = self.iomem.access(self.vm.dev()) {
+            let _ = self.stop(io);
+        }
 
         // AS slots retain a VM ref, we need to kill the circular ref manually.
         self.vm.kill();
@@ -248,7 +253,7 @@ impl<'drm> Firmware<'drm> {
     /// Load firmware and map sections into MCU VM.
     pub(crate) fn new(
         dev: &'drm Device<Bound>,
-        iomem: Arc<IoMem<'drm>>,
+        iomem: Arc<DevresIoMem<SZ_2M>>,
         ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu<'drm>>,
         gpu_info: &GpuInfo,
@@ -318,9 +323,7 @@ impl<'drm> Firmware<'drm> {
             })
     }
 
-    pub(crate) fn boot(&self) -> Result {
-        let io = &self.iomem;
-
+    pub(crate) fn boot(&self, io: &IoMem<'_>) -> Result {
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
 
         if let Err(e) = poll::read_poll_timeout(
@@ -341,8 +344,7 @@ impl<'drm> Firmware<'drm> {
         Ok(())
     }
 
-    fn stop(&self) -> Result {
-        let io = &self.iomem;
+    fn stop(&self, io: &IoMem<'_>) -> Result {
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Disable));
 
         if let Err(e) = poll::read_poll_timeout(
@@ -375,11 +377,16 @@ impl<'drm> Firmware<'drm> {
     }
 
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
+    pub(crate) fn enable_global_interface(
+        &self,
+        gpu_info: &GpuInfo,
+        core_clk: &Clk,
+        io: &IoMem<'_>,
+    ) -> Result {
         let shared_section = self.shared_section()?;
         self.global_iface.lock().enable(
             self.vm.dev(),
-            &self.iomem,
+            io,
             shared_section,
             gpu_info,
             core_clk,

@@ -15,6 +15,7 @@ use kernel::{
     }, //
     error::Result,
     io::{
+        mem::DevresIoMem,
         poll,
         register::Array,
         Io, //
@@ -39,7 +40,6 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
     mmu::{
         AsSlotManager,
         Mmu, //
@@ -152,7 +152,7 @@ pub(crate) struct AddressSpaceManager<'drm> {
     dev: &'drm Device<Bound>,
 
     /// Memory-mapped I/O region for GPU register access.
-    iomem: Arc<IoMem<'drm>>,
+    iomem: Arc<DevresIoMem<SZ_2M>>,
 
     /// Bitmask of present address space slots from GPU_AS_PRESENT register.
     as_present: u32,
@@ -165,7 +165,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// I/O memory region, along with the bitmask of available AS slots.
     pub(super) fn new(
         dev: &'drm Device<Bound>,
-        iomem: Arc<IoMem<'drm>>,
+        iomem: Arc<DevresIoMem<SZ_2M>>,
         as_present: u32,
     ) -> Result<AddressSpaceManager<'drm>> {
         if as_present.trailing_ones() != as_present.count_ones() {
@@ -216,7 +216,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     ///
     /// Returns an error if polling times out after 10ms or if register access fails.
     fn as_wait_ready(&self, as_nr: usize) -> Result {
-        let io = &*self.iomem;
+        let io = self.iomem.access(self.dev)?;
         let op = || {
             let status_reg = STATUS::try_at(as_nr).ok_or(EINVAL)?;
             Ok(io.read(status_reg))
@@ -232,7 +232,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// Returns an error if waiting for ready times out or if register write fails.
     fn as_send_cmd(&mut self, as_nr: usize, cmd: MmuCommand) -> Result {
         self.as_wait_ready(as_nr)?;
-        let io = &*self.iomem;
+        let io = self.iomem.access(self.dev)?;
         let command_reg = COMMAND::try_at(as_nr).ok_or(EINVAL)?;
         io.write(command_reg, COMMAND::zeroed().with_command(cmd));
         Ok(())
@@ -253,7 +253,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
         self.validate_as_slot(as_nr)?;
 
-        let io = &*self.iomem;
+        let io = self.iomem.access(self.dev)?;
 
         let transtab = as_config.transtab;
         io.write(
@@ -299,7 +299,7 @@ impl<'drm> AddressSpaceManager<'drm> {
         // Flush AS before disabling
         self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushMem)?;
 
-        let io = &*self.iomem;
+        let io = self.iomem.access(self.dev)?;
 
         io.write(
             TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
@@ -394,7 +394,7 @@ impl<'drm> AddressSpaceManager<'drm> {
         // because log2(32 KiB) = 15.
         let lockaddr_size = lock_region_log2 - 1;
 
-        let io = &*self.iomem;
+        let io = self.iomem.access(self.dev)?;
 
         // The LOCKADDR base field stores address bits 63:12, so remove the low 12 bits
         // before passing this value to the register macro helper.

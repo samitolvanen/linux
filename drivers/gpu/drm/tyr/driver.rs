@@ -20,6 +20,7 @@ use kernel::{
     drm,
     drm::ioctl,
     io::{
+        mem::DevresIoMem,
         poll,
         Io, //
     },
@@ -89,7 +90,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
     /// stops.
-    _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<JobIrq<'drm>>>>>,
+    _job_irq: Pin<KBox<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>>>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -97,8 +98,8 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     #[pin]
     regulators: Mutex<Regulators>,
 
-    /// GPU MMIO register mapping.
-    pub(crate) iomem: Arc<IoMem<'drm>>,
+    /// Device-managed handle to the GPU MMIO register mapping.
+    pub(crate) iomem: Arc<DevresIoMem<SZ_2M>>,
 
     /// GPU information read from hardware during probe.
     pub(crate) gpu_info: GpuInfo,
@@ -149,12 +150,13 @@ impl platform::Driver for TyrPlatformDriver {
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
 
-        let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?, GFP_KERNEL)?;
+        let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?.into_devres()?, GFP_KERNEL)?;
+        let io = iomem.access(pdev.as_ref())?;
 
-        issue_soft_reset(pdev.as_ref(), &iomem)?;
-        gpu::l2_power_on(pdev.as_ref(), &iomem)?;
+        issue_soft_reset(pdev.as_ref(), io)?;
+        gpu::l2_power_on(pdev.as_ref(), io)?;
 
-        let gpu_info = GpuInfo::new(&iomem);
+        let gpu_info = GpuInfo::new(io);
         gpu_info.log(pdev.as_ref());
 
         let pa_bits = MMU_FEATURES::from_raw(gpu_info.mmu_features)
@@ -167,7 +169,7 @@ impl platform::Driver for TyrPlatformDriver {
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev, Ok(()))?;
 
-        let mmu = Mmu::new(pdev.as_ref(), iomem.as_arc_borrow(), &gpu_info)?;
+        let mmu = Mmu::new(pdev.as_ref(), iomem.clone(), &gpu_info)?;
 
         let firmware = Firmware::new(
             pdev.as_ref(),
@@ -188,17 +190,17 @@ impl platform::Driver for TyrPlatformDriver {
                     firmware.fw_ready.clone(),
                     firmware.ready_wait.clone(),
                 )
-            },
+            }?,
             GFP_KERNEL,
         )?;
 
-        firmware.boot()?;
+        firmware.boot(io)?;
 
         firmware
             .wait_ready(1000)
             .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
-        firmware.enable_global_interface(&gpu_info, &core_clk)?;
+        firmware.enable_global_interface(&gpu_info, &core_clk, io)?;
 
         let reg_data = pin_init!(TyrDrmRegistrationData {
                 pdev,
@@ -279,38 +281,43 @@ struct Regulators {
 }
 
 pub(crate) trait TyrIrqTrait: Sync {
-    fn read_status(&self) -> u32;
-    fn clear_mask(&self);
-    fn reenable_mask(&self);
-    fn read_raw_status(&self) -> u32;
-    fn clear_status(&self, status: u32);
+    fn read_status(&self, io: &IoMem<'_>) -> u32;
+    fn clear_mask(&self, io: &IoMem<'_>);
+    fn reenable_mask(&self, io: &IoMem<'_>);
+    fn read_raw_status(&self, io: &IoMem<'_>) -> u32;
+    fn clear_status(&self, io: &IoMem<'_>, status: u32);
     fn mask(&self) -> u32;
     fn handle(&self, status: u32);
 }
 
 #[pin_data]
-pub(crate) struct TyrIrq<T: TyrIrqTrait> {
+pub(crate) struct TyrIrq<'drm, T: TyrIrqTrait> {
+    dev: &'drm Device<Bound>,
+    iomem: Arc<DevresIoMem<SZ_2M>>,
     irq: T,
     #[pin]
     _pin: PhantomPinned,
 }
 
-impl<T: TyrIrqTrait> TyrIrq<T> {
+impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
     /// Registers a threaded handler for the named IRQ line.
     ///
     /// # Safety
     ///
     /// Callers must not `mem::forget()` the resulting registration or otherwise prevent its
     /// `Drop` implementation from running.
-    pub(crate) unsafe fn request<'a>(
-        pdev: &'a platform::Device<Bound>,
+    pub(crate) unsafe fn request(
+        pdev: &'drm platform::Device<Bound>,
         name: &'static CStr,
+        iomem: Arc<DevresIoMem<SZ_2M>>,
         irq: T,
-    ) -> impl PinInit<ThreadedRegistration<'a, Self>, Error> + 'a
+    ) -> impl PinInit<ThreadedRegistration<'drm, Self>, Error> + 'drm
     where
-        T: 'a,
+        T: 'drm,
     {
         let handler = try_pin_init!(Self {
+            dev: pdev.as_ref(),
+            iomem,
             irq,
             _pin: PhantomPinned,
         });
@@ -320,31 +327,37 @@ impl<T: TyrIrqTrait> TyrIrq<T> {
     }
 }
 
-impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<T> {
+impl<T: TyrIrqTrait> ThreadedHandler for TyrIrq<'_, T> {
     fn handle(&self) -> ThreadedIrqReturn {
-        let masked_status = self.irq.read_status();
+        let Ok(io) = self.iomem.access(self.dev) else {
+            return ThreadedIrqReturn::None;
+        };
+        let masked_status = self.irq.read_status(io);
 
         if masked_status == 0 {
             return ThreadedIrqReturn::None;
         }
-        self.irq.clear_mask();
+        self.irq.clear_mask(io);
         ThreadedIrqReturn::WakeThread
     }
 
     fn handle_threaded(&self) -> IrqReturn {
+        let Ok(io) = self.iomem.access(self.dev) else {
+            return IrqReturn::None;
+        };
         let mut ret = IrqReturn::None;
 
         loop {
-            let raw_status = self.irq.read_raw_status() & self.irq.mask();
+            let raw_status = self.irq.read_raw_status(io) & self.irq.mask();
             if raw_status == 0 {
                 break;
             }
             self.irq.handle(raw_status);
-            self.irq.clear_status(raw_status);
+            self.irq.clear_status(io, raw_status);
             ret = IrqReturn::Handled;
         }
 
-        self.irq.reenable_mask();
+        self.irq.reenable_mask(io);
         ret
     }
 }

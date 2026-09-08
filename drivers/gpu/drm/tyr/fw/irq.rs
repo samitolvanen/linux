@@ -6,10 +6,14 @@
 
 use kernel::{
     device::Bound,
-    io::Io,
+    io::{
+        mem::DevresIoMem,
+        Io, //
+    },
     irq::ThreadedRegistration,
     platform,
     prelude::*,
+    sizes::SZ_2M,
     sync::{
         atomic::{
             Atomic,
@@ -36,8 +40,7 @@ use crate::{
 
 const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
 
-pub(crate) struct JobIrq<'drm> {
-    iomem: Arc<IoMem<'drm>>,
+pub(crate) struct JobIrq {
     fw_ready: Arc<Atomic<bool>>,
     ready_wait: Arc<Wait>,
 }
@@ -50,50 +53,50 @@ pub(crate) struct JobIrq<'drm> {
 /// `Drop` implementation from running.
 pub(crate) unsafe fn job_irq_init<'drm>(
     pdev: &'drm platform::Device<Bound>,
-    iomem: Arc<IoMem<'drm>>,
+    iomem: Arc<DevresIoMem<SZ_2M>>,
     fw_ready: Arc<Atomic<bool>>,
     ready_wait: Arc<Wait>,
-) -> impl PinInit<ThreadedRegistration<'drm, TyrIrq<JobIrq<'drm>>>, Error> + 'drm {
+) -> Result<impl PinInit<ThreadedRegistration<'drm, TyrIrq<'drm, JobIrq>>, Error> + 'drm> {
     let mask = JOB_IRQ_MASK::zeroed()
         .with_const_csg::<CSG_IRQ_MASK>()
         .with_glb(true);
 
-    iomem.write_reg(JOB_IRQ_CLEAR::from_raw(mask.into_raw()));
-    iomem.write_reg(mask);
+    let io = iomem.access(pdev.as_ref())?;
+    io.write_reg(JOB_IRQ_CLEAR::from_raw(mask.into_raw()));
+    io.write_reg(mask);
 
     let job_irq = JobIrq {
-        iomem: iomem.clone(),
         fw_ready,
         ready_wait,
     };
 
     // SAFETY: The caller guarantees that the registration is not leaked.
-    unsafe { TyrIrq::request(pdev, c"job", job_irq) }
+    Ok(unsafe { TyrIrq::request(pdev, c"job", iomem, job_irq) })
 }
 
-impl TyrIrqTrait for JobIrq<'_> {
-    fn read_status(&self) -> u32 {
-        self.iomem.read(JOB_IRQ_STATUS).into_raw()
+impl TyrIrqTrait for JobIrq {
+    fn read_status(&self, io: &IoMem<'_>) -> u32 {
+        io.read(JOB_IRQ_STATUS).into_raw()
     }
 
-    fn clear_mask(&self) {
-        self.iomem.write_reg(JOB_IRQ_MASK::zeroed());
+    fn clear_mask(&self, io: &IoMem<'_>) {
+        io.write_reg(JOB_IRQ_MASK::zeroed());
     }
 
-    fn reenable_mask(&self) {
-        self.iomem.write_reg(
+    fn reenable_mask(&self, io: &IoMem<'_>) {
+        io.write_reg(
             JOB_IRQ_MASK::zeroed()
                 .with_const_csg::<CSG_IRQ_MASK>()
                 .with_glb(true),
         );
     }
 
-    fn read_raw_status(&self) -> u32 {
-        self.iomem.read(JOB_IRQ_RAWSTAT).into_raw()
+    fn read_raw_status(&self, io: &IoMem<'_>) -> u32 {
+        io.read(JOB_IRQ_RAWSTAT).into_raw()
     }
 
-    fn clear_status(&self, status: u32) {
-        self.iomem.write_reg(JOB_IRQ_CLEAR::from_raw(status));
+    fn clear_status(&self, io: &IoMem<'_>, status: u32) {
+        io.write_reg(JOB_IRQ_CLEAR::from_raw(status));
     }
 
     fn mask(&self) -> u32 {
