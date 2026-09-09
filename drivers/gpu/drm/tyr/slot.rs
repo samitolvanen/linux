@@ -262,16 +262,16 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     }
 
     /// Activates a slot for the given seat.
-    fn activate_slot(&mut self, slot_idx: usize, slot_data: T::SlotData) -> Result {
+    fn activate_slot(&mut self, slot_idx: usize, slot_data: T::SlotData) -> Result<usize> {
         self.manager.activate(slot_idx, &slot_data)?;
         self.record_active_slot(slot_idx, slot_data);
-        Ok(())
+        Ok(slot_idx)
     }
 
     /// Finds a slot for the given seat. A free slot is preferred, but if none
     /// are available, the oldest idle slot is evicted and reused. Otherwise, if
     /// there are no free or idle slots, return [`EBUSY`].
-    fn allocate_slot(&mut self, slot_data: T::SlotData) -> Result {
+    fn allocate_slot(&mut self, slot_data: T::SlotData) -> Result<usize> {
         let slots = &self.slots[..self.slot_count];
 
         let mut idle_slot_idx = None;
@@ -376,7 +376,9 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     }
 
     /// Activates a resource on any available/reclaimable slot.
-    pub(crate) fn activate(&mut self, slot_data: T::SlotData) -> Result {
+    ///
+    /// Returns the slot the resource is resident on.
+    pub(crate) fn activate(&mut self, slot_data: T::SlotData) -> Result<usize> {
         self.check_seat(T::seat(&slot_data));
 
         // Copy out only the slot index so the borrow of slot_data ends here.
@@ -386,7 +388,10 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         };
 
         match slot_idx {
-            Some(slot_idx) => self.reactivate_slot(slot_idx, &slot_data),
+            Some(slot_idx) => {
+                self.reactivate_slot(slot_idx, &slot_data)?;
+                Ok(slot_idx)
+            }
             None => self.allocate_slot(slot_data),
         }
     }

@@ -13,6 +13,7 @@ use kernel::{
     new_mutex,
     prelude::*,
     sync::{
+        aref::ARef,
         atomic::{
             Atomic,
             Relaxed, //
@@ -79,7 +80,6 @@ pub(crate) enum State {
 pub(crate) enum GroupListState {
     None,
     Idle,
-    #[expect(dead_code)]
     Runnable,
 }
 
@@ -87,7 +87,6 @@ pub(crate) enum GroupListState {
 ///
 /// Lets the rule engine and Tick lifecycle read `can_run`, `is_idle`,
 /// and `csg_id` together under a single `inner` lock acquisition.
-#[expect(dead_code)]
 pub(crate) struct GroupStatus {
     pub(crate) can_run: bool,
     pub(crate) is_idle: bool,
@@ -204,6 +203,25 @@ pub(crate) struct Group {
     #[pin]
     submit_lock: Mutex<()>,
     pub(crate) tiler_oom: Atomic<u32>,
+    /// Number of consecutive ticks the group has remained bound to a
+    /// hardware slot. Reset to zero when the group is bound and
+    /// incremented when the group is retained on a slot at the start
+    /// of a tick. Read by the full-tick rule engine to pick the
+    /// longest-resident group for rotation.
+    pub(crate) bound_tick_counter: Atomic<u32>,
+    /// Tyr DRM device that owns this group.
+    ///
+    /// # Invariants
+    ///
+    /// The device reaches groups through the scheduler lists and the
+    /// `CsgSlotManager`, and every group holds an `ARef` back, so the
+    /// refcounts form a cycle. Two paths break it before the device's
+    /// final `ARef` drops:
+    ///
+    /// * File close empties the per-file `group::Pool`.
+    /// * The tick and `term_work` drain the `Arc<Group>` references
+    ///   they hold before the file's last reference is released.
+    pub(crate) tdev: ARef<TyrDrmDevice>,
     /// CSG slot manager seat for this group.
     ///
     /// The owner is the per-device `CsgSlotManager` mutex. Callers
@@ -359,6 +377,8 @@ impl Group {
                 }),
                 submit_lock <- new_mutex!(()),
                 tiler_oom: Atomic::new(0),
+                bound_tick_counter: Atomic::new(0),
+                tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
                 links <- ListLinks::new(),
@@ -408,17 +428,14 @@ impl Group {
         });
     }
 
-    #[expect(dead_code)]
     pub(crate) fn can_run(&self) -> bool {
         self.inner.lock().can_run()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
         self.inner.lock().is_idle()
     }
 
-    #[expect(dead_code)]
     pub(crate) fn status(&self) -> GroupStatus {
         let inner = self.inner.lock();
         GroupStatus {
@@ -468,7 +485,11 @@ impl Group {
         self.heap_pool.lock().clone()
     }
 
-    pub(super) fn submit(&self, queue_submits: KVec<QueueSubmit>, file: &TyrDrmFile) -> Result {
+    pub(super) fn submit(
+        self: &Arc<Self>,
+        queue_submits: KVec<QueueSubmit>,
+        file: &TyrDrmFile,
+    ) -> Result {
         let jobs = Job::from_queue_submits(queue_submits)?;
         let mut prepared_jobs = KVec::<PreparedQueueSubmit>::new();
 
@@ -558,8 +579,6 @@ impl Pool {
 
     pub(crate) fn submit_group(
         &self,
-        ddev: &TyrDrmDevice,
-        reg_data: &TyrDrmRegistrationData<'_>,
         groupsubmit: &uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result {
@@ -585,11 +604,6 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        let mut ctx = super::CsgUpdateContext::new();
-        ddev.with_locked_scheduler(|sched| {
-            sched.bind(ddev, &reg_data.fw, group.clone(), &mut ctx)?;
-            sched.apply_csg_updates(ddev, &reg_data.fw, &mut ctx)
-        })?;
         group.submit(queue_submits, file)
     }
 

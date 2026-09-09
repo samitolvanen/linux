@@ -512,7 +512,8 @@ impl AsSlotManager {
 
     /// Activates a VM by assigning it to a hardware slot.
     pub(super) fn activate_vm(&mut self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
-        self.activate(vm_as_data.into())
+        self.activate(vm_as_data.into())?;
+        Ok(())
     }
 
     /// Deactivates a VM by evicting it from its hardware slot.

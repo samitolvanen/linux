@@ -137,7 +137,7 @@ impl Scheduler {
         Ok(queued_tiler_oom)
     }
 
-    fn process_csg_irq(
+    pub(super) fn process_csg_irq(
         &mut self,
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,

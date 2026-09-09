@@ -10,7 +10,10 @@ use kernel::{
     alloc::KVec,
     dma_buf::dma_fence::PublicDmaFence,
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     transmute::FromBytes,
     uaccess::UserSlice,
     uapi, //
@@ -228,7 +231,11 @@ impl Job {
         Ok(jobs)
     }
 
-    pub(crate) fn prepare(self, group: &Group, file: &TyrDrmFile) -> Result<PreparedQueueSubmit> {
+    pub(crate) fn prepare(
+        self,
+        group: &Arc<Group>,
+        file: &TyrDrmFile,
+    ) -> Result<PreparedQueueSubmit> {
         let queue = group.queues.get(self.queue_index).ok_or(EINVAL)?;
 
         let deps = deps::wait_fences(file, &self.syncs)?;
@@ -237,7 +244,11 @@ impl Job {
 
         // The extra slot holds the prior-work dependency that commit adds.
         let extra_dep_capacity = usize::from(!has_stream);
-        let prepared = queue.prepare_job(QueueJob::new(self.stream), &deps, extra_dep_capacity)?;
+        let prepared = queue.prepare_job(
+            QueueJob::new(self.stream, group.clone()),
+            &deps,
+            extra_dep_capacity,
+        )?;
 
         Ok(PreparedQueueSubmit {
             queue_index: self.queue_index,
