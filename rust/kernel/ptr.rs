@@ -238,7 +238,7 @@ pub trait KnownSize {
     /// Minimum size of this type known at compile-time.
     const MIN_SIZE: usize;
 
-    /// Minimum alignment of this type known at compile-time.
+    /// Minimum alignment of a valid pointer to this type, which may exceed the layout alignment.
     const MIN_ALIGN: Alignment;
 
     /// Get the size of an object of this type in bytes, with the metadata of the given pointer.

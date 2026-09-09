@@ -198,8 +198,9 @@ fn io_view_assert<'a, IO: Io<'a>, U>(
     offset: usize,
 ) -> <IO::Backend as IoBackend>::View<'a, U> {
     // We cannot check alignment with `offset_valid` using `ptr.addr()`. So set 0 for it and
-    // ensure alignment by checking that the alignment of `U` is smaller or equal to the
-    // alignment of `IO::Target`.
+    // ensure alignment by checking that the alignment of `U` is smaller or equal to
+    // `IO::Target::MIN_ALIGN`. The view's type invariant guarantees that the base address meets
+    // `MIN_ALIGN`, which may exceed `align_of_val()`.
     const_assert!(Alignment::of::<U>().as_usize() <= IO::Target::MIN_ALIGN.as_usize());
     build_assert!(offset_valid::<U>(0, offset, IO::Target::MIN_SIZE));
 
@@ -269,7 +270,8 @@ pub trait IoBackend {
     ///
     /// # Safety
     ///
-    /// `ptr` must be a projection of `Self::as_ptr(view)`.
+    /// `ptr` must be a projection of `Self::as_ptr(view)`: the `KnownSize::size(ptr)` bytes at
+    /// `ptr` lie within `view`, and `ptr` meets `U::MIN_ALIGN`, which may exceed `align_of_val()`.
     unsafe fn project_view<'a, T: ?Sized + KnownSize, U: ?Sized + KnownSize>(
         view: Self::View<'a, T>,
         ptr: *mut U,
@@ -1167,6 +1169,7 @@ impl<'a, T: IoBase<'a>> Io<'a> for T {}
 /// # Invariant
 ///
 /// `ptr` points to a valid and aligned memory-mapped I/O region for the duration lifetime `'a`.
+/// Alignment means `T::MIN_ALIGN`, which may exceed `align_of_val()`.
 pub struct Mmio<'a, T: ?Sized> {
     ptr: *mut T,
     phantom: PhantomData<&'a ()>,
@@ -1186,6 +1189,7 @@ impl<'a, T: ?Sized> Mmio<'a, T> {
     /// # Safety
     ///
     /// `raw` represents a valid and aligned memory-mapped I/O region while `'a` is alive.
+    /// Alignment means `T::MIN_ALIGN`, which may exceed `align_of_val()`.
     #[inline]
     pub unsafe fn from_raw(raw: MmioRaw<T>) -> Self {
         // INVARIANT: Per safety requirement.
@@ -1481,7 +1485,8 @@ impl IoCopyable for SysMemBackend {
 /// # Invariants
 ///
 /// `self.ptr.addr() .. self.ptr.addr() + KnownSize::size(self.ptr)` is valid and aligned kernel
-/// accessible memory region for the lifetime `'a`.
+/// accessible memory region for the lifetime `'a`. Alignment means `T::MIN_ALIGN`, which may
+/// exceed `align_of_val()`.
 pub struct SysMem<'a, T: ?Sized> {
     ptr: *mut T,
     phantom: PhantomData<&'a ()>,
@@ -1507,7 +1512,8 @@ impl<'a, T: ?Sized> SysMem<'a, T> {
     /// # Safety
     ///
     /// `ptr.addr() .. ptr.addr() + KnownSize::size(ptr)` must be valid and aligned kernel
-    /// accessible memory region for the lifetime `'a`.
+    /// accessible memory region for the lifetime `'a`. Alignment means `T::MIN_ALIGN`, which may
+    /// exceed `align_of_val()`.
     #[inline]
     pub unsafe fn new(ptr: *mut T) -> Self {
         // INVARIANT: Per safety requirement.
