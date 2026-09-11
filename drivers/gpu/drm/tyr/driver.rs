@@ -639,7 +639,7 @@ impl platform::Driver for TyrPlatformDriver {
             .wait_ready(1000)
             .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
-        firmware.enable_global_interface(&core_clk, io)?;
+        firmware.enable_global_interface(core_clk.rate().as_hz() as u64, io)?;
 
         let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware)?;
         unreg_dev.sched.lock().enable(scheduler);

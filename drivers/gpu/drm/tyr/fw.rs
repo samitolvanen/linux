@@ -14,7 +14,6 @@
 //! [`Section`]: crate::fw::Section
 
 use kernel::{
-    clk::Clk,
     device::{
         Bound,
         Device, //
@@ -453,8 +452,8 @@ impl<'drm> Firmware<'drm> {
     }
 
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(&self, core_clk: &Clk, io: &IoMem<'_>) -> Result {
-        self.global_iface.enable(core_clk, io)
+    pub(crate) fn enable_global_interface(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
+        self.global_iface.enable(core_clk_rate, io)
     }
 
     pub(crate) fn csif_info_counts(&self) -> Result<(u32, u32, u32, u32)> {

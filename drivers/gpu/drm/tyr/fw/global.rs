@@ -13,7 +13,6 @@ pub(crate) mod csg;
 use core::ops::Range;
 
 use kernel::{
-    clk::Clk,
     device::{
         Bound,
         Device, //
@@ -90,14 +89,13 @@ pub(crate) use self::csg::{
 };
 
 /// Encodes a GLB timer timeout and selects the backing time source.
-pub(super) fn conv_timeout(core_clk: &Clk, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
+pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
     // The max timeout is determined by the 31 bit size of the timeout field.
     let max_timeout = (1u32 << 31) - 1;
-    let core_rate = core_clk.rate().as_hz() as u64;
 
     let (timer_rate, timer_source) = match arch_timer_get_rate() {
         Some(rate) => (u64::from(rate), Bounded::try_new(0).unwrap()),
-        _ if core_rate != 0 => (core_rate, Bounded::try_new(1).unwrap()),
+        _ if core_clk_rate != 0 => (core_clk_rate, Bounded::try_new(1).unwrap()),
         _ => return Err(EINVAL),
     };
 
@@ -263,13 +261,13 @@ impl<'drm> GlobalInterface<'drm> {
         }))
     }
 
-    pub(crate) fn enable(&self, core_clk: &Clk, io: &IoMem<'_>) -> Result {
+    pub(crate) fn enable(&self, core_clk_rate: u64, io: &IoMem<'_>) -> Result {
         let enabled = InnerGlobalInterface::build_enabled(
             self.dev,
             io,
             &self.shared_section,
             self.gpu_info,
-            core_clk,
+            core_clk_rate,
             &self.event_wait,
             self.user_as_slot_count,
         )?;
@@ -410,7 +408,7 @@ impl InnerGlobalInterface {
         io: &IoMem<'_>,
         shared_section: &SharedSectionInfo,
         gpu_info: GpuInfo,
-        core_clk: &Clk,
+        core_clk_rate: u64,
         event_wait: &Wait,
         user_as_slot_count: usize,
     ) -> Result<EnabledGlobalInterface> {
@@ -456,7 +454,7 @@ impl InnerGlobalInterface {
             output_va.value().get().into(),
         )?;
 
-        Self::configure_glb_input(&glb_input, &gpu_info, core_clk)?;
+        Self::configure_glb_input(&glb_input, &gpu_info, core_clk_rate)?;
         let ack_mask = Self::configure_glb_requests(&glb_input, &glb_output)?;
 
         // Ring the global doorbell to notify the MCU.
@@ -540,7 +538,7 @@ impl InnerGlobalInterface {
     fn configure_glb_input(
         glb_input: &FwInterface<FwRegion<GLB_INPUT_BLOCK_SIZE>>,
         gpu_info: &GpuInfo,
-        core_clk: &Clk,
+        core_clk_rate: u64,
     ) -> Result {
         // Make all present shader cores available for endpoint allocation.
         glb_input.write(
@@ -554,7 +552,7 @@ impl InnerGlobalInterface {
 
         // Power-down delay after idle, in microseconds.
         const PWROFF_HYSTERESIS_US: u32 = 10_000;
-        let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk, PWROFF_HYSTERESIS_US)?;
+        let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk_rate, PWROFF_HYSTERESIS_US)?;
         let pwroff_source = pwroff_source.into();
         let pwroff_timeout = Bounded::<u32, 31>::try_new(pwroff_timeout).ok_or(EINVAL)?;
         glb_input.write(
@@ -582,7 +580,7 @@ impl InnerGlobalInterface {
 
         // Configure the delay before reporting the GPU as idle.
         const IDLE_HYSTERESIS_US: u32 = 800;
-        let (idle_timeout, idle_source) = conv_timeout(core_clk, IDLE_HYSTERESIS_US)?;
+        let (idle_timeout, idle_source) = conv_timeout(core_clk_rate, IDLE_HYSTERESIS_US)?;
         let idle_source = idle_source.into();
         let idle_timeout = Bounded::<u32, 31>::try_new(idle_timeout).ok_or(EINVAL)?;
         glb_input.write(
