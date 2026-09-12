@@ -34,7 +34,8 @@ use crate::{
     regs::{
         gpu_control,
         join_u64, //
-    }, //
+    },
+    trace, //
 };
 
 /// Returns the GPU IRQ sources the driver services.
@@ -112,6 +113,8 @@ impl TyrIrqTrait for GpuIrq {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, io: &IoMem<'_>, status: u32) {
+        trace::gpu_irq(status);
+
         let status_reg = gpu_control::GPU_IRQ_STATUS::from_raw(status);
 
         if status_reg.gpu_fault() || status_reg.gpu_protected_fault() {

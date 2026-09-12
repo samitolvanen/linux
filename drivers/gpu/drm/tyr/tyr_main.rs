@@ -37,6 +37,7 @@ mod regs;
 mod reset;
 mod sched;
 mod slot;
+mod trace;
 mod vm;
 mod wait;
 
