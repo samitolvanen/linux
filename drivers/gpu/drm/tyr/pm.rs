@@ -42,7 +42,8 @@ use crate::{
     gpu,
     mmu,
     reset,
-    sched, //
+    sched,
+    trace, //
 };
 
 /// Autosuspend delay in milliseconds.
@@ -77,10 +78,12 @@ fn suspend_hw_components(tdev: &TyrDrmDevice, reg_data: &TyrDrmRegistrationData<
     };
 
     reg_data.fw.suspend(&reg_data.job_irq, io);
+    trace::pm_hw(trace::PmHwStep::FwSuspend, 0);
 
     // After fw.suspend() frees the firmware's AS slot, drain the idle
     // user slots while still clocked so teardown hits no gated MMIO.
     mmu::suspend(reg_data, io);
+    trace::pm_hw(trace::PmHwStep::MmuSuspend, 0);
 
     gpu::suspend(tdev, reg_data, io);
 }
@@ -97,7 +100,7 @@ fn resume_hw_components(
     gpu::resume(tdev, reg_data, io)?;
     mmu::resume(reg_data, io);
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
-    if reload {
+    let fw_res = if reload {
         reg_data
             .fw
             .reload(tdev, &reg_data.job_irq, core_clk_rate, io)
@@ -105,7 +108,12 @@ fn resume_hw_components(
         reg_data
             .fw
             .resume(tdev, &reg_data.job_irq, core_clk_rate, io)
-    }
+    };
+    trace::pm_hw(
+        trace::PmHwStep::FwResume,
+        fw_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    fw_res
 }
 
 /// Latches a failed resume so the tick keeps asking for another resume,
@@ -150,6 +158,7 @@ fn quiesce_and_suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationD
     tdev.pm_powered_down.store(true, Relaxed);
 
     tdev.user_mmio.lock().set_powered(tdev, false);
+    trace::reset_pm(trace::ResetPmPath::SuspendFlush, 0);
     tdev.reset.flush();
     tdev.cancel_fw_ping();
     sched::tick::suspend(tdev, reg_data);
@@ -172,7 +181,14 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
         return Err(EAGAIN);
     };
 
-    if let Err(e) = devfreq::suspend(Some(&data.devfreq)) {
+    trace::pm_runtime_suspend(trace::PmPhase::Begin, 0);
+
+    let devfreq_res = devfreq::suspend(Some(&data.devfreq));
+    trace::pm_devfreq(
+        trace::PmDevfreqOp::Suspend,
+        devfreq_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    if let Err(e) = devfreq_res {
         dev_warn!(tdev.as_ref(), "Failed to suspend devfreq: {:?}\n", e);
     }
 
@@ -180,6 +196,8 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
         quiesce_and_suspend(tdev, reg_data);
         reg_data.clks.lock().gate();
     });
+
+    trace::pm_runtime_suspend(trace::PmPhase::End, 0);
     Ok(())
 }
 
@@ -196,89 +214,112 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         return Err(ENODEV);
     }
 
-    // Probe arms autosuspend before it registers the DRM device. The device
-    // is still powered in that window, so there is nothing to resume.
-    let Some(guard) = tdev.registration_guard() else {
-        return Ok(());
-    };
-    guard.registration_data_with(|reg_data| {
-        // Bound so the clock guard drops before the latch takes the scheduler
-        // mutex. A failed `ungate` unwinds its own clocks, so this leg skips
-        // the hardware suspend.
-        let ungate_res = reg_data.clks.lock().ungate();
-        if let Err(e) = ungate_res {
-            return Err(latch_resume_failure(tdev, reg_data, e));
-        }
+    trace::pm_runtime_resume(trace::PmPhase::Begin, 0);
 
-        // A reset recorded while the device was suspended means the firmware state
-        // cannot be trusted, so complete the reset here with a full firmware
-        // reload instead of the fast resident-section reboot.
-        let pending_reset = tdev.reset.claim_pending();
-        if pending_reset {
-            dev_info!(
-                reg_data.pdev,
-                "debug: completing latched GPU reset on resume\n"
-            );
-        }
-
-        let hw = if pending_reset || reg_data.fw.needs_reload() {
-            resume_hw_components(tdev, reg_data, true)
-        } else {
-            resume_hw_components(tdev, reg_data, false).or_else(|e| {
-                dev_err!(
-                    reg_data.pdev,
-                    "Resume failed, retrying with a full firmware reload: {:?}\n",
-                    e
-                );
-                resume_hw_components(tdev, reg_data, true)
-            })
+    let res = (|| -> Result {
+        // Probe arms autosuspend before it registers the DRM device. The device
+        // is still powered in that window, so there is nothing to resume.
+        let Some(guard) = tdev.registration_guard() else {
+            return Ok(());
         };
+        guard.registration_data_with(|reg_data| {
+            // Bound so the clock guard drops before the latch takes the scheduler
+            // mutex. A failed `ungate` unwinds its own clocks, so this leg skips
+            // the hardware suspend.
+            let ungate_res = reg_data.clks.lock().ungate();
+            if let Err(e) = ungate_res {
+                return Err(latch_resume_failure(tdev, reg_data, e));
+            }
 
-        if pending_reset {
-            tdev.reset.complete_claimed();
-        }
+            // A reset recorded while the device was suspended means the firmware state
+            // cannot be trusted, so complete the reset here with a full firmware
+            // reload instead of the fast resident-section reboot.
+            let pending_reset = tdev.reset.claim_pending();
+            if pending_reset {
+                dev_info!(
+                    reg_data.pdev,
+                    "debug: completing latched GPU reset on resume\n"
+                );
+            }
 
-        if let Err(e) = hw {
-            return Err(fail_resume(tdev, reg_data, e));
-        }
-
-        // A request recorded during the reboot arrived after the earlier
-        // claim, so no worker will pick it up. Complete it before the rebind.
-        if tdev.reset.claim_pending() {
-            dev_info!(
-                reg_data.pdev,
-                "debug: completing GPU reset latched during firmware reboot\n"
-            );
-            let reset_res = if tdev.is_unusable() {
-                Ok(())
+            let hw = if pending_reset || reg_data.fw.needs_reload() {
+                resume_hw_components(tdev, reg_data, true)
             } else {
-                let gate = tdev.reset.hw_gate();
-                reset::run_hw_reset(tdev, reg_data, &gate)
+                resume_hw_components(tdev, reg_data, false).or_else(|e| {
+                    dev_err!(
+                        reg_data.pdev,
+                        "Resume failed, retrying with a full firmware reload: {:?}\n",
+                        e
+                    );
+                    resume_hw_components(tdev, reg_data, true)
+                })
             };
-            tdev.reset.complete_claimed();
 
-            if let Err(e) = reset_res {
+            if pending_reset {
+                trace::reset_pm(
+                    trace::ResetPmPath::ResumeReload,
+                    hw.as_ref().err().map_or(0, |e| e.to_errno()),
+                );
+                tdev.reset.complete_claimed();
+            }
+
+            if let Err(e) = hw {
                 return Err(fail_resume(tdev, reg_data, e));
             }
-        }
 
-        // The work reissued below tests this flag, so clear it first. A failed
-        // resume returns before this point, and the flag stays set until a
-        // later resume succeeds.
-        tdev.pm_powered_down.store(false, Release);
+            // A request recorded during the reboot arrived after the earlier
+            // claim, so no worker will pick it up. Complete it before the rebind.
+            if tdev.reset.claim_pending() {
+                dev_info!(
+                    reg_data.pdev,
+                    "debug: completing GPU reset latched during firmware reboot\n"
+                );
+                let reset_res = if tdev.is_unusable() {
+                    Ok(())
+                } else {
+                    let gate = tdev.reset.hw_gate();
+                    reset::run_hw_reset(tdev, reg_data, &gate)
+                };
+                trace::reset_pm(
+                    trace::ResetPmPath::ResumeLateReload,
+                    reset_res.as_ref().err().map_or(0, |e| e.to_errno()),
+                );
+                tdev.reset.complete_claimed();
 
-        sched::tick::resume(tdev);
+                if let Err(e) = reset_res {
+                    return Err(fail_resume(tdev, reg_data, e));
+                }
+            }
 
-        if let Err(e) = devfreq::resume(Some(&data.devfreq)) {
-            dev_warn!(reg_data.pdev, "Failed to resume devfreq: {:?}\n", e);
-        }
+            // The work reissued below tests this flag, so clear it first. A failed
+            // resume returns before this point, and the flag stays set until a
+            // later resume succeeds.
+            tdev.pm_powered_down.store(false, Release);
+
+            sched::tick::resume(tdev);
+
+            let devfreq_res = devfreq::resume(Some(&data.devfreq));
+            trace::pm_devfreq(
+                trace::PmDevfreqOp::Resume,
+                devfreq_res.as_ref().err().map_or(0, |e| e.to_errno()),
+            );
+            if let Err(e) = devfreq_res {
+                dev_warn!(reg_data.pdev, "Failed to resume devfreq: {:?}\n", e);
+            }
+
+            Ok(())
+        })?;
+
+        tdev.user_mmio.lock().set_powered(tdev, true);
 
         Ok(())
-    })?;
+    })();
 
-    tdev.user_mmio.lock().set_powered(tdev, true);
-
-    Ok(())
+    trace::pm_runtime_resume(
+        trace::PmPhase::End,
+        res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    res
 }
 
 #[vtable]

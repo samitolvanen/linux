@@ -39,6 +39,10 @@ use crate::fw::{
         CSG_OUTPUT_BLOCK_SIZE,
         CSG_PROTM_SUSPEND_BUF,
         CSG_REQ,
+        CSG_RESOURCE_DEP,
+        CSG_STATUS_EP_CURRENT,
+        CSG_STATUS_EP_REQ,
+        CSG_STATUS_STATE,
         CSG_SUSPEND_BUF,
         CS_CONTROL_BLOCK_SIZE,
         GROUP_FEATURES,
@@ -54,6 +58,7 @@ use crate::fw::{
     MAX_CS,
     MIN_CS, //
 };
+use crate::trace;
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
 const CSG_GROUP_CONTROL_OFFSET: usize = 0x1000;
@@ -309,7 +314,7 @@ impl CsgInterface {
 
         for cs_idx in 0..enabled.cs_num {
             // Create and enable the CS interface.
-            let mut cs = CsInterface::new(cs_idx)?;
+            let mut cs = CsInterface::new()?;
             cs.enable(
                 dev,
                 shared_section,
@@ -439,6 +444,7 @@ impl CsgInterface {
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
 
+        trace::fw_csg_ep_req_write(self.csg_idx as u32, ep_req.into_raw());
         enabled.write_ep_req(ep_req);
         Ok(())
     }
@@ -510,6 +516,17 @@ impl CsgInterface {
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
 
+        let csg_id = self.csg_idx as u32;
+        trace::fw_csg_activate_bufs(csg_id, inputs.suspend_buf, inputs.protm_suspend_buf);
+        trace::fw_csg_activate_config(
+            csg_id,
+            inputs.ep_req.into_raw(),
+            inputs.config.into_raw(),
+            inputs.allow_compute,
+            inputs.allow_fragment,
+            inputs.allow_other,
+        );
+
         enabled.csg_input.write(
             CSG_ALLOW_COMPUTE,
             CSG_ALLOW_COMPUTE::zeroed().with_mask(inputs.allow_compute),
@@ -580,6 +597,7 @@ impl CsgInterface {
         enabled
             .csg_input
             .write(CSG_DB_REQ, CSG_DB_REQ::from_raw(new));
+        trace::fw_csg_doorbell_req(self.csg_idx as u32, new, 0, mask);
         Ok(())
     }
 
@@ -607,7 +625,26 @@ impl CsgInterface {
         Ok(enabled.csg_output.read(CSG_ACK))
     }
 
-    #[expect(dead_code)]
+    /// Snapshot of the per-CSG output area used by the
+    /// `tyr_fw_csg_dump_output` tracepoint. Reads `CSG_ACK`,
+    /// `CSG_STATUS_STATE`, `CSG_STATUS_EP_CURRENT`, `CSG_STATUS_EP_REQ`
+    /// and `CSG_RESOURCE_DEP` as raw u32 values.
+    pub(crate) fn read_output_dump_raw(&self) -> Result<(u32, u32, u32, u32, u32)> {
+        let enabled = match &self.state {
+            CsgInterfaceState::Enabled(enabled) => enabled,
+            CsgInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        Ok((
+            enabled.csg_output.read(CSG_ACK).into_raw(),
+            enabled.csg_output.read(CSG_STATUS_STATE).into_raw(),
+            enabled.csg_output.read(CSG_STATUS_EP_CURRENT).into_raw(),
+            enabled.csg_output.read(CSG_STATUS_EP_REQ).into_raw(),
+            enabled.csg_output.read(CSG_RESOURCE_DEP).into_raw(),
+        ))
+    }
+
+    #[allow(dead_code)]
     pub(in super::super) fn read_output_db_ack(&self) -> Result<CSG_DB_ACK> {
         let enabled = match &self.state {
             CsgInterfaceState::Enabled(e) => e,

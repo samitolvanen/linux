@@ -25,6 +25,7 @@ use kernel::{
         self,
         shmem,
         BaseObject,
+        IntoGEMObject,
         ResvGuard, //
     },
     new_mutex,
@@ -64,6 +65,7 @@ use crate::{
         ReclaimState,
         VmReclaim, //
     },
+    trace,
     vm::{
         range,
         Vm,
@@ -320,8 +322,18 @@ impl Drop for BoVmap {
                 ManuallyDrop::take(&mut self.handoff),
             )
         };
+        let id = debug_id(vmap.owner());
+        let size = vmap.owner().size() as u64;
 
-        handoff.spawn(vmap, drop);
+        trace::cleanup_wq_enqueue(trace::CleanupWqKind::MappedBoVmap, id, size);
+        handoff.spawn(vmap, |vmap| {
+            trace::cleanup_wq_exec(
+                trace::CleanupWqKind::MappedBoVmap,
+                debug_id(vmap.owner()),
+                vmap.owner().size() as u64,
+            );
+            drop(vmap);
+        });
     }
 }
 
@@ -432,13 +444,38 @@ pub(crate) fn sync(
     offset: u64,
     size: u64,
 ) -> Result {
+    let imported = bo.is_imported();
+    let wc = bo.map_wc();
+
+    let result = sync_inner(bo, dev, type_, offset, size, imported, wc);
+    trace::bo_sync(
+        debug_id(bo),
+        type_,
+        offset,
+        size,
+        imported,
+        wc,
+        result.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    result
+}
+
+fn sync_inner(
+    bo: &Bo,
+    dev: &device::Device<Bound>,
+    type_: u32,
+    offset: u64,
+    size: u64,
+    imported: bool,
+    wc: bool,
+) -> Result {
     let bo_size = bo.size() as u64;
     let end = offset.checked_add(size).ok_or(EINVAL)?;
     if end > bo_size {
         return Err(EINVAL);
     }
 
-    if bo.is_imported() {
+    if imported {
         return Err(EINVAL);
     }
 
@@ -448,7 +485,7 @@ pub(crate) fn sync(
         _ => return Err(EINVAL),
     }
 
-    if bo.map_wc() {
+    if wc {
         return Ok(());
     }
 
@@ -506,6 +543,13 @@ pub(crate) fn sync(
     }
 
     Ok(())
+}
+
+/// Returns the address of the underlying `struct drm_gem_object` as a
+/// file-independent debug identity for the BO. Used only to correlate a
+/// BO's mapping lifecycle in tracepoints; never dereferenced.
+pub(crate) fn debug_id(bo: &Bo) -> u64 {
+    bo.as_raw() as u64
 }
 
 /// Creates a kernel-owned GEM object mapped into the VM and vmapped for CPU access.
@@ -752,10 +796,27 @@ impl Drop for KernelBo {
         // Firmware sections are dropped only by probe and unbind, outside any
         // signalling section.
         match self.handoff.take() {
-            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap),
+            Some(handoff) => {
+                trace::cleanup_wq_enqueue(
+                    trace::CleanupWqKind::KernelBo,
+                    captures.va_range.start,
+                    va_range_size(&captures.va_range),
+                );
+                handoff.spawn(captures, deferred_kernel_bo_unmap);
+            }
             None => kernel_bo_unmap(captures),
         }
     }
+}
+
+/// `kernel_bo_unmap` as run from the cleanup workqueue.
+fn deferred_kernel_bo_unmap(captures: KernelBoCleanup) {
+    trace::cleanup_wq_exec(
+        trace::CleanupWqKind::KernelBo,
+        captures.va_range.start,
+        va_range_size(&captures.va_range),
+    );
+    kernel_bo_unmap(captures);
 }
 
 /// Tears down a `KernelBo` mapping and then releases the VA

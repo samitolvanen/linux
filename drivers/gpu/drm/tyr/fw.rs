@@ -879,6 +879,11 @@ impl<'drm> Firmware<'drm> {
         &self.vm
     }
 
+    /// The GPU register mapping.
+    pub(crate) fn iomem(&self) -> Result<&IoMem<'_>> {
+        self.iomem.access(self.dev.as_ref())
+    }
+
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
     pub(crate) fn alloc_queue_mem(
         &self,

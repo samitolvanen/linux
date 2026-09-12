@@ -41,7 +41,7 @@ use crate::{
         TyrDrmDevice,
         TyrDrmRegistrationData, //
     },
-    gem,
+    gem, trace,
     vm::{
         self,
         Vm,
@@ -164,6 +164,24 @@ pub(crate) struct ContextGrowArgs {
     pub(crate) heap_gpu_va: u64,
     pub(crate) renderpasses_in_flight: u32,
     pub(crate) pending_frag_count: u32,
+    /// Identity of the group whose CS raised the OOM, carried for the
+    /// `tyr_heap_grow_decision` tracepoint.
+    pub(crate) group_uid: u64,
+    /// Index of the CS within that group.
+    pub(crate) cs_id: u32,
+    pub(crate) vt_start: u32,
+    pub(crate) vt_end: u32,
+    pub(crate) frag_end: u32,
+}
+
+/// Per-heap state observed while deciding whether a grow can proceed,
+/// reported by `Pool::grow_heap_context` through the
+/// `tyr_heap_grow_decision` tracepoint.
+#[derive(Default)]
+struct GrowState {
+    chunk_count: u32,
+    max_chunks: u32,
+    target_in_flight: u32,
 }
 
 /// Creates a tiler heap context in the heap pool of the VM named by
@@ -366,8 +384,44 @@ impl Pool {
         reg_data: &TyrDrmRegistrationData<'_>,
         args: ContextGrowArgs,
     ) -> Result<(u64, u64)> {
-        let _ = args.pending_frag_count;
+        let mut state = GrowState::default();
+        let result = self.try_grow_heap_context(ddev, reg_data, &args, &mut state);
 
+        // Mirrors the outcome the caller derives from the same error
+        // codes in `sched::events`.
+        let outcome = match &result {
+            Ok(_) => trace::HeapGrowOutcome::Grown,
+            Err(e) if *e == ENOMEM => trace::HeapGrowOutcome::Reclaim,
+            Err(_) => trace::HeapGrowOutcome::Fatal,
+        };
+        trace::heap_grow_decision(
+            args.group_uid,
+            args.cs_id,
+            args.heap_gpu_va,
+            state.chunk_count,
+            state.max_chunks,
+            args.renderpasses_in_flight,
+            state.target_in_flight,
+            args.pending_frag_count,
+            args.vt_start,
+            args.vt_end,
+            args.frag_end,
+            outcome,
+        );
+
+        result
+    }
+
+    /// Links one more chunk into the heap context addressed by
+    /// `args.heap_gpu_va`, recording the state the decision was taken on
+    /// in `state` so the caller can trace refusals.
+    fn try_grow_heap_context(
+        &self,
+        ddev: &TyrDrmDevice,
+        reg_data: &TyrDrmRegistrationData<'_>,
+        args: &ContextGrowArgs,
+        state: &mut GrowState,
+    ) -> Result<(u64, u64)> {
         let index = self.heap_va_to_index(args.heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
@@ -378,6 +432,10 @@ impl Pool {
         let (vm, chunk_size, max_chunks, cookie) = {
             let guard = xa.lock();
             let heap_ctx = guard.get(index).ok_or(EINVAL)?;
+
+            state.chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
+            state.max_chunks = heap_ctx.max_chunks;
+            state.target_in_flight = heap_ctx.target_in_flight;
 
             if args.renderpasses_in_flight > heap_ctx.target_in_flight
                 || heap_ctx.chunks.len() >= heap_ctx.max_chunks as usize
@@ -407,6 +465,10 @@ impl Pool {
         if heap_ctx.cookie != cookie {
             return Err(EINVAL);
         }
+
+        // Chunks may have been added while the lock was dropped, so refresh
+        // the count the refusal below is taken on.
+        state.chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
 
         if heap_ctx.chunks.len() >= max_chunks as usize {
             return Err(ENOMEM);
@@ -486,5 +548,85 @@ impl Pool {
 
     pub(crate) fn total_size(&self) -> usize {
         self.pool_total_size.load(Relaxed)
+    }
+
+    /// Best-effort dump of every heap-context entry and chunk-header in
+    /// this pool to the `tyr_heap_context_dump` / `tyr_heap_chunk_dump`
+    /// tracepoints. Called from the CS_FAULT / CS_FATAL event path in
+    /// dma-fence signalling context and from the periodic 1Hz heap-dump
+    /// worker (which passes `cs_id = 0`). The dump only runs while a
+    /// heap-dump tracepoint is enabled; it is disabled by default and is
+    /// enabled at runtime with `echo 1 > .../tyr_heap_chunk_dump/enable`.
+    /// When enabled, the walk:
+    ///
+    /// * uses `try_lock` on the heap XArray (a spinlock-backed lock)
+    ///   and silently skips the dump when the lock is contended;
+    /// * does no allocation;
+    /// * touches only already-mapped kernel vmaps via raw byte reads;
+    /// * is bounded by [`MAX_HEAPS_PER_POOL`] and by each heap's chunk
+    ///   chain length.
+    ///
+    /// This is a downstream-only debug aid and never returns an error.
+    pub(crate) fn dump_for_trace(&self, group_id: u64, cs_id: u32) {
+        if !trace::heap_dump_enabled() {
+            return;
+        }
+
+        let stride = self.stride.get() as usize;
+        let Some(ctx_base) = self.gpu_contexts.kernel_va().map(|r| r.start) else {
+            return;
+        };
+        let ctx_vmap = self.gpu_contexts.vmap();
+        let ctx_size = ctx_vmap.size();
+
+        let xa = self.xa.as_ref();
+        let Some(guard) = xa.try_lock() else {
+            return;
+        };
+
+        for index in 0..MAX_HEAPS_PER_POOL as usize {
+            let Some(heap_ctx) = guard.get(index) else {
+                continue;
+            };
+
+            let ctx_off = index.saturating_mul(stride);
+            if ctx_off.saturating_add(32) > ctx_size {
+                continue;
+            }
+            let mut content = [0u8; 32];
+            for (i, slot) in content.iter_mut().enumerate() {
+                *slot = ctx_vmap.try_read8(ctx_off + i).unwrap_or(0);
+            }
+
+            let ctx_va = ctx_base + (index as u64) * (stride as u64);
+            let chunk_count = u32::try_from(heap_ctx.chunks.len()).unwrap_or(u32::MAX);
+            trace::heap_context_dump(group_id, cs_id, index as u32, ctx_va, chunk_count, &content);
+
+            for (chunk_index, chunk_bo) in heap_ctx.chunks.iter().enumerate() {
+                let chunk_vmap = chunk_bo.vmap();
+                let chunk_size = chunk_vmap.size();
+                if chunk_size < 64 {
+                    continue;
+                }
+                let chunk_va = match chunk_bo.kernel_va() {
+                    Some(r) => r.start,
+                    None => continue,
+                };
+
+                let mut header = [0u8; 64];
+                for (i, slot) in header.iter_mut().enumerate() {
+                    *slot = chunk_vmap.try_read8(i).unwrap_or(0);
+                }
+
+                trace::heap_chunk_dump(
+                    group_id,
+                    cs_id,
+                    index as u32,
+                    chunk_index as u32,
+                    chunk_va,
+                    &header,
+                );
+            }
+        }
     }
 }
