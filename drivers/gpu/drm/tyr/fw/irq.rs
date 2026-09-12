@@ -46,6 +46,7 @@ use crate::{
         JOB_IRQ_STATUS, //
     },
     sched::Scheduler,
+    trace,
     wait::{
         Wait,
         WaitResult, //
@@ -182,6 +183,7 @@ impl TyrIrqTrait for JobIrq<'_> {
         io.write_reg(JOB_IRQ_CLEAR::from_raw(status));
         // Complete the posted clear before the handler reads the firmware interfaces.
         io.read(JOB_IRQ_RAWSTAT);
+        trace::job_irq_clear(status);
     }
 
     fn mask(&self) -> u32 {
@@ -189,6 +191,8 @@ impl TyrIrqTrait for JobIrq<'_> {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, _io: &IoMem<'_>, status: u32) {
+        trace::fw_irq(status);
+
         self.state.handle(status);
 
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {

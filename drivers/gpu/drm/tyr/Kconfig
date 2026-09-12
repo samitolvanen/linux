@@ -8,6 +8,7 @@ config DRM_TYR
 	depends on MMU
 	depends on !GENERIC_ATOMIC64  # for IOMMU_IO_PGTABLE_LPAE
 	depends on COMMON_CLK
+	depends on EVENT_TRACING
 	depends on IOMMU_SUPPORT
 	default n
 	select DEVFREQ_GOV_SIMPLE_ONDEMAND
