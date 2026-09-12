@@ -113,6 +113,7 @@
 #include <net/netlink.h>
 #include <trace/events/rust_dmaf_debug.h>
 #include <trace/events/rust_jq_debug.h>
+#include <trace/events/rust_syncobj_debug.h>
 #include <trace/events/rust_sample.h>
 
 /*
