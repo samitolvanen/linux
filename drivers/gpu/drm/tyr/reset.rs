@@ -66,7 +66,8 @@ use crate::{
     irq::unquiesce,
     mmu,
     pwr,
-    sched::tick, //
+    sched::tick,
+    trace, //
 };
 
 pub(crate) mod hw_gate;
@@ -91,6 +92,15 @@ enum ResetState {
 // `ResetState` is round-trip transmutable to `i32`.
 unsafe impl AtomicType for ResetState {
     type Repr = i32;
+}
+
+/// What `Controller::record_request` did with a reset request.
+struct RequestRecord {
+    /// The reset path is open, so the caller may queue a worker.
+    ready: bool,
+    /// The state machine was not idle, so this request folded into
+    /// whatever it was already doing. Downstream-only debug aid.
+    coalesced: bool,
 }
 
 /// Internal reset orchestrator that owns the state and work item.
@@ -169,11 +179,14 @@ impl Controller {
     ///
     /// A request recorded before probe opens the reset path stays pending
     /// until `set_ready` enqueues a worker for it.
-    fn record_request(&self) -> bool {
+    fn record_request(&self) -> RequestRecord {
         let ready = self.ready.lock();
         // A request lands only from Idle. Other states leave the machine as is.
-        let _ = self.try_change_state(ResetState::Idle, ResetState::Pending);
-        *ready
+        let landed = self.try_change_state(ResetState::Idle, ResetState::Pending);
+        RequestRecord {
+            ready: *ready,
+            coalesced: !landed,
+        }
     }
 
     /// Opens the reset path and returns whether a request is waiting.
@@ -250,6 +263,7 @@ impl Controller {
     /// If the pending reset cannot be claimed, the worker returns immediately.
     fn reset_work(self: &Arc<Self>) {
         let Some(tdev) = self.device() else {
+            trace::reset_worker(trace::ResetWorkerOutcome::NoDevice);
             self.consume_request();
             return;
         };
@@ -280,9 +294,15 @@ impl Controller {
             self.claim_resumed()
         };
         if !claimed {
+            trace::reset_worker(if active.is_some() {
+                trace::ResetWorkerOutcome::ClaimFailed
+            } else {
+                trace::ResetWorkerOutcome::PmInactive
+            });
             return;
         }
 
+        trace::reset_worker(trace::ResetWorkerOutcome::Run);
         dev_info!(self.pdev.as_ref(), "Starting GPU reset.\n");
 
         tdev.cancel_fw_ping();
@@ -306,6 +326,10 @@ impl Controller {
 
             reset_result
         });
+        trace::reset_cycle(
+            trace::ResetCyclePhase::End,
+            reset_result.as_ref().err().map_or(0, |e| e.to_errno()),
+        );
 
         self.finish_reset();
 
@@ -338,6 +362,7 @@ pub(crate) fn run_hw_reset(
 
     reg_data.fw.pre_reset(&reg_data.job_irq, io);
     mmu::pre_reset(reg_data, io);
+    trace::reset_cycle(trace::ResetCyclePhase::Quiesced, 0);
 
     // A span parked on the closed gate holds a VM op lock while it waits.
     // Taking an op lock here would deadlock against such a span, so this
@@ -347,6 +372,10 @@ pub(crate) fn run_hw_reset(
     let reset_result = tdev
         .hw_ops
         .reset(reg_data.pdev.as_ref(), io, tdev.coherency, tdev.soc_data);
+    trace::reset_cycle(
+        trace::ResetCyclePhase::SoftReset,
+        reset_result.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
     if let Err(e) = &reset_result {
         dev_err!(reg_data.pdev, "GPU reset failed: {:?}\n", e);
     }
@@ -365,6 +394,10 @@ pub(crate) fn run_hw_reset(
     let reboot_result = reg_data
         .fw
         .post_reset(tdev, &reg_data.job_irq, core_clk_rate, io);
+    trace::reset_cycle(
+        trace::ResetCyclePhase::FwReboot,
+        reboot_result.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
     if let Err(e) = &reboot_result {
         dev_err!(
             reg_data.pdev,
@@ -525,13 +558,15 @@ impl ResetHandle {
     /// A reset that is already pending or in progress absorbs new requests.
     pub(crate) fn schedule(&self) {
         let Some(tdev) = self.inner.controller.device() else {
+            trace::reset_schedule(trace::ResetScheduleOutcome::NoDevice);
             return;
         };
 
         // Record before the enqueue below so a worker already queued but not
         // yet started observes and claims the request. A duplicate enqueue is
         // rejected harmlessly.
-        if !self.inner.controller.record_request() {
+        let record = self.inner.controller.record_request();
+        if !record.ready {
             // Probe is still bringing the device up, so `set_ready` runs the
             // request once it is done.
             return;
@@ -540,14 +575,27 @@ impl ResetHandle {
         let Some(_active) = tdev.pm_get_if_active() else {
             // While the device is marked resumed, queue the worker to claim the
             // request. Otherwise the resume in flight or the next one runs it.
-            if self.inner.controller.is_resumed() {
+            let queued = self.inner.controller.is_resumed();
+            if queued {
                 let _ = self.inner.wq.enqueue(self.inner.controller.clone());
             }
+            trace::reset_schedule(if record.coalesced {
+                trace::ResetScheduleOutcome::Coalesced
+            } else if queued {
+                trace::ResetScheduleOutcome::Queued
+            } else {
+                trace::ResetScheduleOutcome::Latched
+            });
             return;
         };
 
         // Queue a worker even when a request is already pending, since a
         // request recorded while the device was inactive has no worker.
         let _ = self.inner.wq.enqueue(self.inner.controller.clone());
+        trace::reset_schedule(if record.coalesced {
+            trace::ResetScheduleOutcome::Coalesced
+        } else {
+            trace::ResetScheduleOutcome::Queued
+        });
     }
 }
