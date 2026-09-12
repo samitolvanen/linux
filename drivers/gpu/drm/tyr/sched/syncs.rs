@@ -50,6 +50,16 @@ impl SyncObj64b {
         mem.vmap().try_read64(offset + Self::SEQNO)
     }
 
+    pub(super) fn read_seqno_status(mem: &gem::BoVmap, offset: usize) -> Result<(u64, u32)> {
+        mem.check_offset::<Self>(offset)?;
+        let vmap = mem.vmap();
+
+        Ok((
+            vmap.try_read64(offset + Self::SEQNO)?,
+            vmap.try_read32(offset + Self::STATUS)?,
+        ))
+    }
+
     pub(super) fn write(mem: &gem::BoVmap, offset: usize, value: Self) -> Result {
         mem.check_offset::<Self>(offset)?;
         let vmap = mem.vmap();

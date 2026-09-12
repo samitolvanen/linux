@@ -46,6 +46,7 @@ use crate::{
         JOB_IRQ_STATUS, //
     },
     sched::Scheduler,
+    trace,
     wait::{
         Wait,
         WaitResult, //
@@ -180,6 +181,7 @@ impl TyrIrqTrait for JobIrq<'_> {
 
     fn clear_status(&self, io: &IoMem<'_>, status: u32) {
         io.write_reg(JOB_IRQ_CLEAR::from_raw(status));
+        trace::job_irq_clear(status);
     }
 
     fn mask(&self) -> u32 {
@@ -187,6 +189,8 @@ impl TyrIrqTrait for JobIrq<'_> {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, _io: &IoMem<'_>, status: u32) {
+        trace::fw_irq(status);
+
         self.state.handle(status);
 
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
