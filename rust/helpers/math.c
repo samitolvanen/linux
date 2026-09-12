@@ -6,3 +6,9 @@ __rust_helper u64 rust_helper_mul_u64_add_u64_div_u64(u64 a, u64 b, u64 c, u64 d
 {
 	return mul_u64_add_u64_div_u64(a, b, c, d);
 }
+
+__rust_helper u64 rust_helper_div_u64_rem(u64 dividend, u32 divisor,
+					  u32 *remainder)
+{
+	return div_u64_rem(dividend, divisor, remainder);
+}
