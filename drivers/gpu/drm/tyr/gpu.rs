@@ -38,8 +38,10 @@ use crate::{
     regs::{
         gpu_control::*,
         join_u64,
-        pwr_control, //
-    }, //
+        pwr_control,
+        read_u64_no_tearing, //
+    },
+    trace, //
 };
 
 /// Number of CS work registers the kernel reserves at the top of the
@@ -512,13 +514,22 @@ fn l2_power_on(
 
     io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
 
-    poll::read_poll_timeout(
+    let r = poll::read_poll_timeout(
         || Ok(io.read(L2_READY_LO)),
         |status| status.ready() == 1,
         Delta::from_millis(1),
         Delta::from_millis(100),
     )
-    .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."))?;
+    .inspect_err(|_| dev_err!(dev, "Failed to power on the GPU."));
+
+    let errno = match &r {
+        Ok(_) => 0,
+        Err(e) => e.to_errno(),
+    };
+    trace::l2_power_on(errno);
+    r?;
+
+    trace_shader_power_state(io);
 
     Ok(())
 }
@@ -544,7 +555,11 @@ fn soft_reset(dev: &Device, io: &IoMem<'_>) -> Result {
 /// Masks the interrupts and powers the L2 block off for runtime suspend.
 pub(crate) fn suspend(tdev: &TyrDrmDevice, reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
     quiesce(&reg_data.gpu_irq, io, irq::gpu_irq_disable);
-    let _ = tdev.hw_ops.l2_power_off(reg_data.pdev.as_ref(), io);
+    let l2_res = tdev.hw_ops.l2_power_off(reg_data.pdev.as_ref(), io);
+    trace::pm_hw(
+        trace::PmHwStep::L2Off,
+        l2_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
     if let Some(pwr_irq) = &reg_data.pwr_irq {
         quiesce(pwr_irq, io, pwr::pwr_irq_disable);
     }
@@ -560,6 +575,31 @@ pub(crate) fn resume(
         unquiesce(pwr_irq, io, pwr::pwr_irq_enable);
     }
     unquiesce(&reg_data.gpu_irq, io, irq::gpu_irq_enable);
-    tdev.hw_ops
-        .l2_power_on(reg_data.pdev.as_ref(), io, tdev.coherency, tdev.soc_data)
+    let l2_res = tdev
+        .hw_ops
+        .l2_power_on(reg_data.pdev.as_ref(), io, tdev.coherency, tdev.soc_data);
+    trace::pm_hw(
+        trace::PmHwStep::L2On,
+        l2_res.as_ref().err().map_or(0, |e| e.to_errno()),
+    );
+    l2_res
+}
+
+/// Snapshots shader-domain power state for tracing. Used to diagnose
+/// firmware allocation failures that stem from cores not being powered
+/// on.
+pub(crate) fn trace_shader_power_state(io: &IoMem<'_>) {
+    let ready = read_u64_no_tearing(
+        || io.read(SHADER_READY_LO).into_raw(),
+        || io.read(SHADER_READY_HI).into_raw(),
+    );
+    let pwrtrans = read_u64_no_tearing(
+        || io.read(SHADER_PWRTRANS_LO).into_raw(),
+        || io.read(SHADER_PWRTRANS_HI).into_raw(),
+    );
+    let pwractive = read_u64_no_tearing(
+        || io.read(SHADER_PWRACTIVE_LO).into_raw(),
+        || io.read(SHADER_PWRACTIVE_HI).into_raw(),
+    );
+    trace::shader_power_state(ready, pwrtrans, pwractive);
 }

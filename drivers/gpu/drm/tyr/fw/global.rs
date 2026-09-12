@@ -85,6 +85,8 @@ use crate::{
     }, //
 };
 
+use crate::trace;
+
 pub(crate) use self::cs::{
     CsActivateInputs,
     CsStatusWait, //
@@ -176,6 +178,7 @@ impl<'a> GlobalInterfaceRequests<'a> {
         let new_val = toggled_bits | preserved_bits;
 
         self.input.write(GLB_REQ, GLB_REQ::from_raw(new_val));
+        trace::fw_glb_req(new_val, reqs_mask_val);
         Ok(())
     }
 
@@ -186,6 +189,7 @@ impl<'a> GlobalInterfaceRequests<'a> {
         let new_val = (cur_req & !mask) | (cur_ack & mask);
 
         self.input.write(GLB_REQ, GLB_REQ::from_raw(new_val));
+        trace::fw_glb_req(new_val, mask);
         Ok(())
     }
 }
@@ -398,10 +402,18 @@ impl<'drm> GlobalInterface<'drm> {
 
         // Caller is the sole writer of CSG_REQ for this slot, so req is
         // stable across the wait.
-        let req = csg_input.read(CSG_REQ) & mask;
+        let req_unmasked = csg_input.read(CSG_REQ);
+        let req = req_unmasked & mask;
 
         let _ = self.event_wait.wait_timeout(timeout_ms, || {
-            let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
+            let ack_unmasked = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw());
+            trace::fw_csg_ack_poll(
+                csg_idx as u32,
+                req_unmasked.into_raw(),
+                ack_unmasked.into_raw(),
+                mask.into_raw(),
+            );
+            let ack = ack_unmasked & mask;
             if ack == req {
                 Ok(WaitResult::Done)
             } else {
@@ -530,6 +542,7 @@ impl<'drm> GlobalInterface<'drm> {
 
     fn ring_doorbell(&self, doorbell_id: usize) -> Result {
         let doorbell = DOORBELL::try_at(doorbell_id).ok_or(EINVAL)?;
+        trace::fw_doorbell_ring(doorbell_id as u32);
 
         // Ensure prior writes to firmware-shared memory (CSG_REQ, GLB_DB_REQ,
         // ring buffers) reach the firmware before the doorbell.
@@ -677,6 +690,12 @@ impl InnerGlobalInterface {
             csg.push(entry, GFP_KERNEL)?;
         }
 
+        let cs_per_csg = csg
+            .first()
+            .and_then(|c| c.cs_slot_count().ok())
+            .unwrap_or(0);
+        trace::fw_boot_complete(version.into_raw(), csg_num as u32, cs_per_csg);
+
         Ok(EnabledGlobalInterface {
             glb_control,
             glb_input,
@@ -705,6 +724,7 @@ impl InnerGlobalInterface {
             GLB_ALLOC_EN,
             GLB_ALLOC_EN::zeroed().with_mask(gpu_info.shader_present),
         );
+        trace::fw_glb_alloc_en(gpu_info.shader_present);
 
         // Configure power-down delay for shader and tiler domains.
         // The firmware powers down a domain after it has been idle for this duration,
@@ -889,6 +909,7 @@ impl InnerGlobalInterface {
         enabled
             .glb_input
             .write(GLB_DB_REQ, GLB_DB_REQ::from_raw(new_req));
+        trace::fw_glb_doorbell_req(new_req, csg_mask);
         Ok(())
     }
 
@@ -905,6 +926,7 @@ impl InnerGlobalInterface {
         let request_field = GlobalInterfaceRequests::new(&enabled.glb_input, &enabled.glb_output);
         let req = enabled.glb_input.read(GLB_REQ);
         let ack = enabled.glb_output.read(GLB_ACK);
+        trace::glb_irq(req.into_raw(), ack.into_raw());
         let pending_idle = req.idle_event() ^ ack.idle_event();
 
         if pending_idle {
