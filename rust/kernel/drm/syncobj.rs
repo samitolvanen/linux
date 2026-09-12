@@ -8,13 +8,14 @@ use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
     bindings,
-    dma_buf::{dma_fence_chain::FenceChain, Fence},
+    dma_buf::{dma_fence_chain::FenceChain, Fence, FenceStatus},
     drm,
     error::Result,
     prelude::*,
     sync::aref::ARef,
 };
 
+use super::syncobj_trace as trace_dbg;
 use super::Driver;
 
 /// A DRM Sync Object
@@ -41,6 +42,13 @@ impl<T: drm::Driver> SyncObj<T> {
                 phantom: PhantomData,
             })
         }
+    }
+
+    /// Returns the kernel `struct drm_syncobj *` address as a file-independent
+    /// debug identity. Used only as a tracepoint correlation key; never
+    /// dereferenced.
+    fn debug_id(&self) -> u64 {
+        self.ptr as u64
     }
 
     /// Returns the DMA fence associated with this sync object, if any.
@@ -72,18 +80,38 @@ impl<T: drm::Driver> SyncObj<T> {
             return Err(Error::from_errno(ret));
         }
 
+        let syncobj_ptr = Self::lookup_handle(file, handle).map_or(0, |s| s.debug_id());
+
         let Some(fence) = NonNull::new(fence) else {
+            trace_dbg::find_fence(syncobj_ptr, point, 0, 0, false);
             return Ok(None);
         };
 
         // SAFETY: `drm_syncobj_find_fence` acquired an additional reference,
         // which the `ARef` takes over. `Fence` is a transparent wrapper of a
         // `struct dma_fence`.
-        Ok(Some(unsafe { ARef::from_raw(fence.cast()) }))
+        let fence: ARef<Fence> = unsafe { ARef::from_raw(fence.cast()) };
+
+        let signaled = !matches!(fence.status(), FenceStatus::Unsignaled);
+        trace_dbg::find_fence(
+            syncobj_ptr,
+            point,
+            fence.context_id(),
+            fence.seqno(),
+            signaled,
+        );
+
+        Ok(Some(fence))
     }
 
     /// Replaces the DMA fence with a new one, or removes it if `fence` is `None`.
     pub fn replace_fence(&self, fence: Option<&Fence>) {
+        let (fence_ctx, fence_seqno) = match fence {
+            Some(fence) => (fence.context_id(), fence.seqno()),
+            None => (0, 0),
+        };
+        trace_dbg::replace_fence(self.debug_id(), fence_ctx, fence_seqno);
+
         // SAFETY: The arguments are valid per the respective type invariants.
         unsafe {
             bindings::drm_syncobj_replace_fence(
@@ -95,6 +123,8 @@ impl<T: drm::Driver> SyncObj<T> {
 
     /// Adds a new timeline point to the sync object.
     pub fn add_point(&self, chain: FenceChain, fence: &Fence, point: u64) {
+        trace_dbg::add_point(self.debug_id(), point, fence.context_id(), fence.seqno());
+
         // SAFETY: The arguments are valid per the respective type invariants, and
         // this transfers ownership of `chain` to the DRM core.
         unsafe {
