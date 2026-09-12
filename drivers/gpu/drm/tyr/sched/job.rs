@@ -15,7 +15,10 @@ use kernel::{
         genmask_u32,
         //
     },
-    io::IoBase,
+    io::{
+        Io,
+        IoBase, //
+    },
     prelude::*,
     transmute::FromBytes,
     uaccess::UserSlice,
@@ -32,7 +35,8 @@ use crate::{
     gpu::{
         CsifInfo,
         UNPRESERVED_CS_REG_COUNT, //
-    }, //
+    },
+    trace, //
 };
 
 use super::{
@@ -40,11 +44,17 @@ use super::{
         self,
         SyncOp, //
     },
+    group::Group,
     queue::{
         MIN_RINGBUF_SIZE,
         RINGBUF_RESERVED_BYTES, //
     }, //
 };
+
+/// Sentinel placed in the `first_qword` field of [`tyr_user_stream_head`]
+/// when the read could not be performed (BO lookup failed or kernel vmap
+/// allocation failed).
+const USER_STREAM_HEAD_SENTINEL: u64 = 0xDEADBEEFDEADBEEF;
 
 /// Encoder for Mali CSF command-stream instructions. Value operands are masked
 /// to their architectural width so out-of-range arguments truncate cleanly.
@@ -358,9 +368,11 @@ impl Job {
     pub(crate) fn build_wrapped_stream(
         &self,
         csif: &CsifInfo,
+        group: &Group,
         sync_va: u64,
         profiling_va: u64,
         profiling_mask: u32,
+        job_counter: u64,
     ) -> Result<(KVec<u8>, KVec<usize>)> {
         const INSTR_BYTES: usize = 8;
         // Instructions in the base wrapper, and the `MOV48`/`STORE_STATE`
@@ -413,6 +425,24 @@ impl Job {
                 Ok(offset)
             };
 
+            if trace::user_stream_head_enabled() {
+                let (first_qword, status) = read_user_stream_head(group, piece.stream_addr);
+                trace::user_stream_head(
+                    group.handle(),
+                    self.queue_index as u32,
+                    piece.stream_addr,
+                    first_qword,
+                    status,
+                );
+            }
+            trace::wrapper_call(
+                group.handle(),
+                self.queue_index as u32,
+                job_counter,
+                piece.stream_addr,
+                piece.stream_size,
+            );
+
             emit(Instr::mov32(val_reg, piece.latest_flush.into()))?;
             emit(Instr::flush_cache2(val_reg))?;
             if cycles {
@@ -452,5 +482,53 @@ impl Job {
         }
 
         Ok((buf, relocs))
+    }
+}
+
+/// Reads the first 64-bit word at the user command-stream's GPU VA.
+///
+/// Returns the value read and an `Ok` status on success, or the
+/// [`USER_STREAM_HEAD_SENTINEL`] paired with a status describing why
+/// the read could not be performed. The GPU VA is resolved via
+/// [`crate::vm::Vm::get_bo_for_va`], so foreign BOs and stream
+/// addresses that no longer have a backing mapping report
+/// `LookupFailed` without blocking the submit-prepare path.
+///
+/// Must be called from a non-signalling context, because the underlying
+/// `BoVmap::new` takes `dma_resv_lock` and a `GFP_KERNEL` vmap.
+/// `build_wrapped_stream` runs at submit-prepare time, which already
+/// satisfies that.
+fn read_user_stream_head(group: &Group, stream_va: u64) -> (u64, trace::UserStreamHeadStatus) {
+    let Some((bo, bo_offset)) = group.vm.get_bo_for_va(stream_va) else {
+        return (
+            USER_STREAM_HEAD_SENTINEL,
+            trace::UserStreamHeadStatus::LookupFailed,
+        );
+    };
+
+    let mapped_bo = match gem::BoVmap::new(&bo) {
+        Ok(mapped) => mapped,
+        Err(_) => {
+            return (
+                USER_STREAM_HEAD_SENTINEL,
+                trace::UserStreamHeadStatus::VmapFailed,
+            );
+        }
+    };
+
+    let offset = bo_offset as usize;
+    if mapped_bo.check_offset::<u64>(offset).is_err() {
+        return (
+            USER_STREAM_HEAD_SENTINEL,
+            trace::UserStreamHeadStatus::VmapFailed,
+        );
+    }
+
+    match mapped_bo.vmap().try_read64(offset) {
+        Ok(value) => (value, trace::UserStreamHeadStatus::Ok),
+        Err(_) => (
+            USER_STREAM_HEAD_SENTINEL,
+            trace::UserStreamHeadStatus::VmapFailed,
+        ),
     }
 }

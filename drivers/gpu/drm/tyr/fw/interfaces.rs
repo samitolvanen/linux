@@ -100,7 +100,11 @@ pub(in crate::fw) use self::{
         output::{
             CSG_ACK,
             CSG_DB_ACK,
-            CSG_IRQ_REQ, //
+            CSG_IRQ_REQ,
+            CSG_RESOURCE_DEP,
+            CSG_STATUS_EP_CURRENT,
+            CSG_STATUS_EP_REQ,
+            CSG_STATUS_STATE, //
         },
         CSG_CONTROL_BLOCK_SIZE,
         CSG_INPUT_BLOCK_SIZE,
