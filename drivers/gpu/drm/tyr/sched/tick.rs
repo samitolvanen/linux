@@ -57,6 +57,7 @@ use crate::{
         MAX_CSGS,
         MAX_CSG_PRIO, //
     },
+    trace,
     vm::Vm, //
 };
 
@@ -158,9 +159,11 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
             }
             if sched.pm_ref.is_none() && sched.has_runnable_groups() {
                 sched.pm_ref = tdev.sched_pm_get();
+                trace::pm_usage(trace::PmUsageEvent::Acquire, sched.pm_ref.is_some());
             }
             Ok((sched.pm_ref.is_some(), sched.resume_failed))
         })?;
+        trace::pm_usage(trace::PmUsageEvent::SkipInactive, resume_pending);
 
         // A denied token with a held reference means a resume is in flight
         // and this tick may be its kick, so re-arm a tick period out rather
@@ -215,6 +218,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
     });
 
     if result == Err(ETIMEDOUT) {
+        trace::reset_request(trace::ResetReason::CsgReqTimeout);
         tdev.reset.schedule();
     }
 
@@ -233,6 +237,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
     }
 
     while let Some(list_arc) = dead_waiting.pop_front() {
+        trace::group_wait(list_arc.handle(), false);
         let group: Arc<Group> = list_arc.into_arc();
         group.schedule_term();
     }
@@ -257,6 +262,7 @@ pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationDa
         // Record the suspend under the scheduler mutex so tick paths that
         // re-check it there observe it once the eviction below begins.
         tdev.sched_suspended.store(true, Relaxed);
+        trace::sched_gate(true);
         Tick::new(sched, &mut teardown_groups, &mut evicted_groups).suspend(tdev, reg_data)
     });
     if let Err(e) = result {
@@ -287,6 +293,7 @@ pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
     let _ = tdev.with_locked_scheduler(|sched| {
         sched.resume_failed = false;
         tdev.sched_suspended.store(false, Relaxed);
+        trace::sched_gate(false);
         Ok(())
     });
     TyrDrmDeviceData::schedule_fw_events(tdev);
@@ -709,6 +716,7 @@ impl SchedulingDecision {
     fn collect_groups(
         list: &mut List<Group>,
         prior_state: GroupListState,
+        priority: Priority,
         groups: &mut [Option<PendingBind>],
         as_budget: &mut AsBudget,
     ) -> Result<usize> {
@@ -720,9 +728,25 @@ impl SchedulingDecision {
                 break;
             }
 
-            let status = group.arc().status();
+            let arc = group.arc();
+            let status = arc.status();
 
-            if !status.can_run || status.csg_id.is_some() || !as_budget.take(&group.arc().vm) {
+            if !status.can_run || status.csg_id.is_some() || !as_budget.take(&arc.vm) {
+                let reason = if !status.can_run {
+                    trace::TickDecisionReason::NotRunnable
+                } else if status.csg_id.is_some() {
+                    trace::TickDecisionReason::AlreadyBound
+                } else {
+                    trace::TickDecisionReason::Other
+                };
+                trace::tick_decision_per_group(
+                    arc.handle(),
+                    trace::TickDecision::Skip,
+                    reason,
+                    priority as u8,
+                    0,
+                    arc.bound_tick_counter.load(Relaxed),
+                );
                 cursor.move_next();
                 continue;
             }
@@ -738,6 +762,7 @@ impl SchedulingDecision {
             list_arc.with_locked_inner(|inner| {
                 inner.list_state = GroupListState::None;
             });
+            trace::group_list(list_arc.handle(), GroupListState::None as u32);
             groups[count] = Some(PendingBind {
                 list_arc,
                 prior_state,
@@ -884,7 +909,8 @@ impl SchedulingDecision {
         };
 
         // Collect available groups.
-        let count = Self::collect_groups(queue, prior_state, target, &mut sched.as_budget)?;
+        let count =
+            Self::collect_groups(queue, prior_state, priority, target, &mut sched.as_budget)?;
         if count > 0 {
             if !is_idle {
                 self.all_idle = false;
@@ -1009,6 +1035,7 @@ impl<'a> Tick<'a> {
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
         keep_mask: u32,
+        forced: bool,
         context: &mut CsgUpdateContext,
     ) {
         // Build the halt request set under the slot-manager lock,
@@ -1024,7 +1051,28 @@ impl<'a> Tick<'a> {
                 continue;
             };
 
-            if slot_data.group.can_run() {
+            trace::sched_evict(
+                csg_idx.get() as u32,
+                slot_data.group.handle(),
+                slot_data.group.priority as u8,
+                forced,
+            );
+
+            let can_run = slot_data.group.can_run();
+            trace::tick_decision_per_group(
+                slot_data.group.handle(),
+                trace::TickDecision::Evict,
+                if can_run {
+                    trace::TickDecisionReason::Preempted
+                } else {
+                    trace::TickDecisionReason::Faulted
+                },
+                slot_data.group.priority as u8,
+                slot_data.fw_priority,
+                slot_data.group.bound_tick_counter.load(Relaxed),
+            );
+
+            if can_run {
                 context.set_state(csg_idx, CsgExecutionState::Suspend);
             } else {
                 context.set_state(csg_idx, CsgExecutionState::Terminate);
@@ -1120,7 +1168,7 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        self.stage_evictions(tdev, decision.keep_mask, &mut context);
+        self.stage_evictions(tdev, decision.keep_mask, false, &mut context);
 
         self.sched
             .apply_csg_updates(tdev, fw, &mut context)
@@ -1141,7 +1189,7 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        self.stage_evictions(tdev, 0, &mut context);
+        self.stage_evictions(tdev, 0, true, &mut context);
 
         if self
             .sched
@@ -1162,9 +1210,14 @@ impl<'a> Tick<'a> {
                     let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                         continue;
                     };
-                    slot_data
-                        .group
-                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
+                    let innocent = slot_data.group.with_locked_inner(|inner| {
+                        let innocent = inner.can_run();
+                        inner.mark_evicted_by_timeout();
+                        innocent
+                    });
+                    if innocent {
+                        trace::group_innocent(slot_data.group.handle(), slot_data.group.uid());
+                    }
                     term_context.set_state(csg_idx, CsgExecutionState::Terminate);
                 }
             }
@@ -1190,7 +1243,9 @@ impl<'a> Tick<'a> {
                 let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                     continue;
                 };
-                slot_data.group.set_state(State::Terminated);
+                slot_data
+                    .group
+                    .set_state(State::Terminated, trace::StateChangeReason::TornDown);
             }
         }
 
@@ -1240,7 +1295,29 @@ impl<'a> Tick<'a> {
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
                 match selection {
-                    SelectedGroup::Kept(slot_idx, _sw_prio, _is_idle, cur_fw_prio) => {
+                    SelectedGroup::Kept(slot_idx, sw_prio, _is_idle, cur_fw_prio) => {
+                        let (group_id, is_idle, bound_ticks) = csg_slot_manager
+                            .slot_data(slot_idx)
+                            .map(|s| {
+                                let is_idle = s.group.status().is_idle;
+                                let bound_ticks =
+                                    s.group.bound_tick_counter.fetch_add(1, Relaxed) + 1;
+                                (s.group.handle(), is_idle, bound_ticks)
+                            })
+                            .unwrap_or((0, false, 0));
+                        trace::sched_keep(slot_idx as u32, group_id, sw_prio as u8, fw_prio);
+                        trace::tick_decision_per_group(
+                            group_id,
+                            trace::TickDecision::Keep,
+                            if is_idle {
+                                trace::TickDecisionReason::Idle
+                            } else {
+                                trace::TickDecisionReason::Runnable
+                            },
+                            sw_prio as u8,
+                            fw_prio,
+                            bound_ticks,
+                        );
                         if cur_fw_prio == fw_prio {
                             continue;
                         }
@@ -1261,7 +1338,7 @@ impl<'a> Tick<'a> {
                             );
                         }
                     }
-                    SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
+                    SelectedGroup::Pending(idx, sw_prio, _is_idle) => {
                         let Some(pending) =
                             decision.pending_groups.get_mut(idx).and_then(Option::take)
                         else {
@@ -1277,6 +1354,7 @@ impl<'a> Tick<'a> {
                         }
 
                         let group: Arc<Group> = pending.list_arc.clone_arc();
+                        let pending_is_idle = matches!(pending.prior_state, GroupListState::Idle);
                         let slot_idx = match csg_slot_manager.activate(CsgSlotData {
                             group: group.clone(),
                             fw_priority: fw_prio,
@@ -1287,6 +1365,14 @@ impl<'a> Tick<'a> {
                                     tdev.as_ref(),
                                     "activate (pending) failed: {}\n",
                                     e.to_errno()
+                                );
+                                trace::tick_decision_per_group(
+                                    group.handle(),
+                                    trace::TickDecision::Skip,
+                                    trace::TickDecisionReason::ActivateFailed,
+                                    sw_prio as u8,
+                                    fw_prio,
+                                    group.bound_tick_counter.load(Relaxed),
                                 );
                                 // ETIMEDOUT reaches here from the AS-ready
                                 // and cache-flush polls under vm.activate().
@@ -1335,6 +1421,20 @@ impl<'a> Tick<'a> {
                             continue;
                         }
 
+                        group.bound_tick_counter.store(0, Relaxed);
+                        trace::sched_bind(slot_idx as u32, group.handle(), sw_prio as u8, fw_prio);
+                        trace::tick_decision_per_group(
+                            group.handle(),
+                            trace::TickDecision::Take,
+                            if pending_is_idle {
+                                trace::TickDecisionReason::Idle
+                            } else {
+                                trace::TickDecisionReason::Runnable
+                            },
+                            sw_prio as u8,
+                            fw_prio,
+                            0,
+                        );
                         drop(pending.list_arc);
                     }
                 }
@@ -1363,6 +1463,23 @@ impl<'a> Tick<'a> {
         self.sched.used_csg_slot_count = decision.num_selected as u32;
         self.sched.might_have_idle_groups = decision.idle_group_count > 0;
 
+        let runnable_remaining: usize = self
+            .sched
+            .runnable_groups
+            .iter()
+            .map(|l| l.iter().count())
+            .sum();
+        trace::tick_decision_summary(
+            self.sched
+                .used_csg_slot_count
+                .saturating_sub(decision.keep_mask.count_ones()),
+            decision.num_pending as u32,
+            decision.keep_mask.count_ones(),
+            runnable_remaining as u32,
+        );
+        let total_slots = tdev.csg_slot_manager.lock().slot_count() as u32;
+        trace::csg_slots_status(self.sched.used_csg_slot_count, total_slots);
+
         let all_slots_busy = decision.num_selected == self.sched.csg_slot_count as usize
             && decision.idle_group_count == 0;
 
@@ -1389,11 +1506,15 @@ impl<'a> Tick<'a> {
 
         if decision.all_idle {
             tdev.devfreq_data.devfreq_state.lock().mark_idle();
+            if self.sched.pm_ref.is_some() {
+                trace::pm_usage(trace::PmUsageEvent::Release, false);
+            }
             self.sched.pm_ref = None;
         } else {
             tdev.devfreq_data.devfreq_state.lock().mark_busy();
             if self.sched.pm_ref.is_none() {
                 self.sched.pm_ref = tdev.sched_pm_get();
+                trace::pm_usage(trace::PmUsageEvent::Acquire, self.sched.pm_ref.is_some());
             }
         }
 
