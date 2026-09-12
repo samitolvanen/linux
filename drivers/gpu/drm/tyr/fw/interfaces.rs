@@ -42,12 +42,18 @@
 use iface::FwInterface;
 use kernel::{
     device::Device,
-    io::Io,
+    io::{
+        Io,
+        Region, //
+    },
     prelude::*,
     sync::Arc, //
 };
 
-use crate::fw::Section;
+use crate::fw::{
+    region::FwRegion,
+    Section, //
+};
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
 const CSG_GROUP_CONTROL_OFFSET: usize = 0x1000;
@@ -59,7 +65,10 @@ const CS_CONTROL_OFFSET: usize = 0x40;
 ///
 /// Provides a bounded VMap-backed IO wrapper for accessing CSF shared memory regions.
 mod iface {
-    use core::ops::Range;
+    use core::{
+        marker::PhantomData,
+        ops::Range, //
+    };
 
     use kernel::{
         device::Device,
@@ -68,15 +77,18 @@ mod iface {
             Io,
             IoBackend,
             IoBase,
-            Region,
             SysMem,
             SysMemBackend, //
         },
         prelude::*,
+        ptr::Alignable,
         sync::Arc, //
     };
 
-    use crate::gem::BoData;
+    use crate::{
+        fw::region::FwBase,
+        gem::BoData, //
+    };
 
     /// Firmware interface wrapper for accessing CSF shared memory regions.
     ///
@@ -85,16 +97,19 @@ mod iface {
     ///
     /// # Invariants
     ///
-    /// `offset .. offset + FW_IFACE_SIZE` lies within `vmap`, `vmap`'s base address plus
-    /// `offset` is 4-byte aligned, and `FW_IFACE_SIZE` is a multiple of 4.
-    pub(super) struct FwInterface<const FW_IFACE_SIZE: usize> {
+    /// `offset .. offset + T::MIN_SIZE` lies within `vmap`, `vmap`'s base
+    /// address plus `offset` is aligned to `T::MIN_ALIGN`, and `T::MIN_SIZE`
+    /// is a multiple of 4.
+    pub(super) struct FwInterface<T: ?Sized> {
         /// Virtual mapping of the shared memory buffer.
         vmap: Arc<VMapOwned<BoData>>,
         /// Offset within the shared memory buffer where this interface starts.
         offset: usize,
+        /// Base type this interface is accessed through.
+        target: PhantomData<T>,
     }
 
-    impl<const FW_IFACE_SIZE: usize> FwInterface<FW_IFACE_SIZE> {
+    impl<T: ?Sized + FwBase> FwInterface<T> {
         /// Creates a new firmware interface wrapper at the specified MCU virtual address.
         ///
         /// Validates that the whole interface block is within the section's address range.
@@ -103,12 +118,14 @@ mod iface {
             vmap: &Arc<VMapOwned<BoData>>,
             va_range: &Range<u64>,
             shared_iface_addr: u64,
-        ) -> Result<FwInterface<FW_IFACE_SIZE>> {
+        ) -> Result<FwInterface<T>> {
+            const_assert!(T::MIN_SIZE % 4 == 0);
+
             let shared_mem_start = va_range.start;
             let shared_mem_end = va_range.end;
 
             let iface_end = shared_iface_addr
-                .checked_add(FW_IFACE_SIZE as u64)
+                .checked_add(T::MIN_SIZE as u64)
                 .ok_or(EINVAL)?;
 
             if shared_iface_addr < shared_mem_start || iface_end > shared_mem_end {
@@ -127,46 +144,51 @@ mod iface {
 
             // The check above covers the MCU address range. `as_view()` projects into the CPU
             // mapping, which needs its own bounds and alignment guarantee.
-            if offset.checked_add(FW_IFACE_SIZE).ok_or(EINVAL)? > vmap.size() {
+            if offset.checked_add(T::MIN_SIZE).ok_or(EINVAL)? > vmap.size() {
                 return Err(EINVAL);
             }
 
-            let base = vmap.as_view().as_ptr().cast::<u8>();
-            Region::<FW_IFACE_SIZE>::ptr_try_from_raw_parts_mut(
-                base.wrapping_add(offset),
-                FW_IFACE_SIZE,
-            )
-            .inspect_err(|_| {
+            let addr = vmap
+                .as_view()
+                .as_ptr()
+                .cast::<u8>()
+                .wrapping_add(offset)
+                .addr();
+            if addr.align_down(T::MIN_ALIGN) != addr {
                 dev_err!(
                     dev,
-                    "FwInterface::new: interface at 0x{:x} is not 4-byte aligned\n",
-                    shared_iface_addr
-                )
-            })?;
+                    "FwInterface::new: interface at 0x{:x} is not {}-byte aligned\n",
+                    shared_iface_addr,
+                    T::MIN_ALIGN.as_usize()
+                );
+                return Err(EINVAL);
+            }
 
-            // INVARIANT: The block was checked against the size of `vmap`, and
-            // `ptr_try_from_raw_parts_mut()` accepted its base address as 4-byte aligned
-            // and its size as a multiple of 4.
+            // INVARIANT: The block was checked against the size of `vmap` and its base address
+            // against `T::MIN_ALIGN`, and `T::MIN_SIZE` is a multiple of 4.
             Ok(FwInterface {
                 vmap: vmap.clone(),
                 offset,
+                target: PhantomData,
             })
         }
     }
 
-    impl<'a, const FW_IFACE_SIZE: usize> IoBase<'a> for &'a FwInterface<FW_IFACE_SIZE> {
+    impl<'a, T: ?Sized + FwBase> IoBase<'a> for &'a FwInterface<T> {
         type Backend = SysMemBackend;
-        type Target = Region<FW_IFACE_SIZE>;
+        type Target = T;
 
         #[inline]
-        fn as_view(self) -> SysMem<'a, Region<FW_IFACE_SIZE>> {
+        fn as_view(self) -> SysMem<'a, T> {
             let view = self.vmap.as_view();
             let base = view.as_ptr().cast::<u8>();
-            let ptr = Region::ptr_from_raw_parts_mut(base.wrapping_add(self.offset), FW_IFACE_SIZE);
+            let ptr = T::ptr_from_parts(base.wrapping_add(self.offset), T::MIN_SIZE);
 
-            // SAFETY: By the type invariants `ptr` is inside `view` and aligned for `Region`.
-            // The mapping still has the base address and size they were checked against, since
-            // `VMap` exposes no way to change either and the size of a GEM object is fixed.
+            // SAFETY: `ptr_from_parts()` preserves the address, the provenance and the size it
+            // is given. By the type invariants that range lies within `view` and its base meets
+            // `T::MIN_ALIGN`. The mapping still has the base address and size they were checked
+            // against, since `VMap` exposes no way to change either and the size of a GEM object
+            // is fixed.
             unsafe { SysMemBackend::project_view(view, ptr) }
         }
     }
@@ -346,13 +368,12 @@ mod glb {
             TimestampSource,
             GLB_INPUT_BLOCK_SIZE, //
         };
-        use kernel::{
-            io::Region,
-            register, //
-        };
+        use kernel::register;
+
+        use crate::fw::region::FwRegion;
 
         register! {
-            base: Region<GLB_INPUT_BLOCK_SIZE>;
+            base: FwRegion<GLB_INPUT_BLOCK_SIZE>;
 
             /// Global request register.
             ///
@@ -815,13 +836,12 @@ mod csg {
             CsgStateIrqMask,
             CSG_INPUT_BLOCK_SIZE, //
         };
-        use kernel::{
-            io::Region,
-            register, //
-        };
+        use kernel::register;
+
+        use crate::fw::region::FwRegion;
 
         register! {
-            base: Region<CSG_INPUT_BLOCK_SIZE>;
+            base: FwRegion<CSG_INPUT_BLOCK_SIZE>;
 
             /// CSG request.
             ///
@@ -1394,14 +1414,13 @@ mod cs {
             CsStateIrqMask,
             CS_KERNEL_INPUT_BLOCK_SIZE, //
         };
-        use kernel::{
-            io::Region,
-            register, //
-        };
+        use kernel::register;
+
+        use crate::fw::region::FwRegion;
 
         // Command stream control, kernel input area.
         register! {
-            base: Region<CS_KERNEL_INPUT_BLOCK_SIZE>;
+            base: FwRegion<CS_KERNEL_INPUT_BLOCK_SIZE>;
 
             /// Command stream request flags.
             pub CS_REQ(u32) @ 0x00 {
@@ -1514,14 +1533,13 @@ mod cs {
             CsWaitCondition,
             CS_KERNEL_OUTPUT_BLOCK_SIZE, //
         };
-        use kernel::{
-            io::Region,
-            register, //
-        };
+        use kernel::register;
+
+        use crate::fw::region::FwRegion;
 
         // Command stream control, kernel output area.
         register! {
-            base: Region<CS_KERNEL_OUTPUT_BLOCK_SIZE>;
+            base: FwRegion<CS_KERNEL_OUTPUT_BLOCK_SIZE>;
 
             /// Command stream acknowledge flags.
             pub CS_ACK(u32) @ 0x00 {
@@ -1684,11 +1702,11 @@ enum GlobalInterfaceState {
 #[expect(dead_code)]
 struct EnabledGlobalInterface {
     /// Control block interface - provides version, features, and CSG discovery.
-    glb_control: FwInterface<GLB_CONTROL_BLOCK_SIZE>,
+    glb_control: FwInterface<Region<GLB_CONTROL_BLOCK_SIZE>>,
     /// Input block interface - driver writes requests here.
-    glb_input: FwInterface<GLB_INPUT_BLOCK_SIZE>,
+    glb_input: FwInterface<FwRegion<GLB_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes acknowledgements here.
-    glb_output: FwInterface<GLB_OUTPUT_BLOCK_SIZE>,
+    glb_output: FwInterface<Region<GLB_OUTPUT_BLOCK_SIZE>>,
     /// Runtime stride between CSG control blocks (read from GLB_GROUP_STRIDE).
     csg_stride: usize,
     /// Number of CSG interfaces reported by hardware.
@@ -1722,8 +1740,12 @@ impl GlobalInterface {
         let vmap = Arc::new(shared_section.mem.bo().owned_vmap::<0>()?, GFP_KERNEL)?;
         let va_range = shared_section.mem.va_range();
 
-        let glb_control =
-            FwInterface::<GLB_CONTROL_BLOCK_SIZE>::new(dev, &vmap, va_range, va_range.start)?;
+        let glb_control = FwInterface::<Region<GLB_CONTROL_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            va_range.start,
+        )?;
 
         let version = glb_control.read(GLB_VERSION);
         if version.major().get() == 0 {
@@ -1742,7 +1764,7 @@ impl GlobalInterface {
         );
 
         let input_va = glb_control.read(GLB_INPUT_VA);
-        let glb_input = FwInterface::<GLB_INPUT_BLOCK_SIZE>::new(
+        let glb_input = FwInterface::<FwRegion<GLB_INPUT_BLOCK_SIZE>>::new(
             dev,
             &vmap,
             va_range,
@@ -1750,7 +1772,7 @@ impl GlobalInterface {
         )?;
 
         let output_va = glb_control.read(GLB_OUTPUT_VA);
-        let glb_output = FwInterface::<GLB_OUTPUT_BLOCK_SIZE>::new(
+        let glb_output = FwInterface::<Region<GLB_OUTPUT_BLOCK_SIZE>>::new(
             dev,
             &vmap,
             va_range,
@@ -1831,13 +1853,13 @@ enum CsgInterfaceState {
 struct EnabledCsgInterface {
     /// Control block interface - provides CSG capabilities and configuration.
     #[expect(dead_code)]
-    csg_control: FwInterface<CSG_CONTROL_BLOCK_SIZE>,
+    csg_control: FwInterface<Region<CSG_CONTROL_BLOCK_SIZE>>,
     /// Input block interface - driver writes CSG requests here.
     #[expect(dead_code)]
-    csg_input: FwInterface<CSG_INPUT_BLOCK_SIZE>,
+    csg_input: FwInterface<FwRegion<CSG_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes CSG acknowledgements here.
     #[expect(dead_code)]
-    csg_output: FwInterface<CSG_OUTPUT_BLOCK_SIZE>,
+    csg_output: FwInterface<Region<CSG_OUTPUT_BLOCK_SIZE>>,
     /// Runtime stride between CS control blocks (read from GROUP_STREAM_STRIDE).
     cs_stride: usize,
     /// Number of CS interfaces reported by hardware for this CSG.
@@ -1898,17 +1920,29 @@ impl CsgInterface {
         let csg_control_va = va_range.start + csg_control_offset as u64;
 
         // Create a bounded interface for this CSG's control block at the calculated address.
-        let csg_control =
-            FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(dev, &vmap, va_range, csg_control_va)?;
+        let csg_control = FwInterface::<Region<CSG_CONTROL_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            csg_control_va,
+        )?;
 
         // Read the input and output VAs from the CSG control block.
         let input_va = csg_control.read(GROUP_INPUT_VA).value().get();
-        let csg_input =
-            FwInterface::<CSG_INPUT_BLOCK_SIZE>::new(dev, &vmap, va_range, input_va.into())?;
+        let csg_input = FwInterface::<FwRegion<CSG_INPUT_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            input_va.into(),
+        )?;
 
         let output_va = csg_control.read(GROUP_OUTPUT_VA).value().get();
-        let csg_output =
-            FwInterface::<CSG_OUTPUT_BLOCK_SIZE>::new(dev, &vmap, va_range, output_va.into())?;
+        let csg_output = FwInterface::<Region<CSG_OUTPUT_BLOCK_SIZE>>::new(
+            dev,
+            &vmap,
+            va_range,
+            output_va.into(),
+        )?;
 
         // Read the runtime stride between CS control blocks.
         let cs_stride = csg_control.read(GROUP_STREAM_STRIDE).value().get() as usize;
@@ -1996,13 +2030,13 @@ enum CsInterfaceState {
 struct EnabledCsInterface {
     /// Control block interface - provides CS capabilities and configuration.
     #[expect(dead_code)]
-    cs_control: FwInterface<CS_CONTROL_BLOCK_SIZE>,
+    cs_control: FwInterface<Region<CS_CONTROL_BLOCK_SIZE>>,
     /// Input block interface - driver writes CS requests here.
     #[expect(dead_code)]
-    cs_input: FwInterface<CS_KERNEL_INPUT_BLOCK_SIZE>,
+    cs_input: FwInterface<FwRegion<CS_KERNEL_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes CS acknowledgements here.
     #[expect(dead_code)]
-    cs_output: FwInterface<CS_KERNEL_OUTPUT_BLOCK_SIZE>,
+    cs_output: FwInterface<FwRegion<CS_KERNEL_OUTPUT_BLOCK_SIZE>>,
 }
 
 /// Command Stream Interface
@@ -2055,11 +2089,11 @@ impl CsInterface {
 
         // Create a bounded interface for this CS's control block at the calculated address.
         let cs_control =
-            FwInterface::<CS_CONTROL_BLOCK_SIZE>::new(dev, &vmap, va_range, cs_control_va)?;
+            FwInterface::<Region<CS_CONTROL_BLOCK_SIZE>>::new(dev, &vmap, va_range, cs_control_va)?;
 
         // Read the input and output VAs from the CS control block.
         let input_va = cs_control.read(STREAM_INPUT_VA).value().get();
-        let cs_input = FwInterface::<CS_KERNEL_INPUT_BLOCK_SIZE>::new(
+        let cs_input = FwInterface::<FwRegion<CS_KERNEL_INPUT_BLOCK_SIZE>>::new(
             dev,
             &vmap,
             va_range,
@@ -2067,7 +2101,7 @@ impl CsInterface {
         )?;
 
         let output_va = cs_control.read(STREAM_OUTPUT_VA).value().get();
-        let cs_output = FwInterface::<CS_KERNEL_OUTPUT_BLOCK_SIZE>::new(
+        let cs_output = FwInterface::<FwRegion<CS_KERNEL_OUTPUT_BLOCK_SIZE>>::new(
             dev,
             &vmap,
             va_range,

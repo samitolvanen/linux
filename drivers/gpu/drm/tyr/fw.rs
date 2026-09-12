@@ -80,6 +80,7 @@ use crate::{
 mod interfaces;
 pub(crate) mod irq;
 mod parser;
+mod region;
 
 /// Maximum number of CSG interfaces supported by hardware.
 const MAX_CSG: usize = 16;
