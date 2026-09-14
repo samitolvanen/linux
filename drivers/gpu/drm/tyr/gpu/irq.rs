@@ -83,7 +83,7 @@ pub(crate) unsafe fn gpu_irq_init<'drm>(
         .write_reg(gpu_control::GPU_IRQ_MASK::from_raw(0));
 
     // SAFETY: The caller guarantees that the registration is not leaked.
-    Ok(unsafe { TyrIrq::request(pdev, tdev, c"gpu", iomem, GpuIrq) })
+    Ok(unsafe { TyrIrq::request(pdev, tdev, c"gpu", c"gpu", iomem, GpuIrq) })
 }
 
 impl TyrIrqTrait for GpuIrq {
