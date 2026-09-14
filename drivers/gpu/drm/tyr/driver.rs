@@ -102,6 +102,7 @@ use crate::{
             GpuIrq, //
         },
         GpuInfo,
+        HwOps,
         SocData, //
     },
     irq::{
@@ -226,6 +227,8 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Per-SoC match data selected by the device-tree compatible.
     pub(crate) soc_data: SocData,
+
+    pub(crate) hw_ops: HwOps,
 
     /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
     /// at unbind. It sits on the device because a file release can terminate
@@ -949,12 +952,13 @@ impl platform::Driver for TyrPlatformDriver {
             let coherency = gpu::select_coherency(pdev.as_ref(), io, coherent)?;
             let soc_data = info.copied().unwrap_or_default();
 
-            gpu::reset(pdev.as_ref(), io, coherency, soc_data)?;
+            let hw_ops = HwOps::bind(io)?;
+            hw_ops.reset(pdev.as_ref(), io, coherency, soc_data)?;
 
             let power_iomem = iomem.clone();
             let power_guard = ScopeGuard::new(move || {
                 if let Ok(io) = power_iomem.access(pdev.as_ref()) {
-                    let _ = gpu::l2_power_off(pdev.as_ref(), io);
+                    let _ = hw_ops.l2_power_off(pdev.as_ref(), io);
                 }
             });
 
@@ -993,6 +997,7 @@ impl platform::Driver for TyrPlatformDriver {
                     coherent,
                     coherency,
                     soc_data,
+                    hw_ops,
                     term_wq,
                     heap_alloc_wq,
                     sched <- new_mutex!(SchedulerState::Disabled),
@@ -1040,7 +1045,7 @@ impl platform::Driver for TyrPlatformDriver {
             let hw_guard = ScopeGuard::new(|| {
                 firmware.stop_mcu();
                 mmu.suspend();
-                let _ = gpu::l2_power_off(pdev.as_ref(), io);
+                let _ = hw_ops.l2_power_off(pdev.as_ref(), io);
                 mmu::unbind(&mmu);
                 unreg_dev.unbind_dead_mappings();
             });
