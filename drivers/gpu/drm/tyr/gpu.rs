@@ -320,6 +320,16 @@ pub(crate) fn select_coherency(
     }
 }
 
+/// Per-SoC match data attached to a device-tree `compatible`.
+///
+/// The ASN hash must be reprogrammed each time the L2 block powers up.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SocData {
+    /// Custom L2 ASN hash to program before L2 power-up, or `None` to keep
+    /// the hardware default.
+    pub(crate) asn_hash: Option<[u32; 3]>,
+}
+
 /// Timeout for an L2 power transition to complete.
 const L2_TRANSITION_TIMEOUT: Delta = Delta::from_millis(20);
 
@@ -346,10 +356,38 @@ pub(crate) fn l2_power_off(dev: &Device, io: &IoMem<'_>) -> Result {
     Ok(())
 }
 
+/// Programs the custom L2 ASN hash before the L2 block powers up.
+///
+/// A no-op when the device tree supplies no hash. The hash needs
+/// architecture 11 or newer, so on older cores it is logged and skipped
+/// while the L2 still powers up.
+fn l2_config_set(dev: &Device, io: &IoMem<'_>, soc_data: SocData) {
+    let Some(asn_hash) = soc_data.asn_hash else {
+        return;
+    };
+
+    if io.read(GPU_ID).arch_major().get() < 11 {
+        dev_err!(dev, "Custom ASN hash not supported by the device\n");
+        return;
+    }
+
+    io.write(GPU_ASN_HASH::at(0), GPU_ASN_HASH::from_raw(asn_hash[0]));
+    io.write(GPU_ASN_HASH::at(1), GPU_ASN_HASH::from_raw(asn_hash[1]));
+    io.write(GPU_ASN_HASH::at(2), GPU_ASN_HASH::from_raw(asn_hash[2]));
+
+    io.write_reg(io.read(L2_CONFIG).with_asn_hash_enable(true));
+}
+
 /// Powers on the l2 block.
-pub(crate) fn l2_power_on(dev: &Device, io: &IoMem<'_>, coherency: CoherencyMode) -> Result {
+pub(crate) fn l2_power_on(
+    dev: &Device,
+    io: &IoMem<'_>,
+    coherency: CoherencyMode,
+    soc_data: SocData,
+) -> Result {
     // The coherency protocol must be selected before the L2 powers up.
     io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(coherency));
+    l2_config_set(dev, io, soc_data);
 
     l2_wait_transition(io).inspect_err(|_| dev_err!(dev, "Failed to power on the GPU.\n"))?;
 
@@ -387,9 +425,14 @@ fn soft_reset(dev: &Device, io: &IoMem<'_>) -> Result {
 /// Runs one synchronous GPU reset pass.
 ///
 /// On success, the GPU is left in a state suitable for reinitialization.
-pub(crate) fn reset(dev: &Device, io: &IoMem<'_>, coherency: CoherencyMode) -> Result {
+pub(crate) fn reset(
+    dev: &Device,
+    io: &IoMem<'_>,
+    coherency: CoherencyMode,
+    soc_data: SocData,
+) -> Result {
     soft_reset(dev, io)?;
-    l2_power_on(dev, io, coherency)?;
+    l2_power_on(dev, io, coherency, soc_data)?;
     Ok(())
 }
 
@@ -404,7 +447,8 @@ pub(crate) fn resume(
     reg_data: &TyrDrmRegistrationData<'_>,
     io: &IoMem<'_>,
     coherency: CoherencyMode,
+    soc_data: SocData,
 ) -> Result {
     unquiesce(&reg_data.gpu_irq, io, irq::gpu_irq_enable);
-    l2_power_on(reg_data.pdev.as_ref(), io, coherency)
+    l2_power_on(reg_data.pdev.as_ref(), io, coherency, soc_data)
 }
