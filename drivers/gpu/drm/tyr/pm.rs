@@ -67,7 +67,7 @@ pub(crate) struct TyrPmPayload {
 /// Powers the hardware components down for runtime suspend, the reverse
 /// of `resume_hw_components`. Shared by runtime suspend and the
 /// resume-failure unwind. The caller gates the clocks afterward.
-fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
+fn suspend_hw_components(tdev: &TyrDrmDevice, reg_data: &TyrDrmRegistrationData<'_>) {
     let Ok(io) = reg_data.iomem.access(reg_data.pdev.as_ref()) else {
         dev_err!(
             reg_data.pdev,
@@ -82,7 +82,7 @@ fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
     // user slots while still clocked so teardown hits no gated MMIO.
     mmu::suspend(reg_data, io);
 
-    gpu::suspend(reg_data, io);
+    gpu::suspend(tdev, reg_data, io);
 }
 
 /// Brings the hardware components up for runtime resume, the reverse of
@@ -94,7 +94,7 @@ fn resume_hw_components(
 ) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
-    gpu::resume(reg_data, io, tdev.coherency, tdev.soc_data)?;
+    gpu::resume(tdev, reg_data, io)?;
     mmu::resume(reg_data, io);
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     if reload {
@@ -135,7 +135,7 @@ fn fail_resume(
     e: Error,
 ) -> Error {
     let e = latch_resume_failure(tdev, reg_data, e);
-    suspend_hw_components(reg_data);
+    suspend_hw_components(tdev, reg_data);
     reg_data.clks.lock().gate();
     e
 }
@@ -155,7 +155,7 @@ fn quiesce_and_suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationD
     sched::tick::suspend(tdev, reg_data);
     // Drain any worker that raced the gate before halting the hardware.
     tdev.drain_sched_work();
-    suspend_hw_components(reg_data);
+    suspend_hw_components(tdev, reg_data);
 }
 
 /// Powers the GPU down for runtime suspend.
