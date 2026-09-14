@@ -157,7 +157,7 @@ pub(crate) unsafe fn job_irq_init<'drm>(
     };
 
     // SAFETY: The caller guarantees that the registration is not leaked.
-    Ok(unsafe { TyrIrq::request(pdev, tdev, c"job", iomem, job_irq) })
+    Ok(unsafe { TyrIrq::request(pdev, tdev, c"job", c"job", iomem, job_irq) })
 }
 
 impl TyrIrqTrait for JobIrq<'_> {
