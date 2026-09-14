@@ -85,7 +85,7 @@ fn suspend_hw_components(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistratio
     // user slots while still clocked so teardown hits no gated MMIO.
     mmu::suspend(reg_data, io);
 
-    if gpu::suspend(reg_data, io).is_ok() && reg_data.mmu.flush_owed.xchg(false, Relaxed) {
+    if gpu::suspend(tdev, reg_data, io).is_ok() && reg_data.mmu.flush_owed.xchg(false, Relaxed) {
         TyrDrmDeviceData::schedule_dead_mappings(tdev);
     }
 }
@@ -99,7 +99,7 @@ fn resume_hw_components(
 ) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
-    gpu::resume(reg_data, io, tdev.coherency, tdev.soc_data)?;
+    gpu::resume(tdev, reg_data, io)?;
     mmu::resume(reg_data, io, !tdev.is_unusable());
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     if reload {
