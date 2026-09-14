@@ -848,7 +848,7 @@ impl platform::Driver for TyrPlatformDriver {
             }
         });
 
-        let gpu_info = GpuInfo::new(io, coherency);
+        let gpu_info = GpuInfo::new(pdev.as_ref(), io, coherency)?;
         gpu_info.log(pdev.as_ref());
         gpu_info.check_l2_line_size(pdev.as_ref())?;
 
