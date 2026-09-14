@@ -76,7 +76,8 @@ impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
     pub(crate) unsafe fn request(
         pdev: &'drm platform::Device<Bound>,
         tdev: ARef<TyrDrmDevice>,
-        name: &'static CStr,
+        irq_name: &'static CStr,
+        devname: &'static CStr,
         iomem: Arc<DevresIoMem<SZ_2M>>,
         irq: T,
     ) -> impl PinInit<ThreadedRegistration<'drm, Self>, Error> + 'drm
@@ -95,7 +96,7 @@ impl<'drm, T: TyrIrqTrait> TyrIrq<'drm, T> {
         });
 
         // SAFETY: The caller guarantees that the registration is not leaked.
-        unsafe { pdev.request_threaded_irq_by_name(Flags::SHARED, name, name, handler) }
+        unsafe { pdev.request_threaded_irq_by_name(Flags::SHARED, irq_name, devname, handler) }
     }
 
     fn set_suspended(&self, suspended: bool) {
