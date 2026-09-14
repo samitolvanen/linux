@@ -98,7 +98,8 @@ use crate::{
             gpu_irq_init,
             GpuIrq, //
         },
-        GpuInfo, //
+        GpuInfo,
+        SocData, //
     },
     irq::{
         unquiesce,
@@ -199,6 +200,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// when `coherent` is false, since a coherent device whose GPU lacks
     /// ACE-Lite support fails to probe.
     pub(crate) coherency: CoherencyMode,
+
+    /// Per-SoC match data selected by the device-tree compatible.
+    pub(crate) soc_data: SocData,
 
     /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
     /// at unbind. It sits on the device because a file release can terminate
@@ -778,8 +782,20 @@ kernel::of_device_table!(
     OF_TABLE,
     <TyrPlatformDriver as platform::Driver>::IdInfo,
     [
-        (of::DeviceId::new(c"rockchip,rk3588-mali"), ()),
-        (of::DeviceId::new(c"arm,mali-valhall-csf"), ())
+        (
+            of::DeviceId::new(c"mediatek,mt8196-mali"),
+            SocData {
+                asn_hash: Some([0xb, 0xe, 0x0]),
+            }
+        ),
+        (
+            of::DeviceId::new(c"rockchip,rk3588-mali"),
+            SocData { asn_hash: None }
+        ),
+        (
+            of::DeviceId::new(c"arm,mali-valhall-csf"),
+            SocData { asn_hash: None }
+        )
     ]
 );
 
@@ -787,7 +803,7 @@ static PM_OPS: pm::DevPMOps<platform::Adapter<TyrPlatformDriver>, TyrPmOps> =
     pm::DevPMOps::for_driver();
 
 impl platform::Driver for TyrPlatformDriver {
-    type IdInfo = ();
+    type IdInfo = SocData;
     type Data<'bound> = TyrPlatformDriverData<'bound>;
     type PmOps = TyrPmOps;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
@@ -798,7 +814,7 @@ impl platform::Driver for TyrPlatformDriver {
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
+        info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let core_clk = Clk::get(pdev.as_ref(), None)?;
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
@@ -826,8 +842,9 @@ impl platform::Driver for TyrPlatformDriver {
 
         let coherent = pdev.as_ref().dma_coherent();
         let coherency = gpu::select_coherency(pdev.as_ref(), io, coherent)?;
+        let soc_data = info.copied().unwrap_or_default();
 
-        gpu::reset(pdev.as_ref(), io, coherency)?;
+        gpu::reset(pdev.as_ref(), io, coherency, soc_data)?;
 
         // Declared before the firmware, so a failed probe stops the MCU
         // before the guard powers the L2 off.
@@ -872,6 +889,7 @@ impl platform::Driver for TyrPlatformDriver {
                 mmio_phys_addr,
                 coherent,
                 coherency,
+                soc_data,
                 term_wq,
                 heap_alloc_wq,
                 sched <- new_mutex!(SchedulerState::Disabled),
