@@ -94,7 +94,7 @@ fn resume_hw_components(
 ) -> Result {
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
-    gpu::resume(reg_data, io, tdev.coherency)?;
+    gpu::resume(reg_data, io, tdev.coherency, tdev.soc_data)?;
     mmu::resume(reg_data, io);
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     if reload {
