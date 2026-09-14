@@ -156,7 +156,7 @@ pub(crate) unsafe fn mmu_irq_init<'drm>(
         .write_reg(mmu_control::IRQ_MASK::from_raw(0));
 
     // SAFETY: The caller guarantees that the registration is not leaked.
-    Ok(unsafe { TyrIrq::request(pdev, tdev, c"mmu", iomem, MmuIrq { fault_mask }) })
+    Ok(unsafe { TyrIrq::request(pdev, tdev, c"mmu", c"mmu", iomem, MmuIrq { fault_mask }) })
 }
 
 impl TyrIrqTrait for MmuIrq {
