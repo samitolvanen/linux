@@ -26,6 +26,7 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
+        TyrDrmDevice,
         TyrDrmRegistrationData, //
     },
     heap,
@@ -330,6 +331,64 @@ pub(crate) struct SocData {
     pub(crate) asn_hash: Option<[u32; 3]>,
 }
 
+/// Hardware operations selected by GPU architecture major.
+///
+/// Bound once at probe and dispatched at reset and L2 power transitions.
+#[derive(Clone, Copy)]
+pub(crate) enum HwOps {
+    /// Architectures 10 through 13.
+    V10,
+}
+
+impl HwOps {
+    /// Selects the operations for the GPU behind `io`.
+    pub(crate) fn bind(io: &IoMem<'_>) -> Result<Self> {
+        match io.read(GPU_ID).arch_major().get() {
+            10..=13 => Ok(Self::V10),
+            _ => Err(EOPNOTSUPP),
+        }
+    }
+
+    fn soft_reset(self, dev: &Device, io: &IoMem<'_>) -> Result {
+        match self {
+            Self::V10 => soft_reset(dev, io),
+        }
+    }
+
+    pub(crate) fn l2_power_off(self, dev: &Device, io: &IoMem<'_>) -> Result {
+        match self {
+            Self::V10 => l2_power_off(dev, io),
+        }
+    }
+
+    fn l2_power_on(
+        self,
+        dev: &Device,
+        io: &IoMem<'_>,
+        coherency: CoherencyMode,
+        soc_data: SocData,
+    ) -> Result {
+        match self {
+            Self::V10 => l2_power_on(dev, io, coherency, soc_data),
+        }
+    }
+
+    /// Runs one synchronous GPU reset pass.
+    ///
+    /// On success, the GPU is left in a state suitable for reinitialization.
+    pub(crate) fn reset(
+        self,
+        dev: &Device,
+        io: &IoMem<'_>,
+        coherency: CoherencyMode,
+        soc_data: SocData,
+    ) -> Result {
+        self.soft_reset(dev, io)?;
+        self.l2_power_on(dev, io, coherency, soc_data)?;
+        Ok(())
+    }
+}
+
 /// Timeout for an L2 power transition to complete.
 const L2_TRANSITION_TIMEOUT: Delta = Delta::from_millis(20);
 
@@ -346,7 +405,7 @@ fn l2_wait_transition(io: &IoMem<'_>) -> Result {
 }
 
 /// Powers off the L2 block.
-pub(crate) fn l2_power_off(dev: &Device, io: &IoMem<'_>) -> Result {
+fn l2_power_off(dev: &Device, io: &IoMem<'_>) -> Result {
     l2_wait_transition(io).inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
 
     io.write_reg(L2_PWROFF_LO::zeroed().with_const_request::<1>());
@@ -379,7 +438,7 @@ fn l2_config_set(dev: &Device, io: &IoMem<'_>, soc_data: SocData) {
 }
 
 /// Powers on the l2 block.
-pub(crate) fn l2_power_on(
+fn l2_power_on(
     dev: &Device,
     io: &IoMem<'_>,
     coherency: CoherencyMode,
@@ -422,33 +481,19 @@ fn soft_reset(dev: &Device, io: &IoMem<'_>) -> Result {
     Ok(())
 }
 
-/// Runs one synchronous GPU reset pass.
-///
-/// On success, the GPU is left in a state suitable for reinitialization.
-pub(crate) fn reset(
-    dev: &Device,
-    io: &IoMem<'_>,
-    coherency: CoherencyMode,
-    soc_data: SocData,
-) -> Result {
-    soft_reset(dev, io)?;
-    l2_power_on(dev, io, coherency, soc_data)?;
-    Ok(())
-}
-
 /// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
-pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
+pub(crate) fn suspend(tdev: &TyrDrmDevice, reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
     quiesce(&reg_data.gpu_irq, io, irq::gpu_irq_disable);
-    let _ = l2_power_off(reg_data.pdev.as_ref(), io);
+    let _ = tdev.hw_ops.l2_power_off(reg_data.pdev.as_ref(), io);
 }
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
 pub(crate) fn resume(
+    tdev: &TyrDrmDevice,
     reg_data: &TyrDrmRegistrationData<'_>,
     io: &IoMem<'_>,
-    coherency: CoherencyMode,
-    soc_data: SocData,
 ) -> Result {
     unquiesce(&reg_data.gpu_irq, io, irq::gpu_irq_enable);
-    l2_power_on(reg_data.pdev.as_ref(), io, coherency, soc_data)
+    tdev.hw_ops
+        .l2_power_on(reg_data.pdev.as_ref(), io, tdev.coherency, tdev.soc_data)
 }
