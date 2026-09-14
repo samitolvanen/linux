@@ -106,6 +106,7 @@ use crate::{
             GpuIrq, //
         },
         GpuInfo,
+        HwOps,
         SocData, //
     },
     irq::{
@@ -245,6 +246,9 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Per-SoC match data selected by the device-tree compatible.
     pub(crate) soc_data: SocData,
+
+    /// Hardware operations selected at probe from the architecture major.
+    pub(crate) hw_ops: HwOps,
 
     /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
     /// at unbind. It sits on the device because a file release can terminate
@@ -925,12 +929,13 @@ impl platform::Driver for TyrPlatformDriver {
             let coherency = gpu::select_coherency(pdev.as_ref(), io, coherent)?;
             let soc_data = info.copied().unwrap_or_default();
 
-            gpu::reset(pdev.as_ref(), io, coherency, soc_data)?;
+            let hw_ops = HwOps::bind(io)?;
+            hw_ops.reset(pdev.as_ref(), io, coherency, soc_data)?;
 
             let power_iomem = iomem.clone();
             let power_guard = ScopeGuard::new(move || {
                 if let Ok(io) = power_iomem.access(pdev.as_ref()) {
-                    let _ = gpu::l2_power_off(pdev.as_ref(), io);
+                    let _ = hw_ops.l2_power_off(pdev.as_ref(), io);
                 }
             });
 
@@ -970,6 +975,7 @@ impl platform::Driver for TyrPlatformDriver {
                     coherent,
                     coherency,
                     soc_data,
+                    hw_ops,
                     term_wq,
                     heap_alloc_wq,
                     sched <- new_mutex!(SchedulerState::Disabled),
@@ -1017,7 +1023,7 @@ impl platform::Driver for TyrPlatformDriver {
             // Declared after the firmware, so a failed probe halts the GPU
             // before the firmware and the MMU drop.
             let hw_guard =
-                ScopeGuard::new(|| halt_failed_probe(pdev.as_ref(), io, &firmware, &mmu));
+                ScopeGuard::new(|| halt_failed_probe(pdev.as_ref(), io, hw_ops, &firmware, &mmu));
             power_guard.dismiss();
 
             // SAFETY: The registration is owned by `gpu_irq` and then by
@@ -1191,16 +1197,28 @@ impl PinnedDrop for TyrDrmRegistrationData<'_> {
             return;
         }
         if let Ok(io) = self.iomem.access(self.pdev.as_ref()) {
-            halt_failed_probe(self.pdev.as_ref(), io, &self.fw, &self.mmu);
+            halt_failed_probe(
+                self.pdev.as_ref(),
+                io,
+                self.tdev.hw_ops,
+                &self.fw,
+                &self.mmu,
+            );
         }
     }
 }
 
 /// Halts the GPU after a failed probe, before the firmware and the MMU drop.
-fn halt_failed_probe(dev: &device::Device, io: &IoMem<'_>, fw: &Firmware<'_>, mmu: &Mmu) {
+fn halt_failed_probe(
+    dev: &device::Device,
+    io: &IoMem<'_>,
+    hw_ops: HwOps,
+    fw: &Firmware<'_>,
+    mmu: &Mmu,
+) {
     fw.stop_mcu();
     mmu.suspend();
-    let _ = gpu::l2_power_off(dev, io);
+    let _ = hw_ops.l2_power_off(dev, io);
     mmu::unbind(mmu);
 }
 
