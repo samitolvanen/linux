@@ -16,6 +16,7 @@ use kernel::{
         register::Array,
         Io, //
     },
+    nvmem,
     prelude::*,
     time::Delta,
     transmute::AsBytes,
@@ -106,9 +107,33 @@ unsafe impl AsBytes for CsifInfo {}
 #[derive(Clone, Copy)]
 pub(crate) struct GpuInfo(pub(crate) uapi::drm_panthor_gpu_info);
 
+/// Returns the shader-present override from the `shader-present` NVMEM cell,
+/// or `shader_present` when the board has no such cell.
+fn override_shader_present(dev: &Device<Bound>, shader_present: u64) -> Result<u64> {
+    match nvmem::read_variable_le_u64(dev, c"shader-present") {
+        Err(e) if e == ENOENT => Ok(shader_present),
+        result => result,
+    }
+}
+
 impl GpuInfo {
-    pub(crate) fn new(io: &IoMem<'_>, coherency: CoherencyMode) -> Self {
-        Self(uapi::drm_panthor_gpu_info {
+    pub(crate) fn new(
+        dev: &Device<Bound>,
+        io: &IoMem<'_>,
+        coherency: CoherencyMode,
+    ) -> Result<Self> {
+        let shader_present = join_u64(
+            io.read(SHADER_PRESENT_LO).into_raw(),
+            io.read(SHADER_PRESENT_HI).into_raw(),
+        );
+
+        let shader_present = override_shader_present(dev, shader_present).inspect_err(|e| {
+            if *e != EPROBE_DEFER {
+                dev_err!(dev, "Failed to read shader-present nvmem cell: {:?}\n", e);
+            }
+        })?;
+
+        Ok(Self(uapi::drm_panthor_gpu_info {
             gpu_id: io.read(GPU_ID).into_raw(),
             gpu_rev: io.read(REVIDR).into_raw(),
             csf_id: io.read(CSF_ID).into_raw(),
@@ -129,10 +154,7 @@ impl GpuInfo {
             ],
             as_present: io.read(AS_PRESENT).into_raw(),
             selected_coherency: coherency as u32,
-            shader_present: join_u64(
-                io.read(SHADER_PRESENT_LO).into_raw(),
-                io.read(SHADER_PRESENT_HI).into_raw(),
-            ),
+            shader_present,
             l2_present: join_u64(
                 io.read(L2_PRESENT_LO).into_raw(),
                 io.read(L2_PRESENT_HI).into_raw(),
@@ -148,7 +170,7 @@ impl GpuInfo {
                 io.read(GPU_FEATURES_LO).into_raw(),
                 io.read(GPU_FEATURES_HI).into_raw(),
             ),
-        })
+        }))
     }
 
     pub(crate) fn log(&self, dev: &Device<Bound>) {
