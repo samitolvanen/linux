@@ -9,7 +9,13 @@ use kernel::{
         capable,
         Capability, //
     },
-    dma_buf::dma_fence::PublicDmaFence,
+    dma_buf::dma_fence::{
+        impl_has_dma_fence_work,
+        new_dma_fence_work,
+        DmaFenceWork,
+        DmaFenceWorkItem,
+        PublicDmaFence, //
+    },
     dma_buf::DmaResvUsage,
     drm::gem::BaseObject,
     io::Io,
@@ -40,7 +46,6 @@ use kernel::{
     uaccess::UserSlice,
     uapi,
     workqueue::{
-        self,
         impl_has_work,
         new_work,
         Work,
@@ -49,6 +54,7 @@ use kernel::{
 };
 
 use crate::{
+    cleanup,
     driver::{
         TyrDrmDevice,
         TyrDrmDeviceData, //
@@ -288,17 +294,17 @@ pub(crate) struct Group {
     /// * On file close, `TyrDrmFileData`'s `PinnedDrop` empties the
     ///   per-file `group::Pool`, releasing the pool's
     ///   `Arc<Group>` references.
-    /// * The tick and `term_work` paths drain any in-flight
-    ///   `Arc<Group>` references they still hold to completion before
-    ///   the file's last reference is released.
+    /// * `Group::schedule_term` takes a reference for `term_work`,
+    ///   which hands it to `release_work` for the drop on the cleanup
+    ///   workqueue.
     /// * Platform unbind flushes `heap_alloc_wq` after quiescing the
     ///   workers that enqueue on it, so no queued `tiler_oom_work`
     ///   holds an `Arc<Group>` past unbind.
     ///
-    /// By the time the device's final `ARef`
-    /// drops on driver detach or last file close, every `Arc<Group>`
-    /// reference has already reached zero, so the cycle does not pin
-    /// the device.
+    /// No path waits on the device to release a group, so the cycle does
+    /// not pin the device. The last `Arc<Group>` drop can land on the
+    /// cleanup workqueue, after the file has closed and the driver has
+    /// unbound.
     pub(crate) tdev: ARef<TyrDrmDevice>,
     /// CSG slot manager seat for this group.
     ///
@@ -315,21 +321,34 @@ pub(crate) struct Group {
     /// per-queue state inside each `Queue` uses interior mutability so
     /// callers do not need the group's `inner` lock to operate on it.
     pub(crate) queues: KVec<Queue>,
-    /// Worker that drives `Group::cancel_queues` off
-    /// `system_unbound()`.
+    /// Worker that drives `Group::cancel_queues` on the device's
+    /// `term_wq`.
     ///
     /// Enqueued by `Group::schedule_term` when the tick lifecycle
     /// evicts a group whose `can_run()` is false (fatal error, user
-    /// destroy, timeout). The body does not carry an outer
-    /// `Arc<Group>` reference. The per-fence signalling inside the
-    /// body opens its own local annotation per signal call,
-    /// satisfying the dma-fence signalling-section rules.
+    /// destroy, timeout). The body runs inside the dma-fence
+    /// signalling annotation and ends by handing its `Arc<Group>` to
+    /// `release_work`.
     #[pin]
-    term_work: Work<Group, 1>,
+    term_work: DmaFenceWork<Group, 1>,
     /// Worker that services this group's pending tiler OOMs on the
     /// device's `heap_alloc_wq`.
     #[pin]
     tiler_oom_work: Work<Group, 2>,
+    /// Worker that drops the reference `term_work` ran with, on the
+    /// cleanup workqueue.
+    ///
+    /// The drop may be the group's last. Unmapping its buffers takes
+    /// `dma_resv_lock` and allocates with `GFP_KERNEL`. Neither is
+    /// allowed inside the signalling annotation. Every queue was
+    /// drained by `term_work`, so the `cancel_all()` in
+    /// `JobQueue::drop` signals nothing here.
+    ///
+    /// The item is embedded in the group, so the enqueue allocates
+    /// nothing and has no `NoMemory` case to handle, unlike
+    /// `cleanup::try_spawn_owned`.
+    #[pin]
+    release_work: Work<Group, 3>,
     #[pin]
     pub(crate) links: ListLinks,
     #[pin]
@@ -513,8 +532,9 @@ impl Group {
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
-                term_work <- new_work!("tyr-group-term"),
+                term_work <- new_dma_fence_work!("tyr-group-term"),
                 tiler_oom_work <- new_work!("tyr-group-tiler-oom"),
+                release_work <- new_work!("tyr-group-release"),
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
                 wait_links <- ListLinks::new(),
@@ -610,12 +630,10 @@ impl Group {
     /// Schedules terminal cleanup for the group.
     ///
     /// Called by the tick lifecycle for groups whose `can_run()` is
-    /// false at eviction time. Enqueues
-    /// `term_work` on the global
-    /// `system_unbound()` queue; the owning `Arc<Group>` is held by
-    /// the workqueue for the duration of the worker's run, so the
-    /// suspend buffers and syncobj pages stay live until cancellation
-    /// has completed.
+    /// false at eviction time. Enqueues `term_work` on the device's
+    /// `term_wq`. The workqueue holds the `Arc<Group>` for the duration
+    /// of the worker's run, so the suspend buffers and syncobj pages
+    /// stay live until cancellation has completed.
     ///
     /// Idempotent: a group can be reached by more than one teardown
     /// path (e.g. a destroy-of-unbound that calls `schedule_term`
@@ -631,7 +649,28 @@ impl Group {
         if already_scheduled {
             return;
         }
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 1>(self.clone());
+        // The latch makes this the only enqueue of `term_work`, so it
+        // cannot find the item pending. `self` keeps the group alive, so
+        // dropping the clone returned in the error is not the group's
+        // last drop.
+        if self
+            .tdev
+            .term_wq
+            .enqueue::<Arc<Self>, 1>(self.clone())
+            .is_err()
+        {
+            pr_err!("Failed to enqueue group term_work\n");
+        }
+    }
+
+    /// Leaks `group` after a failed enqueue of `release_work`.
+    ///
+    /// The failure is not expected. The enqueue runs inside the
+    /// signalling annotation. A drop there may be the group's last, and
+    /// that drop unmaps its buffers under `dma_resv_lock`.
+    fn leak_on_release_enqueue_failure(group: Arc<Self>) {
+        pr_err!("Failed to enqueue group release_work, leaking the group\n");
+        core::mem::forget(group);
     }
 
     /// Schedules the group's tiler OOM worker. Safe from any context.
@@ -1044,16 +1083,22 @@ impl deps::BatchOps for SubmitOps {
     }
 }
 
-impl_has_work! {
-    impl HasWork<Group, 1> for Group {
+impl_has_dma_fence_work! {
+    impl HasDmaFenceWork<Group, 1> for Group {
         self.term_work
-    }
-    impl HasWork<Group, 2> for Group {
-        self.tiler_oom_work
     }
 }
 
-impl WorkItem<1> for Group {
+impl_has_work! {
+    impl HasWork<Group, 2> for Group {
+        self.tiler_oom_work
+    }
+    impl HasWork<Group, 3> for Group {
+        self.release_work
+    }
+}
+
+impl DmaFenceWorkItem<1> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
@@ -1064,6 +1109,20 @@ impl WorkItem<1> for Group {
             .with_locked_inner(|inner| inner.fatal_error)
             .unwrap_or(ECANCELED);
         this.cancel_queues(err);
+
+        // The `term_scheduled` latch makes this the only enqueue of
+        // `release_work`, so it cannot find the item pending.
+        if let Err(group) = cleanup::enqueue::<Arc<Self>, 3>(this) {
+            Self::leak_on_release_enqueue_failure(group);
+        }
+    }
+}
+
+impl WorkItem<3> for Group {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Self::Pointer) {
+        drop(this);
     }
 }
 
