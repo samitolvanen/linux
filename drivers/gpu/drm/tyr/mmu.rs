@@ -19,7 +19,10 @@ use kernel::{
     new_mutex,
     platform,
     prelude::*,
-    sizes::SZ_2M,
+    sizes::{
+        SZ_2M,
+        SZ_4K, //
+    },
     sync::{
         Arc,
         ArcBorrow,
@@ -67,6 +70,9 @@ pub(crate) type AsSlotManager = SlotManager<AddressSpaceManager, MAX_AS>;
 
 /// Largest VA_BITS value that TRANSCFG.INA_BITS can encode.
 const MAX_VA_BITS: u32 = 48;
+
+/// Page sizes the GPU MMU can map, as an io-pgtable page size bitmap.
+pub(crate) const PAGE_SIZE_BITMAP: usize = SZ_4K | SZ_2M;
 
 /// Locked wrapper for carrying out virtual memory (VM) operations on the MMU.
 #[pin_data]
