@@ -129,10 +129,12 @@ pub(crate) fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Res
 /// or `bo_offset` is not GPU-page-aligned, if `[va, va + size)` falls outside
 /// the VM's user VA range, and for `MAP` ops if `bo_handle` is invalid, if
 /// `bo_offset + size` is out of bounds for the target BO, or if the BO is
-/// exclusive to a VM other than `vm`.
+/// exclusive to a VM other than `vm`. A `MAP_SPARSE` op must carry no BO
+/// handle and no BO offset, and must be non-executable.
 ///
-/// For `MAP` ops, returns the looked-up `Bo` so the caller can perform the
-/// bind against the same BO that was validated, avoiding a TOCTOU window.
+/// For `MAP` ops, returns the `Bo` to bind: the object the handle names, or
+/// the VM's sparse backing object. The caller binds against the same BO that
+/// was validated, avoiding a TOCTOU window.
 fn validate_bind_op(
     op: &VmBindOp,
     file: &TyrDrmFile,
@@ -150,6 +152,19 @@ fn validate_bind_op(
     if op.0.flags as i32 & type_mask
         == uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MAP
     {
+        let sparse_flag =
+            uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_SPARSE as u32;
+        let noexec_flag =
+            uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC as u32;
+
+        if op.0.flags & sparse_flag != 0 {
+            if op.0.bo_handle != 0 || op.0.bo_offset != 0 || op.0.flags & noexec_flag == 0 {
+                return Err(EINVAL);
+            }
+
+            return Ok(Some(vm.sparse_bo().ok_or(EINVAL)?.into()));
+        }
+
         let bo = gem::lookup_handle(file, op.0.bo_handle).map_err(|_| EINVAL)?;
         let bo_size = bo.size() as u64;
         // Check size first to avoid underflow in the subtraction.
@@ -192,7 +207,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
 
         KBox::try_pin_init(
             try_pin_init!(Self {
-                vm_pool: vm::Pool::create()?,
+                vm_pool: vm::Pool::create(dev)?,
                 group_pool: group::Pool::create()?,
                 user_mmio_offset: Atomic::new(user_mmio_offset),
                 tdev,
@@ -539,7 +554,8 @@ impl TyrDrmFileData {
                 let map_flags =
                     (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
                         | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
-                        | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
+                        | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED
+                        | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_SPARSE)
                         as u32;
 
                 if op.0.syncs.count != 0 || op.0.syncs.array != 0 {
@@ -1001,7 +1017,8 @@ impl VmBindOp {
         let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
         let map_flags = (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
             | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
-            | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
+            | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED
+            | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_SPARSE)
             as u32;
         let mut syncs = KVec::new();
 

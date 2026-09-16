@@ -146,12 +146,15 @@ const MAX_VMS_PER_POOL: u32 = 32;
 
 pub(crate) struct Pool {
     entries: ObjectPool<Vm>,
+    /// Buffer object that backs the sparse mappings of every VM in this pool.
+    sparse_bo: ARef<Bo>,
 }
 
 impl Pool {
-    pub(crate) fn create() -> Result<Self> {
+    pub(crate) fn create(ddev: &TyrDrmDevice) -> Result<Self> {
         Ok(Self {
             entries: ObjectPool::create(MAX_VMS_PER_POOL)?,
+            sparse_bo: gem::new_sparse_bo(ddev, ddev.coherent)?,
         })
     }
 
@@ -172,6 +175,7 @@ impl Pool {
             &reg_data.gpu_info,
             kernel_range,
             reg_data.wq.clone(),
+            self.sparse_bo.clone(),
         )?;
 
         let index = self.entries.insert(vm)?;
@@ -1034,6 +1038,11 @@ pub(crate) struct Vm {
     /// Every kernel-owned BO in this VM aliases this `dma_resv`, so a
     /// fence on one blocks operations on the others.
     root_gem: ARef<Bo>,
+    /// GEM object that this VM's sparse mappings are bound over.
+    ///
+    /// A user VM can outlive the file it was created from, so it holds a
+    /// reference of its own. `None` for the firmware VM.
+    sparse_bo: Option<ARef<Bo>>,
     /// Declared last, so the device outlives the drop of every other field.
     ddev: ARef<TyrDrmDevice>,
 }
@@ -1058,6 +1067,7 @@ impl Vm {
         total_range: Range<u64>,
         kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
+        sparse_bo: Option<ARef<Bo>>,
         coherent: bool,
         fw: bool,
     ) -> Result<Arc<Vm>> {
@@ -1139,6 +1149,7 @@ impl Vm {
                 kernel_reservations <- new_mutex!(KVec::new()),
                 heap_pool <- new_mutex!(HeapPoolState::Empty),
                 root_gem: dummy_obj,
+                sparse_bo,
                 ddev: ddev.into(),
             }),
             GFP_KERNEL,
@@ -1172,6 +1183,7 @@ impl Vm {
             total_range,
             kernel_range,
             None,
+            None,
             coherent,
             true,
         )
@@ -1184,6 +1196,7 @@ impl Vm {
         gpu_info: &GpuInfo,
         kernel_range: Range<u64>,
         bind_wq: Arc<DmaFenceWorkqueue>,
+        sparse_bo: ARef<Bo>,
     ) -> Result<Arc<Vm>> {
         let total_range = 0..max_va_range(gpu_info);
 
@@ -1195,6 +1208,7 @@ impl Vm {
             total_range,
             kernel_range,
             Some(bind_wq),
+            Some(sparse_bo),
             ddev.coherent,
             false,
         )
@@ -1275,6 +1289,11 @@ impl Vm {
     /// Returns the dummy GEM object whose `dma_resv` anchors this VM.
     pub(crate) fn root_gem(&self) -> &Bo {
         &self.root_gem
+    }
+
+    /// Returns the GEM object that this VM's sparse mappings are bound over.
+    pub(crate) fn sparse_bo(&self) -> Option<&Bo> {
+        self.sparse_bo.as_deref()
     }
 
     /// Locks this VM's reservation together with those of every external
