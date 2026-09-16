@@ -28,10 +28,7 @@ use kernel::{
     num::Bounded,
     platform,
     prelude::*,
-    sizes::{
-        SZ_2M,
-        SZ_4K, //
-    },
+    sizes::SZ_2M,
     sync::{
         aref::ARef,
         atomic::{
@@ -52,7 +49,8 @@ use crate::{
     mmu::{
         irq::PageFaultMask,
         AsSlotManager,
-        Mmu, //
+        Mmu,
+        PAGE_SIZE_BITMAP, //
     },
     regs::{
         gpu_control::{
@@ -175,7 +173,7 @@ impl VmAsData {
     ) -> Result<impl pin_init::PinInit<VmAsData, Error> + 'a> {
         let pt_config = Config {
             quirks: 0,
-            pgsize_bitmap: SZ_4K | SZ_2M,
+            pgsize_bitmap: PAGE_SIZE_BITMAP,
             ias: va_bits,
             oas: pa_bits,
             coherent_walk: coherent,
