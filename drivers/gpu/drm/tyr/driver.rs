@@ -1147,9 +1147,11 @@ impl PinnedDrop for TyrPlatformDriverData<'_> {
 //       - adds DRM_IOCTL_PANTHOR_BO_QUERY_INFO ioctl
 //       - adds drm_panthor_gpu_info::selected_coherency
 // - 1.8 - extends DEV_QUERY_TIMESTAMP_INFO with flags
+// - 1.9 - adds DRM_PANTHOR_DEV_QUERY_MMU_INFO query
+//       - adds DRM_PANTHOR_VM_BIND_OP_MAP_SPARSE flag
 const INFO: drm::DriverInfo = drm::DriverInfo {
     major: 1,
-    minor: 8,
+    minor: 9,
     patchlevel: 0,
     name: c"panthor",
     desc: c"ARM Mali Tyr DRM driver",
