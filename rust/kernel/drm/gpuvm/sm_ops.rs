@@ -185,6 +185,30 @@ impl<'op, T: DriverGpuVm> OpRemap<'op, T> {
         NonNull::new(self.op.next).map(|ptr| unsafe { OpRemapMapData::from_raw(ptr) })
     }
 
+    /// Sets the GEM offset of the subsequent part of a split mapping.
+    ///
+    /// `drm_gpuvm` derives that offset by advancing the offset of the mapping being split. That
+    /// assumes the mapping addresses its object linearly. A driver that maps an object some other
+    /// way overrides the offset here, and `drm_gpuvm` stores the value without checking it.
+    /// [`OpRemap::remap`] consumes the op, so the override always precedes the insertion. Does
+    /// nothing when the split leaves no subsequent part.
+    ///
+    /// The preceding part keeps the address and the GEM offset of the mapping being split, so it
+    /// needs no counterpart.
+    #[inline]
+    pub fn set_next_gem_offset(&mut self, gem_offset: u64) {
+        let Some(next) = NonNull::new(self.op.next) else {
+            return;
+        };
+
+        // SAFETY: `next` points to a `drm_gpuva_op_map` that `drm_gpuvm` built on its stack before
+        // calling this callback, so it stays valid for the duration of the call. `self.op` borrows
+        // the `drm_gpuva_op_remap` alone, not the map it points at, and nothing else accesses that
+        // map in the meantime. Taking `&mut self` rules out a live reference handed out by
+        // `OpRemap::next`.
+        unsafe { (*next.as_ptr()).gem.offset = gem_offset };
+    }
+
     /// Indicates whether the `drm_gpuva` being removed is physically contiguous with the original
     /// mapping request.
     ///
