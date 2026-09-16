@@ -1716,11 +1716,6 @@ impl DriverGpuVm for GpuVmData {
         op: OpMap<'op, Self>,
         context: &mut Self::SmContext<'_>,
     ) -> Result<OpMapped<'op, Self>, Error> {
-        let start_iova = op.addr();
-        let mut iova = start_iova;
-        let mut bytes_left_to_map = op.length();
-        let mut gem_offset = op.gem_offset();
-
         // Make sure that the end of the requested GEM range doesn't run past the
         // end of the GEM buffer itself.
         let gem_range_end = op.gem_offset().checked_add(op.length()).ok_or(EINVAL)?;
@@ -1744,65 +1739,16 @@ impl DriverGpuVm for GpuVmData {
 
         let map_sgt = context.resources.map_sgt.as_ref().ok_or(EINVAL)?;
 
-        for &(paddr, mut sgt_entry_length) in map_sgt.iter() {
-            // Expressly convert to u64 to work with arm 32-bit builds.
-            #[allow(clippy::useless_conversion)]
-            let mut paddr = u64::from(paddr);
-
-            if bytes_left_to_map == 0 {
-                break;
-            }
-
-            if gem_offset > 0 {
-                // Skip the entire SGT entry if the gem_offset exceeds its length.
-                let skip = u64::min(sgt_entry_length, gem_offset);
-                paddr += skip;
-                sgt_entry_length -= skip;
-                gem_offset -= skip;
-            }
-
-            if sgt_entry_length == 0 {
-                continue;
-            }
-
-            let len = u64::min(sgt_entry_length, bytes_left_to_map);
-
-            let segment_mapped = match pt_map(dev, context.pt, iova, paddr, len, prot) {
-                Ok(segment_mapped) => segment_mapped,
-                Err(e) => {
-                    // clean up any successful mappings from previous SGT entries.
-                    let total_mapped = iova - start_iova;
-                    if total_mapped > 0 {
-                        let _ = pt_unmap(
-                            context.dev,
-                            context.pt,
-                            start_iova..(start_iova + total_mapped),
-                        );
-                    }
-                    self.mark_failed(context, &(start_iova..start_iova + op.length()));
-                    return Err(e);
-                }
-            };
-
-            bytes_left_to_map -= segment_mapped;
-            iova += segment_mapped;
-        }
-
-        if bytes_left_to_map != 0 {
-            let total_mapped = iova - start_iova;
-
-            if total_mapped > 0 && pt_unmap(context.dev, context.pt, start_iova..iova).is_err() {
-                self.mark_failed(context, &(start_iova..iova));
-            }
-
-            dev_err!(
-                context.dev,
-                "SG table is too small for requested mapping: {} bytes remain",
-                bytes_left_to_map
-            );
-
-            return Err(EINVAL);
-        }
+        pt_map_sgt(
+            dev,
+            context.pt,
+            op.addr(),
+            op.gem_offset(),
+            op.length(),
+            prot,
+            map_sgt,
+        )
+        .inspect_err(|_| self.mark_failed(context, &(op.addr()..op.addr() + op.length())))?;
 
         let gpuva = context.preallocated_gpuva()?;
         let op = op.insert(gpuva, GpuVaData { prot });
@@ -2035,6 +1981,83 @@ fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(DmaAddress, u
     }
 
     Ok(segments)
+}
+
+/// Maps `size` bytes of `sgt` into the page table at `iova`, starting
+/// `sgt_offset` bytes into `sgt`.
+///
+/// If a segment fails to map, the part of the range already mapped is torn
+/// down before returning.
+fn pt_map_sgt(
+    dev: &Device<Bound>,
+    page_table: &pt_alloc::DevresPageTable,
+    iova: u64,
+    sgt_offset: u64,
+    size: u64,
+    prot: u32,
+    sgt: &[(DmaAddress, u64)],
+) -> Result {
+    let start_iova = iova;
+    let mut iova = iova;
+    let mut bytes_left_to_map = size;
+    let mut sgt_offset = sgt_offset;
+
+    for &(paddr, mut sgt_entry_length) in sgt.iter() {
+        // Expressly convert to u64 to work with arm 32-bit builds.
+        #[allow(clippy::useless_conversion)]
+        let mut paddr = u64::from(paddr);
+
+        if bytes_left_to_map == 0 {
+            break;
+        }
+
+        if sgt_offset > 0 {
+            // Skip the entire SGT entry if the offset exceeds its length.
+            let skip = u64::min(sgt_entry_length, sgt_offset);
+            paddr += skip;
+            sgt_entry_length -= skip;
+            sgt_offset -= skip;
+        }
+
+        if sgt_entry_length == 0 {
+            continue;
+        }
+
+        let len = u64::min(sgt_entry_length, bytes_left_to_map);
+
+        let segment_mapped = match pt_map(dev, page_table, iova, paddr, len, prot) {
+            Ok(segment_mapped) => segment_mapped,
+            Err(e) => {
+                // clean up any successful mappings from previous SGT entries.
+                let total_mapped = iova - start_iova;
+                if total_mapped > 0 {
+                    let _ = pt_unmap(dev, page_table, start_iova..(start_iova + total_mapped));
+                }
+                return Err(e);
+            }
+        };
+
+        bytes_left_to_map -= segment_mapped;
+        iova += segment_mapped;
+    }
+
+    if bytes_left_to_map != 0 {
+        let total_mapped = iova - start_iova;
+
+        if total_mapped > 0 {
+            let _ = pt_unmap(dev, page_table, start_iova..iova);
+        }
+
+        dev_err!(
+            dev,
+            "SG table is too small for requested mapping: {} bytes remain",
+            bytes_left_to_map
+        );
+
+        return Err(EINVAL);
+    }
+
+    Ok(())
 }
 
 /// Maps a physical address range into the page table at the specified virtual address.
