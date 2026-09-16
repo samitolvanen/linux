@@ -27,7 +27,9 @@ use kernel::{
         Arc,
         ArcBorrow,
         Mutex, //
-    }, //
+    },
+    transmute::AsBytes,
+    uapi, //
 };
 
 use crate::{
@@ -73,6 +75,27 @@ const MAX_VA_BITS: u32 = 48;
 
 /// Page sizes the GPU MMU can map, as an io-pgtable page size bitmap.
 pub(crate) const PAGE_SIZE_BITMAP: usize = SZ_4K | SZ_2M;
+
+/// MMU information that can be queried by userspace.
+///
+/// # Invariants
+///
+/// - The layout of this struct is identical to the C `struct drm_panthor_mmu_info`.
+#[repr(transparent)]
+pub(crate) struct MmuInfo(uapi::drm_panthor_mmu_info);
+
+impl MmuInfo {
+    pub(crate) fn new() -> Self {
+        Self(uapi::drm_panthor_mmu_info {
+            page_size_bitmap: PAGE_SIZE_BITMAP as u64,
+        })
+    }
+}
+
+// SAFETY: `MmuInfo`'s invariant guarantees that it is the same type that is
+// already exposed to userspace by the C driver, so it fulfills the
+// requirements for `AsBytes`.
+unsafe impl AsBytes for MmuInfo {}
 
 /// Locked wrapper for carrying out virtual memory (VM) operations on the MMU.
 #[pin_data]
