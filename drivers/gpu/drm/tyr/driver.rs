@@ -191,30 +191,6 @@ pub(crate) mod work_id {
     pub(crate) const FW_PING: u64 = 5;
 }
 
-/// `Send + Sync` newtype around `OwnedQueue` so the cleanup
-/// workqueue can be shared as `Arc<CleanupQueue>` between the device
-/// and the `KernelBo`s that enqueue deferred
-/// drops on it. The wrapped `Queue` is
-/// already `Send + Sync`; this mirrors the equivalent wrapper that
-/// `DmaFenceWorkqueue` applies.
-#[repr(transparent)]
-pub(crate) struct CleanupQueue(OwnedQueue);
-
-// SAFETY: The wrapped `OwnedQueue` exposes a `Queue` which is itself
-// `Send`, and `destroy_workqueue` (run from `OwnedQueue::drop`) is
-// safe to invoke from any thread.
-unsafe impl Send for CleanupQueue {}
-// SAFETY: As for `Send`; `Queue`'s operations are documented as
-// thread-safe by the C workqueue API.
-unsafe impl Sync for CleanupQueue {}
-
-impl core::ops::Deref for CleanupQueue {
-    type Target = OwnedQueue;
-    fn deref(&self) -> &OwnedQueue {
-        &self.0
-    }
-}
-
 pub(crate) struct TyrPlatformDriverData {
     /// Devfreq registration, `None` on devices without an OPP table.
     devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
@@ -281,27 +257,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// with firmware acks under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
-    /// Per-device cleanup workqueue.
-    ///
-    /// Carries deferred drops from objects whose `Drop` would
-    /// otherwise run inside a dma-fence signalling section. The queue
-    /// is deliberately **not** a `DmaFenceWorkqueue`: its purpose
-    /// is to provide an execution context that does not hold the
-    /// `dma_fence_map` lockdep token, so the cleanup work is free to
-    /// take `dma_resv_lock`, the per-VM gpuvm mutex, and allocate
-    /// with `GFP_KERNEL`.
-    ///
-    /// Declared before `clks` so the drop-time drain still runs with the
-    /// clocks up. Probe failure takes the same drop order. After unbind the
-    /// drained unmaps reach no hardware, since devres has revoked the
-    /// mapping.
-    pub(crate) cleanup_wq: Arc<CleanupQueue>,
-
     /// Dedicated unbound workqueue for the per-group tiler OOM workers.
     /// Heap growth allocates with `GFP_KERNEL` and can block in reclaim,
     /// so these workers get their own queue rather than sharing the
-    /// system workqueues. Declared before `clks` for the same drop-order
-    /// reason as `cleanup_wq`.
+    /// system workqueues. Declared before `clks` so the drop-time drain
+    /// still runs with the clocks up.
     pub(crate) heap_alloc_wq: OwnedQueue,
 
     #[pin]
@@ -865,11 +825,6 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info, reset.clone())?;
 
-        let cleanup_wq = Arc::new(
-            CleanupQueue(Queue::new_unbound().build(c"tyr-cleanup")?),
-            GFP_KERNEL,
-        )?;
-
         let firmware = Firmware::new(
             pdev,
             iomem.clone(),
@@ -877,7 +832,6 @@ impl platform::Driver for TyrPlatformDriverData {
             mmu.as_arc_borrow(),
             &gpu_info,
             coherent,
-            cleanup_wq.clone(),
         )?;
 
         let wq = Arc::new(
@@ -910,7 +864,6 @@ impl platform::Driver for TyrPlatformDriverData {
                 fw: firmware,
                 wq,
                 sched_wq,
-                cleanup_wq,
                 heap_alloc_wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,

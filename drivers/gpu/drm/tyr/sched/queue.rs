@@ -1145,7 +1145,6 @@ impl Queue {
             queue_args.ringbuf_size() as usize,
             flags,
             tdev.coherent,
-            tdev.cleanup_wq.clone(),
         )?;
         let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
         let interfaces = Interfaces::new(iface_mem)?;
@@ -1165,7 +1164,6 @@ impl Queue {
             profiling_slot_count as usize * size_of::<super::job::JobProfilingData>(),
             flags,
             tdev.coherent,
-            tdev.cleanup_wq.clone(),
         )?;
 
         let data = Arc::pin_init(
