@@ -53,7 +53,8 @@ use crate::{
         range,
         Vm,
         VmFlag,
-        VmMapFlags, //
+        VmMapFlags,
+        SPARSE_WINDOW_SIZE, //
     },
 };
 
@@ -277,6 +278,25 @@ pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice, coherent: bool) -> Result<AR
     )?;
 
     Ok(bo)
+}
+
+/// Creates the GEM object that backs the sparse mappings of a file.
+pub(crate) fn new_sparse_bo(ddev: &TyrDrmDevice, coherent: bool) -> Result<ARef<Bo>> {
+    let flags = uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP;
+    let size = usize::try_from(SPARSE_WINDOW_SIZE).map_err(|_| EOVERFLOW)?;
+
+    Bo::new(
+        ddev,
+        size,
+        shmem::ObjectConfig {
+            map_wc: should_map_wc(coherent, flags),
+            parent_resv_obj: None,
+        },
+        BoCreateArgs {
+            flags,
+            exclusive_vm_root_gem: None,
+        },
+    )
 }
 
 pub(crate) fn new_bo(
