@@ -1629,6 +1629,8 @@ pub(crate) mod mmu_control {
         }
 
         impl MEMATTR {
+            /// Outer cache-policy nibble indicating device memory.
+            const ARM_MAIR_DEVICE_MEMORY: u8 = 0x0;
             /// ARM MAIR Write-Allocate bit (bit 0 of inner/outer cache policy nibble).
             ///
             /// In the ARM Architecture Reference Manual, the MAIR encoding for Normal memory
@@ -1640,7 +1642,12 @@ pub(crate) mod mmu_control {
             /// ARM MAIR Read-Allocate bit (bit 1 of inner/outer cache policy nibble).
             const ARM_MAIR_READ_ALLOCATE: u8 = 0x2;
             /// ARM MAIR Write-back bit (bit 2 of inner/outer cache policy nibble).
-            const ARM_MAIR_WRITE_BACK: u8 = 0x4;
+            ///
+            /// Bit 2 alone does not mean write-back. It is also set in `0b0100`,
+            /// which encodes Normal non-cacheable memory.
+            const ARM_MAIR_WRITE_BACK_BIT: u8 = 0x4;
+            /// Complete cache-policy nibble encoding for Normal non-cacheable memory.
+            const ARM_MAIR_NON_CACHEABLE: u8 = 0x4;
             /// Mask for the inner cache policy nibble in MAIR attribute bytes.
             const ARM_MAIR_INNER_MASK: u8 = 0x0f;
 
@@ -1674,9 +1681,7 @@ pub(crate) mod mmu_control {
             /// Device memory (memory-mapped I/O, registers) cannot be cached and must
             /// be mapped as GPU `NonCacheable`.
             fn is_device_memory(mair_attr: u8) -> bool {
-                // In AArch64 MAIR, device memory has bits [1:0] of outer nibble = 0.
-                let outer = mair_attr >> 4;
-                (outer & 0x3) == 0
+                (mair_attr >> 4) == Self::ARM_MAIR_DEVICE_MEMORY
             }
 
             /// Check if normal memory is fully write-back cacheable.
@@ -1688,7 +1693,10 @@ pub(crate) mod mmu_control {
                 let outer = mair_attr >> 4;
                 let inner = mair_attr & Self::ARM_MAIR_INNER_MASK;
 
-                (outer & Self::ARM_MAIR_WRITE_BACK) != 0 && (inner & Self::ARM_MAIR_WRITE_BACK) != 0
+                outer != Self::ARM_MAIR_NON_CACHEABLE
+                    && inner != Self::ARM_MAIR_NON_CACHEABLE
+                    && (outer & Self::ARM_MAIR_WRITE_BACK_BIT) != 0
+                    && (inner & Self::ARM_MAIR_WRITE_BACK_BIT) != 0
             }
 
             fn attribute_from_mair(mair_attr: u8, coherent: bool) -> MMU_MEMATTR_STAGE1 {
