@@ -1350,12 +1350,12 @@ impl VmExec {
             map_sgt: Some(prefetch_map_sgt(bo, dev)?),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size)?,
         };
-        self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)?;
+        let result = self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources);
 
         // Flush inline here. The asynchronous VM_BIND path defers this to
         // the cleanup workqueue instead.
         self.flush_deferred_cleanup();
-        Ok(())
+        result
     }
 
     /// Unmaps a virtual address range from the VM.
@@ -1386,12 +1386,12 @@ impl VmExec {
             map_sgt: None,
             pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
         };
-        self.unmap_range_inner(va, size, &mut resources)?;
+        let result = self.unmap_range_inner(va, size, &mut resources);
 
         // Flush inline here. The asynchronous VM_BIND path defers this to
         // the cleanup workqueue instead.
         self.flush_deferred_cleanup();
-        Ok(())
+        result
     }
 }
 
