@@ -526,7 +526,7 @@ impl deps::BatchOps for BindOps {
     }
 
     fn commit(&self, prepared: PreparedVmBindJob) -> Result<ARef<PublicDmaFence>> {
-        Ok(self.vm.commit_bind_job(prepared))
+        self.vm.commit_bind_job(prepared)
     }
 }
 
@@ -1137,6 +1137,11 @@ impl Vm {
         self.bind_lock.lock()
     }
 
+    /// Returns the bind queue, which only a user VM has.
+    fn bind_queue(&self) -> Result<&JobQueue<VmBindQueueOps>> {
+        self.bind_queue.as_ref().ok_or(EINVAL)
+    }
+
     pub(crate) fn prepare_bind_job(
         &self,
         job: VmBindJob,
@@ -1145,19 +1150,15 @@ impl Vm {
     ) -> Result<PreparedVmBindJob> {
         self.flush_deferred_cleanup();
 
-        self.bind_queue.as_ref().ok_or(EINVAL)?.prepare(
-            job,
-            deps,
-            extra_dep_capacity,
-            VmBindFenceData,
-        )
+        self.bind_queue()?
+            .prepare(job, deps, extra_dep_capacity, VmBindFenceData)
     }
 
-    pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob) -> ARef<PublicDmaFence> {
-        self.bind_queue
-            .as_ref()
-            .expect("Vm::commit_bind_job called without a bind queue")
-            .commit(prepared)
+    pub(crate) fn commit_bind_job(
+        &self,
+        prepared: PreparedVmBindJob,
+    ) -> Result<ARef<PublicDmaFence>> {
+        Ok(self.bind_queue()?.commit(prepared))
     }
 }
 
