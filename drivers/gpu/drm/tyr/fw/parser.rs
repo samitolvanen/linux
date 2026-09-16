@@ -264,23 +264,29 @@ impl<'a> FwParser<'a> {
             inner: None,
         };
 
+        let entry_size = entry_section.entry_hdr.size() as usize;
+
         if self.cursor.pos() % size_of::<u32>() != 0
-            || entry_section.entry_hdr.size() as usize % size_of::<u32>() != 0
+            || entry_size % size_of::<u32>() != 0
+            || entry_size < size_of::<EntryHeader>()
         {
             pr_err!(
                 "Firmware entry isn't 32 bit aligned, offset={:#x} size={:#x}\n",
                 self.cursor.pos() - size_of::<u32>(),
-                entry_section.entry_hdr.size()
+                entry_size
             );
             return Err(EINVAL);
         }
 
-        let section_hdr_size = entry_section.entry_hdr.size() as usize - size_of::<EntryHeader>();
+        let section_hdr_size = entry_size - size_of::<EntryHeader>();
+        let entry_end = self
+            .cursor
+            .pos()
+            .checked_add(section_hdr_size)
+            .ok_or(EINVAL)?;
 
         let entry_section = {
-            let mut entry_cursor = self
-                .cursor
-                .view(self.cursor.pos()..self.cursor.pos() + section_hdr_size)?;
+            let mut entry_cursor = self.cursor.view(self.cursor.pos()..entry_end)?;
 
             match entry_section.entry_hdr.entry_type() {
                 Ok(EntryType::Iface) => Ok(EntrySection {
