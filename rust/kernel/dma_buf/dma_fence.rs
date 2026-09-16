@@ -31,8 +31,17 @@ use crate::{
     time::Jiffies,
     types::{ForeignOwnable, NotThreadSafe, Opaque},
     workqueue::{
-        DelayedWork, HasDelayedWork, HasWork, OwnedQueue, Queue, RawDelayedWorkItem, RawWorkItem,
-        Work, WorkItem, WorkItemPointer,
+        DelayedWork,
+        HasDelayedWork,
+        HasWork,
+        OwnedQueue,
+        Queue,
+        RawDelayedWorkItem,
+        RawWorkItem,
+        SupportsCancelling,
+        Work,
+        WorkItem,
+        WorkItemPointer, //
     },
 };
 
@@ -1051,6 +1060,19 @@ impl<T: ?Sized + WorkItem<ID>, const ID: u64> DmaFenceDelayedWork<T, ID> {
         pin_init!(Self {
             inner <- DelayedWork::new(work_name, work_key, timer_name, timer_key),
         })
+    }
+
+    /// Cancels this delayed work item if it is pending and waits for any running execution to
+    /// finish.
+    ///
+    /// The wait means this must not be called from inside a dma-fence signalling section or from
+    /// a work item on the same [`DmaFenceWorkqueue`]. See [`DelayedWork::cancel_sync`].
+    #[inline]
+    pub fn cancel_sync(&self) -> Option<T::Pointer>
+    where
+        T::Pointer: SupportsCancelling<ID>,
+    {
+        self.inner.cancel_sync()
     }
 }
 
