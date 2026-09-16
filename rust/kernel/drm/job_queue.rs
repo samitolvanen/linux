@@ -539,6 +539,10 @@ impl WrapRange {
         self.start == self.end
     }
 
+    fn contains(&self, idx: u32) -> bool {
+        idx.wrapping_sub(self.start) < self.end.wrapping_sub(self.start)
+    }
+
     fn pop_front(&mut self) -> Option<u32> {
         if self.is_empty() {
             None
@@ -1442,6 +1446,31 @@ impl<T: QueueOps> JobQueueInner<T> {
         let _guard = self.fifo.lock();
         self.cancelled.store(true, Relaxed);
     }
+
+    /// Returns the next in-flight hardware fence of a stage and advances `cur`.
+    fn next_hw_fence(&self, stage_i: usize, cur: &mut u32) -> Option<ARef<PublicDmaFence>> {
+        loop {
+            let state = self.state.lock();
+            let range = state.stage_ranges[stage_i];
+            if !range.contains(*cur) && *cur != range.end {
+                *cur = range.start;
+            }
+            if *cur == range.end {
+                return None;
+            }
+            let idx = *cur;
+            *cur = cur.wrapping_add(1);
+            let fence = self
+                .fifo
+                .lock()
+                .get(idx as usize)
+                .and_then(|e| e.as_live())
+                .map(|e| e.submit_fence.clone());
+            if fence.is_some() {
+                return fence;
+            }
+        }
+    }
 }
 
 /// A process-context job queue that manages job dependencies, driver
@@ -1927,8 +1956,11 @@ impl<T: QueueOps> JobQueue<T> {
     /// The cancel is terminal. Every later [`commit`](Self::commit) is refused.
     /// [`park`](Self::park) and [`unpark`](Self::unpark) are unaffected.
     ///
-    /// Must be called from process context (it may sleep while waiting for
-    /// hardware fences).
+    /// Must be called from process context, since it may sleep while waiting
+    /// for hardware fences. It allocates nothing, so a dma-fence signalling
+    /// section may call it when [`PipelineBuilder::set_cancel_timeout`] bounds
+    /// each wait. Such a caller must also keep [`StageOps::teardown`] and the
+    /// [`QueueOps::Job`] destructor free of anything the section forbids.
     pub fn cancel_all(&self) {
         // WaitingForExec is always at index 1; stages beyond it have been
         // handed to hardware and need their fences waited on before cancel.
@@ -1936,74 +1968,20 @@ impl<T: QueueOps> JobQueue<T> {
 
         self.inner.latch_cancelled();
 
+        let stage_count = self.inner.state.lock().stage_ranges.len();
+
         // check_progress() takes state from a signalling section, so don't
-        // allocate or wait on fences while holding it.
-        let mut state = self.inner.state.lock();
-        self.inner.drain_inbox(&mut state);
-        let mut bound: usize = 0;
-        for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
-            let range = state.stage_ranges[stage_i];
-            bound = bound.saturating_add(range.end.wrapping_sub(range.start) as usize);
-        }
-        drop(state);
-
-        // Allocate outside the lock; on OOM, skip the wait but still drain.
-        let (mut in_flight, mut collect_failed): (KVec<ARef<PublicDmaFence>>, bool) =
-            match KVec::with_capacity(bound, GFP_KERNEL) {
-                Ok(v) => (v, false),
-                Err(_) => (KVec::new(), true),
-            };
-
-        let mut state = self.inner.state.lock();
-        // Re-drain: jobs may have landed while the lock was dropped.
-        self.inner.drain_inbox(&mut state);
-
-        // Capacity is reserved, so push_within_capacity() won't allocate under
-        // state. Overflow past the bound is a collection failure.
-        'collect: for stage_i in (EXEC_STAGE_IDX + 1)..state.stage_ranges.len() {
-            let range = state.stage_ranges[stage_i];
-            let mut cur = range.start;
-            while cur != range.end {
-                let fence = self
-                    .inner
-                    .fifo
-                    .lock()
-                    .get(cur as usize)
-                    .and_then(|e| e.as_live())
-                    .map(|e| e.submit_fence.clone());
-                if let Some(f) = fence {
-                    if in_flight.push_within_capacity(f).is_err() {
-                        collect_failed = true;
-                        break 'collect;
-                    }
-                }
-                cur = cur.wrapping_add(1);
+        // wait on fences while holding it. The range is re-read after each
+        // wait, since check_progress() may have advanced the front past `cur`.
+        for stage_i in (EXEC_STAGE_IDX + 1)..stage_count {
+            let mut cur = self.inner.state.lock().stage_ranges[stage_i].start;
+            while let Some(fence) = self.inner.next_hw_fence(stage_i, &mut cur) {
+                self.wait_for_hw_fence(&fence);
             }
         }
-        drop(state);
-
-        if collect_failed {
-            pr_err!(
-                "JobQueue: out of memory collecting HW fences during teardown; skipping wait\n"
-            );
-        } else {
-            for f in in_flight.iter() {
-                match self.inner.cancel_timeout {
-                    None => {
-                        let _ = f.wait();
-                    }
-                    Some(t) => {
-                        if let Ok(FenceWaitResult::TimedOut) = f.wait_timeout(t) {
-                            pr_warn!("JobQueue: timed out waiting for HW fence during teardown\n");
-                        }
-                    }
-                }
-            }
-        }
-        drop(in_flight);
 
         let mut state = self.inner.state.lock();
-        // Re-drain: jobs may have been submitted while the lock was dropped.
+        // Jobs may have been submitted while the lock was dropped, so drain again.
         self.inner.drain_inbox(&mut state);
 
         for stage_i in 0..state.stage_ranges.len() {
@@ -2030,6 +2008,21 @@ impl<T: QueueOps> JobQueue<T> {
         while let Some(idx) = state.done_range.pop_front() {
             let entry = self.inner.fifo.lock().remove(idx as usize);
             drop(entry);
+        }
+    }
+
+    /// Waits for one in-flight hardware fence, bounded by the cancel timeout
+    /// when one is set.
+    fn wait_for_hw_fence(&self, fence: &PublicDmaFence) {
+        match self.inner.cancel_timeout {
+            None => {
+                let _ = fence.wait();
+            }
+            Some(timeout) => {
+                if let Ok(FenceWaitResult::TimedOut) = fence.wait_timeout(timeout) {
+                    pr_warn!("JobQueue: timed out waiting for HW fence during teardown\n");
+                }
+            }
         }
     }
 }
