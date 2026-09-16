@@ -407,14 +407,14 @@ impl Firmware {
                 vm_map_flags,
                 section_flags,
             } = parsed;
-            let size = (va.end - va.start) as usize;
+            let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
             let va = u64::from(va.start);
-            let end = va + size as u64;
+            let end = va + size;
 
             let mem = KernelBo::new(
                 ddev,
                 vm.as_arc_borrow(),
-                size.try_into().unwrap(),
+                size,
                 KernelBoVaAlloc::Explicit(va),
                 vm_map_flags,
                 coherent,
