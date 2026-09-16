@@ -57,7 +57,8 @@ use crate::{
     gem,
     gpu::CsifInfo,
     heap,
-    mmap, //
+    mmap,
+    mmu::MmuInfo, //
     regs::{
         gpu_control,
         join_u64,
@@ -258,6 +259,10 @@ impl TyrDrmFileData {
                         core::mem::size_of::<uapi::drm_panthor_group_priorities_info>() as u32;
                     Ok(0)
                 }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_MMU_INFO => {
+                    devquery.size = core::mem::size_of::<MmuInfo>() as u32;
+                    Ok(0)
+                }
                 _ => Err(EINVAL),
             }
         } else {
@@ -300,6 +305,13 @@ impl TyrDrmFileData {
 
                     let min_size = size_of::<uapi::drm_panthor_group_priorities_info>();
                     set_uobj(devquery.pointer, devquery.size, min_size, &data)?;
+
+                    Ok(0)
+                }
+                uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_MMU_INFO => {
+                    let min_size =
+                        offset_of!(uapi::drm_panthor_mmu_info, page_size_bitmap) + size_of::<u64>();
+                    set_uobj(devquery.pointer, devquery.size, min_size, &MmuInfo::new())?;
 
                     Ok(0)
                 }
