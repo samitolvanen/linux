@@ -1005,9 +1005,15 @@ impl<T: QueueOps> JobQueueInner<T> {
                 // per-stage resources.
                 FrontEntry::Live { timed_out: true } => {
                     if let StageKind::Driver(stage) = &self.stages[stage_i] {
-                        let guard = self.fifo.lock();
-                        if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
-                            stage.teardown(&*entry.job, entry.counter);
+                        let job = {
+                            let guard = self.fifo.lock();
+                            guard
+                                .get(entry_idx as usize)
+                                .and_then(|e| e.as_live())
+                                .map(|e| (e.job.clone(), e.counter))
+                        };
+                        if let Some((job, counter)) = job {
+                            stage.teardown(&job, counter);
                         }
                     }
                     StageAdvance::Advance
