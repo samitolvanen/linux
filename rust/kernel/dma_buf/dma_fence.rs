@@ -179,11 +179,19 @@ impl PublicDmaFence {
     }
 
     /// Wait for the fence to be signaled, blocking indefinitely.
+    ///
+    /// Returns `Ok` once the fence is signaled, including when it was signaled with an error.
+    /// Use [`Self::error`] to tell the two apart.
     pub fn wait(&self) -> Result {
         // SAFETY: The pointer is valid. We pass `false` for a non-interruptible
         // wait and `isize::MAX` to request an indefinite timeout.
         let ret = unsafe { bindings::dma_fence_wait_timeout(self.inner.get(), false, isize::MAX) };
-        to_result(ret as i32)
+
+        if ret < 0 {
+            Err(Error::from_errno(ret as i32))
+        } else {
+            Ok(())
+        }
     }
 
     /// Wait for the fence to be signaled, with a timeout.
