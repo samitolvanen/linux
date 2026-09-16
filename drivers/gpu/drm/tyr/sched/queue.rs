@@ -928,11 +928,6 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         }
 
-        if job.job.stream.len() as u64 > self.data.ringbuf.size() as u64 {
-            fence.signal(Err(ENOSPC));
-            return Err(ENOSPC);
-        }
-
         if let Err(err) = self.data.can_append(job.job.stream.len()) {
             if err == ENOSPC {
                 return Ok(SubmitResult::NoResources(fence));
@@ -1220,6 +1215,10 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
+        if job.stream.len() > self.data.ringbuf.size() {
+            return Err(ENOSPC);
+        }
+
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
