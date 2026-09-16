@@ -467,14 +467,7 @@ impl Group {
         let num_syncs =
             group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
-        let syncobjs = gem::new_kernel_object(
-            ddev,
-            &vm,
-            num_syncs,
-            flags,
-            ddev.coherent,
-            ddev.cleanup_wq.clone(),
-        )?;
+        let syncobjs = gem::new_kernel_object(ddev, &vm, num_syncs, flags, ddev.coherent)?;
 
         let vmap = syncobjs.vmap();
         let size = vmap.owner().size();
@@ -776,7 +769,7 @@ impl Group {
             }
         } else {
             let (bo, bo_offset) = self.vm.get_bo_for_va(syncwait.gpu_va).ok_or(EINVAL)?;
-            let mapped_bo = gem::MappedUserBo::new(&bo, self.tdev.cleanup_wq.clone())?;
+            let mapped_bo = gem::MappedUserBo::new(&bo)?;
             let bo_offset = bo_offset as usize;
 
             // Memoise the resolved BO so subsequent re-evaluations

@@ -186,14 +186,7 @@ fn alloc_chunk_bo(
     chunk_size: u32,
 ) -> Result<Arc<gem::MappedBo>> {
     let flags = VmMapFlags::from(VmFlag::Noexec);
-    let chunk_bo = gem::new_kernel_object(
-        tdev,
-        vm,
-        chunk_size as usize,
-        flags,
-        tdev.coherent,
-        tdev.cleanup_wq.clone(),
-    )?;
+    let chunk_bo = gem::new_kernel_object(tdev, vm, chunk_size as usize, flags, tdev.coherent)?;
 
     ChunkHeader::write(
         &chunk_bo,
@@ -260,14 +253,7 @@ impl Pool {
         let bo_size = (MAX_HEAPS_PER_POOL * stride).next_multiple_of(4096) as usize;
 
         let flags = VmMapFlags::from(VmFlag::Noexec);
-        let gpu_contexts = gem::new_kernel_object(
-            tdev,
-            &vm,
-            bo_size,
-            flags,
-            tdev.coherent,
-            tdev.cleanup_wq.clone(),
-        )?;
+        let gpu_contexts = gem::new_kernel_object(tdev, &vm, bo_size, flags, tdev.coherent)?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
 
         let initial = gpu_contexts.size();
