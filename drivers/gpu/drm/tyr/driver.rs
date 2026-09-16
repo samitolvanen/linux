@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::fmt::Write;
+use core::num::NonZero;
 use core::sync::atomic::{
     AtomicBool,
     AtomicU32,
@@ -37,6 +38,7 @@ use kernel::{
         ioctl,
         UnregisteredDevice, //
     },
+    math64::div_u64_rem,
     new_mutex,
     of,
     opp::ConfigToken,
@@ -1144,15 +1146,14 @@ impl drm::Driver for TyrDrmDriver {
         let stats = inner.stats_snapshot();
 
         if profile_mask & DEVICE_PROFILING_TIMESTAMP != 0 {
-            if let Some(rate) = arch_timer_get_rate() {
-                drm_printf!(
-                    printer,
-                    "drm-engine-panthor:\t{} ns\n",
-                    u64::div_ceil(
-                        stats.time.saturating_mul(NSEC_PER_SEC as u64),
-                        u64::from(rate)
-                    )
-                );
+            if let Some(rate) = arch_timer_get_rate().and_then(NonZero::new) {
+                let nsec_per_sec = NSEC_PER_SEC as u64;
+                let (secs, rem) = div_u64_rem(stats.time, rate);
+                let (frac, frac_rem) = div_u64_rem(u64::from(rem) * nsec_per_sec, rate);
+                let ns = secs
+                    .saturating_mul(nsec_per_sec)
+                    .saturating_add(frac + u64::from(frac_rem != 0));
+                drm_printf!(printer, "drm-engine-panthor:\t{} ns\n", ns);
             }
         }
 
