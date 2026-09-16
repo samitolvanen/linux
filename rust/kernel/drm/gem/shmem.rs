@@ -154,8 +154,9 @@ impl<T: DriverObject> Object<T> {
         let shmem = self.as_raw_shmem();
 
         // SAFETY: `shmem` points to the embedded `drm_gem_shmem_object`, which
-        // is valid for the lifetime of `self` per the type invariant.
-        !unsafe { (*shmem).pages }.is_null()
+        // is valid for the lifetime of `self` per the type invariant. The
+        // volatile read tolerates a concurrent write from the page put path.
+        !unsafe { core::ptr::read_volatile(&raw const (*shmem).pages) }.is_null()
     }
 
     /// Create a new shmem-backed DRM object of the given size.
