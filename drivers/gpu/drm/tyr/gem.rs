@@ -52,6 +52,7 @@ use crate::{
     vm::{
         range,
         Vm,
+        VmFlag,
         VmMapFlags, //
     },
 };
@@ -538,6 +539,11 @@ impl KernelBo {
     ) -> Result<Self> {
         if size == 0 {
             dev_err!(dev, "Cannot create KernelBo with size 0");
+            return Err(EINVAL);
+        }
+
+        if flags.contains(VmFlag::Sparse) {
+            dev_err!(dev, "Cannot map a KernelBo sparsely");
             return Err(EINVAL);
         }
 
