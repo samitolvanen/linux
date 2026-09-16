@@ -246,6 +246,11 @@ const MIN_KERNEL_VA_SIZE: u64 = 0x10000000;
 
 const SZ_4G: u64 = 4 * u64::SZ_1G;
 
+/// Size of the window a sparse mapping repeats over its range.
+///
+/// The object bound over a sparse range is exactly this large.
+pub(crate) const SPARSE_WINDOW_SIZE: u64 = u64::SZ_2M;
+
 impl_flags!(
     /// Flags controlling virtual memory mapping behavior.
     ///
@@ -263,6 +268,8 @@ impl_flags!(
         Noexec = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC as u32,
         /// Map as uncached.
         Uncached = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED as u32,
+        /// Map the range over the buffer object repeatedly.
+        Sparse = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_SPARSE as u32,
     }
 );
 
@@ -310,6 +317,14 @@ impl fmt::Display for VmMapFlags {
                 write!(f, " | ")?;
             }
             write!(f, "UNCACHED")?;
+            first = false;
+        }
+
+        if self.contains(VmFlag::Sparse) {
+            if !first {
+                write!(f, " | ")?;
+            }
+            write!(f, "SPARSE")?;
         }
 
         Ok(())
@@ -535,7 +550,10 @@ impl TryFrom<u32> for VmMapFlags {
     type Error = Error;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        let valid = VmFlag::Readonly as u32 | VmFlag::Noexec as u32 | VmFlag::Uncached as u32;
+        let valid = VmFlag::Readonly as u32
+            | VmFlag::Noexec as u32
+            | VmFlag::Uncached as u32
+            | VmFlag::Sparse as u32;
 
         if value & !valid != 0 {
             return Err(EINVAL);
@@ -608,6 +626,9 @@ struct PtMapArgs<'a> {
     ///
     /// This is directly derived from [`VmMapFlags`] via [`VmMapFlags::to_prot`].
     prot: u32,
+
+    /// Whether the mapping repeats the buffer object over its range.
+    sparse: bool,
 
     /// Device used to DMA-map the buffer object and to reach the page table.
     dev: &'a Device<Bound>,
@@ -813,11 +834,13 @@ impl GpuVmData {
 /// Per-mapping private data stored on each `GpuVa`.
 ///
 /// A remap splits an existing mapping and may have to rebuild page-table
-/// entries for the surviving fragments. Those fragments keep the protection
-/// of the original mapping, so the protection flags are recorded here.
+/// entries for the surviving fragments. Those fragments inherit the
+/// properties of the mapping being split, so the mapping records them here.
 pub(crate) struct GpuVaData {
     /// Memory protection flags of this mapping, as passed to `pt_map`.
     prot: u32,
+    /// Whether this mapping repeats the buffer object over its range.
+    sparse: bool,
 }
 
 fn max_va_range(gpu_info: &GpuInfo) -> u64 {
@@ -1399,7 +1422,11 @@ impl VmExec {
         let guard = self.gpuvm_unique.lock();
         let gpuva = guard.as_ref()?.find_first(va, 1)?;
         let bo = gpuva.obj();
-        let bo_offset = gpuva.gem_offset() + (va - gpuva.addr());
+        let bo_offset = if gpuva.data_ref().sparse {
+            va & (SPARSE_WINDOW_SIZE - 1)
+        } else {
+            gpuva.gem_offset() + (va - gpuva.addr())
+        };
         Some((ARef::from(bo), bo_offset))
     }
 
@@ -1486,6 +1513,7 @@ impl VmExec {
 
         match req.op_type {
             VmOpType::Map(args) => {
+                let sparse = args.flags.contains(VmFlag::Sparse);
                 let mut pt_upd = PtUpdateContext::new(
                     self,
                     pt,
@@ -1494,15 +1522,22 @@ impl VmExec {
                     req.region,
                     PtOpType::Map(PtMapArgs {
                         prot: args.flags.to_prot(),
+                        sparse,
                         dev: args.dev,
                     }),
                     resources,
                 )?;
 
+                let gem_offset = if sparse {
+                    pt_upd.region.start & (SPARSE_WINDOW_SIZE - 1)
+                } else {
+                    args.bo_offset
+                };
+
                 gpuvm_unique.sm_map(OpMapRequest {
                     addr: pt_upd.region.start,
                     range: pt_upd.region.end - pt_upd.region.start,
-                    gem_offset: args.bo_offset,
+                    gem_offset,
                     vm_bo: &args.vm_bo,
                     context: &mut pt_upd,
                 })
@@ -1557,7 +1592,9 @@ impl VmExec {
         let bo_size = u64::try_from(vm_bo.obj().size()).map_err(|_| EOVERFLOW)?;
         let bo_end = bo_offset.checked_add(map_size).ok_or(EINVAL)?;
 
-        if bo_end > bo_size {
+        // A sparse map repeats the VM's sparse object over the range, so the
+        // object size does not bound the mapping.
+        if !flags.contains(VmFlag::Sparse) && bo_end > bo_size {
             dev_err!(
                 self.dev(),
                 "BO mapping range {:#x}..{:#x} exceeds BO size {:#x}",
@@ -1716,42 +1753,50 @@ impl DriverGpuVm for GpuVmData {
         op: OpMap<'op, Self>,
         context: &mut Self::SmContext<'_>,
     ) -> Result<OpMapped<'op, Self>, Error> {
-        // Make sure that the end of the requested GEM range doesn't run past the
-        // end of the GEM buffer itself.
-        let gem_range_end = op.gem_offset().checked_add(op.length()).ok_or(EINVAL)?;
-
-        if gem_range_end > op.obj().size() as u64 {
-            dev_err!(
-                context.dev,
-                "Requested GEM range ends at {} which is beyond the GEM buffer size {}",
-                gem_range_end,
-                op.obj().size()
-            );
-            return Err(EINVAL);
-        }
-
-        let (prot, dev) = match &context.op_type {
-            PtOpType::Map(args) => (args.prot, args.dev),
+        let (prot, sparse, dev) = match &context.op_type {
+            PtOpType::Map(args) => (args.prot, args.sparse, args.dev),
             _ => {
                 return Err(EINVAL);
             }
         };
 
+        if !sparse {
+            // Make sure that the end of the requested GEM range doesn't run past the
+            // end of the GEM buffer itself.
+            let gem_range_end = op.gem_offset().checked_add(op.length()).ok_or(EINVAL)?;
+
+            if gem_range_end > op.obj().size() as u64 {
+                dev_err!(
+                    context.dev,
+                    "Requested GEM range ends at {} which is beyond the GEM buffer size {}",
+                    gem_range_end,
+                    op.obj().size()
+                );
+                return Err(EINVAL);
+            }
+        }
+
         let map_sgt = context.resources.map_sgt.as_ref().ok_or(EINVAL)?;
 
-        pt_map_sgt(
-            dev,
-            context.pt,
-            op.addr(),
-            op.gem_offset(),
-            op.length(),
-            prot,
-            map_sgt,
-        )
-        .inspect_err(|_| self.mark_failed(context, &(op.addr()..op.addr() + op.length())))?;
+        if sparse {
+            pt_map_sgt_cyclic(dev, context.pt, op.addr(), op.length(), prot, map_sgt).inspect_err(
+                |_| self.mark_failed(context, &(op.addr()..op.addr() + op.length())),
+            )?;
+        } else {
+            pt_map_sgt(
+                dev,
+                context.pt,
+                op.addr(),
+                op.gem_offset(),
+                op.length(),
+                prot,
+                map_sgt,
+            )
+            .inspect_err(|_| self.mark_failed(context, &(op.addr()..op.addr() + op.length())))?;
+        }
 
         let gpuva = context.preallocated_gpuva()?;
-        let op = op.insert(gpuva, GpuVaData { prot });
+        let op = op.insert(gpuva, GpuVaData { prot, sparse });
 
         Ok(op)
     }
@@ -1789,7 +1834,7 @@ impl DriverGpuVm for GpuVmData {
     /// Split up an existing mapping.
     fn sm_step_remap<'op>(
         &mut self,
-        op: OpRemap<'op, Self>,
+        mut op: OpRemap<'op, Self>,
         context: &mut Self::SmContext<'_>,
     ) -> Result<OpRemapped<'op, Self>, Error> {
         let unmap_start = if let Some(prev) = op.prev() {
@@ -1804,9 +1849,7 @@ impl DriverGpuVm for GpuVmData {
             op.va_to_unmap().addr() + op.va_to_unmap().length()
         };
 
-        // The surviving fragments inherit the protection of the mapping being
-        // split.
-        let prot = op.va_to_unmap().data_ref().prot;
+        let &GpuVaData { prot, sparse } = op.va_to_unmap().data_ref();
 
         let block = Alignment::new::<{ pt_alloc::PT_MIN_BLOCK_SIZE }>();
         let aligned_start = unmap_start.align_down(block);
@@ -1882,8 +1925,17 @@ impl DriverGpuVm for GpuVmData {
             .inspect_err(|_| self.mark_failed(context, &(region_start..region_end)))?;
         }
 
-        let (op_remapped, remap_ret) =
-            op.remap([prev_va, next_va], GpuVaData { prot }, GpuVaData { prot });
+        if sparse {
+            if let Some(addr) = op.next().map(|next| next.addr()) {
+                op.set_next_gem_offset(addr & (SPARSE_WINDOW_SIZE - 1));
+            }
+        }
+
+        let (op_remapped, remap_ret) = op.remap(
+            [prev_va, next_va],
+            GpuVaData { prot, sparse },
+            GpuVaData { prot, sparse },
+        );
 
         if let Some(unused_va) = remap_ret.unused_va {
             context.return_preallocated_gpuva(unused_va);
@@ -2055,6 +2107,40 @@ fn pt_map_sgt(
         );
 
         return Err(EINVAL);
+    }
+
+    Ok(())
+}
+
+/// Maps `size` bytes at `iova` by repeating `sgt` over the range.
+///
+/// An address in the range maps to the byte of `sgt` at that address modulo
+/// `SPARSE_WINDOW_SIZE`, so the walk is cut at every window boundary and `sgt`
+/// must span a full window. If a window fails to map, the part of the range
+/// already mapped is torn down before returning.
+fn pt_map_sgt_cyclic(
+    dev: &Device<Bound>,
+    page_table: &pt_alloc::DevresPageTable,
+    iova: u64,
+    size: u64,
+    prot: u32,
+    sgt: &[(DmaAddress, u64)],
+) -> Result {
+    let mut mapped = 0;
+
+    while mapped < size {
+        let addr = iova + mapped;
+        let sgt_offset = addr & (SPARSE_WINDOW_SIZE - 1);
+        let chunk = u64::min(size - mapped, SPARSE_WINDOW_SIZE - sgt_offset);
+
+        if let Err(e) = pt_map_sgt(dev, page_table, addr, sgt_offset, chunk, prot, sgt) {
+            if mapped > 0 {
+                let _ = pt_unmap(dev, page_table, iova..addr);
+            }
+            return Err(e);
+        }
+
+        mapped += chunk;
     }
 
     Ok(())
