@@ -1281,6 +1281,14 @@ impl DmaFenceWorkqueue {
         ))
     }
 
+    /// Flushes this workqueue.
+    ///
+    /// See [`OwnedQueue::flush`] for the contract.
+    #[inline]
+    pub fn flush(&self) {
+        self.0.flush()
+    }
+
     /// Returns a reference to the wrapped queue.
     fn as_queue(&self) -> &Queue {
         &self.0
