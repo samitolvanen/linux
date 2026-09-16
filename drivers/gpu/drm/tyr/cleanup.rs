@@ -32,8 +32,9 @@ global_lock! {
 
 /// Registration of the module-wide cleanup workqueue.
 ///
-/// Creating it builds the queue and publishes it to `try_spawn_owned`.
-/// Dropping it destroys the queue, which drains every item still queued.
+/// Creating it builds the queue and publishes it to `try_spawn_owned` and
+/// `enqueue`. Dropping it destroys the queue, which drains every item still
+/// queued.
 pub(crate) struct Registration(());
 
 impl Registration {
@@ -141,4 +142,19 @@ pub(crate) fn try_spawn_owned<T: 'static + Send>(value: T, f: fn(T)) -> Result<(
     }
 
     Ok(())
+}
+
+/// Enqueues a work item on the cleanup workqueue.
+///
+/// Must not be called before the module has created the `Registration`.
+/// The item comes back in the error when it is already pending or the
+/// module has destroyed the queue.
+pub(crate) fn enqueue<W, const ID: u64>(w: W) -> Result<(), W>
+where
+    W: workqueue::RawWorkItem<ID, EnqueueOutput = Result<(), W>> + Send + 'static,
+{
+    match CLEANUP_WQ.lock().as_ref() {
+        Some(wq) => wq.enqueue(w),
+        None => Err(w),
+    }
 }

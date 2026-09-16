@@ -257,6 +257,12 @@ pub(crate) struct TyrDrmDeviceData {
     /// with firmware acks under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
+    /// Dedicated unbound workqueue for the per-group `term_work`, whose
+    /// worker waits on in-flight hardware fences. Flushed at unbind. It
+    /// sits on the device because a file release can terminate groups
+    /// after unbind.
+    pub(crate) term_wq: DmaFenceWorkqueue,
+
     /// Dedicated unbound workqueue for the per-group tiler OOM workers.
     /// Heap growth allocates with `GFP_KERNEL` and can block in reclaim,
     /// so these workers get their own queue rather than sharing the
@@ -841,6 +847,8 @@ impl platform::Driver for TyrPlatformDriverData {
 
         let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
 
+        let term_wq = DmaFenceWorkqueue::new_unbound(c"tyr-group-term")?;
+
         let heap_alloc_wq = Queue::new_unbound().build(c"tyr-heap-alloc")?;
 
         let csg_slot_ops = CsgSlotOps::new(firmware.clone());
@@ -864,6 +872,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 fw: firmware,
                 wq,
                 sched_wq,
+                term_wq,
                 heap_alloc_wq,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
@@ -1010,6 +1019,9 @@ impl platform::Driver for TyrPlatformDriverData {
         // The workers that enqueue tiler OOM works are drained and their
         // gates reject later runs, so the queue stays empty from here.
         this.device.heap_alloc_wq.flush();
+        // Let the queued terminations hand their groups to the cleanup
+        // workqueue before the module can exit.
+        this.device.term_wq.flush();
         // Cancel the watchdog last. Both the reset worker and a resume that
         // was already in flight when `unbinding` was set re-arm it.
         this.device.cancel_fw_ping();
