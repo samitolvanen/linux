@@ -171,7 +171,10 @@ impl Mmu {
     }
 
     /// Returns the AS slot index the VM is currently bound to, or `None`
-    /// if it is not resident.
+    /// if it has no bound users.
+    ///
+    /// An idle VM reports `None` even though its slot stays programmed
+    /// until it is reclaimed.
     ///
     /// The returned value is a snapshot taken under the AS slot manager
     /// mutex. Callers that act on the slot id must serialize their use
