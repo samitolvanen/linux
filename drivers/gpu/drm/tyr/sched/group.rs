@@ -994,11 +994,14 @@ impl WorkItem<{ work_id::RELEASE }> for Group {
     }
 }
 
+/// Maximum number of live groups per file.
+const MAX_GROUPS_PER_POOL: u32 = 128;
+
 pub(crate) struct Pool(pool::Pool<Group>);
 
 impl Pool {
     pub(crate) fn create() -> Result<Self> {
-        Ok(Self(pool::Pool::create()?))
+        Ok(Self(pool::Pool::create(MAX_GROUPS_PER_POOL)?))
     }
 
     pub(crate) fn create_group(
@@ -1141,13 +1144,11 @@ impl Pool {
     }
 
     fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
-        let group = self.0.get(index).ok_or(EINVAL)?;
+        let group = self.0.remove(index)?;
 
         group.with_locked_inner(|inner| {
             inner.fatal_error = Some(ECANCELED);
         });
-
-        self.0.remove(index)?;
 
         let csg_id = ddev.with_locked_scheduler(|sched| {
             sched.detach_destroyed_group(&group);
@@ -1179,10 +1180,10 @@ impl Pool {
     }
 
     pub(crate) fn destroy_all(&self, ddev: &TyrDrmDevice) -> Result {
-        for index in 1..self.0.index_upper_bound() {
+        self.0.for_each(|index, _| {
             let _ = self.destroy_group_index(ddev, index);
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 }
