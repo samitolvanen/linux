@@ -214,10 +214,11 @@ impl<'a> FwParser<'a> {
     /// in the binary, extracting section information needed for loading.
     pub(super) fn parse(&mut self) -> Result<KVec<ParsedSection>> {
         let fw_header = self.parse_fw_header()?;
+        let header_end = fw_header.size as usize;
 
         let mut parsed_sections = KVec::new();
-        while (self.cursor.pos() as u32) < fw_header.size {
-            let entry_section = self.parse_entry()?;
+        while self.cursor.pos() < header_end {
+            let entry_section = self.parse_entry(header_end)?;
 
             if let Some(inner) = entry_section.inner {
                 parsed_sections.push(inner, GFP_KERNEL)?;
@@ -256,9 +257,24 @@ impl<'a> FwParser<'a> {
         Ok(fw_header)
     }
 
-    fn parse_entry(&mut self) -> Result<EntrySection> {
+    fn parse_entry(&mut self, header_end: usize) -> Result<EntrySection> {
         let fw_data = self.cursor.data;
         let dev = self.dev;
+        let entry_start = self.cursor.pos();
+
+        let entry_header_end = entry_start
+            .checked_add(size_of::<EntryHeader>())
+            .ok_or(EINVAL)?;
+
+        if entry_header_end > header_end {
+            pr_err!(
+                "Firmware entry header at {:#x} exceeds header region ending at {:#x}\n",
+                entry_start,
+                header_end
+            );
+            return Err(EINVAL);
+        }
+
         let entry_section = EntrySection {
             entry_hdr: EntryHeader(self.cursor.read_u32()?),
             inner: None,
@@ -278,12 +294,18 @@ impl<'a> FwParser<'a> {
             return Err(EINVAL);
         }
 
+        let entry_end = entry_start.checked_add(entry_size).ok_or(EINVAL)?;
+
+        if entry_end > header_end {
+            pr_err!(
+                "Firmware entry at {:#x} extends beyond header region ending at {:#x}\n",
+                entry_start,
+                header_end
+            );
+            return Err(EINVAL);
+        }
+
         let section_hdr_size = entry_size - size_of::<EntryHeader>();
-        let entry_end = self
-            .cursor
-            .pos()
-            .checked_add(section_hdr_size)
-            .ok_or(EINVAL)?;
 
         let entry_section = {
             let mut entry_cursor = self.cursor.view(self.cursor.pos()..entry_end)?;
