@@ -836,7 +836,10 @@ impl AsSlotManager {
     }
 
     /// Returns the AS slot index `vm` is currently assigned to, or `None`
-    /// if the VM is not resident.
+    /// if the VM has no bound users.
+    ///
+    /// An idle VM reports `None` even though its slot stays programmed
+    /// until it is reclaimed.
     ///
     /// The slot binding is only stable for as long as the caller holds
     /// the AS slot manager mutex; once dropped, another caller may
