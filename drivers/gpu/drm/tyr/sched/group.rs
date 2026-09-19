@@ -1162,32 +1162,14 @@ impl Pool {
         }
 
         let group = Group::create(ddev, file, groupcreate, queue_args)?;
+        let reservation = self.0.reserve()?;
 
-        ddev.with_locked_scheduler(|sched| sched.add_group(group.clone()))?;
+        if let Err(e) = ddev.with_locked_scheduler(|sched| sched.add_group(group.clone())) {
+            reservation.release();
+            return Err(e);
+        }
 
-        let handle = match self.0.insert(group.clone()) {
-            Ok(handle) => handle,
-            Err(e) => {
-                // The group is unreachable without a handle, and a
-                // tick may already have bound it.
-                group.with_locked_inner(|inner| {
-                    inner.fatal_error = Some(ECANCELED);
-                });
-
-                let csg_id = ddev.with_locked_scheduler(|sched| {
-                    sched.detach_destroyed_group(&group);
-                    Ok(group.with_locked_inner(|inner| inner.csg_id))
-                });
-
-                if matches!(csg_id, Ok(Some(_))) {
-                    TyrDrmDeviceData::schedule_tick(&ARef::from(ddev));
-                }
-
-                return Err(e);
-            }
-        };
-
-        groupcreate.group_handle = handle as u32;
+        groupcreate.group_handle = reservation.store(group)? as u32;
         Ok(())
     }
 
