@@ -122,6 +122,9 @@ static VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKe
 // SAFETY: todo
 static VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
+/// Maximum number of live VMs per file.
+const MAX_VMS_PER_POOL: u32 = 32;
+
 pub(crate) struct Pool {
     entries: ObjectPool<Vm>,
 }
@@ -129,7 +132,7 @@ pub(crate) struct Pool {
 impl Pool {
     pub(crate) fn create() -> Result<Self> {
         Ok(Self {
-            entries: ObjectPool::create()?,
+            entries: ObjectPool::create(MAX_VMS_PER_POOL)?,
         })
     }
 
@@ -229,13 +232,11 @@ impl Pool {
     }
 
     pub(crate) fn destroy_all(&self, tdev: &TyrDrmDevice) -> Result {
-        let max_index = self.entries.index_upper_bound();
-
-        for index in 1..max_index {
+        self.entries.for_each(|index, _| {
             let _ = self.destroy_vm_index(tdev, index);
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 }
 
