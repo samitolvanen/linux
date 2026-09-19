@@ -40,30 +40,32 @@ impl<T: 'static> Pool<T> {
         })
     }
 
-    /// Stores `value` at the next free index, wrapping within the pool range.
+    /// Reserves the next free index, wrapping within the pool range.
+    ///
+    /// The reserved index holds no value, so `get` returns `None` and `remove`
+    /// fails until a value is stored.
     ///
     /// Returns `EBUSY` when every index in the range is taken.
-    pub(crate) fn insert(&self, value: Arc<T>) -> Result<usize> {
+    pub(crate) fn reserve(&self) -> Result<Reservation<'_, T>> {
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
 
         let mut next = self.next_index.load(Relaxed);
-        let index = match guard.alloc_cyclic(
-            value,
+        let index = guard.alloc_cyclic_reserve(
             xarray::XaLimit::new(MIN_INDEX, self.max_index),
             &mut next,
             GFP_KERNEL,
-        ) {
-            Ok(index) => index,
-            Err(e) => {
-                // Dropping the last reference to the value can sleep.
-                drop(guard);
-                return Err(e.error);
-            }
-        };
+        )?;
         self.next_index.store(next, Relaxed);
 
-        Ok(index)
+        Ok(Reservation { pool: self, index })
+    }
+
+    /// Stores `value` at the next free index, wrapping within the pool range.
+    ///
+    /// Returns `EBUSY` when every index in the range is taken.
+    pub(crate) fn insert(&self, value: Arc<T>) -> Result<usize> {
+        self.reserve()?.store(value)
     }
 
     pub(crate) fn get(&self, index: usize) -> Option<Arc<T>> {
@@ -94,8 +96,51 @@ impl<T: 'static> Pool<T> {
     pub(crate) fn remove(&self, index: usize) -> Result<Arc<T>> {
         let xa = self.xa.as_ref();
         let mut guard = xa.lock();
+
+        // A reserved index reads as missing but is still erasable, and
+        // erasing it would hand the same index out twice.
+        if guard.get(index).is_none() {
+            return Err(EINVAL);
+        }
+
         let value = guard.remove(index).ok_or(EINVAL)?;
 
         Ok(value)
+    }
+}
+
+/// An allocated `Pool` index that holds no value yet.
+///
+/// The index stays allocated until it is stored into or released.
+pub(crate) struct Reservation<'a, T: 'static> {
+    pool: &'a Pool<T>,
+    index: xarray::ReservedIndex,
+}
+
+impl<T: 'static> Reservation<'_, T> {
+    /// Stores `value` at the reserved index and returns that index.
+    ///
+    /// The reservation already allocated the slot, so the store does not
+    /// allocate. A failed store releases the index.
+    pub(crate) fn store(self, value: Arc<T>) -> Result<usize> {
+        let xa = self.pool.xa.as_ref();
+        let mut guard = xa.lock();
+
+        if let Err(e) = guard.store_reserved(self.index, value) {
+            guard.release(self.index);
+            // Dropping the last reference to the value can sleep.
+            drop(guard);
+            return Err(e.error);
+        }
+
+        Ok(self.index.index())
+    }
+
+    /// Releases the reserved index without storing a value.
+    pub(crate) fn release(self) {
+        let xa = self.pool.xa.as_ref();
+        let mut guard = xa.lock();
+
+        guard.release(self.index);
     }
 }
