@@ -60,7 +60,6 @@ use crate::{
     },
     gem,
     gpu::CsifInfo,
-    heap,
     pool,
     sched::CsgSlotManager,
     slot::Seat,
@@ -348,8 +347,6 @@ pub(crate) struct Group {
     pub(super) suspend_buf: gem::KernelBo,
     pub(super) protm_suspend_buf: gem::KernelBo,
     syncobjs: Arc<gem::MappedBo>,
-    #[pin]
-    heap_pool: Mutex<Option<Arc<heap::Pool>>>,
 }
 
 impl_list_arc_safe! {
@@ -501,10 +498,6 @@ impl Group {
                 suspend_buf,
                 protm_suspend_buf,
                 syncobjs,
-                heap_pool <- new_mutex!(file
-                    .inner()
-                    .heap_pools()
-                    .get_pool(group_args.vm_id as usize)),
             }),
             GFP_KERNEL,
         )
@@ -809,14 +802,6 @@ impl Group {
         syncs::SyncObj64b::write(&self.syncobjs, self.syncobj_offset(queue_index)?, value)
     }
 
-    pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
-        *self.heap_pool.lock() = Some(pool);
-    }
-
-    pub(crate) fn get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
-        self.heap_pool.lock().clone()
-    }
-
     pub(super) fn submit(
         self: &Arc<Self>,
         csif: &CsifInfo,
@@ -1086,16 +1071,6 @@ impl Pool {
 
     pub(crate) fn group(&self, index: usize) -> Option<Arc<Group>> {
         self.0.get(index)
-    }
-
-    pub(crate) fn set_heap_pool_for_vm(&self, vm: &Arc<Vm>, pool: Arc<heap::Pool>) -> Result {
-        self.0.for_each(|_, group| {
-            if Arc::ptr_eq(&group.vm, vm) {
-                group.set_heap_pool(pool.clone());
-            }
-
-            Ok(())
-        })
     }
 
     pub(crate) fn submit_group(

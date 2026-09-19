@@ -103,6 +103,7 @@ use crate::{
     gem,
     gem::Bo,
     gpu::GpuInfo,
+    heap,
     mmu::{
         address_space::VmAsData,
         Mmu, //
@@ -897,11 +898,32 @@ pub(crate) struct Vm {
     /// Kernel VA reservations that must live as long as the VM.
     #[pin]
     kernel_reservations: Mutex<KVec<range::LiveRange>>,
+    /// Tiler heap pool of this VM.
+    ///
+    /// Lock order `heap_pool > {kernel VA, gpuvm, drm_exec, dma_resv, AS slot
+    /// manager}`, because creating a pool maps buffer objects into this VM.
+    /// The mutex is held across allocation and mapping, and must never be
+    /// taken under the scheduler mutex.
+    ///
+    /// The pool and its buffer objects hold references back to the VM, and
+    /// `kill()` breaks that cycle.
+    #[pin]
+    heap_pool: Mutex<HeapPoolState>,
     /// Dummy GEM object that anchors the VM's `dma_resv`.
     ///
     /// Every kernel-owned BO in this VM aliases this `dma_resv`, so a
     /// fence on one blocks operations on the others.
     root_gem: ARef<Bo>,
+}
+
+/// State of a VM's tiler heap pool.
+enum HeapPoolState {
+    /// The VM has no pool yet. The first heap context creates one.
+    Empty,
+    /// The VM has a pool.
+    Live(Arc<heap::Pool>),
+    /// The VM is going away and cannot take a new pool.
+    Destroyed,
 }
 
 impl Vm {
@@ -980,6 +1002,7 @@ impl Vm {
                 user_va_limit: kernel_range.start,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
+                heap_pool <- new_mutex!(HeapPoolState::Empty),
                 root_gem: dummy_obj,
             }),
             GFP_KERNEL,
@@ -1039,9 +1062,49 @@ impl Vm {
         )
     }
 
-    /// Kills the VM by deactivating it and unmapping all regions.
+    /// Returns this VM's tiler heap pool, if it has one.
+    pub(crate) fn heap_pool(&self) -> Option<Arc<heap::Pool>> {
+        match &*self.heap_pool.lock() {
+            HeapPoolState::Live(pool) => Some(pool.clone()),
+            HeapPoolState::Empty | HeapPoolState::Destroyed => None,
+        }
+    }
+
+    /// Returns this VM's tiler heap pool, creating it on first use.
+    ///
+    /// Returns `EINVAL` once the VM has been killed.
+    pub(crate) fn get_or_create_heap_pool(
+        self: &Arc<Self>,
+        ddev: &TyrDrmDevice,
+        reg_data: &TyrDrmRegistrationData<'_>,
+    ) -> Result<Arc<heap::Pool>> {
+        let mut guard = self.heap_pool.lock();
+
+        match &*guard {
+            HeapPoolState::Live(pool) => Ok(pool.clone()),
+            HeapPoolState::Destroyed => Err(EINVAL),
+            HeapPoolState::Empty => {
+                let pool = heap::Pool::create(ddev, reg_data, self.clone())?;
+                let pool = Arc::new(pool, GFP_KERNEL)?;
+                *guard = HeapPoolState::Live(pool.clone());
+
+                Ok(pool)
+            }
+        }
+    }
+
+    /// Kills the VM by releasing its heap pool, deactivating it, and
+    /// unmapping all regions.
     pub(crate) fn kill(&self) {
         self.exec.mark_unusable();
+
+        let previous = {
+            let mut guard = self.heap_pool.lock();
+            core::mem::replace(&mut *guard, HeapPoolState::Destroyed)
+        };
+
+        drop(previous);
+
         let _ = self
             .exec
             .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)

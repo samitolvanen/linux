@@ -169,7 +169,6 @@ fn validate_bind_op(
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
-    heap_pools: heap::Pools,
     user_mmio_offset: Atomic<u64>,
     tdev: ARef<TyrDrmDevice>,
 }
@@ -193,7 +192,6 @@ impl drm::file::DriverFile for TyrDrmFileData {
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
                 group_pool: group::Pool::create()?,
-                heap_pools: heap::Pools::create()?,
                 user_mmio_offset: Atomic::new(user_mmio_offset),
                 tdev,
             }),
@@ -226,10 +224,6 @@ impl TyrDrmFileData {
 
     pub(crate) fn group_pool(self: Pin<&Self>) -> &group::Pool {
         &self.get_ref().group_pool
-    }
-
-    pub(crate) fn heap_pools(self: Pin<&Self>) -> &heap::Pools {
-        &self.get_ref().heap_pools
     }
 
     pub(crate) fn user_mmio_offset(&self) -> u64 {
@@ -832,18 +826,7 @@ impl TyrDrmFileData {
         heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        let vm_id = heapcreate.vm_id as usize;
-        let vm = file.inner().vm_pool().get_vm(vm_id).ok_or(EINVAL)?;
-
-        let pool = file.inner().heap_pools().create_context(
-            ddev,
-            reg_data,
-            vm_id,
-            vm.clone(),
-            heapcreate,
-        )?;
-
-        file.inner().group_pool().set_heap_pool_for_vm(&vm, pool)?;
+        heap::create_context(ddev, reg_data, file.inner().vm_pool(), heapcreate)?;
 
         Ok(0)
     }
@@ -854,7 +837,7 @@ impl TyrDrmFileData {
         heapdestroy: &mut uapi::drm_panthor_tiler_heap_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner().heap_pools().destroy_context(heapdestroy)?;
+        heap::destroy_context(file.inner().vm_pool(), heapdestroy)?;
 
         Ok(0)
     }
