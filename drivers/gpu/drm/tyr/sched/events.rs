@@ -159,6 +159,10 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
         };
 
         guard.registration_data_with(|reg_data| {
+            // The heap pool mutex must not be taken under the scheduler
+            // mutex, so fetch the pool before locking the scheduler.
+            let heap_pool = this.vm.heap_pool();
+
             // Service only the OOMs pending now, so a re-raised OOM cannot starve
             // the others. The IRQ handler records an OOM and requeues the work
             // under the scheduler mutex, so an OOM recorded later gets a new run.
@@ -196,7 +200,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
                     );
                     Err(EINVAL)
                 } else {
-                    this.get_heap_pool().ok_or(EINVAL).and_then(|pool| {
+                    heap_pool.as_ref().ok_or(EINVAL).and_then(|pool| {
                         pool.grow_heap_context(
                             tdev,
                             reg_data,
@@ -221,7 +225,14 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
 
                 let _ = tdev
                     .with_locked_scheduler(|sched| {
-                        sched.finish_pending_tiler_oom(tdev, reg_data, &this, &oom, outcome)
+                        sched.finish_pending_tiler_oom(
+                            tdev,
+                            reg_data,
+                            &this,
+                            &oom,
+                            outcome,
+                            heap_pool.as_ref(),
+                        )
                     })
                     .inspect_err(|err| {
                         dev_err!(
@@ -502,6 +513,7 @@ impl Scheduler {
         group: &Arc<Group>,
         oom: &PendingOom,
         outcome: GrowOutcome,
+        heap_pool: Option<&Arc<heap::Pool>>,
     ) -> Result {
         let (new_chunk_va, cookie) = match outcome {
             GrowOutcome::Grown(va, cookie) => (va, cookie),
@@ -517,7 +529,7 @@ impl Scheduler {
         };
         if !owned {
             if new_chunk_va != 0 {
-                if let Some(pool) = group.get_heap_pool() {
+                if let Some(pool) = heap_pool {
                     let _ = pool
                         .return_chunk(reg_data, oom.heap_address, new_chunk_va, cookie)
                         .inspect_err(|e| {
