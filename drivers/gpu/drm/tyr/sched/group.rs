@@ -69,7 +69,7 @@ use crate::{
         self,
         global::csg::Priority, //
     },
-    gem, heap, pool,
+    gem, pool,
     sched::CsgSlotManager,
     slot::Seat,
     vm::{Vm, VmFlag, VmMapFlags},
@@ -378,8 +378,6 @@ pub(crate) struct Group {
     #[allow(dead_code)]
     pub(super) protm_suspend_buf: gem::KernelBo,
     _syncobjs: Arc<gem::MappedBo>,
-    #[pin]
-    heap_pool: Mutex<Option<Arc<heap::Pool>>>,
     /// Accumulated GPU usage, filled by the job completion path.
     ///
     /// A spinlock, not a mutex, because the accumulation runs inside the
@@ -550,7 +548,6 @@ impl Group {
                 suspend_buf,
                 protm_suspend_buf,
                 _syncobjs: syncobjs,
-                heap_pool <- new_mutex!(file.inner().heap_pools().get_pool(group_args.vm_id as usize)),
                 fdinfo <- new_spinlock!(FdInfo::default()),
                 active: Atomic::new(false),
                 kbo_sizes,
@@ -899,15 +896,6 @@ impl Group {
         self.active.store(active, Relaxed);
     }
 
-    pub(crate) fn set_heap_pool(&self, pool: Arc<heap::Pool>) {
-        *self.heap_pool.lock() = Some(pool);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn get_heap_pool(&self) -> Option<Arc<heap::Pool>> {
-        self.heap_pool.lock().clone()
-    }
-
     pub(super) fn submit(
         self: &Arc<Self>,
         queue_submits: KVec<QueueSubmit>,
@@ -1202,16 +1190,6 @@ impl Pool {
 
     pub(crate) fn group(&self, index: usize) -> Option<Arc<Group>> {
         self.0.get(index)
-    }
-
-    pub(crate) fn set_heap_pool_for_vm(&self, vm: &Arc<Vm>, pool: Arc<heap::Pool>) -> Result {
-        self.0.for_each(|_, group| {
-            if Arc::ptr_eq(&group.vm, vm) {
-                group.set_heap_pool(pool.clone());
-            }
-
-            Ok(())
-        })
     }
 
     /// Drains every group's profiling samples into `stats`.

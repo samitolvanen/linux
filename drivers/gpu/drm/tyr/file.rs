@@ -183,7 +183,6 @@ pub(crate) struct MemoryStats {
 pub(crate) struct TyrDrmFileData {
     vm_pool: vm::Pool,
     group_pool: group::Pool,
-    heap_pools: heap::Pools,
     user_mmio_offset: Atomic<u64>,
     tdev: ARef<TyrDrmDevice>,
     /// Accumulated GPU usage, a spinlock to match the per-group
@@ -211,7 +210,6 @@ impl drm::file::DriverFile for TyrDrmFileData {
             try_pin_init!(Self {
                 vm_pool: vm::Pool::create()?,
                 group_pool: group::Pool::create()?,
-                heap_pools: heap::Pools::create()?,
                 user_mmio_offset: Atomic::new(user_mmio_offset),
                 tdev,
                 stats <- new_spinlock!(Stats::default()),
@@ -243,10 +241,6 @@ impl TyrDrmFileData {
         &self.get_ref().group_pool
     }
 
-    pub(crate) fn heap_pools(self: Pin<&Self>) -> &heap::Pools {
-        &self.get_ref().heap_pools
-    }
-
     pub(crate) fn user_mmio_offset(&self) -> u64 {
         self.user_mmio_offset.load(Relaxed)
     }
@@ -271,27 +265,24 @@ impl TyrDrmFileData {
 
     /// Collects the file's GPU memory footprint.
     ///
-    /// Resident sums each group's kernel BOs and every VM's tiler-heap
+    /// Resident sums each group's kernel BOs and every live VM's tiler-heap
     /// pool. Active counts the groups on a CSG slot and the heap pools
     /// whose VM holds an address-space slot.
     pub(crate) fn gather_mem_info(self: Pin<&Self>) -> MemoryStats {
         let mut stats = MemoryStats::default();
         self.group_pool().gather_mem_info(&mut stats);
 
-        for vm_id in 1..self.vm_pool().index_upper_bound() {
-            if let Some(pool) = self.heap_pools().get_pool(vm_id) {
+        let _ = self.vm_pool().for_each(|_, vm| {
+            if let Some(pool) = vm.heap_pool() {
                 let size = pool.total_size() as u64;
                 stats.resident += size;
-                if self
-                    .vm_pool()
-                    .get_vm(vm_id)
-                    .and_then(|vm| vm.as_slot())
-                    .is_some()
-                {
+                if vm.as_slot().is_some() {
                     stats.active += size;
                 }
             }
-        }
+
+            Ok(())
+        });
 
         stats
     }
@@ -865,14 +856,7 @@ impl TyrDrmFileData {
         heapcreate: &mut uapi::drm_panthor_tiler_heap_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        let vm_id = heapcreate.vm_id as usize;
-        let vm = file.inner().vm_pool().get_vm(vm_id).ok_or(EINVAL)?;
-        let pool = file
-            .inner()
-            .heap_pools()
-            .create_context(ddev, vm_id, vm.clone(), heapcreate)?;
-
-        file.inner().group_pool().set_heap_pool_for_vm(&vm, pool)?;
+        heap::create_context(ddev, file.inner().vm_pool(), heapcreate)?;
 
         Ok(0)
     }
@@ -882,7 +866,7 @@ impl TyrDrmFileData {
         heapdestroy: &mut uapi::drm_panthor_tiler_heap_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner().heap_pools().destroy_context(heapdestroy)?;
+        heap::destroy_context(file.inner().vm_pool(), heapdestroy)?;
 
         Ok(0)
     }
