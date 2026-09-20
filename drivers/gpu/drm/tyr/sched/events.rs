@@ -157,16 +157,16 @@ impl WorkItem<2> for Group {
 }
 
 impl Scheduler {
-    pub(crate) fn process_csg_irqs(&mut self, mut events: u32, tdev: &TyrDrmDevice) -> Result {
+    pub(crate) fn process_csg_irqs(&mut self, mut events: u32, tdev: &TyrDrmDevice) {
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            self.process_csg_irq(tdev, csg_id)?;
+            if let Err(e) = self.process_csg_irq(tdev, csg_id) {
+                pr_err!("Failed to process the CSG slot {} IRQ: {:?}\n", csg_id, e);
+            }
             events &= !mask;
         }
-
-        Ok(())
     }
 
     pub(super) fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result {

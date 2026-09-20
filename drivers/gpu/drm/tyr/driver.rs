@@ -619,14 +619,10 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             return;
         }
 
-        let _ = tdev
-            .with_locked_scheduler(|sched| sched.process_csg_irqs(events, tdev))
-            .inspect_err(|err| {
-                pr_err!(
-                    "fw_events_work: failed to process firmware CSG IRQs: {:?}\n",
-                    err
-                );
-            });
+        let _ = tdev.with_locked_scheduler(|sched| {
+            sched.process_csg_irqs(events, tdev);
+            Ok(())
+        });
 
         // A CSG IRQ that the firmware raised for any of the slots we
         // own is by definition an observable state change from the
