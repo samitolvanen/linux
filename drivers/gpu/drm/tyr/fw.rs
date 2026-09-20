@@ -399,77 +399,86 @@ impl Firmware {
         // SAFETY: `new` is only called from probe, so the device is bound.
         let dev = unsafe { pdev.as_ref().as_bound() };
 
-        let mut sections = KVec::new();
-        for parsed in parsed_sections {
-            let ParsedSection {
-                data,
-                va,
-                vm_map_flags,
-                section_flags,
-            } = parsed;
-            let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
-            let va = u64::from(va.start);
-            let end = va + size;
+        let result = (|| {
+            let mut sections = KVec::new();
+            for parsed in parsed_sections {
+                let ParsedSection {
+                    data,
+                    va,
+                    vm_map_flags,
+                    section_flags,
+                } = parsed;
+                let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
+                let va = u64::from(va.start);
+                let end = va + size;
 
-            let mem = KernelBo::new(
-                ddev,
-                vm.as_arc_borrow(),
-                size,
-                KernelBoVaAlloc::Explicit(va),
-                vm_map_flags,
-                coherent,
-            )?;
+                let mem = KernelBo::new(
+                    ddev,
+                    vm.as_arc_borrow(),
+                    size,
+                    KernelBoVaAlloc::Explicit(va),
+                    vm_map_flags,
+                    coherent,
+                )?;
 
-            let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
-            let auto_va_end = auto_va_start + u64::from(CSF_MCU_SHARED_REGION_SIZE);
-            if end > auto_va_start && va < auto_va_end {
-                vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
+                let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
+                let auto_va_end = auto_va_start + u64::from(CSF_MCU_SHARED_REGION_SIZE);
+                if end > auto_va_start && va < auto_va_end {
+                    vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
+                }
+
+                let vmap = mem.bo.owned_vmap::<0>()?;
+                Self::init_section_mem(&vmap, &data, section_flags)?;
+
+                let sgt = mem.bo.owned_sg_table(dev)?;
+                Self::sync_section(pdev.as_ref(), &sgt)?;
+
+                sections.push(
+                    Section {
+                        data,
+                        section_flags,
+                        vmap,
+                        sgt,
+                        mem,
+                    },
+                    GFP_KERNEL,
+                )?;
             }
 
-            let vmap = mem.bo.owned_vmap::<0>()?;
-            Self::init_section_mem(&vmap, &data, section_flags)?;
+            let irq_state = irq::JobIrqState::new()?;
+            let shared_section = Self::find_shared_section(&sections)?;
+            let user_as_slot_count = mmu.as_slot_count().saturating_sub(1);
+            let global_iface = GlobalInterface::new(
+                pdev,
+                iomem.clone(),
+                shared_section,
+                *gpu_info,
+                &irq_state,
+                user_as_slot_count,
+            )?;
 
-            let sgt = mem.bo.owned_sg_table(dev)?;
-            Self::sync_section(pdev.as_ref(), &sgt)?;
-
-            sections.push(
-                Section {
-                    data,
-                    section_flags,
-                    vmap,
-                    sgt,
-                    mem,
-                },
+            let vm = vm.clone();
+            let firmware = Arc::pin_init(
+                try_pin_init!(Firmware {
+                    pdev: pdev.into(),
+                    iomem,
+                    vm,
+                    sections,
+                    irq_state,
+                    unclean_stop: Atomic::new(false),
+                    global_iface <- global_iface,
+                }),
                 GFP_KERNEL,
             )?;
+
+            Ok(firmware)
+        })();
+
+        if result.is_err() {
+            vm.kill();
         }
 
-        let irq_state = irq::JobIrqState::new()?;
-        let shared_section = Self::find_shared_section(&sections)?;
-        let user_as_slot_count = mmu.as_slot_count().saturating_sub(1);
-        let global_iface = GlobalInterface::new(
-            pdev,
-            iomem.clone(),
-            shared_section,
-            *gpu_info,
-            &irq_state,
-            user_as_slot_count,
-        )?;
-
-        let firmware = Arc::pin_init(
-            try_pin_init!(Firmware {
-                pdev: pdev.into(),
-                iomem,
-                vm,
-                sections,
-                irq_state,
-                unclean_stop: Atomic::new(false),
-                global_iface <- global_iface,
-            }),
-            GFP_KERNEL,
-        )?;
-
-        Ok(firmware)
+        result
     }
 
     /// Polls `MCU_STATUS` until it reaches `target` and `acked` returns
