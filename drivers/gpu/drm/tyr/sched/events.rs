@@ -187,16 +187,21 @@ impl Scheduler {
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         mut events: u32,
-    ) -> Result {
+    ) {
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            self.process_csg_irq(tdev, fw, csg_id)?;
+            if let Err(e) = self.process_csg_irq(tdev, fw, csg_id) {
+                dev_err!(
+                    tdev.as_ref(),
+                    "Failed to process the CSG slot {} IRQ: {:?}\n",
+                    csg_id,
+                    e
+                );
+            }
             events &= !mask;
         }
-
-        Ok(())
     }
 
     pub(super) fn process_csg_irq(
