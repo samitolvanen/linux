@@ -1014,9 +1014,9 @@ impl Scheduler {
                     }
                     _ => {
                         // Other reasons (`SbWait`, `ProgressWait`,
-                        // `Deferred`, `Resource`, `Flush`) do not
-                        // count as scheduler-visible blocks: the
-                        // queue is still considered runnable.
+                        // `Deferred`, `Resource`, `Flush`, `Unknown`)
+                        // do not count as scheduler-visible blocks.
+                        // The queue is still considered runnable.
                     }
                 }
 
