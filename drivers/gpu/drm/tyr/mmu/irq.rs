@@ -14,9 +14,14 @@ use kernel::{
     devres::Devres,
     io::Io,
     irq::ThreadedRegistration,
+    new_spinlock,
     platform,
     prelude::*,
-    sync::{aref::ARef, Arc},
+    sync::{
+        aref::ARef,
+        Arc,
+        SpinLock, //
+    }, //
 };
 
 use crate::{
@@ -35,23 +40,81 @@ use crate::{
 
 const PAGE_FAULT_BITS: u16 = ((1u32 << MAX_AS) - 1) as u16;
 
-/// Returns the MMU IRQ mask the driver actively services.
-pub(crate) fn mmu_interrupts_mask() -> u32 {
-    mmu_control::IRQ_MASK::zeroed()
-        .with_page_fault(PAGE_FAULT_BITS)
-        .into_raw()
+/// Live `IRQ_MASK` value for the page-fault sources, one bit per hardware
+/// AS slot.
+///
+/// The lock covers the `IRQ_MASK` write and the value. The hard handler
+/// never takes the lock, and `mmu_irq_disable` writes `IRQ_MASK` without
+/// it, so a quiesced window must run no AS programming.
+#[pin_data]
+pub(crate) struct PageFaultMask {
+    #[pin]
+    mask: SpinLock<u32>,
+}
+
+impl PageFaultMask {
+    /// Creates a mask with every slot masked.
+    pub(super) fn new() -> impl PinInit<Self> {
+        pin_init!(Self {
+            mask <- new_spinlock!(0),
+        })
+    }
+
+    /// Returns the mask, for filtering `IRQ_RAWSTAT`.
+    fn get(&self) -> u32 {
+        *self.mask.lock()
+    }
+
+    /// Masks every slot, for a reset that left them all unprogrammed.
+    pub(super) fn mask_all(&self, io: &IoMem) {
+        let mut mask = self.mask.lock();
+
+        *mask = 0;
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+    }
+
+    /// Unmasks AS slot `as_nr`, dropping the faults it latched while masked.
+    ///
+    /// The caller passes a present slot and holds the AS slot manager lock.
+    pub(super) fn unmask_slot(&self, io: &IoMem, as_nr: usize) {
+        let bit = 1u32 << as_nr;
+        let mut mask = self.mask.lock();
+
+        *mask |= bit;
+        io.write_reg(mmu_control::IRQ_CLEAR::from_raw(bit));
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+    }
+
+    /// Masks AS slot `as_nr`.
+    ///
+    /// The caller requirements of `unmask_slot` apply.
+    pub(super) fn mask_slot(&self, io: &IoMem, as_nr: usize) {
+        let mut mask = self.mask.lock();
+
+        *mask &= !(1u32 << as_nr);
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+    }
+
+    /// Clears the latched faults of the slots in the mask and unmasks them.
+    pub(super) fn enable(&self, io: &IoMem) {
+        let mask = self.mask.lock();
+
+        io.write_reg(mmu_control::IRQ_CLEAR::from_raw(*mask));
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+    }
+
+    /// Writes the mask back to `IRQ_MASK`.
+    fn restore(&self, io: &IoMem) {
+        let mask = self.mask.lock();
+
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+    }
 }
 
 pub(crate) struct MmuIrq {
     iomem: Arc<Devres<IoMem>>,
-    /// Cached value of `mmu_interrupts_mask`.
-    mask: u32,
-}
-
-/// Clears latched MMU IRQs and unmasks the sources the driver handles.
-pub(crate) fn mmu_irq_enable(io: &IoMem) {
-    io.write_reg(mmu_control::IRQ_CLEAR::from_raw(u32::MAX));
-    io.write_reg(mmu_control::IRQ_MASK::from_raw(mmu_interrupts_mask()));
+    /// Live page-fault IRQ mask, shared with the AS manager.
+    fault_mask: Arc<PageFaultMask>,
 }
 
 /// Masks all MMU IRQ sources.
@@ -63,13 +126,13 @@ pub(crate) fn mmu_irq_init<'a>(
     tdev: ARef<TyrDrmDevice>,
     pdev: &'a platform::Device<Bound>,
     iomem: Arc<Devres<IoMem>>,
+    fault_mask: Arc<PageFaultMask>,
 ) -> Result<impl PinInit<ThreadedRegistration<TyrIrq<MmuIrq>>, Error> + 'a> {
-    let mask = mmu_interrupts_mask();
     let io = iomem.access(pdev.as_ref())?;
     // The caller unmasks the sources once the handler is registered.
     io.write_reg(mmu_control::IRQ_MASK::from_raw(0));
 
-    let irq_type = MmuIrq { iomem, mask };
+    let irq_type = MmuIrq { iomem, fault_mask };
     TyrIrq::request(pdev, tdev, c_str!("mmu"), c_str!("mmu"), irq_type)
 }
 
@@ -89,7 +152,7 @@ impl TyrIrqTrait for MmuIrq {
 
     fn reenable(&self, dev: &Device<Bound>) {
         if let Ok(io) = self.iomem.access(dev) {
-            io.write_reg(mmu_control::IRQ_MASK::from_raw(self.mask()));
+            self.fault_mask.restore(io);
         }
     }
 
@@ -107,7 +170,7 @@ impl TyrIrqTrait for MmuIrq {
     }
 
     fn mask(&self) -> u32 {
-        self.mask
+        self.fault_mask.get()
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
