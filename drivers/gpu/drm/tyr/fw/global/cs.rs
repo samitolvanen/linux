@@ -370,7 +370,7 @@ impl CsInterface {
         };
 
         let wait = enabled.cs_output.read(CS_STATUS_WAIT);
-        let condition = wait.sync_wait_condition()?;
+        let condition = wait.sync_wait_condition();
         let sync64 = wait.sync_wait_size();
 
         let sync_ptr = enabled
