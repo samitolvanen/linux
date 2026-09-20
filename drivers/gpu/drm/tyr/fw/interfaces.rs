@@ -1380,6 +1380,8 @@ pub(super) mod cs {
     }
 
     /// CS wait condition (csf_wait_condition_t in spec).
+    ///
+    /// Encodings other than `Gt` decode to `Le`.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsWaitCondition {
@@ -1389,14 +1391,11 @@ pub(super) mod cs {
         Gt = 1,
     }
 
-    impl TryFrom<Bounded<u32, 4>> for CsWaitCondition {
-        type Error = Error;
-
-        fn try_from(val: Bounded<u32, 4>) -> Result<Self, Self::Error> {
+    impl From<Bounded<u32, 4>> for CsWaitCondition {
+        fn from(val: Bounded<u32, 4>) -> Self {
             match val.get() {
-                0 => Ok(CsWaitCondition::Le),
-                1 => Ok(CsWaitCondition::Gt),
-                _ => Err(EINVAL),
+                1 => CsWaitCondition::Gt,
+                _ => CsWaitCondition::Le,
             }
         }
     }
@@ -1766,7 +1765,7 @@ pub(super) mod cs {
                 /// Source of scoreboard wait status, if any.
                 19:16 sb_source ?=> CsSbWaitSource;
                 /// SYNC_WAIT condition.
-                27:24 sync_wait_condition ?=> CsWaitCondition;
+                27:24 sync_wait_condition => CsWaitCondition;
                 /// Waiting for PROGRESS_WAIT instruction.
                 28:28 progress_wait => bool;
                 /// Waiting for protected execution.
