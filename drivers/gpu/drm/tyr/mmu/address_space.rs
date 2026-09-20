@@ -52,6 +52,7 @@ use kernel::{
 use crate::{
     driver::IoMem,
     mmu::{
+        irq::PageFaultMask,
         AsSlotManager,
         Mmu, //
     },
@@ -277,6 +278,9 @@ pub(crate) struct AddressSpaceManager {
     /// Bitmask of available address space slots from GPU_AS_PRESENT register.
     as_present: u32,
 
+    /// Live page-fault IRQ mask, shared with the MMU IRQ handler.
+    fault_mask: Arc<PageFaultMask>,
+
     /// Whether hardware AS slot N currently holds a region lock.
     ///
     /// The lock is tracked per slot. Every Lock and Unlock on a slot goes
@@ -344,11 +348,13 @@ impl AddressSpaceManager {
         iomem: ArcBorrow<'_, Devres<IoMem>>,
         as_present: u32,
         reset: ResetHandle,
+        fault_mask: Arc<PageFaultMask>,
     ) -> Result<AddressSpaceManager> {
         Ok(Self {
             pdev: pdev.into(),
             iomem: iomem.into(),
             as_present,
+            fault_mask,
             lock_pending: [false; MAX_AS],
             faulty: [false; MAX_AS],
             stuck: [false; MAX_AS],
@@ -447,6 +453,8 @@ impl AddressSpaceManager {
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
 
+        self.fault_mask.unmask_slot(io, as_nr);
+
         let transtab = as_config.transtab;
         io.write(
             TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
@@ -491,6 +499,13 @@ impl AddressSpaceManager {
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_disable(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
+
+        {
+            let dev = self.dev();
+            let io = self.iomem.access(dev)?;
+
+            self.fault_mask.mask_slot(io, as_nr);
+        }
 
         self.gpu_flush_caches(
             FlushMode::CleanInvalidate,

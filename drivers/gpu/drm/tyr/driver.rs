@@ -117,7 +117,6 @@ use crate::{
     mmap,
     mmu::{
         irq::{
-            mmu_irq_enable,
             mmu_irq_init,
             MmuIrq, //
         },
@@ -938,11 +937,17 @@ impl platform::Driver for TyrPlatformDriverData {
         }
 
         let mmu_irq = Arc::pin_init(
-            mmu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
+            mmu_irq_init(
+                tdev.clone(),
+                pdev,
+                tdev.iomem.clone(),
+                tdev.mmu.fault_mask.clone(),
+            )?,
             GFP_KERNEL,
         )?;
         tdev.mmu_irq.publish(Devres::new(pdev.as_ref(), mmu_irq)?);
-        tdev.mmu_irq.reset_resume(&tdev.iomem, mmu_irq_enable);
+        tdev.mmu_irq
+            .reset_resume(&tdev.iomem, |io| tdev.mmu.enable_irq(io));
 
         let job_irq = Arc::pin_init(
             job_irq_init(tdev.clone(), pdev, tdev.iomem.clone(), tdev.fw.irq_state())?,
