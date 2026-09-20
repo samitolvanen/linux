@@ -49,6 +49,7 @@ use kernel::{
 
 use crate::{
     mmu::{
+        irq::PageFaultMask,
         AsSlotManager,
         Mmu, //
     },
@@ -217,6 +218,9 @@ pub(crate) struct AddressSpaceManager {
     /// Bitmask of present address space slots from GPU_AS_PRESENT register.
     as_present: u32,
 
+    /// Live page-fault IRQ mask, shared with the MMU IRQ handler.
+    fault_mask: Arc<PageFaultMask>,
+
     /// Whether hardware AS slot N currently holds a region lock.
     ///
     /// The lock is tracked per slot. Every Lock and Unlock on a slot goes
@@ -248,6 +252,7 @@ impl AddressSpaceManager {
         iomem: Arc<DevresIoMem<SZ_2M>>,
         as_present: u32,
         reset: ResetHandle,
+        fault_mask: Arc<PageFaultMask>,
     ) -> Result<AddressSpaceManager> {
         if as_present.trailing_ones() != as_present.count_ones() {
             dev_err!(
@@ -262,6 +267,7 @@ impl AddressSpaceManager {
             pdev: pdev.into(),
             iomem,
             as_present,
+            fault_mask,
             lock_pending: [false; MAX_AS],
             faulty: [false; MAX_AS],
             suspended: false,
@@ -358,6 +364,8 @@ impl AddressSpaceManager {
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
 
+            self.fault_mask.unmask_slot(&io, as_nr);
+
             let transtab = as_config.transtab;
             io.write(
                 TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
@@ -402,6 +410,12 @@ impl AddressSpaceManager {
     fn as_disable(&mut self, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
         self.check_powered()?;
+
+        {
+            let io = self.iomem.try_access().ok_or(ENODEV)?;
+
+            self.fault_mask.mask_slot(&io, as_nr);
+        }
 
         // Reclaiming a slot mid-update leaves the region lock from
         // `as_start_update` unbalanced. Release it before the slot is reused.
