@@ -78,6 +78,10 @@ pub(crate) struct Mmu {
     /// worker. Shared with the reset controller that closes it.
     hw_gate: Arc<HwGate>,
 
+    /// Live page-fault IRQ mask. The AS manager updates it, and the MMU IRQ
+    /// handler reads it.
+    pub(crate) fault_mask: Arc<irq::PageFaultMask>,
+
     /// Manages the allocation of hardware MMU slots to GPU address spaces.
     ///
     /// Tracks which address spaces are currently active in hardware slots and
@@ -103,10 +107,12 @@ impl Mmu {
         let slot_count: usize = present.count_ones().try_into()?;
 
         let hw_gate = reset.hw_gate();
-        let as_manager = AddressSpaceManager::new(pdev, iomem, present, reset)?;
+        let fault_mask = Arc::pin_init(irq::PageFaultMask::new(), GFP_KERNEL)?;
+        let as_manager = AddressSpaceManager::new(pdev, iomem, present, reset, fault_mask.clone())?;
         let mmu_init = try_pin_init!(Self{
             as_slot_count: slot_count,
             hw_gate,
+            fault_mask,
             as_manager <- new_mutex!(SlotManager::new(as_manager, slot_count)?),
         });
         Arc::pin_init(mmu_init, GFP_KERNEL)
@@ -127,6 +133,11 @@ impl Mmu {
     /// caller parked on a closed gate never holds it.
     pub(crate) fn begin_hw_access(&self) -> HwReadGuard<'_> {
         self.hw_gate.read()
+    }
+
+    /// Clears and unmasks the page-fault IRQs of the programmed AS slots.
+    pub(crate) fn enable_irq(&self, io: &IoMem) {
+        self.fault_mask.enable(io);
     }
 
     /// Make a VM active.
@@ -238,9 +249,9 @@ pub(crate) fn pre_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
 
 /// Restores the MMU after a GPU reset.
 ///
-/// The reset left every AS slot unprogrammed, so every recorded
-/// binding is released and the next activation reprograms the slot.
-/// The MMU IRQ is then re-enabled with a full mask rewrite.
+/// The reset left every AS slot unprogrammed, so every recorded binding is
+/// released, the page-fault mask is emptied, and the next activation
+/// reprograms the slot. The MMU IRQ is then re-enabled.
 pub(crate) fn post_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
     {
         // The reset worker holds the closed gate here, so eviction must not
@@ -258,9 +269,13 @@ pub(crate) fn post_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
                 pr_err!("post_reset: releasing AS slot {} failed: {:?}\n", as_idx, e);
             }
         }
+        if let Some(io) = iomem.try_access() {
+            tdev.mmu.fault_mask.mask_all(&io);
+        }
     }
 
-    tdev.mmu_irq.reset_resume(iomem, irq::mmu_irq_enable);
+    tdev.mmu_irq
+        .reset_resume(iomem, |io| tdev.mmu.enable_irq(io));
 }
 
 /// Releases the resident AS slots and stops the MMU IRQ for runtime
@@ -277,6 +292,6 @@ pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDrive
 pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
     let io = data.device.iomem.access(dev.as_ref())?;
     data.device.mmu_irq.clear_suspended();
-    irq::mmu_irq_enable(io);
+    data.device.mmu.enable_irq(io);
     Ok(())
 }
