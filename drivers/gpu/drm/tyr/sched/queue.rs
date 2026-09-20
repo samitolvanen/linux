@@ -710,6 +710,9 @@ impl QueueOps for TyrQueueOps {
             // A concurrent eviction requeues by live ring state, so the
             // bytes committed above are still kicked.
             let tick = match group.tdev.with_locked_scheduler(|sched| {
+                group.with_locked_inner(|inner| {
+                    inner.set_queue_idle(queue_index, false);
+                });
                 sched.mark_group_runnable(group);
                 Ok(sched.submit_tick(group.priority))
             }) {
