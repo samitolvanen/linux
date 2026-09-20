@@ -492,15 +492,10 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
         };
 
         guard.registration_data_with(|reg_data| {
-            let _ = tdev
-                .with_locked_scheduler(|sched| sched.process_csg_irqs(tdev, &reg_data.fw, events))
-                .inspect_err(|err| {
-                    dev_err!(
-                        reg_data.pdev,
-                        "fw_events_work: failed to process firmware CSG IRQs: {:?}\n",
-                        err
-                    );
-                });
+            let _ = tdev.with_locked_scheduler(|sched| {
+                sched.process_csg_irqs(tdev, &reg_data.fw, events);
+                Ok(())
+            });
         });
 
         // A CSG IRQ means firmware state changed on a slot we own. A
