@@ -106,7 +106,6 @@ use crate::{
     mmap,
     mmu::{
         irq::{
-            mmu_irq_enable,
             mmu_irq_init,
             MmuIrq, //
         },
@@ -804,10 +803,17 @@ impl platform::Driver for TyrPlatformDriver {
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
         // is never forgotten.
         let mmu_irq = KBox::pin_init(
-            unsafe { mmu_irq_init(pdev, ARef::from(&*unreg_dev), iomem.clone()) }?,
+            unsafe {
+                mmu_irq_init(
+                    pdev,
+                    ARef::from(&*unreg_dev),
+                    iomem.clone(),
+                    mmu.fault_mask.clone(),
+                )
+            }?,
             GFP_KERNEL,
         )?;
-        unquiesce(&mmu_irq, io, mmu_irq_enable);
+        unquiesce(&mmu_irq, io, |io| mmu.enable_irq(io));
 
         // SAFETY: The registration is owned by `job_irq` and then by
         // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
