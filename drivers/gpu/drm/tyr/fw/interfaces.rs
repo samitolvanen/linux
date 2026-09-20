@@ -1388,21 +1388,22 @@ pub(super) mod cs {
         Resource = 5,
         /// Blocked awaiting completion of a synchronous FLUSH_CACHE2 instruction.
         Flush = 6,
+        /// Reserved encoding, treated as not blocking. The reverse conversion
+        /// casts the discriminant into a four-bit field, so it must stay below 16.
+        Unknown,
     }
 
-    impl TryFrom<Bounded<u32, 4>> for CsBlockedReason {
-        type Error = Error;
-
-        fn try_from(val: Bounded<u32, 4>) -> Result<Self, Self::Error> {
+    impl From<Bounded<u32, 4>> for CsBlockedReason {
+        fn from(val: Bounded<u32, 4>) -> Self {
             match val.get() {
-                0 => Ok(CsBlockedReason::Unblocked),
-                1 => Ok(CsBlockedReason::SbWait),
-                2 => Ok(CsBlockedReason::ProgressWait),
-                3 => Ok(CsBlockedReason::SyncWait),
-                4 => Ok(CsBlockedReason::Deferred),
-                5 => Ok(CsBlockedReason::Resource),
-                6 => Ok(CsBlockedReason::Flush),
-                _ => Err(EINVAL),
+                0 => CsBlockedReason::Unblocked,
+                1 => CsBlockedReason::SbWait,
+                2 => CsBlockedReason::ProgressWait,
+                3 => CsBlockedReason::SyncWait,
+                4 => CsBlockedReason::Deferred,
+                5 => CsBlockedReason::Resource,
+                6 => CsBlockedReason::Flush,
+                _ => CsBlockedReason::Unknown,
             }
         }
     }
@@ -1759,7 +1760,7 @@ pub(super) mod cs {
 
             /// Blocked reason.
             pub CS_STATUS_BLOCKED_REASON(u32) @ 0x60 {
-                3:0 reason ?=> CsBlockedReason;
+                3:0 reason => CsBlockedReason;
             }
 
             /// Sync object test value, high half.
