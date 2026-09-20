@@ -116,7 +116,9 @@ pub(crate) use interfaces::{
 };
 
 /// Maximum number of CSG interfaces supported by hardware.
-pub(crate) const MAX_CSG: usize = 16;
+///
+/// The scheduler addresses only `sched::MAX_CSGS` of these slots.
+pub(crate) const MAX_CSG: usize = 31;
 
 /// Bitmap over CSG slot indices in `[0, MAX_CSG)`.
 ///
@@ -205,7 +207,7 @@ impl CsDbMask {
 }
 
 /// Maximum number of CS interfaces supported by hardware.
-const MAX_CS: usize = 16;
+const MAX_CS: usize = 32;
 
 /// MCU virtual address where the CSF shared memory region starts.
 ///
