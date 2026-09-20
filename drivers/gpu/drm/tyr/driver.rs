@@ -40,6 +40,7 @@ use kernel::{
     },
     math64::div_u64_rem,
     new_mutex,
+    new_spinlock,
     of,
     opp::ConfigToken,
     platform,
@@ -70,7 +71,8 @@ use kernel::{
         },
         Arc,
         Mutex,
-        SetOnce, //
+        SetOnce,
+        SpinLock, //
     },
     time::{
         arch_timer_get_rate,
@@ -355,6 +357,11 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
 
+    /// Shut by unbind to stop the sync-update sweep, the periodic tick
+    /// re-arm and the firmware ping.
+    #[pin]
+    system_work_closed: SpinLock<bool>,
+
     /// Device-wide job profiling enablement bitmask, a combination of
     /// `DEVICE_PROFILING_*`. Read at job submit time and baked into the
     /// wrapped command stream. `0` (the default) disables profiling.
@@ -491,7 +498,18 @@ impl TyrDrmDeviceData {
             .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
     }
 
-    /// Schedules the sync-update worker. Safe from any context.
+    /// Runs `f` unless unbind has stopped the system-workqueue items.
+    ///
+    /// `f` enqueues one of them under a spinlock, so callers must be
+    /// preemptible and `f` must not sleep.
+    fn enqueue_system_work<F: FnOnce()>(&self, f: F) {
+        let closed = self.system_work_closed.lock();
+        if !*closed {
+            f();
+        }
+    }
+
+    /// Schedules the sync-update worker.
     ///
     /// `sync_upd_pending` short-circuits a SYNC_UPDATE storm before it
     /// reaches `queue_work`'s per-pool spinlock, coalescing the burst into
@@ -504,8 +522,10 @@ impl TyrDrmDeviceData {
         {
             return;
         }
-        let _ = workqueue::system_unbound()
-            .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());
+        tdev.enqueue_system_work(|| {
+            let _ = workqueue::system_unbound()
+                .enqueue::<ARef<TyrDrmDevice>, { work_id::SYNC_UPD }>(tdev.clone());
+        });
     }
 
     /// Schedules an immediate scheduler tick on
@@ -528,19 +548,23 @@ impl TyrDrmDeviceData {
         let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
     }
 
-    /// Waits for the tick and firmware-events workers to finish.
+    /// Waits for the tick, firmware-events and sync-update workers to
+    /// finish.
     ///
-    /// Both block bounded. Not callable under the scheduler or CSG
-    /// slot-manager mutexes, nor in a dma-fence signalling section. The
-    /// per-group tiler OOM workers are not flushed. They re-check slot
-    /// ownership and read the acknowledgment from the live interface
-    /// under the scheduler mutex before writing to the firmware. A
-    /// failed heap growth can still queue a fresh tick after this
-    /// returns, so callers gate the tick first.
+    /// All block bounded. Not callable under the scheduler, CSG
+    /// slot-manager or per-VM gpuvm mutexes, nor with a BO reservation
+    /// lock held, nor from a reclaim worker, nor in a dma-fence
+    /// signalling section. The per-group tiler OOM workers are not
+    /// flushed. They re-check slot ownership and read the acknowledgment
+    /// from the live interface under the scheduler mutex before writing
+    /// to the firmware. A failed heap growth can still queue a fresh
+    /// tick after this returns, so callers gate the tick first.
     pub(crate) fn drain_sched_work(&self) {
         let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
         let _ =
             workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::FW_EVENTS }>(self);
+        let _ =
+            workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::SYNC_UPD }>(self);
     }
 
     /// Re-arms the scheduler tick `delay` jiffies from now.
@@ -550,8 +574,13 @@ impl TyrDrmDeviceData {
     /// To force an earlier tick, call `schedule_tick`
     /// directly.
     pub(crate) fn schedule_periodic_tick(tdev: &ARef<TyrDrmDevice>, delay: Jiffies) {
-        let _ = workqueue::system_unbound()
-            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(tdev.clone(), delay);
+        tdev.enqueue_system_work(|| {
+            let _ = workqueue::system_unbound()
+                .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::PERIODIC_TICK }>(
+                    tdev.clone(),
+                    delay,
+                );
+        });
     }
 
     /// Arms the firmware ping watchdog `PING_INTERVAL_MS` from now.
@@ -559,19 +588,34 @@ impl TyrDrmDeviceData {
     /// Called at global-interface enable and re-arm, so the watchdog only
     /// runs while the firmware interface is live.
     pub(crate) fn arm_fw_ping(tdev: &ARef<TyrDrmDevice>) {
-        let _ = workqueue::system_unbound()
-            .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::FW_PING }>(
-                tdev.clone(),
-                msecs_to_jiffies(PING_INTERVAL_MS),
-            );
+        tdev.enqueue_system_work(|| {
+            let _ = workqueue::system_unbound()
+                .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::FW_PING }>(
+                    tdev.clone(),
+                    msecs_to_jiffies(PING_INTERVAL_MS),
+                );
+        });
     }
 
     /// Cancels the firmware ping watchdog and waits for an in-flight ping.
     ///
-    /// Called before the firmware is halted for a suspend or reset so no
-    /// ping reaches a stopped MCU. Must run in process context.
+    /// Called before the firmware is halted for a suspend, a reset or
+    /// unbind so no ping reaches a stopped MCU. Must run in process
+    /// context.
     pub(crate) fn cancel_fw_ping(&self) {
         let _ = self.fw_ping_work.cancel_sync();
+    }
+
+    /// Stops the system-workqueue items and waits for the in-flight runs.
+    ///
+    /// The gate is shut and released before the cancels, since a running
+    /// ping re-arms itself under the gate. Must run in process context.
+    /// Same lock rules as `drain_sched_work`.
+    pub(crate) fn stop_system_work(&self) {
+        *self.system_work_closed.lock() = true;
+        let _ = self.sync_upd_work.cancel_sync();
+        let _ = self.periodic_tick_work.cancel_sync();
+        self.cancel_fw_ping();
     }
 }
 
@@ -888,6 +932,7 @@ impl platform::Driver for TyrPlatformDriverData {
                 sync_upd_pending: AtomicBool::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
+                system_work_closed <- new_spinlock!(false),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
                 devfreq_data,
@@ -1014,6 +1059,7 @@ impl platform::Driver for TyrPlatformDriverData {
         // Runtime PM outlives unbind, so refuse resumes before any teardown
         // starts.
         this.device.set_unbinding();
+        this.device.stop_system_work();
         this.device.reset.unbind();
         drop(this.devfreq_registration.lock().take());
         Self::suspend_at_unbind(pdev, this);
@@ -1023,9 +1069,6 @@ impl platform::Driver for TyrPlatformDriverData {
         // Let the queued terminations hand their groups to the cleanup
         // workqueue before the module can exit.
         this.device.term_wq.flush();
-        // Cancel the watchdog last. Both the reset worker and a resume that
-        // was already in flight when `unbinding` was set re-arm it.
-        this.device.cancel_fw_ping();
     }
 }
 
