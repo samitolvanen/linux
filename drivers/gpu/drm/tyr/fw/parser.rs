@@ -19,6 +19,7 @@ use kernel::{
     device::Device,
     impl_flags,
     prelude::*,
+    sizes::SZ_4K,
     str::CString, //
 };
 
@@ -280,6 +281,7 @@ impl<'a> FwParser<'a> {
             inner: None,
         };
 
+        let firmware_size = self.cursor.len();
         let entry_size = entry_section.entry_hdr.size() as usize;
 
         if self.cursor.pos() % size_of::<u32>() != 0
@@ -313,7 +315,7 @@ impl<'a> FwParser<'a> {
             match entry_section.entry_hdr.entry_type() {
                 Ok(EntryType::Iface) => Ok(EntrySection {
                     entry_hdr: entry_section.entry_hdr,
-                    inner: Self::parse_section_entry(&mut entry_cursor, fw_data)?,
+                    inner: Self::parse_section_entry(&mut entry_cursor, fw_data, firmware_size)?,
                 }),
                 Ok(EntryType::BuildInfoMetadata) => {
                     Self::parse_build_info(dev, &mut entry_cursor, fw_data)?;
@@ -372,6 +374,7 @@ impl<'a> FwParser<'a> {
     fn parse_section_entry(
         entry_cursor: &mut Cursor<'_>,
         fw_data: &[u8],
+        firmware_size: usize,
     ) -> Result<Option<ParsedSection>> {
         let section_hdr: SectionHeader = SectionHeader::new(entry_cursor)?;
 
@@ -384,11 +387,30 @@ impl<'a> FwParser<'a> {
             return Err(EINVAL);
         }
 
+        if section_hdr.data.end as usize > firmware_size {
+            pr_err!(
+                "Firmware data range {:#x}..{:#x} exceeds firmware size {:#x}\n",
+                section_hdr.data.start,
+                section_hdr.data.end,
+                firmware_size,
+            );
+            return Err(EINVAL);
+        }
+
         if section_hdr.va.end < section_hdr.va.start {
             pr_err!(
                 "Firmware corrupted, section_hdr.va.end < section_hdr.va.start (0x{:x} < 0x{:x})\n",
                 section_hdr.va.end,
                 section_hdr.va.start
+            );
+            return Err(EINVAL);
+        }
+
+        if section_hdr.va.start as usize % SZ_4K != 0 || section_hdr.va.end as usize % SZ_4K != 0 {
+            pr_err!(
+                "Firmware virtual address range {:#x}..{:#x} is not page aligned\n",
+                section_hdr.va.start,
+                section_hdr.va.end
             );
             return Err(EINVAL);
         }
