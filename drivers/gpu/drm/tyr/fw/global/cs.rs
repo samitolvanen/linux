@@ -396,7 +396,7 @@ impl CsInterface {
             CsInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        enabled.cs_output.read(CS_STATUS_BLOCKED_REASON).reason()
+        Ok(enabled.cs_output.read(CS_STATUS_BLOCKED_REASON).reason())
     }
 
     /// Reads `CS_STATUS_SCOREBOARDS.nonzero`.
