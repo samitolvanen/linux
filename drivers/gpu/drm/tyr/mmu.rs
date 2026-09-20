@@ -74,6 +74,10 @@ pub(crate) struct Mmu {
     /// worker. Shared with the reset controller that closes it.
     hw_gate: Arc<HwGate>,
 
+    /// Live page-fault IRQ mask. The AS manager updates it, and the MMU IRQ
+    /// handler reads it.
+    pub(crate) fault_mask: Arc<irq::PageFaultMask>,
+
     /// Slot Manager instance used to allocate hardware slots and write to MMU registers.
     #[pin]
     pub(crate) as_manager: Mutex<AsSlotManager>,
@@ -91,7 +95,9 @@ impl Mmu {
         let slot_count: usize = present.count_ones().try_into()?;
 
         let hw_gate = reset.hw_gate();
-        let address_space_manager = AddressSpaceManager::new(pdev, iomem, present, reset)?;
+        let fault_mask = Arc::pin_init(irq::PageFaultMask::new(), GFP_KERNEL)?;
+        let address_space_manager =
+            AddressSpaceManager::new(pdev, iomem, present, reset, fault_mask.clone())?;
         let as_slot_manager =
             SlotManager::new(address_space_manager, slot_count).inspect_err(|e| {
                 dev_err!(
@@ -104,6 +110,7 @@ impl Mmu {
         let mmu_init = try_pin_init!(Self{
             as_slot_count: slot_count,
             hw_gate,
+            fault_mask,
             as_manager <- new_mutex!(as_slot_manager),
         });
         Arc::pin_init(mmu_init, GFP_KERNEL)
@@ -124,6 +131,11 @@ impl Mmu {
     /// caller parked on a closed gate never holds it.
     pub(crate) fn begin_hw_access(&self) -> HwReadGuard<'_> {
         self.hw_gate.read()
+    }
+
+    /// Clears and unmasks the page-fault IRQs of the programmed AS slots.
+    pub(crate) fn enable_irq(&self, io: &IoMem<'_>) {
+        self.fault_mask.enable(io);
     }
 
     /// Assign a VM to an AS slot, provide a translation table,
@@ -234,9 +246,9 @@ pub(crate) fn pre_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 
 /// Restores the MMU after a GPU reset.
 ///
-/// The reset left every AS slot unprogrammed, so every recorded
-/// binding is released and the next activation reprograms the slot.
-/// The MMU IRQ is then re-enabled with a full mask rewrite.
+/// The reset left every AS slot unprogrammed, so every recorded binding is
+/// released, the page-fault mask is emptied, and the next activation
+/// reprograms the slot. The MMU IRQ is then re-enabled.
 pub(crate) fn post_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
     {
         // The reset worker holds the closed gate here, so eviction must not
@@ -259,9 +271,10 @@ pub(crate) fn post_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) 
                 );
             }
         }
+        reg_data.mmu.fault_mask.mask_all(io);
     }
 
-    unquiesce(&reg_data.mmu_irq, io, irq::mmu_irq_enable);
+    unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
 }
 
 /// Releases the resident AS slots and stops the MMU IRQ for runtime
@@ -273,5 +286,5 @@ pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 
 /// Re-enables the MMU IRQ for runtime resume.
 pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
-    unquiesce(&reg_data.mmu_irq, io, irq::mmu_irq_enable);
+    unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
 }
