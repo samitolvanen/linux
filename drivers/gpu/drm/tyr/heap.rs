@@ -7,6 +7,7 @@ use kernel::{
     drm::gem::BaseObject,
     io::Io,
     kvec,
+    page::PAGE_SIZE,
     prelude::*,
     sync::{
         atomic::{
@@ -236,11 +237,9 @@ impl Pool {
             return Err(EINVAL);
         }
 
-        let aligned = args
-            .chunk_size
-            .checked_next_multiple_of(4096)
-            .ok_or(EINVAL)?;
-        if args.chunk_size != aligned {
+        let size = args.chunk_size as usize;
+        let aligned = size.checked_next_multiple_of(PAGE_SIZE).ok_or(EINVAL)?;
+        if size != aligned {
             return Err(EINVAL);
         }
 
@@ -413,7 +412,7 @@ impl Pool {
         let chunk_start = chunk_bo.kernel_va().ok_or(EINVAL)?.start;
 
         Ok((
-            (chunk_start & CHUNK_SIZE_MASK) | (chunk_bo.size() as u64 >> 12),
+            (chunk_start & CHUNK_SIZE_MASK) | (u64::from(chunk_size) >> 12),
             cookie,
         ))
     }
