@@ -467,7 +467,7 @@ impl Group {
                     list_state: GroupListState::None,
                     csg_id: None,
                     blocked_queues: 0,
-                    idle_queues: 0,
+                    idle_queues: u32::MAX >> (u32::BITS - queue_count as u32),
                     fatal_queues: 0,
                     fatal_error: None,
                     timedout: false,
