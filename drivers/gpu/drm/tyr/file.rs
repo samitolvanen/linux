@@ -776,6 +776,10 @@ impl TyrDrmFileData {
         groupcreate: &mut uapi::drm_panthor_group_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
+        if ddev.is_unusable() {
+            return Err(ENODEV);
+        }
+
         file.inner()
             .group_pool()
             .create_group(ddev, reg_data, groupcreate, file)?;
@@ -797,11 +801,15 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn group_submit(
-        _ddev: &TyrDrmDevice<Registered>,
+        ddev: &TyrDrmDevice<Registered>,
         reg_data: &TyrDrmRegistrationData<'_>,
         groupsubmit: &mut uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result<u32> {
+        if ddev.is_unusable() {
+            return Err(ENODEV);
+        }
+
         file.inner()
             .group_pool()
             .submit_group(&reg_data.csif_info, groupsubmit, file)?;

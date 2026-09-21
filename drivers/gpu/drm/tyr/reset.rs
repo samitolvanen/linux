@@ -221,6 +221,13 @@ impl Controller {
             return;
         };
 
+        // Nothing runs on a device marked unusable, so close the request
+        // instead of resetting again.
+        if tdev.is_unusable() {
+            self.consume_request();
+            return;
+        }
+
         // The registration data owns the firmware the reboot below needs.
         // Registration ends at unbind, which also empties the device slot,
         // so treat a missing guard like a missing device.
@@ -246,6 +253,14 @@ impl Controller {
         let reset_result = guard.registration_data_with(|reg_data| {
             let parked = tick::pre_reset(&tdev, reg_data);
             let reset_result = run_hw_reset(&tdev, reg_data, &self.gate);
+
+            // Set before the termination sweep in `tick::post_reset`. A
+            // concurrent `create_group` then either sees the flag or has its
+            // group terminated by the sweep.
+            if reset_result.is_err() {
+                tdev.mark_unusable();
+            }
+
             tick::post_reset(&tdev, parked, reset_result.is_err());
 
             match reset_result {
@@ -313,9 +328,6 @@ pub(crate) fn run_hw_reset(
             "Firmware reboot after reset failed: {:?}\n",
             e
         );
-
-        // TODO: Unplug the GPU.
-        // There is no API for unplugging the GPU.
     }
 
     reset_result.and(reboot_result)
