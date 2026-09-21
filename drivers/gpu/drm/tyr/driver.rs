@@ -393,9 +393,10 @@ pub(crate) struct TyrDrmDeviceData {
     /// cannot serve instead, since resume clears it.
     pub(crate) unbinding: Atomic<bool>,
 
-    /// Set when a GPU reset fails, never cleared: the device is unusable
-    /// until unbind. `Relaxed` suffices, since `create_group` reads it
-    /// under the scheduler lock that orders it against the reset sweep.
+    /// Set when a GPU reset or a runtime resume fails, never cleared: the
+    /// device is unusable until unbind. `Relaxed` suffices, since
+    /// `create_group` reads it under the scheduler lock that orders it
+    /// against the group sweep.
     unusable: Atomic<bool>,
 
     #[pin]
@@ -438,7 +439,7 @@ impl TyrDrmDeviceData {
         f(sched.enabled_mut()?)
     }
 
-    /// Returns whether a failed reset has left the device unusable.
+    /// Returns whether a failed reset or resume has left the device unusable.
     pub(crate) fn is_unusable(&self) -> bool {
         self.unusable.load(Relaxed)
     }
