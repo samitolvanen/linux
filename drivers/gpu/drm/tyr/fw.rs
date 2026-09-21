@@ -563,7 +563,7 @@ impl Firmware {
         )
     }
 
-    fn stop_mcu(&self) {
+    pub(crate) fn stop_mcu(&self) {
         {
             let Some(io) = self.iomem.try_access() else {
                 return;
