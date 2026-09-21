@@ -307,6 +307,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// it.
     pub(crate) unbinding: Atomic<bool>,
 
+    /// Set when a GPU reset fails, never cleared: the device is unusable
+    /// until unbind. `Relaxed` suffices, since `create_group` reads it
+    /// under the scheduler lock that orders it against the reset sweep.
+    unusable: Atomic<bool>,
+
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
 
@@ -321,6 +326,16 @@ impl TyrDrmDeviceData {
     {
         let mut sched = self.sched.lock();
         f(sched.enabled_mut()?)
+    }
+
+    /// Returns whether a failed reset has left the device unusable.
+    pub(crate) fn is_unusable(&self) -> bool {
+        self.unusable.load(Relaxed)
+    }
+
+    /// Marks the device unusable. Never undone.
+    pub(crate) fn mark_unusable(&self) {
+        self.unusable.store(true, Relaxed);
     }
 
     /// Accumulates `bits` into the firmware-events word.
@@ -808,6 +823,7 @@ impl platform::Driver for TyrPlatformDriver {
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
                 unbinding: Atomic::new(false),
+                unusable: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
             }? Error),

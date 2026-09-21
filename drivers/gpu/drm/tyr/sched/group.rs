@@ -1045,7 +1045,13 @@ impl Pool {
         let group = Group::create(ddev, reg_data, file, groupcreate, queue_args)?;
         let reservation = self.0.reserve()?;
 
-        if let Err(e) = ddev.with_locked_scheduler(|sched| sched.add_group(group.clone())) {
+        if let Err(e) = ddev.with_locked_scheduler(|sched| {
+            if ddev.is_unusable() {
+                return Err(ENODEV);
+            }
+
+            sched.add_group(group.clone())
+        }) {
             reservation.release();
             return Err(e);
         }
