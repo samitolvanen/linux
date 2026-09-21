@@ -131,6 +131,10 @@ macro_rules! build_scheduling_rules {
 /// Otherwise the tick stays idle until something requests it via
 /// `Scheduler::request_tick`.
 pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
+    if tdev.is_unusable() {
+        return Ok(());
+    }
+
     // The token blocks a suspend mid-tick without itself resuming. When the
     // device is down the tick defers, holding a usage reference for any
     // runnable work so the asynchronous resume reissues the tick.

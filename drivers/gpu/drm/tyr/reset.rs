@@ -221,6 +221,15 @@ impl Controller {
             return;
         };
 
+        // Nothing runs on a device marked unusable, so close the request
+        // instead of resetting again.
+        if tdev.is_unusable() {
+            if self.claim_pending() {
+                self.finish_reset();
+            }
+            return;
+        }
+
         // The token blocks a suspend when runtime PM can hold a reference. A
         // reset must not run against a powered-off GPU, so a denied token
         // leaves the request pending across the suspend cycle.
@@ -237,6 +246,13 @@ impl Controller {
         tdev.cancel_fw_ping();
         let parked = tick::pre_reset(&tdev);
         let reset_result = run_hw_reset(&tdev, self.pdev.as_ref(), &self.iomem, &self.gate);
+
+        // Latched before the sweep below, so a concurrent group create
+        // cannot slip past both.
+        if reset_result.is_err() {
+            tdev.mark_unusable();
+        }
+
         tick::post_reset(&tdev, parked, reset_result.is_err());
 
         match reset_result {
@@ -296,9 +312,6 @@ pub(crate) fn run_hw_reset(
     let reboot_result = tdev.fw.post_reset(tdev);
     if let Err(e) = &reboot_result {
         dev_err!(dev, "Firmware reboot after reset failed: {:?}\n", e);
-
-        // TODO: Unplug the GPU.
-        // There is no API for unplugging the GPU.
     }
 
     reset_result.and(reboot_result)
