@@ -772,6 +772,15 @@ impl platform::Driver for TyrPlatformDriver {
 
         gpu::reset(pdev.as_ref(), io)?;
 
+        // Declared before the firmware, so a failed probe stops the MCU
+        // before the guard powers the L2 off.
+        let power_iomem = iomem.clone();
+        let power_guard = ScopeGuard::new(move || {
+            if let Ok(io) = power_iomem.access(pdev.as_ref()) {
+                let _ = gpu::l2_power_off(pdev.as_ref(), io);
+            }
+        });
+
         let gpu_info = GpuInfo::new(io);
         gpu_info.log(pdev.as_ref());
 
@@ -913,29 +922,6 @@ impl platform::Driver for TyrPlatformDriver {
 
         let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
 
-        let reg_data = pin_init!(TyrDrmRegistrationData {
-                pdev,
-                mmu,
-                fw: firmware,
-                job_irq,
-                mmu_irq,
-                gpu_irq,
-                wq,
-                sched_wq,
-                clks <- new_mutex!(Clocks {
-                    core: core_clk,
-                    stacks: stacks_clk,
-                    coregroup: coregroup_clk,
-                    gated: false,
-                }),
-                regulators <- new_mutex!(Regulators {
-                    _mali: mali_regulator,
-                }),
-                iomem,
-                gpu_info,
-                csif_info,
-        });
-
         if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
             match unreg_dev.create_huge_mnt(c"within_size") {
                 Ok(()) => dev_info!(pdev, "Using transparent huge pages.\n"),
@@ -967,6 +953,32 @@ impl platform::Driver for TyrPlatformDriver {
 
         let populated = unreg_dev.pm.populate(pm);
         debug_assert!(populated);
+
+        // The clocks and the regulator move into the data below.
+        power_guard.dismiss();
+
+        let reg_data = pin_init!(TyrDrmRegistrationData {
+                pdev,
+                mmu,
+                fw: firmware,
+                job_irq,
+                mmu_irq,
+                gpu_irq,
+                wq,
+                sched_wq,
+                clks <- new_mutex!(Clocks {
+                    core: core_clk,
+                    stacks: stacks_clk,
+                    coregroup: coregroup_clk,
+                    gated: false,
+                }),
+                regulators <- new_mutex!(Regulators {
+                    _mali: mali_regulator,
+                }),
+                iomem,
+                gpu_info,
+                csif_info,
+        });
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
         // unbound; it is never forgotten.
