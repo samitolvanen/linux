@@ -352,7 +352,7 @@ pub(crate) fn suspend_at_unbind(tdev: &TyrDrmDevice) {
     }
 
     if let Some(guard) = tdev.registration_guard() {
-        guard.registration_data_with(mmu::unbind);
+        guard.registration_data_with(|reg_data| mmu::unbind(&reg_data.mmu));
     }
 
     sched::tick::unbind(&tdev);

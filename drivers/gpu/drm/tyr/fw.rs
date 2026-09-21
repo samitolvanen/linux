@@ -281,11 +281,7 @@ pub(crate) struct Firmware<'drm> {
 impl<'drm> Drop for Firmware<'drm> {
     fn drop(&mut self) {
         // Stop the MCU before releasing its firmware mappings and memory.
-        if self.mcu_running.load(Acquire) {
-            if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
-                let _ = self.stop(io);
-            }
-        }
+        self.stop_mcu();
 
         // AS slots retain a VM ref, we need to kill the circular ref manually.
         self.vm.kill();
@@ -572,6 +568,15 @@ impl<'drm> Firmware<'drm> {
         }
 
         Ok(())
+    }
+
+    /// Stops the MCU if it is running.
+    pub(crate) fn stop_mcu(&self) {
+        if self.mcu_running.load(Acquire) {
+            if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
+                let _ = self.stop(io);
+            }
+        }
     }
 
     fn halt_mcu(&self, io: &IoMem<'_>) -> Result<(), McuWaitError> {

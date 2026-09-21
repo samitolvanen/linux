@@ -323,8 +323,8 @@ pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>, rele
     unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
 }
 
-/// Releases the AS slot bindings kept by failed evictions, once unbind has
-/// halted the GPU.
-pub(crate) fn unbind(reg_data: &TyrDrmRegistrationData<'_>) {
-    reg_data.mmu.as_manager.lock().release_vms();
+/// Releases the AS slot bindings kept by failed evictions, once the GPU is
+/// halted.
+pub(crate) fn unbind(mmu: &Mmu) {
+    mmu.as_manager.lock().release_vms();
 }

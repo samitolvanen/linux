@@ -106,6 +106,7 @@ use crate::{
     },
     mmap,
     mmu::{
+        self,
         irq::{
             mmu_irq_init,
             MmuIrq, //
@@ -829,6 +830,13 @@ impl platform::Driver for TyrPlatformDriver {
 
             gpu::reset(pdev.as_ref(), io)?;
 
+            let power_iomem = iomem.clone();
+            let power_guard = ScopeGuard::new(move || {
+                if let Ok(io) = power_iomem.access(pdev.as_ref()) {
+                    let _ = gpu::l2_power_off(pdev.as_ref(), io);
+                }
+            });
+
             let gpu_info = GpuInfo::new(io);
             gpu_info.log(pdev.as_ref());
 
@@ -902,6 +910,16 @@ impl platform::Driver for TyrPlatformDriver {
                 &gpu_info,
                 coherent,
             )?;
+
+            // Declared after the firmware, so a failed probe halts the GPU
+            // before the firmware and the MMU drop.
+            let hw_guard = ScopeGuard::new(|| {
+                firmware.stop_mcu();
+                mmu.suspend();
+                let _ = gpu::l2_power_off(pdev.as_ref(), io);
+                mmu::unbind(&mmu);
+            });
+            power_guard.dismiss();
 
             // SAFETY: The registration is owned by `gpu_irq` and then by
             // `TyrDrmRegistrationData`. Every exit from `probe()` drops one or the other, so it
@@ -1003,6 +1021,9 @@ impl platform::Driver for TyrPlatformDriver {
             if !unreg_dev.pm.populate(pm) {
                 return Err(EBUSY);
             }
+
+            // The clocks and the regulator move into the data below.
+            hw_guard.dismiss();
 
             Ok(try_pin_init!(TyrPlatformDriverData {
                 devfreq_registration,
