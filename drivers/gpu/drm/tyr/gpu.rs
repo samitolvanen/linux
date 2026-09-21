@@ -358,7 +358,7 @@ impl HwOps {
         }
     }
 
-    fn l2_power_off(self, dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+    pub(crate) fn l2_power_off(self, dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
         match self {
             Self::V10 => l2_power_off(dev, iomem),
             Self::V14 {
