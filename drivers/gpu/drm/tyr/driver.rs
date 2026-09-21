@@ -859,6 +859,11 @@ impl platform::Driver for TyrPlatformDriverData {
         let hw_ops = HwOps::bind(pdev.as_ref(), &iomem)?;
         hw_ops.reset(pdev.as_ref(), &iomem, coherency, soc_data)?;
 
+        let power_iomem = iomem.clone();
+        let power_guard = ScopeGuard::new(move || {
+            let _ = hw_ops.l2_power_off(pdev.as_ref(), &power_iomem);
+        });
+
         let pwr_irq = match hw_ops {
             HwOps::V14 { .. } => Some(KBox::pin_init(IrqSlot::new(), GFP_KERNEL)?),
             HwOps::V10 => None,
@@ -909,6 +914,9 @@ impl platform::Driver for TyrPlatformDriverData {
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(csg_slot_ops, MAX_CSGS)?;
 
         let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
+
+        // The clocks move into the data below.
+        power_guard.dismiss();
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
