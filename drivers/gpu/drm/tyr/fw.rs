@@ -310,11 +310,13 @@ impl<'drm> Firmware<'drm> {
             })
     }
 
+    /// `section_size` must not exceed the object size.
     fn init_section_mem(
         dev: &Device,
         vmap: &VMapOwned<BoData>,
         data: &KVec<u8>,
         flags: SectionFlags,
+        section_size: u64,
     ) -> Result {
         let zero_tail = flags.zero();
 
@@ -323,21 +325,28 @@ impl<'drm> Firmware<'drm> {
         }
 
         let size = vmap.owner().size();
+        let section_size = usize::try_from(section_size).map_err(|_| EINVAL)?;
 
-        if data.len() > size {
-            dev_err!(dev, "fw section {} bigger than BO {}", data.len(), size);
+        if data.len() > section_size {
+            dev_err!(
+                dev,
+                "fw section {} bigger than its mapping {}",
+                data.len(),
+                section_size
+            );
             return Err(EINVAL);
         }
 
         let dst = vmap.as_view().as_ptr().cast::<u8>();
         // SAFETY: `dst` is the section BO's writable CPU mapping, valid for
-        // `size` bytes, and the check above bounds `data.len()` by `size`.
-        // `data` is a separate allocation.
+        // `size` bytes, and the check above bounds `data.len()` by the
+        // mapping, which `size` rounds up. `data` is a separate allocation.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
 
         if zero_tail {
-            // SAFETY: `dst` is valid for `size` bytes and the check above bounds
-            // `data.len()` by `size`, so the tail ends at `size`.
+            // SAFETY: `dst` is valid for `size` bytes and the check above
+            // bounds `data.len()` by the mapping, which `size` rounds up, so
+            // the tail ends at `size`.
             unsafe { core::ptr::write_bytes(dst.add(data.len()), 0, size - data.len()) };
         }
 
@@ -429,7 +438,7 @@ impl<'drm> Firmware<'drm> {
                 }
 
                 let vmap = mem.bo().owned_vmap::<0>()?;
-                Self::init_section_mem(dev, &vmap, &data, section_flags)?;
+                Self::init_section_mem(dev, &vmap, &data, section_flags, size)?;
                 Self::sync_section(dev, mem.bo())?;
 
                 sections.push(
@@ -651,7 +660,15 @@ impl<'drm> Firmware<'drm> {
         let dev = self.dev.as_ref();
 
         for section in self.sections.iter() {
-            Self::init_section_mem(dev, &section.vmap, &section.data, section.section_flags)?;
+            let va = section.mem.va_range();
+
+            Self::init_section_mem(
+                dev,
+                &section.vmap,
+                &section.data,
+                section.section_flags,
+                va.end - va.start,
+            )?;
             Self::sync_section(dev, section.mem.bo())?;
         }
         Ok(())
