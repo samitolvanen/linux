@@ -841,6 +841,15 @@ pub(crate) struct VmExec {
     va_range: Range<u64>,
 }
 
+/// Flushes the deferred `vm_bo` list, then drops the gpuvm references
+/// that `VmExec::drop` moved out.
+///
+/// The flush takes the gpuvm reservation lock, so `VmExec::drop` hands
+/// this off to the cleanup workqueue when it can.
+fn release_gpuvm((gpuvm, _unique): (ARef<GpuVm<GpuVmData>>, Option<UniqueRefGpuVm<GpuVmData>>)) {
+    gpuvm.deferred_cleanup();
+}
+
 #[pinned_drop]
 impl PinnedDrop for VmExec {
     fn drop(self: Pin<&mut Self>) {
@@ -861,7 +870,7 @@ impl PinnedDrop for VmExec {
         // signalling path. `None` only on the impossible contended case,
         // in which the inner reference drops inline with the mutex.
         let gpuvm_unique = this.gpuvm_unique.try_lock().and_then(|mut g| g.take());
-        let Err(e) = cleanup::try_spawn_owned((gpuvm, gpuvm_unique), drop) else {
+        let Err(e) = cleanup::try_spawn_owned((gpuvm, gpuvm_unique), release_gpuvm) else {
             return;
         };
 
@@ -874,7 +883,7 @@ impl PinnedDrop for VmExec {
                 captures
             }
         };
-        drop(captures);
+        release_gpuvm(captures);
     }
 }
 
