@@ -981,6 +981,12 @@ impl platform::Driver for TyrPlatformDriverData {
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
         let tdev: ARef<TyrDrmDevice> = ddev.into();
 
+        let hw_guard = ScopeGuard::new(|| {
+            tdev.fw.stop_mcu();
+            tdev.mmu.suspend();
+            let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
+        });
+
         tdev.reset
             .set_device(Devres::new(pdev.as_ref(), tdev.clone())?);
 
@@ -1072,6 +1078,7 @@ impl platform::Driver for TyrPlatformDriverData {
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
         ping_guard.dismiss();
+        hw_guard.dismiss();
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
