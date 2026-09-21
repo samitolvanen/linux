@@ -24,6 +24,7 @@ use kernel::{
         DeviceContext, //
     },
     new_mutex,
+    page::PAGE_SIZE,
     pr_warn_once,
     prelude::*,
     str::CString,
@@ -370,7 +371,7 @@ pub(crate) fn new_dummy_object<Ctx: DeviceContext>(
 ) -> Result<ARef<Bo>> {
     let bo = gem::shmem::Object::<BoData>::new(
         ddev,
-        4096,
+        PAGE_SIZE,
         shmem::ObjectConfig {
             map_wc: should_map_wc(coherent, 0),
             parent_resv_obj: None,
@@ -394,7 +395,7 @@ pub(crate) fn new_bo(
     if size == 0 {
         return Err(EINVAL);
     }
-    let aligned_size = size.checked_next_multiple_of(1 << 12).ok_or(EINVAL)?;
+    let aligned_size = size.checked_next_multiple_of(PAGE_SIZE).ok_or(EINVAL)?;
 
     let map_wc = should_map_wc(coherent, flags);
     let bo = Bo::new(
@@ -527,6 +528,9 @@ pub(crate) fn new_kernel_object(
 ///
 /// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
 /// VM BO blocks operations on the others.
+///
+/// The object and the mapping are both rounded to the host page size,
+/// so `Bo::size()` matches the mapping.
 pub(crate) fn new_kernel_object_no_vmap(
     dev: &TyrDrmDevice,
     vm: &Arc<Vm>,
@@ -534,7 +538,7 @@ pub(crate) fn new_kernel_object_no_vmap(
     flags: VmMapFlags,
     coherent: bool,
 ) -> Result<KernelBo> {
-    let aligned_size = size.next_multiple_of(1 << 12);
+    let aligned_size = size.checked_next_multiple_of(PAGE_SIZE).ok_or(EINVAL)?;
     let node = vm.alloc_kernel_range(aligned_size)?;
     let va = node.start();
 
@@ -608,6 +612,9 @@ impl KernelBo {
     /// This function allocates a new shmem-backed GEM object and immediately maps
     /// it into the specified GPU virtual memory space. The mapping is automatically
     /// cleaned up when the [`KernelBo`] is dropped.
+    ///
+    /// The object is rounded up to the host page size while the mapping
+    /// keeps `size`.
     pub(crate) fn new<Ctx: DeviceContext>(
         ddev: &TyrDrmDevice<Ctx>,
         vm: ArcBorrow<'_, Vm>,
@@ -623,9 +630,14 @@ impl KernelBo {
 
         let KernelBoVaAlloc::Explicit(va) = va_alloc;
 
+        let bo_size = usize::try_from(size)
+            .ok()
+            .and_then(|bytes| bytes.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(EOVERFLOW)?;
+
         let bo = gem::shmem::Object::<BoData>::new(
             ddev,
-            size as usize,
+            bo_size,
             shmem::ObjectConfig {
                 map_wc: should_map_wc(coherent, 0),
                 parent_resv_obj: Some(vm.root_gem()),

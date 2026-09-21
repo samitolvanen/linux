@@ -313,7 +313,13 @@ impl Firmware {
             })
     }
 
-    fn init_section_mem(vmap: &VMapOwned<BoData>, data: &KVec<u8>, flags: SectionFlags) -> Result {
+    /// `section_size` must not exceed the object size.
+    fn init_section_mem(
+        vmap: &VMapOwned<BoData>,
+        data: &KVec<u8>,
+        flags: SectionFlags,
+        section_size: u64,
+    ) -> Result {
         let zero_tail = flags.contains(SectionFlag::Zero);
 
         if data.is_empty() && !zero_tail {
@@ -321,9 +327,14 @@ impl Firmware {
         }
 
         let size = vmap.owner().size();
+        let section_size = usize::try_from(section_size).map_err(|_| EINVAL)?;
 
-        if data.len() > size {
-            pr_err!("fw section {} bigger than BO {}\n", data.len(), size);
+        if data.len() > section_size {
+            pr_err!(
+                "fw section {} bigger than its mapping {}\n",
+                data.len(),
+                section_size
+            );
             return Err(EINVAL);
         }
 
@@ -430,7 +441,7 @@ impl Firmware {
                 }
 
                 let vmap = mem.bo.owned_vmap::<0>()?;
-                Self::init_section_mem(&vmap, &data, section_flags)?;
+                Self::init_section_mem(&vmap, &data, section_flags, size)?;
 
                 let sgt = mem.bo.owned_sg_table(dev)?;
                 Self::sync_section(pdev.as_ref(), &sgt)?;
@@ -668,7 +679,14 @@ impl Firmware {
     /// takes BO locks.
     fn reload_sections(&self) -> Result {
         for section in self.sections.iter() {
-            Self::init_section_mem(&section.vmap, &section.data, section.section_flags)?;
+            let va = section.mem.va_range();
+
+            Self::init_section_mem(
+                &section.vmap,
+                &section.data,
+                section.section_flags,
+                va.end - va.start,
+            )?;
             Self::sync_section(self.pdev.as_ref(), &section.sgt)?;
         }
         Ok(())
