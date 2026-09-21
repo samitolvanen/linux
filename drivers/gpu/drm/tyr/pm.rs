@@ -87,20 +87,31 @@ fn resume_hw_components(
 }
 
 /// Failure path of `resume`. The PM core records the error in
-/// `power.runtime_error` and the device stays suspended. Suspends the
-/// hardware first so nothing touches the gated block.
+/// `power.runtime_error` and the device stays suspended. Latches the
+/// device unusable, powers the hardware down and fails every group.
 fn fail_resume(
     dev: &platform::Device<Bound>,
     data: Pin<&TyrPlatformDriverData>,
     e: Error,
 ) -> Error {
+    let tdev = &data.device;
+
     dev_err!(
         dev.as_ref(),
         "Runtime resume failed, device is unusable: {:?}\n",
         e
     );
+
+    tdev.mark_unusable();
+
     suspend_hw_components(dev, data);
-    data.device.clks.lock().gate();
+    tdev.clks.lock().gate();
+
+    let _ = tdev.with_locked_scheduler(|sched| {
+        sched.fail_all_groups();
+        Ok(())
+    });
+
     e
 }
 
