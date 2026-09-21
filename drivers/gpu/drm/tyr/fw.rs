@@ -624,6 +624,7 @@ impl Firmware {
     /// issuing cache and TLB maintenance up to the soft reset. It is released
     /// after the soft reset by `mmu::post_reset`, together with the user VMs.
     pub(crate) fn pre_reset(&self, tdev: &TyrDrmDevice) {
+        self.unclean_stop.store(true, Release);
         tdev.job_irq
             .reset_suspend(&self.iomem, irq::job_irq_disable);
 
