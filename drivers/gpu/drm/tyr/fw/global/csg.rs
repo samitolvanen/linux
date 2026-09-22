@@ -68,9 +68,10 @@ enum CsgInterfaceState {
 }
 
 struct EnabledCsgInterface {
-    csg_control: FwInterface<CSG_CONTROL_BLOCK_SIZE>,
     csg_input: FwInterface<CSG_INPUT_BLOCK_SIZE>,
     csg_output: FwInterface<CSG_OUTPUT_BLOCK_SIZE>,
+    suspend_size: u32,
+    protm_suspend_size: u32,
     cs_stride: usize,
     cs_num: usize,
     cs: KVec<CsInterface>,
@@ -180,9 +181,10 @@ impl CsgInterface {
         }
 
         self.state = CsgInterfaceState::Enabled(EnabledCsgInterface {
-            csg_control,
             csg_input,
             csg_output,
+            suspend_size: csg_control.read(GROUP_SUSPEND_SIZE).value().get(),
+            protm_suspend_size: csg_control.read(GROUP_PROTM_SUSPEND_SIZE).value().get(),
             cs_stride,
             cs_num: cs_num as usize,
             cs: KVec::with_capacity(cs_num as usize, GFP_KERNEL)?,
@@ -218,14 +220,7 @@ impl CsgInterface {
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        let suspend_size = enabled.csg_control.read(GROUP_SUSPEND_SIZE).value().get();
-        let protm_suspend_size = enabled
-            .csg_control
-            .read(GROUP_PROTM_SUSPEND_SIZE)
-            .value()
-            .get();
-
-        Ok((suspend_size, protm_suspend_size))
+        Ok((enabled.suspend_size, enabled.protm_suspend_size))
     }
 
     pub(in super::super) fn cs(&self, index: usize) -> Option<&CsInterface> {
