@@ -395,13 +395,15 @@ impl Job {
         const BASE_INSTRS: usize = 11;
         const INSTRS_PER_FLAG: usize = 4;
 
-        // Pull CSF working-register and scoreboard counts from the
-        // firmware so the wrapper adapts to the per-chip CSIF
-        // configuration. `work_regs` is the total CS register count;
+        // Pull the probe-time CSF working-register and scoreboard counts
+        // so the wrapper adapts to the per-chip CSIF configuration.
+        // `work_regs` is the total CS register count;
         // the firmware reserves the top `UNPRESERVED_CS_REG_COUNT` for
         // the kernel-side wrapper.
-        let (_csg_slot_count, _cs_slot_count, work_regs, scoreboards) =
-            group.tdev.fw.csif_info_counts()?;
+        let (work_regs, scoreboards) = {
+            let csif = group.tdev.csif_info.lock();
+            (csif.cs_reg_count, csif.scoreboard_slot_count)
+        };
         let addr_reg = u64::from(
             work_regs
                 .checked_sub(crate::gpu::UNPRESERVED_CS_REG_COUNT)
