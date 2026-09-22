@@ -101,14 +101,16 @@ enum CsgInterfaceState {
     Enabled(EnabledCsgInterface),
 }
 
-/// When enabled, a CSG Interface has control, input, and output system memory interfaces.
+/// When enabled, a CSG Interface has input and output system memory interfaces.
 struct EnabledCsgInterface {
-    /// Control block interface - provides CSG capabilities and configuration.
-    csg_control: FwInterface<Region<CSG_CONTROL_BLOCK_SIZE>>,
     /// Input block interface - driver writes CSG requests here.
     csg_input: FwInterface<FwRegion<CSG_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes CSG acknowledgements here.
     csg_output: FwInterface<Region<CSG_OUTPUT_BLOCK_SIZE>>,
+    /// Suspend buffer size (read from GROUP_SUSPEND_SIZE).
+    suspend_size: u32,
+    /// Protected-mode suspend buffer size (read from GROUP_PROTM_SUSPEND_SIZE).
+    protm_suspend_size: u32,
     /// Runtime stride between CS control blocks (read from GROUP_STREAM_STRIDE).
     cs_stride: usize,
     /// Number of CS interfaces reported by hardware for this CSG.
@@ -227,9 +229,10 @@ impl CsgInterface {
         }
 
         let enabled = EnabledCsgInterface {
-            csg_control,
             csg_input,
             csg_output,
+            suspend_size: csg_control.read(GROUP_SUSPEND_SIZE).value().get(),
+            protm_suspend_size: csg_control.read(GROUP_PROTM_SUSPEND_SIZE).value().get(),
             cs_stride,
             cs_num: cs_num as usize,
             cs: KVec::with_capacity(cs_num as usize, GFP_KERNEL)?,
@@ -277,14 +280,7 @@ impl CsgInterface {
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
 
-        let suspend_size = enabled.csg_control.read(GROUP_SUSPEND_SIZE).value().get();
-        let protm_suspend_size = enabled
-            .csg_control
-            .read(GROUP_PROTM_SUSPEND_SIZE)
-            .value()
-            .get();
-
-        Ok((suspend_size, protm_suspend_size))
+        Ok((enabled.suspend_size, enabled.protm_suspend_size))
     }
 
     pub(in super::super) fn cs(&self, index: usize) -> Option<&CsInterface> {
