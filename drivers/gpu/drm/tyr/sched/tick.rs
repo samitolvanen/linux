@@ -994,9 +994,6 @@ impl<'a> Tick<'a> {
         decision: &SchedulingDecision,
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
-        // An eviction reclaims the slot for other work only when this
-        // pass selected some.
-        context.reclaim = decision.num_selected != 0;
 
         self.stage_evictions(data, decision.keep_mask, &mut context);
 
