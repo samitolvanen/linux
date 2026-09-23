@@ -334,14 +334,13 @@ pub(crate) struct Group {
     /// device's `heap_alloc_wq`.
     #[pin]
     tiler_oom_work: Work<Group, 2>,
-    /// Worker that drops the reference `term_work` ran with, on the
-    /// cleanup workqueue.
+    /// Worker that drains the queues and drops the reference `term_work`
+    /// ran with, on the cleanup workqueue.
     ///
-    /// The drop may be the group's last. Unmapping its buffers takes
-    /// `dma_resv_lock` and allocates with `GFP_KERNEL`. Neither is
-    /// allowed inside the signalling annotation. Every queue was
-    /// drained by `term_work`, so the `cancel_all()` in
-    /// `JobQueue::drop` signals nothing here.
+    /// The drain waits on hardware fences, and the drop may be the
+    /// group's last. Unmapping its buffers takes `dma_resv_lock` and
+    /// allocates with `GFP_KERNEL`. None of these is allowed inside the
+    /// signalling annotation.
     ///
     /// The item is embedded in the group, so the enqueue allocates
     /// nothing and has no `NoMemory` case to handle, unlike
@@ -663,7 +662,8 @@ impl Group {
     ///
     /// The failure is not expected. The enqueue runs inside the
     /// signalling annotation. A drop there may be the group's last, and
-    /// that drop unmaps its buffers under `dma_resv_lock`.
+    /// that drop unmaps its buffers under `dma_resv_lock`. The queues
+    /// stay unparked, so their remaining jobs still fail at submit.
     fn leak_on_release_enqueue_failure(group: Arc<Self>) {
         pr_err!("Failed to enqueue group release_work, leaking the group\n");
         core::mem::forget(group);
@@ -715,6 +715,13 @@ impl Group {
                     pad: 0,
                 },
             );
+        }
+    }
+
+    /// Drains every queue. Same context rule as `Queue::drain`.
+    fn drain_queues(&self) {
+        for queue in self.queues.iter() {
+            queue.drain();
         }
     }
 
@@ -1109,6 +1116,7 @@ impl WorkItem<3> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
+        this.drain_queues();
         drop(this);
     }
 }
