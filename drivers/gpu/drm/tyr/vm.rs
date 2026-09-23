@@ -12,8 +12,10 @@ pub(crate) mod range;
 
 use core::{
     mem::ManuallyDrop,
-    ops::{Deref, Range},
-    sync::atomic::{AtomicBool, Ordering},
+    ops::{
+        Deref,
+        Range, //
+    },
 };
 
 use kernel::{
@@ -71,6 +73,10 @@ use kernel::{
     },
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         LockClassKey,
@@ -102,8 +108,6 @@ use crate::{
 
 #[cfg(CONFIG_DEBUG_FS)]
 use crate::debugfs::NOT_REGISTERED;
-#[cfg(CONFIG_DEBUG_FS)]
-use core::sync::atomic::AtomicUsize;
 #[cfg(CONFIG_DEBUG_FS)]
 use kernel::seq_file::SeqFile;
 
@@ -823,7 +827,7 @@ pub(crate) struct VmExec {
     /// the cleanup workqueue closure rather than dropping it inline.
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
-    unusable: AtomicBool,
+    unusable: Atomic<bool>,
 }
 
 /// Flushes the deferred `vm_bo` list, then drops the gpuvm references
@@ -914,7 +918,7 @@ pub(crate) struct Vm {
     /// Index of this VM in the device-wide `gpuvas` registry, or
     /// `NOT_REGISTERED`. Only ever touched under the registry lock.
     #[cfg(CONFIG_DEBUG_FS)]
-    registry_slot: AtomicUsize,
+    registry_slot: Atomic<usize>,
 }
 
 /// State of a VM's tiler heap pool.
@@ -976,7 +980,7 @@ impl Vm {
                 mmu: mmu.into(),
                 gpuvm: ManuallyDrop::new(gpuvm),
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
-                unusable: AtomicBool::new(false),
+                unusable: Atomic::new(false),
             }),
             GFP_KERNEL,
         )?;
@@ -1002,7 +1006,7 @@ impl Vm {
                 heap_pool <- new_mutex!(HeapPoolState::Empty),
                 root_gem: dummy_obj,
                 #[cfg(CONFIG_DEBUG_FS)]
-                registry_slot: AtomicUsize::new(NOT_REGISTERED),
+                registry_slot: Atomic::new(NOT_REGISTERED),
             }),
             GFP_KERNEL,
         )?;
@@ -1145,7 +1149,7 @@ impl Vm {
 
     /// Returns this VM's slot in the device-wide `gpuvas` registry.
     #[cfg(CONFIG_DEBUG_FS)]
-    pub(crate) fn registry_slot(&self) -> &AtomicUsize {
+    pub(crate) fn registry_slot(&self) -> &Atomic<usize> {
         &self.registry_slot
     }
 
@@ -1257,11 +1261,11 @@ impl VmExec {
     }
 
     pub(crate) fn is_unusable(&self) -> bool {
-        self.unusable.load(Ordering::Relaxed)
+        self.unusable.load(Relaxed)
     }
 
     pub(crate) fn mark_unusable(&self) {
-        self.unusable.store(true, Ordering::Relaxed);
+        self.unusable.store(true, Relaxed);
     }
 
     /// Returns the buffer object mapped at `va` and its offset within

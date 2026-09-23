@@ -5,8 +5,6 @@
 //! This module owns the Job IRQ registration plus the wait state used for
 //! firmware events and initial GLB readiness.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use kernel::{
     c_str,
     device::{
@@ -20,6 +18,11 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
+        atomic::{
+            Acquire,
+            Atomic,
+            Release, //
+        },
         Arc, //
     },
 };
@@ -47,7 +50,7 @@ const CSG_IRQ_MASK: u32 = (1u32 << super::MAX_CSG) - 1;
 pub(crate) struct JobIrqState {
     event_wait: Arc<Wait>,
     boot_wait: Arc<Wait>,
-    fw_ready: Arc<AtomicBool>,
+    fw_ready: Arc<Atomic<bool>>,
 }
 
 impl JobIrqState {
@@ -55,7 +58,7 @@ impl JobIrqState {
         Ok(Self {
             event_wait: new_wait!()?,
             boot_wait: new_wait!()?,
-            fw_ready: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
+            fw_ready: Arc::new(Atomic::new(false), GFP_KERNEL)?,
         })
     }
 
@@ -66,12 +69,12 @@ impl JobIrqState {
     /// Re-arms the readiness latch so `wait_ready` observes the next
     /// firmware boot. Call before starting the MCU.
     pub(crate) fn clear_ready(&self) {
-        self.fw_ready.store(false, Ordering::Release);
+        self.fw_ready.store(false, Release);
     }
 
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
         self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
-            if self.fw_ready.load(Ordering::Acquire) {
+            if self.fw_ready.load(Acquire) {
                 Ok(WaitResult::Done)
             } else {
                 Ok(WaitResult::Retry)
@@ -83,7 +86,7 @@ impl JobIrqState {
         self.event_wait.notify_all();
 
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
-            self.fw_ready.store(true, Ordering::Release);
+            self.fw_ready.store(true, Release);
             self.boot_wait.notify_all();
         }
     }

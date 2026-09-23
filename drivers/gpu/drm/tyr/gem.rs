@@ -58,9 +58,9 @@ use crate::debugfs::{
     NOT_REGISTERED, //
 };
 #[cfg(CONFIG_DEBUG_FS)]
-use core::sync::atomic::AtomicUsize;
-#[cfg(CONFIG_DEBUG_FS)]
 use kernel::str::CStr;
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::sync::atomic::Atomic;
 
 /// Maximum length of a BO label, including the NUL terminator.
 pub(crate) const BO_LABEL_MAXLEN: usize = 4096;
@@ -82,7 +82,7 @@ pub(crate) struct BoData {
     /// Index of this BO in the device-wide debugfs registry, or
     /// `NOT_REGISTERED`. Only ever touched under the registry lock.
     #[cfg(CONFIG_DEBUG_FS)]
-    registry_slot: AtomicUsize,
+    registry_slot: Atomic<usize>,
 }
 
 impl BoData {
@@ -100,7 +100,7 @@ impl BoData {
 
     /// Returns this BO's slot in the device-wide debugfs registry.
     #[cfg(CONFIG_DEBUG_FS)]
-    pub(crate) fn registry_slot(&self) -> &AtomicUsize {
+    pub(crate) fn registry_slot(&self) -> &Atomic<usize> {
         &self.registry_slot
     }
 
@@ -146,7 +146,7 @@ impl gem::DriverObject for BoData {
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
             label <- new_mutex!(None),
             #[cfg(CONFIG_DEBUG_FS)]
-            registry_slot: AtomicUsize::new(NOT_REGISTERED),
+            registry_slot: Atomic::new(NOT_REGISTERED),
         })
     }
 
@@ -156,7 +156,7 @@ impl gem::DriverObject for BoData {
             exclusive_vm_root_gem: None,
             label <- new_mutex!(None),
             #[cfg(CONFIG_DEBUG_FS)]
-            registry_slot: AtomicUsize::new(NOT_REGISTERED),
+            registry_slot: Atomic::new(NOT_REGISTERED),
         })
     }
 
