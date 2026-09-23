@@ -132,7 +132,8 @@ mod iface {
             IoKnownSize, //
         },
         prelude::*,
-        sync::Arc, //
+        sync::Arc,
+        warn_on, //
     };
 
     use crate::gem::BoData;
@@ -206,7 +207,7 @@ mod iface {
         const MIN_SIZE: usize = FW_IFACE_SIZE;
     }
 
-    impl<T, const FW_IFACE_SIZE: usize> IoCapable<T> for FwInterface<FW_IFACE_SIZE> {
+    impl<T: Zeroable, const FW_IFACE_SIZE: usize> IoCapable<T> for FwInterface<FW_IFACE_SIZE> {
         unsafe fn io_read(&self, addr: usize) -> T {
             let base = self.addr();
             let size = size_of::<T>();
@@ -218,7 +219,8 @@ mod iface {
                     base,
                     base + FW_IFACE_SIZE
                 );
-                panic!("io_read: address 0x{:x} out of bounds", addr);
+                warn_on!(true);
+                return T::zeroed();
             }
 
             let ptr = addr as *const T;
@@ -238,7 +240,8 @@ mod iface {
                     base,
                     base + FW_IFACE_SIZE
                 );
-                panic!("io_write: address 0x{:x} out of bounds", addr);
+                warn_on!(true);
+                return;
             }
 
             let ptr = addr as *mut T;
