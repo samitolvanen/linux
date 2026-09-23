@@ -132,8 +132,6 @@ pub(crate) struct CsgUpdateContext {
     /// Bitmask of CSG slot indices whose request timed out during the
     /// most recent apply cycle.
     pub(crate) timedout_mask: CsgSlotMask,
-    /// True when this batch frees slots for other work.
-    pub(crate) reclaim: bool,
 }
 
 /// CSG_REQ::state field mask (bits 2:0). The firmware transitions all
@@ -165,7 +163,6 @@ impl CsgUpdateContext {
             db_toggle: [CsDbMask::empty(); MAX_CSGS],
             update_mask: CsgSlotMask::empty(),
             timedout_mask: CsgSlotMask::empty(),
-            reclaim: false,
         }
     }
 
@@ -745,7 +742,7 @@ impl Scheduler {
                 self.sync_csg_slot_priority(fw, &mut csg_slot_manager, csg_id)?;
             }
             if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
-                self.sync_csg_slot_state(tdev, fw, &csg_slot_manager, csg_id, context.reclaim)?;
+                self.sync_csg_slot_state(tdev, fw, &csg_slot_manager, csg_id)?;
             }
             if !(acked_reqs & CSG_REQ_STATUS_UPDATE).is_empty() {
                 self.sync_csg_slot_queues_state(fw, &csg_slot_manager, csg_id)?;
@@ -823,15 +820,13 @@ impl Scheduler {
     /// firmware-acknowledged `CSG_ACK.state`.
     ///
     /// A transition into `Suspend` also opens the off-slot deadline
-    /// credit. `Group::blocked_idle_queues` documents the reclaim
-    /// exception.
+    /// credit, except for the queues in `Group::blocked_idle_queues`.
     fn sync_csg_slot_state(
         &mut self,
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         csg_slot_manager: &CsgSlotManager,
         csg_idx: usize,
-        reclaim: bool,
     ) -> Result {
         let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
             return Ok(());
@@ -865,11 +860,7 @@ impl Scheduler {
         if new_state == group::State::Suspended {
             self.sync_csg_slot_queues_state(fw, csg_slot_manager, csg_idx)?;
 
-            let blocked_idle = if reclaim {
-                group.blocked_idle_queues()
-            } else {
-                0
-            };
+            let blocked_idle = group.blocked_idle_queues();
             for (queue_idx, queue) in group.queues.iter().enumerate() {
                 if (blocked_idle & (1u32 << queue_idx)) != 0 {
                     continue;
