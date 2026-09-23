@@ -9,8 +9,6 @@
 //! `Scheduler::request_tick`; the periodic re-arm is handled
 //! separately by `periodic_tick_work` on the system unbound workqueue.
 
-use core::sync::atomic::Ordering;
-
 use kernel::{
     list::{
         List,
@@ -823,7 +821,7 @@ impl<'a> Tick<'a> {
             let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                 continue;
             };
-            if slot_data.group.tiler_oom.load(Ordering::Relaxed) != 0 {
+            if slot_data.group.tiler_oom.load(ordering::Relaxed) != 0 {
                 slot_data.group.schedule_tiler_oom();
             }
             for queue in slot_data.group.queues.iter() {
