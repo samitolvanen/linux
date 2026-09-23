@@ -190,9 +190,8 @@ pub(crate) struct TyrDrmDeviceData {
     /// cacheability policy in `crate::gem::should_map_wc`.
     pub(crate) coherent: bool,
 
-    /// Dedicated unbound workqueue for the per-group `term_work`, whose
-    /// worker waits on in-flight hardware fences. Flushed at unbind.
-    /// It sits on the device because a file release can terminate
+    /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
+    /// at unbind. It sits on the device because a file release can terminate
     /// groups after unbind, with no registration data left to hold it.
     pub(crate) term_wq: DmaFenceWorkqueue,
 
