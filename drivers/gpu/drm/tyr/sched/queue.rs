@@ -919,14 +919,14 @@ impl QueueOps for TyrQueueOps {
         fence: DriverDmaFence<Self::FenceData, Published>,
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
-        if job.job.stream.is_empty() {
-            fence.signal(Ok(()));
-            return Ok(SubmitResult::Submitted);
-        }
-
         if !job.job.group.can_run() {
             fence.signal(Err(ECANCELED));
             TyrDrmDeviceData::schedule_tick(&job.job.group.tdev);
+            return Ok(SubmitResult::Submitted);
+        }
+
+        if job.job.stream.is_empty() {
+            fence.signal(Ok(()));
             return Ok(SubmitResult::Submitted);
         }
 
@@ -1280,17 +1280,22 @@ impl Queue {
         self.job_queue.unpark();
     }
 
-    /// Cancels every job tracked by this queue and signals all
-    /// remaining pending submit fences with `err`.
+    /// Signals every pending submit fence with `err`.
     ///
-    /// Must be called from process context: `cancel_all` may sleep
-    /// waiting for in-flight HW fences.
+    /// The caller must have made the group unrunnable first, so the jobs
+    /// left in the pipeline fail at submit.
     pub(crate) fn cancel(&self, err: Error) {
         self.job_queue.park();
         self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
-        self.job_queue.cancel_all();
-        self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
         self.job_queue.unpark();
+    }
+
+    /// Retires every job left in the pipeline and refuses later commits.
+    ///
+    /// Waits on hardware fences, so it must not be called from a dma-fence
+    /// signalling section.
+    pub(crate) fn drain(&self) {
+        self.job_queue.cancel_all();
     }
 }
 

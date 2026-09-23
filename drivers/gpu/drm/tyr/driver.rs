@@ -257,10 +257,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// with firmware acks under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
-    /// Dedicated unbound workqueue for the per-group `term_work`, whose
-    /// worker waits on in-flight hardware fences. Flushed at unbind. It
-    /// sits on the device because a file release can terminate groups
-    /// after unbind.
+    /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
+    /// at unbind. It sits on the device because a file release can
+    /// terminate groups after unbind.
     pub(crate) term_wq: DmaFenceWorkqueue,
 
     /// Dedicated unbound workqueue for the per-group tiler OOM workers.
