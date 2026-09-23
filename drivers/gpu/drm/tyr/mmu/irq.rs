@@ -6,8 +6,6 @@
 //! wires the generic Tyr IRQ wrapper to the MMU IRQ registers and delegates the
 //! human-readable fault reporting to `faults.rs`.
 
-use core::sync::atomic::Ordering;
-
 use kernel::{
     c_str,
     device::{Bound, Device},
@@ -19,6 +17,7 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
+        atomic::Relaxed,
         Arc,
         SpinLock, //
     }, //
@@ -195,7 +194,7 @@ impl TyrIrqTrait for MmuIrq {
             let Some(vm_as_data) = as_manager.slot_data(as_idx).cloned() else {
                 continue;
             };
-            vm_as_data.unhandled_fault.store(true, Ordering::Relaxed);
+            vm_as_data.unhandled_fault.store(true, Relaxed);
             if let Err(e) = as_manager.disable_vm(&vm_as_data) {
                 pr_err!("mmu_irq: disable_vm({}) failed: {:?}\n", as_idx, e);
             }

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::sync::atomic::Ordering;
-
 use kernel::{
     list::{
         List,
@@ -12,6 +10,7 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
+        atomic::Relaxed,
         Arc, //
     },
     time::{
@@ -370,7 +369,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             }
             inner.csg_id = None;
         });
-        slot_data.group.tiler_oom.store(0, Ordering::Relaxed);
+        slot_data.group.tiler_oom.store(0, Relaxed);
         slot_data.group.set_active(false);
         slot_data.group.vm.idle()?;
         Ok(())
@@ -1466,13 +1465,7 @@ impl Scheduler {
                 let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
                     continue;
                 };
-                if slot_data
-                    .group
-                    .vm
-                    .as_data
-                    .unhandled_fault
-                    .load(Ordering::Relaxed)
-                {
+                if slot_data.group.vm.as_data.unhandled_fault.load(Relaxed) {
                     *slot = Some((csg_idx, slot_data.group.clone()));
                 }
                 context.toggle_reqs(csg_idx, CSG_REQ_STATUS_UPDATE);

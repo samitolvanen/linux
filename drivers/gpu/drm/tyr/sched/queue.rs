@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-use core::{
-    ops::{Deref, Range},
-    sync::atomic::{
-        AtomicBool,
-        AtomicI64,
-        AtomicU64,
-        AtomicUsize,
-        Ordering, //
-    },
+use core::ops::{
+    Deref,
+    Range, //
 };
 
 use kernel::{
@@ -31,7 +25,16 @@ use kernel::{
     prelude::*,
     sizes::SZ_4K,
     sizes::SZ_64K,
-    sync::{aref::ARef, Arc, LockClassKey, Mutex},
+    sync::{
+        aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
+        Arc,
+        LockClassKey,
+        Mutex, //
+    },
     time::{
         msecs_to_jiffies,
         Delta,
@@ -201,7 +204,7 @@ struct PendingFences {
 /// consumed, in which case the slot passes to the pending entry.
 pub(in crate::sched) struct PendingFenceReservation {
     queue: Arc<QueueData>,
-    consumed: AtomicBool,
+    consumed: Atomic<bool>,
     profiling_slot: Option<u32>,
 }
 
@@ -209,7 +212,7 @@ impl PendingFenceReservation {
     fn new(queue: Arc<QueueData>, profiling_slot: Option<u32>) -> Self {
         Self {
             queue,
-            consumed: AtomicBool::new(false),
+            consumed: Atomic::new(false),
             profiling_slot,
         }
     }
@@ -237,14 +240,14 @@ impl PendingFenceReservation {
         match pending.vec.push_within_capacity(pending_fence) {
             Ok(()) => {
                 pending.outstanding = pending.outstanding.saturating_sub(1);
-                self.consumed.store(true, Ordering::Relaxed);
+                self.consumed.store(true, Relaxed);
                 Ok(())
             }
             Err(err) => match err.0.fence {
                 Some(fence) => Err((EINVAL, fence)),
                 None => {
                     pending.outstanding = pending.outstanding.saturating_sub(1);
-                    self.consumed.store(true, Ordering::Relaxed);
+                    self.consumed.store(true, Relaxed);
                     Ok(())
                 }
             },
@@ -314,13 +317,13 @@ pub(super) struct QueueJob {
     /// Per-queue syncobj seqno at which this job is complete. Zero for a
     /// sync-only job that advances no syncobj. Claimed at commit time, the
     /// same key the firmware's `SYNC_ADD64` produces for the job.
-    done_seqno: AtomicU64,
+    done_seqno: Atomic<u64>,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
     /// from the queue's current accumulator by the timeout stage so a
     /// job is not faulted for time the queue spent suspended off its
     /// CSG slot before this job was submitted.
-    baseline_suspend_nanos: AtomicI64,
+    baseline_suspend_nanos: Atomic<i64>,
     /// Back-reference to the owning group; used by
     /// `TyrQueueOps::submit` to reach the scheduler workqueue when
     /// no CSG doorbell has been assigned to the queue yet.
@@ -348,8 +351,8 @@ impl QueueJob {
     ) -> Self {
         Self {
             stream,
-            done_seqno: AtomicU64::new(0),
-            baseline_suspend_nanos: AtomicI64::new(0),
+            done_seqno: Atomic::new(0),
+            baseline_suspend_nanos: Atomic::new(0),
             group,
             queue_index,
             profiling_mask,
@@ -358,23 +361,23 @@ impl QueueJob {
     }
 
     fn done_seqno(&self) -> Option<u64> {
-        match self.done_seqno.load(Ordering::Relaxed) {
+        match self.done_seqno.load(Relaxed) {
             0 => None,
             v => Some(v),
         }
     }
 
     pub(super) fn set_done_seqno(&self, done_seqno: u64) {
-        self.done_seqno.store(done_seqno, Ordering::Relaxed);
+        self.done_seqno.store(done_seqno, Relaxed);
     }
 
     pub(super) fn baseline_suspend(&self) -> Delta {
-        Delta::from_nanos(self.baseline_suspend_nanos.load(Ordering::Relaxed))
+        Delta::from_nanos(self.baseline_suspend_nanos.load(Relaxed))
     }
 
     fn set_baseline_suspend(&self, baseline: Delta) {
         self.baseline_suspend_nanos
-            .store(baseline.as_nanos(), Ordering::Relaxed);
+            .store(baseline.as_nanos(), Relaxed);
     }
 }
 
@@ -402,8 +405,8 @@ pub(crate) struct QueueData {
     priority: u8,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
-    doorbell_id: AtomicUsize,
-    next_seqno: AtomicU64,
+    doorbell_id: Atomic<usize>,
+    next_seqno: Atomic<u64>,
     /// Per-job profiling sample slots, mapped into the VM and the
     /// kernel. Holds `profiling_slot_count` `JobProfilingData` records.
     profiling_slots: Arc<gem::MappedBo>,
@@ -459,7 +462,7 @@ impl QueueData {
     }
 
     fn doorbell_id(&self) -> Option<usize> {
-        let doorbell_id = self.doorbell_id.load(Ordering::Relaxed);
+        let doorbell_id = self.doorbell_id.load(Relaxed);
 
         if doorbell_id == UNASSIGNED_DOORBELL_ID {
             None
@@ -469,10 +472,8 @@ impl QueueData {
     }
 
     pub(super) fn set_doorbell_id(&self, doorbell_id: Option<usize>) {
-        self.doorbell_id.store(
-            doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID),
-            Ordering::Relaxed,
-        );
+        self.doorbell_id
+            .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
     pub(super) fn can_append(&self, instr_count: usize) -> Result {
@@ -483,12 +484,12 @@ impl QueueData {
     /// Claims `n` consecutive seqnos in a single atomic step and returns
     /// the highest one claimed.
     pub(super) fn claim_seqnos(&self, n: usize) -> u64 {
-        self.next_seqno.fetch_add(n as u64, Ordering::Relaxed) + n as u64
+        self.next_seqno.fetch_add(n as u64, Relaxed) + n as u64
     }
 
     /// Returns the highest seqno claimed so far on this queue.
     pub(crate) fn next_seqno(&self) -> u64 {
-        self.next_seqno.load(Ordering::Relaxed)
+        self.next_seqno.load(Relaxed)
     }
 
     /// Returns a drained job's profiling sample slot to the free list.
@@ -1174,8 +1175,8 @@ impl Queue {
                 priority: queue_args.priority(),
                 ringbuf,
                 interfaces,
-                doorbell_id: AtomicUsize::new(UNASSIGNED_DOORBELL_ID),
-                next_seqno: AtomicU64::new(0),
+                doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
+                next_seqno: Atomic::new(0),
                 profiling_slots,
                 profiling_slot_count,
                 iomem: tdev.iomem.clone(),

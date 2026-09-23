@@ -6,12 +6,14 @@
 //! records pending CS bits, while per-group work items grow heaps and write the
 //! firmware acknowledgments back once allocation can sleep.
 
-use core::sync::atomic::Ordering;
-
 use kernel::{
     alloc::KVec,
     prelude::*,
-    sync::{aref::ARef, Arc},
+    sync::{
+        aref::ARef,
+        atomic::Relaxed,
+        Arc, //
+    },
     workqueue::WorkItem,
 };
 
@@ -301,7 +303,12 @@ impl Scheduler {
 
         if let Some(group) = &group {
             if tiler_oom_mask != 0 {
-                group.tiler_oom.fetch_or(tiler_oom_mask, Ordering::Relaxed);
+                let tiler_oom = &group.tiler_oom;
+                let mut old = tiler_oom.load(Relaxed);
+                while let Err(current) = tiler_oom.cmpxchg(old, old | tiler_oom_mask, Relaxed) {
+                    old = current;
+                }
+
                 group.schedule_tiler_oom();
             }
 
@@ -355,7 +362,7 @@ impl Scheduler {
         let mut pending = KVec::with_capacity(MAX_CS_PER_GROUP, GFP_KERNEL)?;
 
         tdev.with_locked_scheduler(|_| {
-            let mut oom_mask = group.tiler_oom.swap(0, Ordering::Relaxed);
+            let mut oom_mask = group.tiler_oom.xchg(0, Relaxed);
             while oom_mask != 0 {
                 let cs_id = oom_mask.trailing_zeros();
                 oom_mask &= !(1u32 << cs_id);

@@ -13,7 +13,6 @@
 //! [`SlotOperations`]: crate::slot::SlotOperations
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel::{
     device::{
@@ -40,6 +39,10 @@ use kernel::{
     },
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         LockedBy,
@@ -134,7 +137,7 @@ pub(crate) struct VmAsData {
     /// Set by the MMU IRQ handler when this AS slot took a page fault
     /// the in-kernel handler could not service. The scheduler reads it
     /// during the next tick to terminate any groups bound to this VM.
-    pub(crate) unhandled_fault: AtomicBool,
+    pub(crate) unhandled_fault: Atomic<bool>,
 
     /// Serializes page-table update spans on this VM against hardware
     /// residency changes, so the GPU never translates against a page
@@ -183,7 +186,7 @@ impl VmAsData {
             as_active_users: LockedBy::new(&mmu.as_manager, 0),
             va_bits: va_bits as u8,
             coherent,
-            unhandled_fault: AtomicBool::new(false),
+            unhandled_fault: Atomic::new(false),
             op_lock <- new_mutex!(()),
             pt_allocator,
             page_table <- page_table_init,
@@ -792,7 +795,7 @@ impl AsSlotManager {
                 }
             }
             self.activate(&vm.as_seat, vm.into(), &mut ())?;
-            vm.unhandled_fault.store(false, Ordering::Relaxed);
+            vm.unhandled_fault.store(false, Relaxed);
         }
         *vm.as_active_users.access_mut(self) += 1;
         Ok(())

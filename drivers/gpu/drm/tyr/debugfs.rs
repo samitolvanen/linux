@@ -8,11 +8,7 @@
 use core::{
     cmp::min,
     fmt::Write,
-    ptr::NonNull,
-    sync::atomic::{
-        AtomicUsize,
-        Ordering, //
-    },
+    ptr::NonNull, //
 };
 
 use kernel::{
@@ -27,7 +23,13 @@ use kernel::{
         SeqFile, //
     },
     str::Formatter,
-    sync::Mutex,
+    sync::{
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
+        Mutex, //
+    },
     task::{
         Pid,
         TaskComm, //
@@ -109,7 +111,7 @@ impl GemRegistry {
         let mut bos = self.bos.lock();
         let index = bos.len();
         match bos.push(entry, GFP_KERNEL) {
-            Ok(()) => bo.registry_slot().store(index, Ordering::Relaxed),
+            Ok(()) => bo.registry_slot().store(index, Relaxed),
             Err(_) => {
                 pr_warn_once!("tyr: gems debugfs registration failed under memory pressure\n")
             }
@@ -117,9 +119,9 @@ impl GemRegistry {
     }
 
     /// Removes the BO owning `slot`. A no-op if the BO was never registered.
-    pub(crate) fn unregister(&self, slot: &AtomicUsize) {
+    pub(crate) fn unregister(&self, slot: &Atomic<usize>) {
         let mut bos = self.bos.lock();
-        let index = slot.swap(NOT_REGISTERED, Ordering::Relaxed);
+        let index = slot.xchg(NOT_REGISTERED, Relaxed);
         if index == NOT_REGISTERED {
             return;
         }
@@ -135,7 +137,7 @@ impl GemRegistry {
             // is alive, and the registry lock is held for exclusive access.
             unsafe { bos[index].gem.as_ref() }
                 .registry_slot()
-                .store(index, Ordering::Relaxed);
+                .store(index, Relaxed);
         }
     }
 
@@ -269,7 +271,7 @@ impl VmRegistry {
         let mut vms = self.vms.lock();
         let index = vms.len();
         match vms.push(VmEntry { vm: vm.into() }, GFP_KERNEL) {
-            Ok(()) => vm.registry_slot().store(index, Ordering::Relaxed),
+            Ok(()) => vm.registry_slot().store(index, Relaxed),
             Err(_) => {
                 pr_warn_once!("tyr: gpuvas debugfs registration failed under memory pressure\n")
             }
@@ -277,9 +279,9 @@ impl VmRegistry {
     }
 
     /// Removes the VM owning `slot`. A no-op if the VM was never registered.
-    pub(crate) fn unregister(&self, slot: &AtomicUsize) {
+    pub(crate) fn unregister(&self, slot: &Atomic<usize>) {
         let mut vms = self.vms.lock();
-        let index = slot.swap(NOT_REGISTERED, Ordering::Relaxed);
+        let index = slot.xchg(NOT_REGISTERED, Relaxed);
         if index == NOT_REGISTERED {
             return;
         }
@@ -292,7 +294,7 @@ impl VmRegistry {
             // reference keeps its VM alive, and the registry lock is held.
             unsafe { entry.vm.as_ref() }
                 .registry_slot()
-                .store(i, Ordering::Relaxed);
+                .store(i, Relaxed);
         }
     }
 

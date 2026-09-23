@@ -2,11 +2,6 @@
 
 use core::fmt::Write;
 use core::num::NonZero;
-use core::sync::atomic::{
-    AtomicBool,
-    AtomicU32,
-    Ordering, //
-};
 
 use kernel::{
     bindings,
@@ -66,8 +61,12 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::{
+            Acquire,
             Atomic,
-            Relaxed, //
+            AtomicFlag,
+            Full,
+            Relaxed,
+            Release, //
         },
         Arc,
         Mutex,
@@ -314,7 +313,7 @@ pub(crate) struct TyrDrmDeviceData {
     /// Producers OR new status bits in via `fw_events_or` from any
     /// context; the consumer reads-and-clears with `fw_events_take`.
     /// This keeps scheduler-mutex work off the threaded IRQ handler.
-    fw_events: AtomicU32,
+    fw_events: Atomic<u32>,
 
     /// Worker that drains `fw_events` under the
     /// scheduler mutex. Enqueued on `sched_wq`.
@@ -338,13 +337,13 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     sync_upd_work: Work<TyrDrmDevice, { work_id::SYNC_UPD }>,
 
-    /// Dedup gate paired with `sync_upd_work`. The IRQ side flips it
-    /// false -> true under cmpxchg before enqueuing the worker, and
-    /// the worker flips it back to false at the start of its run.
+    /// Dedup gate paired with `sync_upd_work`. The IRQ side claims it
+    /// with xchg and enqueues the worker only if it was false, and the
+    /// worker flips it back to false at the start of its run.
     /// Coalesces a burst of CSG SYNC_UPDATE acks into a single
     /// re-evaluation pass while leaving any IRQ that races the
     /// snapshot free to schedule the next one.
-    sync_upd_pending: AtomicBool,
+    sync_upd_pending: AtomicFlag,
 
     /// Periodic re-arm worker for `tick_work`.
     ///
@@ -488,20 +487,24 @@ impl TyrDrmDeviceData {
     /// drain side observes any state the producer wrote before raising
     /// the bit.
     pub(crate) fn fw_events_or(&self, bits: u32) {
-        self.fw_events.fetch_or(bits, Ordering::Release);
+        let mut old = self.fw_events.load(Relaxed);
+
+        while let Err(current) = self.fw_events.cmpxchg(old, old | bits, Release) {
+            old = current;
+        }
     }
 
     /// Atomically reads and clears the firmware-events word, returning
     /// the bits that were set.
     pub(crate) fn fw_events_take(&self) -> u32 {
-        self.fw_events.swap(0, Ordering::Acquire)
+        self.fw_events.xchg(0, Acquire)
     }
 
     /// Returns whether any firmware-events bits are pending, a hint for
     /// rescheduling the drain worker. The drain itself synchronizes through
     /// `fw_events_take`.
     pub(crate) fn fw_events_pending(&self) -> bool {
-        self.fw_events.load(Ordering::Relaxed) != 0
+        self.fw_events.load(Relaxed) != 0
     }
 
     /// Schedules the fw-events worker on the scheduler workqueue.
@@ -531,11 +534,7 @@ impl TyrDrmDeviceData {
     /// reaches `queue_work`'s per-pool spinlock, coalescing the burst into
     /// one re-evaluation pass.
     pub(crate) fn schedule_sync_upd(tdev: &ARef<TyrDrmDevice>) {
-        if tdev
-            .sync_upd_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if tdev.sync_upd_pending.xchg(true, Full) {
             return;
         }
         tdev.enqueue_system_work(|| {
@@ -718,7 +717,7 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
         // SYNC_UPDATE that fires after the snapshot re-arms the worker
         // for the next pass; clearing at the end would silently drop
         // IRQs racing the snapshot.
-        tdev.sync_upd_pending.store(false, Ordering::Release);
+        tdev.sync_upd_pending.store(false, Release);
 
         Scheduler::drain_resident_queue_completions(tdev);
 
@@ -949,11 +948,11 @@ impl platform::Driver for TyrPlatformDriverData {
                 sched <- new_mutex!(SchedulerState::Disabled),
                 sched_suspended: Atomic::new(false),
                 csg_slot_manager <- new_mutex!(csg_slot_manager),
-                fw_events: AtomicU32::new(0),
+                fw_events: Atomic::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
-                sync_upd_pending: AtomicBool::new(false),
+                sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 system_work_closed <- new_spinlock!(false),

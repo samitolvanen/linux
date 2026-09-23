@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::mem::offset_of;
-use core::sync::atomic::AtomicU32;
 
 use kernel::{
     alloc::KVec,
@@ -280,7 +279,7 @@ pub(crate) struct Group {
     /// signalling sections and must not cover a userspace copy.
     #[pin]
     submit_lock: Mutex<()>,
-    pub(crate) tiler_oom: AtomicU32,
+    pub(crate) tiler_oom: Atomic<u32>,
     /// Tyr DRM device that owns this group.
     ///
     /// # Invariants
@@ -526,7 +525,7 @@ impl Group {
                     term_scheduled: false,
                 }),
                 submit_lock <- new_mutex!(()),
-                tiler_oom: AtomicU32::new(0),
+                tiler_oom: Atomic::new(0),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
