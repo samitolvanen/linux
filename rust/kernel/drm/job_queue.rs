@@ -99,7 +99,8 @@
 //!   signal, either normally or with `ECANCELED`, before drop returns.
 //! - Jobs at stages beyond `WaitingForExec` — those already handed to hardware —
 //!   are waited on before cancellation. Use
-//!   [`PipelineBuilder::set_cancel_timeout`] to bound this wait.
+//!   [`PipelineBuilder::set_cancel_timeout`] to bound this wait. The wait is
+//!   not allowed inside a dma-fence signalling section, even when bounded.
 //! - The driver's [`QueueOps`] methods are never called again after drop returns.
 //!
 //! Together these guarantees make teardown straightforward to reason about: no
@@ -1956,11 +1957,10 @@ impl<T: QueueOps> JobQueue<T> {
     /// The cancel is terminal. Every later [`commit`](Self::commit) is refused.
     /// [`park`](Self::park) and [`unpark`](Self::unpark) are unaffected.
     ///
-    /// Must be called from process context, since it may sleep while waiting
-    /// for hardware fences. It allocates nothing, so a dma-fence signalling
-    /// section may call it when [`PipelineBuilder::set_cancel_timeout`] bounds
-    /// each wait. Such a caller must also keep [`StageOps::teardown`] and the
-    /// [`QueueOps::Job`] destructor free of anything the section forbids.
+    /// Must be called from process context and outside any dma-fence
+    /// signalling section, since it may wait on hardware fences.
+    /// [`PipelineBuilder::set_cancel_timeout`] bounds the wait but does not
+    /// make it safe there.
     pub fn cancel_all(&self) {
         // WaitingForExec is always at index 1; stages beyond it have been
         // handed to hardware and need their fences waited on before cancel.
