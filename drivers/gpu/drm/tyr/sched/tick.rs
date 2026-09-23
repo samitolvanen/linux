@@ -382,7 +382,7 @@ impl ParkedGroups {
 ///
 /// The eviction leaves every group that can still run on a scheduler
 /// list, so parking the listed groups covers all of them. Groups it
-/// routed to terminal cleanup instead are drained by
+/// routed to terminal cleanup instead are canceled by
 /// `Group::cancel_queues`.
 pub(crate) fn pre_reset(
     tdev: &ARef<TyrDrmDevice>,
@@ -407,10 +407,8 @@ pub(crate) fn pre_reset(
 /// Every queue `pre_reset` parked is released here, on both legs. After
 /// a successful reset the worker reissues the tick, and the groups that
 /// can still run rebind. A failed reset leaves the hardware
-/// unusable, so every group is terminated first, and
-/// `Group::cancel_queues` drains the queues of a terminated group,
-/// signaling the queued and in-flight fences rather than leaving them
-/// unsignaled.
+/// unusable, so every group is terminated first, and terminal cleanup
+/// signals the queued and in-flight fences of a terminated group.
 pub(crate) fn post_reset(tdev: &ARef<TyrDrmDevice>, parked: ParkedGroups, reset_failed: bool) {
     if reset_failed {
         let _ = tdev.with_locked_scheduler(|sched| {
