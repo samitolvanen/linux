@@ -430,6 +430,15 @@ impl<'a> FwParser<'a> {
             return Err(EINVAL);
         }
 
+        if section_hdr.data.len() > section_hdr.va.len() {
+            pr_err!("Firmware corrupted, section data exceeds section size\n");
+            return Err(EINVAL);
+        }
+
+        if section_hdr.va.is_empty() {
+            return Ok(None);
+        }
+
         let name_len = entry_cursor.len() - entry_cursor.pos();
         let name_bytes = entry_cursor.read(name_len)?;
 
@@ -599,14 +608,6 @@ impl SectionHeader {
         let va_end = cursor.read_u32()?;
 
         let va = va_start..va_end;
-
-        if va.is_empty() {
-            pr_err!(
-                "Invalid firmware file: empty VA range at pos {}\n",
-                cursor.pos(),
-            );
-            return Err(EINVAL);
-        }
 
         let data_start = cursor.read_u32()?;
         let data_end = cursor.read_u32()?;
