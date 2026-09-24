@@ -143,14 +143,22 @@ impl Mmu {
     ///
     /// An extra user on an already-resident VM only bumps the count under the
     /// AS slot manager lock, keeping it off any in-flight page-table update.
-    /// Binding a not-resident VM takes the op lock first.
-    pub(crate) fn activate_vm(&self, vm_as_data: ArcBorrow<'_, VmAsData>) -> Result {
+    /// Binding a not-resident VM takes the op lock first, then fails with
+    /// `EINVAL` if `refuse` returns true.
+    pub(crate) fn activate_vm(
+        &self,
+        vm_as_data: ArcBorrow<'_, VmAsData>,
+        refuse: impl FnOnce() -> bool,
+    ) -> Result {
         // The `.lock()` guard is a condition temporary, so it drops before
         // the path below can take the op lock.
         if self.as_manager.lock().bump_resident_vm_users(&vm_as_data) {
             return Ok(());
         }
         let _op = vm_as_data.lock_ops();
+        if refuse() {
+            return Err(EINVAL);
+        }
         let _hw = self.begin_hw_access();
         self.as_manager.lock().activate_vm(vm_as_data)
     }
@@ -171,6 +179,13 @@ impl Mmu {
         let _op = vm_as_data.lock_ops();
         let _hw = self.begin_hw_access();
         self.as_manager.lock().deactivate_vm(vm_as_data)
+    }
+
+    /// Disables an unusable VM's address space, keeping its AS slot bound.
+    ///
+    /// The caller holds the VM's op lock and a `begin_hw_access()` guard.
+    pub(crate) fn disable_vm(&self, vm_as_data: &VmAsData) -> Result {
+        self.as_manager.lock().disable_vm(vm_as_data)
     }
 
     /// Releases every resident VM's hardware AS slot for runtime suspend.
