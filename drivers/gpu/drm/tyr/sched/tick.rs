@@ -1146,6 +1146,9 @@ impl<'a> Tick<'a> {
                                 bind_timed_out = true;
                             }
                             self.requeue_pending_bind(pending);
+                            if !group.can_run() {
+                                Scheduler::request_tick(data);
+                            }
                             continue;
                         }
 
