@@ -476,7 +476,7 @@ impl QueueOps for VmBindQueueOps {
                 Ok(SubmitResult::Submitted)
             }
             Err(err) => {
-                self.exec.mark_unusable();
+                self.exec.declare_unusable();
                 fence.signal(Err(err));
                 Err(err)
             }
@@ -1233,7 +1233,7 @@ impl VmExec {
     /// Activate the VM in a hardware address space slot.
     pub(crate) fn activate(&self) -> Result {
         self.mmu
-            .activate_vm(self.as_data.as_arc_borrow())
+            .activate_vm(self.as_data.as_arc_borrow(), || self.is_unusable())
             .inspect_err(|e| {
                 dev_err!(self.dev(), "Failed to activate VM: {:?}", e);
             })
@@ -1268,8 +1268,30 @@ impl VmExec {
         self.unusable.load(Relaxed)
     }
 
-    pub(crate) fn mark_unusable(&self) {
-        self.unusable.store(true, Relaxed);
+    /// Marks the VM unusable, returning whether it was usable before.
+    ///
+    /// Unlike `declare_unusable`, does not disable the address space.
+    pub(crate) fn mark_unusable(&self) -> bool {
+        !self.unusable.xchg(true, Relaxed)
+    }
+
+    /// Marks the VM unusable after a failed update and disables its address
+    /// space.
+    fn declare_unusable(&self) {
+        if self.mark_unusable() {
+            let _op = self.as_data.lock_ops();
+            let _hw = self.mmu.begin_hw_access();
+            self.disable_as();
+        }
+    }
+
+    /// Disables the address space of this unusable VM.
+    ///
+    /// The caller holds the op lock and a `begin_hw_access()` guard.
+    fn disable_as(&self) {
+        if let Err(e) = self.mmu.disable_vm(&self.as_data) {
+            dev_err!(self.dev(), "Failed to disable unusable VM: {:?}\n", e);
+        }
     }
 
     /// Flag the VM idle, keeping its address space slot resident.
@@ -1398,8 +1420,8 @@ impl VmExec {
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
 
-        // kill() marks the VM unusable under gpuvm_unique before unmapping,
-        // so this check under the same lock cannot race with teardown.
+        // kill() marks the VM unusable before its unmap takes gpuvm_unique,
+        // so a map that passes this check is removed by that unmap.
         if self.is_unusable() {
             return Err(EINVAL);
         }
