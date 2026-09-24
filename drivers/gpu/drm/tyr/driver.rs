@@ -811,7 +811,7 @@ impl platform::Driver for TyrPlatformDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         pin_init::pin_init_scope(move || {
-            let core_clk = Clk::get(pdev.as_ref(), Some(c"core"))?;
+            let core_clk = Clk::get(pdev.as_ref(), None)?;
             let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
             let coregroup_clk = OptionalClk::get(pdev.as_ref(), Some(c"coregroup"))?;
 
