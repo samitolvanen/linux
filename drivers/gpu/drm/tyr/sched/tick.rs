@@ -9,8 +9,6 @@
 //! `Scheduler::request_tick`; the periodic re-arm is handled
 //! separately by `periodic_tick_work` on the system unbound workqueue.
 
-use core::sync::atomic::Ordering;
-
 use kernel::{
     list::{
         List,
@@ -656,7 +654,7 @@ impl SchedulingDecision {
                     reason,
                     priority as u8,
                     0,
-                    arc.bound_tick_counter.load(Ordering::Relaxed),
+                    arc.bound_tick_counter.load(ordering::Relaxed),
                 );
                 cursor.move_next();
                 continue;
@@ -961,7 +959,7 @@ impl<'a> Tick<'a> {
                 },
                 slot_data.group.priority as u8,
                 slot_data.fw_priority,
-                slot_data.group.bound_tick_counter.load(Ordering::Relaxed),
+                slot_data.group.bound_tick_counter.load(ordering::Relaxed),
             );
 
             if can_run {
@@ -1164,7 +1162,7 @@ impl<'a> Tick<'a> {
                             .map(|s| {
                                 let is_idle = s.group.status().is_idle;
                                 let bound_ticks =
-                                    s.group.bound_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                    s.group.bound_tick_counter.fetch_add(1, ordering::Relaxed) + 1;
                                 (s.group.handle(), is_idle, bound_ticks)
                             })
                             .unwrap_or((0, false, 0));
@@ -1229,7 +1227,7 @@ impl<'a> Tick<'a> {
                                 trace::TickDecisionReason::ActivateFailed,
                                 sw_prio as u8,
                                 fw_prio,
-                                group.bound_tick_counter.load(Ordering::Relaxed),
+                                group.bound_tick_counter.load(ordering::Relaxed),
                             );
                             // ETIMEDOUT reaches here from the AS-ready
                             // and cache-flush polls under vm.activate().
@@ -1243,7 +1241,7 @@ impl<'a> Tick<'a> {
                             continue;
                         }
 
-                        group.bound_tick_counter.store(0, Ordering::Relaxed);
+                        group.bound_tick_counter.store(0, ordering::Relaxed);
                         let slot_idx = group.with_locked_inner(|inner| inner.csg_id).unwrap_or(0);
                         trace::sched_bind(slot_idx as u32, group.handle(), sw_prio as u8, fw_prio);
                         trace::tick_decision_per_group(

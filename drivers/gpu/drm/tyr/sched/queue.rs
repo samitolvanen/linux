@@ -4,10 +4,6 @@ use core::ops::{
     Deref,
     Range, //
 };
-use core::sync::atomic::{
-    AtomicU64,
-    Ordering, //
-};
 
 use kernel::{
     alloc::KVec,
@@ -339,11 +335,11 @@ pub(crate) struct QueueData {
     ///
     /// Set once by `set_group_id` before the queue is published to any
     /// path that can emit a tracepoint; reads after publish are stable.
-    group_id: AtomicU64,
+    group_id: Atomic<u64>,
     /// Owning group's reuse-proof uid, captured alongside `group_id` so
     /// tracepoints emitted without a `&Group` can carry a handle-reuse
     /// proof identity. Published once by `set_group_id`.
-    group_uid: AtomicU64,
+    group_uid: Atomic<u64>,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
     doorbell_id: Atomic<usize>,
@@ -422,16 +418,16 @@ impl QueueData {
     /// called once after the group's pool index is reserved, before any
     /// path that can emit a tracepoint runs.
     pub(crate) fn set_group_id(&self, group_id: u64, group_uid: u64) {
-        self.group_id.store(group_id, Ordering::Relaxed);
-        self.group_uid.store(group_uid, Ordering::Relaxed);
+        self.group_id.store(group_id, Relaxed);
+        self.group_uid.store(group_uid, Relaxed);
     }
 
     fn group_id(&self) -> u64 {
-        self.group_id.load(Ordering::Relaxed)
+        self.group_id.load(Relaxed)
     }
 
     fn group_uid(&self) -> u64 {
-        self.group_uid.load(Ordering::Relaxed)
+        self.group_uid.load(Relaxed)
     }
 
     pub(super) fn can_append(&self, instr_count: usize) -> Result {
@@ -1562,8 +1558,8 @@ impl Queue {
             pin_init!(QueueData {
                 priority: queue_args.priority(),
                 cs_id,
-                group_id: AtomicU64::new(0),
-                group_uid: AtomicU64::new(0),
+                group_id: Atomic::new(0),
+                group_uid: Atomic::new(0),
                 ringbuf,
                 interfaces,
                 doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),

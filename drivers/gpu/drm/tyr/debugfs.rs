@@ -9,8 +9,7 @@
 use core::{
     cmp::min,
     fmt::Write,
-    ptr::NonNull,
-    sync::atomic::Ordering, //
+    ptr::NonNull, //
 };
 
 use kernel::{
@@ -382,7 +381,7 @@ fn reset_write(tdev: &ARef<TyrDrmDevice>, _reader: &mut UserSliceReader) -> Resu
 
 /// Reports the remaining number of armed ping failures.
 fn fail_ping_read(tdev: &ARef<TyrDrmDevice>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    writeln!(f, "{}", tdev.fail_ping_count.load(Ordering::Relaxed))
+    writeln!(f, "{}", tdev.fail_ping_count.load(Relaxed))
 }
 
 /// Arms ping fault injection for the next N watchdog pings.
@@ -395,7 +394,7 @@ fn fail_ping_write(tdev: &ARef<TyrDrmDevice>, reader: &mut UserSliceReader) -> R
     reader.read_slice(&mut buf[..n])?;
     let s = core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?;
     let count = s.trim().parse::<u32>().map_err(|_| EINVAL)?;
-    tdev.fail_ping_count.store(count, Ordering::Relaxed);
+    tdev.fail_ping_count.store(count, Relaxed);
     Ok(())
 }
 

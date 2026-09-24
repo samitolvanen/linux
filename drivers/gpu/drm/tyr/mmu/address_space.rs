@@ -13,11 +13,6 @@
 //! [`SlotOperations`]: crate::slot::SlotOperations
 
 use core::ops::Range;
-use core::sync::atomic::{
-    AtomicU32,
-    AtomicU64,
-    Ordering, //
-};
 
 use kernel::{
     device::{
@@ -159,25 +154,25 @@ pub(crate) struct VmAsData {
     /// Updated by the scheduler at CSG slot activate / evict so the
     /// MMU IRQ handler can resolve the faulting AS slot back to a
     /// group without taking any scheduler lock.
-    pub(crate) bound_group_id: AtomicU64,
+    pub(crate) bound_group_id: Atomic<u64>,
 
     /// Reuse-proof uid of the bound group, or [`u64::MAX`] when no group
     /// is bound. Paired with [`Self::bound_group_id`] and updated at the
     /// same sites, so the MMU fault tracepoint can name the exact group
     /// instance even after the pool handle has been reused.
-    pub(crate) bound_group_uid: AtomicU64,
+    pub(crate) bound_group_uid: Atomic<u64>,
 
     /// CSG slot index the bound group occupies, or [`u32::MAX`] when
     /// no group is bound. Paired with [`Self::bound_group_id`] and
     /// updated at the same sites.
-    pub(crate) bound_csg_id: AtomicU32,
+    pub(crate) bound_csg_id: Atomic<u32>,
 
     /// Pool handle of the VM owning this address-space data, or `0`
     /// before the owning VM has been inserted into the pool. Mirrors
     /// `VmExec::handle` so the AS-lifecycle tracepoints can correlate
     /// with the `as_slot_assign` / `vm_bind` events. Downstream-only
     /// debug aid.
-    vm_id: AtomicU64,
+    vm_id: Atomic<u64>,
 
     /// Page table.
     ///
@@ -220,10 +215,10 @@ impl VmAsData {
             unhandled_fault: Atomic::new(false),
             op_lock <- new_mutex!(()),
             pt_allocator,
-            bound_group_id: AtomicU64::new(u64::MAX),
-            bound_group_uid: AtomicU64::new(u64::MAX),
-            bound_csg_id: AtomicU32::new(u32::MAX),
-            vm_id: AtomicU64::new(0),
+            bound_group_id: Atomic::new(u64::MAX),
+            bound_group_uid: Atomic::new(u64::MAX),
+            bound_csg_id: Atomic::new(u32::MAX),
+            vm_id: Atomic::new(0),
             page_table <- page_table_init,
         }? Error))
     }
@@ -239,27 +234,27 @@ impl VmAsData {
 
     /// Records the owning VM's pool handle for trace correlation.
     pub(crate) fn set_vm_id(&self, vm_id: u64) {
-        self.vm_id.store(vm_id, Ordering::Relaxed);
+        self.vm_id.store(vm_id, Relaxed);
     }
 
     /// Returns the owning VM's pool handle, or `0` if not yet set.
     fn vm_id(&self) -> u64 {
-        self.vm_id.load(Ordering::Relaxed)
+        self.vm_id.load(Relaxed)
     }
 
     /// Records that the group with `group_id` / `group_uid` is now bound
     /// on `csg_id` for this VM.
     pub(crate) fn set_bound_group(&self, group_id: u64, group_uid: u64, csg_id: u32) {
-        self.bound_group_id.store(group_id, Ordering::Relaxed);
-        self.bound_group_uid.store(group_uid, Ordering::Relaxed);
-        self.bound_csg_id.store(csg_id, Ordering::Relaxed);
+        self.bound_group_id.store(group_id, Relaxed);
+        self.bound_group_uid.store(group_uid, Relaxed);
+        self.bound_csg_id.store(csg_id, Relaxed);
     }
 
     /// Clears the bound-group back-pointer set by [`Self::set_bound_group`].
     pub(crate) fn clear_bound_group(&self) {
-        self.bound_group_id.store(u64::MAX, Ordering::Relaxed);
-        self.bound_group_uid.store(u64::MAX, Ordering::Relaxed);
-        self.bound_csg_id.store(u32::MAX, Ordering::Relaxed);
+        self.bound_group_id.store(u64::MAX, Relaxed);
+        self.bound_group_uid.store(u64::MAX, Relaxed);
+        self.bound_csg_id.store(u32::MAX, Relaxed);
     }
 
     /// Returns the currently bound `(group_id, group_uid, csg_id)`
@@ -267,9 +262,9 @@ impl VmAsData {
     /// bound.
     pub(crate) fn bound_group(&self) -> (u64, u64, u32) {
         (
-            self.bound_group_id.load(Ordering::Relaxed),
-            self.bound_group_uid.load(Ordering::Relaxed),
-            self.bound_csg_id.load(Ordering::Relaxed),
+            self.bound_group_id.load(Relaxed),
+            self.bound_group_uid.load(Relaxed),
+            self.bound_csg_id.load(Relaxed),
         )
     }
 

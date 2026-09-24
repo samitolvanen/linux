@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use core::mem::offset_of;
-use core::sync::atomic::{
-    AtomicU32,
-    AtomicU64,
-    Ordering, //
-};
 
 use kernel::{
     alloc::KVec,
@@ -106,7 +101,7 @@ pub(crate) const MAX_CS_PER_GROUP: usize = 32;
 /// reuse the same slot. This counter never repeats for the lifetime of
 /// the driver, giving each group instance a stable, unambiguous identity
 /// across the trace.
-static GROUP_UID: AtomicU64 = AtomicU64::new(0);
+static GROUP_UID: Atomic<u64> = Atomic::new(0);
 
 /// The group's lifecycle state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -303,10 +298,10 @@ pub(crate) struct Group {
     /// tick. Frozen at the value seen when the group is evicted; not
     /// reset until the next bind. Used by the
     /// `tyr_tick_decision_per_group` tracepoint as a residency proxy.
-    pub(crate) bound_tick_counter: AtomicU32,
+    pub(crate) bound_tick_counter: Atomic<u32>,
     /// Pool handle used as the stable group identifier in tracepoints.
     /// Zero until the group's pool index is reserved.
-    handle: AtomicU64,
+    handle: Atomic<u64>,
     /// Reuse-proof per-instance identity, assigned from [`GROUP_UID`] at
     /// creation. Unlike `handle`, it is never reused, so group-keyed
     /// tracepoints can tell two instances apart across handle reuse.
@@ -564,9 +559,9 @@ impl Group {
                 }),
                 submit_lock <- new_mutex!(()),
                 tiler_oom: Atomic::new(0),
-                bound_tick_counter: AtomicU32::new(0),
-                handle: AtomicU64::new(0),
-                uid: GROUP_UID.fetch_add(1, Ordering::Relaxed),
+                bound_tick_counter: Atomic::new(0),
+                handle: Atomic::new(0),
+                uid: GROUP_UID.fetch_add(1, Relaxed),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
@@ -802,7 +797,7 @@ impl Group {
     /// Pool handle assigned when the group's pool index is reserved.
     /// Returns `0` before that.
     pub(crate) fn handle(&self) -> u64 {
-        self.handle.load(Ordering::Relaxed)
+        self.handle.load(Relaxed)
     }
 
     /// Reuse-proof per-instance identity assigned at creation. Fixed for
@@ -812,7 +807,7 @@ impl Group {
     }
 
     fn set_handle(&self, handle: u64) {
-        self.handle.store(handle, Ordering::Relaxed);
+        self.handle.store(handle, Relaxed);
     }
 
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
