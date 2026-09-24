@@ -461,6 +461,14 @@ impl<'a> FwParser<'a> {
             return Err(EINVAL);
         }
 
+        if section_hdr.data.len() > section_hdr.va.len() {
+            dev_err!(
+                entry_cursor.dev,
+                "Firmware corrupted, section data exceeds section size"
+            );
+            return Err(EINVAL);
+        }
+
         if section_hdr.va.is_empty() {
             return Ok(None);
         }
