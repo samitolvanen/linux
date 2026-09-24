@@ -291,8 +291,8 @@ pub(crate) struct AddressSpaceManager {
     /// `as_manager` mutex, so the flag follows whichever VM occupies the slot.
     lock_pending: [bool; MAX_AS],
 
-    /// Whether hardware AS slot N was unprogrammed by the fault
-    /// handler while its slot binding was kept. Cleared when the slot
+    /// Whether hardware AS slot N was unprogrammed for a faulted or
+    /// unusable VM while its slot binding was kept. Cleared when the slot
     /// is programmed again.
     faulty: [bool; MAX_AS],
 
@@ -829,8 +829,8 @@ impl AsSlotManager {
         self.evict(&vm.as_seat, &mut ())
     }
 
-    /// Disables a faulted VM's hardware address space while keeping
-    /// the slot bound to the VM.
+    /// Disables a faulted or unusable VM's hardware address space while
+    /// keeping the slot bound to the VM.
     ///
     /// The user count is untouched, so the slot cannot be handed to
     /// another VM while bound groups still name it through their CSG
