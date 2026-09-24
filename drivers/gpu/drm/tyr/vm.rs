@@ -838,6 +838,8 @@ pub(crate) struct VmExec {
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
+    /// VA range for this VM.
+    va_range: Range<u64>,
 }
 
 /// Flushes the deferred `vm_bo` list, then drops the gpuvm references
@@ -900,8 +902,6 @@ pub(crate) struct Vm {
     /// sequence numbers in the same order.
     #[pin]
     bind_lock: Mutex<()>,
-    /// VA range for this VM.
-    va_range: Range<u64>,
     /// Exclusive upper bound on what user space may bind.
     user_va_limit: u64,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
@@ -991,6 +991,7 @@ impl Vm {
                 gpuvm: ManuallyDrop::new(gpuvm),
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: Atomic::new(false),
+                va_range: total_range,
             }),
             GFP_KERNEL,
         )?;
@@ -1009,7 +1010,6 @@ impl Vm {
                 exec,
                 bind_queue,
                 bind_lock <- new_mutex!(()),
-                va_range: total_range,
                 user_va_limit: kernel_range.start,
                 kernel_va,
                 kernel_reservations <- new_mutex!(KVec::new()),
@@ -1457,12 +1457,21 @@ impl VmExec {
     }
 
     pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+        let end = va.checked_add(size).ok_or(EINVAL)?;
+        let full_vm = va == self.va_range.start && end == self.va_range.end;
+
         let mut resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-            ],
+            preallocated_gpuvas: if full_vm {
+                // Unmapping the entire VM cannot split an existing mapping,
+                // so no GPUVA objects are needed for remap operations.
+                [None, None, None]
+            } else {
+                [
+                    Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                    Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                    Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
+                ]
+            },
             vm_bo: None,
             map_sgt: None,
             pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
