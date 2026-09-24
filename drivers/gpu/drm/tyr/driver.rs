@@ -831,7 +831,7 @@ impl platform::Driver for TyrPlatformDriverData {
         pdev: &platform::Device<Core>,
         info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
-        let core_clk = Clk::get(pdev.as_ref(), Some(c"core"))?;
+        let core_clk = Clk::get(pdev.as_ref(), None)?;
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
         let coregroup_clk = OptionalClk::get(pdev.as_ref(), Some(c"coregroup"))?;
 
