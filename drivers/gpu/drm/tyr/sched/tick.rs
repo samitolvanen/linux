@@ -182,7 +182,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
 
     // The closure does not run until the scheduler is enabled, so a tick
     // step that fires during probe cannot re-arm itself and keep retrying.
-    let result = tdev.with_locked_scheduler(|sched| {
+    let Some(result) = tdev.with_enabled_scheduler(|sched| {
         // The gate above was passed before this lock, so a scheduler suspend
         // may have begun in between. It sets the flag under this same lock
         // before evicting.
@@ -193,7 +193,9 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         Tick::new(sched, &mut teardown_groups)
             .tick(tdev)
             .inspect_err(|_| Scheduler::request_tick(tdev))
-    });
+    }) else {
+        return Ok(());
+    };
 
     if result == Err(ETIMEDOUT) {
         tdev.reset.schedule();
