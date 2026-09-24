@@ -2,10 +2,6 @@
 
 use core::fmt::Write;
 use core::num::NonZero;
-use core::sync::atomic::{
-    AtomicU32,
-    Ordering, //
-};
 
 use kernel::{
     bindings,
@@ -487,7 +483,7 @@ pub(crate) struct TyrDrmDeviceData {
     /// Remaining ping failures to inject, armed through the `fail_ping`
     /// debugfs knob. While non-zero, the watchdog decrements it and
     /// treats the ping as failed without calling the firmware.
-    pub(crate) fail_ping_count: AtomicU32,
+    pub(crate) fail_ping_count: Atomic<u32>,
 
     /// Completed once unbind or a failed probe has halted the firmware.
     #[pin]
@@ -1088,14 +1084,16 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
             return;
         }
 
-        if tdev
-            .fail_ping_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            dev_info!(tdev.pdev.as_ref(), "debug: injecting ping failure\n");
-            tdev.reset.schedule();
-            return;
+        let mut armed = tdev.fail_ping_count.load(Relaxed);
+        while armed > 0 {
+            match tdev.fail_ping_count.cmpxchg(armed, armed - 1, Relaxed) {
+                Ok(_) => {
+                    dev_info!(tdev.pdev.as_ref(), "debug: injecting ping failure\n");
+                    tdev.reset.schedule();
+                    return;
+                }
+                Err(current) => armed = current,
+            }
         }
 
         let ping_res = tdev.fw.ping(PING_TIMEOUT_MS);
@@ -1300,7 +1298,7 @@ impl TyrPlatformDriverData {
                 unbind_halted <- Completion::new(),
                 dead_mappings <- new_mutex!(KVec::new()),
                 dead_mapping_work <- kernel::new_work!("TyrDrmDeviceData::dead_mapping_work"),
-                fail_ping_count: AtomicU32::new(0),
+                fail_ping_count: Atomic::new(0),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
                 devfreq_data,
