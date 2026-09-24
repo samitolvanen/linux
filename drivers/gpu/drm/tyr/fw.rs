@@ -425,6 +425,16 @@ impl Firmware {
                 let va = u64::from(va.start);
                 let end = va + size;
 
+                if vm.overlaps_mapping(va, size) {
+                    dev_err!(
+                        dev,
+                        "Firmware corrupted, section {:#x}..{:#x} overlaps another section\n",
+                        va,
+                        end
+                    );
+                    return Err(EINVAL);
+                }
+
                 let mem = KernelBo::new(
                     ddev,
                     vm.as_arc_borrow(),
