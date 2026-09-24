@@ -1398,6 +1398,16 @@ impl VmExec {
         Some((ARef::from(bo), bo_offset))
     }
 
+    /// Returns whether any mapping overlaps `[va, va + size)`.
+    ///
+    /// The lookup is a snapshot taken under `gpuvm_unique`.
+    pub(crate) fn overlaps_mapping(&self, va: u64, size: u64) -> bool {
+        let guard = self.gpuvm_unique.lock();
+        guard
+            .as_ref()
+            .is_some_and(|gpuvm| gpuvm.find_first(va, size).is_some())
+    }
+
     /// Flag the VM idle, keeping its address space slot resident.
     ///
     /// The slot is reclaimed lazily under pressure. Use `deactivate`
