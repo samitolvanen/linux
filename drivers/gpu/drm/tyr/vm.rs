@@ -1150,7 +1150,7 @@ pub(crate) struct VmExec {
     /// insert completes, matching the unallocated value of the
     /// underlying allocating XArray (whose first allocated index is
     /// `1`).
-    handle: core::sync::atomic::AtomicU64,
+    handle: Atomic<u64>,
 }
 
 impl_has_work! {
@@ -1368,7 +1368,7 @@ impl Vm {
                 va_range: total_range,
                 handoff,
                 cleanup_work <- new_work!("tyr-vm-cleanup"),
-                handle: core::sync::atomic::AtomicU64::new(0),
+                handle: Atomic::new(0),
             }),
             GFP_KERNEL,
         )?;
@@ -1416,9 +1416,7 @@ impl Vm {
     }
 
     fn set_handle(&self, handle: u64) {
-        self.exec
-            .handle
-            .store(handle, core::sync::atomic::Ordering::Relaxed);
+        self.exec.handle.store(handle, Relaxed);
         self.exec.as_data.set_vm_id(handle);
     }
 
@@ -1784,7 +1782,7 @@ impl VmExec {
     /// firmware VM, or if a user VM has not yet been inserted into the
     /// [`Pool`].
     pub(crate) fn handle(&self) -> u64 {
-        self.handle.load(core::sync::atomic::Ordering::Relaxed)
+        self.handle.load(Relaxed)
     }
 
     /// Activate the VM in a hardware address space slot.
