@@ -398,7 +398,7 @@ impl VmBindJob {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                None,
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: None,
             map_sgt: None,
@@ -695,15 +695,25 @@ impl<'ctx> PtUpdateContext<'ctx> {
     }
 
     /// Finds one of our pre-allocated VAs.
-    ///
-    /// It is a logic error to call this more than three times for a given
-    /// PtUpdateContext.
     fn preallocated_gpuva(&mut self) -> Result<GpuVaAlloc<GpuVmData>> {
         self.resources
             .preallocated_gpuvas
             .iter_mut()
             .find_map(|f| f.take())
             .ok_or(EINVAL)
+    }
+
+    /// Returns an unused GPUVA object to the preallocated pool.
+    /// If the pool is already full, the unused allocation is simply dropped.
+    fn return_preallocated_gpuva(&mut self, gpuva: GpuVaAlloc<GpuVmData>) {
+        if let Some(slot) = self
+            .resources
+            .preallocated_gpuvas
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            *slot = Some(gpuva);
+        }
     }
 
     /// Widens the AS lock to also cover `region`.
@@ -1451,7 +1461,7 @@ impl VmExec {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
-                None,
+                Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: None,
             map_sgt: None,
@@ -1652,8 +1662,12 @@ impl DriverGpuVm for GpuVmData {
         let prev_va = context.preallocated_gpuva()?;
         let next_va = context.preallocated_gpuva()?;
 
-        let (op_remapped, _remap_ret) =
+        let (op_remapped, remap_ret) =
             op.remap([prev_va, next_va], GpuVaData { prot }, GpuVaData { prot });
+
+        if let Some(unused_va) = remap_ret.unused_va {
+            context.return_preallocated_gpuva(unused_va);
+        }
 
         Ok(op_remapped)
     }
