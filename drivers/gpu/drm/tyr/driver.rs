@@ -438,6 +438,16 @@ impl TyrDrmDeviceData {
         f(sched.enabled_mut()?)
     }
 
+    /// Runs `f` under the scheduler mutex, or returns `None` before probe
+    /// enables the scheduler.
+    pub(crate) fn with_enabled_scheduler<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Scheduler) -> R,
+    {
+        let mut sched = self.sched.lock();
+        sched.enabled_mut().ok().map(f)
+    }
+
     /// Returns whether a failed reset or resume has left the device unusable.
     pub(crate) fn is_unusable(&self) -> bool {
         self.unusable.load(Relaxed)
