@@ -633,6 +633,9 @@ enum PtOpType {
 /// Memory Management Unit (MMU) state is properly managed and Translation
 /// Lookaside Buffer (TLB) entries are flushed.
 pub(crate) struct PtUpdateContext<'ctx> {
+    /// VM being updated.
+    vm: &'ctx VmExec,
+
     /// Page table.
     pt: &'ctx pt_alloc::PageTable,
 
@@ -668,6 +671,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
     /// The context will automatically flush the TLB and
     /// complete the update when dropped.
     fn new(
+        vm: &'ctx VmExec,
         pt: &'ctx pt_alloc::PageTable,
         mmu: &'ctx Mmu,
         as_data: &'ctx VmAsData,
@@ -683,6 +687,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
             .set_reserve(core::mem::take(&mut resources.pt_reserve));
 
         Ok(Self {
+            vm,
             pt,
             mmu,
             as_data,
@@ -749,7 +754,62 @@ impl Drop for PtUpdateContext<'_> {
 ///
 /// Implements [`DriverGpuVm`] to provide VM operation callbacks (map, unmap, remap)
 /// and associated types for buffer objects, virtual addresses, and contexts.
-pub(crate) struct GpuVmData {}
+pub(crate) struct GpuVmData {
+    /// Range that failed page-table updates may have left out of sync with
+    /// the VA tree. Outside it, the page table matches the VA tree. It is
+    /// empty until the first failure.
+    pt_out_of_sync: Range<u64>,
+}
+
+impl GpuVmData {
+    /// Marks the VM unusable and disables its address space after a failed
+    /// page-table update to `region`.
+    ///
+    /// The recorded range is widened to whole `PT_MIN_BLOCK_SIZE` blocks, so
+    /// splitting an unmap at the range edges never cuts a block mapping.
+    fn mark_failed(&mut self, context: &PtUpdateContext<'_>, region: &Range<u64>) {
+        let block = Alignment::new::<{ pt_alloc::PT_MIN_BLOCK_SIZE }>();
+        let end = region.end.align_up(block).unwrap_or(u64::MAX);
+        let region = region.start.align_down(block)..end;
+        let span = &mut self.pt_out_of_sync;
+
+        *span = if span.is_empty() {
+            region
+        } else {
+            span.start.min(region.start)..span.end.max(region.end)
+        };
+        context.vm.mark_unusable();
+        context.vm.disable_as();
+    }
+
+    /// Unmaps `region` from the page table, marking the VM unusable on failure.
+    ///
+    /// A failed update can leave holes in the range it covered, so only the
+    /// part of `region` inside `pt_out_of_sync` is unmapped page by page.
+    fn unmap(&mut self, context: &PtUpdateContext<'_>, region: Range<u64>) -> Result {
+        let span = &self.pt_out_of_sync;
+        let probed = region.start.max(span.start)..region.end.min(span.end);
+
+        if probed.is_empty() {
+            return self.unmap_in_sync(context, region);
+        }
+
+        self.unmap_in_sync(context, region.start..probed.start)
+            .and_then(|()| pt_unmap_mapped(context.pt, probed.clone()))
+            .and_then(|()| self.unmap_in_sync(context, probed.end..region.end))
+            .inspect_err(|_| self.mark_failed(context, &region))
+    }
+
+    /// Unmaps `region`, which lies outside `pt_out_of_sync` and so is fully mapped.
+    fn unmap_in_sync(&mut self, context: &PtUpdateContext<'_>, region: Range<u64>) -> Result {
+        if pt_unmap(context.pt, region.clone()).is_ok() {
+            return Ok(());
+        }
+
+        self.mark_failed(context, &region);
+        pt_unmap_mapped(context.pt, region)
+    }
+}
 
 /// Per-mapping private data stored on each `GpuVa`.
 ///
@@ -973,7 +1033,9 @@ impl Vm {
             &*dummy_obj,
             total_range.clone(),
             reserve_range,
-            GpuVmData {},
+            GpuVmData {
+                pt_out_of_sync: 0..0,
+            },
         )
         .inspect_err(|e| {
             pr_err!("Failed to create GpuVm: {:?}\n", e);
@@ -1371,6 +1433,7 @@ impl VmExec {
         match req.op_type {
             VmOpType::Map(args) => {
                 let mut pt_upd = PtUpdateContext::new(
+                    self,
                     pt,
                     &self.mmu,
                     &self.as_data,
@@ -1392,6 +1455,7 @@ impl VmExec {
             }
             VmOpType::Unmap => {
                 let mut pt_upd = PtUpdateContext::new(
+                    self,
                     pt,
                     &self.mmu,
                     &self.as_data,
@@ -1581,6 +1645,7 @@ impl DriverGpuVm for GpuVmData {
                     if total_mapped > 0 {
                         pt_unmap(context.pt, start_iova..(start_iova + total_mapped)).ok();
                     }
+                    self.mark_failed(context, &(start_iova..start_iova + op.length()));
                     return Err(e);
                 }
             };
@@ -1606,14 +1671,19 @@ impl DriverGpuVm for GpuVmData {
         let length = op.va().length();
 
         let region = start_iova..(start_iova + length);
-        pt_unmap(context.pt, region.clone()).inspect_err(|e| {
+        let result = self.unmap(context, region.clone()).inspect_err(|e| {
             pr_err!(
                 "Failed to unmap region {:#x}..{:#x}: {:?}\n",
                 region.start,
                 region.end,
                 e
             );
-        })?;
+        });
+
+        // Keep the VA so its BO outlives any PTE left in an enabled address space.
+        if !context.vm.must_disable_as() {
+            result?;
+        }
 
         let (op_unmapped, _va_removed) = op.remove();
 
@@ -1676,10 +1746,13 @@ impl DriverGpuVm for GpuVmData {
             unmap_end
         };
 
+        let prev_va = context.preallocated_gpuva()?;
+        let next_va = context.preallocated_gpuva()?;
+
         if region_end > region_start {
             let region = region_start..region_end;
             context.extend_lock(region.clone())?;
-            pt_unmap(context.pt, region.clone()).inspect_err(|e| {
+            self.unmap(context, region.clone()).inspect_err(|e| {
                 pr_err!(
                     "Failed to unmap remap region {:#x}..{:#x}: {:?}\n",
                     region.start,
@@ -1696,7 +1769,8 @@ impl DriverGpuVm for GpuVmData {
                 head_paddr,
                 unmap_start - aligned_start,
                 prot,
-            )?;
+            )
+            .inspect_err(|_| self.mark_failed(context, &(region_start..region_end)))?;
         }
         if let Some(tail_paddr) = tail_paddr {
             pt_map(
@@ -1705,11 +1779,9 @@ impl DriverGpuVm for GpuVmData {
                 tail_paddr,
                 aligned_end - unmap_end,
                 prot,
-            )?;
+            )
+            .inspect_err(|_| self.mark_failed(context, &(region_start..region_end)))?;
         }
-
-        let prev_va = context.preallocated_gpuva()?;
-        let next_va = context.preallocated_gpuva()?;
 
         let (op_remapped, remap_ret) =
             op.remap([prev_va, next_va], GpuVaData { prot }, GpuVaData { prot });
@@ -1877,6 +1949,9 @@ fn pt_unmap(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
         // the pt reference comes from PtUpdateContext, which was
         // created while holding &mut Vm, preventing any other access to the
         // page table for the duration of this operation.
+        // Every range passed here is fully mapped, so this page table has one
+        // or more consecutive mappings starting at `iova` with the total size
+        // of `pgcount * pgsize`.
         let unmapped = unsafe { pt.unmap_pages(iova as usize, pgsize as usize, pgcount as usize) };
 
         if unmapped == 0 {
@@ -1889,4 +1964,32 @@ fn pt_unmap(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
     }
 
     Ok(())
+}
+
+/// Unmaps the pages of `range` that are still mapped, skipping any holes.
+fn pt_unmap_mapped(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
+    let mut run_start = None;
+    let mut iova = range.start;
+
+    while iova < range.end {
+        // SAFETY: The VM update holds the `gpuvm_unique` mutex, so no other
+        // io-pgtable operation runs on this page table.
+        let mapped = unsafe { pt.iova_to_phys(iova as usize) }.is_some();
+
+        match (mapped, run_start) {
+            (true, None) => run_start = Some(iova),
+            (false, Some(start)) => {
+                pt_unmap(pt, start..iova)?;
+                run_start = None;
+            }
+            _ => {}
+        }
+
+        iova += SZ_4K as u64;
+    }
+
+    match run_start {
+        Some(start) => pt_unmap(pt, start..range.end),
+        None => Ok(()),
+    }
 }
