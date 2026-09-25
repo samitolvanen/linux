@@ -90,6 +90,7 @@ use kernel::{
 use pin_init::pin_init_scope;
 
 use crate::{
+    cleanup,
     devfreq::{
         self,
         TyrDevfreqCallbacks,
@@ -417,6 +418,9 @@ pub(crate) struct TyrDrmDeviceData {
     #[cfg(CONFIG_DEBUG_FS)]
     #[pin]
     vm_registry: VmRegistry,
+
+    /// Declared last, so that module exit waits for every other field to drop.
+    _live: cleanup::LiveDevice,
 }
 
 impl TyrDrmDeviceData {
@@ -978,6 +982,7 @@ impl TyrPlatformDriverData {
                 gem_registry <- GemRegistry::new(),
                 #[cfg(CONFIG_DEBUG_FS)]
                 vm_registry <- VmRegistry::new(),
+                _live: cleanup::LiveDevice::new(),
         });
 
         if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
