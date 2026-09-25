@@ -74,6 +74,7 @@ use crate::{
     gem::{
         BoData,
         KernelBo,
+        KernelBoOwner,
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
@@ -442,6 +443,7 @@ impl Firmware {
                     KernelBoVaAlloc::Explicit(va),
                     vm_map_flags,
                     coherent,
+                    KernelBoOwner::Firmware,
                 )?;
 
                 let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
