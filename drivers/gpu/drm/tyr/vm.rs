@@ -24,6 +24,7 @@ use kernel::{
         Bound,
         Device, //
     },
+    devres::Devres,
     dma_buf::dma_fence::{
         DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, PublicDmaFence, Published,
     },
@@ -637,7 +638,7 @@ pub(crate) struct PtUpdateContext<'ctx> {
     vm: &'ctx VmExec,
 
     /// Page table.
-    pt: &'ctx pt_alloc::PageTable,
+    page_table: &'ctx Devres<pt_alloc::PageTable>,
 
     /// MMU manager.
     mmu: &'ctx Mmu,
@@ -672,7 +673,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
     /// complete the update when dropped.
     fn new(
         vm: &'ctx VmExec,
-        pt: &'ctx pt_alloc::PageTable,
+        page_table: &'ctx Devres<pt_alloc::PageTable>,
         mmu: &'ctx Mmu,
         as_data: &'ctx VmAsData,
         region: Range<u64>,
@@ -688,7 +689,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
 
         Ok(Self {
             vm,
-            pt,
+            page_table,
             mmu,
             as_data,
             region,
@@ -795,19 +796,19 @@ impl GpuVmData {
         }
 
         self.unmap_in_sync(context, region.start..probed.start)
-            .and_then(|()| pt_unmap_mapped(context.pt, probed.clone()))
+            .and_then(|()| pt_unmap_mapped(context.page_table, probed.clone()))
             .and_then(|()| self.unmap_in_sync(context, probed.end..region.end))
             .inspect_err(|_| self.mark_failed(context, &region))
     }
 
     /// Unmaps `region`, which lies outside `pt_out_of_sync` and so is fully mapped.
     fn unmap_in_sync(&mut self, context: &PtUpdateContext<'_>, region: Range<u64>) -> Result {
-        if pt_unmap(context.pt, region.clone()).is_ok() {
+        if pt_unmap(context.page_table, region.clone()).is_ok() {
             return Ok(());
         }
 
         self.mark_failed(context, &region);
-        pt_unmap_mapped(context.pt, region)
+        pt_unmap_mapped(context.page_table, region)
     }
 }
 
@@ -881,7 +882,7 @@ pub(crate) struct VmExec {
     pub(crate) as_data: Arc<VmAsData>,
     /// MMU manager.
     mmu: Arc<Mmu>,
-    /// Platform device reference (needed to access the page table via devres).
+    /// Platform device reference (needed to DMA-map the BOs mapped in this VM).
     pdev: ARef<platform::Device>,
     /// DRM GPUVM core for managing virtual address space.
     ///
@@ -1423,18 +1424,13 @@ impl VmExec {
         req: VmOpRequest,
         resources: &mut VmOpResources,
     ) -> Result {
-        // SAFETY: pdev is a bound device.
-        let dev = unsafe { self.pdev.as_ref().as_bound() };
-
-        let pt = self.as_data.page_table.access(dev).inspect_err(|e| {
-            pr_err!("Failed to access page table while mapping pages: {:?}\n", e);
-        })?;
+        let page_table = &self.as_data.page_table;
 
         match req.op_type {
             VmOpType::Map(args) => {
                 let mut pt_upd = PtUpdateContext::new(
                     self,
-                    pt,
+                    page_table,
                     &self.mmu,
                     &self.as_data,
                     req.region,
@@ -1456,7 +1452,7 @@ impl VmExec {
             VmOpType::Unmap => {
                 let mut pt_upd = PtUpdateContext::new(
                     self,
-                    pt,
+                    page_table,
                     &self.mmu,
                     &self.as_data,
                     req.region,
@@ -1637,13 +1633,13 @@ impl DriverGpuVm for GpuVmData {
             }
             let len = sgt_entry_length.min(bytes_left_to_map);
 
-            let segment_mapped = match pt_map(context.pt, iova, paddr, len, prot) {
+            let segment_mapped = match pt_map(context.page_table, iova, paddr, len, prot) {
                 Ok(segment_mapped) => segment_mapped,
                 Err(e) => {
                     // clean up any successful mappings from previous SGT entries.
                     let total_mapped = iova - start_iova;
                     if total_mapped > 0 {
-                        pt_unmap(context.pt, start_iova..(start_iova + total_mapped)).ok();
+                        pt_unmap(context.page_table, start_iova..(start_iova + total_mapped)).ok();
                     }
                     self.mark_failed(context, &(start_iova..start_iova + op.length()));
                     return Err(e);
@@ -1724,13 +1720,13 @@ impl DriverGpuVm for GpuVmData {
         // never expanded, so its sub-range unmap stays correct.
         let head_paddr = match op.prev() {
             Some(prev) if aligned_start < unmap_start && prev.addr() <= aligned_start => {
-                contiguous_phys(context.pt, aligned_start..unmap_start)
+                contiguous_phys(context.page_table, aligned_start..unmap_start)
             }
             _ => None,
         };
         let tail_paddr = match op.next() {
             Some(next) if aligned_end > unmap_end && next.addr() + next.length() >= aligned_end => {
-                contiguous_phys(context.pt, unmap_end..aligned_end)
+                contiguous_phys(context.page_table, unmap_end..aligned_end)
             }
             _ => None,
         };
@@ -1764,7 +1760,7 @@ impl DriverGpuVm for GpuVmData {
 
         if let Some(head_paddr) = head_paddr {
             pt_map(
-                context.pt,
+                context.page_table,
                 aligned_start,
                 head_paddr,
                 unmap_start - aligned_start,
@@ -1774,7 +1770,7 @@ impl DriverGpuVm for GpuVmData {
         }
         if let Some(tail_paddr) = tail_paddr {
             pt_map(
-                context.pt,
+                context.page_table,
                 unmap_end,
                 tail_paddr,
                 aligned_end - unmap_end,
@@ -1800,7 +1796,12 @@ impl DriverGpuVm for GpuVmData {
 /// `range` is a sub-block fragment, so its length is below 2MB and the walk
 /// visits at most 511 pages. The walk is read-only, lock-free and does not
 /// allocate, so it is safe on the dma-fence signalling path.
-fn contiguous_phys(pt: &pt_alloc::PageTable, range: Range<u64>) -> Option<PhysAddr> {
+fn contiguous_phys(
+    page_table: &Devres<pt_alloc::PageTable>,
+    range: Range<u64>,
+) -> Option<PhysAddr> {
+    let pt = page_table.try_access()?;
+
     // SAFETY: The page table is exclusively accessed through the
     // &mut UniqueRefGpuVm held under the gpuvm_unique mutex for the duration of
     // the VM update, so no other io-pgtable operation runs concurrently.
@@ -1881,10 +1882,17 @@ fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(PhysAddr, u64
 /// automatically selects optimal page sizes to minimize page table overhead.
 ///
 /// If the mapping fails partway through, all successfully mapped pages are
-/// unmapped before returning an error.
+/// unmapped before returning an error. Fails with `ENODEV` once unbind has
+/// freed the page table.
 ///
 /// Returns the number of bytes successfully mapped.
-fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) -> Result<u64> {
+fn pt_map(
+    page_table: &Devres<pt_alloc::PageTable>,
+    iova: u64,
+    paddr: u64,
+    len: u64,
+    prot: u32,
+) -> Result<u64> {
     let mut segment_mapped = 0u64;
     while segment_mapped < len {
         let remaining = len - segment_mapped;
@@ -1892,6 +1900,8 @@ fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) 
         let curr_paddr = paddr + segment_mapped;
 
         let (pgsize, pgcount) = get_pgsize(curr_iova | curr_paddr, remaining);
+
+        let pt = page_table.try_access().ok_or(ENODEV)?;
 
         // The page tables for this map come from the reserve. The flags only
         // reach the fallback path, which runs in the VM_BIND dma-fence
@@ -1915,7 +1925,7 @@ fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) 
         if let Err(e) = result {
             pr_err!("pt.map_pages failed at iova {:#x}: {:?}\n", curr_iova, e);
             if segment_mapped > 0 {
-                pt_unmap(pt, iova..(iova + segment_mapped)).ok();
+                pt_unmap(page_table, iova..(iova + segment_mapped)).ok();
             }
             return Err(e);
         }
@@ -1923,7 +1933,7 @@ fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) 
         if mapped == 0 {
             pr_err!("Failed to map any pages at iova {:#x}\n", curr_iova);
             if segment_mapped > 0 {
-                pt_unmap(pt, iova..(iova + segment_mapped)).ok();
+                pt_unmap(page_table, iova..(iova + segment_mapped)).ok();
             }
             return Err(ENOMEM);
         }
@@ -1938,12 +1948,17 @@ fn pt_map(pt: &pt_alloc::PageTable, iova: u64, paddr: u64, len: u64, prot: u32) 
 ///
 /// This function removes all page table entries in the specified range,
 /// automatically handling different page sizes that may be present.
-fn pt_unmap(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
+fn pt_unmap(page_table: &Devres<pt_alloc::PageTable>, range: Range<u64>) -> Result {
     let mut iova = range.start;
     let mut bytes_left_to_unmap = range.end - range.start;
 
     while bytes_left_to_unmap > 0 {
         let (pgsize, pgcount) = get_pgsize(iova, bytes_left_to_unmap);
+
+        // Unbind frees the page table, leaving nothing to unmap.
+        let Some(pt) = page_table.try_access() else {
+            return Ok(());
+        };
 
         // SAFETY: Exclusive access to the page table is ensured because
         // the pt reference comes from PtUpdateContext, which was
@@ -1967,19 +1982,23 @@ fn pt_unmap(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
 }
 
 /// Unmaps the pages of `range` that are still mapped, skipping any holes.
-fn pt_unmap_mapped(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
+fn pt_unmap_mapped(page_table: &Devres<pt_alloc::PageTable>, range: Range<u64>) -> Result {
     let mut run_start = None;
     let mut iova = range.start;
 
     while iova < range.end {
+        let Some(pt) = page_table.try_access() else {
+            return Ok(());
+        };
         // SAFETY: The VM update holds the `gpuvm_unique` mutex, so no other
         // io-pgtable operation runs on this page table.
         let mapped = unsafe { pt.iova_to_phys(iova as usize) }.is_some();
+        drop(pt);
 
         match (mapped, run_start) {
             (true, None) => run_start = Some(iova),
             (false, Some(start)) => {
-                pt_unmap(pt, start..iova)?;
+                pt_unmap(page_table, start..iova)?;
                 run_start = None;
             }
             _ => {}
@@ -1989,7 +2008,7 @@ fn pt_unmap_mapped(pt: &pt_alloc::PageTable, range: Range<u64>) -> Result {
     }
 
     match run_start {
-        Some(start) => pt_unmap(pt, start..range.end),
+        Some(start) => pt_unmap(page_table, start..range.end),
         None => Ok(()),
     }
 }
