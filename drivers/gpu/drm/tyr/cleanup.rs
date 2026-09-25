@@ -14,14 +14,19 @@
 //! A queued item may drop the last reference to a device, and destroying
 //! a workqueue from one of its own workers deadlocks, so no device owns
 //! the queue. The module creates it before the platform driver registers
-//! and destroys it after the driver has unregistered. That drains the
-//! drops deferred after unbind.
+//! and destroys it after the driver has unregistered and every device has
+//! been released. Until its release, a device's own queues can still defer
+//! drops here.
 
 use core::mem::MaybeUninit;
 
 use kernel::{
     prelude::*,
-    sync::global_lock,
+    sync::{
+        global_lock,
+        Arc,
+        Completion, //
+    },
     workqueue::{
         self,
         impl_has_work,
@@ -36,12 +41,32 @@ global_lock! {
     unsafe(uninit) static CLEANUP_WQ: SpinLock<Option<workqueue::OwnedQueue>> = None;
 }
 
+global_lock! {
+    // SAFETY: Initialized by `Registration::new` before any other use.
+    unsafe(uninit) static DEVICES: SpinLock<Devices> = Devices { live: 0, released: None };
+}
+
+/// The devices that have not been released yet.
+struct Devices {
+    /// Number of such devices.
+    live: usize,
+    /// Set by module exit, and completed by the release of the last device.
+    released: Option<Arc<Completion>>,
+}
+
 /// Registration of the module-wide cleanup workqueue.
 ///
 /// Creating it builds the queue and publishes it to `try_spawn_owned`,
-/// `enqueue` and `Handoff::spawn`. Dropping it destroys the queue, which
-/// drains every item still queued.
-pub(crate) struct Registration(());
+/// `enqueue` and `Handoff::spawn`. Dropping it waits for every device to be
+/// released, then destroys the queue, which drains every item still queued.
+///
+/// The wait is unbounded and uninterruptible, so the last device release must
+/// run on the cleanup worker, in file close (the module is pinned by
+/// `fops.owner`) or on the module exit or unbind thread.
+pub(crate) struct Registration {
+    /// Completed once no device is left.
+    released: Arc<Completion>,
+}
 
 impl Registration {
     /// Creates the cleanup workqueue.
@@ -53,14 +78,29 @@ impl Registration {
     pub(crate) unsafe fn new() -> Result<Self> {
         // SAFETY: The caller calls this at most once, before any other use.
         unsafe { CLEANUP_WQ.init() };
+        // SAFETY: Same as above.
+        unsafe { DEVICES.init() };
+        let released = Arc::pin_init(Completion::new(), GFP_KERNEL)?;
         let wq = workqueue::Queue::new_unbound().build(c"tyr-cleanup")?;
         *CLEANUP_WQ.lock() = Some(wq);
-        Ok(Self(()))
+        Ok(Self { released })
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        let wait = {
+            let mut devices = DEVICES.lock();
+            let wait = devices.live > 0;
+            if wait {
+                devices.released = Some(self.released.clone());
+            }
+            wait
+        };
+        if wait {
+            self.released.wait_for_completion();
+        }
+
         // Destroying the queue sleeps and runs items that may enqueue again,
         // so take it out of the static first.
         let wq = CLEANUP_WQ.lock().take();
@@ -74,8 +114,8 @@ impl Drop for Registration {
 pub(crate) enum SpawnError<T = ()> {
     /// The work item allocation failed.
     NoMemory(T),
-    /// The module has destroyed the queue. That only happens after the
-    /// driver has unregistered, so the caller is outside any dma-fence
+    /// The module has destroyed the queue. That only happens once every
+    /// device has been released, so the caller is outside any dma-fence
     /// signalling section and may run its cleanup inline.
     QueueGone(T),
 }
@@ -224,5 +264,36 @@ impl<T: Send + 'static, K: Send + 'static> Handoff<T, K> {
             None => work,
         };
         HandoffWork::run(work);
+    }
+}
+
+/// Counts a device as live until its release, so that module exit waits for
+/// it before destroying the queue.
+///
+/// Must not be created before the module has created the `Registration`.
+pub(crate) struct LiveDevice(());
+
+impl LiveDevice {
+    pub(crate) fn new() -> Self {
+        DEVICES.lock().live += 1;
+        Self(())
+    }
+}
+
+impl Drop for LiveDevice {
+    fn drop(&mut self) {
+        let released = {
+            let mut devices = DEVICES.lock();
+            devices.live -= 1;
+            if devices.live == 0 {
+                devices.released.take()
+            } else {
+                None
+            }
+        };
+
+        if let Some(released) = released {
+            released.complete_all();
+        }
     }
 }
