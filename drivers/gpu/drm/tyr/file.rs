@@ -227,6 +227,8 @@ impl PinnedDrop for TyrDrmFileData {
             pr_err!("Failed to destroy all groups: {:?}\n", e);
         }
 
+        self.tdev.term_wq.flush();
+
         if let Err(e) = self.as_ref().vm_pool().destroy_all(&self.tdev) {
             pr_err!("Failed to destroy all VMs: {:?}\n", e);
         }
