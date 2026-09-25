@@ -773,7 +773,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
         let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
 
         if adjusted_elapsed >= self.timeout {
-            dev_err!(
+            dev_warn!(
                 ctx.job.group.tdev.as_ref(),
                 "Queue job {} timed out\n",
                 ctx.counter

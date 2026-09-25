@@ -473,7 +473,7 @@ impl CsInterface {
         let exception_data = (fatal >> 8) & 0x00FF_FFFF;
         let name = exception_name(FATAL_EXCEPTION_NAMES, exception_type);
 
-        dev_err!(
+        dev_warn!(
             dev,
             "CSG slot: {} CS slot: {}\n\
              CS_FATAL.EXCEPTION_TYPE: 0x{:x} ({})\n\
@@ -506,7 +506,7 @@ impl CsInterface {
         let exception_data = (fault >> 8) & 0x00FF_FFFF;
         let name = exception_name(FAULT_EXCEPTION_NAMES, exception_type);
 
-        dev_err!(
+        dev_warn!(
             dev,
             "CSG slot: {} CS slot: {}\n\
              CS_FAULT.EXCEPTION_TYPE: 0x{:x} ({})\n\
