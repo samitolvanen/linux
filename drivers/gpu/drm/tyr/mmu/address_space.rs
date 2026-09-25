@@ -206,8 +206,8 @@ impl VmAsData {
     ///
     /// The caller must ensure that the address space is evicted and cleaned up
     /// before the `VmAsData` is dropped.
-    fn as_config(&self, dev: &Device<Bound>) -> Result<AddressSpaceConfig> {
-        let pt = self.page_table.access(dev)?;
+    fn as_config(&self) -> Result<AddressSpaceConfig> {
+        let pt = self.page_table.try_access().ok_or(ENODEV)?;
 
         // The hardware computes the valid input address range as:
         //   INA_BITS_VALID = min(HW_INA_BITS, 55 - INA_BITS)
@@ -318,7 +318,7 @@ impl SlotOperations for AddressSpaceManager {
         slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
-        let as_config = slot_data.as_config(self.dev())?;
+        let as_config = slot_data.as_config()?;
         self.as_enable(slot_idx, &as_config)
     }
 
