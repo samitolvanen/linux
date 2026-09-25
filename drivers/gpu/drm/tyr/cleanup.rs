@@ -26,7 +26,13 @@ use core::mem::MaybeUninit;
 use kernel::{
     prelude::*,
     sync::global_lock,
-    workqueue, //
+    workqueue::{
+        self,
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
+    },
 };
 
 global_lock! {
@@ -36,9 +42,9 @@ global_lock! {
 
 /// Registration of the module-wide cleanup workqueue.
 ///
-/// Creating it builds the queue and publishes it to `try_spawn_owned` and
-/// `enqueue`. Dropping it destroys the queue, which drains every item still
-/// queued.
+/// Creating it builds the queue and publishes it to `try_spawn_owned`,
+/// `enqueue` and `Handoff::spawn`. Dropping it destroys the queue, which
+/// drains every item still queued.
 pub(crate) struct Registration(());
 
 impl Registration {
@@ -72,9 +78,9 @@ impl Drop for Registration {
 pub(crate) enum SpawnError<T = ()> {
     /// The work item allocation failed.
     NoMemory(T),
-    /// The module has destroyed the queue. That only happens after the
-    /// driver has unregistered, so the caller is outside any dma-fence
-    /// signalling section and may run its cleanup inline.
+    /// The module destroyed the queue after the driver unregistered.
+    /// No dma-fence signalling section calls `try_spawn_owned` after unbind,
+    /// so the caller may run its cleanup inline.
     QueueGone(T),
 }
 
@@ -160,5 +166,67 @@ where
     match CLEANUP_WQ.lock().as_ref() {
         Some(wq) => wq.enqueue(w),
         None => Err(w),
+    }
+}
+
+/// A deferred drop whose work item is allocated ahead of time.
+///
+/// Queuing the work item does not allocate, so it cannot fail in a dma-fence
+/// signalling section.
+pub(crate) struct Handoff<T, K = ()>(Pin<KBox<HandoffWork<T, K>>>);
+
+#[pin_data]
+struct HandoffWork<T, K> {
+    #[pin]
+    work: Work<HandoffWork<T, K>>,
+    keep: K,
+    /// Set by `Handoff::spawn`.
+    value: Option<(T, fn(T))>,
+}
+
+impl_has_work! {
+    impl{T, K} HasWork<Self> for HandoffWork<T, K> { self.work }
+}
+
+impl<T: Send + 'static, K: Send + 'static> WorkItem for HandoffWork<T, K> {
+    type Pointer = Pin<KBox<Self>>;
+
+    fn run(mut this: Pin<KBox<Self>>) {
+        if let Some((value, f)) = this.as_mut().project().value.take() {
+            f(value);
+        }
+    }
+}
+
+impl<T: Send + 'static, K: Send + 'static> Handoff<T, K> {
+    /// Allocates the work item with `GFP_KERNEL`. `keep` is dropped after the
+    /// deferred drop has run.
+    pub(crate) fn new(keep: K) -> Result<Self> {
+        let work = KBox::pin_init(
+            pin_init!(HandoffWork {
+                work <- new_work!("cleanup::Handoff"),
+                keep,
+                value: None,
+            }),
+            GFP_KERNEL,
+        )?;
+
+        Ok(Self(work))
+    }
+
+    /// Runs `f(value)` on the cleanup workqueue, then drops `keep`.
+    ///
+    /// Must not be called before the module has created the `Registration`.
+    /// Once the module has destroyed the queue, runs both inline. No dma-fence
+    /// signalling section calls this after unbind.
+    pub(crate) fn spawn(self, value: T, f: fn(T)) {
+        let mut work = self.0;
+        *work.as_mut().project().value = Some((value, f));
+
+        let work = match CLEANUP_WQ.lock().as_ref() {
+            Some(wq) => return wq.enqueue(work),
+            None => work,
+        };
+        HandoffWork::run(work);
     }
 }
