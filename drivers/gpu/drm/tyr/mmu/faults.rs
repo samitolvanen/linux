@@ -183,14 +183,14 @@ fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) 
             true
         }
         Ok(VaClass::Unmapped { below, above }) => {
-            pr_err!("fault VA 0x{:016X} is not mapped\n", addr);
+            pr_info!("fault VA 0x{:016X} is not mapped\n", addr);
             match below {
-                Some(m) => pr_err!("  nearest below: 0x{:016X} size 0x{:X}\n", m.va, m.size),
-                None => pr_err!("  nearest below: none\n"),
+                Some(m) => pr_info!("  nearest below: 0x{:016X} size 0x{:X}\n", m.va, m.size),
+                None => pr_info!("  nearest below: none\n"),
             }
             match above {
-                Some(m) => pr_err!("  nearest above: 0x{:016X} size 0x{:X}\n", m.va, m.size),
-                None => pr_err!("  nearest above: none\n"),
+                Some(m) => pr_info!("  nearest above: 0x{:016X} size 0x{:X}\n", m.va, m.size),
+                None => pr_info!("  nearest above: none\n"),
             }
             false
         }
@@ -299,7 +299,7 @@ fn report_heap_for_fault(
     }
 
     let Some(pool) = Scheduler::heap_pool_for_csg(tdev, csg_id as usize, group_uid) else {
-        pr_err!(
+        pr_info!(
             "fault VA 0x{:016X}: no heap pool, or its lock is contended\n",
             addr
         );

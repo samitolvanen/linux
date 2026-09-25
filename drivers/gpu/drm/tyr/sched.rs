@@ -1059,7 +1059,7 @@ impl Scheduler {
 
         match data.fw.probe_liveness(GLB_PROBE_TIMEOUT_MS) {
             Ok((probe, mcu_status)) => {
-                pr_err!(
+                pr_info!(
                     "CSG {}: GLB liveness probe: {} req_mask=0x{:x} glb_req=0x{:x}->0x{:x} glb_ack=0x{:x}->0x{:x} mcu_status=0x{:x}\n",
                     csg_id,
                     if probe.acked {
@@ -1086,7 +1086,7 @@ impl Scheduler {
                 );
             }
             Err(e) => {
-                pr_err!(
+                pr_info!(
                     "CSG {}: GLB liveness probe failed: {}\n",
                     csg_id,
                     e.to_errno()
