@@ -739,8 +739,9 @@ impl TyrDrmFileData {
             .inspect_err(|e| {
                 let va = op.0.va;
                 let size = op.0.size;
+                let errno = e.to_errno();
                 pr_info!(
-                    "vm_bind_async vm={vm_id:#x} op[{i}] kind={op_kind} va={va:#x} size={size:#x} rejected: {e:?}\n"
+                    "vm_bind_async vm={vm_id:#x} op[{i}] kind={op_kind} va={va:#x} size={size:#x} rejected: {errno}\n"
                 );
             })?;
         }

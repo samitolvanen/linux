@@ -170,7 +170,7 @@ fn report_fault_va(tdev: &TyrDrmDevice, csg_id: u32, group_uid: u64, addr: u64) 
             false
         }
         Ok(VaClass::Mapped { map, bo_offset }) => {
-            pr_err!(
+            pr_info!(
                 "fault VA 0x{:016X} is mapped: mapping 0x{:016X} size 0x{:X}, \
                 BO base 0x{:016X} size 0x{:X} offset 0x{:X}\n",
                 addr,
