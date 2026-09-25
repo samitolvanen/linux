@@ -15,7 +15,10 @@ use kernel::{
         Bound,
         Core, //
     },
-    devres::Devres,
+    devres::{
+        self,
+        Devres, //
+    },
     dma::{
         Device as DmaDevice,
         DmaMask, //
@@ -198,6 +201,9 @@ pub(crate) struct TyrPlatformDriverData {
     /// runtime PM on unbind. Held only for its `Drop`.
     #[expect(dead_code)]
     pm: pm::Registration<TyrPmOps>,
+
+    /// DRM registration, taken by `unbind` to unplug the device first.
+    drm_registration: Pin<KBox<Mutex<Option<Registration<TyrDrmDriver>>>>>,
 
     pub(crate) device: ARef<TyrDrmDevice>,
 }
@@ -992,8 +998,12 @@ impl TyrPlatformDriverData {
             }
         }
 
-        let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
-        let tdev: ARef<TyrDrmDevice> = ddev.into();
+        // SAFETY: `unbind` drops the registration, and a failed probe drops it
+        // when this function returns. Both happen before `pdev` releases its
+        // devres resources.
+        let registration = unsafe { Registration::new(pdev.as_ref(), uninit_ddev, data, 0)? };
+        let tdev: ARef<TyrDrmDevice> = registration.device().into();
+        let drm_registration = KBox::pin_init(new_mutex!(Some(registration)), GFP_KERNEL)?;
 
         let hw_guard = ScopeGuard::new(|| {
             tdev.stop_system_work();
@@ -1001,6 +1011,9 @@ impl TyrPlatformDriverData {
             tdev.mmu.suspend();
             let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
         });
+
+        // Devres drops this reference after the entries below that hold the device.
+        devres::register(pdev.as_ref(), tdev.clone(), GFP_KERNEL)?;
 
         tdev.reset
             .set_device(Devres::new(pdev.as_ref(), tdev.clone())?);
@@ -1092,6 +1105,7 @@ impl TyrPlatformDriverData {
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
+            drm_registration,
             device: tdev,
         })
     }
@@ -1113,8 +1127,11 @@ impl platform::Driver for TyrPlatformDriverData {
     }
 
     fn unbind(pdev: &platform::Device<Core>, this: Pin<&Self>) {
-        // Runtime PM outlives unbind, so refuse resumes before any teardown
-        // starts.
+        // Unplug first, so the ioctls in flight finish before any teardown.
+        let reg = this.drm_registration.lock().take();
+        drop(reg);
+        // Runtime PM outlives unbind, so refuse resumes before the rest of
+        // the teardown.
         this.device.set_unbinding();
         this.device.stop_system_work();
         this.device.reset.unbind();
