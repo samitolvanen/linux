@@ -750,12 +750,6 @@ impl TyrDrmFileData {
             | uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_WB_MMAP;
 
         if bocreate.flags & !valid_flags != 0 {
-            dev_err!(
-                ddev.as_ref(),
-                "bo_create: invalid flags {}\n",
-                bocreate.flags
-            );
-
             return Err(EINVAL);
         }
 
