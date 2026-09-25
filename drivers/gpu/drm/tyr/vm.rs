@@ -920,7 +920,7 @@ struct GpuVmRelease {
 /// that `VmExec::drop` moved out.
 ///
 /// The flush takes the gpuvm reservation lock, so `VmExec::drop` hands
-/// this off to the cleanup workqueue when it can.
+/// this off to the cleanup workqueue, except for the firmware VM.
 fn release_gpuvm(release: GpuVmRelease) {
     let GpuVmRelease { gpuvm, unique } = release;
     gpuvm.deferred_cleanup();
@@ -954,25 +954,12 @@ impl PinnedDrop for VmExec {
             unique: gpuvm_unique,
         };
 
-        if let Some(handoff) = this.handoff.take() {
-            handoff.spawn(release, release_gpuvm);
-            return;
+        // The firmware VM has no hand-off. It is dropped only by probe and
+        // the device release, outside any signalling section.
+        match this.handoff.take() {
+            Some(handoff) => handoff.spawn(release, release_gpuvm),
+            None => release_gpuvm(release),
         }
-
-        let Err(e) = cleanup::try_spawn_owned(release, release_gpuvm) else {
-            return;
-        };
-
-        let captures = match e {
-            cleanup::SpawnError::QueueGone(captures) => captures,
-            cleanup::SpawnError::NoMemory(captures) => {
-                pr_warn_once!(
-                    "tyr: VmExec cleanup hand-off failed under memory pressure; performing inline gpuvm teardown (lockdep cycle may fire)\n",
-                );
-                captures
-            }
-        };
-        release_gpuvm(captures);
     }
 }
 
