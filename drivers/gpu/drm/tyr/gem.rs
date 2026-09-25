@@ -25,7 +25,6 @@ use kernel::{
     },
     new_mutex,
     page::PAGE_SIZE,
-    pr_warn_once,
     prelude::*,
     str::CString,
     sync::{
@@ -690,15 +689,7 @@ impl KernelBo {
     }
 }
 
-/// Heap-parked captures for the `KernelBo::drop` hand-off to the
-/// cleanup workqueue.
-///
-/// Living on the heap rather than inside the `Queue::try_spawn`
-/// closure lets the `Drop` body recover the captures and run the
-/// cleanup inline if enqueue fails on the dma-fence signalling path.
-/// Letting the closure drop in place on enqueue failure would skip
-/// the GPU unmap entirely, leaving stale PTEs that could be observed
-/// by the next allocation handed the same VA.
+/// Captures for the `KernelBo::drop` hand-off to the cleanup workqueue.
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
@@ -737,32 +728,18 @@ impl Drop for KernelBo {
             kernel_node,
         };
 
-        if let Some(handoff) = self.handoff.take() {
-            handoff.spawn(captures, kernel_bo_unmap);
-            return;
+        // Firmware sections have no hand-off. They are dropped only by probe
+        // and the device release, outside any signalling section.
+        match self.handoff.take() {
+            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap),
+            None => kernel_bo_unmap(captures),
         }
-
-        let Err(e) = cleanup::try_spawn_owned(captures, kernel_bo_unmap) else {
-            return;
-        };
-
-        let captures = match e {
-            cleanup::SpawnError::QueueGone(captures) => captures,
-            cleanup::SpawnError::NoMemory(captures) => {
-                pr_warn_once!(
-                    "tyr: KernelBo cleanup hand-off failed under memory pressure; performing inline unmap (lockdep cycle may fire)\n",
-                );
-                captures
-            }
-        };
-        kernel_bo_unmap(captures);
     }
 }
 
 /// Tears down a `KernelBo` mapping and then releases the VA
 /// reservation. Runs on the cleanup workqueue, or inline from
-/// `KernelBo::drop` when the hand-off cannot be set up. Taking
-/// `gpuvm_unique` inline may trigger a lockdep splat.
+/// `KernelBo::drop` for a firmware section.
 fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
