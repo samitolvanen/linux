@@ -160,11 +160,38 @@ pub trait Driver {
 pub struct Registration<T: Driver>(ARef<drm::Device<T>>);
 
 impl<T: Driver> Registration<T> {
-    fn new(
+    /// Registers a new [`UnregisteredDevice`](drm::UnregisteredDevice) with userspace.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not `mem::forget()` the returned [`Registration`] or otherwise prevent its
+    /// [`Drop`] implementation from running, and must drop it before `dev` releases its devres
+    /// resources, i.e. no later than the driver's unbind callback.
+    /// [`RegistrationGuard`](drm::RegistrationGuard) relies on the drop to unplug the device while
+    /// those resources are still available.
+    #[inline]
+    pub unsafe fn new(
+        dev: &device::Device<device::Bound>,
+        drm: drm::UnregisteredDevice<T>,
+        data: impl PinInit<T::Data, Error>,
+        flags: usize,
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
+        Self::new_internal(dev, drm, data, flags)
+    }
+
+    fn new_internal(
+        dev: &device::Device<device::Bound>,
         drm: drm::UnregisteredDevice<T>,
         data: impl PinInit<T::Data, Error>,
         flags: usize,
     ) -> Result<Self> {
+        if drm.as_ref().as_raw() != dev.as_raw() {
+            return Err(EINVAL);
+        }
+
         // SAFETY:
         // - `raw_data` is a valid pointer to uninitialized memory.
         // - `raw_data` will not move until it is dropped.
@@ -192,7 +219,10 @@ impl<T: Driver> Registration<T> {
 
     /// Registers a new [`UnregisteredDevice`](drm::UnregisteredDevice) with userspace.
     ///
-    /// Ownership of the [`Registration`] object is passed to [`devres::register`].
+    /// Ownership of the [`Registration`] object is passed to [`devres::register`]. Devres unplugs
+    /// the device only after it has released the devres resources of `dev` registered later, so
+    /// those can be released within a [`RegistrationGuard`](drm::RegistrationGuard) critical
+    /// section.
     pub fn new_foreign_owned<'a>(
         drm: drm::UnregisteredDevice<T>,
         dev: &'a device::Device<device::Bound>,
@@ -202,11 +232,7 @@ impl<T: Driver> Registration<T> {
     where
         T: 'static,
     {
-        if drm.as_ref().as_raw() != dev.as_raw() {
-            return Err(EINVAL);
-        }
-
-        let reg = Registration::<T>::new(drm, data, flags)?;
+        let reg = Registration::<T>::new_internal(dev, drm, data, flags)?;
         let drm = NonNull::from(reg.device());
 
         devres::register(dev, reg, GFP_KERNEL)?;
