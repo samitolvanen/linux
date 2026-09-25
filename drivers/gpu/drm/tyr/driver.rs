@@ -353,8 +353,9 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
 
-    /// Shut by unbind to stop the scheduler tick, the firmware-event drain,
-    /// the sync-update sweep, the periodic tick re-arm and the firmware ping.
+    /// Shut by unbind or a failed probe to stop the scheduler tick, the
+    /// firmware-event drain, the sync-update sweep, the periodic tick re-arm
+    /// and the firmware ping.
     #[pin]
     system_work_closed: SpinLock<bool>,
 
@@ -990,6 +991,7 @@ impl TyrPlatformDriverData {
         let tdev: ARef<TyrDrmDevice> = ddev.into();
 
         let hw_guard = ScopeGuard::new(|| {
+            tdev.stop_system_work();
             tdev.fw.stop_mcu();
             tdev.mmu.suspend();
             let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
@@ -1044,10 +1046,6 @@ impl TyrPlatformDriverData {
             .inspect_err(|_| pr_err!("Timed out waiting for firmware to be ready.\n"))?;
         tdev.fw.enable_global_interface(&tdev)?;
 
-        // enable_global_interface armed the firmware watchdog. Cancel it if
-        // probe fails past this point so no ping outlives a failed bring-up.
-        let ping_guard = ScopeGuard::new(|| tdev.cancel_fw_ping());
-
         let scheduler = Scheduler::init(&tdev)?;
         tdev.sched.lock().enable(scheduler);
 
@@ -1085,7 +1083,6 @@ impl TyrPlatformDriverData {
         // We need this to be dev_info!() because dev_dbg!() does not work at
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
-        ping_guard.dismiss();
         hw_guard.dismiss();
         Ok(TyrPlatformDriverData {
             devfreq_registration,
