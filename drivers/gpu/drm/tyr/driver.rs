@@ -90,6 +90,7 @@ use kernel::{
         WorkItem, //
     }, //
 };
+use pin_init::pin_init_scope;
 
 use crate::{
     devfreq::{
@@ -821,16 +822,8 @@ impl DeviceAttribute for ProfilingAttr {
 
 kernel::device_attribute_groups!(TYR_GROUPS, [ProfilingAttr]);
 
-impl platform::Driver for TyrPlatformDriverData {
-    type IdInfo = SocData;
-    const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
-    const PM_OPS: Option<&'static bindings::dev_pm_ops> = Some(&PMContext::<TyrPmOps>::PM_OPS);
-    const DEV_GROUPS: Option<&'static dyn AttributeGroups> = Some(&TYR_GROUPS);
-
-    fn probe(
-        pdev: &platform::Device<Core>,
-        info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
+impl TyrPlatformDriverData {
+    fn new(pdev: &platform::Device<Core>, info: Option<&SocData>) -> Result<Self> {
         let core_clk = Clk::get(pdev.as_ref(), None)?;
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
         let coregroup_clk = OptionalClk::get(pdev.as_ref(), Some(c"coregroup"))?;
@@ -1083,6 +1076,22 @@ impl platform::Driver for TyrPlatformDriverData {
             pm: pm_registration,
             device: tdev,
         })
+    }
+}
+
+impl platform::Driver for TyrPlatformDriverData {
+    type IdInfo = SocData;
+    const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+    const PM_OPS: Option<&'static bindings::dev_pm_ops> = Some(&PMContext::<TyrPmOps>::PM_OPS);
+    const DEV_GROUPS: Option<&'static dyn AttributeGroups> = Some(&TYR_GROUPS);
+
+    fn probe(
+        pdev: &platform::Device<Core>,
+        info: Option<&Self::IdInfo>,
+    ) -> impl PinInit<Self, Error> {
+        // A failed driver data allocation gets no unbind, so bring the device
+        // up only once the allocation has succeeded.
+        pin_init_scope(move || Ok(Self::new(pdev, info)))
     }
 
     fn unbind(pdev: &platform::Device<Core>, this: Pin<&Self>) {
