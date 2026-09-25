@@ -974,6 +974,18 @@ impl<T: ?Sized + WorkItem<ID>, const ID: u64> DmaFenceWork<T, ID> {
             inner <- Work::new(name, key),
         })
     }
+
+    /// Cancels this work item if it is pending and waits for any running execution to finish.
+    ///
+    /// The wait means this must not be called from inside a dma-fence signalling section or from
+    /// a work item on the same [`DmaFenceWorkqueue`]. See [`Work::cancel_sync`].
+    #[inline]
+    pub fn cancel_sync(&self) -> Option<T::Pointer>
+    where
+        T::Pointer: SupportsCancel<ID>,
+    {
+        self.inner.cancel_sync()
+    }
 }
 
 /// Used to safely implement the `HasDmaFenceWork` trait.
