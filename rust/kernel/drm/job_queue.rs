@@ -1456,9 +1456,9 @@ impl<T: QueueOps> JobQueueInner<T> {
 /// submission, and hardware completion for GPU jobs.
 ///
 /// Dropping the queue cancels every job, waiting on in-flight hardware
-/// fences, and then cancels the stage timer synchronously, so it must not
-/// happen inside a dma-fence signalling section or on a worker of the
-/// queue's own [`DmaFenceWorkqueue`].
+/// fences, and then cancels its work items synchronously. It must not
+/// happen inside a dma-fence signalling section or on a worker of either
+/// workqueue passed to [`JobQueue::new`].
 pub struct JobQueue<T: QueueOps> {
     inner: Arc<JobQueueInner<T>>,
 }
@@ -2026,11 +2026,14 @@ impl<T: QueueOps> JobQueue<T> {
     }
 }
 
-/// Drains the pipeline, then cancels the stage timer synchronously. See the
+/// Drains the pipeline, then cancels the work items synchronously. See the
 /// type documentation for where a drop is not allowed.
 impl<T: QueueOps> Drop for JobQueue<T> {
     fn drop(&mut self) {
         self.cancel_all();
         drop(self.inner.stage_timer.cancel_sync());
+        // A pipeline check still running may queue the cleanup work.
+        drop(self.inner.work.cancel_sync());
+        drop(self.inner.cleanup_work.cancel_sync());
     }
 }
