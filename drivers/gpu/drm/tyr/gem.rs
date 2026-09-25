@@ -26,7 +26,6 @@ use kernel::{
     },
     new_mutex,
     page::PAGE_SIZE,
-    pr_warn_once,
     prelude::*,
     str::CString,
     sync::{
@@ -166,12 +165,20 @@ pub(crate) struct BoVmap {
     /// only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
     vmap: Option<shmem::VMapOwned<BoData>>,
+    /// Ships the vmap to the cleanup workqueue and keeps the device alive
+    /// for its final GEM put. `Some` for the entire lifetime of the value,
+    /// taken by `Drop` with `vmap`.
+    handoff: Option<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl BoVmap {
     pub(crate) fn new(bo: &Bo) -> Result<Self> {
+        let handoff = cleanup::Handoff::new(bo.dev().into())?;
         let vmap = bo.owned_vmap::<0>()?;
-        Ok(Self { vmap: Some(vmap) })
+        Ok(Self {
+            vmap: Some(vmap),
+            handoff: Some(handoff),
+        })
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
@@ -212,25 +219,11 @@ impl core::ops::Deref for BoVmap {
 
 impl Drop for BoVmap {
     fn drop(&mut self) {
-        let Some(vmap) = self.vmap.take() else {
+        let (Some(vmap), Some(handoff)) = (self.vmap.take(), self.handoff.take()) else {
             return;
         };
 
-        let Err(e) = cleanup::try_spawn_owned(vmap, drop) else {
-            return;
-        };
-
-        match e {
-            cleanup::SpawnError::QueueGone(vmap) => drop(vmap),
-            cleanup::SpawnError::NoMemory(vmap) => {
-                pr_warn_once!(
-                    "BoVmap cleanup hand-off failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
-                );
-                // Dropping the vmap would take `dma_resv_lock` from the
-                // signalling section that prompted the deferral.
-                core::mem::forget(vmap);
-            }
-        }
+        handoff.spawn(vmap, drop);
     }
 }
 
@@ -473,6 +466,9 @@ pub(crate) struct KernelBo {
     /// covers the address. `None` when the VA is managed externally,
     /// as on the firmware load path.
     kernel_node: Option<range::LiveRange>,
+    /// Ships the unmap to the cleanup workqueue. `Some` for the entire
+    /// lifetime of the value, taken by `Drop`.
+    handoff: Option<cleanup::Handoff<KernelBoCleanup>>,
 }
 
 impl KernelBo {
@@ -505,6 +501,7 @@ impl KernelBo {
             .and_then(|bytes| bytes.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(EOVERFLOW)?;
         let va_end = va.checked_add(size).ok_or(EINVAL)?;
+        let handoff = cleanup::Handoff::new(())?;
 
         let bo = Bo::new(
             ddev,
@@ -526,6 +523,7 @@ impl KernelBo {
             vm: ManuallyDrop::new(vm),
             va_range: va..va_end,
             kernel_node: None,
+            handoff: Some(handoff),
         })
     }
 
@@ -555,12 +553,7 @@ impl KernelBo {
     }
 }
 
-/// Heap-parked captures for the `KernelBo::drop` hand-off to the
-/// cleanup workqueue.
-///
-/// Keeping them off the closure lets `Drop` recover them and unmap
-/// inline when enqueue fails. Dropping the closure in place would skip
-/// the unmap and leave stale PTEs for the next user of the VA.
+/// Captures for the `KernelBo::drop` hand-off to the cleanup workqueue.
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
@@ -593,27 +586,14 @@ impl Drop for KernelBo {
             kernel_node,
         };
 
-        let Err(e) = cleanup::try_spawn_owned(captures, kernel_bo_unmap) else {
-            return;
-        };
-
-        let captures = match e {
-            cleanup::SpawnError::QueueGone(captures) => captures,
-            cleanup::SpawnError::NoMemory(captures) => {
-                pr_warn_once!(
-                    "KernelBo cleanup hand-off failed under memory pressure; performing inline unmap (lockdep cycle may fire)\n",
-                );
-                captures
-            }
-        };
-        kernel_bo_unmap(captures);
+        if let Some(handoff) = self.handoff.take() {
+            handoff.spawn(captures, kernel_bo_unmap);
+        }
     }
 }
 
 /// Tears down a `KernelBo` mapping and then releases the VA
-/// reservation. Runs on the cleanup workqueue, or inline from
-/// `KernelBo::drop` when the hand-off cannot be set up, where taking
-/// `gpuvm_unique` may trigger a lockdep splat.
+/// reservation. Runs on the cleanup workqueue.
 fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
