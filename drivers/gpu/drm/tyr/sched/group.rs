@@ -280,31 +280,6 @@ pub(crate) struct Group {
     #[pin]
     submit_lock: Mutex<()>,
     pub(crate) tiler_oom: Atomic<u32>,
-    /// Tyr DRM device that owns this group.
-    ///
-    /// # Invariants
-    ///
-    /// This field forms a strong refcount cycle: the device owns the
-    /// per-priority scheduler lists and the `CsgSlotManager`, both
-    /// of which hold `Arc<Group>`, while every `Group` holds an
-    /// `ARef<TyrDrmDevice>` here. The cycle
-    /// is broken structurally at teardown:
-    ///
-    /// * On file close, `TyrDrmFileData`'s `PinnedDrop` empties the
-    ///   per-file `group::Pool`, releasing the pool's
-    ///   `Arc<Group>` references.
-    /// * `Group::schedule_term` takes a reference for `term_work`,
-    ///   which hands it to `release_work` for the drop on the cleanup
-    ///   workqueue.
-    /// * Platform unbind flushes `heap_alloc_wq` after quiescing the
-    ///   workers that enqueue on it, so no queued `tiler_oom_work`
-    ///   holds an `Arc<Group>` past unbind.
-    ///
-    /// No path waits on the device to release a group, so the cycle does
-    /// not pin the device. The last `Arc<Group>` drop can land on the
-    /// cleanup workqueue, after the file has closed and the driver has
-    /// unbound.
-    pub(crate) tdev: ARef<TyrDrmDevice>,
     /// CSG slot manager seat for this group.
     ///
     /// The owner is the per-device `CsgSlotManager` mutex. Callers
@@ -391,6 +366,33 @@ pub(crate) struct Group {
     /// slot. Fixed at creation.
     kbo_sizes: usize,
     task_info: TaskInfo,
+    /// Tyr DRM device that owns this group.
+    ///
+    /// # Invariants
+    ///
+    /// This field forms a strong refcount cycle: the device owns the
+    /// per-priority scheduler lists and the `CsgSlotManager`, both
+    /// of which hold `Arc<Group>`, while every `Group` holds an
+    /// `ARef<TyrDrmDevice>` here. The cycle
+    /// is broken structurally at teardown:
+    ///
+    /// * On file close, `TyrDrmFileData`'s `PinnedDrop` empties the
+    ///   per-file `group::Pool`, releasing the pool's
+    ///   `Arc<Group>` references.
+    /// * `Group::schedule_term` takes a reference for `term_work`,
+    ///   which hands it to `release_work` for the drop on the cleanup
+    ///   workqueue.
+    /// * Platform unbind flushes `heap_alloc_wq` after quiescing the
+    ///   workers that enqueue on it, so no queued `tiler_oom_work`
+    ///   holds an `Arc<Group>` past unbind.
+    ///
+    /// No path waits on the device to release a group, so the cycle does
+    /// not pin the device. The last `Arc<Group>` drop can land on the
+    /// cleanup workqueue, after the file has closed and the driver has
+    /// unbound.
+    ///
+    /// Declared last, so the device outlives the drop of every other field.
+    pub(crate) tdev: ARef<TyrDrmDevice>,
 }
 
 impl_list_arc_safe! {

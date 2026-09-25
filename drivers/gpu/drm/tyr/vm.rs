@@ -896,7 +896,7 @@ pub(crate) struct VmExec {
     /// internal mapping tree, like GpuVm::obtain()
     ///
     /// Wrapped in `ManuallyDrop` so `Drop` can move this reference into
-    /// the cleanup workqueue closure rather than dropping it inline.
+    /// the cleanup workqueue hand-off rather than dropping it inline.
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
@@ -904,6 +904,16 @@ pub(crate) struct VmExec {
     fw: bool,
     /// VA range for this VM.
     va_range: Range<u64>,
+    /// Ships the gpuvm references to the cleanup workqueue and keeps the
+    /// device alive until they are released. `None` for the firmware VM,
+    /// which the device owns.
+    handoff: Option<cleanup::Handoff<GpuVmRelease, ARef<TyrDrmDevice>>>,
+}
+
+/// References that `VmExec::drop` hands to `release_gpuvm`.
+struct GpuVmRelease {
+    gpuvm: ARef<GpuVm<GpuVmData>>,
+    unique: Option<UniqueRefGpuVm<GpuVmData>>,
 }
 
 /// Flushes the deferred `vm_bo` list, then drops the gpuvm references
@@ -911,8 +921,11 @@ pub(crate) struct VmExec {
 ///
 /// The flush takes the gpuvm reservation lock, so `VmExec::drop` hands
 /// this off to the cleanup workqueue when it can.
-fn release_gpuvm((gpuvm, _unique): (ARef<GpuVm<GpuVmData>>, Option<UniqueRefGpuVm<GpuVmData>>)) {
+fn release_gpuvm(release: GpuVmRelease) {
+    let GpuVmRelease { gpuvm, unique } = release;
     gpuvm.deferred_cleanup();
+    drop(unique);
+    drop(gpuvm);
 }
 
 #[pinned_drop]
@@ -920,7 +933,8 @@ impl PinnedDrop for VmExec {
     fn drop(self: Pin<&mut Self>) {
         // SAFETY: We do not move out of any structurally pinned field.
         // The `Mutex` is only accessed through `try_lock` in place, and
-        // the only field moved out is `gpuvm`, which is not `#[pin]`.
+        // the only fields moved out are `gpuvm` and `handoff`, neither of
+        // which is `#[pin]`.
         let this = unsafe { self.get_unchecked_mut() };
 
         // SAFETY: `Drop` runs at most once, and this is the only
@@ -935,7 +949,17 @@ impl PinnedDrop for VmExec {
         // signalling path. `None` only on the impossible contended case,
         // in which the inner reference drops inline with the mutex.
         let gpuvm_unique = this.gpuvm_unique.try_lock().and_then(|mut g| g.take());
-        let Err(e) = cleanup::try_spawn_owned((gpuvm, gpuvm_unique), release_gpuvm) else {
+        let release = GpuVmRelease {
+            gpuvm,
+            unique: gpuvm_unique,
+        };
+
+        if let Some(handoff) = this.handoff.take() {
+            handoff.spawn(release, release_gpuvm);
+            return;
+        }
+
+        let Err(e) = cleanup::try_spawn_owned(release, release_gpuvm) else {
             return;
         };
 
@@ -993,6 +1017,10 @@ pub(crate) struct Vm {
     /// `NOT_REGISTERED`. Only ever touched under the registry lock.
     #[cfg(CONFIG_DEBUG_FS)]
     registry_slot: Atomic<usize>,
+    /// Keeps the device alive until every field above has dropped, including
+    /// the final put of `root_gem`. `None` for the firmware VM, which the
+    /// device owns.
+    ddev: Option<ARef<TyrDrmDevice>>,
 }
 
 /// State of a VM's tiler heap pool.
@@ -1003,6 +1031,15 @@ enum HeapPoolState {
     Live(Arc<heap::Pool>),
     /// The VM is going away and cannot take a new pool.
     Destroyed,
+}
+
+/// Owner of a `Vm`.
+enum VmOwner {
+    /// The device, for the firmware VM.
+    Firmware,
+    /// A file. The VM holds this device reference until its deferred drops
+    /// have run.
+    User(ARef<TyrDrmDevice>),
 }
 
 impl Vm {
@@ -1016,8 +1053,13 @@ impl Vm {
         kernel_range: Range<u64>,
         bind_wq: Option<Arc<DmaFenceWorkqueue>>,
         coherent: bool,
-        fw: bool,
+        owner: VmOwner,
     ) -> Result<Arc<Vm>> {
+        let (fw, device_ref) = match owner {
+            VmOwner::Firmware => (true, None),
+            VmOwner::User(dev) => (false, Some(dev)),
+        };
+
         let mmu_features = MMU_FEATURES::from_raw(gpu_info.mmu_features);
         let va_bits = mmu_features.va_bits().get();
         let pa_bits = mmu_features.pa_bits().get();
@@ -1050,6 +1092,7 @@ impl Vm {
         )?;
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
 
+        let handoff = device_ref.clone().map(cleanup::Handoff::new).transpose()?;
         let exec = Arc::pin_init(
             pin_init!(VmExec {
                 as_data,
@@ -1060,6 +1103,7 @@ impl Vm {
                 unusable: Atomic::new(false),
                 fw,
                 va_range: total_range,
+                handoff,
             }),
             GFP_KERNEL,
         )?;
@@ -1085,6 +1129,7 @@ impl Vm {
                 root_gem: dummy_obj,
                 #[cfg(CONFIG_DEBUG_FS)]
                 registry_slot: Atomic::new(NOT_REGISTERED),
+                ddev: device_ref,
             }),
             GFP_KERNEL,
         )?;
@@ -1119,7 +1164,7 @@ impl Vm {
             kernel_range,
             None,
             coherent,
-            true,
+            VmOwner::Firmware,
         )
     }
 
@@ -1141,7 +1186,7 @@ impl Vm {
             kernel_range,
             Some(ddev.wq.clone()),
             ddev.coherent,
-            false,
+            VmOwner::User(ddev.into()),
         )
     }
 

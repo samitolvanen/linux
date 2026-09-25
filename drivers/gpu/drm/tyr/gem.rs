@@ -196,15 +196,21 @@ pub(crate) struct MappedBo {
     /// only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
     vmap: Option<shmem::VMapOwned<BoData>>,
+    /// Ships the vmap to the cleanup workqueue and keeps the device alive
+    /// for its final GEM put. `Some` for the entire lifetime of the value,
+    /// taken by `Drop` with `vmap`.
+    handoff: Option<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl MappedBo {
     pub(crate) fn new(kernel_bo: KernelBo) -> Result<Arc<Self>> {
+        let handoff = cleanup::Handoff::new(kernel_bo.bo.dev().into())?;
         let vmap = kernel_bo.bo.owned_vmap::<0>()?;
         Ok(Arc::new(
             Self {
                 kernel_bo,
                 vmap: Some(vmap),
+                handoff: Some(handoff),
             },
             GFP_KERNEL,
         )?)
@@ -248,25 +254,11 @@ impl core::ops::Deref for MappedBo {
 
 impl Drop for MappedBo {
     fn drop(&mut self) {
-        let Some(vmap) = self.vmap.take() else {
+        let (Some(vmap), Some(handoff)) = (self.vmap.take(), self.handoff.take()) else {
             return;
         };
 
-        let Err(e) = cleanup::try_spawn_owned(vmap, drop) else {
-            return;
-        };
-
-        match e {
-            cleanup::SpawnError::QueueGone(vmap) => drop(vmap),
-            cleanup::SpawnError::NoMemory(vmap) => {
-                pr_warn_once!(
-                    "tyr: MappedBo cleanup hand-off failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
-                );
-                // Dropping the vmap would take `dma_resv_lock` from the
-                // signalling section that prompted the deferral.
-                core::mem::forget(vmap);
-            }
-        }
+        handoff.spawn(vmap, drop);
     }
 }
 
@@ -291,12 +283,23 @@ pub(crate) struct MappedUserBo {
     /// only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
     vmap: Option<shmem::VMapOwned<BoData>>,
+    /// Ships the vmap to the cleanup workqueue and keeps the device alive
+    /// for its final GEM put. `Some` for the entire lifetime of the value,
+    /// taken by `Drop` with `vmap`.
+    handoff: Option<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl MappedUserBo {
     pub(crate) fn new(bo: &Bo) -> Result<Arc<Self>> {
+        let handoff = cleanup::Handoff::new(bo.dev().into())?;
         let vmap = bo.owned_vmap::<0>()?;
-        Ok(Arc::new(Self { vmap: Some(vmap) }, GFP_KERNEL)?)
+        Ok(Arc::new(
+            Self {
+                vmap: Some(vmap),
+                handoff: Some(handoff),
+            },
+            GFP_KERNEL,
+        )?)
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
@@ -329,25 +332,11 @@ impl MappedUserBo {
 
 impl Drop for MappedUserBo {
     fn drop(&mut self) {
-        let Some(vmap) = self.vmap.take() else {
+        let (Some(vmap), Some(handoff)) = (self.vmap.take(), self.handoff.take()) else {
             return;
         };
 
-        let Err(e) = cleanup::try_spawn_owned(vmap, drop) else {
-            return;
-        };
-
-        match e {
-            cleanup::SpawnError::QueueGone(vmap) => drop(vmap),
-            cleanup::SpawnError::NoMemory(vmap) => {
-                pr_warn_once!(
-                    "tyr: MappedUserBo cleanup hand-off failed under memory pressure; leaking vmap to avoid dma_resv_lock cycle in signalling section\n",
-                );
-                // Dropping the vmap would take `dma_resv_lock` from the
-                // signalling section that prompted the deferral.
-                core::mem::forget(vmap);
-            }
-        }
+        handoff.spawn(vmap, drop);
     }
 }
 
@@ -549,6 +538,7 @@ pub(crate) fn new_kernel_object_no_vmap(
         KernelBoVaAlloc::Explicit(va),
         flags,
         coherent,
+        KernelBoOwner::User(dev.into()),
     )?
     .with_va_reservation(node);
 
@@ -568,6 +558,15 @@ pub(crate) fn new_kernel_object_no_vmap(
 pub(crate) enum KernelBoVaAlloc {
     /// Explicit VA address specified by the caller.
     Explicit(u64),
+}
+
+/// Owner of a `KernelBo`.
+pub(crate) enum KernelBoOwner {
+    /// The device, for a firmware section.
+    Firmware,
+    /// A group, queue or heap object. The BO holds this device reference
+    /// until its deferred unmap has run.
+    User(ARef<TyrDrmDevice>),
 }
 
 /// A kernel-owned buffer object with automatic GPU virtual address mapping.
@@ -598,12 +597,15 @@ pub(crate) struct KernelBo {
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`, for BOs whose
     /// VA was handed out by `Vm::alloc_kernel_range`. Dropped from
-    /// the deferred cleanup closure once `Vm::unmap_exact` has torn
+    /// the deferred cleanup once `Vm::unmap_exact` has torn
     /// the mapping down. Leaked instead if the unmap fails, since a
     /// live mapping still covers the address. `None` for BOs with
     /// externally managed reservations (the firmware load path,
     /// which uses `Vm::reserve_kernel_range`).
     kernel_node: Option<range::LiveRange>,
+    /// Ships the unmap to the cleanup workqueue and keeps the device alive
+    /// until it has run. `None` for firmware sections, which the device owns.
+    handoff: Option<cleanup::Handoff<KernelBoCleanup, ARef<TyrDrmDevice>>>,
 }
 
 impl KernelBo {
@@ -622,6 +624,7 @@ impl KernelBo {
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
         coherent: bool,
+        owner: KernelBoOwner,
     ) -> Result<Self> {
         if size == 0 {
             pr_err!("Cannot create KernelBo with size 0\n");
@@ -634,6 +637,10 @@ impl KernelBo {
             .ok()
             .and_then(|bytes| bytes.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(EOVERFLOW)?;
+        let handoff = match owner {
+            KernelBoOwner::Firmware => None,
+            KernelBoOwner::User(dev) => Some(cleanup::Handoff::new(dev)?),
+        };
 
         let bo = gem::shmem::Object::<BoData>::new(
             ddev,
@@ -655,6 +662,7 @@ impl KernelBo {
             vm: ManuallyDrop::new(vm.into()),
             va_range: va..(va + size),
             kernel_node: None,
+            handoff,
         })
     }
 
@@ -717,7 +725,7 @@ impl Drop for KernelBo {
         // (rather than cloning) means `drop_in_place` has nothing left
         // to release inline, so the GEM object's final drop, with its
         // `dma_resv_lock`-taking sg-table teardown, can only run from
-        // the cleanup closure or the inline fallback below.
+        // the cleanup workqueue or the inline path below.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
         let kernel_node = self.kernel_node.take();
 
@@ -728,6 +736,11 @@ impl Drop for KernelBo {
             size,
             kernel_node,
         };
+
+        if let Some(handoff) = self.handoff.take() {
+            handoff.spawn(captures, kernel_bo_unmap);
+            return;
+        }
 
         let Err(e) = cleanup::try_spawn_owned(captures, kernel_bo_unmap) else {
             return;
