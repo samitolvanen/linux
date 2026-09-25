@@ -2588,7 +2588,7 @@ pub(crate) fn cs_user_stream_dump(
     } else {
         dump.bytes.as_ptr()
     };
-    pr_err!(
+    pr_info!(
         "tyr DBG cs_user_stream_dump: group={} cs={} cs_extract={:#x} bo_va_base={:#x} bo_offset={:#x} payload_offset={:#x} status={} len={} bytes={}\n",
         group_id,
         cs_id,
@@ -2663,7 +2663,7 @@ pub(crate) fn heap_context_dump(
         return;
     }
 
-    pr_err!(
+    pr_info!(
         "tyr DBG heap_context_dump: group={} cs={} heap_index={} heap_context_va={:#x} chunk_count={} bytes={}\n",
         group_id,
         cs_id,
@@ -2718,7 +2718,7 @@ pub(crate) fn heap_chunk_dump(
         return;
     }
 
-    pr_err!(
+    pr_info!(
         "tyr DBG heap_chunk_dump: group={} cs={} heap_index={} chunk_index={} chunk_va={:#x} bytes={}\n",
         group_id,
         cs_id,
@@ -2973,7 +2973,7 @@ pub(crate) fn cs_fault_instruction_decode(
     } else {
         bytes.as_ptr()
     };
-    pr_err!(
+    pr_info!(
         "tyr DBG cs_fault_instruction_decode: group={} cs={} cs_extract={:#x} ringbuf_va={:#x} opcode={:#04x} mnemonic={} len={} bytes={}\n",
         group_id,
         cs_id,
@@ -3021,7 +3021,7 @@ pub(crate) fn cs_fault_info_dump(
     } else {
         bytes.as_ptr()
     };
-    pr_err!(
+    pr_info!(
         "tyr DBG cs_fault_info_dump: group={} cs={} info_va={:#x} bo_va_base={:#x} bo_size={:#x} bo_offset={:#x} len={} bytes={}\n",
         group_id,
         cs_id,
