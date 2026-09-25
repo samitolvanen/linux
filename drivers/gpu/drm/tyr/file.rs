@@ -211,6 +211,8 @@ impl PinnedDrop for TyrDrmFileData {
             );
         }
 
+        self.tdev.term_wq.flush();
+
         if let Err(e) = self.as_ref().vm_pool().destroy_all(&self.tdev) {
             dev_err!(self.tdev.as_ref(), "Failed to destroy all VMs: {:?}\n", e);
         }
