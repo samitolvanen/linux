@@ -79,9 +79,13 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 /// piece and pads the concatenation up to a 64-byte boundary, so the
 /// minimum is `next_multiple_of(88, 64) == 128`. Profiled wrappers are
 /// larger, so this stays a lower bound. Used to size the pre-allocated
-/// pending-fence vec and the per-queue profiling slot count to the most
-/// jobs the ring can hold.
+/// pending-fence vec and the per-queue profiling slot count to an upper
+/// bound on the number of jobs a `ringbuf_size`-byte ring can hold.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
+
+/// The hardware considers a CSF ring buffer full one 64-byte cache
+/// line short of its allocated size.
+const RINGBUF_RESERVED_BYTES: usize = 64;
 
 // SAFETY: todo
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -330,7 +334,8 @@ pub(crate) struct QueueData {
     /// kernel. Holds `profiling_slot_count` `JobProfilingData` records.
     profiling_slots: Arc<gem::MappedBo>,
     /// Number of `JobProfilingData` records in `profiling_slots`. Sized
-    /// to the maximum number of wrappers the ring buffer can hold.
+    /// to an upper bound on the number of jobs a `ringbuf_size`-byte
+    /// ring can hold.
     profiling_slot_count: u32,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
@@ -360,20 +365,20 @@ impl QueueData {
         self.ringbuf.size() + self.interfaces.mem_size() + self.profiling_slots.size()
     }
 
+    fn ringbuf_capacity(&self) -> usize {
+        self.ringbuf.size() - RINGBUF_RESERVED_BYTES
+    }
+
     fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput> {
         let ringbuf_input = self.interfaces.read_input()?;
-        let ringbuf_sz = self.ringbuf.size() as u64;
+        let capacity = self.ringbuf_capacity() as u64;
         let ringbuf_output = self.interfaces.read_output()?;
         let used = ringbuf_input
             .insert
             .checked_sub(ringbuf_output.extract)
             .ok_or(EIO)?;
 
-        if instr_count as u64 > ringbuf_sz {
-            return Err(ENOSPC);
-        }
-
-        if used > ringbuf_sz || instr_count as u64 > ringbuf_sz - used {
+        if used > capacity || instr_count as u64 > capacity - used {
             return Err(ENOSPC);
         }
 
@@ -1210,7 +1215,7 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
-        if job.stream.len() > self.data.ringbuf.size() {
+        if job.stream.len() > self.data.ringbuf_capacity() {
             return Err(ENOSPC);
         }
 
