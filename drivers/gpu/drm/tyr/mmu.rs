@@ -42,7 +42,8 @@ use crate::{
     regs::{
         gpu_control::{
             FlushMode,
-            AS_PRESENT, //
+            AS_PRESENT,
+            MMU_FEATURES, //
         },
         MAX_AS, //
     },
@@ -61,6 +62,9 @@ mod faults;
 pub(crate) mod irq;
 
 pub(crate) type AsSlotManager = SlotManager<AddressSpaceManager, MAX_AS>;
+
+/// Largest VA_BITS value that TRANSCFG.INA_BITS can encode.
+const MAX_VA_BITS: u32 = 48;
 
 /// MMU component of the GPU.
 ///
@@ -103,6 +107,14 @@ impl Mmu {
         gpu_info: &GpuInfo,
         reset: ResetHandle,
     ) -> Result<Arc<Mmu>> {
+        let va_bits = MMU_FEATURES::from_raw(gpu_info.mmu_features)
+            .va_bits()
+            .get();
+        if va_bits > MAX_VA_BITS {
+            dev_err!(pdev, "Unsupported VA_BITS: {}", va_bits);
+            return Err(EINVAL);
+        }
+
         let present = AS_PRESENT::from_raw(gpu_info.as_present).present().get();
         let slot_count: usize = present.count_ones().try_into()?;
 
