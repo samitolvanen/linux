@@ -702,13 +702,23 @@ impl Group {
         }
     }
 
-    /// Cancels every queue in the group with `err`.
+    /// Cancels every queue in the group.
     ///
     /// Writes the per-queue terminator syncobj with `status = !0` and
     /// the highest seqno so GPU-side consumers observe the queue as
     /// done.
-    pub(crate) fn cancel_queues(self: &Arc<Self>, err: Error) {
+    pub(crate) fn cancel_queues(self: &Arc<Self>) {
+        let (fatal_queues, timedout) =
+            self.with_locked_inner(|inner| (inner.fatal_queues(), inner.timedout));
+
         for (queue_idx, queue) in self.queues.iter().enumerate() {
+            let err = if fatal_queues & (1 << queue_idx) != 0 {
+                EINVAL
+            } else if timedout {
+                ETIMEDOUT
+            } else {
+                ECANCELED
+            };
             queue.cancel(err);
 
             let seqno = queue.next_seqno();
@@ -1111,13 +1121,7 @@ impl DmaFenceWorkItem<1> for Group {
     type Pointer = Arc<Self>;
 
     fn run(this: Self::Pointer) {
-        // Use the error captured at eviction time (fatal fault, user
-        // destroy, or tick timeout); fall back to ECANCELED if none
-        // was recorded.
-        let err = this
-            .with_locked_inner(|inner| inner.fatal_error)
-            .unwrap_or(ECANCELED);
-        this.cancel_queues(err);
+        this.cancel_queues();
 
         // The `term_scheduled` latch makes this the only enqueue of
         // `release_work`, so it cannot find the item pending.
