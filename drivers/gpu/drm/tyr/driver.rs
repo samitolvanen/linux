@@ -275,8 +275,8 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
 
-    /// Shut by unbind to stop the sync-update sweep, the periodic tick
-    /// re-arm and the firmware ping.
+    /// Shut by unbind to stop the scheduler tick, the firmware-event drain,
+    /// the sync-update sweep, the periodic tick re-arm and the firmware ping.
     #[pin]
     system_work_closed: SpinLock<bool>,
 
@@ -366,38 +366,42 @@ impl TyrDrmDeviceData {
 
     /// Schedules the fw-events worker on the scheduler workqueue.
     ///
-    /// Safe to call from any context including the threaded IRQ
-    /// handler. Repeated calls coalesce in the workqueue.
+    /// Safe to call from the threaded IRQ handler. Repeated calls coalesce
+    /// in the workqueue.
     pub(crate) fn schedule_fw_events(tdev: &ARef<TyrDrmDevice>) {
         let Some(guard) = tdev.registration_guard() else {
             return;
         };
 
         guard.registration_data_with(|reg_data| {
-            let _ = reg_data
-                .sched_wq
-                .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
+            tdev.enqueue_system_work(|| {
+                let _ = reg_data
+                    .sched_wq
+                    .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
+            });
         });
     }
 
     /// Schedules an immediate scheduler tick on
     /// `sched_wq`.
     ///
-    /// Safe to call from any context including the threaded IRQ
-    /// handler. Repeated calls coalesce in the workqueue.
+    /// Safe to call from the threaded IRQ handler. Repeated calls coalesce
+    /// in the workqueue.
     pub(crate) fn schedule_tick(tdev: &ARef<TyrDrmDevice>) {
         let Some(guard) = tdev.registration_guard() else {
             return;
         };
 
         guard.registration_data_with(|reg_data| {
-            let _ = reg_data
-                .sched_wq
-                .enqueue::<ARef<TyrDrmDevice>, { work_id::TICK }>(tdev.clone());
+            tdev.enqueue_system_work(|| {
+                let _ = reg_data
+                    .sched_wq
+                    .enqueue::<ARef<TyrDrmDevice>, { work_id::TICK }>(tdev.clone());
+            });
         });
     }
 
-    /// Runs `f` unless unbind has stopped the system-workqueue items.
+    /// Runs `f` unless unbind has stopped the work items it gates.
     ///
     /// `f` enqueues one of them under a spinlock, so callers must be
     /// preemptible and `f` must not sleep.
@@ -487,13 +491,15 @@ impl TyrDrmDeviceData {
         let _ = self.fw_ping_work.cancel_sync();
     }
 
-    /// Stops the system-workqueue items and waits for the in-flight runs.
+    /// Stops the gated work items and waits for the in-flight runs.
     ///
     /// The gate is shut and released before the cancels, since a running
     /// ping re-arms itself under the gate. Must run in process context.
     /// Same lock rules as `drain_sched_work`.
     pub(crate) fn stop_system_work(&self) {
         *self.system_work_closed.lock() = true;
+        let _ = self.tick_work.cancel_sync();
+        let _ = self.fw_events_work.cancel_sync();
         let _ = self.sync_upd_work.cancel_sync();
         let _ = self.periodic_tick_work.cancel_sync();
         self.cancel_fw_ping();
