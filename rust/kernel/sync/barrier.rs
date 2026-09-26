@@ -70,3 +70,14 @@ pub fn wmb() {
     // operands, so it has no validity requirements on the caller.
     unsafe { bindings::wmb() };
 }
+
+/// A read-read memory barrier for coherent memory written by devices.
+///
+/// Orders a read of a device-written status word before the reads of the
+/// data it guards. Does not order reads with respect to other CPUs.
+#[inline(always)]
+pub fn dma_rmb() {
+    // SAFETY: `dma_rmb()` is a barrier with no memory operands, so it has no
+    // validity requirements on the caller.
+    unsafe { bindings::dma_rmb() };
+}

@@ -21,3 +21,8 @@ __rust_helper void rust_helper_wmb(void)
 {
 	wmb();
 }
+
+__rust_helper void rust_helper_dma_rmb(void)
+{
+	dma_rmb();
+}
