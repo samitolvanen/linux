@@ -33,6 +33,7 @@ use kernel::{
         ioctl,
         UnregisteredDevice, //
     },
+    error::to_result,
     math64::div_u64_rem,
     new_mutex,
     new_spinlock,
@@ -53,11 +54,7 @@ use kernel::{
     prelude::*,
     regulator,
     sizes::SZ_2M,
-    str::{
-        parse_int::ParseInt,
-        BStr,
-        Formatter, //
-    },
+    str::Formatter,
     sync::{
         aref::ARef,
         atomic::{
@@ -821,7 +818,10 @@ impl DeviceAttribute for ProfilingAttr {
 
     fn store(dev: &device::Device<Bound>, buf: &CStr) -> Result {
         let data = dev.drvdata::<TyrPlatformDriverData>()?;
-        let value = u32::from_str(BStr::from_bytes(buf.to_bytes().trim_ascii()))?;
+        let mut value = 0;
+        // SAFETY: `buf` is a NUL-terminated string that outlives the call, and
+        // `value` is a live `u32` that `kstrtouint()` may write.
+        to_result(unsafe { bindings::kstrtouint(buf.as_char_ptr(), 0, &mut value) })?;
         if value & !(DEVICE_PROFILING_CYCLES | DEVICE_PROFILING_TIMESTAMP) != 0 {
             return Err(EINVAL);
         }
