@@ -22,6 +22,7 @@ use kernel::{
     io::register::Array,
     io::Io,
     new_mutex,
+    pr_err_once,
     prelude::*,
     sizes::SZ_4K,
     sizes::SZ_64K,
@@ -31,6 +32,7 @@ use kernel::{
             Atomic,
             Relaxed, //
         },
+        barrier::dma_rmb,
         Arc,
         LockClassKey,
         Mutex, //
@@ -43,7 +45,7 @@ use kernel::{
         Monotonic, //
     },
     transmute::FromBytes,
-    uapi,
+    uapi, //
 };
 
 use crate::{
@@ -60,9 +62,12 @@ use crate::{
     vm::{Vm, VmFlag, VmMapFlags},
 };
 
-use super::group::{
-    Group,
-    State, //
+use super::{
+    group::{
+        Group,
+        State, //
+    },
+    job::JobProfilingData, //
 };
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
@@ -185,70 +190,63 @@ struct PendingSubmitFence {
 /// `Queue::maybe_truncate_pending` compacts the prefix away once
 /// `head` exceeds `max(len / 2, 16)`.
 ///
-/// `profiling_free` is a stack of profiling sample slots not currently
-/// assigned to any job. A slot is popped when a profiled job reserves,
-/// pushed back when its reservation drops unconsumed or when its
-/// completed entry drains. Pre-sized to the slot count so the pop and
-/// push never allocate.
+/// `next_profiling_slot` is the sample slot the next profiled job takes
+/// when its fence is pushed. Slots are assigned round robin.
 struct PendingFences {
     vec: KVec<PendingSubmitFence>,
     head: usize,
     outstanding: usize,
-    profiling_free: KVec<u32>,
+    next_profiling_slot: u32,
 }
 
 /// RAII guard for a pending-submit-fence reservation.
-///
-/// `profiling_slot` is the sample slot popped from `profiling_free` for a
-/// profiled job. The guard returns it on drop unless the reservation is
-/// consumed, in which case the slot passes to the pending entry.
 pub(in crate::sched) struct PendingFenceReservation {
     queue: Arc<QueueData>,
     consumed: Atomic<bool>,
-    profiling_slot: Option<u32>,
 }
 
 impl PendingFenceReservation {
-    fn new(queue: Arc<QueueData>, profiling_slot: Option<u32>) -> Self {
+    fn new(queue: Arc<QueueData>) -> Self {
         Self {
             queue,
             consumed: Atomic::new(false),
-            profiling_slot,
         }
     }
 
-    /// The profiling sample slot held for this reservation, if any.
-    pub(in crate::sched) fn profiling_slot(&self) -> Option<u32> {
-        self.profiling_slot
-    }
-
     /// Pushes `fence` into the queue's pending list, consuming this reservation.
+    ///
+    /// Returns the profiling sample slot assigned to the job, if
+    /// `profiling_mask` enables sampling.
     fn consume(
         &self,
         done_seqno: u64,
         profiling_mask: u32,
         fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
+    ) -> Result<Option<u32>, (Error, DriverDmaFence<QueueFenceData, Published>)> {
+        let mut pending = self.queue.pending_submit_fences.lock();
+        let profiling_slot = (profiling_mask != 0).then_some(pending.next_profiling_slot);
         let pending_fence = PendingSubmitFence {
             done_seqno,
-            profiling_slot: self.profiling_slot.unwrap_or(0),
+            profiling_slot: profiling_slot.unwrap_or(0),
             profiling_mask,
             fence: Some(fence),
         };
 
-        let mut pending = self.queue.pending_submit_fences.lock();
         match pending.vec.push_within_capacity(pending_fence) {
             Ok(()) => {
                 pending.outstanding = pending.outstanding.saturating_sub(1);
                 self.consumed.store(true, Relaxed);
-                Ok(())
+                if let Some(slot) = profiling_slot {
+                    pending.next_profiling_slot = (slot + 1) % self.queue.profiling_slot_count;
+                }
+                Ok(profiling_slot)
             }
             Err(err) => match err.0.fence {
                 Some(fence) => Err((EINVAL, fence)),
                 None => {
                     pending.outstanding = pending.outstanding.saturating_sub(1);
                     self.consumed.store(true, Relaxed);
-                    Ok(())
+                    Ok(None)
                 }
             },
         }
@@ -262,9 +260,6 @@ impl Drop for PendingFenceReservation {
         }
         let mut pending = self.queue.pending_submit_fences.lock();
         pending.outstanding = pending.outstanding.saturating_sub(1);
-        if let Some(slot) = self.profiling_slot {
-            let _ = pending.profiling_free.push_within_capacity(slot);
-        }
     }
 }
 
@@ -336,8 +331,10 @@ pub(super) struct QueueJob {
     /// which sample deltas the completion path accumulates. `0` when the
     /// job carries no profiling slot.
     profiling_mask: u32,
+    /// Offsets in `stream` of the `MOV48`s that load the profiling sample
+    /// addresses, moved from slot 0 to the job's slot at exec.
+    profiling_relocs: KVec<usize>,
     /// Reserved at prepare time, consumed in submit, rolled back on drop.
-    /// Also holds the profiling sample slot baked into `stream`.
     reservation: Option<PendingFenceReservation>,
 }
 
@@ -347,6 +344,7 @@ impl QueueJob {
         group: Arc<Group>,
         queue_index: usize,
         profiling_mask: u32,
+        profiling_relocs: KVec<usize>,
         reservation: Option<PendingFenceReservation>,
     ) -> Self {
         Self {
@@ -356,6 +354,7 @@ impl QueueJob {
             group,
             queue_index,
             profiling_mask,
+            profiling_relocs,
             reservation,
         }
     }
@@ -492,12 +491,6 @@ impl QueueData {
         self.next_seqno.load(Relaxed)
     }
 
-    /// Returns a drained job's profiling sample slot to the free list.
-    fn release_profiling_slot(&self, slot: u32) {
-        let mut pending = self.pending_submit_fences.lock();
-        let _ = pending.profiling_free.push_within_capacity(slot);
-    }
-
     /// GPU virtual address of the profiling sample slot `slot`.
     pub(super) fn profiling_slot_va(&self, slot: u32) -> Result<u64> {
         let base = self.profiling_slots.kernel_va().ok_or(EINVAL)?.start;
@@ -529,20 +522,54 @@ impl QueueData {
         let ringbuf_start = ringbuf_input.insert;
         let cs_insert = (ringbuf_start & (ringbuf_sz - 1)) as usize;
 
-        let ringbuf = self.ringbuf.vmap();
-        let size = ringbuf.owner().size();
-        // SAFETY: `ringbuf` owns a writable CPU mapping for the queue ring buffer
-        // and `size` matches the mapped object size.
-        let bytes = unsafe { core::slice::from_raw_parts_mut(ringbuf.addr() as *mut u8, size) };
-
-        let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
-        bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
-        if first_chunk < instrs.len() {
-            bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
-        }
+        self.with_ringbuf(|bytes| {
+            let first_chunk = core::cmp::min(bytes.len() - cs_insert, instrs.len());
+            bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
+            if first_chunk < instrs.len() {
+                bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
+            }
+        });
 
         let completion_point = ringbuf_start + instrs.len() as u64;
         Ok(completion_point)
+    }
+
+    /// Points the ring copy of `job` at sample slot `slot`. The copy ends at
+    /// `completion_point`.
+    ///
+    /// The addresses stay inside `profiling_slots`, so the add never carries
+    /// out of the 48-bit `MOV48` operand.
+    fn relocate_profiling(&self, job: &QueueJob, completion_point: u64, slot: u32) {
+        let delta = u64::from(slot) * size_of::<JobProfilingData>() as u64;
+        let ringbuf_start = completion_point - job.stream.len() as u64;
+
+        self.with_ringbuf(|bytes| {
+            let ring_mask = bytes.len() as u64 - 1;
+            for &offset in job.profiling_relocs.iter() {
+                let pos = ((ringbuf_start + offset as u64) & ring_mask) as usize;
+                let instr = job.stream.get(offset..).and_then(|s| s.first_chunk());
+                let dst = bytes.get_mut(pos..).and_then(|b| b.first_chunk_mut());
+                if let (Some(instr), Some(dst)) = (instr, dst) {
+                    *dst = (u64::from_le_bytes(*instr) + delta).to_le_bytes();
+                } else {
+                    pr_err_once!("profiling relocation out of range\n");
+                }
+            }
+        });
+    }
+
+    /// Calls `f` with the CPU mapping of the ring buffer.
+    ///
+    /// Only the `TyrQueueOps::submit` path may call this, and only to write
+    /// past `INSERT`.
+    fn with_ringbuf<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let ringbuf = self.ringbuf.vmap();
+        let size = ringbuf.owner().size();
+        // SAFETY: `ringbuf` owns a writable CPU mapping of `size` bytes. Callers
+        // write only past `INSERT` and the firmware reads only up to it. The job
+        // queue serializes the only writer.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(ringbuf.addr() as *mut u8, size) };
+        f(bytes)
     }
 
     /// Publishes a previously claimed ringbuffer range to the firmware.
@@ -574,7 +601,7 @@ impl QueueData {
 
     fn signal_submit_fences_up_to(&self, up_to_seqno: u64, result: Result) {
         loop {
-            let (profiling_slot, profiling_mask, fence) = {
+            let fence = {
                 let mut pending = self.pending_submit_fences.lock();
                 let head = pending.head;
                 let Some(entry) = pending.vec.get_mut(head) else {
@@ -585,16 +612,10 @@ impl QueueData {
                     Self::maybe_truncate_pending(&mut pending);
                     break;
                 }
-                let profiling_slot = entry.profiling_slot;
-                let profiling_mask = entry.profiling_mask;
                 let fence = entry.fence.take();
                 pending.head = head + 1;
-                (profiling_slot, profiling_mask, fence)
+                fence
             };
-
-            if profiling_mask != 0 {
-                self.release_profiling_slot(profiling_slot);
-            }
 
             if let Some(fence) = fence {
                 let _annotation = DmaFenceSignallingAnnotation::new();
@@ -615,8 +636,10 @@ impl QueueData {
     /// fdinfo spinlock. It allocates nothing, takes no `dma_resv` lock, and
     /// waits on no fence.
     fn complete_pending_fences_up_to(&self, group: &Group, up_to_seqno: u64) {
+        // No sample may be read before the sync object that marks it complete.
+        dma_rmb();
         loop {
-            let (profiling_slot, profiling_mask, fence) = {
+            let (profiling_mask, sample, fence) = {
                 let mut pending = self.pending_submit_fences.lock();
                 let head = pending.head;
                 let Some(entry) = pending.vec.get_mut(head) else {
@@ -627,16 +650,18 @@ impl QueueData {
                     Self::maybe_truncate_pending(&mut pending);
                     break;
                 }
-                let profiling_slot = entry.profiling_slot;
                 let profiling_mask = entry.profiling_mask;
+                // Read the sample before the head advance lets its slot be
+                // reassigned.
+                let sample =
+                    (profiling_mask != 0).then(|| self.read_profiling_sample(entry.profiling_slot));
                 let fence = entry.fence.take();
                 pending.head = head + 1;
-                (profiling_slot, profiling_mask, fence)
+                (profiling_mask, sample, fence)
             };
 
-            if profiling_mask != 0 {
-                self.accumulate_profiling_sample(group, profiling_slot, profiling_mask);
-                self.release_profiling_slot(profiling_slot);
+            if let Some(sample) = sample {
+                Self::accumulate_profiling_sample(group, sample, profiling_mask);
             }
 
             if let Some(fence) = fence {
@@ -646,14 +671,19 @@ impl QueueData {
         }
     }
 
-    /// Reads the profiling slot `slot` and accumulates the enabled
-    /// before/after deltas into `group`'s fdinfo.
+    /// Reads the profiling sample in slot `slot`.
+    fn read_profiling_sample(&self, slot: u32) -> Result<JobProfilingData> {
+        let offset = slot as usize * size_of::<JobProfilingData>();
+        JobProfilingData::read(&*self.profiling_slots, offset)
+    }
+
+    /// Accumulates the enabled before/after deltas of `sample` into
+    /// `group`'s fdinfo.
     ///
     /// A read error is logged and skipped, because a missed sample must not
     /// abort fence completion.
-    fn accumulate_profiling_sample(&self, group: &Group, slot: u32, mask: u32) {
-        let offset = slot as usize * size_of::<super::job::JobProfilingData>();
-        let data = match super::job::JobProfilingData::read(&*self.profiling_slots, offset) {
+    fn accumulate_profiling_sample(group: &Group, sample: Result<JobProfilingData>, mask: u32) {
+        let data = match sample {
             Ok(data) => data,
             Err(err) => {
                 pr_err!("profiling slot read failed: {}\n", err.to_errno());
@@ -964,9 +994,17 @@ impl QueueOps for TyrQueueOps {
             return Err(EINVAL);
         };
 
-        if let Err((err, fence)) = reservation.consume(done_seqno, job.job.profiling_mask, fence) {
-            fence.signal(Err(err));
-            return Err(err);
+        let profiling_slot = match reservation.consume(done_seqno, job.job.profiling_mask, fence) {
+            Ok(slot) => slot,
+            Err((err, fence)) => {
+                fence.signal(Err(err));
+                return Err(err);
+            }
+        };
+
+        if let Some(slot) = profiling_slot {
+            self.data
+                .relocate_profiling(job.job, ringbuf_completion_point, slot);
         }
 
         if let Err(err) = self.data.commit_ringbuf_range(ringbuf_completion_point) {
@@ -1156,12 +1194,9 @@ impl Queue {
         let max_jobs = queue_args.ringbuf_size() as usize / WRAPPER_RINGBUF_BYTES;
         let pending_fence_vec = KVec::with_capacity(max_jobs, GFP_KERNEL)?;
 
-        // One profiling slot per wrapper the ring can hold simultaneously.
-        let profiling_slot_count = max_jobs as u32;
-        let mut profiling_free = KVec::with_capacity(max_jobs, GFP_KERNEL)?;
-        for slot in 0..profiling_slot_count {
-            profiling_free.push(slot, GFP_KERNEL)?;
-        }
+        // One profiling slot per pending submit fence, so a slot is not reused
+        // before its sample is read.
+        let profiling_slot_count = u32::try_from(pending_fence_vec.capacity())?;
         let profiling_slots = gem::new_kernel_object(
             tdev,
             &vm,
@@ -1184,7 +1219,7 @@ impl Queue {
                     vec: pending_fence_vec,
                     head: 0,
                     outstanding: 0,
-                    profiling_free,
+                    next_profiling_slot: 0,
                 }),
                 last_submit_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
@@ -1236,30 +1271,14 @@ impl Queue {
     /// breaks the lockdep cycle through `fs_reclaim` that would
     /// otherwise close via `JobQueue::state` -> `dma_fence_map` ->
     /// `mmu_notifier` -> `fs_reclaim` -> `pending_submit_fences`.
-    ///
-    /// When `profiling` is set, a sample slot is popped from
-    /// `profiling_free` and carried by the reservation. The free list holds
-    /// one slot per capacity unit, so a granted reservation always finds
-    /// one.
-    pub(in crate::sched) fn reserve_pending_submit_fence(
-        &self,
-        profiling: bool,
-    ) -> Result<PendingFenceReservation> {
+    pub(in crate::sched) fn reserve_pending_submit_fence(&self) -> Result<PendingFenceReservation> {
         let mut pending = self.data.pending_submit_fences.lock();
         let additional = pending.outstanding.checked_add(1).ok_or(EOVERFLOW)?;
         if pending.vec.len() + additional > pending.vec.capacity() {
             return Err(ENOSPC);
         }
         pending.outstanding = additional;
-        let profiling_slot = if profiling {
-            pending.profiling_free.pop()
-        } else {
-            None
-        };
-        Ok(PendingFenceReservation::new(
-            self.data.clone(),
-            profiling_slot,
-        ))
+        Ok(PendingFenceReservation::new(self.data.clone()))
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
