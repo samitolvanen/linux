@@ -264,7 +264,7 @@ impl GroupInner {
     }
 }
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct Group {
     /// The mutable, lock-protected portion of the group state.
     #[pin]
@@ -295,6 +295,9 @@ pub(crate) struct Group {
     /// per-queue state inside each `Queue` uses interior mutability so
     /// callers do not need the group's `inner` lock to operate on it.
     pub(crate) queues: KVec<Queue>,
+    /// Carries `queues` to the cleanup workqueue when the group drops.
+    /// `Some` for the group's whole lifetime, taken by `Drop`.
+    queues_handoff: Option<cleanup::Handoff<KVec<Queue>>>,
     /// Worker that drives `Group::cancel_queues` on the device's
     /// `term_wq`.
     ///
@@ -312,10 +315,8 @@ pub(crate) struct Group {
     /// Worker that drains the queues and drops the reference `term_work`
     /// ran with, on the cleanup workqueue.
     ///
-    /// The drain waits on hardware fences, and the drop may be the
-    /// group's last. Unmapping its buffers takes `dma_resv_lock` and
-    /// allocates with `GFP_KERNEL`. None of these is allowed inside the
-    /// signalling annotation.
+    /// The drain waits on hardware fences, which is not allowed inside
+    /// the signalling annotation.
     ///
     /// The item is embedded in the group, so the enqueue allocates
     /// nothing and has no `NoMemory` case to handle, unlike
@@ -330,6 +331,7 @@ pub(crate) struct Group {
     pub(crate) wait_links: ListLinks<1>,
     #[pin]
     pub(crate) wait_tracker: AtomicTracker<1>,
+    /// Must drop before `_syncobjs`, which keeps the last reference.
     #[allow(dead_code)]
     pub(super) vm: Arc<Vm>,
     /// Software-visible scheduling priority.
@@ -498,6 +500,7 @@ impl Group {
         }
 
         let queue_count = queues.len();
+        let queues_handoff = cleanup::Handoff::new(())?;
 
         let kbo_sizes = suspend_buf.bo.size()
             + protm_suspend_buf.bo.size()
@@ -530,6 +533,7 @@ impl Group {
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,
+                queues_handoff: Some(queues_handoff),
                 term_work <- new_dma_fence_work!("tyr-group-term"),
                 tiler_oom_work <- new_work!("tyr-group-tiler-oom"),
                 release_work <- new_work!("tyr-group-release"),
@@ -662,10 +666,9 @@ impl Group {
 
     /// Leaks `group` after a failed enqueue of `release_work`.
     ///
-    /// The failure is not expected. The enqueue runs inside the
-    /// signalling annotation. A drop there may be the group's last, and
-    /// that drop unmaps its buffers under `dma_resv_lock`. The queues
-    /// stay unparked, so their remaining jobs still fail at submit.
+    /// The failure is not expected. A drop here may release the last
+    /// device reference and destroy `term_wq` from its own worker. The
+    /// queues stay unparked, so their remaining jobs still fail at submit.
     fn leak_on_release_enqueue_failure(group: Arc<Self>) {
         pr_err!("Failed to enqueue group release_work, leaking the group\n");
         core::mem::forget(group);
@@ -1076,6 +1079,16 @@ impl deps::BatchOps for SubmitOps {
         };
 
         Ok(signal_fence)
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for Group {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if let Some(handoff) = this.queues_handoff.take() {
+            handoff.spawn(core::mem::take(this.queues), drop);
+        }
     }
 }
 
