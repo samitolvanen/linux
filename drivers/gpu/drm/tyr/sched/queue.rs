@@ -100,6 +100,10 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 /// jobs a `ringbuf_size`-byte ring can hold.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
 
+/// The hardware considers a CSF ring buffer full one 64-byte cache
+/// line short of its allocated size.
+const RINGBUF_RESERVED_BYTES: usize = 64;
+
 // SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
 // static is never dropped.
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -180,17 +184,17 @@ pub(crate) struct QueueData {
 }
 
 impl QueueData {
+    fn ringbuf_capacity(&self) -> usize {
+        self.ringbuf.size() - RINGBUF_RESERVED_BYTES
+    }
+
     fn ringbuf_space_for(&self, instr_count: usize) -> Result<u64> {
         let insert = self.interfaces.read_insert()?;
-        let size = self.ringbuf.vmap().size();
+        let capacity = self.ringbuf_capacity() as u64;
         let extract = self.interfaces.read_extract()?;
         let used = insert.checked_sub(extract).ok_or(EIO)?;
 
-        if instr_count > size {
-            return Err(ENOSPC);
-        }
-
-        if used > size as u64 || instr_count as u64 > size as u64 - used {
+        if used > capacity || instr_count as u64 > capacity - used {
             return Err(ENOSPC);
         }
 
@@ -1069,9 +1073,9 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
-        // A stream larger than the ringbuffer can never be appended, so
+        // A stream larger than the ring capacity can never be appended, so
         // reject it before commit claims seqnos for it.
-        if job.stream.len() > self.data.ringbuf.vmap().size() {
+        if job.stream.len() > self.data.ringbuf_capacity() {
             return Err(ENOSPC);
         }
 
