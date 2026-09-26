@@ -37,6 +37,7 @@ use kernel::{
         AsBytes,
         FromBytes, //
     },
+    types::ScopeGuard,
     uaccess::{
         UserSlice,
         UserSliceReader, //
@@ -654,6 +655,9 @@ impl TyrDrmFileData {
             stride.checked_mul(count).ok_or(EINVAL)?,
         )
         .reader();
+
+        // Declared before `ctx` so it flushes after the uncommitted jobs drop.
+        let _flush = ScopeGuard::new(|| vm.flush_deferred_cleanup());
 
         // `count` is unbounded, so the arrays come from kvmalloc.
         let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
