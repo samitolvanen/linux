@@ -96,8 +96,7 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 /// `sched::job::build_wrapped_stream` emits 11 8-byte instructions per
 /// piece and pads the concatenation up to a 64-byte boundary, so the
 /// minimum is `next_multiple_of(88, 64) == 128`. Used to size the
-/// pre-allocated pending-fence vec so `Queue::reserve_pending_submit_fence`
-/// never needs to allocate under the lock.
+/// pre-allocated pending-fence vec to the most jobs the ring can hold.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
 
 // SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
@@ -362,15 +361,20 @@ impl QueueData {
     }
 
     /// Compacts the drained prefix away once `head` has grown past
-    /// `max(len / 2, 16)`.
+    /// `max(len / 2, 16)`, or once `head` is non-zero in a full vec so that
+    /// `push_submit_fence` finds a free slot.
     ///
-    /// Must preserve `vec.capacity()` so `Queue::reserve_pending_submit_fence`
-    /// never needs to grow the vec. `KVec::retain` shifts surviving
-    /// entries in place and only adjusts `len`, leaving the underlying
-    /// allocation intact.
+    /// Must preserve `vec.capacity()`, which bounds the submitted jobs whose
+    /// fences have not drained yet. `KVec::retain` shifts surviving entries
+    /// in place and only adjusts `len`, leaving the underlying allocation
+    /// intact.
     fn maybe_truncate_pending(pending: &mut PendingFences) {
         let len = pending.vec.len();
-        let threshold = core::cmp::max(len / 2, 16);
+        let threshold = if len == pending.vec.capacity() {
+            1
+        } else {
+            core::cmp::max(len / 2, 16)
+        };
         if pending.head < threshold {
             return;
         }
@@ -382,6 +386,35 @@ impl QueueData {
             keep
         });
         pending.head = 0;
+    }
+
+    /// Pushes `fence` into the pending list, or hands it back when every
+    /// entry holds a job that has not drained yet.
+    ///
+    /// It must not allocate, since an allocation under this lock closes the
+    /// lockdep cycle `JobQueue::state` -> `dma_fence_map` -> `mmu_notifier`
+    /// -> `fs_reclaim` -> `pending_submit_fences`.
+    fn push_submit_fence(
+        &self,
+        done_seqno: u64,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> Result<(), DriverDmaFence<QueueFenceData, Published>> {
+        // The fence goes in after the push, so a failed push can hand it back.
+        let pending_fence = PendingSubmitFence {
+            done_seqno,
+            fence: None,
+        };
+
+        let mut pending = self.pending_submit_fences.lock();
+        Self::maybe_truncate_pending(&mut pending);
+        if pending.vec.push_within_capacity(pending_fence).is_err() {
+            return Err(fence);
+        }
+        let Some(entry) = pending.vec.last_mut() else {
+            return Err(fence);
+        };
+        entry.fence = Some(fence);
+        Ok(())
     }
 
     fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
@@ -632,16 +665,13 @@ impl QueueOps for TyrQueueOps {
             }
         };
 
-        let (Some(reservation), Some(done_seqno)) =
-            (job.job.reservation.as_ref(), job.job.done_seqno())
-        else {
+        let Some(done_seqno) = job.job.done_seqno() else {
             fence.signal(Err(EINVAL));
             return Err(EINVAL);
         };
 
-        if let Err((err, fence)) = reservation.consume(done_seqno, fence) {
-            fence.signal(Err(err));
-            return Err(err);
+        if let Err(fence) = self.data.push_submit_fence(done_seqno, fence) {
+            return Ok(SubmitResult::NoResources(fence));
         }
 
         if let Err(err) = self.data.commit_ringbuf_range(ringbuf_completion_point) {
@@ -840,24 +870,16 @@ pub(super) struct QueueJob {
     /// at prepare time so the timeout stage can read the per-queue
     /// syncobj without an extra lookup.
     queue_index: usize,
-    /// Reserved at prepare time, consumed in submit, rolled back on drop.
-    reservation: Option<PendingFenceReservation>,
 }
 
 impl QueueJob {
-    pub(super) fn new(
-        stream: KVec<u8>,
-        group: Arc<Group>,
-        queue_index: usize,
-        reservation: Option<PendingFenceReservation>,
-    ) -> Self {
+    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>, queue_index: usize) -> Self {
         Self {
             stream,
             done_seqno: Atomic::new(0),
             baseline_suspend_nanos: Atomic::new(0),
             group,
             queue_index,
-            reservation,
         }
     }
 
@@ -959,15 +981,6 @@ struct PendingSubmitFence {
 /// State protected by the pending-submit-fences mutex.
 ///
 /// `vec` carries the live ordered list of in-flight per-job fences.
-/// `outstanding` counts reservations made by
-/// `Queue::reserve_pending_submit_fence` whose `PendingFenceReservation`
-/// guard has not yet been consumed or dropped.
-///
-/// `KVec::reserve` is relative to the current `len`, so `outstanding`
-/// is what makes consecutive reserves accumulate space. Without it the
-/// second of two back-to-back reserves would do nothing, and the
-/// matching push would fail `push_within_capacity` from inside the
-/// dma-fence signalling section that wraps the submit path.
 ///
 /// `head` is the cursor into `vec` past which entries are live. The
 /// prefix `vec[..head]` is drained but not yet truncated and every
@@ -976,65 +989,11 @@ struct PendingSubmitFence {
 /// None` if an error path already took the fence out, which is
 /// treated as a hole and skipped on drain.
 /// `Queue::maybe_truncate_pending` compacts the prefix away once
-/// `head` exceeds `max(len / 2, 16)`.
+/// `head` exceeds `max(len / 2, 16)`, or once `head` is non-zero in a
+/// full vec.
 struct PendingFences {
     vec: KVec<PendingSubmitFence>,
     head: usize,
-    outstanding: usize,
-}
-
-/// RAII guard for a pending-submit-fence reservation.
-pub(in crate::sched) struct PendingFenceReservation {
-    queue: Arc<QueueData>,
-    consumed: Atomic<bool>,
-}
-
-impl PendingFenceReservation {
-    fn new(queue: Arc<QueueData>) -> Self {
-        Self {
-            queue,
-            consumed: Atomic::new(false),
-        }
-    }
-
-    /// Pushes `fence` into the queue's pending list, consuming this reservation.
-    fn consume(
-        &self,
-        done_seqno: u64,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> Result<(), (Error, DriverDmaFence<QueueFenceData, Published>)> {
-        let pending_fence = PendingSubmitFence {
-            done_seqno,
-            fence: Some(fence),
-        };
-
-        let mut pending = self.queue.pending_submit_fences.lock();
-        match pending.vec.push_within_capacity(pending_fence) {
-            Ok(()) => {
-                pending.outstanding = pending.outstanding.saturating_sub(1);
-                self.consumed.store(true, Relaxed);
-                Ok(())
-            }
-            Err(err) => match err.0.fence {
-                Some(fence) => Err((EINVAL, fence)),
-                None => {
-                    pending.outstanding = pending.outstanding.saturating_sub(1);
-                    self.consumed.store(true, Relaxed);
-                    Ok(())
-                }
-            },
-        }
-    }
-}
-
-impl Drop for PendingFenceReservation {
-    fn drop(&mut self) {
-        if *self.consumed.get_mut() {
-            return;
-        }
-        let mut pending = self.queue.pending_submit_fences.lock();
-        pending.outstanding = pending.outstanding.saturating_sub(1);
-    }
 }
 
 /// A minimal hardware queue object owned by a scheduling group.
@@ -1076,7 +1035,6 @@ impl Queue {
                 pending_submit_fences <- new_mutex!(PendingFences {
                     vec: pending_fence_vec,
                     head: 0,
-                    outstanding: 0,
                 }),
                 last_submit_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
@@ -1118,26 +1076,6 @@ impl Queue {
 
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
-    }
-
-    /// Reserves capacity for one pending submit fence and returns an
-    /// RAII guard for the reservation.
-    ///
-    /// The pending-fence vec is pre-sized at queue creation to the
-    /// maximum number of wrappers the ringbuf can hold, so this
-    /// performs no allocation. It only checks that the new reservation
-    /// still fits within `capacity`. Keeping the lock allocation-free
-    /// breaks the lockdep cycle through `fs_reclaim` that would
-    /// otherwise close via `JobQueue::state` -> `dma_fence_map` ->
-    /// `mmu_notifier` -> `fs_reclaim` -> `pending_submit_fences`.
-    pub(in crate::sched) fn reserve_pending_submit_fence(&self) -> Result<PendingFenceReservation> {
-        let mut pending = self.data.pending_submit_fences.lock();
-        let additional = pending.outstanding.checked_add(1).ok_or(EOVERFLOW)?;
-        if pending.vec.len() + additional > pending.vec.capacity() {
-            return Err(ENOSPC);
-        }
-        pending.outstanding = additional;
-        Ok(PendingFenceReservation::new(self.data.clone()))
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {

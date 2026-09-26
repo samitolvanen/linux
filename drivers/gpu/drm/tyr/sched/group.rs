@@ -882,8 +882,7 @@ impl deps::BatchOps for SubmitOps {
     type Job = Job;
     type Prepared = PreparedSubmit;
 
-    /// Allocates the wrapped command stream, reserves the pending submit
-    /// fence slot, and hands the job to its queue.
+    /// Allocates the wrapped command stream and hands the job to its queue.
     fn prepare(
         &self,
         job: Job,
@@ -893,12 +892,6 @@ impl deps::BatchOps for SubmitOps {
         let queue_index = job.queue_index();
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
         let has_stream = job.has_stream();
-
-        let reservation = if has_stream {
-            Some(queue.reserve_pending_submit_fence()?)
-        } else {
-            None
-        };
 
         let wrapped = if has_stream {
             let sync_va = self.group.syncobj_va(queue_index)?;
@@ -910,7 +903,7 @@ impl deps::BatchOps for SubmitOps {
         // The extra slot holds the prior-work dependency that
         // `SubmitOps::commit` adds.
         let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, self.group.clone(), queue_index, reservation),
+            QueueJob::new(wrapped, self.group.clone(), queue_index),
             deps,
             extra_dep_capacity + usize::from(!has_stream),
         )?;
