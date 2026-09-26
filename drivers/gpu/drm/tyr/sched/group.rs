@@ -992,8 +992,7 @@ impl deps::BatchOps for SubmitOps {
     type Job = Job;
     type Prepared = PreparedSubmit;
 
-    /// Allocates the wrapped command stream, reserves the pending submit
-    /// fence slot, and hands the job to its queue.
+    /// Allocates the wrapped command stream and hands the job to its queue.
     fn prepare(
         &self,
         job: Job,
@@ -1003,12 +1002,6 @@ impl deps::BatchOps for SubmitOps {
         let queue_index = job.queue_index();
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
         let has_stream = job.has_stream();
-
-        let reservation = if has_stream {
-            Some(queue.reserve_pending_submit_fence()?)
-        } else {
-            None
-        };
 
         // The wrapped stream samples into slot 0, and the exec stage points its
         // ring copy at the job's slot. A stream-less job emits no GPU work and
@@ -1034,7 +1027,6 @@ impl deps::BatchOps for SubmitOps {
                 queue_index,
                 profiling_mask,
                 profiling_relocs,
-                reservation,
             ),
             deps,
             extra_dep_capacity,

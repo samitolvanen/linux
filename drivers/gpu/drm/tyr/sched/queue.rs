@@ -79,9 +79,8 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 /// piece and pads the concatenation up to a 64-byte boundary, so the
 /// minimum is `next_multiple_of(88, 64) == 128`. Profiled wrappers are
 /// larger, so this stays a lower bound. Used to size the pre-allocated
-/// pending-fence vec so `Queue::reserve_pending_submit_fence` never
-/// needs to allocate under the lock, and to bound the per-queue
-/// profiling slot count.
+/// pending-fence vec and the per-queue profiling slot count to the most
+/// jobs the ring can hold.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
 
 // SAFETY: todo
@@ -169,17 +168,6 @@ struct PendingSubmitFence {
 /// State protected by the pending-submit-fences mutex.
 ///
 /// `vec` carries the live ordered list of in-flight per-job fences.
-/// `outstanding` counts reservations made by
-/// `Queue::reserve_pending_submit_fence` whose `PendingFenceReservation`
-/// guard has not yet been consumed or dropped.
-///
-/// Tracking `outstanding` separately is what makes multiple consecutive
-/// reserves accumulate space. `KVec::reserve(additional)` only ensures
-/// `capacity - len >= additional` at the moment of the call, so without
-/// `outstanding` the second of two back-to-back reserves on an empty
-/// vec would observe `capacity - len == 1` already, do nothing, and
-/// the matching second push would fail `push_within_capacity` from
-/// inside the dma-fence signalling section that wraps the submit path.
 ///
 /// `head` is the cursor into `vec` past which entries are live: the
 /// prefix `vec[..head]` is drained but not yet truncated and every
@@ -188,79 +176,15 @@ struct PendingSubmitFence {
 /// None` if an error path already took the fence out, which is
 /// treated as a hole and skipped on drain.
 /// `Queue::maybe_truncate_pending` compacts the prefix away once
-/// `head` exceeds `max(len / 2, 16)`.
+/// `head` exceeds `max(len / 2, 16)`, or once `head` is non-zero in a
+/// full vec.
 ///
 /// `next_profiling_slot` is the sample slot the next profiled job takes
 /// when its fence is pushed. Slots are assigned round robin.
 struct PendingFences {
     vec: KVec<PendingSubmitFence>,
     head: usize,
-    outstanding: usize,
     next_profiling_slot: u32,
-}
-
-/// RAII guard for a pending-submit-fence reservation.
-pub(in crate::sched) struct PendingFenceReservation {
-    queue: Arc<QueueData>,
-    consumed: Atomic<bool>,
-}
-
-impl PendingFenceReservation {
-    fn new(queue: Arc<QueueData>) -> Self {
-        Self {
-            queue,
-            consumed: Atomic::new(false),
-        }
-    }
-
-    /// Pushes `fence` into the queue's pending list, consuming this reservation.
-    ///
-    /// Returns the profiling sample slot assigned to the job, if
-    /// `profiling_mask` enables sampling.
-    fn consume(
-        &self,
-        done_seqno: u64,
-        profiling_mask: u32,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> Result<Option<u32>, (Error, DriverDmaFence<QueueFenceData, Published>)> {
-        let mut pending = self.queue.pending_submit_fences.lock();
-        let profiling_slot = (profiling_mask != 0).then_some(pending.next_profiling_slot);
-        let pending_fence = PendingSubmitFence {
-            done_seqno,
-            profiling_slot: profiling_slot.unwrap_or(0),
-            profiling_mask,
-            fence: Some(fence),
-        };
-
-        match pending.vec.push_within_capacity(pending_fence) {
-            Ok(()) => {
-                pending.outstanding = pending.outstanding.saturating_sub(1);
-                self.consumed.store(true, Relaxed);
-                if let Some(slot) = profiling_slot {
-                    pending.next_profiling_slot = (slot + 1) % self.queue.profiling_slot_count;
-                }
-                Ok(profiling_slot)
-            }
-            Err(err) => match err.0.fence {
-                Some(fence) => Err((EINVAL, fence)),
-                None => {
-                    pending.outstanding = pending.outstanding.saturating_sub(1);
-                    self.consumed.store(true, Relaxed);
-                    Ok(None)
-                }
-            },
-        }
-    }
-}
-
-impl Drop for PendingFenceReservation {
-    fn drop(&mut self) {
-        if *self.consumed.get_mut() {
-            return;
-        }
-        let mut pending = self.queue.pending_submit_fences.lock();
-        pending.outstanding = pending.outstanding.saturating_sub(1);
-    }
 }
 
 /// Per-queue snapshot of the active GPU sync-wait. Populated when the
@@ -334,8 +258,6 @@ pub(super) struct QueueJob {
     /// Offsets in `stream` of the `MOV48`s that load the profiling sample
     /// addresses, moved from slot 0 to the job's slot at exec.
     profiling_relocs: KVec<usize>,
-    /// Reserved at prepare time, consumed in submit, rolled back on drop.
-    reservation: Option<PendingFenceReservation>,
 }
 
 impl QueueJob {
@@ -345,7 +267,6 @@ impl QueueJob {
         queue_index: usize,
         profiling_mask: u32,
         profiling_relocs: KVec<usize>,
-        reservation: Option<PendingFenceReservation>,
     ) -> Self {
         Self {
             stream,
@@ -355,7 +276,6 @@ impl QueueJob {
             queue_index,
             profiling_mask,
             profiling_relocs,
-            reservation,
         }
     }
 
@@ -705,15 +625,20 @@ impl QueueData {
     }
 
     /// Compacts the drained prefix away once `head` has grown past
-    /// `max(len / 2, 16)`.
+    /// `max(len / 2, 16)`, or once `head` is non-zero in a full vec so that
+    /// `push_submit_fence` finds room.
     ///
-    /// Must preserve `vec.capacity()` so `Queue::reserve_pending_submit_fence`
-    /// never needs to grow the vec. `KVec::retain` shifts surviving
-    /// entries in place and only adjusts `len`, leaving the underlying
-    /// allocation intact.
+    /// Must preserve `vec.capacity()`, which bounds the submitted jobs whose
+    /// fences have not drained yet. `KVec::retain` shifts surviving entries
+    /// in place and only adjusts `len`, leaving the underlying allocation
+    /// intact.
     fn maybe_truncate_pending(pending: &mut PendingFences) {
         let len = pending.vec.len();
-        let threshold = core::cmp::max(len / 2, 16);
+        let threshold = if len == pending.vec.capacity() {
+            1
+        } else {
+            core::cmp::max(len / 2, 16)
+        };
         if pending.head < threshold {
             return;
         }
@@ -725,6 +650,44 @@ impl QueueData {
             keep
         });
         pending.head = 0;
+    }
+
+    /// Pushes `fence` into the pending list, or hands it back when every
+    /// entry holds a job that has not drained yet.
+    ///
+    /// Returns the profiling sample slot assigned to `job`, if it is
+    /// profiled.
+    ///
+    /// It must not allocate, since an allocation under this lock closes the
+    /// lockdep cycle `JobQueue::state` -> `dma_fence_map` -> `mmu_notifier`
+    /// -> `fs_reclaim` -> `pending_submit_fences`.
+    fn push_submit_fence(
+        &self,
+        job: &QueueJob,
+        done_seqno: u64,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> Result<Option<u32>, DriverDmaFence<QueueFenceData, Published>> {
+        let mut pending = self.pending_submit_fences.lock();
+        Self::maybe_truncate_pending(&mut pending);
+        let profiling_slot = (job.profiling_mask != 0).then_some(pending.next_profiling_slot);
+        // The fence goes in after the push, so a failed push can hand it back.
+        let pending_fence = PendingSubmitFence {
+            done_seqno,
+            profiling_slot: profiling_slot.unwrap_or(0),
+            profiling_mask: job.profiling_mask,
+            fence: None,
+        };
+        if pending.vec.push_within_capacity(pending_fence).is_err() {
+            return Err(fence);
+        }
+        let Some(entry) = pending.vec.last_mut() else {
+            return Err(fence);
+        };
+        entry.fence = Some(fence);
+        if let Some(slot) = profiling_slot {
+            pending.next_profiling_slot = (slot + 1) % self.profiling_slot_count;
+        }
+        Ok(profiling_slot)
     }
 
     fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
@@ -987,19 +950,14 @@ impl QueueOps for TyrQueueOps {
             }
         };
 
-        let (Some(reservation), Some(done_seqno)) =
-            (job.job.reservation.as_ref(), job.job.done_seqno())
-        else {
+        let Some(done_seqno) = job.job.done_seqno() else {
             fence.signal(Err(EINVAL));
             return Err(EINVAL);
         };
 
-        let profiling_slot = match reservation.consume(done_seqno, job.job.profiling_mask, fence) {
+        let profiling_slot = match self.data.push_submit_fence(job.job, done_seqno, fence) {
             Ok(slot) => slot,
-            Err((err, fence)) => {
-                fence.signal(Err(err));
-                return Err(err);
-            }
+            Err(fence) => return Ok(SubmitResult::NoResources(fence)),
         };
 
         if let Some(slot) = profiling_slot {
@@ -1218,7 +1176,6 @@ impl Queue {
                 pending_submit_fences <- new_mutex!(PendingFences {
                     vec: pending_fence_vec,
                     head: 0,
-                    outstanding: 0,
                     next_profiling_slot: 0,
                 }),
                 last_submit_fence <- new_mutex!(None),
@@ -1259,26 +1216,6 @@ impl Queue {
 
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
-    }
-
-    /// Reserves capacity for one pending submit fence and returns an
-    /// RAII guard for the reservation.
-    ///
-    /// The pending-fence vec is pre-sized at queue creation to the
-    /// maximum number of wrappers the ringbuf can hold, so this
-    /// performs no allocation: it only checks that the new reservation
-    /// still fits within `capacity`. Keeping the lock allocation-free
-    /// breaks the lockdep cycle through `fs_reclaim` that would
-    /// otherwise close via `JobQueue::state` -> `dma_fence_map` ->
-    /// `mmu_notifier` -> `fs_reclaim` -> `pending_submit_fences`.
-    pub(in crate::sched) fn reserve_pending_submit_fence(&self) -> Result<PendingFenceReservation> {
-        let mut pending = self.data.pending_submit_fences.lock();
-        let additional = pending.outstanding.checked_add(1).ok_or(EOVERFLOW)?;
-        if pending.vec.len() + additional > pending.vec.capacity() {
-            return Err(ENOSPC);
-        }
-        pending.outstanding = additional;
-        Ok(PendingFenceReservation::new(self.data.clone()))
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
