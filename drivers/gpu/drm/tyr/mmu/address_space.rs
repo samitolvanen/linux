@@ -353,6 +353,15 @@ impl AddressSpaceManager {
         reset: ResetHandle,
         fault_mask: Arc<PageFaultMask>,
     ) -> Result<AddressSpaceManager> {
+        if as_present.trailing_ones() != as_present.count_ones() {
+            dev_err!(
+                pdev,
+                "Sparse AS_PRESENT mask is unsupported: {:#x}",
+                as_present
+            );
+            return Err(EINVAL);
+        }
+
         Ok(Self {
             pdev: pdev.into(),
             iomem: iomem.into(),
