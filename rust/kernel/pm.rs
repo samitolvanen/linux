@@ -725,9 +725,11 @@ const fn system_sleep_base<D: driver::DriverLayout, T: PMOps<D>>() -> bindings::
 /// Intended to be constructed by bus-specific helpers, allowing
 /// the bus to ensure that the callback device type matches the device
 /// supplied by the C driver core.
+///
+/// Drivers must pass the same `static` to both the bus and [`Registration`].
 pub struct DevPMOps<D, T: ?Sized> {
     #[allow(unused)]
-    raw: &'static bindings::dev_pm_ops,
+    raw: bindings::dev_pm_ops,
     _p: PhantomData<fn() -> (D, T)>,
 }
 
@@ -747,7 +749,7 @@ where
     #[allow(unused)]
     pub(crate) const unsafe fn new_unchecked() -> Self {
         Self {
-            raw: &PMContext::<D, T>::PM_OPS,
+            raw: PMContext::<D, T>::PM_OPS,
             _p: PhantomData,
         }
     }
@@ -757,7 +759,7 @@ impl<D, T> DevPMOps<D, T> {
     /// Returns the raw C runtime PM operations table.
     #[allow(unused)]
     pub(crate) const fn as_raw(&self) -> *const bindings::dev_pm_ops {
-        self.raw
+        &self.raw
     }
 }
 
@@ -1254,7 +1256,7 @@ impl<'bound, D: driver::DriverLayout, T: PMOps<D>> Registration<'bound, D, T> {
     #[inline]
     pub fn new(
         dev: &'bound device::Device<device::Core<'_>>,
-        ops: DevPMOps<D, T>,
+        ops: &'static DevPMOps<D, T>,
         profiles: Option<KVec<PMProfile>>,
         configs: Option<KVec<PMConfig>>,
         payload: Option<T::RuntimePayloadType>,
@@ -1271,7 +1273,7 @@ impl<'bound, D: driver::DriverLayout, T: PMOps<D>> Registration<'bound, D, T> {
     /// callback.
     pub fn new_with_sleep_data(
         dev: &'bound device::Device<device::Core<'_>>,
-        ops: DevPMOps<D, T>,
+        ops: &'static DevPMOps<D, T>,
         profiles: Option<KVec<PMProfile>>,
         configs: Option<KVec<PMConfig>>,
         payload: Option<T::RuntimePayloadType>,

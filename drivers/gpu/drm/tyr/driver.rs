@@ -697,14 +697,17 @@ kernel::of_device_table!(
     ]
 );
 
+static PM_OPS: pm::DevPMOps<platform::Adapter<TyrPlatformDriver>, TyrPmOps> =
+    pm::DevPMOps::for_driver();
+
 impl platform::Driver for TyrPlatformDriver {
     type IdInfo = ();
     type Data<'bound> = TyrPlatformDriverData<'bound>;
     type PmOps = TyrPmOps;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn dev_pm_ops() -> Option<pm::DevPMOps<platform::Adapter<Self>, Self::PmOps>> {
-        Some(pm::DevPMOps::for_driver())
+    fn dev_pm_ops() -> Option<&'static pm::DevPMOps<platform::Adapter<Self>, Self::PmOps>> {
+        Some(&PM_OPS)
     }
 
     fn probe<'bound>(
@@ -905,7 +908,7 @@ impl platform::Driver for TyrPlatformDriver {
         let pm_registration =
             pm::Registration::<platform::Adapter<Self>, TyrPmOps>::new_with_sleep_data(
                 pdev.as_ref(),
-                pm::DevPMOps::for_driver(),
+                &PM_OPS,
                 None,
                 Some(pm_configs),
                 Some(TyrPmPayload {
