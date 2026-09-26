@@ -301,8 +301,8 @@ impl Job {
     /// Merges `queue_submits` into one `Job` per queue index, paired
     /// with the flattened sync-op stream for that queue. The
     /// per-(queue, batch) merge invariant lets the rest of the submit
-    /// path assume there is exactly one pending-submit-fence
-    /// reservation and one wrapped-stream allocation per Job.
+    /// path assume there is exactly one pending submit fence and one
+    /// wrapped-stream allocation per Job.
     pub(crate) fn from_queue_submits(
         queue_submits: KVec<QueueSubmit>,
     ) -> Result<KVec<(Self, KVec<SyncOp>)>> {
