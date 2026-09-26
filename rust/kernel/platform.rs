@@ -56,7 +56,7 @@ unsafe impl<T: Driver> driver::DriverLayout for Adapter<T> {
 
 // SAFETY: A call to `unregister` for a given instance of `DriverType` is guaranteed to be valid if
 // a preceding call to `register` has been successful.
-unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
+unsafe impl<T: Driver + 'static> driver::RegistrationOps for Adapter<T> {
     unsafe fn register(
         pdrv: &Opaque<Self::DriverType>,
         name: &'static CStr,
@@ -244,7 +244,7 @@ pub trait Driver {
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = None;
 
     /// Provides driver's PM callbacks, if any.
-    fn dev_pm_ops() -> Option<crate::pm::DevPMOps<Adapter<Self>, Self::PmOps>>
+    fn dev_pm_ops() -> Option<&'static crate::pm::DevPMOps<Adapter<Self>, Self::PmOps>>
     where
         Self: Sized,
     {
