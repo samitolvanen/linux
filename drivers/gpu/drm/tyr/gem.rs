@@ -598,7 +598,7 @@ pub(crate) struct KernelBo {
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`, for BOs whose
     /// VA was handed out by `Vm::alloc_kernel_range`. Dropped from
-    /// the deferred cleanup closure once `Vm::unmap_range` has torn
+    /// the deferred cleanup closure once `Vm::unmap_exact` has torn
     /// the mapping down. Leaked instead if the unmap fails, since a
     /// live mapping still covers the address. `None` for BOs with
     /// externally managed reservations (the firmware load path,
@@ -759,7 +759,7 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
         kernel_node,
     } = captures;
     let unmapped = vm
-        .unmap_range(va, size)
+        .unmap_exact(va, size)
         .inspect_err(|e| {
             pr_err!(
                 "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
