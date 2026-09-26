@@ -84,6 +84,7 @@ use kernel::{
         Mutex,
         MutexGuard, //
     },
+    types::ScopeGuard,
     uapi, //
 };
 
@@ -1521,6 +1522,9 @@ impl VmExec {
     ) -> Result {
         // SAFETY: pdev is a bound device.
         let dev = unsafe { self.pdev.as_ref().as_bound() };
+        // Flush inline here. The bind queue's submit defers this to the
+        // cleanup workqueue instead.
+        let _flush = ScopeGuard::new(|| self.flush_deferred_cleanup());
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -1531,12 +1535,8 @@ impl VmExec {
             map_sgt: Some(prefetch_map_sgt(bo, dev)?),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size)?,
         };
-        let result = self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources);
 
-        // Flush inline here. The asynchronous VM_BIND path defers this to
-        // the cleanup workqueue instead.
-        self.flush_deferred_cleanup();
-        result
+        self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)
     }
 
     /// Unmaps a virtual address range from the VM.
