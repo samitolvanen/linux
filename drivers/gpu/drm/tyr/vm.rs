@@ -1583,6 +1583,23 @@ impl VmExec {
         self.flush_deferred_cleanup();
         result
     }
+
+    /// Unmaps `va..va + size`. The unmap must not split a mapping.
+    ///
+    /// Only a split needs GPUVA objects or page tables, so this does not
+    /// allocate. A split fails with `EINVAL`.
+    pub(crate) fn unmap_exact(&self, va: u64, size: u64) -> Result {
+        let mut resources = VmOpResources {
+            preallocated_gpuvas: [None, None, None],
+            vm_bo: None,
+            map_sgt: None,
+            pt_reserve: pt_alloc::PtReserve::default(),
+        };
+        let result = self.unmap_range_inner(va, size, &mut resources);
+
+        self.flush_deferred_cleanup();
+        result
+    }
 }
 
 impl DriverGpuVm for GpuVmData {
