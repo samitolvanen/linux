@@ -468,7 +468,7 @@ pub(crate) struct KernelBo {
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`. Dropped from the
-    /// deferred cleanup once `Vm::unmap_range` has torn the mapping
+    /// deferred cleanup once `Vm::unmap_exact` has torn the mapping
     /// down, or leaked if the unmap fails and a live mapping still
     /// covers the address. `None` when the VA is managed externally,
     /// as on the firmware load path.
@@ -623,7 +623,7 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
         kernel_node,
     } = captures;
     let unmapped = vm
-        .unmap_range(va, size)
+        .unmap_exact(va, size)
         .inspect_err(|e| {
             dev_err!(
                 vm.dev(),
