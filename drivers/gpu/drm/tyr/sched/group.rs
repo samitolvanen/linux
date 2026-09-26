@@ -1004,34 +1004,27 @@ impl deps::BatchOps for SubmitOps {
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
         let has_stream = job.has_stream();
 
-        let profiling = self.profile_mask != 0;
         let reservation = if has_stream {
-            Some(queue.reserve_pending_submit_fence(profiling)?)
+            Some(queue.reserve_pending_submit_fence()?)
         } else {
             None
         };
 
-        // The reservation carries the profiling slot, so a failed prepare
-        // returns it and no two in-flight jobs ever share a slot. The slot
-        // GPU address is baked into the wrapped stream below. A stream-less
-        // job emits no GPU work and no samples, so it carries no slot.
-        let (wrapped, profiling_mask) = if has_stream {
+        // The wrapped stream samples into slot 0, and the exec stage points its
+        // ring copy at the job's slot. A stream-less job emits no GPU work and
+        // no samples, so it carries no slot.
+        let (wrapped, profiling_relocs, profiling_mask) = if has_stream {
             let sync_va = self.group.syncobj_va(queue_index)?;
-            let profiling_slot = reservation.as_ref().and_then(|r| r.profiling_slot());
-            let profiling_mask = if profiling_slot.is_some() {
-                self.profile_mask
+            let profiling_va = if self.profile_mask != 0 {
+                queue.profiling_slot_va(0)?
             } else {
                 0
             };
-            let profiling_va = match profiling_slot {
-                Some(slot) => queue.profiling_slot_va(slot)?,
-                None => 0,
-            };
-            let wrapped =
-                job.build_wrapped_stream(&self.group, sync_va, profiling_va, profiling_mask)?;
-            (wrapped, profiling_mask)
+            let (wrapped, relocs) =
+                job.build_wrapped_stream(&self.group, sync_va, profiling_va, self.profile_mask)?;
+            (wrapped, relocs, self.profile_mask)
         } else {
-            (KVec::new(), 0)
+            (KVec::new(), KVec::new(), 0)
         };
 
         let prepared = queue.prepare_job(
@@ -1040,6 +1033,7 @@ impl deps::BatchOps for SubmitOps {
                 self.group.clone(),
                 queue_index,
                 profiling_mask,
+                profiling_relocs,
                 reservation,
             ),
             deps,

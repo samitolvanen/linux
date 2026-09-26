@@ -376,17 +376,18 @@ impl Job {
     /// aligned trailing storage.
     ///
     /// When `profiling_mask` enables sampling, `STORE_STATE` pairs
-    /// record the GPU cycle counter and/or timestamp into the per-job
+    /// record the GPU cycle counter and/or timestamp into the sample
     /// slot at `profiling_va`, before the first piece's `CALL` and
     /// after the last piece's, so the before/after delta covers the
-    /// whole job.
+    /// whole job. Also returns the offsets of the `MOV48`s that load the
+    /// sample addresses, so the slot can be changed after the build.
     pub(crate) fn build_wrapped_stream(
         &self,
         group: &Group,
         sync_va: u64,
         profiling_va: u64,
         profiling_mask: u32,
-    ) -> Result<KVec<u8>> {
+    ) -> Result<(KVec<u8>, KVec<usize>)> {
         const INSTR_BYTES: usize = 8;
         // Instructions in the base wrapper emitted for every piece, and
         // the per-job `MOV48`/`STORE_STATE` pairs emitted for each enabled
@@ -439,9 +440,14 @@ impl Job {
             .ok_or(EOVERFLOW)?;
         let padded = total.next_multiple_of(64);
         let mut buf = KVec::<u8>::with_capacity(padded, GFP_KERNEL)?;
+        let mut relocs = KVec::new();
 
         {
-            let mut emit = |word: u64| buf.extend_from_slice(&word.to_le_bytes(), GFP_KERNEL);
+            let mut emit = |word: u64| -> Result<usize> {
+                let offset = buf.len();
+                buf.extend_from_slice(&word.to_le_bytes(), GFP_KERNEL)?;
+                Ok(offset)
+            };
 
             for (i, piece) in self.pieces.iter().enumerate() {
                 let first = i == 0;
@@ -450,11 +456,11 @@ impl Job {
                 emit(Instr::mov32(val_reg, piece.latest_flush.into()))?;
                 emit(Instr::flush_cache2(val_reg))?;
                 if cycles && first {
-                    emit(Instr::mov48(cycle_reg, cycles_before_va))?;
+                    relocs.push(emit(Instr::mov48(cycle_reg, cycles_before_va))?, GFP_KERNEL)?;
                     emit(Instr::store_state(cycle_reg, 1))?;
                 }
                 if timestamp && first {
-                    emit(Instr::mov48(time_reg, time_before_va))?;
+                    relocs.push(emit(Instr::mov48(time_reg, time_before_va))?, GFP_KERNEL)?;
                     emit(Instr::store_state(time_reg, 0))?;
                 }
                 emit(Instr::mov48(addr_reg, piece.stream_addr))?;
@@ -462,11 +468,11 @@ impl Job {
                 emit(Instr::wait(1))?;
                 emit(Instr::call(addr_reg, val_reg))?;
                 if cycles && last {
-                    emit(Instr::mov48(cycle_reg, cycles_after_va))?;
+                    relocs.push(emit(Instr::mov48(cycle_reg, cycles_after_va))?, GFP_KERNEL)?;
                     emit(Instr::store_state(cycle_reg, 1))?;
                 }
                 if timestamp && last {
-                    emit(Instr::mov48(time_reg, time_after_va))?;
+                    relocs.push(emit(Instr::mov48(time_reg, time_after_va))?, GFP_KERNEL)?;
                     emit(Instr::store_state(time_reg, 0))?;
                 }
                 emit(Instr::mov48(addr_reg, sync_va))?;
@@ -486,6 +492,6 @@ impl Job {
             buf.push(0, GFP_KERNEL)?;
         }
 
-        Ok(buf)
+        Ok((buf, relocs))
     }
 }
