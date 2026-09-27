@@ -687,7 +687,7 @@ impl WorkItem<{ work_id::FW_PING }> for TyrDrmDeviceData {
 
         // The device is runtime suspended (or a transition is in flight),
         // so the clocks are gated and the firmware MMIO is unreachable.
-        // The resume path, or an aborted suspend, re-arms the watchdog.
+        // The resume path re-arms the watchdog.
         if !tdev.pm_active() {
             return;
         }

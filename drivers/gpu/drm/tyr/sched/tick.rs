@@ -144,22 +144,17 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
     // device is down the tick defers, holding a usage reference for any
     // runnable work so the asynchronous resume reissues the tick.
     let Some(_active) = tdev.pm_get_if_active() else {
-        let (resume_pending, kick_pending, resume_failed) =
-            tdev.with_locked_scheduler(|sched| {
-                // A reference taken against a failing resume arms nothing, so
-                // release it before asking.
-                if sched.resume_failed {
-                    sched.pm_ref = None;
-                }
-                if sched.pm_ref.is_none() && sched.has_runnable_groups() {
-                    sched.pm_ref = tdev.sched_pm_get();
-                }
-                Ok((
-                    sched.pm_ref.is_some(),
-                    sched.pending_resident_kick,
-                    sched.resume_failed,
-                ))
-            })?;
+        let (resume_pending, resume_failed) = tdev.with_locked_scheduler(|sched| {
+            // A reference taken against a failing resume arms nothing, so
+            // release it before asking.
+            if sched.resume_failed {
+                sched.pm_ref = None;
+            }
+            if sched.pm_ref.is_none() && sched.has_runnable_groups() {
+                sched.pm_ref = tdev.sched_pm_get();
+            }
+            Ok((sched.pm_ref.is_some(), sched.resume_failed))
+        })?;
 
         // A denied token with a held reference means a resume is in flight
         // and this tick may be its kick, so re-arm a tick period out rather
@@ -168,10 +163,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
         if !tdev.sched_suspended.load(Relaxed) {
             if resume_failed && resume_pending {
                 Scheduler::request_resume_retry(tdev);
-            } else if (resume_pending || kick_pending)
-                && !tdev.pm_suspended()
-                && !tdev.pm_powered_down()
-            {
+            } else if resume_pending && !tdev.pm_suspended() && !tdev.pm_powered_down() {
                 Scheduler::request_tick(tdev);
             }
         }
@@ -295,17 +287,6 @@ pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
     TyrDrmDeviceData::schedule_sync_upd(tdev);
     TyrDrmDeviceData::schedule_tick(tdev);
     Scheduler::request_tick(tdev);
-}
-
-/// Recovers the scheduler after a runtime suspend that the devfreq step
-/// aborted. The PM core keeps the device active and runs no resume
-/// callback, so kick the resident groups and reissue the tick here.
-pub(crate) fn resume_after_aborted_suspend(tdev: &ARef<TyrDrmDevice>) {
-    let _ = tdev.with_locked_scheduler(|sched| {
-        sched.request_resident_kick();
-        Ok(())
-    });
-    resume(tdev);
 }
 
 /// Latches a failed runtime resume and arms a retry. Returns whether this
@@ -863,46 +844,9 @@ impl<'a> Tick<'a> {
         }
     }
 
-    /// Rings the user doorbell of every resident queue whose ring
-    /// buffer has committed commands and requeues the tiler OOM worker
-    /// of every resident group with pending events. Runs on the first
-    /// granted tick after a failed runtime suspend (see
-    /// `Scheduler::pending_resident_kick`).
-    fn kick_resident_queues(tdev: &ARef<TyrDrmDevice>) {
-        let csg_slot_manager = tdev.csg_slot_manager.lock();
-        for i in 0..MAX_CSGS {
-            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
-                continue;
-            };
-            if slot_data.group.tiler_oom.load(Relaxed) != 0 {
-                slot_data.group.schedule_tiler_oom();
-            }
-            for queue in slot_data.group.queues.iter() {
-                if queue.is_ringbuf_empty().unwrap_or(true) {
-                    continue;
-                }
-                // A failed eviction leaves the group bound with the
-                // interval open.
-                queue.resume_timeout();
-                if let Err(e) = queue.kick() {
-                    dev_err!(
-                        tdev.as_ref(),
-                        "CSG {}: resident-queue kick failed: {}\n",
-                        i,
-                        e.to_errno()
-                    );
-                }
-            }
-        }
-    }
-
     /// Evaluates groups and applies the scheduling decisions to the
     /// hardware.
     fn tick(&mut self, tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result<()> {
-        if core::mem::take(&mut self.sched.pending_resident_kick) {
-            Self::kick_resident_queues(tdev);
-        }
-
         self.sched
             .sync_group_states(tdev, fw)
             .inspect_err(|_| dev_err!(tdev.as_ref(), "sync_group_states failed\n"))?;

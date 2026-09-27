@@ -173,15 +173,9 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
     };
 
     if let Err(e) = devfreq::suspend(Some(&data.devfreq)) {
-        sched::tick::resume_after_aborted_suspend(tdev);
-        // Re-arm the ping watchdog that the aborted suspend may have left
-        // disarmed.
-        TyrDrmDeviceData::arm_fw_ping(tdev);
-        return Err(e);
+        dev_warn!(tdev.as_ref(), "Failed to suspend devfreq: {:?}\n", e);
     }
 
-    // Nothing below fails. Once the governor is paused, the device
-    // always reaches the suspended state.
     guard.registration_data_with(|reg_data| {
         quiesce_and_suspend(tdev, reg_data);
         reg_data.clks.lock().gate();
