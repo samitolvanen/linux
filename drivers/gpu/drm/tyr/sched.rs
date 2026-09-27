@@ -1253,17 +1253,20 @@ impl Scheduler {
             }
         }
 
-        for entry in snapshot.iter() {
+        Self::drain_queue_completions(&snapshot);
+    }
+
+    /// Drains the queues of `groups` like `drain_resident_queue_completions`.
+    /// Must be called outside `TyrDrmDeviceData::with_locked_scheduler`.
+    fn drain_queue_completions(groups: &[Option<Arc<Group>>]) {
+        for entry in groups.iter() {
             let Some(group) = entry else {
                 continue;
             };
             for (queue_idx, queue) in group.queues.iter().enumerate() {
                 match group.read_syncobj(queue_idx) {
                     Ok(syncobj) => queue.complete_submit_fences(group, syncobj.seqno),
-                    Err(err) => pr_err!(
-                        "sync_upd: queue completion drain failed: {}\n",
-                        err.to_errno()
-                    ),
+                    Err(err) => pr_err!("queue completion drain failed: {}\n", err.to_errno()),
                 }
             }
         }
