@@ -279,9 +279,9 @@ pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
     Scheduler::request_tick(tdev);
 }
 
-/// Recovers the scheduler after a system resume. Runtime PM is disabled
-/// for the duration of a system sleep, so a tick that ran in that window
-/// could not take a usage reference. Without one it cannot arm a resume.
+/// Recovers the scheduler after a system resume. Runtime PM stays disabled
+/// until the system resume. If the runtime PM status was also suspended, a
+/// tick could not take a usage reference, so it could not arm a resume.
 /// Reissue the tick when the scheduler has runnable groups but holds no
 /// reference.
 pub(crate) fn resume_after_system_sleep(tdev: &ARef<TyrDrmDevice>) {
