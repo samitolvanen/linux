@@ -430,9 +430,6 @@ pub(crate) struct Scheduler {
 
     /// Runtime-PM usage reference held while any resident group has work.
     pub(in crate::sched) pm_ref: Option<AwakeScope>,
-    /// Set by a failed runtime suspend. The next granted tick rings the
-    /// user doorbell of every non-empty resident ring buffer.
-    pub(in crate::sched) pending_resident_kick: bool,
 }
 
 /// The tick to schedule after marking a group runnable.
@@ -495,14 +492,7 @@ impl Scheduler {
             last_tick: Instant::<Monotonic>::now(),
             last_full_tick_jiffies: jiffies64(),
             pm_ref: None,
-            pending_resident_kick: false,
         })
-    }
-
-    /// Requests a resident-queue doorbell kick from the next granted
-    /// tick. Called from the failed-runtime-suspend path.
-    pub(crate) fn request_resident_kick(&mut self) {
-        self.pending_resident_kick = true;
     }
 
     /// Returns whether any priority band has runnable groups queued.
