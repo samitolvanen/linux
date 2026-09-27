@@ -140,7 +140,11 @@ fn quiesce_and_suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriv
 /// Powers the GPU down for runtime suspend.
 fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     let bound = dev.as_ref();
-    let data = bound.drvdata::<TyrPlatformDriverData>()?;
+    // Probe arms autosuspend before the driver data is set. EAGAIN fails a
+    // suspend in that window without latching a runtime PM error.
+    let Ok(data) = bound.drvdata::<TyrPlatformDriverData>() else {
+        return Err(EAGAIN);
+    };
     let tdev = &data.device;
 
     if let Err(e) = devfreq::suspend(slot) {
