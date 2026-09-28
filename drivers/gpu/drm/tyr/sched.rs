@@ -1451,6 +1451,20 @@ impl Scheduler {
         }
     }
 
+    /// Returns whether an unbound idle group that can still run waits on a
+    /// sync object.
+    pub(crate) fn needs_syncwait_poll(&self) -> bool {
+        self.waiting_groups.iter().flatten().any(|group| {
+            !group.vm.is_unusable()
+                && group.with_locked_inner(|inner| {
+                    inner.can_run()
+                        && inner.csg_id.is_none()
+                        && inner.is_idle()
+                        && inner.has_blocked_queues()
+                })
+        })
+    }
+
     /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
     /// applies the batch. The post-ack sync pass refreshes per-queue
     /// firmware-status state.
