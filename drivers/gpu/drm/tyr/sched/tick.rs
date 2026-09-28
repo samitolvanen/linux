@@ -341,14 +341,14 @@ pub(crate) fn resume_after_system_sleep(tdev: &ARef<TyrDrmDevice>) {
     }
 }
 
-/// Releases the scheduler's usage reference at unbind.
+/// Marks the device unusable and terminates every group at unbind.
 ///
-/// Runs at unbind, after the halt or after the suspend that already
-/// evicted every resident group. A reference taken from here on would
-/// only arm a resume, and resume is refused.
+/// Runs after the halt or after the suspend that already evicted every
+/// resident group.
 pub(crate) fn unbind(tdev: &ARef<TyrDrmDevice>) {
     let _ = tdev.with_locked_scheduler(|sched| {
-        sched.pm_ref = None;
+        tdev.mark_unusable();
+        sched.fail_all_groups();
         Ok(())
     });
 }
