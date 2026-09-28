@@ -107,13 +107,13 @@ struct RustScopedDebugFs {
 
 #[pin_data]
 struct ModuleData {
-    device_dir: Dir,
+    device_dir: Dir<LocalModule>,
     #[pin]
     devices: Mutex<KVec<Pin<KBox<Scope<DeviceData>>>>>,
 }
 
 impl ModuleData {
-    fn init(device_dir: Dir) -> impl PinInit<Self> {
+    fn init(device_dir: Dir<LocalModule>) -> impl PinInit<Self> {
         pin_init! {
             Self {
                 device_dir: device_dir,
@@ -129,7 +129,10 @@ struct DeviceData {
     blob: Pin<KBox<Mutex<[u8; SZ_4K]>>>,
 }
 
-fn init_control(base_dir: &Dir, dyn_dirs: Dir) -> impl PinInit<Scope<ModuleData>> + '_ {
+fn init_control(
+    base_dir: &Dir<LocalModule>,
+    dyn_dirs: Dir<LocalModule>,
+) -> impl PinInit<Scope<ModuleData>> + '_ {
     base_dir.scope(ModuleData::init(dyn_dirs), c"control", |data, dir| {
         dir.write_only_callback_file(c"create", data, &create_file_write);
         dir.write_only_callback_file(c"remove", data, &remove_file_write);
