@@ -1368,11 +1368,11 @@ impl Scheduler {
     ///
     /// Walks `waiting_groups` per priority once and, for each peeked
     /// group that has a matching result, clears the newly unblocked
-    /// queue bits, then removes the group from the wait list and
-    /// marks it runnable if it has no other blocked queues and is
-    /// not currently bound to a CSG slot. Re-validation against the
-    /// live wait list handles groups that another path (e.g.
-    /// destroy) removed between the snapshot and apply phases.
+    /// queue bits. An unbound group becomes runnable once any of its
+    /// queues is unblocked, and a group leaves the wait list once none
+    /// is blocked. Re-validation against the live wait list handles
+    /// groups that another path (e.g. destroy) removed between the
+    /// snapshot and apply phases.
     ///
     /// Caller must not drop `results` before releasing the scheduler
     /// mutex.
@@ -1413,11 +1413,11 @@ impl Scheduler {
                         }
 
                         let unblocked = !inner.has_blocked_queues();
-                        let move_to_runnable = unblocked && inner.csg_id.is_none();
+                        let move_to_runnable = result.unblocked != 0 && inner.csg_id.is_none();
                         (unblocked, move_to_runnable)
                     });
 
-                    if unblocked {
+                    if unblocked || move_to_runnable {
                         let list_arc = peek.remove();
                         if move_to_runnable {
                             if prio == Priority::RealTime as usize {
@@ -1434,8 +1434,11 @@ impl Scheduler {
             // The wait-list cursor borrow is dropped: now safe to
             // re-borrow `self` mutably for `mark_group_runnable`.
             while let Some(list_arc) = make_runnable.pop_front() {
-                let group: Arc<Group> = list_arc.into_arc();
+                let group: Arc<Group> = list_arc.clone_arc();
                 self.mark_group_runnable(&group);
+                if group.with_locked_inner(|inner| inner.has_blocked_queues()) {
+                    self.waiting_groups[prio].push_back(list_arc);
+                }
             }
         }
 
