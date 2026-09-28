@@ -1389,10 +1389,10 @@ impl Scheduler {
     /// Applies the results from `evaluate_syncwait_candidates`
     /// under the scheduler mutex.
     ///
-    /// A group leaves the wait list once none of its queues is blocked,
-    /// and becomes runnable if it is not bound to a CSG slot. Results
-    /// are re-validated against the live wait list, so a group that
-    /// another path removed between the snapshot and the apply is
+    /// An unbound group becomes runnable once any of its queues is
+    /// unblocked, and a group leaves the wait list once none is blocked.
+    /// Results are re-validated against the live wait list, so a group
+    /// that another path removed between the snapshot and the apply is
     /// skipped.
     ///
     /// Caller must not drop `results` before releasing the scheduler
@@ -1433,11 +1433,11 @@ impl Scheduler {
                         }
 
                         let unblocked = !inner.has_blocked_queues();
-                        let move_to_runnable = unblocked && inner.csg_id.is_none();
+                        let move_to_runnable = result.unblocked != 0 && inner.csg_id.is_none();
                         (unblocked, move_to_runnable)
                     });
 
-                    if unblocked {
+                    if unblocked || move_to_runnable {
                         let list_arc = peek.remove();
                         if move_to_runnable {
                             if prio == Priority::RealTime as usize {
@@ -1454,8 +1454,11 @@ impl Scheduler {
             // The wait-list cursor borrow is dropped, so we can now
             // re-borrow `self` mutably for `mark_group_runnable`.
             while let Some(list_arc) = make_runnable.pop_front() {
-                let group: Arc<Group> = list_arc.into_arc();
+                let group: Arc<Group> = list_arc.clone_arc();
                 self.mark_group_runnable(&group);
+                if group.with_locked_inner(|inner| inner.has_blocked_queues()) {
+                    self.waiting_groups[prio].push_back(list_arc);
+                }
             }
         }
 
