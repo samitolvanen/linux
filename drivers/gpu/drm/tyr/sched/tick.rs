@@ -1151,7 +1151,13 @@ impl<'a> Tick<'a> {
             }
         }
 
-        self.unbind_evicted_groups(tdev, &reg_data.fw, 0)
+        let res = self.unbind_evicted_groups(tdev, &reg_data.fw, 0);
+
+        if self.sched.has_runnable_groups() {
+            TyrDrmDeviceData::schedule_tick(tdev);
+        }
+
+        res
     }
 
     /// Puts a staged bind back on a scheduler list so a later tick can
