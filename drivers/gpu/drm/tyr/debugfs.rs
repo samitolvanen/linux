@@ -66,6 +66,7 @@ use crate::{
     gem::Bo,
     reclaim,
     vm::Vm,
+    LocalModule, //
 };
 
 /// Sentinel `Vm` registry-slot value for a VM absent from the `gpuvas` registry.
@@ -403,7 +404,7 @@ pub(crate) struct TyrDebugfs {
     _reset: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
     _fail_ping: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
     _fw_va: Pin<KBox<File<ARef<TyrDrmDevice>>>>,
-    _dir: Dir,
+    _dir: Dir<LocalModule>,
 }
 
 impl TyrDebugfs {
