@@ -718,9 +718,13 @@ impl platform::Driver for TyrPlatformDriver {
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
         let coregroup_clk = OptionalClk::get(pdev.as_ref(), Some(c"coregroup"))?;
 
-        core_clk.prepare_enable()?;
-        stacks_clk.prepare_enable()?;
-        coregroup_clk.prepare_enable()?;
+        let mut clks = Clocks {
+            core: core_clk,
+            stacks: stacks_clk,
+            coregroup: coregroup_clk,
+            gated: true,
+        };
+        clks.ungate()?;
 
         let mali_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"mali")?;
 
@@ -855,7 +859,7 @@ impl platform::Driver for TyrPlatformDriver {
         )?;
         unquiesce(&job_irq, io, job_irq_enable);
 
-        let devfreq_registration = devfreq::init(&unreg_dev, pdev.as_ref(), &core_clk)?;
+        let devfreq_registration = devfreq::init(&unreg_dev, pdev.as_ref(), &clks.core)?;
         let devfreq_registration = Arc::pin_init(new_mutex!(devfreq_registration), GFP_KERNEL)?;
 
         firmware.boot(io)?;
@@ -864,7 +868,7 @@ impl platform::Driver for TyrPlatformDriver {
             .wait_ready(1000)
             .inspect_err(|_| dev_err!(pdev, "Timed out waiting for firmware to be ready."))?;
 
-        firmware.enable_global_interface(&unreg_dev, core_clk.rate().as_hz() as u64, io)?;
+        firmware.enable_global_interface(&unreg_dev, clks.core.rate().as_hz() as u64, io)?;
 
         // enable_global_interface armed the firmware watchdog. Cancel it if
         // probe fails past this point so no ping outlives a failed bring-up.
@@ -925,12 +929,7 @@ impl platform::Driver for TyrPlatformDriver {
                 gpu_irq,
                 wq,
                 sched_wq,
-                clks <- new_mutex!(Clocks {
-                    core: core_clk,
-                    stacks: stacks_clk,
-                    coregroup: coregroup_clk,
-                    gated: false,
-                }),
+                clks <- new_mutex!(clks),
                 regulators <- new_mutex!(Regulators {
                     _mali: mali_regulator,
                 }),
