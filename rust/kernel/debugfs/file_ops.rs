@@ -12,6 +12,10 @@ use crate::{
     debugfs::callback_adapters::Adapter,
     fmt,
     fs::file,
+    module::{
+        this_module,
+        ModuleMetadata, //
+    },
     prelude::*,
     seq_file::SeqFile,
     seq_print,
@@ -124,13 +128,14 @@ unsafe extern "C" fn writer_act<T: Writer + Sync>(
 }
 
 // Work around lack of generic const items.
-pub(crate) trait ReadFile<T> {
+pub(crate) trait ReadFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<T: Writer + Sync> ReadFile<T> for T {
+impl<M: ModuleMetadata, T: Writer + Sync> ReadFile<M, T> for T {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             read: Some(bindings::seq_read),
             llseek: Some(bindings::seq_lseek),
             release: Some(bindings::single_release),
@@ -175,13 +180,14 @@ pub(crate) unsafe extern "C" fn write<T: Reader + Sync>(
 }
 
 // A trait to get the file operations for a type.
-pub(crate) trait ReadWriteFile<T> {
+pub(crate) trait ReadWriteFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<T: Writer + Reader + Sync> ReadWriteFile<T> for T {
+impl<M: ModuleMetadata, T: Writer + Reader + Sync> ReadWriteFile<M, T> for T {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             open: Some(writer_open::<T>),
             read: Some(bindings::seq_read),
             write: Some(write::<T>),
@@ -232,13 +238,14 @@ pub(crate) unsafe extern "C" fn write_only_write<T: Reader + Sync>(
     read(data, buf, count)
 }
 
-pub(crate) trait WriteFile<T> {
+pub(crate) trait WriteFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<T: Reader + Sync> WriteFile<T> for T {
+impl<M: ModuleMetadata, T: Reader + Sync> WriteFile<M, T> for T {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             open: Some(write_only_open),
             write: Some(write_only_write::<T>),
             llseek: Some(bindings::noop_llseek),
@@ -284,13 +291,14 @@ extern "C" fn blob_read<T: BinaryWriter>(
 }
 
 /// Representation of [`FileOps`] for read only binary files.
-pub(crate) trait BinaryReadFile<T> {
+pub(crate) trait BinaryReadFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<T: BinaryWriter + Sync> BinaryReadFile<T> for T {
+impl<M: ModuleMetadata, T: BinaryWriter + Sync> BinaryReadFile<M, T> for T {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             read: Some(blob_read::<T>),
             llseek: Some(bindings::default_llseek),
             open: Some(bindings::simple_open),
@@ -338,13 +346,14 @@ extern "C" fn blob_write<T: BinaryReader>(
 }
 
 /// Representation of [`FileOps`] for write only binary files.
-pub(crate) trait BinaryWriteFile<T> {
+pub(crate) trait BinaryWriteFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<T: BinaryReader + Sync> BinaryWriteFile<T> for T {
+impl<M: ModuleMetadata, T: BinaryReader + Sync> BinaryWriteFile<M, T> for T {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             write: Some(blob_write::<T>),
             llseek: Some(bindings::default_llseek),
             open: Some(bindings::simple_open),
@@ -362,13 +371,14 @@ impl<T: BinaryReader + Sync> BinaryWriteFile<T> for T {
 }
 
 /// Representation of [`FileOps`] for read/write binary files.
-pub(crate) trait BinaryReadWriteFile<T> {
+pub(crate) trait BinaryReadWriteFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<T: BinaryWriter + BinaryReader + Sync> BinaryReadWriteFile<T> for T {
+impl<M: ModuleMetadata, T: BinaryWriter + BinaryReader + Sync> BinaryReadWriteFile<M, T> for T {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             read: Some(blob_read::<T>),
             write: Some(blob_write::<T>),
             llseek: Some(bindings::default_llseek),
