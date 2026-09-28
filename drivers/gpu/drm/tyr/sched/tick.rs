@@ -1044,6 +1044,7 @@ impl<'a> Tick<'a> {
                 self.evicted_groups[i] = Some(group.clone());
             } else if self.num_teardown < self.teardown_groups.len() {
                 // Canceled / faulted: queue for terminal cleanup.
+                self.sched.remove_group_from_wait_list(&group);
                 self.teardown_groups[self.num_teardown] = Some(group.clone());
                 self.num_teardown += 1;
             }
