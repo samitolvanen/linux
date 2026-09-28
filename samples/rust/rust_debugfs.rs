@@ -68,7 +68,7 @@ struct RustDebugFs {
     pdev: ARef<platform::Device>,
     // As we only hold these for drop effect (to remove the directory/files) we have a leading
     // underscore to indicate to the compiler that we don't expect to use this field directly.
-    _debugfs: Dir,
+    _debugfs: Dir<LocalModule>,
     #[pin]
     _compatible: File<CString>,
     #[pin]
@@ -139,11 +139,11 @@ impl platform::Driver for RustDebugFs {
 }
 
 impl RustDebugFs {
-    fn build_counter(dir: &Dir) -> impl PinInit<File<Atomic<usize>>> + '_ {
+    fn build_counter(dir: &Dir<LocalModule>) -> impl PinInit<File<Atomic<usize>>> + '_ {
         dir.read_write_file(c"counter", Atomic::<usize>::new(0))
     }
 
-    fn build_inner(dir: &Dir) -> impl PinInit<File<Mutex<Inner>>> + '_ {
+    fn build_inner(dir: &Dir<LocalModule>) -> impl PinInit<File<Mutex<Inner>>> + '_ {
         dir.read_write_file(c"pair", new_mutex!(Inner { x: 3, y: 10 }))
     }
 

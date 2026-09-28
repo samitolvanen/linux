@@ -203,7 +203,7 @@ impl Gsp {
                     // PANIC: `DEBUGFS_ROOT` cannot be `None` here.  It is set before driver
                     // registration and cleared after driver unregistration, so it is always
                     // `Some` for the entire lifetime that probe() can be called.
-                    let log_parent: &debugfs::Dir = unsafe { crate::DEBUGFS_ROOT.as_ref() }
+                    let log_parent: &debugfs::Dir<_> = unsafe { crate::DEBUGFS_ROOT.as_ref() }
                         .expect("DEBUGFS_ROOT not initialized");
 
                     log_parent.scope(log_buffers, dev.name(), |logs, dir| {
