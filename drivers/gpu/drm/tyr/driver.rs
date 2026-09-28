@@ -180,6 +180,9 @@ const PING_INTERVAL_MS: u32 = 12_000;
 /// triggers a GPU reset.
 const PING_TIMEOUT_MS: u32 = 100;
 
+/// Interval between syncwait polls of evicted groups.
+const SYNCWAIT_POLL_MS: u32 = 10;
+
 /// Per-device work-slot identifiers used as the `WORK_ID` const
 /// generic on this device's work-item fields and their `HasWork` /
 /// `HasDelayedWork` impls.
@@ -194,6 +197,8 @@ pub(crate) mod work_id {
     pub(crate) const PERIODIC_TICK: u64 = 4;
     /// Firmware liveness ping watchdog.
     pub(crate) const FW_PING: u64 = 5;
+    /// Syncwait poll of evicted groups.
+    pub(crate) const SYNCWAIT_POLL: u64 = 6;
 }
 
 pub(crate) struct TyrPlatformDriverData {
@@ -412,9 +417,14 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     fw_ping_work: DelayedWork<TyrDrmDevice, { work_id::FW_PING }>,
 
+    /// Syncwait poll of evicted groups, on a freezable queue so it does not
+    /// run during system sleep.
+    #[pin]
+    syncwait_poll_work: DelayedWork<TyrDrmDevice, { work_id::SYNCWAIT_POLL }>,
+
     /// Shut by unbind or a failed probe to stop the scheduler tick, the
-    /// firmware-event drain, the sync-update sweep, the periodic tick re-arm
-    /// and the firmware ping.
+    /// firmware-event drain, the sync-update sweep and its poll, the periodic
+    /// tick re-arm and the firmware ping.
     #[pin]
     system_work_closed: SpinLock<bool>,
 
@@ -674,6 +684,18 @@ impl TyrDrmDeviceData {
         });
     }
 
+    /// Arms the syncwait poll `SYNCWAIT_POLL_MS` from now. A pending poll
+    /// keeps its deadline.
+    pub(crate) fn schedule_syncwait_poll(tdev: &ARef<TyrDrmDevice>) {
+        tdev.enqueue_system_work(|| {
+            let _ = workqueue::system_freezable_power_efficient()
+                .enqueue_delayed::<ARef<TyrDrmDevice>, { work_id::SYNCWAIT_POLL }>(
+                    tdev.clone(),
+                    msecs_to_jiffies(SYNCWAIT_POLL_MS),
+                );
+        });
+    }
+
     /// Arms the firmware ping watchdog `PING_INTERVAL_MS` from now.
     ///
     /// Called at global-interface enable and re-arm, so the watchdog only
@@ -708,6 +730,7 @@ impl TyrDrmDeviceData {
         let _ = self.fw_events_work.cancel_sync();
         let _ = self.sync_upd_work.cancel_sync();
         let _ = self.periodic_tick_work.cancel_sync();
+        let _ = self.syncwait_poll_work.cancel_sync();
         self.cancel_fw_ping();
     }
 }
@@ -730,6 +753,10 @@ impl_has_delayed_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<TyrDrmDevice, { work_id::FW_PING }> for TyrDrmDeviceData { self.fw_ping_work }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<TyrDrmDevice, { work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData { self.syncwait_poll_work }
 }
 
 impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
@@ -805,12 +832,18 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
         let results = Scheduler::evaluate_syncwait_candidates(snapshot);
 
-        let tick = tdev
-            .with_locked_scheduler(|sched| Ok(sched.apply_syncwait_results(&results)))
-            .unwrap_or(SubmitTick::None);
+        let (tick, poll) = tdev
+            .with_locked_scheduler(|sched| {
+                let tick = sched.apply_syncwait_results(&results);
+                Ok((tick, sched.needs_syncwait_poll()))
+            })
+            .unwrap_or((SubmitTick::None, false));
         drop(results);
 
         tick.dispatch(&this);
+        if poll {
+            Self::schedule_syncwait_poll(&this);
+        }
     }
 }
 
@@ -819,6 +852,14 @@ impl WorkItem<{ work_id::PERIODIC_TICK }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         Self::schedule_tick(&this);
+    }
+}
+
+impl WorkItem<{ work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        Self::schedule_sync_upd(&this);
     }
 }
 
@@ -1030,6 +1071,7 @@ impl TyrPlatformDriverData {
                 sync_upd_pending: AtomicFlag::new(false),
                 periodic_tick_work <- kernel::new_delayed_work!("TyrDrmDeviceData::periodic_tick_work"),
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
+                syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                 system_work_closed <- new_spinlock!(false),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
