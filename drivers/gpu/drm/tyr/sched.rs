@@ -1083,9 +1083,10 @@ impl Scheduler {
 
     /// Terminates every group on the scheduler lists.
     ///
-    /// Called after a failed GPU reset or runtime resume, when the hardware
-    /// is unusable. Every group is terminated and its fences canceled.
-    /// Nothing is bound: the pre-reset or suspend pass evicted every CSG slot.
+    /// Called at unbind or after a failed GPU reset or runtime resume, when
+    /// the hardware is unusable. Every group is terminated and its fences
+    /// canceled. Nothing is bound, since the pre-reset or suspend pass
+    /// evicted every CSG slot.
     pub(crate) fn fail_all_groups(&mut self) {
         for prio in 0..GROUP_PRIORITY_COUNT {
             Self::terminate_list(&mut self.runnable_groups[prio]);
