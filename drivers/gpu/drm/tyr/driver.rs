@@ -1196,6 +1196,10 @@ impl platform::Driver for TyrPlatformDriverData {
         this.device.reset.unbind();
         drop(this.devfreq_registration.lock().take());
         Self::suspend_at_unbind(pdev, this);
+        let _ = this.device.with_locked_scheduler(|sched| {
+            sched.fail_all_groups();
+            Ok(())
+        });
         // The workers that enqueue tiler OOM works are drained and their
         // gates reject later runs, so the queue stays empty from here.
         this.device.heap_alloc_wq.flush();
