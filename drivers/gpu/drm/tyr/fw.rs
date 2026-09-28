@@ -261,6 +261,10 @@ pub(crate) struct Firmware<'drm> {
     /// reload that fails part way keeps it set.
     unclean_stop: Atomic<bool>,
 
+    /// Set from `boot` until `stop`. The GPU may be powered off after a stop,
+    /// so `Drop` stops the MCU only while this is set.
+    mcu_running: Atomic<bool>,
+
     /// The global FW interface.
     global_iface: Arc<GlobalInterface<'drm>>,
 }
@@ -268,8 +272,10 @@ pub(crate) struct Firmware<'drm> {
 impl<'drm> Drop for Firmware<'drm> {
     fn drop(&mut self) {
         // Stop the MCU before releasing its firmware mappings and memory.
-        if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
-            let _ = self.stop(io);
+        if self.mcu_running.load(Acquire) {
+            if let Ok(io) = self.iomem.access(self.dev.as_ref()) {
+                let _ = self.stop(io);
+            }
         }
 
         // AS slots retain a VM ref, we need to kill the circular ref manually.
@@ -484,6 +490,7 @@ impl<'drm> Firmware<'drm> {
                 sections,
                 irq_state,
                 unclean_stop: Atomic::new(false),
+                mcu_running: Atomic::new(false),
                 global_iface,
             })
         })();
@@ -521,6 +528,7 @@ impl<'drm> Firmware<'drm> {
     }
 
     pub(crate) fn boot(&self, io: &IoMem<'_>) -> Result {
+        self.mcu_running.store(true, Release);
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
 
         if let Err(e) = Self::wait_for_mcu_status(
@@ -539,6 +547,7 @@ impl<'drm> Firmware<'drm> {
     }
 
     fn stop(&self, io: &IoMem<'_>) -> Result {
+        self.mcu_running.store(false, Release);
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Disable));
 
         if let Err(e) = Self::wait_for_mcu_status(
