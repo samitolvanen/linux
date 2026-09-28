@@ -828,9 +828,13 @@ impl TyrPlatformDriverData {
         let stacks_clk = OptionalClk::get(pdev.as_ref(), Some(c"stacks"))?;
         let coregroup_clk = OptionalClk::get(pdev.as_ref(), Some(c"coregroup"))?;
 
-        core_clk.prepare_enable()?;
-        stacks_clk.prepare_enable()?;
-        coregroup_clk.prepare_enable()?;
+        let mut clks = Clocks {
+            core: core_clk,
+            stacks: stacks_clk,
+            coregroup: coregroup_clk,
+            gated: true,
+        };
+        clks.ungate()?;
 
         pm::attach_domains(pdev.as_ref(), pm::DomainAttachFlags::DEV_LINK_ON)?;
 
@@ -928,12 +932,7 @@ impl TyrPlatformDriverData {
                 sched_wq,
                 term_wq,
                 heap_alloc_wq,
-                clks <- new_mutex!(Clocks {
-                    core: core_clk,
-                    stacks: stacks_clk,
-                    coregroup: coregroup_clk,
-                    gated: false,
-                }),
+                clks <- new_mutex!(clks),
                 reset,
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
