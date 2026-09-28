@@ -435,14 +435,14 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) pending_resident_kick: bool,
 }
 
-/// The tick a submit schedules after marking its group runnable.
+/// The tick to schedule after marking a group runnable.
 ///
 /// Dispatched by the caller once the scheduler mutex is dropped.
 pub(crate) enum SubmitTick {
     Immediate,
     /// Re-arm the periodic tick `delay` from now.
     Periodic(Jiffies),
-    /// A tick is already due by the rotation deadline, so do nothing.
+    /// No tick is needed.
     None,
 }
 
@@ -1377,12 +1377,11 @@ impl Scheduler {
     /// Caller must not drop `results` before releasing the scheduler
     /// mutex.
     ///
-    /// Returns `true` if an unbound RealTime-priority group was
-    /// promoted to `runnable_groups`, in which case the caller fires
-    /// an immediate tick so the rule engine binds it without waiting
-    /// for the periodic tick.
-    pub(crate) fn apply_syncwait_results(&mut self, results: &KVec<SyncwaitResult>) -> bool {
+    /// Returns an immediate tick for a promoted real-time group and a
+    /// periodic one for any other promotion.
+    pub(crate) fn apply_syncwait_results(&mut self, results: &KVec<SyncwaitResult>) -> SubmitTick {
         let mut immediate_tick = false;
+        let mut promoted = false;
 
         for prio in 0..GROUP_PRIORITY_COUNT {
             // Stage the wait-list links of groups that should move to
@@ -1423,6 +1422,7 @@ impl Scheduler {
                             if prio == Priority::RealTime as usize {
                                 immediate_tick = true;
                             }
+                            promoted = true;
                             make_runnable.push_back(list_arc);
                         }
                     } else {
@@ -1442,7 +1442,13 @@ impl Scheduler {
             }
         }
 
-        immediate_tick
+        if immediate_tick {
+            SubmitTick::Immediate
+        } else if promoted {
+            SubmitTick::Periodic(msecs_to_jiffies(tick::TICK_PERIOD_MS))
+        } else {
+            SubmitTick::None
+        }
     }
 
     /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
