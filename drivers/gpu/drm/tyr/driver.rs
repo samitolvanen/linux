@@ -590,12 +590,6 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
                 Ok(())
             });
         });
-
-        // A CSG IRQ means firmware state changed on a slot we own. A
-        // CSG_REQ ack may have flipped, or a CS may have faulted or run
-        // out of tiler heap. Arm the periodic tick to re-evaluate
-        // residency and apply any pending transitions.
-        Scheduler::request_tick(&this);
     }
 }
 
