@@ -645,14 +645,6 @@ impl SchedulingDecision {
                 continue;
             }
 
-            // Don't re-bind a syncwait group from the idle list; it
-            // sits on `waiting_groups` waiting for sync_upd to promote
-            // it back to runnable.
-            if matches!(prior_state, GroupListState::Idle) && status.has_blocked_queues {
-                cursor.move_next();
-                continue;
-            }
-
             // `peek.remove(self)` advances the cursor to the next
             // element internally, so no separate `move_next` is
             // needed. The returned `ListArc` is the authoritative
