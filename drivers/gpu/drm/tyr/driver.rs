@@ -787,14 +787,6 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             sched.process_csg_irqs(events, tdev);
             Ok(())
         });
-
-        // A CSG IRQ that the firmware raised for any of the slots we
-        // own is by definition an observable state change from the
-        // scheduler's point of view: a CSG_REQ ack might have flipped,
-        // or a CS in the slot might have hit a fault or run out of
-        // tiler heap. Arm the periodic tick so it re-evaluates
-        // residency and applies any pending state transitions.
-        crate::sched::Scheduler::request_tick(&this);
     }
 }
 
