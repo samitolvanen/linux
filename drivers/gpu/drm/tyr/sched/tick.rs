@@ -1015,6 +1015,7 @@ impl<'a> Tick<'a> {
         // Evict every slot even when one fails, so no group is left bound when
         // the caller halts the MCU.
         let mut ret = Ok(());
+        let mut poll = false;
         for i in 0..MAX_CSGS {
             if (keep_mask & (1u32 << i)) != 0 {
                 continue;
@@ -1039,12 +1040,17 @@ impl<'a> Tick<'a> {
                     let is_idle = group.is_idle_live();
                     self.sched.requeue_group(list_arc, is_idle);
                 }
+                poll |= group.blocked_idle_queues() != 0;
                 self.evicted_groups[i] = Some(group.clone());
             } else if self.num_teardown < self.teardown_groups.len() {
                 // Canceled / faulted: queue for terminal cleanup.
                 self.teardown_groups[self.num_teardown] = Some(group.clone());
                 self.num_teardown += 1;
             }
+        }
+
+        if poll {
+            TyrDrmDeviceData::schedule_syncwait_poll(tdev);
         }
 
         ret
