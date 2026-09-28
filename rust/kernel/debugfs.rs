@@ -12,6 +12,7 @@
 use crate::sync::Arc;
 use crate::{
     fmt,
+    module::ModuleMetadata,
     prelude::*,
     str::CStr,
     uaccess::UserSliceReader, //
@@ -63,34 +64,51 @@ use entry::Entry;
 ///
 /// The directory in the filesystem represented by [`Dir`] will be removed when handle has been
 /// dropped *and* all children have been removed.
+///
+/// `M` must be the module that creates the files, usually `crate::LocalModule`. Open files in the
+/// tree hold a reference to `M`, so a [`Dir`] must not be handed to another module.
 // If we have a parent, we hold a reference to it in the `Entry`. This prevents the `dentry`
 // we point to from being cleaned up if our parent `Dir`/`Entry` is dropped before us.
 //
 // The `None` option indicates that the `Arc` could not be allocated, so our children would not be
 // able to refer to us. In this case, we need to silently fail. All future child directories/files
 // will silently fail as well.
-#[derive(Clone)]
-pub struct Dir(#[cfg(CONFIG_DEBUG_FS)] Option<Arc<Entry<'static>>>);
+pub struct Dir<M>(
+    #[cfg(CONFIG_DEBUG_FS)] Option<Arc<Entry<'static>>>,
+    PhantomData<fn() -> M>,
+);
 
-impl Dir {
+impl<M> Clone for Dir<M> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(
+            #[cfg(CONFIG_DEBUG_FS)]
+            self.0.clone(),
+            PhantomData,
+        )
+    }
+}
+
+impl<M: ModuleMetadata> Dir<M> {
     /// Create a new directory in DebugFS. If `parent` is [`None`], it will be created at the root.
-    fn create(name: &CStr, parent: Option<&Dir>) -> Self {
+    fn create(name: &CStr, parent: Option<&Self>) -> Self {
         #[cfg(CONFIG_DEBUG_FS)]
         {
             let parent_entry = match parent {
                 // If the parent couldn't be allocated, just early-return
-                Some(Dir(None)) => return Self(None),
-                Some(Dir(Some(entry))) => Some(entry.clone()),
+                Some(Dir(None, _)) => return Self(None, PhantomData),
+                Some(Dir(Some(entry), _)) => Some(entry.clone()),
                 None => None,
             };
             Self(
                 // If Arc creation fails, the `Entry` will be dropped, so the directory will be
                 // cleaned up.
                 Arc::new(Entry::dynamic_dir(name, parent_entry), GFP_KERNEL).ok(),
+                PhantomData,
             )
         }
         #[cfg(not(CONFIG_DEBUG_FS))]
-        Self()
+        Self(PhantomData)
     }
 
     /// Creates a DebugFS file which will own the data produced by the initializer provided in
@@ -127,7 +145,7 @@ impl Dir {
     ///
     /// ```
     /// # use kernel::debugfs::Dir;
-    /// let debugfs = Dir::new(c"parent");
+    /// let debugfs = Dir::<crate::LocalModule>::new(c"parent");
     /// ```
     pub fn new(name: &CStr) -> Self {
         Dir::create(name, None)
@@ -139,7 +157,7 @@ impl Dir {
     ///
     /// ```
     /// # use kernel::debugfs::Dir;
-    /// let parent = Dir::new(c"parent");
+    /// let parent = Dir::<crate::LocalModule>::new(c"parent");
     /// let child = parent.subdir(c"child");
     /// ```
     pub fn subdir(&self, name: &CStr) -> Self {
@@ -156,7 +174,7 @@ impl Dir {
     /// ```
     /// # use kernel::debugfs::Dir;
     /// # use kernel::prelude::*;
-    /// # let dir = Dir::new(c"my_debugfs_dir");
+    /// # let dir = Dir::<crate::LocalModule>::new(c"my_debugfs_dir");
     /// let file = KBox::pin_init(dir.read_only_file(c"foo", 200), GFP_KERNEL)?;
     /// // "my_debugfs_dir/foo" now contains the number 200.
     /// // The file is removed when `file` is dropped.
@@ -170,7 +188,7 @@ impl Dir {
     where
         T: Writer + Send + Sync + 'static,
     {
-        let file_ops = &<T as ReadFile<_>>::FILE_OPS;
+        let file_ops = &<T as ReadFile<M, _>>::FILE_OPS;
         self.create_file(name, data, file_ops)
     }
 
@@ -184,7 +202,7 @@ impl Dir {
     /// ```
     /// # use kernel::debugfs::Dir;
     /// # use kernel::prelude::*;
-    /// # let dir = Dir::new(c"my_debugfs_dir");
+    /// # let dir = Dir::<crate::LocalModule>::new(c"my_debugfs_dir");
     /// let file = KBox::pin_init(dir.read_binary_file(c"foo", [0x1, 0x2]), GFP_KERNEL)?;
     /// # Ok::<(), Error>(())
     /// ```
@@ -196,7 +214,7 @@ impl Dir {
     where
         T: BinaryWriter + Send + Sync + 'static,
     {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &<T as BinaryReadFile<M, _>>::FILE_OPS)
     }
 
     /// Creates a read-only file in this directory, with contents from a callback.
@@ -215,7 +233,7 @@ impl Dir {
     /// #         Relaxed,
     /// #     },
     /// # };
-    /// # let dir = Dir::new(c"foo");
+    /// # let dir = Dir::<crate::LocalModule>::new(c"foo");
     /// let file = KBox::pin_init(
     ///     dir.read_callback_file(c"bar",
     ///     Atomic::<u32>::new(3),
@@ -239,7 +257,7 @@ impl Dir {
         T: Send + Sync + 'static,
         F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
     {
-        let file_ops = <FormatAdapter<T, F>>::FILE_OPS.adapt();
+        let file_ops = <FormatAdapter<T, F> as ReadFile<M, _>>::FILE_OPS.adapt();
         self.create_file(name, data, file_ops)
     }
 
@@ -255,7 +273,7 @@ impl Dir {
     where
         T: Writer + Reader + Send + Sync + 'static,
     {
-        let file_ops = &<T as ReadWriteFile<_>>::FILE_OPS;
+        let file_ops = &<T as ReadWriteFile<M, _>>::FILE_OPS;
         self.create_file(name, data, file_ops)
     }
 
@@ -271,7 +289,7 @@ impl Dir {
     where
         T: BinaryWriter + BinaryReader + Send + Sync + 'static,
     {
-        let file_ops = &<T as BinaryReadWriteFile<_>>::FILE_OPS;
+        let file_ops = &<T as BinaryReadWriteFile<M, _>>::FILE_OPS;
         self.create_file(name, data, file_ops)
     }
 
@@ -294,7 +312,7 @@ impl Dir {
         W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
         let file_ops =
-            <WritableAdapter<FormatAdapter<T, F>, W> as file_ops::ReadWriteFile<_>>::FILE_OPS
+            <WritableAdapter<FormatAdapter<T, F>, W> as file_ops::ReadWriteFile<M, _>>::FILE_OPS
                 .adapt()
                 .adapt();
         self.create_file(name, data, file_ops)
@@ -314,7 +332,7 @@ impl Dir {
     where
         T: Reader + Send + Sync + 'static,
     {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &<T as WriteFile<M, _>>::FILE_OPS)
     }
 
     /// Creates a write-only binary file in this directory.
@@ -331,7 +349,7 @@ impl Dir {
     where
         T: BinaryReader + Send + Sync + 'static,
     {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &<T as BinaryWriteFile<M, _>>::FILE_OPS)
     }
 
     /// Creates a write-only file in this directory, with write logic from a callback.
@@ -348,7 +366,7 @@ impl Dir {
         T: Send + Sync + 'static,
         W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let file_ops = <WritableAdapter<NoWriter<T>, W> as WriteFile<_>>::FILE_OPS
+        let file_ops = <WritableAdapter<NoWriter<T>, W> as WriteFile<M, _>>::FILE_OPS
             .adapt()
             .adapt();
         self.create_file(name, data, file_ops)
@@ -359,7 +377,7 @@ impl Dir {
     //
     // Unless you also extract the `entry` later and schedule it for `Drop` at the appropriate
     // time, a `ScopedDir` with a `Dir` parent will never be deleted.
-    fn scoped_dir<'data>(&self, name: &CStr) -> ScopedDir<'data, 'static> {
+    fn scoped_dir<'data>(&self, name: &CStr) -> ScopedDir<'data, 'static, M> {
         #[cfg(CONFIG_DEBUG_FS)]
         {
             let parent_entry = match &self.0 {
@@ -369,6 +387,7 @@ impl Dir {
             ScopedDir {
                 entry: ManuallyDrop::new(Entry::dynamic_dir(name, Some(parent_entry))),
                 _phantom: PhantomData,
+                _module: PhantomData,
             }
         }
         #[cfg(not(CONFIG_DEBUG_FS))]
@@ -390,7 +409,7 @@ impl Dir {
         init: F,
     ) -> impl PinInit<Scope<T>, E> + 'a
     where
-        F: for<'data, 'dir> FnOnce(&'data T, &'dir ScopedDir<'data, 'dir>) + 'a,
+        F: for<'data, 'dir> FnOnce(&'data T, &'dir ScopedDir<'data, 'dir, M>) + 'a,
     {
         Scope::new(data, |data| {
             let scoped = self.scoped_dir(name);
@@ -483,13 +502,16 @@ impl<'a, T: 'a> Scope<T> {
     ///
     /// The entire directory tree created within the scope will be removed when the returned
     /// `Scope` handle is dropped.
-    pub fn dir<E: 'a, F>(
+    ///
+    /// `M` is the module that creates the files, usually `crate::LocalModule`. Callers name it
+    /// explicitly, as in `Scope::dir::<crate::LocalModule, _, _>(...)`.
+    pub fn dir<M: ModuleMetadata, E: 'a, F>(
         data: impl PinInit<T, E> + 'a,
         name: &'a CStr,
         init: F,
     ) -> impl PinInit<Self, E> + 'a
     where
-        F: for<'data, 'dir> FnOnce(&'data T, &'dir ScopedDir<'data, 'dir>) + 'a,
+        F: for<'data, 'dir> FnOnce(&'data T, &'dir ScopedDir<'data, 'dir, M>) + 'a,
     {
         Scope::new(data, |data| {
             let scoped = ScopedDir::new(name);
@@ -518,23 +540,27 @@ impl<T> Deref for File<T> {
 ///
 /// Dropping a ScopedDir will not delete or clean it up, this is expected to occur through dropping
 /// the `Scope` that created it.
-pub struct ScopedDir<'data, 'dir> {
+///
+/// `M` is the module that creates the files, as with [`Dir`].
+pub struct ScopedDir<'data, 'dir, M> {
     #[cfg(CONFIG_DEBUG_FS)]
     entry: ManuallyDrop<Entry<'dir>>,
     _phantom: PhantomData<fn(&'data ()) -> &'dir ()>,
+    _module: PhantomData<fn() -> M>,
 }
 
-impl<'data, 'dir> ScopedDir<'data, 'dir> {
+impl<'data, 'dir, M: ModuleMetadata> ScopedDir<'data, 'dir, M> {
     /// Creates a subdirectory inside this `ScopedDir`.
     ///
     /// The returned directory handle cannot outlive this one.
-    pub fn dir<'dir2>(&'dir2 self, name: &CStr) -> ScopedDir<'data, 'dir2> {
+    pub fn dir<'dir2>(&'dir2 self, name: &CStr) -> ScopedDir<'data, 'dir2, M> {
         #[cfg(not(CONFIG_DEBUG_FS))]
         let _ = name;
         ScopedDir {
             #[cfg(CONFIG_DEBUG_FS)]
             entry: ManuallyDrop::new(Entry::dir(name, Some(&*self.entry))),
             _phantom: PhantomData,
+            _module: PhantomData,
         }
     }
 
@@ -551,7 +577,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
     pub fn read_only_file<T: Writer + Send + Sync + 'static>(&self, name: &CStr, data: &'data T) {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &<T as ReadFile<M, _>>::FILE_OPS)
     }
 
     /// Creates a read-only binary file in this directory.
@@ -565,7 +591,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: &'data T,
     ) {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &<T as BinaryReadFile<M, _>>::FILE_OPS)
     }
 
     /// Creates a read-only file in this directory, with contents from a callback.
@@ -584,7 +610,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         T: Send + Sync + 'static,
         F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
     {
-        let vtable = <FormatAdapter<T, F> as ReadFile<_>>::FILE_OPS.adapt();
+        let vtable = <FormatAdapter<T, F> as ReadFile<M, _>>::FILE_OPS.adapt();
         self.create_file(name, data, vtable)
     }
 
@@ -601,7 +627,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: &'data T,
     ) {
-        let vtable = &<T as ReadWriteFile<_>>::FILE_OPS;
+        let vtable = &<T as ReadWriteFile<M, _>>::FILE_OPS;
         self.create_file(name, data, vtable)
     }
 
@@ -617,7 +643,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: &'data T,
     ) {
-        let vtable = &<T as BinaryReadWriteFile<_>>::FILE_OPS;
+        let vtable = &<T as BinaryReadWriteFile<M, _>>::FILE_OPS;
         self.create_file(name, data, vtable)
     }
 
@@ -642,7 +668,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
         W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let vtable = <WritableAdapter<FormatAdapter<T, F>, W> as ReadWriteFile<_>>::FILE_OPS
+        let vtable = <WritableAdapter<FormatAdapter<T, F>, W> as ReadWriteFile<M, _>>::FILE_OPS
             .adapt()
             .adapt();
         self.create_file(name, data, vtable)
@@ -656,7 +682,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
     pub fn write_only_file<T: Reader + Send + Sync + 'static>(&self, name: &CStr, data: &'data T) {
-        let vtable = &<T as WriteFile<_>>::FILE_OPS;
+        let vtable = &<T as WriteFile<M, _>>::FILE_OPS;
         self.create_file(name, data, vtable)
     }
 
@@ -671,7 +697,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: &'data T,
     ) {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &<T as BinaryWriteFile<M, _>>::FILE_OPS)
     }
 
     /// Creates a write-only file in this directory, with write logic from a callback.
@@ -689,7 +715,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         T: Send + Sync + 'static,
         W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let vtable = &<WritableAdapter<NoWriter<T>, W> as WriteFile<_>>::FILE_OPS
+        let vtable = &<WritableAdapter<NoWriter<T>, W> as WriteFile<M, _>>::FILE_OPS
             .adapt()
             .adapt();
         self.create_file(name, data, vtable)
@@ -700,6 +726,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
             #[cfg(CONFIG_DEBUG_FS)]
             entry: ManuallyDrop::new(Entry::empty()),
             _phantom: PhantomData,
+            _module: PhantomData,
         }
     }
     #[cfg(CONFIG_DEBUG_FS)]
@@ -710,15 +737,16 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     fn into_entry(self) {}
 }
 
-impl<'data> ScopedDir<'data, 'static> {
+impl<'data, M> ScopedDir<'data, 'static, M> {
     // This is safe, but intentionally not exported due to footgun status. A ScopedDir with no
     // parent will never be released by default, and needs to have its entry extracted and used
     // somewhere.
-    fn new(name: &CStr) -> ScopedDir<'data, 'static> {
+    fn new(name: &CStr) -> ScopedDir<'data, 'static, M> {
         ScopedDir {
             #[cfg(CONFIG_DEBUG_FS)]
             entry: ManuallyDrop::new(Entry::dir(name, None)),
             _phantom: PhantomData,
+            _module: PhantomData,
         }
     }
 }
