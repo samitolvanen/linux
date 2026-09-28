@@ -266,12 +266,8 @@ pub(crate) struct TyrDrmDeviceData {
     /// Dedicated unbound workqueue for the per-group tiler OOM workers.
     /// Heap growth allocates with `GFP_KERNEL` and can block in reclaim,
     /// so these workers get their own queue rather than sharing the
-    /// system workqueues. Declared before `clks` so the drop-time drain
-    /// still runs with the clocks up.
+    /// system workqueues.
     pub(crate) heap_alloc_wq: OwnedQueue,
-
-    #[pin]
-    pub(crate) clks: Mutex<Clocks>,
 
     /// Some information on the GPU.
     ///
@@ -307,6 +303,11 @@ pub(crate) struct TyrDrmDeviceData {
     /// other way round.
     #[pin]
     pub(crate) csg_slot_manager: Mutex<CsgSlotManager>,
+
+    /// Initialized first and declared after every field whose drop needs the
+    /// clocks, such as `fw`, `heap_alloc_wq` and `csg_slot_manager`.
+    #[pin]
+    pub(crate) clks: Mutex<Clocks>,
 
     /// Outstanding firmware-events bits accumulated by IRQ handlers.
     ///
@@ -915,6 +916,7 @@ impl TyrPlatformDriverData {
         power_guard.dismiss();
 
         let data = try_pin_init!(TyrDrmDeviceData {
+                clks <- new_mutex!(clks),
                 pdev: platform.clone(),
                 mmu,
                 mmu_irq <- IrqSlot::new(),
@@ -932,7 +934,6 @@ impl TyrPlatformDriverData {
                 sched_wq,
                 term_wq,
                 heap_alloc_wq,
-                clks <- new_mutex!(clks),
                 reset,
                 gpu_info,
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
