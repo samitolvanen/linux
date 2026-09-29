@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
 use kernel::{
+    device::{
+        Bound,
+        Device, //
+    },
     list::{
         List,
         ListArc,
@@ -1308,6 +1312,7 @@ impl Scheduler {
     /// one is logged. Allocation failure on the results vector drops the
     /// remaining candidates. The periodic tick will revisit.
     pub(crate) fn evaluate_syncwait_candidates(
+        dev: &Device<Bound>,
         snapshot: KVec<SyncwaitCandidate>,
     ) -> KVec<SyncwaitResult> {
         let mut results = KVec::new();
@@ -1318,7 +1323,7 @@ impl Scheduler {
             while tested != 0 {
                 let cs_id = tested.trailing_zeros();
                 tested &= !(1u32 << cs_id);
-                match candidate.group.eval_syncwait(cs_id as usize) {
+                match candidate.group.eval_syncwait(dev, cs_id as usize) {
                     Ok(true) => unblocked |= 1u32 << cs_id,
                     Ok(false) => {}
                     Err(e) => {

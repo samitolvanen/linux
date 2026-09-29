@@ -8,10 +8,18 @@
 #![expect(dead_code)]
 
 use kernel::{
-    drm::gem::shmem,
+    device::{
+        Bound,
+        Device, //
+    },
+    drm::gem::{
+        shmem,
+        BaseObject, //
+    },
     io::Io,
     prelude::*,
-    sync::Arc, //
+    sync::Arc,
+    uapi, //
 };
 
 use crate::gem;
@@ -156,3 +164,39 @@ macro_rules! impl_sync_rw {
 
 impl_sync_rw!(SyncObj32b, u32);
 impl_sync_rw!(SyncObj64b, u64);
+
+/// Makes the GPU's last write to the seqno of the sync object at `offset`
+/// visible to a CPU read through a cached mapping of `mem`.
+/// Does nothing for an imported BO.
+pub(super) fn sync_seqno_for_cpu(
+    dev: &Device<Bound>,
+    mem: &gem::MappedUserBo,
+    offset: usize,
+    sync64: bool,
+) -> Result {
+    let bo = mem.vmap().owner();
+
+    if bo.is_imported() {
+        return Ok(());
+    }
+
+    let (seqno, size) = if sync64 {
+        (
+            core::mem::offset_of!(SyncObj64b, seqno),
+            core::mem::size_of::<u64>(),
+        )
+    } else {
+        (
+            core::mem::offset_of!(SyncObj32b, seqno),
+            core::mem::size_of::<u32>(),
+        )
+    };
+
+    gem::sync(
+        bo,
+        dev,
+        uapi::drm_panthor_bo_sync_op_type_DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE,
+        (offset + seqno) as u64,
+        size as u64,
+    )
+}
