@@ -637,7 +637,8 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
                 .with_locked_scheduler(|sched| Ok(sched.collect_syncwait_candidates(&this)))
                 .unwrap_or_default();
 
-            let results = Scheduler::evaluate_syncwait_candidates(&reg_data.fw, snapshot);
+            let dev = reg_data.pdev.as_ref();
+            let results = Scheduler::evaluate_syncwait_candidates(dev, &reg_data.fw, snapshot);
 
             let (tick, poll) = this
                 .with_locked_scheduler(|sched| {
