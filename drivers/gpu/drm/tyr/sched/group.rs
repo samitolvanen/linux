@@ -755,8 +755,8 @@ impl Group {
     /// `gem::MappedUserBo` vmap otherwise, and applies the captured
     /// comparison.
     ///
-    /// On a malformed snapshot the caller should treat the queue as
-    /// still blocked and surface the error.
+    /// On error the caller unblocks the queue so the group does not stall.
+    /// The firmware still evaluates the wait itself.
     ///
     /// First-time foreign-BO resolutions are memoised on the
     /// `SyncWait` snapshot via `QueueData::cache_syncwait_bo` so
