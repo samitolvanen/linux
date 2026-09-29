@@ -1016,15 +1016,11 @@ impl VmBindOp {
                     return Err(EINVAL);
                 }
 
-                job.push_map(
-                    dev,
-                    vm,
-                    bo,
-                    self.0.bo_offset,
-                    self.0.size,
-                    self.0.va,
-                    VmMapFlags::try_from(self.0.flags & map_flags)?,
-                )?;
+                let flags = VmMapFlags::try_from(self.0.flags & map_flags)?;
+
+                if self.0.size != 0 {
+                    job.push_map(dev, vm, bo, self.0.bo_offset, self.0.size, self.0.va, flags)?;
+                }
             }
             uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP => {
                 if self.0.bo_handle != 0 || self.0.bo_offset != 0 {
@@ -1035,7 +1031,9 @@ impl VmBindOp {
                     return Err(EINVAL);
                 }
 
-                job.push_unmap(self.0.va, self.0.size)?;
+                if self.0.size != 0 {
+                    job.push_unmap(self.0.va, self.0.size)?;
+                }
             }
             uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY => {
                 if !is_async
