@@ -585,14 +585,30 @@ pub(crate) struct SchedulingDecision {
 }
 
 impl SchedulingDecision {
+    /// Creates an empty decision for `Self::evaluate_rules` to fill.
+    fn new() -> Self {
+        Self {
+            rotated_slots: [const { None }; Priority::num_priorities()],
+            keep_mask: 0,
+            all_idle: true,
+            idle_group_count: 0,
+            pending_groups: [const { None }; MAX_CSGS],
+            num_selected: 0,
+            num_pending: 0,
+            nonidle_group_counts: [0; Priority::num_priorities()],
+            selections: [const { None }; MAX_CSGS],
+        }
+    }
+
     /// Evaluates the priority rules to decide which groups to keep and
     /// which to take.
     pub(crate) fn evaluate_rules(
+        &mut self,
         tdev: &TyrDrmDeviceData,
         sched: &mut Scheduler,
         rules: impl IntoIterator<Item = Rule>,
         full_tick: bool,
-    ) -> Result<Self> {
+    ) -> Result {
         // Hold the slot-manager lock once across the whole rule loop
         // so a slot's bound group cannot change between the rotation
         // scan and the `Keep` rules that consume it.
@@ -602,22 +618,12 @@ impl SchedulingDecision {
         let csg_slot_manager = tdev.csg_slot_manager.lock();
         let slot_count = csg_slot_manager.slot_count();
 
-        let mut decision = Self {
-            rotated_slots: find_rotated_slots(&csg_slot_manager, slot_count, full_tick),
-            keep_mask: 0,
-            all_idle: true,
-            idle_group_count: 0,
-            pending_groups: [const { None }; MAX_CSGS],
-            num_selected: 0,
-            num_pending: 0,
-            nonidle_group_counts: [0; Priority::num_priorities()],
-            selections: [const { None }; MAX_CSGS],
-        };
+        self.rotated_slots = find_rotated_slots(&csg_slot_manager, slot_count, full_tick);
 
         for rule in rules {
             match rule.action {
                 Action::Keep | Action::KeepExceptRotated => {
-                    decision.keep_bound(
+                    self.keep_bound(
                         &csg_slot_manager,
                         slot_count,
                         rule.priority,
@@ -626,11 +632,11 @@ impl SchedulingDecision {
                     );
                 }
                 Action::Take => {
-                    decision.take_unbound(sched, slot_count, rule.priority, rule.is_idle)?;
+                    self.take_unbound(sched, slot_count, rule.priority, rule.is_idle)?;
                 }
             }
         }
-        Ok(decision)
+        Ok(())
     }
 
     /// Takes up to `groups.len()` eligible groups from a list.
@@ -872,7 +878,8 @@ impl<'a> Tick<'a> {
             ]
         };
 
-        let mut decision = SchedulingDecision::evaluate_rules(tdev, self.sched, rules, full_tick)?;
+        let mut decision = SchedulingDecision::new();
+        decision.evaluate_rules(tdev, self.sched, rules, full_tick)?;
         self.apply(tdev, fw, &mut decision)?;
 
         if full_tick {
