@@ -9,6 +9,8 @@
 //! `Scheduler::request_tick`. The periodic re-arm is handled
 //! separately by `periodic_tick_work` on `system_dfl()`.
 
+use core::cmp::Reverse;
+
 use kernel::{
     list::{
         List,
@@ -513,40 +515,21 @@ impl SelectedGroup {
     /// behind the other retained idle groups but stays ahead of the
     /// newly bound idle groups.
     pub(crate) fn iter_prioritized(
-        selections: &[Option<SelectedGroup>],
+        selections: &[Option<SelectedGroup>; MAX_CSGS],
         rotated_slots: [Option<usize>; Priority::num_priorities()],
     ) -> impl Iterator<Item = SelectedGroup> + '_ {
-        (0..Priority::num_priorities())
-            .rev()
-            .filter_map(|p| Priority::try_from(p as u8).ok())
-            .flat_map(move |sw_prio| {
-                // Collect all selections that match the current
-                // software priority band. Slots beyond `..count` are
-                // never read after the sort truncates the iterator.
-                // The dummy fill value is only there to give the
-                // fixed-size array a Copy initializer.
-                let mut prio_selections =
-                    [(SelectedGroup::Pending(0, Priority::Low, false), 0_usize); MAX_CSGS];
-                let mut count = 0;
+        let mut order: [usize; MAX_CSGS] = core::array::from_fn(|idx| idx);
 
-                for (idx, selection) in selections.iter().enumerate() {
-                    if let Some(sel) = selection {
-                        if sel.priority() == sw_prio {
-                            prio_selections[count] = (*sel, idx);
-                            count += 1;
-                        }
-                    }
-                }
-
-                let rotated = rotated_slots[sw_prio as usize];
-
-                prio_selections[..count]
-                    .sort_unstable_by_key(|(s, original_idx)| sort_key(s, *original_idx, rotated));
-
-                // Truncate the padded array to the actual count and
-                // discard the stable-sort index.
-                prio_selections.into_iter().take(count).map(|(s, _)| s)
+        order.sort_unstable_by_key(|&idx| {
+            selections.get(idx).copied().flatten().map(|sel| {
+                let band = sel.priority() as usize;
+                (Reverse(band), sort_key(&sel, idx, rotated_slots[band]))
             })
+        });
+
+        order
+            .into_iter()
+            .filter_map(move |idx| selections.get(idx).copied().flatten())
     }
 }
 
@@ -1136,10 +1119,9 @@ impl<'a> Tick<'a> {
         {
             let mut csg_slot_manager = tdev.csg_slot_manager.lock();
 
-            for selection in SelectedGroup::iter_prioritized(
-                &decision.selections[..decision.num_selected],
-                decision.rotated_slots,
-            ) {
+            for selection in
+                SelectedGroup::iter_prioritized(&decision.selections, decision.rotated_slots)
+            {
                 let fw_prio = next_fw_prio;
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
