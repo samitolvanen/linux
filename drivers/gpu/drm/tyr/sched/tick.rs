@@ -228,6 +228,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
     }
 
     while let Some(list_arc) = dead_waiting.pop_front() {
+        trace::group_wait(list_arc.handle(), false);
         let group: Arc<Group> = list_arc.into_arc();
         group.schedule_term();
     }
