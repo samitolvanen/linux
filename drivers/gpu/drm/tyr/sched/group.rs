@@ -693,8 +693,8 @@ impl Group {
     /// comparison. The awaited object sits either in the group's own
     /// `syncobjs` or in a foreign BO reached through `Vm::get_bo_for_va`.
     ///
-    /// On a malformed snapshot the caller should treat the queue as
-    /// still blocked and surface the error.
+    /// On error the caller unblocks the queue so the group does not stall.
+    /// The firmware still evaluates the wait itself.
     ///
     /// A foreign-BO resolution is memoized on the `SyncWait` snapshot,
     /// keyed by its own `(gpu_va, sync64)`, so a later evaluation skips

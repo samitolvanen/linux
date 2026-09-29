@@ -7,6 +7,7 @@ use kernel::{
         ListItem, //
     },
     pm::AwakeScope,
+    pr_warn_once,
     prelude::*,
     sync::{
         aref::ARef,
@@ -1340,12 +1341,10 @@ impl Scheduler {
     /// `Group::eval_syncwait` takes the per-VM gpuvm mutex and may
     /// `GFP_KERNEL`-vmap a foreign BO, both of which would close a
     /// lockdep cycle through `dma_fence_map` if the scheduler mutex
-    /// were held. Read errors are logged and treated as "unblock and
-    /// let the next tick surface any further failure". Allocation
-    /// failure on the results vector drops the remaining candidates.
-    /// The periodic tick will revisit.
+    /// were held. Evaluation errors unblock the queue, and only the first
+    /// one is logged. Allocation failure on the results vector drops the
+    /// remaining candidates. The periodic tick will revisit.
     pub(crate) fn evaluate_syncwait_candidates(
-        tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         snapshot: KVec<SyncwaitCandidate>,
     ) -> KVec<SyncwaitResult> {
@@ -1361,7 +1360,7 @@ impl Scheduler {
                     Ok(true) => unblocked |= 1u32 << cs_id,
                     Ok(false) => {}
                     Err(e) => {
-                        dev_err!(tdev.as_ref(), "eval_syncwait failed: {}\n", e.to_errno());
+                        pr_warn_once!("eval_syncwait failed: {}\n", e.to_errno());
                         unblocked |= 1u32 << cs_id;
                     }
                 }
@@ -1378,7 +1377,6 @@ impl Scheduler {
                 )
                 .is_err()
             {
-                dev_err!(tdev.as_ref(), "sync_upd: out of memory recording results\n");
                 return results;
             }
         }
