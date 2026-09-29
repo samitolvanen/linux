@@ -1349,7 +1349,7 @@ impl drm::Driver for TyrDrmDriver {
     }
 
     #[cfg(CONFIG_DEBUG_FS)]
-    fn debugfs_init(dir: &ScopeRef<'_, TyrDrmRegistrationData<'_>>) {
+    fn debugfs_init(dir: &ScopeRef<'_, TyrDrmRegistrationData<'_>, Self::OwnerModule>) {
         dir.seq_file::<GpuvasShow>(c"gpuvas");
     }
 }
