@@ -715,10 +715,6 @@ impl Group {
         let queue = self.queues.get(queue_idx).ok_or(EINVAL)?;
         let syncwait = queue.syncwait_snapshot();
 
-        if syncwait.gpu_va == 0 {
-            return Ok(false);
-        }
-
         // The firmware preserves CS_STATUS_WAIT_SYNC_POINTER across
         // CS state transitions, so the snapshot captured by an
         // earlier sync_csg_slot_queues_state pass can outlive the

@@ -173,8 +173,7 @@ pub(crate) struct QueueData {
     /// retires. `None` until the first command-stream job is committed.
     #[pin]
     last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
-    /// Active GPU sync-wait captured for this queue. The `Default`
-    /// value (`gpu_va == 0`) means no wait is currently active.
+    /// Active GPU sync-wait captured for this queue.
     #[pin]
     syncwait: Mutex<SyncWait>,
     /// Per-queue accounting of off-slot suspend time, credited against
@@ -929,18 +928,13 @@ impl Default for SuspendState {
 /// Per-queue snapshot of the active GPU sync-wait. Populated when the
 /// firmware reports `BlockedReason::SyncWait` for the queue's CS.
 ///
-/// A `gpu_va` of `0` is the sentinel for "no active wait captured"
-/// and is the value the field holds at queue creation and after a
-/// successful unblock.
-///
 /// `cached` carries a BO resolution from a prior evaluation. It
 /// stores its own `(gpu_va, sync64)` so the next evaluation can
 /// detect when the live wait has moved on and rebuild rather than
 /// read from a stale BO.
 #[derive(Default, Clone)]
 pub(crate) struct SyncWait {
-    /// GPU virtual address of the awaited sync object. `0` means no
-    /// active wait is currently captured.
+    /// GPU virtual address of the awaited sync object.
     pub(crate) gpu_va: u64,
     /// Reference value the wait compares against.
     pub(crate) ref_val: u64,
