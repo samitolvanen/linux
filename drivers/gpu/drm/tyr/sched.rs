@@ -412,6 +412,9 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) waiting_groups: [List<Group, 1>; GROUP_PRIORITY_COUNT],
     /// Number of CSG slots the firmware exposes, capped to `MAX_CSG_PRIO + 1`.
     pub(in crate::sched) csg_slot_count: u32,
+    /// Per-tick address-space budget, boxed to keep `Scheduler` small
+    /// while probe moves it by value.
+    pub(in crate::sched) as_budget: KBox<tick::AsBudget>,
     /// Number of CSG slots used by the most recent tick.
     pub(in crate::sched) used_csg_slot_count: u32,
     /// Set when a resident group may have become idle. The submit path
@@ -457,6 +460,17 @@ impl Scheduler {
         let (csg_slot_count, cs_slot_count, cs_reg_count, scoreboard_slot_count) =
             tdev.fw.csif_info_counts()?;
 
+        let user_as_slot_count = tdev.mmu.as_slot_count().saturating_sub(1);
+        if user_as_slot_count == 0 {
+            pr_err!(
+                "Not enough AS slots ({}, expected at least 2)\n",
+                tdev.mmu.as_slot_count()
+            );
+            return Err(EINVAL);
+        }
+
+        let as_budget = KBox::new(tick::AsBudget::new(user_as_slot_count), GFP_KERNEL)?;
+
         // A distinct CSG priority per slot avoids a FW scheduler deadlock,
         // capping the usable slots to the priority count.
         let csg_slot_count = core::cmp::min(MAX_CSG_PRIO + 1, csg_slot_count);
@@ -485,6 +499,7 @@ impl Scheduler {
             idle_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
             waiting_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
             csg_slot_count,
+            as_budget,
             used_csg_slot_count: 0,
             might_have_idle_groups: false,
             resched_target: None,
