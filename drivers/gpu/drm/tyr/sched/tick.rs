@@ -9,6 +9,8 @@
 //! `Scheduler::request_tick`; the periodic re-arm is handled
 //! separately by `periodic_tick_work` on the system unbound workqueue.
 
+use core::cmp::Reverse;
+
 use kernel::{
     list::{
         List,
@@ -476,37 +478,20 @@ impl SelectedGroup {
         selections: &[Option<SelectedGroup>],
         rotated_slots: [Option<usize>; Priority::num_priorities()],
     ) -> impl Iterator<Item = SelectedGroup> + '_ {
-        (0..Priority::num_priorities())
-            .rev()
-            .filter_map(|p| Priority::try_from(p as u8).ok())
-            .flat_map(move |sw_prio| {
-                // Collect all selections that match the current
-                // software priority band. Slots beyond `..count` are
-                // never read after the sort truncates the iterator;
-                // the dummy fill value is only there to give the
-                // fixed-size array a Copy initialiser.
-                let mut prio_selections =
-                    [(SelectedGroup::Pending(0, Priority::Low, false), 0_usize); MAX_CSGS];
-                let mut count = 0;
+        let count = selections.len();
+        let mut order: [usize; MAX_CSGS] = core::array::from_fn(|idx| idx);
 
-                for (idx, selection) in selections.iter().enumerate() {
-                    if let Some(sel) = selection {
-                        if sel.priority() == sw_prio {
-                            prio_selections[count] = (*sel, idx);
-                            count += 1;
-                        }
-                    }
-                }
-
-                let rotated = rotated_slots[sw_prio as usize];
-
-                prio_selections[..count]
-                    .sort_unstable_by_key(|(s, original_idx)| sort_key(s, *original_idx, rotated));
-
-                // Truncate the padded array to the actual count and
-                // discard the stable-sort index.
-                prio_selections.into_iter().take(count).map(|(s, _)| s)
+        order[..count].sort_unstable_by_key(|&idx| {
+            selections[idx].map(|sel| {
+                let band = sel.priority() as usize;
+                (Reverse(band), sort_key(&sel, idx, rotated_slots[band]))
             })
+        });
+
+        order
+            .into_iter()
+            .take(count)
+            .filter_map(move |idx| selections[idx])
     }
 }
 
