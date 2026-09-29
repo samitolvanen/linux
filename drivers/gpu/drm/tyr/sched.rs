@@ -33,7 +33,6 @@ use crate::{
     fw::{
         global::{
             csg::Priority,
-            CsActivateInputs,
             CsgActivateInputs,
             //
         },
@@ -294,13 +293,9 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // remain stable for as long as the slot is active.
         let cs_doorbell = (slot_idx as u32) + 1;
 
-        // Stage per-CS inputs on the stack so a per-queue EINVAL bails
-        // before any firmware write, and to keep the activate path
-        // allocation-free.
-        let mut cs_inputs: [Option<CsActivateInputs>; group::MAX_CS_PER_GROUP] =
-            [const { None }; group::MAX_CS_PER_GROUP];
-        for (cs_idx, queue) in group.queues.iter().enumerate() {
-            cs_inputs[cs_idx] = Some(queue.cs_activate_inputs(cs_doorbell)?);
+        // Fail before any firmware write if a queue's inputs are invalid.
+        for queue in group.queues.iter() {
+            queue.cs_activate_inputs(cs_doorbell)?;
         }
 
         for queue in group.queues.iter() {
@@ -310,10 +305,9 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         let mut db_mask = CsDbMask::empty();
         self.fw.with_csg_mut(slot_idx, |csg| {
             csg.program_activate_inputs(&inputs)?;
-            for (cs_idx, cs_input) in cs_inputs.iter().enumerate() {
-                let Some(cs_input) = cs_input else { break };
+            for (cs_idx, queue) in group.queues.iter().enumerate() {
                 let cs = csg.cs_mut(cs_idx).ok_or(EINVAL)?;
-                cs.program_activate_inputs(cs_input)?;
+                cs.program_activate_inputs(&queue.cs_activate_inputs(cs_doorbell)?)?;
                 db_mask.insert(cs_idx);
             }
             Ok(())
