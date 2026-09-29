@@ -88,6 +88,9 @@ where
     might_sleep();
 
     loop {
+        // The last `op()` call must happen after the timeout expires.
+        let expired = start.elapsed() > timeout_delta;
+
         let val = op()?;
         if cond(&val) {
             // Unlike the C version, we immediately return.
@@ -95,9 +98,7 @@ where
             return Ok(val);
         }
 
-        if start.elapsed() > timeout_delta {
-            // Unlike the C version, we immediately return.
-            // We have just called `op()` so we don't need to call it again.
+        if expired {
             return Err(ETIMEDOUT);
         }
 
