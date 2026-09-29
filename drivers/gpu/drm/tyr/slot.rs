@@ -338,6 +338,7 @@ impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
                 // Lazily evict idle slot just before it is reused
                 if let Slot::Idle(slot_info) = &self.slots[slot_idx] {
                     self.manager.evict(slot_idx, &slot_info.slot_data, ctx)?;
+                    take(&mut self.slots[slot_idx]);
                 }
                 self.activate_slot(slot_idx, locked_seat, slot_data, ctx)
             }
