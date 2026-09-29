@@ -8,6 +8,10 @@ use kernel::{
         capable,
         Capability, //
     },
+    device::{
+        Bound,
+        Device, //
+    },
     dma_buf::dma_fence::{
         impl_has_dma_fence_work,
         new_dma_fence_work,
@@ -768,7 +772,7 @@ impl Group {
     ///
     /// Must not be called from a dma-fence signalling section:
     /// the foreign-BO path takes `dma_resv_lock` and `GFP_KERNEL`-vmaps.
-    pub(crate) fn eval_syncwait(&self, queue_idx: usize) -> Result<bool> {
+    pub(crate) fn eval_syncwait(&self, dev: &Device<Bound>, queue_idx: usize) -> Result<bool> {
         let queue = self.queues.get(queue_idx).ok_or(EINVAL)?;
         let syncwait = queue.syncwait_snapshot();
 
@@ -813,6 +817,7 @@ impl Group {
             .as_ref()
             .filter(|c| c.gpu_va == syncwait.gpu_va && c.sync64 == syncwait.sync64)
         {
+            syncs::sync_seqno_for_cpu(dev, &cached.bo, cached.offset, syncwait.sync64)?;
             if syncwait.sync64 {
                 syncs::SyncObj64b::read_seqno(&cached.bo, cached.offset)?
             } else {
@@ -841,6 +846,7 @@ impl Group {
                 return Ok(false);
             }
 
+            syncs::sync_seqno_for_cpu(dev, &mapped_bo, bo_offset, syncwait.sync64)?;
             if syncwait.sync64 {
                 syncs::SyncObj64b::read_seqno(&mapped_bo, bo_offset)?
             } else {

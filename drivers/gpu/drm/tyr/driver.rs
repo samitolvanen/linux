@@ -822,7 +822,10 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
             .with_locked_scheduler(|sched| Ok(sched.collect_syncwait_candidates()))
             .unwrap_or_default();
 
-        let results = Scheduler::evaluate_syncwait_candidates(snapshot);
+        // SAFETY: `stop_system_work` cancels this worker and shuts its gate
+        // before the device unbinds, both at unbind and on a failed probe.
+        let dev = unsafe { tdev.as_ref().as_bound() };
+        let results = Scheduler::evaluate_syncwait_candidates(dev, snapshot);
 
         let (tick, poll) = tdev
             .with_locked_scheduler(|sched| {
