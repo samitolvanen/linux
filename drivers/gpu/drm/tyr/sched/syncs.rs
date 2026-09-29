@@ -113,7 +113,7 @@ impl<T: BoMapping> BoMapping for Arc<T> {
 }
 
 macro_rules! impl_sync_rw {
-    ($type:ty) => {
+    ($type:ty, $seqno_ty:ty) => {
         impl $type {
             pub(super) fn read<M: BoMapping>(mem: &M, offset: usize) -> Result<Self> {
                 mem.check_offset::<Self>(offset)?;
@@ -121,6 +121,18 @@ macro_rules! impl_sync_rw {
                 let vmap = mem.vmap();
                 // SAFETY: `check_offset` verified bounds and alignment for `Self` at `offset`.
                 let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<Self>() };
+
+                // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
+                Ok(unsafe { core::ptr::read_volatile(ptr) })
+            }
+
+            pub(super) fn read_seqno<M: BoMapping>(mem: &M, offset: usize) -> Result<$seqno_ty> {
+                let offset = offset + core::mem::offset_of!(Self, seqno);
+                mem.check_offset::<$seqno_ty>(offset)?;
+
+                let vmap = mem.vmap();
+                // SAFETY: `check_offset` verified bounds and alignment for the seqno at `offset`.
+                let ptr = unsafe { (vmap.addr() as *mut u8).add(offset).cast::<$seqno_ty>() };
 
                 // SAFETY: `ptr` is aligned, in-bounds (see above), and shared with the GPU.
                 Ok(unsafe { core::ptr::read_volatile(ptr) })
@@ -142,5 +154,5 @@ macro_rules! impl_sync_rw {
     };
 }
 
-impl_sync_rw!(SyncObj32b);
-impl_sync_rw!(SyncObj64b);
+impl_sync_rw!(SyncObj32b, u32);
+impl_sync_rw!(SyncObj64b, u64);
