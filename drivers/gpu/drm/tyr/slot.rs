@@ -166,8 +166,8 @@ pub(crate) struct SlotManager<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usi
 }
 
 impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
-    /// Creates a specific instance of a slot manager.
-    pub(crate) fn new(manager: T, slot_count: usize) -> Result<Self> {
+    /// Returns an initializer for a new slot manager.
+    pub(crate) fn new(manager: T, slot_count: usize) -> Result<impl Init<Self>> {
         if slot_count == 0 {
             return Err(EINVAL);
         }
@@ -179,12 +179,12 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
             return Err(EINVAL);
         }
 
-        Ok(Self {
+        Ok(init!(Self {
             manager,
             slot_count,
             slots: [const { Slot::Free }; MAX_SLOTS],
             use_seqno: 1,
-        })
+        }))
     }
 
     /// Updates the active slot count.
