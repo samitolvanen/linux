@@ -745,6 +745,7 @@ impl Scheduler {
             let here: *const Group = &*peek.arc();
             if core::ptr::eq(here, target) {
                 let _ = peek.remove();
+                trace::group_wait(group.handle(), false);
                 return;
             }
             cursor.move_next();
@@ -1650,6 +1651,7 @@ impl Scheduler {
             // cleanup running twice.
             while let Some(wait_arc) = self.waiting_groups[prio].pop_front() {
                 let group: Arc<Group> = wait_arc.into_arc();
+                trace::group_wait(group.handle(), false);
                 group.with_locked_inner(|inner| {
                     inner.state = group::State::Terminated;
                     inner.fatal = true;
