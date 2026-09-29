@@ -962,7 +962,7 @@ impl platform::Driver for TyrPlatformDriver {
         let ping_dev = ARef::from(&*unreg_dev);
         let ping_guard = ScopeGuard::new(move || ping_dev.cancel_fw_ping());
 
-        let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware)?;
+        let (scheduler, csif_info) = Scheduler::init(&unreg_dev, &firmware, &mmu)?;
         unreg_dev.sched.lock().enable(scheduler);
 
         let wq = Arc::new(

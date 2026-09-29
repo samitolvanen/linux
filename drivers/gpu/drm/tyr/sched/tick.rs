@@ -42,6 +42,7 @@ use crate::{
         CsgExecutionState,
         Firmware, //
     },
+    regs::MAX_AS,
     sched::{
         group::{
             Group,
@@ -55,6 +56,7 @@ use crate::{
         MAX_CSGS,
         MAX_CSG_PRIO, //
     },
+    vm::Vm, //
 };
 
 const TEARDOWN_ARRAY_SIZE: usize = MAX_CSGS;
@@ -76,8 +78,8 @@ enum Action {
     /// Retain currently bound groups that match the rule criteria.
     Keep,
     /// Retain currently bound groups that match the rule criteria,
-    /// except the rotating one, whose slot is left to a subsequent
-    /// `Take`.
+    /// except the rotating one and the others on its VM. The rotating
+    /// group's slot is left to a subsequent `Take`.
     KeepExceptRotated,
     /// Bind new, unbound groups from the software queues that match
     /// the rule criteria.
@@ -132,11 +134,12 @@ macro_rules! build_scheduling_rules {
 ///
 /// Re-arms the tick while any software priority level holds more than
 /// one selected non-idle group, so groups sharing a level keep
-/// rotating. It also re-arms while every slot holds a non-idle group
-/// and a runnable group waits. A tick that runs and fails re-arms too.
-/// Without that, `resched_target` would stay armed with nothing queued
-/// behind it. Otherwise the tick stays idle until something requests it
-/// via `Scheduler::request_tick`.
+/// rotating. It also re-arms while a runnable group waits and either
+/// every slot holds a non-idle group or a group was refused an address
+/// space. A tick that runs and fails re-arms too. Without that,
+/// `resched_target` would stay armed with nothing queued behind it.
+/// Otherwise the tick stays idle until something requests it via
+/// `Scheduler::request_tick`.
 pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result {
     if tdev.is_unusable() {
         return Ok(());
@@ -552,6 +555,60 @@ pub(crate) struct PendingBind {
     pub(crate) prior_state: GroupListState,
 }
 
+/// Address spaces taken by the groups selected in one tick.
+pub(in crate::sched) struct AsBudget {
+    /// Addresses of the VMs of the selected groups, one per address space.
+    /// Addresses rather than pointers keep the scheduler `Send`.
+    vms: [Option<usize>; MAX_AS],
+    /// Number of AS slots available to user VMs.
+    limit: usize,
+    /// Whether a group was refused because no address space was left.
+    refused: bool,
+}
+
+impl AsBudget {
+    /// Creates an empty budget of `limit` address spaces, at most `MAX_AS`.
+    pub(in crate::sched) fn new(limit: usize) -> Self {
+        Self {
+            vms: [None; MAX_AS],
+            limit: limit.min(MAX_AS),
+            refused: false,
+        }
+    }
+
+    /// Releases the address spaces taken by the previous tick.
+    fn reset(&mut self) {
+        self.vms = [None; MAX_AS];
+        self.refused = false;
+    }
+
+    /// Takes an address space for `vm`, unless an earlier selection already
+    /// took one for it. Returns `false` if none is left.
+    fn take(&mut self, vm: &Vm) -> bool {
+        let vm = Some(core::ptr::from_ref(vm).addr());
+        if self.vms.contains(&vm) {
+            return true;
+        }
+        let free = self
+            .vms
+            .iter_mut()
+            .take(self.limit)
+            .find(|slot| slot.is_none());
+        let Some(slot) = free else {
+            self.refused = true;
+            return false;
+        };
+        *slot = vm;
+        true
+    }
+
+    /// Returns whether `take` would succeed for `vm`.
+    fn can_take(&self, vm: &Vm) -> bool {
+        let vm = Some(core::ptr::from_ref(vm).addr());
+        self.vms.iter().take(self.limit).any(Option::is_none) || self.vms.contains(&vm)
+    }
+}
+
 /// Represents the outcome of evaluating scheduling rules.
 pub(crate) struct SchedulingDecision {
     /// Slot holding the group that rotates in each software priority
@@ -619,12 +676,15 @@ impl SchedulingDecision {
         let slot_count = csg_slot_manager.slot_count();
 
         self.rotated_slots = find_rotated_slots(&csg_slot_manager, slot_count, full_tick);
+        sched.as_budget.reset();
 
+        let mut reserved = 0;
         for rule in rules {
             match rule.action {
                 Action::Keep | Action::KeepExceptRotated => {
-                    self.keep_bound(
+                    reserved = self.keep_bound(
                         &csg_slot_manager,
+                        &mut sched.as_budget,
                         slot_count,
                         rule.priority,
                         rule.is_idle,
@@ -632,7 +692,8 @@ impl SchedulingDecision {
                     );
                 }
                 Action::Take => {
-                    self.take_unbound(sched, slot_count, rule.priority, rule.is_idle)?;
+                    let available = slot_count.checked_sub(reserved).ok_or(EINVAL)?;
+                    self.take_unbound(sched, available, rule.priority, rule.is_idle)?;
                 }
             }
         }
@@ -648,6 +709,7 @@ impl SchedulingDecision {
         list: &mut List<Group>,
         prior_state: GroupListState,
         groups: &mut [Option<PendingBind>],
+        as_budget: &mut AsBudget,
     ) -> Result<usize> {
         let mut count = 0;
         let mut cursor = list.cursor_front();
@@ -659,7 +721,7 @@ impl SchedulingDecision {
 
             let status = group.arc().status();
 
-            if !status.can_run || status.csg_id.is_some() {
+            if !status.can_run || status.csg_id.is_some() || !as_budget.take(&group.arc().vm) {
                 cursor.move_next();
                 continue;
             }
@@ -692,15 +754,21 @@ impl SchedulingDecision {
     /// `skip_rotated` is set. When a band has more eligible groups than
     /// slots, the highest-priority ones are kept and the rest are
     /// dropped.
+    ///
+    /// When the rotating group is skipped, the others on its VM are
+    /// skipped too. Their slots are reserved while that VM can still get
+    /// an address space. Returns the number of reserved slots.
     fn keep_bound(
         &mut self,
         csg_slot_manager: &CsgSlotManager,
+        as_budget: &mut AsBudget,
         slot_count: usize,
         priority: Priority,
         is_idle: bool,
         skip_rotated: bool,
-    ) {
+    ) -> usize {
         let rotated = self.rotated_slots[priority as usize];
+        let mut skipped = None;
         let mut candidates = [(0u32, 0usize); MAX_CSGS];
         let mut count = 0;
 
@@ -709,13 +777,18 @@ impl SchedulingDecision {
                 continue;
             };
 
-            let status = slot_data.group.status();
-            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
-            {
+            if (self.keep_mask & (1u32 << i)) != 0 {
                 continue;
             }
 
-            if (self.keep_mask & (1u32 << i)) != 0 || (skip_rotated && rotated == Some(i)) {
+            if skip_rotated && rotated == Some(i) {
+                skipped = Some(i);
+                continue;
+            }
+
+            let status = slot_data.group.status();
+            if slot_data.group.priority != priority || !status.can_run || status.is_idle != is_idle
+            {
                 continue;
             }
 
@@ -727,9 +800,26 @@ impl SchedulingDecision {
             (rotated == Some(i), u32::MAX - fw_priority, i)
         });
 
+        let rotated_vm = skipped
+            .and_then(|i| csg_slot_manager.slot_data(i))
+            .map(|slot_data| &slot_data.group.vm);
+        let mut reserved = 0;
         for &(fw_priority, i) in &candidates[..count] {
-            if self.num_selected >= slot_count {
+            if self.num_selected + reserved >= slot_count {
                 break;
+            }
+
+            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                continue;
+            };
+            if rotated_vm.is_some_and(|vm| Arc::ptr_eq(vm, &slot_data.group.vm)) {
+                if as_budget.can_take(&slot_data.group.vm) {
+                    reserved += 1;
+                }
+                continue;
+            }
+            if !as_budget.take(&slot_data.group.vm) {
+                continue;
             }
 
             self.keep_mask |= 1u32 << i;
@@ -746,6 +836,8 @@ impl SchedulingDecision {
                 self.idle_group_count += 1;
             }
         }
+
+        reserved
     }
 
     /// Selects unbound groups matching the priority and idle state to
@@ -778,7 +870,7 @@ impl SchedulingDecision {
         };
 
         // Collect available groups.
-        let count = Self::collect_groups(queue, prior_state, target)?;
+        let count = Self::collect_groups(queue, prior_state, target, &mut sched.as_budget)?;
         if count > 0 {
             if !is_idle {
                 self.all_idle = false;
@@ -859,8 +951,9 @@ impl<'a> Tick<'a> {
                 Keep Medium,   Take Medium,
                 Keep Low,      Take Low,
             ],
-            // The trailing `Keep` re-admits the rotating group when no
-            // runnable group claimed the slot it left.
+            // The trailing `Keep` re-admits the groups skipped by
+            // `KeepExceptRotated` when the `Take` left them a slot and an
+            // address space.
             if full_tick => [
                 KeepExceptRotated RealTime, Take RealTime, Keep RealTime,
                 KeepExceptRotated High,     Take High,     Keep High,
@@ -1259,7 +1352,10 @@ impl<'a> Tick<'a> {
         let all_slots_busy = decision.num_selected == self.sched.csg_slot_count as usize
             && decision.idle_group_count == 0;
 
-        if decision.needs_resched() || (all_slots_busy && self.sched.has_runnable_groups()) {
+        if decision.needs_resched()
+            || ((all_slots_busy || self.sched.as_budget.refused)
+                && self.sched.has_runnable_groups())
+        {
             let period = Delta::from_millis(i64::from(TICK_PERIOD_MS));
             self.sched.resched_target = Some(self.sched.last_tick + period);
             Scheduler::request_tick(tdev);
