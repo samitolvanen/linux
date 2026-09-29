@@ -925,6 +925,7 @@ impl WorkItem<{ work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        trace::work_run(c_str!("syncwait_poll_work"));
         Self::schedule_sync_upd(&this);
     }
 }
