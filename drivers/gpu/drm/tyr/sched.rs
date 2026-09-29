@@ -1339,7 +1339,6 @@ impl Scheduler {
                 )
                 .is_err()
             {
-                pr_err!("sync_upd: out of memory recording results\n");
                 return results;
             }
         }
