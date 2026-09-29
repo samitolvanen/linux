@@ -23,8 +23,6 @@ impl SyncObj32b {
     const SEQNO: usize = core::mem::offset_of!(Self, seqno);
 
     pub(super) fn read_seqno(mem: &gem::BoVmap, offset: usize) -> Result<u32> {
-        mem.check_offset::<Self>(offset)?;
-
         mem.vmap().try_read32(offset + Self::SEQNO)
     }
 }
@@ -43,8 +41,6 @@ impl SyncObj64b {
     const PAD: usize = core::mem::offset_of!(Self, pad);
 
     pub(super) fn read_seqno(mem: &gem::BoVmap, offset: usize) -> Result<u64> {
-        mem.check_offset::<Self>(offset)?;
-
         mem.vmap().try_read64(offset + Self::SEQNO)
     }
 
