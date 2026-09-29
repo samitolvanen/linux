@@ -215,22 +215,22 @@ pub(crate) struct SlotManager<T: SlotOperations, const MAX_SLOTS: usize> {
 type LockedSeat<T, const MAX_SLOTS: usize> = LockedBy<Seat, SlotManager<T, MAX_SLOTS>>;
 
 impl<T: SlotOperations, const MAX_SLOTS: usize> SlotManager<T, MAX_SLOTS> {
-    /// Creates a new slot manager.
+    /// Returns an initializer for a new slot manager.
     ///
     /// Returns [`EINVAL`] if the slot count is zero or exceeds the maximum number of slots.
-    pub(crate) fn new(manager: T, slot_count: usize) -> Result<Self> {
+    pub(crate) fn new(manager: T, slot_count: usize) -> Result<impl Init<Self>> {
         if slot_count == 0 {
             return Err(EINVAL);
         }
         if slot_count > MAX_SLOTS {
             return Err(EINVAL);
         }
-        Ok(Self {
+        Ok(init!(Self {
             manager,
             slot_count,
             slots: [const { Slot::Free }; MAX_SLOTS],
             use_seqno: 1,
-        })
+        }))
     }
 
     /// Updates the active slot count.
