@@ -178,7 +178,7 @@ pub trait Driver {
     ///
     /// Called by the DRM core during registration. The `ScopeRef` provides
     /// access to the device's `RegistrationData` for creating debugfs files.
-    fn debugfs_init(_dir: &debugfs::ScopeRef<'_, Self::RegistrationData<'_>>)
+    fn debugfs_init(_dir: &debugfs::ScopeRef<'_, Self::RegistrationData<'_>, Self::OwnerModule>)
     where
         Self: Sized,
     {

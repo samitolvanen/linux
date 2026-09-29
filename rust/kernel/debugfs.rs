@@ -621,7 +621,7 @@ impl<'data, 'dir, M: ModuleMetadata> ScopedDir<'data, 'dir, M> {
     /// The file's contents are produced by invoking [`SeqShow::show`] with
     /// `data` on each read.
     pub fn seq_file<S: SeqShow<U>, U: Sync>(&self, name: &CStr, data: &'data U) {
-        self.create_file(name, data, &<S as SeqReadFile<U>>::FILE_OPS)
+        self.create_file(name, data, &<S as SeqReadFile<M, U>>::FILE_OPS)
     }
 
     /// Creates a read-write file in this directory.
@@ -787,13 +787,16 @@ impl<'data, M> ScopedDir<'data, 'static, M> {
 /// Created from an existing debugfs dentry (e.g. the DRM debugfs root).
 /// `data` must remain valid while the debugfs files created under this
 /// scope may be accessed.
-pub struct ScopeRef<'a, T> {
+///
+/// `M` is the module that creates the files, as with [`Dir`].
+pub struct ScopeRef<'a, T, M> {
     #[cfg(CONFIG_DEBUG_FS)]
-    inner: ScopedDir<'a, 'a, crate::LocalModule>,
+    inner: ScopedDir<'a, 'a, M>,
     data: &'a T,
+    _module: PhantomData<fn() -> M>,
 }
 
-impl<'a, T> ScopeRef<'a, T> {
+impl<'a, T, M: ModuleMetadata> ScopeRef<'a, T, M> {
     /// Creates a [`ScopeRef`] from an existing debugfs dentry and a data reference.
     ///
     /// # Safety
@@ -809,6 +812,7 @@ impl<'a, T> ScopeRef<'a, T> {
             // and remains valid for the lifetime of the returned `ScopeRef`.
             inner: unsafe { ScopedDir::from_dentry(dentry) },
             data,
+            _module: PhantomData,
         }
     }
 

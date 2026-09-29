@@ -167,13 +167,14 @@ unsafe extern "C" fn seq_file_open<S: SeqShow<T>, T: Sync>(
     unsafe { bindings::single_open(file, Some(seq_file_show::<S, T>), data.cast()) }
 }
 
-pub(crate) trait SeqReadFile<T> {
+pub(crate) trait SeqReadFile<M, T> {
     const FILE_OPS: FileOps<T>;
 }
 
-impl<S: SeqShow<T>, T: Sync> SeqReadFile<T> for S {
+impl<M: ModuleMetadata, S: SeqShow<T>, T: Sync> SeqReadFile<M, T> for S {
     const FILE_OPS: FileOps<T> = {
         let operations = bindings::file_operations {
+            owner: this_module::<M>().as_ptr(),
             read: Some(bindings::seq_read),
             llseek: Some(bindings::seq_lseek),
             release: Some(bindings::single_release),
