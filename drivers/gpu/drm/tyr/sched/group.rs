@@ -804,9 +804,9 @@ impl Group {
         let value = if syncwait.gpu_va >= syncobjs_va.start && syncwait.gpu_va < syncobjs_va.end {
             let offset = (syncwait.gpu_va - syncobjs_va.start) as usize;
             if syncwait.sync64 {
-                syncs::SyncObj64b::read(&self._syncobjs, offset)?.seqno
+                syncs::SyncObj64b::read_seqno(&self._syncobjs, offset)?
             } else {
-                u64::from(syncs::SyncObj32b::read(&self._syncobjs, offset)?.seqno)
+                u64::from(syncs::SyncObj32b::read_seqno(&self._syncobjs, offset)?)
             }
         } else if let Some(cached) = syncwait
             .cached
@@ -814,9 +814,9 @@ impl Group {
             .filter(|c| c.gpu_va == syncwait.gpu_va && c.sync64 == syncwait.sync64)
         {
             if syncwait.sync64 {
-                syncs::SyncObj64b::read(&cached.bo, cached.offset)?.seqno
+                syncs::SyncObj64b::read_seqno(&cached.bo, cached.offset)?
             } else {
-                u64::from(syncs::SyncObj32b::read(&cached.bo, cached.offset)?.seqno)
+                u64::from(syncs::SyncObj32b::read_seqno(&cached.bo, cached.offset)?)
             }
         } else {
             let (bo, bo_offset) = self.vm.get_bo_for_va(syncwait.gpu_va).ok_or(EINVAL)?;
@@ -842,9 +842,9 @@ impl Group {
             }
 
             if syncwait.sync64 {
-                syncs::SyncObj64b::read(&mapped_bo, bo_offset)?.seqno
+                syncs::SyncObj64b::read_seqno(&mapped_bo, bo_offset)?
             } else {
-                u64::from(syncs::SyncObj32b::read(&mapped_bo, bo_offset)?.seqno)
+                u64::from(syncs::SyncObj32b::read_seqno(&mapped_bo, bo_offset)?)
             }
         };
 
