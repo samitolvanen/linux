@@ -628,7 +628,7 @@ impl AddressSpaceManager {
 
         let lockaddr_val = LOCKADDR::zeroed()
             .try_with_size(lockaddr_size)?
-            .try_with_base(lockaddr_base)?
+            .try_with_base(lockaddr_base >> 12)?
             .into_raw();
 
         io.write(
