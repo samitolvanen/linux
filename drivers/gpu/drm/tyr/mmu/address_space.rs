@@ -400,6 +400,7 @@ impl AddressSpaceManager {
         self.stuck[as_nr] = false;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
         self.faulty[as_nr] = false;
+        self.lock_pending[as_nr] = false;
 
         Ok(())
     }
