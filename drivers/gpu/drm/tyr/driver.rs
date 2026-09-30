@@ -35,6 +35,7 @@ use kernel::{
     },
     error::to_result,
     math64::div_u64_rem,
+    new_condvar,
     new_mutex,
     new_spinlock,
     of,
@@ -66,6 +67,7 @@ use kernel::{
             Release, //
         },
         Arc,
+        CondVar,
         Mutex,
         SetOnce,
         SpinLock, //
@@ -199,6 +201,54 @@ pub(crate) struct TyrPlatformDriverData {
     pm: pm::Registration<TyrPmOps>,
 
     pub(crate) device: ARef<TyrDrmDevice>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeState {
+    Probing,
+    Ready,
+    Failed,
+}
+
+/// Holds file opens until probe finishes.
+#[pin_data]
+pub(crate) struct ProbeGate {
+    #[pin]
+    state: Mutex<ProbeState>,
+    #[pin]
+    done: CondVar,
+}
+
+impl ProbeGate {
+    fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                state <- new_mutex!(ProbeState::Probing),
+                done <- new_condvar!(),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    fn finish(&self, state: ProbeState) {
+        *self.state.lock() = state;
+        self.done.notify_all();
+    }
+
+    /// Waits for probe to finish. Fails with `ENODEV` if probe failed, or
+    /// `ERESTARTSYS` on a signal.
+    pub(crate) fn wait(&self) -> Result {
+        let mut state = self.state.lock();
+        while *state == ProbeState::Probing {
+            if self.done.wait_interruptible(&mut state) {
+                return Err(ERESTARTSYS);
+            }
+        }
+        if *state == ProbeState::Failed {
+            return Err(ENODEV);
+        }
+        Ok(())
+    }
 }
 
 #[pin_data]
@@ -396,6 +446,8 @@ pub(crate) struct TyrDrmDeviceData {
     /// `create_group` reads it under the scheduler lock that orders it
     /// against the group sweep.
     unusable: Atomic<bool>,
+
+    pub(crate) probe_gate: Arc<ProbeGate>,
 
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
@@ -929,6 +981,11 @@ impl TyrPlatformDriverData {
 
         let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
 
+        let probe_gate = ProbeGate::new()?;
+        let probe_guard = ScopeGuard::new_with_data(probe_gate.clone(), |gate| {
+            gate.finish(ProbeState::Failed);
+        });
+
         // The clocks move into the data below.
         power_guard.dismiss();
 
@@ -972,6 +1029,7 @@ impl TyrPlatformDriverData {
                 pm_powered_down: Atomic::new(false),
                 unbinding: Atomic::new(false),
                 unusable: Atomic::new(false),
+                probe_gate,
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
                 opp_config <- new_mutex!(None),
                 #[cfg(CONFIG_DEBUG_FS)]
@@ -1084,6 +1142,7 @@ impl TyrPlatformDriverData {
         // all in Rust for now, and we need to see whether probe succeeded.
         dev_info!(pdev, "Tyr initialized correctly.\n");
         hw_guard.dismiss();
+        probe_guard.dismiss().finish(ProbeState::Ready);
         Ok(TyrPlatformDriverData {
             devfreq_registration,
             pm: pm_registration,
