@@ -14,9 +14,9 @@ use crate::fw::{
         FwInterface, CSG_ACK, CSG_ACK_IRQ_MASK, CSG_ALLOW_COMPUTE, CSG_ALLOW_FRAGMENT,
         CSG_ALLOW_OTHER, CSG_CONFIG, CSG_CONTROL_BLOCK_SIZE, CSG_DB_ACK, CSG_DB_REQ, CSG_EP_REQ,
         CSG_EP_REQ2, CSG_INPUT_BLOCK_SIZE, CSG_IRQ_ACK, CSG_IRQ_REQ, CSG_OUTPUT_BLOCK_SIZE,
-        CSG_PROTM_SUSPEND_BUF, CSG_REQ, CSG_SUSPEND_BUF, CS_CONTROL_BLOCK_SIZE, GROUP_INPUT_VA,
-        GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM, GROUP_STREAM_STRIDE,
-        GROUP_SUSPEND_SIZE,
+        CSG_PROTM_SUSPEND_BUF, CSG_REQ, CSG_SUSPEND_BUF, CS_CONTROL_BLOCK_SIZE, GROUP_FEATURES,
+        GROUP_INPUT_VA, GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM,
+        GROUP_STREAM_STRIDE, GROUP_SUSPEND_SIZE,
     },
     CsDbMask,
     MAX_CS,
@@ -72,6 +72,7 @@ enum CsgInterfaceState {
 struct EnabledCsgInterface {
     csg_input: FwInterface<CSG_INPUT_BLOCK_SIZE>,
     csg_output: FwInterface<CSG_OUTPUT_BLOCK_SIZE>,
+    features: GROUP_FEATURES,
     suspend_size: u32,
     protm_suspend_size: u32,
     cs_stride: usize,
@@ -106,7 +107,6 @@ impl EnabledCsgInterface {
 
 pub(crate) struct CsgInterface {
     state: CsgInterfaceState,
-    #[expect(dead_code)]
     csg_idx: usize,
 }
 
@@ -138,6 +138,7 @@ impl CsgInterface {
         csg_idx: usize,
         csg_stride: usize,
         has_64bit_ep_req: bool,
+        first_cs: Option<&CsInterface>,
     ) -> Result {
         let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
         let csg_control_va = shared_section.va_range.start + csg_control_offset as u64;
@@ -194,6 +195,7 @@ impl CsgInterface {
         self.state = CsgInterfaceState::Enabled(EnabledCsgInterface {
             csg_input,
             csg_output,
+            features: csg_control.read(GROUP_FEATURES),
             suspend_size: csg_control.read(GROUP_SUSPEND_SIZE).value().get(),
             protm_suspend_size: csg_control.read(GROUP_PROTM_SUSPEND_SIZE).value().get(),
             cs_stride,
@@ -202,10 +204,15 @@ impl CsgInterface {
             has_64bit_ep_req,
         });
 
-        self.init_cs(shared_section, csg_control_offset)
+        self.init_cs(shared_section, csg_control_offset, first_cs)
     }
 
-    fn init_cs(&mut self, shared_section: &SharedSectionInfo, csg_control_offset: usize) -> Result {
+    fn init_cs(
+        &mut self,
+        shared_section: &SharedSectionInfo,
+        csg_control_offset: usize,
+        first_cs: Option<&CsInterface>,
+    ) -> Result {
         let enabled = match &mut self.state {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),
@@ -219,10 +226,35 @@ impl CsgInterface {
                 cs_idx,
                 enabled.cs_stride,
             )?;
+            if first_cs
+                .or(enabled.cs.first())
+                .is_some_and(|first| !cs.matches(first))
+            {
+                pr_err!(
+                    "CSG {} CS {} does not match CSG 0 CS 0\n",
+                    self.csg_idx,
+                    cs_idx
+                );
+                return Err(EINVAL);
+            }
             enabled.cs.push(cs, GFP_KERNEL)?;
         }
 
         Ok(())
+    }
+
+    /// Returns whether `other` reports the same features, suspend buffer
+    /// sizes and CS count.
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (CsgInterfaceState::Enabled(a), CsgInterfaceState::Enabled(b)) => {
+                a.features == b.features
+                    && a.suspend_size == b.suspend_size
+                    && a.protm_suspend_size == b.protm_suspend_size
+                    && a.cs_num == b.cs_num
+            }
+            _ => false,
+        }
     }
 
     pub(in super::super) fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {
