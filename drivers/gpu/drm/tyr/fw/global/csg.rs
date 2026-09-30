@@ -18,7 +18,9 @@ use crate::fw::{
         GROUP_OUTPUT_VA, GROUP_PROTM_SUSPEND_SIZE, GROUP_STREAM_NUM, GROUP_STREAM_STRIDE,
         GROUP_SUSPEND_SIZE,
     },
-    CsDbMask, MAX_CS,
+    CsDbMask,
+    MAX_CS,
+    MIN_CS, //
 };
 
 /// Offset from GLB_CONTROL_BLOCK start to the first GROUP_CONTROL block.
@@ -176,6 +178,15 @@ impl CsgInterface {
                 "Too many CS: hardware reports {}, max supported {}\n",
                 cs_num,
                 MAX_CS
+            );
+            return Err(EINVAL);
+        }
+
+        if (cs_num as usize) < MIN_CS {
+            pr_err!(
+                "Too few CS: hardware reports {}, min required {}\n",
+                cs_num,
+                MIN_CS
             );
             return Err(EINVAL);
         }
