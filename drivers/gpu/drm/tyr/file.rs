@@ -199,6 +199,8 @@ impl drm::file::DriverFile for TyrDrmFileData {
     type Driver = TyrDrmDriver;
 
     fn open(dev: &drm::Device<Self::Driver>) -> Result<Pin<KBox<Self>>> {
+        dev.probe_gate.wait()?;
+
         let tdev = ARef::from(dev);
 
         let user_mmio_offset = if task::in_compat_syscall() {
