@@ -447,7 +447,7 @@ mod glb {
 
             /// This register contains the count of CSG interfaces supported.
             pub GLB_GROUP_NUM(u32) @ 0x10 {
-                4:0 value;
+                31:0 value;
             }
 
             /// Stride, in bytes, between each CSG interface capabilities structure.
@@ -930,7 +930,7 @@ mod csg {
 
             /// Number of CS interfaces supported by this CSG.
             pub GROUP_STREAM_NUM(u32) @ 0x14 {
-                5:0 value;
+                31:0 value;
             }
 
             /// Stride, in bytes, between CS interface capabilities structures.
