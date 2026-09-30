@@ -1015,6 +1015,10 @@ impl Pool {
             return Err(EINVAL);
         }
 
+        if groupcreate.queues.count > reg_data.csif_info.cs_slot_count {
+            return Err(EINVAL);
+        }
+
         static_assert!(
             size_of::<uapi::drm_panthor_queue_create>()
                 == offset_of!(uapi::drm_panthor_queue_create, ringbuf_size) + size_of::<u32>()
