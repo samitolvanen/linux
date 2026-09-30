@@ -9,8 +9,13 @@ use kernel::{
     alloc::KVec,
     c_str,
     dma_buf::dma_fence::{
-        DmaFenceSignallingAnnotation, DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps,
-        PublicDmaFence, Published,
+        DmaFenceSignallingAnnotation,
+        DmaFenceWorkqueue,
+        DriverDmaFence,
+        DriverDmaFenceOps,
+        FenceWaitResult,
+        PublicDmaFence,
+        Published, //
     },
     drm::{
         gem::BaseObject,
@@ -23,6 +28,7 @@ use kernel::{
     io::Io,
     new_mutex,
     pr_err_once,
+    pr_warn_once,
     prelude::*,
     sizes::SZ_4K,
     sizes::SZ_64K,
@@ -343,6 +349,9 @@ pub(crate) struct QueueData {
     /// command-stream job is committed.
     #[pin]
     last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
+    /// Submit fence of the most recently committed job of any kind.
+    #[pin]
+    last_job_fence: Mutex<Option<ARef<PublicDmaFence>>>,
     /// Active GPU sync-wait captured for this queue.
     #[pin]
     syncwait: Mutex<SyncWait>,
@@ -1176,6 +1185,7 @@ impl Queue {
                     next_profiling_slot: 0,
                 }),
                 last_submit_fence <- new_mutex!(None),
+                last_job_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
                 suspend_state <- new_mutex!(SuspendState {
                     since: Some(Instant::<Monotonic>::now()),
@@ -1216,7 +1226,9 @@ impl Queue {
     }
 
     pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
-        self.job_queue.commit(prepared)
+        let fence = self.job_queue.commit(prepared);
+        *self.data.last_job_fence.lock() = Some(fence.clone());
+        fence
     }
 
     /// Stops the pipeline from handing any further job to the
@@ -1245,10 +1257,24 @@ impl Queue {
 
     /// Retires every job left in the pipeline and refuses later commits.
     ///
-    /// Waits on hardware fences, so it must not be called from a dma-fence
-    /// signalling section.
+    /// Waits for the last committed job first, so a job committed before the
+    /// drain is not canceled before its dependencies signal. Waits on
+    /// fences, so it must not be called from a dma-fence signalling section.
     pub(crate) fn drain(&self) {
+        let last = self.data.last_job_fence.lock().clone();
+        if let Some(fence) = last {
+            wait_for_fence(&fence);
+        }
         self.job_queue.cancel_all();
+    }
+}
+
+/// Waits for `fence` to signal, in `JOB_TIMEOUT_MS` steps so the wait does
+/// not trip the hung-task detector.
+pub(crate) fn wait_for_fence(fence: &PublicDmaFence) {
+    let step = msecs_to_jiffies(JOB_TIMEOUT_MS);
+    while let Ok(FenceWaitResult::TimedOut) = fence.wait_timeout(step) {
+        pr_warn_once!("still waiting for job dependencies during teardown\n");
     }
 }
 
