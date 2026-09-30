@@ -652,8 +652,9 @@ impl QueueOps for TyrQueueOps {
                 return Ok(SubmitResult::NoResources(fence));
             }
 
+            pr_warn_once!("queue ring space check failed: {}\n", err.to_errno());
             fence.signal(Err(err));
-            return Err(err);
+            return Ok(SubmitResult::Submitted);
         }
 
         // Fold any in-flight suspend interval into the baseline so it
@@ -669,14 +670,16 @@ impl QueueOps for TyrQueueOps {
         let ringbuf_completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(completion_point) => completion_point,
             Err(err) => {
+                pr_warn_once!("queue ring claim failed: {}\n", err.to_errno());
                 fence.signal(Err(err));
-                return Err(err);
+                return Ok(SubmitResult::Submitted);
             }
         };
 
         let Some(done_seqno) = job.job.done_seqno() else {
+            pr_warn_once!("queue job has no done seqno\n");
             fence.signal(Err(EINVAL));
-            return Err(EINVAL);
+            return Ok(SubmitResult::Submitted);
         };
 
         if let Err(fence) = self.data.push_submit_fence(done_seqno, fence) {
@@ -684,8 +687,9 @@ impl QueueOps for TyrQueueOps {
         }
 
         if let Err(err) = self.data.commit_ringbuf_range(ringbuf_completion_point) {
+            pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
             self.data.signal_submit_fence(done_seqno, Err(err));
-            return Err(err);
+            return Ok(SubmitResult::Submitted);
         }
 
         // `Scheduler::program_csg_activate` and `CsgSlotOps::evict` update
@@ -718,8 +722,9 @@ impl QueueOps for TyrQueueOps {
 
         if active {
             if let Err(err) = kick_err {
+                pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
                 self.data.signal_submit_fence(done_seqno, Err(err));
-                return Err(err);
+                return Ok(SubmitResult::Submitted);
             }
             // This path does not always schedule a tick, so record the busy
             // edge here.
@@ -757,8 +762,9 @@ impl QueueOps for TyrQueueOps {
             }) {
                 Ok(tick) => tick,
                 Err(err) => {
+                    pr_warn_once!("queue group scheduling failed: {}\n", err.to_errno());
                     self.data.signal_submit_fence(done_seqno, Err(err));
-                    return Err(err);
+                    return Ok(SubmitResult::Submitted);
                 }
             };
             tick.dispatch(&group.tdev);
