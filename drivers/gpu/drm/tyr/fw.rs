@@ -122,6 +122,9 @@ pub(crate) use interfaces::{
 /// The scheduler addresses only `sched::MAX_CSGS` of these slots.
 pub(crate) const MAX_CSG: usize = 31;
 
+/// Minimum number of CSG interfaces the firmware must report.
+const MIN_CSG: usize = 3;
+
 /// Bitmap over CSG slot indices in `[0, MAX_CSG)`.
 ///
 /// Each bit at position `i` indicates that CSG slot `i` is part of the
@@ -211,6 +214,9 @@ impl CsDbMask {
 
 /// Maximum number of CS interfaces supported by hardware.
 const MAX_CS: usize = 32;
+
+/// Minimum number of CS interfaces a CSG must report.
+const MIN_CS: usize = 8;
 
 /// MCU virtual address where the CSF shared memory region starts.
 ///

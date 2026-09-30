@@ -23,7 +23,10 @@ use crate::{
             GLB_VERSION,
         },
         irq::JobIrqState,
-        CsgSlotMask, Section, MAX_CSG,
+        CsgSlotMask,
+        Section,
+        MAX_CSG,
+        MIN_CSG, //
     },
     gem::BoData,
     gpu::GpuInfo,
@@ -543,8 +546,12 @@ impl InnerGlobalInterface {
             return Err(EINVAL);
         }
 
-        if csg_num == 0 {
-            pr_err!("No CSG slots available\n");
+        if csg_num < MIN_CSG {
+            pr_err!(
+                "Too few CSGs: hardware reports {}, min required {}\n",
+                csg_num,
+                MIN_CSG
+            );
             return Err(EINVAL);
         }
 
