@@ -434,7 +434,7 @@ impl QueueOps for VmBindQueueOps {
     ) -> Result<SubmitResult<Self::FenceData>> {
         let Some(guard) = self.ddev.registration_guard() else {
             fence.signal(Err(ENODEV));
-            return Err(ENODEV);
+            return Ok(SubmitResult::Submitted);
         };
 
         let result = guard.registration_data_with(|reg_data| {
@@ -471,17 +471,13 @@ impl QueueOps for VmBindQueueOps {
             Ok(())
         });
 
-        let submitted = match result {
-            Ok(()) => {
-                fence.signal(Ok(()));
-                Ok(SubmitResult::Submitted)
-            }
+        match result {
+            Ok(()) => fence.signal(Ok(())),
             Err(err) => {
                 self.exec.declare_unusable();
                 fence.signal(Err(err));
-                Err(err)
             }
-        };
+        }
 
         let exec = self.exec.clone();
         let queued = cleanup::try_spawn_owned(exec, |exec| exec.flush_deferred_cleanup());
@@ -492,7 +488,7 @@ impl QueueOps for VmBindQueueOps {
             );
         }
 
-        submitted
+        Ok(SubmitResult::Submitted)
     }
 }
 
