@@ -558,8 +558,19 @@ impl InnerGlobalInterface {
         let has_64bit_ep_req = has_64bit_ep_req(version);
         let mut csg = KVec::with_capacity(csg_num, GFP_KERNEL)?;
         for csg_idx in 0..csg_num {
+            let first_cs = csg.first().and_then(|first: &CsgInterface| first.cs(0));
             let mut entry = CsgInterface::new(csg_idx)?;
-            entry.enable(shared_section, csg_idx, csg_stride, has_64bit_ep_req)?;
+            entry.enable(
+                shared_section,
+                csg_idx,
+                csg_stride,
+                has_64bit_ep_req,
+                first_cs,
+            )?;
+            if csg.first().is_some_and(|first| !entry.matches(first)) {
+                pr_err!("CSG {} does not match CSG 0\n", csg_idx);
+                return Err(EINVAL);
+            }
             csg.push(entry, GFP_KERNEL)?;
         }
 
