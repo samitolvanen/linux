@@ -14,6 +14,7 @@ use crate::error::to_result;
 use crate::irq::flags::Flags;
 use crate::prelude::*;
 use crate::str::CStr;
+use crate::sync::aref::ARef;
 use crate::sync::Arc;
 
 /// The value that can be returned from a [`Handler`] or a [`ThreadedHandler`].
@@ -187,6 +188,8 @@ pub struct Registration<T: Handler> {
     #[pin]
     inner: Devres<RegistrationInner>,
 
+    dev: ARef<Device>,
+
     #[pin]
     handler: T,
 
@@ -206,6 +209,7 @@ impl<T: Handler> Registration<T> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(&this in Self {
             handler <- handler,
+            dev: request.dev.into(),
             inner <- Devres::new(
                 request.dev,
                 try_pin_init!(RegistrationInner {
@@ -262,13 +266,16 @@ impl<T: Handler> Registration<T> {
 ///
 /// This function should be only used as the callback in `request_irq`.
 unsafe extern "C" fn handle_irq_callback<T: Handler>(_irq: i32, ptr: *mut c_void) -> c_uint {
-    // SAFETY: `ptr` is a pointer to `Registration<T>` set in `Registration::new`
-    let registration = unsafe { &*(ptr as *const Registration<T>) };
+    let registration = ptr.cast_const().cast::<Registration<T>>();
+    // SAFETY: `ptr` points to the `Registration<T>` set in `Registration::new`, and its `inner`
+    // may not be initialized yet. `handler` and `dev` are initialized before the IRQ is requested
+    // and dropped after `inner` frees it.
+    let (handler, dev) = unsafe { (&(*registration).handler, &(*registration).dev) };
     // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
     // callback is running implies that the device has not yet been unbound.
-    let device = unsafe { registration.inner.device().as_bound() };
+    let device = unsafe { dev.as_bound() };
 
-    T::handle(&registration.handler, device) as c_uint
+    T::handle(handler, device) as c_uint
 }
 
 /// The value that can be returned from [`ThreadedHandler::handle`].
@@ -403,6 +410,8 @@ pub struct ThreadedRegistration<T: ThreadedHandler> {
     #[pin]
     inner: Devres<RegistrationInner>,
 
+    dev: ARef<Device>,
+
     #[pin]
     handler: T,
 
@@ -422,6 +431,7 @@ impl<T: ThreadedHandler> ThreadedRegistration<T> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(&this in Self {
             handler <- handler,
+            dev: request.dev.into(),
             inner <- Devres::new(
                 request.dev,
                 try_pin_init!(RegistrationInner {
@@ -482,24 +492,30 @@ unsafe extern "C" fn handle_threaded_irq_callback<T: ThreadedHandler>(
     _irq: i32,
     ptr: *mut c_void,
 ) -> c_uint {
-    // SAFETY: `ptr` is a pointer to `ThreadedRegistration<T>` set in `ThreadedRegistration::new`
-    let registration = unsafe { &*(ptr as *const ThreadedRegistration<T>) };
+    let registration = ptr.cast_const().cast::<ThreadedRegistration<T>>();
+    // SAFETY: `ptr` points to the `ThreadedRegistration<T>` set in `ThreadedRegistration::new`,
+    // and its `inner` may not be initialized yet. `handler` and `dev` are initialized before the
+    // IRQ is requested and dropped after `inner` frees it.
+    let (handler, dev) = unsafe { (&(*registration).handler, &(*registration).dev) };
     // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
     // callback is running implies that the device has not yet been unbound.
-    let device = unsafe { registration.inner.device().as_bound() };
+    let device = unsafe { dev.as_bound() };
 
-    T::handle(&registration.handler, device) as c_uint
+    T::handle(handler, device) as c_uint
 }
 
 /// # Safety
 ///
 /// This function should be only used as the callback in `request_threaded_irq`.
 unsafe extern "C" fn thread_fn_callback<T: ThreadedHandler>(_irq: i32, ptr: *mut c_void) -> c_uint {
-    // SAFETY: `ptr` is a pointer to `ThreadedRegistration<T>` set in `ThreadedRegistration::new`
-    let registration = unsafe { &*(ptr as *const ThreadedRegistration<T>) };
+    let registration = ptr.cast_const().cast::<ThreadedRegistration<T>>();
+    // SAFETY: `ptr` points to the `ThreadedRegistration<T>` set in `ThreadedRegistration::new`,
+    // and its `inner` may not be initialized yet. `handler` and `dev` are initialized before the
+    // IRQ is requested and dropped after `inner` frees it.
+    let (handler, dev) = unsafe { (&(*registration).handler, &(*registration).dev) };
     // SAFETY: The irq callback is removed before the device is unbound, so the fact that the irq
     // callback is running implies that the device has not yet been unbound.
-    let device = unsafe { registration.inner.device().as_bound() };
+    let device = unsafe { dev.as_bound() };
 
-    T::handle_threaded(&registration.handler, device) as c_uint
+    T::handle_threaded(handler, device) as c_uint
 }
