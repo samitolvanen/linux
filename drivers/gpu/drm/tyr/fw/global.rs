@@ -602,8 +602,13 @@ impl InnerGlobalInterface {
             return Err(EINVAL);
         }
 
-        if csg_num == 0 {
-            dev_err!(dev, "No CSG slots available\n");
+        if csg_num < super::MIN_CSG {
+            dev_err!(
+                dev,
+                "Too few CSGs: hardware reports {}, min required {}\n",
+                csg_num,
+                super::MIN_CSG
+            );
             return Err(EINVAL);
         }
 
