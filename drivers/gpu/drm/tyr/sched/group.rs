@@ -270,9 +270,10 @@ pub(crate) struct Group {
     inner: Mutex<GroupInner>,
     /// Serializes a submit's prepare-to-commit window on this group, so
     /// every queue claims its pipeline slots and fence seqnos in the
-    /// same order.
+    /// same order. `drain_queues` takes it once as a barrier. `submit`
+    /// takes `inner` under it to recheck `can_run()`.
     ///
-    /// Lock order `submit_lock > {drm_exec, job queue}`, with nothing
+    /// Lock order `submit_lock > {inner, drm_exec, job queue}`, with nothing
     /// else held when it is taken. The window allocates and holds the VM
     /// reservation lock, so the lock is off limits to dma-fence
     /// signalling sections and must not cover a userspace copy.
@@ -314,8 +315,8 @@ pub(crate) struct Group {
     /// Worker that drains the queues and drops the reference `term_work`
     /// ran with, on the cleanup workqueue.
     ///
-    /// The drain waits on hardware fences, which is not allowed inside
-    /// the signalling annotation.
+    /// The drain waits on fences, which is not allowed inside the
+    /// signalling annotation.
     ///
     /// The item is embedded in the group, so the enqueue allocates
     /// nothing and has no `NoMemory` case to handle, unlike
@@ -733,6 +734,9 @@ impl Group {
 
     /// Drains every queue. Same context rule as `Queue::drain`.
     fn drain_queues(&self) {
+        // A submit holding the lock commits before the drain gets it. The group
+        // can no longer run, so a later submit fails its `can_run()` recheck.
+        drop(self.submit_lock.lock());
         for queue in self.queues.iter() {
             queue.drain();
         }
@@ -934,6 +938,10 @@ impl Group {
         ctx.collect_signal_ops()?;
 
         let _submit_lock = self.submit_lock.lock();
+
+        if !self.can_run() {
+            return Err(EINVAL);
+        }
 
         for idx in 0..job_count {
             ctx.prepare(idx)?;
