@@ -199,6 +199,16 @@ impl CsInterface {
         Ok(())
     }
 
+    /// Returns whether `other` reports the same `STREAM_FEATURES`.
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (CsInterfaceState::Enabled(a), CsInterfaceState::Enabled(b)) => {
+                a.cs_control.read(STREAM_FEATURES) == b.cs_control.read(STREAM_FEATURES)
+            }
+            _ => false,
+        }
+    }
+
     pub(in super::super) fn work_regs(&self) -> Result<u32> {
         let enabled = match &self.state {
             CsInterfaceState::Enabled(e) => e,

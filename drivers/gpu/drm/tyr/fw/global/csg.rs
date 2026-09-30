@@ -40,6 +40,7 @@ use crate::fw::{
         CSG_REQ,
         CSG_SUSPEND_BUF,
         CS_CONTROL_BLOCK_SIZE,
+        GROUP_FEATURES,
         GROUP_INPUT_VA,
         GROUP_OUTPUT_VA,
         GROUP_PROTM_SUSPEND_SIZE,
@@ -108,6 +109,8 @@ struct EnabledCsgInterface {
     csg_input: FwInterface<FwRegion<CSG_INPUT_BLOCK_SIZE>>,
     /// Output block interface - firmware writes CSG acknowledgements here.
     csg_output: FwInterface<Region<CSG_OUTPUT_BLOCK_SIZE>>,
+    /// CSG features (read from GROUP_FEATURES).
+    features: GROUP_FEATURES,
     /// Suspend buffer size (read from GROUP_SUSPEND_SIZE).
     suspend_size: u32,
     /// Protected-mode suspend buffer size (read from GROUP_PROTM_SUSPEND_SIZE).
@@ -127,7 +130,6 @@ pub(crate) struct CsgInterface {
     /// Current interface state (Disabled or Enabled).
     state: CsgInterfaceState,
     /// CSG identifier/index number.
-    #[expect(dead_code)]
     csg_idx: usize,
 }
 
@@ -165,6 +167,7 @@ impl CsgInterface {
         shared_section: &SharedSectionInfo,
         csg_idx: usize,
         csg_stride: usize,
+        first_cs: Option<&CsInterface>,
     ) -> Result {
         let vmap = &shared_section.vmap;
         let va_range = &shared_section.va_range;
@@ -242,6 +245,7 @@ impl CsgInterface {
         let enabled = EnabledCsgInterface {
             csg_input,
             csg_output,
+            features: csg_control.read(GROUP_FEATURES),
             suspend_size: csg_control.read(GROUP_SUSPEND_SIZE).value().get(),
             protm_suspend_size: csg_control.read(GROUP_PROTM_SUSPEND_SIZE).value().get(),
             cs_stride,
@@ -250,7 +254,7 @@ impl CsgInterface {
         };
 
         self.state = CsgInterfaceState::Enabled(enabled);
-        self.init_cs(dev, shared_section, csg_control_offset)?;
+        self.init_cs(dev, shared_section, csg_control_offset, first_cs)?;
         Ok(())
     }
 
@@ -262,6 +266,7 @@ impl CsgInterface {
         dev: &Device,
         shared_section: &SharedSectionInfo,
         csg_control_offset: usize,
+        first_cs: Option<&CsInterface>,
     ) -> Result {
         let enabled = match &mut self.state {
             CsgInterfaceState::Enabled(e) => e,
@@ -279,10 +284,37 @@ impl CsgInterface {
                 enabled.cs_stride,
             )?;
 
+            if first_cs
+                .or(enabled.cs.first())
+                .is_some_and(|first| !cs.matches(first))
+            {
+                dev_err!(
+                    dev,
+                    "CSG {} CS {} does not match CSG 0 CS 0\n",
+                    self.csg_idx,
+                    cs_idx
+                );
+                return Err(EINVAL);
+            }
+
             enabled.cs.push(cs, GFP_KERNEL)?;
         }
 
         Ok(())
+    }
+
+    /// Returns whether `other` reports the same features, suspend buffer
+    /// sizes and CS count.
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        match (&self.state, &other.state) {
+            (CsgInterfaceState::Enabled(a), CsgInterfaceState::Enabled(b)) => {
+                a.features == b.features
+                    && a.suspend_size == b.suspend_size
+                    && a.protm_suspend_size == b.protm_suspend_size
+                    && a.cs_num == b.cs_num
+            }
+            _ => false,
+        }
     }
 
     pub(in super::super) fn suspend_buf_sizes(&self) -> Result<(u32, u32)> {

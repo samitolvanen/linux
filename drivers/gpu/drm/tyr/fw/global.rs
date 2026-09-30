@@ -614,8 +614,14 @@ impl InnerGlobalInterface {
 
         let mut csg = KVec::with_capacity(csg_num, GFP_KERNEL)?;
         for csg_idx in 0..csg_num {
+            let first_cs = csg.first().and_then(|first: &CsgInterface| first.cs(0));
             let mut entry = CsgInterface::new(csg_idx)?;
-            entry.enable(dev, shared_section, csg_idx, csg_stride)?;
+            entry.enable(dev, shared_section, csg_idx, csg_stride, first_cs)?;
+
+            if csg.first().is_some_and(|first| !entry.matches(first)) {
+                dev_err!(dev, "CSG {} does not match CSG 0\n", csg_idx);
+                return Err(EINVAL);
+            }
 
             csg.push(entry, GFP_KERNEL)?;
         }

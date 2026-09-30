@@ -78,6 +78,7 @@ pub(in crate::fw) use self::{
     },
     csg::{
         control::{
+            GROUP_FEATURES,
             GROUP_INPUT_VA,
             GROUP_OUTPUT_VA,
             GROUP_PROTM_SUSPEND_SIZE,
