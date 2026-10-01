@@ -695,6 +695,8 @@ impl Group {
                 },
             );
         }
+
+        TyrDrmDeviceData::schedule_sync_upd(&self.tdev);
     }
 
     /// Drains every queue. Same context rule as `Queue::drain`.
