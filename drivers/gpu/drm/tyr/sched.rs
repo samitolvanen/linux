@@ -565,7 +565,7 @@ impl Scheduler {
     ///
     /// The id-0 (idle/runnable) and id-1 (waiting) memberships are
     /// independent; both are handled.
-    pub(crate) fn detach_destroyed_group(&mut self, group: &Arc<Group>) {
+    pub(crate) fn detach_group(&mut self, group: &Arc<Group>) {
         let priority = group.priority as usize;
         let list_state = group.with_locked_inner(|inner| inner.list_state);
 
