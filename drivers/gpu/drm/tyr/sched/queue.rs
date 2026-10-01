@@ -1158,7 +1158,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             ctx.job
                 .group
                 .with_locked_inner(|inner| inner.mark_timedout());
-            TyrDrmDeviceData::schedule_tick(&ctx.job.group.tdev);
+            ctx.job.group.detach_and_terminate();
             if let Some(done_seqno) = ctx.job.done_seqno() {
                 self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));
             }
