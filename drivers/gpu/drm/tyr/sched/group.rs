@@ -663,6 +663,24 @@ impl Group {
         }
     }
 
+    /// Detaches the group from the scheduler lists and schedules its
+    /// terminal cleanup. The caller must have made `can_run()` false.
+    pub(crate) fn detach_and_terminate(self: &Arc<Self>) {
+        let csg_id = self.tdev.with_locked_scheduler(|sched| {
+            sched.detach_group(self);
+            Ok(self.with_locked_inner(|inner| inner.csg_id))
+        });
+
+        if matches!(csg_id, Ok(Some(_))) {
+            // The group is bound. The tick observes `can_run() == false`,
+            // stages terminate, evicts, and routes the group through
+            // `schedule_term`.
+            TyrDrmDeviceData::schedule_tick(&self.tdev);
+        } else {
+            self.schedule_term();
+        }
+    }
+
     /// Leaks `group` after a failed enqueue of `release_work`.
     ///
     /// The failure is not expected. A drop here may release the last
@@ -1289,45 +1307,29 @@ impl Pool {
         Ok(())
     }
 
-    fn destroy_group_index(&self, ddev: &TyrDrmDevice, index: usize) -> Result {
+    fn destroy_group_index(&self, index: usize) -> Result {
         let group = self.0.remove(index)?;
 
         group.with_locked_inner(|inner| {
             inner.fatal_error = Some(ECANCELED);
         });
 
-        let csg_id = ddev.with_locked_scheduler(|sched| {
-            sched.detach_destroyed_group(&group);
-            Ok(group.with_locked_inner(|inner| inner.csg_id))
-        });
-
-        if matches!(csg_id, Ok(Some(_))) {
-            // Bound: the tick observes `can_run() == false`, stages
-            // terminate, evicts, and routes the group through
-            // `schedule_term`.
-            TyrDrmDeviceData::schedule_tick(&ARef::from(ddev));
-        } else {
-            group.schedule_term();
-        }
+        group.detach_and_terminate();
 
         Ok(())
     }
 
-    pub(crate) fn destroy_group(
-        &self,
-        ddev: &TyrDrmDevice,
-        groupdestroy: &uapi::drm_panthor_group_destroy,
-    ) -> Result {
+    pub(crate) fn destroy_group(&self, groupdestroy: &uapi::drm_panthor_group_destroy) -> Result {
         if groupdestroy.pad != 0 {
             return Err(EINVAL);
         }
 
-        self.destroy_group_index(ddev, groupdestroy.group_handle as usize)
+        self.destroy_group_index(groupdestroy.group_handle as usize)
     }
 
-    pub(crate) fn destroy_all(&self, ddev: &TyrDrmDevice) -> Result {
+    pub(crate) fn destroy_all(&self) -> Result {
         self.0.for_each(|index, _| {
-            let _ = self.destroy_group_index(ddev, index);
+            let _ = self.destroy_group_index(index);
 
             Ok(())
         })

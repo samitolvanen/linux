@@ -225,7 +225,7 @@ impl drm::file::DriverFile for TyrDrmFileData {
 #[pinned_drop]
 impl PinnedDrop for TyrDrmFileData {
     fn drop(self: Pin<&mut Self>) {
-        if let Err(e) = self.as_ref().group_pool().destroy_all(&self.tdev) {
+        if let Err(e) = self.as_ref().group_pool().destroy_all() {
             pr_err!("Failed to destroy all groups: {:?}\n", e);
         }
 
@@ -826,13 +826,11 @@ impl TyrDrmFileData {
     }
 
     pub(crate) fn group_destroy(
-        ddev: &TyrDrmDevice,
+        _ddev: &TyrDrmDevice,
         groupdestroy: &mut uapi::drm_panthor_group_destroy,
         file: &TyrDrmFile,
     ) -> Result<u32> {
-        file.inner()
-            .group_pool()
-            .destroy_group(ddev, groupdestroy)?;
+        file.inner().group_pool().destroy_group(groupdestroy)?;
 
         Ok(0)
     }
