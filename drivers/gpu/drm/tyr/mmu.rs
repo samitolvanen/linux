@@ -60,7 +60,7 @@ use crate::{
 };
 
 pub(crate) mod address_space;
-mod faults;
+pub(crate) mod faults;
 pub(crate) mod irq;
 
 pub(crate) type AsSlotManager = SlotManager<AddressSpaceManager, MAX_AS>;

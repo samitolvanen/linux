@@ -12,8 +12,7 @@ use kernel::{
         Io,
         Region, //
     },
-    prelude::*,
-    str::CStr, //
+    prelude::*, //
 };
 
 use super::SharedSectionInfo;
@@ -54,45 +53,8 @@ use crate::fw::interfaces::{
     STREAM_OUTPUT_VA, //
 };
 use crate::fw::region::FwRegion;
+use crate::mmu::faults;
 use crate::regs::join_u64;
-
-/// Names for `CS_FATAL.exception_type` codes, used by `CsInterface::decode_fatal`.
-const FATAL_EXCEPTION_NAMES: &[(u32, &CStr)] = &[
-    (0x00, c"OK"),
-    (0x40, c"CS_CONFIG_FAULT"),
-    (0x41, c"CS_UNRECOVERABLE"),
-    (0x44, c"CS_ENDPOINT_FAULT"),
-    (0x48, c"CS_BUS_FAULT"),
-    (0x49, c"CS_INVALID_INSTRUCTION"),
-    (0x4A, c"CS_CALL_STACK_OVERFLOW"),
-    (0x68, c"FIRMWARE_INTERNAL_ERROR"),
-];
-
-/// Names for `CS_FAULT.exception_type` codes, used by `CsInterface::decode_fault`.
-const FAULT_EXCEPTION_NAMES: &[(u32, &CStr)] = &[
-    (0x00, c"OK"),
-    (0x05, c"KABOOM"),
-    (0x0F, c"CS_RESOURCE_TERMINATED"),
-    (0x48, c"CS_BUS_FAULT"),
-    (0x4B, c"CS_INHERIT_FAULT"),
-    (0x50, c"INSTR_INVALID_PC"),
-    (0x51, c"INSTR_INVALID_ENC"),
-    (0x55, c"INSTR_BARRIER_FAULT"),
-    (0x58, c"DATA_INVALID_FAULT"),
-    (0x59, c"TILE_RANGE_FAULT"),
-    (0x5A, c"ADDR_RANGE_FAULT"),
-    (0x5B, c"IMPRECISE_FAULT"),
-    (0x69, c"RESOURCE_EVICTION_TIMEOUT"),
-];
-
-fn exception_name(table: &[(u32, &'static CStr)], code: u32) -> &'static CStr {
-    for &(c, name) in table {
-        if c == code {
-            return name;
-        }
-    }
-    c"UNKNOWN"
-}
 
 /// Offset from GROUP_CONTROL_BLOCK start to the first STREAM_CONTROL block.
 const CS_CONTROL_OFFSET: usize = 0x40;
@@ -471,7 +433,7 @@ impl CsInterface {
         let info = enabled.cs_output.read(CS_FATAL_INFO).into_raw();
         let exception_type = fatal & 0xFF;
         let exception_data = (fatal >> 8) & 0x00FF_FFFF;
-        let name = exception_name(FATAL_EXCEPTION_NAMES, exception_type);
+        let name = faults::get_exception_name(exception_type);
 
         dev_warn!(
             dev,
@@ -504,7 +466,7 @@ impl CsInterface {
         let info = enabled.cs_output.read(CS_FAULT_INFO).into_raw();
         let exception_type = fault & 0xFF;
         let exception_data = (fault >> 8) & 0x00FF_FFFF;
-        let name = exception_name(FAULT_EXCEPTION_NAMES, exception_type);
+        let name = faults::get_exception_name(exception_type);
 
         dev_warn!(
             dev,
