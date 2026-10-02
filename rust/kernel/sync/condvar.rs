@@ -177,6 +177,24 @@ impl CondVar {
         crate::current!().signal_pending()
     }
 
+    /// Releases the lock and waits for a notification in uninterruptible mode, with a timeout.
+    ///
+    /// Atomically releases the given lock (whose ownership is proven by the guard) and puts the
+    /// thread to sleep, reacquiring the lock on wake up. It wakes up when notified by
+    /// [`CondVar::notify_one`] or [`CondVar::notify_all`], or when a timeout occurs. It may also
+    /// wake up spuriously.
+    ///
+    /// Returns the remaining sleep duration, or zero if the timeout elapsed.
+    #[must_use = "wait_timeout returns zero on a timeout, so the caller must check the return value"]
+    pub fn wait_timeout<T: ?Sized, B: Backend>(
+        &self,
+        guard: &mut Guard<'_, T, B>,
+        jiffies: Jiffies,
+    ) -> Jiffies {
+        let jiffies = jiffies.try_into().unwrap_or(MAX_SCHEDULE_TIMEOUT);
+        self.wait_internal(TASK_UNINTERRUPTIBLE, guard, jiffies) as Jiffies
+    }
+
     /// Releases the lock and waits for a notification in interruptible mode.
     ///
     /// Atomically releases the given lock (whose ownership is proven by the guard) and puts the
@@ -241,7 +259,7 @@ impl CondVar {
     }
 }
 
-/// The return type of `wait_timeout`.
+/// The return type of [`CondVar::wait_interruptible_timeout`].
 pub enum CondVarTimeoutResult {
     /// The timeout was reached.
     Timeout,
