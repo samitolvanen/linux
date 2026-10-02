@@ -529,32 +529,29 @@ impl QueueData {
 
     fn signal_submit_fences_up_to(&self, up_to_seqno: u64, result: Result) {
         loop {
-            let fence = {
-                let mut pending = self.pending_submit_fences.lock();
-                let head = pending.head;
-                let Some(entry) = pending.vec.get_mut(head) else {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                };
-                if entry.done_seqno > up_to_seqno {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                }
-                let fence = entry.fence.take();
-                pending.head = head + 1;
-                fence
+            let _annotation = DmaFenceSignallingAnnotation::new();
+            let mut pending = self.pending_submit_fences.lock();
+            let head = pending.head;
+            let Some(entry) = pending.vec.get_mut(head) else {
+                Self::maybe_truncate_pending(&mut pending);
+                break;
             };
+            if entry.done_seqno > up_to_seqno {
+                Self::maybe_truncate_pending(&mut pending);
+                break;
+            }
+            let fence = entry.fence.take();
+            pending.head = head + 1;
 
             if let Some(fence) = fence {
-                let _annotation = DmaFenceSignallingAnnotation::new();
                 fence.signal(result);
             }
         }
     }
 
     /// Signals each leading pending submit fence whose `done_seqno` is
-    /// `<= up_to_seqno`, dropping the queue lock before each
-    /// `dma_fence_signal()` so no driver lock is held across the signal.
+    /// `<= up_to_seqno`. Each fence signals under `pending_submit_fences`,
+    /// so concurrent drains signal in seqno order.
     ///
     /// For each completed job, the per-job profiling samples are read
     /// back from the slot BO and accumulated into `group`'s fdinfo.
@@ -567,33 +564,30 @@ impl QueueData {
         // No sample may be read before the sync object that marks it complete.
         dma_rmb();
         loop {
-            let (profiling_mask, sample, fence) = {
-                let mut pending = self.pending_submit_fences.lock();
-                let head = pending.head;
-                let Some(entry) = pending.vec.get_mut(head) else {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                };
-                if entry.done_seqno > up_to_seqno {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                }
-                let profiling_mask = entry.profiling_mask;
-                // Read the sample before the head advance lets its slot be
-                // reassigned.
-                let sample =
-                    (profiling_mask != 0).then(|| self.read_profiling_sample(entry.profiling_slot));
-                let fence = entry.fence.take();
-                pending.head = head + 1;
-                (profiling_mask, sample, fence)
+            let _annotation = DmaFenceSignallingAnnotation::new();
+            let mut pending = self.pending_submit_fences.lock();
+            let head = pending.head;
+            let Some(entry) = pending.vec.get_mut(head) else {
+                Self::maybe_truncate_pending(&mut pending);
+                break;
             };
+            if entry.done_seqno > up_to_seqno {
+                Self::maybe_truncate_pending(&mut pending);
+                break;
+            }
+            let profiling_mask = entry.profiling_mask;
+            // Read the sample before the head advance lets its slot be
+            // reassigned.
+            let sample =
+                (profiling_mask != 0).then(|| self.read_profiling_sample(entry.profiling_slot));
+            let fence = entry.fence.take();
+            pending.head = head + 1;
 
             if let Some(sample) = sample {
                 Self::accumulate_profiling_sample(group, sample, profiling_mask);
             }
 
             if let Some(fence) = fence {
-                let _annotation = DmaFenceSignallingAnnotation::new();
                 fence.signal(Ok(()));
             }
         }
@@ -699,24 +693,22 @@ impl QueueData {
     }
 
     fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
-        let fence = {
-            let mut pending = self.pending_submit_fences.lock();
-            let head = pending.head;
-            let mut position = None;
-            for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
-                if entry.done_seqno == done_seqno {
-                    position = Some(idx);
-                    break;
-                }
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        let mut pending = self.pending_submit_fences.lock();
+        let head = pending.head;
+        let mut position = None;
+        for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
+            if entry.done_seqno == done_seqno {
+                position = Some(idx);
+                break;
             }
-            position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()))
-        };
+        }
+        let fence = position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()));
 
         let Some(fence) = fence else {
             return false;
         };
 
-        let _annotation = DmaFenceSignallingAnnotation::new();
         fence.signal(result);
         true
     }
