@@ -315,56 +315,27 @@ impl QueueData {
         )
     }
 
+    /// Signals each leading pending submit fence whose `done_seqno` is
+    /// `<= up_to_seqno`. Each fence signals under `pending_submit_fences`,
+    /// so concurrent drains signal in seqno order.
     fn signal_submit_fences_up_to(&self, up_to_seqno: u64, result: Result) {
         loop {
-            let fence = {
-                let mut pending = self.pending_submit_fences.lock();
-                let head = pending.head;
-                let Some(entry) = pending.vec.get_mut(head) else {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                };
-                if entry.done_seqno > up_to_seqno {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                }
-                let fence = entry.fence.take();
-                pending.head = head + 1;
-                fence
+            let _annotation = DmaFenceSignallingAnnotation::new();
+            let mut pending = self.pending_submit_fences.lock();
+            let head = pending.head;
+            let Some(entry) = pending.vec.get_mut(head) else {
+                Self::maybe_truncate_pending(&mut pending);
+                break;
             };
-
-            if let Some(fence) = fence {
-                let _annotation = DmaFenceSignallingAnnotation::new();
-                fence.signal(result);
+            if entry.done_seqno > up_to_seqno {
+                Self::maybe_truncate_pending(&mut pending);
+                break;
             }
-        }
-    }
-
-    /// Signals each leading pending submit fence whose `done_seqno` is
-    /// `<= up_to_seqno`, dropping the queue lock before each
-    /// `dma_fence_signal()` so no driver lock is held across the signal.
-    fn complete_pending_fences_up_to(&self, up_to_seqno: u64) {
-        loop {
-            let (_done_seqno, fence) = {
-                let mut pending = self.pending_submit_fences.lock();
-                let head = pending.head;
-                let Some(entry) = pending.vec.get_mut(head) else {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                };
-                if entry.done_seqno > up_to_seqno {
-                    Self::maybe_truncate_pending(&mut pending);
-                    break;
-                }
-                let done_seqno = entry.done_seqno;
-                let fence = entry.fence.take();
-                pending.head = head + 1;
-                (done_seqno, fence)
-            };
+            let fence = entry.fence.take();
+            pending.head = head + 1;
 
             if let Some(fence) = fence {
-                let _annotation = DmaFenceSignallingAnnotation::new();
-                fence.signal(Ok(()));
+                fence.signal(result);
             }
         }
     }
@@ -427,24 +398,22 @@ impl QueueData {
     }
 
     fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
-        let fence = {
-            let mut pending = self.pending_submit_fences.lock();
-            let head = pending.head;
-            let mut position = None;
-            for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
-                if entry.done_seqno == done_seqno {
-                    position = Some(idx);
-                    break;
-                }
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        let mut pending = self.pending_submit_fences.lock();
+        let head = pending.head;
+        let mut position = None;
+        for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
+            if entry.done_seqno == done_seqno {
+                position = Some(idx);
+                break;
             }
-            position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()))
-        };
+        }
+        let fence = position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()));
 
         let Some(fence) = fence else {
             return false;
         };
 
-        let _annotation = DmaFenceSignallingAnnotation::new();
         fence.signal(result);
         true
     }
@@ -461,7 +430,7 @@ impl QueueData {
     /// The completion stage also calls this as a backstop for a missed
     /// sync-update IRQ.
     pub(in crate::sched) fn complete_submit_fences(&self, syncobj_seqno: u64) {
-        self.complete_pending_fences_up_to(syncobj_seqno);
+        self.signal_submit_fences_up_to(syncobj_seqno, Ok(()));
     }
 
     /// Stages `err` on every pending submit fence whose `done_seqno`
@@ -471,7 +440,7 @@ impl QueueData {
     /// The caller is expected to pass the value of the per-queue
     /// syncobj, read with `Group::read_syncobj`. The fences are left
     /// in the pending list. The regular seqno-ordered drain in
-    /// `Self::complete_pending_fences_up_to` will signal them at
+    /// `Self::complete_submit_fences` will signal them at
     /// their natural completion points so waiters still observe a
     /// monotonic submit-order signal sequence.
     ///
