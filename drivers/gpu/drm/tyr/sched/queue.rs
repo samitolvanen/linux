@@ -170,7 +170,7 @@ struct PendingSubmitFence {
     /// completion to accumulate the group's GPU usage.
     profiling_slot: u32,
     /// Profiling flags the wrapped stream emitted samples for. `0` when
-    /// profiling was disabled for this job.
+    /// profiling was disabled for this job or its submit failed.
     profiling_mask: u32,
     fence: Option<DriverDmaFence<QueueFenceData, Published>>,
 }
@@ -183,8 +183,9 @@ struct PendingSubmitFence {
 /// prefix `vec[..head]` is drained but not yet truncated and every
 /// such entry has `fence == None`. The suffix `vec[head..]` is the
 /// live ordered list; an entry inside it may still have `fence ==
-/// None` if an error path already took the fence out, which is
-/// treated as a hole and skipped on drain.
+/// None` if the completion stage or `QueueData::fail_submit_fence`
+/// signaled it as the oldest live entry. Such a hole is skipped on
+/// drain.
 /// `Queue::maybe_truncate_pending` compacts the prefix away once
 /// `head` exceeds `max(len / 2, 16)`, or once `head` is non-zero in a
 /// full vec.
@@ -713,6 +714,46 @@ impl QueueData {
         true
     }
 
+    /// Signals `fence`, which was never pushed, with `err`. Hands it back
+    /// instead while an older pending fence is live.
+    fn signal_unpushed_fence(
+        &self,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+        err: Error,
+    ) -> Result<(), DriverDmaFence<QueueFenceData, Published>> {
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        let pending = self.pending_submit_fences.lock();
+        let head = pending.head;
+        if pending.vec.iter().skip(head).any(|e| e.fence.is_some()) {
+            return Err(fence);
+        }
+        fence.signal(Err(err));
+        Ok(())
+    }
+
+    /// Fails the pending fence for `done_seqno` with `err`. While an older
+    /// pending fence is live, the error is staged for the in-order drain.
+    fn fail_submit_fence(&self, done_seqno: u64, err: Error) {
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        let mut pending = self.pending_submit_fences.lock();
+        let head = pending.head;
+        let mut older_live = false;
+        for entry in pending.vec.iter_mut().skip(head) {
+            if entry.done_seqno == done_seqno {
+                entry.profiling_mask = 0;
+                if older_live {
+                    if let Some(fence) = entry.fence.as_mut() {
+                        fence.set_error(err);
+                    }
+                } else if let Some(fence) = entry.fence.take() {
+                    fence.signal(Err(err));
+                }
+                return;
+            }
+            older_live |= entry.fence.is_some();
+        }
+    }
+
     /// Signals every leading pending submit fence whose stored
     /// `done_seqno` is at or below `syncobj_seqno`.
     ///
@@ -913,8 +954,10 @@ impl QueueOps for TyrQueueOps {
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
         if !job.job.group.can_run() {
-            fence.signal(Err(ECANCELED));
             TyrDrmDeviceData::schedule_tick(&job.job.group.tdev);
+            if let Err(fence) = self.data.signal_unpushed_fence(fence, ECANCELED) {
+                return Ok(SubmitResult::NoResources(fence));
+            }
             return Ok(SubmitResult::Submitted);
         }
 
@@ -929,7 +972,9 @@ impl QueueOps for TyrQueueOps {
             }
 
             pr_warn_once!("queue ring space check failed: {}\n", err.to_errno());
-            fence.signal(Err(err));
+            if let Err(fence) = self.data.signal_unpushed_fence(fence, err) {
+                return Ok(SubmitResult::NoResources(fence));
+            }
             return Ok(SubmitResult::Submitted);
         }
 
@@ -947,14 +992,18 @@ impl QueueOps for TyrQueueOps {
             Ok(completion_point) => completion_point,
             Err(err) => {
                 pr_warn_once!("queue ring claim failed: {}\n", err.to_errno());
-                fence.signal(Err(err));
+                if let Err(fence) = self.data.signal_unpushed_fence(fence, err) {
+                    return Ok(SubmitResult::NoResources(fence));
+                }
                 return Ok(SubmitResult::Submitted);
             }
         };
 
         let Some(done_seqno) = job.job.done_seqno() else {
             pr_warn_once!("queue job has no done seqno\n");
-            fence.signal(Err(EINVAL));
+            if let Err(fence) = self.data.signal_unpushed_fence(fence, EINVAL) {
+                return Ok(SubmitResult::NoResources(fence));
+            }
             return Ok(SubmitResult::Submitted);
         };
 
@@ -970,7 +1019,7 @@ impl QueueOps for TyrQueueOps {
 
         if let Err(err) = self.data.commit_ringbuf_range(ringbuf_completion_point) {
             pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
-            self.data.signal_submit_fence(done_seqno, Err(err));
+            self.data.fail_submit_fence(done_seqno, err);
             return Ok(SubmitResult::Submitted);
         }
 
@@ -1005,7 +1054,7 @@ impl QueueOps for TyrQueueOps {
         if active {
             if let Err(err) = kick_err {
                 pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
-                self.data.signal_submit_fence(done_seqno, Err(err));
+                self.data.fail_submit_fence(done_seqno, err);
                 return Ok(SubmitResult::Submitted);
             }
             // This path does not always schedule a tick, so record the busy
@@ -1045,7 +1094,7 @@ impl QueueOps for TyrQueueOps {
                 Ok(tick) => tick,
                 Err(err) => {
                     pr_warn_once!("queue group scheduling failed: {}\n", err.to_errno());
-                    self.data.signal_submit_fence(done_seqno, Err(err));
+                    self.data.fail_submit_fence(done_seqno, err);
                     return Ok(SubmitResult::Submitted);
                 }
             };
