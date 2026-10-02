@@ -133,7 +133,7 @@ impl<'a> GlobalInterfaceRequests<'a> {
     fn wait_acks(&self, reqs_mask: GLB_REQ, event_wait: &Wait, timeout_ms: u32) -> Result {
         let mask = reqs_mask.into_raw();
 
-        event_wait.wait_interruptible_timeout(timeout_ms, || {
+        event_wait.wait_timeout(timeout_ms, || {
             let req = self.input.read(GLB_REQ).into_raw() & mask;
             let ack = self.output.read(GLB_ACK).into_raw() & mask;
             if req == ack {
@@ -352,9 +352,7 @@ impl<'drm> GlobalInterface<'drm> {
     /// Wait timeouts and transient I/O errors are visible in the
     /// returned mask rather than in the error path, so callers can
     /// distinguish a stuck slot from a successful transition and see
-    /// exactly which sub-requests were honored. Signal interrupts
-    /// (`ERESTARTSYS`) propagate as `Err` so callers in syscall
-    /// context honor the kernel's restart-on-signal semantics.
+    /// exactly which sub-requests were honored.
     ///
     /// The wait predicate runs under the event-wait lock and must not
     /// re-acquire `inner`. `process_global_irq` already holds `inner`
@@ -381,7 +379,7 @@ impl<'drm> GlobalInterface<'drm> {
         // stable across the wait.
         let req = csg_input.read(CSG_REQ) & mask;
 
-        let wait_result = self.event_wait.wait_interruptible_timeout(timeout_ms, || {
+        let _ = self.event_wait.wait_timeout(timeout_ms, || {
             let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
             if ack == req {
                 Ok(WaitResult::Done)
@@ -389,9 +387,6 @@ impl<'drm> GlobalInterface<'drm> {
                 Ok(WaitResult::Retry)
             }
         });
-        if wait_result == Err(ERESTARTSYS) {
-            return Err(ERESTARTSYS);
-        }
 
         // Re-read ACK so the returned mask reflects what the firmware
         // acked even on timeout.

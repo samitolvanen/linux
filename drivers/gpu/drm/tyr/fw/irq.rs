@@ -94,7 +94,7 @@ impl JobIrqState {
 
     /// Waits until the firmware signals readiness via the GLB IRQ bit.
     pub(crate) fn wait_ready(&self, timeout_ms: u32) -> Result {
-        self.boot_wait.wait_interruptible_timeout(timeout_ms, || {
+        self.boot_wait.wait_timeout(timeout_ms, || {
             if self.fw_ready.load(Acquire) {
                 Ok(WaitResult::Done)
             } else {
