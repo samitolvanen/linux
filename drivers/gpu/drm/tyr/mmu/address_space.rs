@@ -322,7 +322,7 @@ impl AddressSpaceManager {
         };
         let cond = |status: &STATUS| -> bool { !status.active_ext() };
         let res =
-            poll::read_poll_timeout(op, cond, Delta::from_micros(50), Delta::from_millis(100));
+            poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
         if matches!(res, Err(e) if e == ETIMEDOUT) {
             // A stuck AS_ACTIVE bit only clears with a GPU reset.
             dev_err!(&self.pdev, "AS_ACTIVE bit stuck\n");
