@@ -859,7 +859,8 @@ where
 /// A reference to a GEM object that is known to have a mapped [`SGTable`].
 ///
 /// This is used by the Rust bindings with [`Devres`] in order to ensure that mappings for SGTables
-/// on GEM shmem objects are revoked on driver-unbind.
+/// on GEM shmem objects are revoked on driver-unbind. The table of an imported object belongs to
+/// the exporter and stays mapped until the object is released.
 ///
 /// # Invariants
 ///
@@ -887,9 +888,14 @@ impl<T: DriverObject> Drop for SGTableMap<T> {
     fn drop(&mut self) {
         // SAFETY: `obj` is always valid via our type invariants
         let obj = unsafe { self.obj.as_ref() };
+        if obj.is_imported() {
+            return;
+        }
+
         let _lock = DmaResvGuard::new(obj);
 
-        // SAFETY: We acquired the lock needed for calling this function above
+        // SAFETY: We hold the reservation lock, and the table of an object that is not imported
+        // belongs to the shmem helper.
         unsafe { bindings::__drm_gem_shmem_free_sgt_locked(obj.as_raw_shmem()) };
     }
 }
