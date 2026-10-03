@@ -391,10 +391,16 @@ impl<T: DriverObject> Object<T> {
                     Err(e) => {
                         // We can't make sure that the pages for this object are unmapped on
                         // driver-unbind, so we need to release the sgt
-                        // SAFETY:
-                        // - We grabbed the lock required for calling this function above
-                        // - We checked above that get_pages_sgt_locked() was successful
-                        unsafe { bindings::__drm_gem_shmem_free_sgt_locked(self.as_raw_shmem()) };
+                        if !self.is_imported() {
+                            // SAFETY:
+                            // - We grabbed the lock required for calling this function above
+                            // - We checked above that get_pages_sgt_locked() was successful
+                            // - The table of an object that is not imported belongs to the shmem
+                            //   helper
+                            unsafe {
+                                bindings::__drm_gem_shmem_free_sgt_locked(self.as_raw_shmem())
+                            };
+                        }
 
                         Err(e)
                     }
@@ -803,7 +809,8 @@ extern "C" fn prime_import_callback(
 /// A reference to a GEM object that is known to have a mapped [`SGTable`].
 ///
 /// This is used by the Rust bindings with [`Devres`] in order to ensure that mappings for SGTables
-/// on GEM shmem objects are revoked on driver-unbind.
+/// on GEM shmem objects are revoked on driver-unbind. The table of an imported object belongs to
+/// the exporter and stays mapped until the object is released.
 ///
 /// # Invariants
 ///
@@ -828,11 +835,15 @@ impl<T: DriverObject> Drop for SGTableMap<T> {
     fn drop(&mut self) {
         // SAFETY: `obj` is always valid via our type invariants
         let obj = unsafe { self.obj.as_ref() };
+        if obj.is_imported() {
+            return;
+        }
 
         // SAFETY: The dma_resv for GEM objects is initialized throughout its lifetime
         unsafe { bindings::dma_resv_lock(obj.raw_dma_resv(), ptr::null_mut()) };
 
-        // SAFETY: We acquired the lock needed for calling this function above
+        // SAFETY: We hold the reservation lock, and the table of an object that is not imported
+        // belongs to the shmem helper.
         unsafe { bindings::__drm_gem_shmem_free_sgt_locked(obj.as_raw_shmem()) };
 
         // SAFETY: We are releasing the lock we acquired above.
