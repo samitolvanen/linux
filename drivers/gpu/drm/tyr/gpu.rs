@@ -402,21 +402,32 @@ impl HwOps {
     }
 }
 
-/// Powers off the L2 block.
-fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
-    let io = (*iomem).access(dev)?;
-    io.write_reg(L2_PWROFF_LO::zeroed().with_const_request::<1>());
+/// Timeout for an L2 power transition to complete.
+const L2_TRANSITION_TIMEOUT: Delta = Delta::from_millis(20);
 
+/// Waits for an L2 power transition in progress to complete.
+fn l2_wait_transition(iomem: &Devres<IoMem>) -> Result {
     poll::read_poll_timeout(
         || {
-            let io = (*iomem).access(dev)?;
+            let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(io.read(L2_PWRTRANS_LO))
         },
         |status| status.changing() == 0,
         Delta::from_micros(100),
-        Delta::from_millis(20),
-    )
-    .inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
+        L2_TRANSITION_TIMEOUT,
+    )?;
+
+    Ok(())
+}
+
+/// Powers off the L2 block.
+fn l2_power_off(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+    l2_wait_transition(iomem).inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
+
+    let io = (*iomem).access(dev)?;
+    io.write_reg(L2_PWROFF_LO::zeroed().with_const_request::<1>());
+
+    l2_wait_transition(iomem).inspect_err(|_| dev_err!(dev, "Failed to power off the GPU.\n"))?;
 
     Ok(())
 }
@@ -455,6 +466,12 @@ fn l2_power_on(
         // The coherency protocol must be selected before the L2 powers up.
         io.write_reg(COHERENCY_ENABLE::zeroed().with_l2_cache_protocol_select(coherency));
         l2_config_set(dev, &io, soc_data);
+    }
+
+    l2_wait_transition(iomem).inspect_err(|_| dev_err!(dev, "Failed to power on the GPU.\n"))?;
+
+    {
+        let io = iomem.try_access().ok_or(ENODEV)?;
         io.write_reg(L2_PWRON_LO::zeroed().with_const_request::<1>());
     }
 
