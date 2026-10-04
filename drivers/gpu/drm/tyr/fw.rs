@@ -687,14 +687,12 @@ impl<'drm> Firmware<'drm> {
         let dev = self.dev.as_ref();
 
         for section in self.sections.iter() {
-            let va = section.mem.va_range();
-
             Self::init_section_mem(
                 dev,
                 &section.vmap,
                 &section.data,
                 section.section_flags,
-                va.end - va.start,
+                section.mem.size(),
             )?;
             Self::sync_section(dev, section.mem.bo())?;
         }

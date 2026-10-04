@@ -1002,8 +1002,9 @@ impl platform::Driver for TyrPlatformDriver {
 
         drop(pm.get(PMProfile::new().auto())?);
 
-        let populated = unreg_dev.pm.populate(pm);
-        debug_assert!(populated);
+        if !unreg_dev.pm.populate(pm) {
+            return Err(EBUSY);
+        }
 
         // The clocks and the regulator move into the data below.
         power_guard.dismiss();
