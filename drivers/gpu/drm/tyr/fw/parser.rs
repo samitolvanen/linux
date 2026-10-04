@@ -48,15 +48,19 @@ impl From<Bounded<u32, 2>> for CacheMode {
             0 => Self::None,
             1 => Self::Cached,
             2 => Self::UncachedCoherent,
-            3 => Self::CachedCoherent,
-            _ => unreachable!(),
+            _ => Self::CachedCoherent,
         }
     }
 }
 
 impl From<CacheMode> for Bounded<u32, 2> {
     fn from(value: CacheMode) -> Self {
-        Bounded::try_new(value as u32).unwrap()
+        match value {
+            CacheMode::None => Self::new::<0>(),
+            CacheMode::Cached => Self::new::<1>(),
+            CacheMode::UncachedCoherent => Self::new::<2>(),
+            CacheMode::CachedCoherent => Self::new::<3>(),
+        }
     }
 }
 

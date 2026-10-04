@@ -47,6 +47,7 @@ use crate::{
     fw::{
         interfaces::{
             FwInterface,
+            TimestampSource,
             CSG_ACK,
             CSG_CONTROL_BLOCK_SIZE,
             CSG_REQ,
@@ -89,13 +90,13 @@ pub(crate) use self::csg::{
 };
 
 /// Encodes a GLB timer timeout and selects the backing time source.
-pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
+pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, TimestampSource)> {
     // The max timeout is determined by the 31 bit size of the timeout field.
     let max_timeout = (1u32 << 31) - 1;
 
     let (timer_rate, timer_source) = match arch_timer_get_rate() {
-        Some(rate) => (u64::from(rate), Bounded::try_new(0).unwrap()),
-        _ if core_clk_rate != 0 => (core_clk_rate, Bounded::try_new(1).unwrap()),
+        Some(rate) => (u64::from(rate), TimestampSource::SystemTimestamp),
+        _ if core_clk_rate != 0 => (core_clk_rate, TimestampSource::GpuCounter),
         _ => return Err(EINVAL),
     };
 
@@ -662,7 +663,6 @@ impl InnerGlobalInterface {
         // Power-down delay after idle, in microseconds.
         const PWROFF_HYSTERESIS_US: u32 = 10_000;
         let (pwroff_timeout, pwroff_source) = conv_timeout(core_clk_rate, PWROFF_HYSTERESIS_US)?;
-        let pwroff_source = pwroff_source.into();
         let pwroff_timeout = Bounded::<u32, 31>::try_new(pwroff_timeout).ok_or(EINVAL)?;
         glb_input.write(
             GLB_PWROFF_TIMER,
@@ -690,7 +690,6 @@ impl InnerGlobalInterface {
         // Configure the delay before reporting the GPU as idle.
         const IDLE_HYSTERESIS_US: u32 = 800;
         let (idle_timeout, idle_source) = conv_timeout(core_clk_rate, IDLE_HYSTERESIS_US)?;
-        let idle_source = idle_source.into();
         let idle_timeout = Bounded::<u32, 31>::try_new(idle_timeout).ok_or(EINVAL)?;
         glb_input.write(
             GLB_IDLE_TIMER,
