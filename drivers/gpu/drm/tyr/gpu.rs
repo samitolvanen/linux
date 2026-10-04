@@ -27,6 +27,7 @@ use crate::{
         IoMem,
         TyrDrmRegistrationData, //
     },
+    heap,
     irq::{
         quiesce,
         unquiesce, //
@@ -41,6 +42,13 @@ use crate::{
 /// register file for its own wrapper prologue/epilogue. Per the CSF
 /// programming manual. The value is constant across all current CSF chips.
 pub(crate) const UNPRESERVED_CS_REG_COUNT: u32 = 4;
+
+/// Largest supported `L2_FEATURES.line_size`, the log2 of the L2 cache line
+/// size in bytes. A heap context pool at a larger stride does not fit in
+/// `u32`.
+const MAX_L2_LINE_SIZE: u32 = 24;
+
+static_assert!((heap::MAX_HEAPS_PER_POOL as u64) << MAX_L2_LINE_SIZE <= u32::MAX as u64);
 
 /// CSIF (Command Stream Interface) information.
 ///
@@ -181,6 +189,15 @@ impl GpuInfo {
             self.l2_present,
             self.tiler_present,
         );
+    }
+
+    pub(crate) fn check_l2_line_size(&self, dev: &Device<Bound>) -> Result {
+        let line_size = L2_FEATURES::from_raw(self.l2_features).line_size().get();
+        if line_size > MAX_L2_LINE_SIZE {
+            dev_err!(dev, "Unsupported L2 line size: {}\n", line_size);
+            return Err(EINVAL);
+        }
+        Ok(())
     }
 
     pub(crate) fn heap_context_stride(&self) -> u32 {

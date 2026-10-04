@@ -832,6 +832,7 @@ impl platform::Driver for TyrPlatformDriver {
 
         let gpu_info = GpuInfo::new(io);
         gpu_info.log(pdev.as_ref());
+        gpu_info.check_l2_line_size(pdev.as_ref())?;
 
         let pa_bits = MMU_FEATURES::from_raw(gpu_info.mmu_features)
             .pa_bits()

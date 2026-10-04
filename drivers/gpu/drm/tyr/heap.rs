@@ -2,6 +2,8 @@
 
 //! Tiler heap management.
 
+use core::num::NonZero;
+
 use kernel::{
     alloc::KVec,
     device::{
@@ -45,7 +47,7 @@ use crate::{
     },
 };
 
-const MAX_HEAPS_PER_POOL: u32 = 128;
+pub(crate) const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
 
 /// Header the firmware keeps at the start of every tiler heap chunk.
@@ -190,6 +192,7 @@ pub(crate) fn destroy_context(
 pub(crate) struct Pool {
     vm: Arc<Vm>,
     gpu_contexts: Arc<gem::MappedBo>,
+    stride: NonZero<u32>,
     xa: Pin<KBox<XArray<KBox<Context>>>>,
     next_id: Atomic<u32>,
     /// Ever-incrementing source of context cookies. Unlike `next_id`, it
@@ -203,8 +206,8 @@ impl Pool {
         reg_data: &TyrDrmRegistrationData<'_>,
         vm: Arc<Vm>,
     ) -> Result<Self> {
-        let stride = reg_data.gpu_info.heap_context_stride();
-        let bo_size = (MAX_HEAPS_PER_POOL * stride).next_multiple_of(4096) as usize;
+        let stride = NonZero::new(reg_data.gpu_info.heap_context_stride()).ok_or(EINVAL)?;
+        let bo_size = (MAX_HEAPS_PER_POOL * stride.get()).next_multiple_of(4096) as usize;
 
         let flags = VmMapFlags::from(VmFlag::Noexec);
         let gpu_contexts = gem::new_kernel_object(
@@ -220,6 +223,7 @@ impl Pool {
         Ok(Self {
             vm,
             gpu_contexts,
+            stride,
             xa,
             next_id: Atomic::new(0),
             next_cookie: Atomic::new(0),
@@ -275,7 +279,7 @@ impl Pool {
             .ok_or(EINVAL)?
             .start;
 
-        let stride = reg_data.gpu_info.heap_context_stride() as usize;
+        let stride = self.stride.get() as usize;
         let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
 
         let xa = self.xa.as_ref();
@@ -318,15 +322,11 @@ impl Pool {
         })
     }
 
-    fn heap_va_to_index(
-        &self,
-        reg_data: &TyrDrmRegistrationData<'_>,
-        heap_gpu_va: u64,
-    ) -> Result<usize> {
+    fn heap_va_to_index(&self, heap_gpu_va: u64) -> Result<usize> {
         let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
         let offset = heap_gpu_va.checked_sub(contexts_va).ok_or(EINVAL)?;
         let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
-        Ok((offset / reg_data.gpu_info.heap_context_stride()) as usize)
+        Ok((offset / self.stride) as usize)
     }
 
     pub(crate) fn grow_heap_context(
@@ -337,7 +337,7 @@ impl Pool {
     ) -> Result<(u64, u64)> {
         let _ = args.pending_frag_count;
 
-        let index = self.heap_va_to_index(reg_data, args.heap_gpu_va)?;
+        let index = self.heap_va_to_index(args.heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
 
@@ -398,14 +398,8 @@ impl Pool {
         ))
     }
 
-    pub(crate) fn return_chunk(
-        &self,
-        reg_data: &TyrDrmRegistrationData<'_>,
-        heap_gpu_va: u64,
-        chunk_gpu_va: u64,
-        cookie: u64,
-    ) -> Result {
-        let index = self.heap_va_to_index(reg_data, heap_gpu_va)?;
+    pub(crate) fn return_chunk(&self, heap_gpu_va: u64, chunk_gpu_va: u64, cookie: u64) -> Result {
+        let index = self.heap_va_to_index(heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
         let removed = {

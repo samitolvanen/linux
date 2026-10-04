@@ -454,7 +454,7 @@ impl Scheduler {
                 if new_chunk_va != 0 {
                     if let Some(pool) = heap_pool {
                         let _ = pool
-                            .return_chunk(reg_data, oom.heap_address, new_chunk_va, cookie)
+                            .return_chunk(oom.heap_address, new_chunk_va, cookie)
                             .inspect_err(|e| {
                                 dev_err!(
                                     tdev.as_ref(),
