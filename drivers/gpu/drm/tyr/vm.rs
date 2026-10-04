@@ -864,10 +864,11 @@ fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> Result<u64> {
 /// base is aligned to the window size.
 fn kernel_va_window(gpu_info: &GpuInfo, user_va_range: u64) -> Result<Range<u64>> {
     let full_va_range = max_va_range(gpu_info);
-    let leftover = full_va_range - user_va_range;
+    let leftover = full_va_range.checked_sub(user_va_range).ok_or(EINVAL)?;
     let kernel_va_range = 1u64 << leftover.checked_ilog2().ok_or(EINVAL)?;
+    let kernel_va_start = full_va_range.checked_sub(kernel_va_range).ok_or(EINVAL)?;
 
-    Ok((full_va_range - kernel_va_range)..full_va_range)
+    Ok(kernel_va_start..full_va_range)
 }
 
 /// GPU virtual address space.
@@ -1944,20 +1945,22 @@ impl DriverGpuVm for GpuVmData {
 /// allocate, so it is safe on the dma-fence signalling path. A revoked page
 /// table also reports `None`, leaving the unmap unexpanded.
 fn contiguous_phys(page_table: &pt_alloc::DevresPageTable, range: Range<u64>) -> Option<PhysAddr> {
+    let start_usize = usize::try_from(range.start).ok()?;
     let pt = page_table.try_access()?;
 
     // SAFETY: The page table is exclusively accessed through the
     // &mut UniqueRefGpuVm held under the gpuvm_unique mutex for the duration of
     // the VM update, so no other io-pgtable operation runs concurrently.
-    let base = unsafe { pt.iova_to_phys(range.start as usize) }?;
+    let base = unsafe { pt.iova_to_phys(start_usize) }?;
 
     let mut iova = range.start + SZ_4K as u64;
     while iova < range.end {
         let offset = (iova - range.start) as PhysAddr;
+        let iova_usize = usize::try_from(iova).ok()?;
         // SAFETY: The page table is accessed exclusively through the
         // &mut UniqueRefGpuVm held under the gpuvm_unique mutex, so no
         // concurrent io-pgtable operation runs.
-        let paddr = unsafe { pt.iova_to_phys(iova as usize) }?;
+        let paddr = unsafe { pt.iova_to_phys(iova_usize) }?;
         if paddr != base + offset {
             return None;
         }
@@ -2209,7 +2212,9 @@ fn pt_unmap(dev: &Device, page_table: &pt_alloc::DevresPageTable, range: Range<u
             return Err(EINVAL);
         }
 
-        bytes_left_to_unmap -= unmapped as u64;
+        bytes_left_to_unmap = bytes_left_to_unmap
+            .checked_sub(unmapped as u64)
+            .ok_or(EINVAL)?;
         iova += unmapped as u64;
     }
 
