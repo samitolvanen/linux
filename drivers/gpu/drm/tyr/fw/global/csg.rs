@@ -175,10 +175,16 @@ impl CsgInterface {
         // Calculate the runtime offset for this CSG's control block.
         // The CSG control blocks start at CSG_GROUP_CONTROL_OFFSET from the GLB control block,
         // with each CSG spaced by csg_stride bytes.
-        let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
+        let csg_control_offset = csg_idx
+            .checked_mul(csg_stride)
+            .and_then(|offset| offset.checked_add(CSG_GROUP_CONTROL_OFFSET))
+            .ok_or(EINVAL)?;
 
         // The CSG control block's MCU virtual address is relative to the shared section start.
-        let csg_control_va = va_range.start + csg_control_offset as u64;
+        let csg_control_va = va_range
+            .start
+            .checked_add(csg_control_offset as u64)
+            .ok_or(EINVAL)?;
 
         // Create a bounded interface for this CSG's control block at the calculated address.
         let csg_control = FwInterface::<Region<CSG_CONTROL_BLOCK_SIZE>>::new(

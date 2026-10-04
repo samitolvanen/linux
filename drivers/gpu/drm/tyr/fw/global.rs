@@ -100,7 +100,9 @@ pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, 
         _ => return Err(EINVAL),
     };
 
-    let timeout_in_cycles = u64::from(timeout_us) * timer_rate;
+    let timeout_in_cycles = u64::from(timeout_us)
+        .checked_mul(timer_rate)
+        .ok_or(EINVAL)?;
 
     // The hardware stores the represented timeout value with a shr(10) to save space.
     let timeout_shift = u64::SZ_1K;

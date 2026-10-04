@@ -162,10 +162,17 @@ impl CsInterface {
         let va_range = &shared_section.va_range;
 
         // Calculate the runtime offset for this CS's control block.
-        let cs_control_offset = CS_CONTROL_OFFSET + cs_idx * cs_stride;
+        let cs_control_offset = cs_idx
+            .checked_mul(cs_stride)
+            .and_then(|offset| offset.checked_add(CS_CONTROL_OFFSET))
+            .ok_or(EINVAL)?;
 
         // The CS control block's MCU virtual address is relative to the shared section start.
-        let cs_control_va = va_range.start + csg_control_offset as u64 + cs_control_offset as u64;
+        let cs_control_va = va_range
+            .start
+            .checked_add(csg_control_offset as u64)
+            .and_then(|va| va.checked_add(cs_control_offset as u64))
+            .ok_or(EINVAL)?;
 
         // Create a bounded interface for this CS's control block at the calculated address.
         let cs_control =
