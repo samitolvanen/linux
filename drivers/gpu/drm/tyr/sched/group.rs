@@ -64,6 +64,7 @@ use crate::{
     },
     gem,
     gpu::CsifInfo,
+    mask::MaskIdx,
     pool,
     sched::CsgSlotManager,
     slot::Seat,
@@ -104,6 +105,14 @@ pub(crate) mod work_id {
 /// Upper bound on queues per group, set by the width of the per-queue
 /// bitmasks (`blocked_queues`, `idle_queues`, `fatal_queues`).
 pub(crate) const MAX_CS_PER_GROUP: usize = 32;
+
+/// Index of a queue in a group, and of the CS it runs on.
+///
+/// The five bits cover `0..MAX_CS_PER_GROUP`, so the index is a valid bit
+/// in the per-queue masks.
+pub(crate) type QueueIdx = MaskIdx<5>;
+
+static_assert!(MAX_CS_PER_GROUP == 1 << 5);
 
 /// The group's lifecycle state.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -210,8 +219,8 @@ impl GroupInner {
     }
 
     /// Sets a queue as blocked or unblocked.
-    pub(crate) fn set_queue_blocked(&mut self, queue_idx: usize, blocked: bool) {
-        let mask = 1 << queue_idx;
+    pub(crate) fn set_queue_blocked(&mut self, queue_idx: QueueIdx, blocked: bool) {
+        let mask = queue_idx.bit();
 
         if blocked {
             self.blocked_queues |= mask;
@@ -223,8 +232,8 @@ impl GroupInner {
     /// Sets a queue as idle or active.
     ///
     /// Returns true if the queue was previously idle.
-    pub(crate) fn set_queue_idle(&mut self, queue_idx: usize, idle: bool) -> bool {
-        let mask = 1 << queue_idx;
+    pub(crate) fn set_queue_idle(&mut self, queue_idx: QueueIdx, idle: bool) -> bool {
+        let mask = queue_idx.bit();
         let was_idle = (self.idle_queues & mask) != 0;
 
         if idle {
@@ -236,9 +245,9 @@ impl GroupInner {
         was_idle
     }
 
-    pub(crate) fn set_queue_fatal(&mut self, queue_idx: usize) {
-        if (self.fatal_queues & (1 << queue_idx)) == 0 {
-            self.fatal_queues |= 1 << queue_idx;
+    pub(crate) fn set_queue_fatal(&mut self, queue_idx: QueueIdx) {
+        if (self.fatal_queues & queue_idx.bit()) == 0 {
+            self.fatal_queues |= queue_idx.bit();
             self.fatal_error = Some(EFAULT);
         }
     }
@@ -468,7 +477,7 @@ impl Group {
                     list_state: GroupListState::None,
                     csg_id: None,
                     blocked_queues: 0,
-                    idle_queues: u32::MAX >> (u32::BITS - queue_count as u32),
+                    idle_queues: QueueIdx::mask_below(queue_count),
                     fatal_queues: 0,
                     fatal_error: None,
                     timedout: false,
@@ -536,8 +545,8 @@ impl Group {
         if !inner.is_idle() {
             return false;
         }
-        for (cs_id, queue) in self.queues.iter().enumerate() {
-            if inner.blocked_queues() & (1u32 << cs_id) != 0 {
+        for (cs_id, queue) in self.indexed_queues() {
+            if inner.blocked_queues() & cs_id.bit() != 0 {
                 continue;
             }
             if !queue.is_ringbuf_empty().unwrap_or(false) {
@@ -675,8 +684,8 @@ impl Group {
         let (fatal_queues, timedout) =
             self.with_locked_inner(|inner| (inner.fatal_queues(), inner.timedout));
 
-        for (queue_idx, queue) in self.queues.iter().enumerate() {
-            let err = if fatal_queues & (1 << queue_idx) != 0 {
+        for (queue_idx, queue) in self.indexed_queues() {
+            let err = if fatal_queues & queue_idx.bit() != 0 {
                 EINVAL
             } else if timedout {
                 ETIMEDOUT
@@ -687,7 +696,7 @@ impl Group {
 
             let seqno = queue.next_seqno();
             let _ = self.write_syncobj(
-                queue_idx,
+                queue_idx.get(),
                 syncs::SyncObj64b {
                     seqno,
                     status: !0,
@@ -711,6 +720,14 @@ impl Group {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    /// Returns each queue with its index.
+    ///
+    /// `Pool::create_group` caps the queue count at `MAX_CS_PER_GROUP`, so
+    /// every queue gets an index.
+    pub(crate) fn indexed_queues(&self) -> impl Iterator<Item = (QueueIdx, &Queue)> {
+        QueueIdx::all().zip(self.queues.iter())
     }
 
     /// Evaluates whether the queue at `queue_idx`'s captured sync-wait
@@ -930,12 +947,12 @@ impl deps::BatchOps for SubmitOps {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedSubmit> {
-        let queue_index = job.queue_index();
-        let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+        let queue_index = QueueIdx::new(job.queue_index()).ok_or(EINVAL)?;
+        let queue = self.group.queues.get(queue_index.get()).ok_or(EINVAL)?;
         let has_stream = job.has_stream();
 
         let wrapped = if has_stream {
-            let sync_va = self.group.syncobj_va(queue_index)?;
+            let sync_va = self.group.syncobj_va(queue_index.get())?;
             job.build_wrapped_stream(&self.csif, sync_va)?
         } else {
             KVec::new()
@@ -950,7 +967,7 @@ impl deps::BatchOps for SubmitOps {
         )?;
 
         Ok(PreparedSubmit {
-            queue_index,
+            queue_index: queue_index.get(),
             queue_job: prepared,
             piece_count: job.piece_count(),
         })

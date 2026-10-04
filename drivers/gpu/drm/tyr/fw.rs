@@ -86,7 +86,10 @@ use crate::{
         MCU_CONTROL,
         MCU_STATUS, //
     },
-    sched::group::MAX_CS_PER_GROUP,
+    sched::group::{
+        QueueIdx,
+        MAX_CS_PER_GROUP, //
+    },
     vm::{
         Vm,
         VmFlag,
@@ -194,13 +197,12 @@ impl CsDbMask {
     }
 
     #[expect(dead_code)]
-    pub(crate) const fn contains(self, cs_idx: usize) -> bool {
-        (self.0 & (1u32 << cs_idx)) != 0
+    pub(crate) fn contains(self, cs_idx: QueueIdx) -> bool {
+        (self.0 & cs_idx.bit()) != 0
     }
 
-    pub(crate) fn insert(&mut self, cs_idx: usize) {
-        debug_assert!(cs_idx < MAX_CS_PER_GROUP);
-        self.0 |= 1u32 << cs_idx;
+    pub(crate) fn insert(&mut self, cs_idx: QueueIdx) {
+        self.0 |= cs_idx.bit();
     }
 
     #[expect(dead_code)]

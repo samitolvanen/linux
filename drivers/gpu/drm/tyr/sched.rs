@@ -58,7 +58,10 @@ use crate::{
     }, //
 };
 
-use group::Group;
+use group::{
+    Group,
+    QueueIdx, //
+};
 
 const GROUP_PRIORITY_COUNT: usize = Priority::num_priorities();
 
@@ -618,8 +621,8 @@ impl Scheduler {
         let mut db_mask = CsDbMask::empty();
         fw.with_csg_mut(slot_idx, |csg| {
             csg.program_activate_inputs(&inputs)?;
-            for (cs_idx, queue) in group.queues.iter().enumerate() {
-                let cs = csg.cs_mut(cs_idx).ok_or(EINVAL)?;
+            for (cs_idx, queue) in group.indexed_queues() {
+                let cs = csg.cs_mut(cs_idx.get()).ok_or(EINVAL)?;
                 cs.program_activate_inputs(&queue.cs_activate_inputs(cs_doorbell)?)?;
                 db_mask.insert(cs_idx);
             }
@@ -871,8 +874,8 @@ impl Scheduler {
             self.sync_csg_slot_queues_state(fw, csg_slot_manager, csg_idx)?;
 
             let blocked_idle = group.blocked_idle_queues();
-            for (queue_idx, queue) in group.queues.iter().enumerate() {
-                if (blocked_idle & (1u32 << queue_idx)) != 0 {
+            for (queue_idx, queue) in group.indexed_queues() {
+                if (blocked_idle & queue_idx.bit()) != 0 {
                     continue;
                 }
                 queue.suspend_timeout();
@@ -955,11 +958,7 @@ impl Scheduler {
         // Snapshot the per-CS firmware state under one
         // `with_csg_mut`. The arrays are sized to
         // `MAX_CS_PER_GROUP` (the width of the per-queue bitmasks
-        // in `GroupInner`) so this stays allocation-free. The loop
-        // bound is min(queue_count, MAX_CS_PER_GROUP) to avoid
-        // out-of-bounds access if a future caller created a larger
-        // group.
-        let queue_count = core::cmp::min(group.queue_count(), group::MAX_CS_PER_GROUP);
+        // in `GroupInner`) so this stays allocation-free.
         let mut blocked_reasons: [Option<CsBlockedReason>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
         let mut scoreboards: [u32; group::MAX_CS_PER_GROUP] = [0; group::MAX_CS_PER_GROUP];
@@ -967,27 +966,27 @@ impl Scheduler {
             [const { None }; group::MAX_CS_PER_GROUP];
 
         fw.with_csg_mut(csg_idx, |csg| {
-            for cs_id in 0..queue_count {
-                let Some(cs) = csg.cs_mut(cs_id) else {
+            for (cs_id, _) in group.indexed_queues() {
+                let Some(cs) = csg.cs_mut(cs_id.get()) else {
                     continue;
                 };
                 let reason = cs.read_status_blocked_reason()?;
-                blocked_reasons[cs_id] = Some(reason);
-                scoreboards[cs_id] = cs.read_status_scoreboards()?;
+                blocked_reasons[cs_id.get()] = Some(reason);
+                scoreboards[cs_id.get()] = cs.read_status_scoreboards()?;
 
                 if reason == CsBlockedReason::SyncWait {
                     let wait = cs.read_status_wait_sync()?;
                     let gt = matches!(wait.condition, CsWaitCondition::Gt);
-                    sync_waits[cs_id] = Some((wait.sync_ptr, wait.ref_val, wait.sync64, gt));
+                    sync_waits[cs_id.get()] = Some((wait.sync_ptr, wait.ref_val, wait.sync64, gt));
                 }
             }
 
             Ok::<_, Error>(())
         })?;
 
-        for (cs_id, sync_wait) in sync_waits.iter_mut().enumerate().take(queue_count) {
+        for (queue, sync_wait) in group.queues.iter().zip(sync_waits.iter_mut()) {
             if let Some((gpu_va, ref_val, sync64, gt)) = sync_wait.take() {
-                group.queues[cs_id].set_syncwait(gpu_va, ref_val, sync64, gt);
+                queue.set_syncwait(gpu_va, ref_val, sync64, gt);
             }
         }
 
@@ -997,16 +996,16 @@ impl Scheduler {
         let has_sync_wait = group.with_locked_inner(|inner| {
             let mut has_sync_wait = false;
 
-            for cs_id in 0..queue_count {
+            for (cs_id, queue) in group.indexed_queues() {
                 let mut idle = false;
                 let mut blocked = false;
 
-                match blocked_reasons[cs_id] {
+                match blocked_reasons[cs_id.get()] {
                     // `is_ringbuf_empty` reads firmware-shared memory directly, not
                     // through the firmware lock, so probing it here under `inner` is safe.
                     Some(CsBlockedReason::Unblocked)
-                        if scoreboards[cs_id] == 0
-                            && group.queues[cs_id].is_ringbuf_empty().unwrap_or(false) =>
+                        if scoreboards[cs_id.get()] == 0
+                            && queue.is_ringbuf_empty().unwrap_or(false) =>
                     {
                         idle = true;
                     }
@@ -1015,7 +1014,7 @@ impl Scheduler {
                         has_sync_wait = true;
                         // Only blocked if there is no deferred work
                         // still resolving on the scoreboards.
-                        if scoreboards[cs_id] == 0 {
+                        if scoreboards[cs_id.get()] == 0 {
                             blocked = true;
                         }
                     }
@@ -1433,10 +1432,7 @@ impl Scheduler {
                     };
 
                     let (unblocked, move_to_runnable) = result.group.with_locked_inner(|inner| {
-                        let mut bits = result.unblocked;
-                        while bits != 0 {
-                            let cs_id = bits.trailing_zeros() as usize;
-                            bits &= !(1u32 << cs_id);
+                        for cs_id in QueueIdx::iter_mask(result.unblocked) {
                             inner.set_queue_blocked(cs_id, false);
                         }
 
@@ -1536,7 +1532,7 @@ impl Scheduler {
                 if inner.has_fatal_queues() {
                     return;
                 }
-                for cs_id in 0..queue_count {
+                for cs_id in QueueIdx::all().take(queue_count) {
                     inner.set_queue_fatal(cs_id);
                 }
             });

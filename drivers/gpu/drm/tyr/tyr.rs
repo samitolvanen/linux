@@ -25,6 +25,7 @@ mod gem;
 mod gpu;
 mod heap;
 mod irq;
+mod mask;
 mod mmap;
 mod mmu;
 mod pm;
