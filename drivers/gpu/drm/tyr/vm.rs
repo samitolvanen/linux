@@ -2229,7 +2229,9 @@ fn pt_unmap(dev: &Device, page_table: &pt_alloc::DevresPageTable, range: Range<u
             return Err(EINVAL);
         }
 
-        bytes_left_to_unmap -= unmapped as u64;
+        bytes_left_to_unmap = bytes_left_to_unmap
+            .checked_sub(unmapped as u64)
+            .ok_or(EINVAL)?;
         iova += unmapped as u64;
     }
 
