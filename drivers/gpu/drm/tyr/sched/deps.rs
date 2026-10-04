@@ -403,7 +403,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
     /// the job to `BatchOps::prepare` with enough dep capacity reserved
     /// to absorb every intra-batch fence at commit time.
     pub(crate) fn prepare(&mut self, job_idx: usize) -> Result {
-        let job = match self.jobs[job_idx].state.take() {
+        let job = match self.jobs.get_mut(job_idx).ok_or(EINVAL)?.state.take() {
             Some(JobState::Pending(job)) => job,
             _ => return Err(EINVAL),
         };
@@ -417,7 +417,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
             .ops
             .prepare(job, &external_deps, intra_batch_deps.len())?;
 
-        self.jobs[job_idx].state = Some(JobState::Prepared {
+        self.jobs.get_mut(job_idx).ok_or(EINVAL)?.state = Some(JobState::Prepared {
             prepared,
             intra_batch_deps,
         });
@@ -442,7 +442,8 @@ impl<'a, T: BatchOps> Context<'a, T> {
     /// that serializes the whole prepare-to-commit window, so a queue
     /// claims its seqno ranges in the order its pipeline runs the jobs.
     pub(crate) fn commit(&mut self, job_idx: usize) -> Result<ARef<PublicDmaFence>> {
-        let (mut prepared, intra_batch_deps) = match self.jobs[job_idx].state.take() {
+        let state = self.jobs.get_mut(job_idx).ok_or(EINVAL)?.state.take();
+        let (mut prepared, intra_batch_deps) = match state {
             Some(JobState::Prepared {
                 prepared,
                 intra_batch_deps,
@@ -518,7 +519,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
         let mut external = KVec::new();
         let mut intra_batch = KVec::new();
 
-        for syncop in self.jobs[job_idx].syncops.iter() {
+        for syncop in self.jobs.get(job_idx).ok_or(EINVAL)?.syncops.iter() {
             if !syncop.is_wait() {
                 continue;
             }
@@ -551,7 +552,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
     }
 
     fn update_job_syncs(&mut self, job_idx: usize, done_fence: ARef<PublicDmaFence>) -> Result {
-        let syncops = self.jobs[job_idx].syncops.clone();
+        let syncops = self.jobs.get(job_idx).ok_or(EINVAL)?.syncops.clone();
 
         for syncop in syncops.iter() {
             if !syncop.is_signal() {

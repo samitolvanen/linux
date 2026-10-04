@@ -690,7 +690,7 @@ impl SchedulingDecision {
                         rule.priority,
                         rule.is_idle,
                         matches!(rule.action, Action::KeepExceptRotated),
-                    );
+                    )?;
                 }
                 Action::Take => {
                     let available = slot_count.checked_sub(reserved).ok_or(EINVAL)?;
@@ -767,7 +767,7 @@ impl SchedulingDecision {
         priority: Priority,
         is_idle: bool,
         skip_rotated: bool,
-    ) -> usize {
+    ) -> Result<usize> {
         let rotated = self.rotated_slots[priority as usize];
         let mut skipped = None;
         let mut candidates = [(0u32, 0usize); MAX_CSGS];
@@ -793,8 +793,10 @@ impl SchedulingDecision {
                 continue;
             }
 
-            candidates[count] = (slot_data.fw_priority, i);
-            count += 1;
+            if let Some(candidate) = candidates.get_mut(count) {
+                *candidate = (slot_data.fw_priority, i);
+                count += 1;
+            }
         }
 
         candidates[..count].sort_unstable_by_key(|&(fw_priority, i)| {
@@ -819,14 +821,14 @@ impl SchedulingDecision {
                 }
                 continue;
             }
+            let selection = self.selections.get_mut(self.num_selected).ok_or(EINVAL)?;
             if !as_budget.take(&slot_data.group.vm) {
                 continue;
             }
 
             self.keep_mask |= 1u32 << i;
 
-            self.selections[self.num_selected] =
-                Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
+            *selection = Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
 
             self.num_selected += 1;
 
@@ -838,7 +840,7 @@ impl SchedulingDecision {
             }
         }
 
-        reserved
+        Ok(reserved)
     }
 
     /// Selects unbound groups matching the priority and idle state to
@@ -854,9 +856,20 @@ impl SchedulingDecision {
             return Ok(());
         }
 
+        let selections = self
+            .selections
+            .get_mut(self.num_selected..slot_count)
+            .ok_or(EINVAL)?;
         // How many slots we are allowed to fill.
-        let available_slots = slot_count - self.num_selected;
-        let target = &mut self.pending_groups[self.num_pending..self.num_pending + available_slots];
+        let available_slots = selections.len();
+        let end = self
+            .num_pending
+            .checked_add(available_slots)
+            .ok_or(EINVAL)?;
+        let target = self
+            .pending_groups
+            .get_mut(self.num_pending..end)
+            .ok_or(EINVAL)?;
 
         let (queue, prior_state) = if is_idle {
             (
@@ -879,8 +892,8 @@ impl SchedulingDecision {
             } else {
                 self.idle_group_count += count;
             }
-            for i in 0..count {
-                self.selections[self.num_selected + i] = Some(SelectedGroup::Pending(
+            for (i, selection) in selections.iter_mut().take(count).enumerate() {
+                *selection = Some(SelectedGroup::Pending(
                     self.num_pending + i,
                     priority,
                     is_idle,
@@ -973,7 +986,12 @@ impl<'a> Tick<'a> {
         };
 
         let mut decision = SchedulingDecision::new();
-        decision.evaluate_rules(tdev, self.sched, rules, full_tick)?;
+        if let Err(e) = decision.evaluate_rules(tdev, self.sched, rules, full_tick) {
+            for pending in decision.pending_groups.iter_mut().filter_map(Option::take) {
+                self.requeue_pending_bind(pending);
+            }
+            return Err(e);
+        }
         self.apply(tdev, fw, &mut decision)?;
 
         if full_tick {
@@ -1254,7 +1272,9 @@ impl<'a> Tick<'a> {
                         }
                     }
                     SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
-                        let Some(pending) = decision.pending_groups[idx].take() else {
+                        let Some(pending) =
+                            decision.pending_groups.get_mut(idx).and_then(Option::take)
+                        else {
                             continue;
                         };
 
