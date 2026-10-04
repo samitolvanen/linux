@@ -86,9 +86,12 @@ use crate::{
         MCU_CONTROL,
         MCU_STATUS, //
     },
-    sched::group::{
-        QueueIdx,
-        MAX_CS_PER_GROUP, //
+    sched::{
+        group::{
+            QueueIdx,
+            MAX_CS_PER_GROUP, //
+        },
+        CsgSlotIdx, //
     },
     vm::{
         Vm,
@@ -126,7 +129,7 @@ pub(crate) const MAX_CSG: usize = 31;
 /// Minimum number of CSG interfaces the firmware must report.
 const MIN_CSG: usize = 3;
 
-/// Bitmap over CSG slot indices in `[0, MAX_CSG)`.
+/// Bitmap over CSG slots, indexed by `CsgSlotIdx`.
 ///
 /// Each bit at position `i` indicates that CSG slot `i` is part of the
 /// set. Used to drive per-tick batch operations (apply, doorbell-ring,
@@ -153,13 +156,12 @@ impl CsgSlotMask {
         self.0 == 0
     }
 
-    pub(crate) const fn contains(self, csg_idx: usize) -> bool {
-        (self.0 & (1u32 << csg_idx)) != 0
+    pub(crate) fn contains(self, csg_idx: CsgSlotIdx) -> bool {
+        (self.0 & csg_idx.bit()) != 0
     }
 
-    pub(crate) fn insert(&mut self, csg_idx: usize) {
-        debug_assert!(csg_idx < MAX_CSG);
-        self.0 |= 1u32 << csg_idx;
+    pub(crate) fn insert(&mut self, csg_idx: CsgSlotIdx) {
+        self.0 |= csg_idx.bit();
     }
 
     #[expect(dead_code)]
@@ -173,9 +175,8 @@ impl CsgSlotMask {
 /// Each bit at position `i` indicates that CS `i` within a CSG slot has
 /// a pending per-CS doorbell ring request.
 ///
-/// Distinct from `CsgSlotMask`, whose bits are CSG slot indices in
-/// `[0, MAX_CSG)`. Both are 32-bit bitmaps but the bit positions mean
-/// different things.
+/// Distinct from `CsgSlotMask`, whose bits are indexed by `CsgSlotIdx`.
+/// Both are 32-bit bitmaps but the bit positions mean different things.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct CsDbMask(u32);
 

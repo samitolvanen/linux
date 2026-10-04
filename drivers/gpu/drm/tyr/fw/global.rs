@@ -77,6 +77,7 @@ use crate::{
     gem::BoData,
     gpu::GpuInfo,
     regs::doorbell_block::DOORBELL,
+    sched::CsgSlotIdx,
     wait::{
         Wait,
         WaitResult, //
@@ -421,13 +422,14 @@ impl<'drm> GlobalInterface<'drm> {
     where
         F: FnOnce(&mut csg::CsgInterface) -> Result<R>,
     {
+        let csg_slot = CsgSlotIdx::new(csg_idx).ok_or(EINVAL)?;
         let ret = {
             let mut inner = self.inner.lock();
             let csg = inner.csg_mut(csg_idx).ok_or(EINVAL)?;
             let ret = f(csg)?;
 
             let mut mask = CsgSlotMask::empty();
-            mask.insert(csg_idx);
+            mask.insert(csg_slot);
             inner.toggle_glb_db_req(mask)?;
             ret
         };
