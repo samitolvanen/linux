@@ -240,9 +240,9 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     fn reactivate_slot(&mut self, slot_idx: usize, slot_data: &T::SlotData) -> Result {
         let cur_seqno = self.use_seqno;
 
-        let mut slot_info = match mem::take(&mut self.slots[slot_idx]) {
-            Slot::Active(slot_info) | Slot::Idle(slot_info) => slot_info,
-            Slot::Free => {
+        let mut slot_info = match self.slots.get_mut(slot_idx).map(mem::take) {
+            Some(Slot::Active(slot_info) | Slot::Idle(slot_info)) => slot_info,
+            Some(Slot::Free) | None => {
                 *T::seat(slot_data).access_mut(self) = Seat::NoSeat;
                 return Err(EINVAL);
             }
@@ -263,6 +263,9 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
 
     /// Activates a slot for the given seat.
     fn activate_slot(&mut self, slot_idx: usize, slot_data: T::SlotData) -> Result<usize> {
+        if slot_idx >= MAX_SLOTS {
+            return Err(EINVAL);
+        }
         self.manager.activate(slot_idx, &slot_data)?;
         self.record_active_slot(slot_idx, slot_data);
         Ok(slot_idx)
@@ -272,7 +275,7 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     /// are available, the oldest idle slot is evicted and reused. Otherwise, if
     /// there are no free or idle slots, return [`EBUSY`].
     fn allocate_slot(&mut self, slot_data: T::SlotData) -> Result<usize> {
-        let slots = &self.slots[..self.slot_count];
+        let slots = self.slots.get(..self.slot_count).ok_or(EINVAL)?;
 
         let mut idle_slot_idx = None;
         let mut idle_slot_seqno: u64 = 0;
@@ -295,7 +298,7 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         match idle_slot_idx {
             Some(slot_idx) => {
                 // Lazily evict idle slot just before it is reused.
-                if let Slot::Idle(slot_info) = &self.slots[slot_idx] {
+                if let Some(Slot::Idle(slot_info)) = self.slots.get(slot_idx) {
                     self.manager.evict(slot_idx, &slot_info.slot_data)?;
                     mem::take(&mut self.slots[slot_idx]);
                 }
@@ -307,9 +310,9 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
 
     /// Converts an active slot and its seat to idle state.
     fn idle_slot(&mut self, slot_idx: usize, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
-        let slot = mem::take(&mut self.slots[slot_idx]);
+        let slot = self.slots.get_mut(slot_idx).ok_or(EINVAL)?;
 
-        self.slots[slot_idx] = match slot {
+        *slot = match mem::take(slot) {
             // If the slot was active, make it idle.
             Slot::Active(slot_info) => Slot::Idle(slot_info),
 
@@ -340,7 +343,7 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         locked_seat: &LockedSeat<T, MAX_SLOTS>,
         force: bool,
     ) -> Result {
-        let res = match &self.slots[slot_idx] {
+        let res = match self.slots.get(slot_idx).ok_or(EINVAL)? {
             Slot::Active(slot_info) | Slot::Idle(slot_info) => {
                 self.manager.evict(slot_idx, &slot_info.slot_data)
             }
@@ -366,15 +369,16 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
             _ => return,
         };
 
+        let slot = self.slots.get(slot_idx);
         let valid = if is_active {
             !kernel::warn_on!(!matches!(
-                &self.slots[slot_idx],
-                Slot::Active(slot_info) if slot_info.seqno == seat_seqno
+                slot,
+                Some(Slot::Active(slot_info)) if slot_info.seqno == seat_seqno
             ))
         } else {
             matches!(
-                &self.slots[slot_idx],
-                Slot::Idle(slot_info) if slot_info.seqno == seat_seqno
+                slot,
+                Some(Slot::Idle(slot_info)) if slot_info.seqno == seat_seqno
             )
         };
 
@@ -469,8 +473,8 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         if slot_idx >= self.slot_count {
             return None;
         }
-        match &self.slots[slot_idx] {
-            Slot::Active(info) | Slot::Idle(info) => Some(&info.slot_data),
+        match self.slots.get(slot_idx) {
+            Some(Slot::Active(info) | Slot::Idle(info)) => Some(&info.slot_data),
             _ => None,
         }
     }
@@ -480,8 +484,8 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         if slot_idx >= self.slot_count {
             return None;
         }
-        match &mut self.slots[slot_idx] {
-            Slot::Active(info) | Slot::Idle(info) => Some(&mut info.slot_data),
+        match self.slots.get_mut(slot_idx) {
+            Some(Slot::Active(info) | Slot::Idle(info)) => Some(&mut info.slot_data),
             _ => None,
         }
     }
