@@ -161,14 +161,12 @@ impl core::ops::Deref for MappedBo {
 /// `dma_resv_lock`, never runs on the dropping context, which may be
 /// a dma-fence signalling section.
 pub(crate) struct BoVmap {
-    /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when shipping the vmap to the cleanup
+    /// Taken only by `Drop` when passing the vmap to the cleanup
     /// workqueue.
-    vmap: Option<shmem::VMapOwned<BoData>>,
+    vmap: ManuallyDrop<shmem::VMapOwned<BoData>>,
     /// Passes the vmap to the cleanup workqueue and keeps the device alive
-    /// for its final GEM put. `Some` for the entire lifetime of the value,
-    /// taken by `Drop` with `vmap`.
-    handoff: Option<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
+    /// for its final GEM put. Taken by `Drop` with `vmap`.
+    handoff: ManuallyDrop<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl BoVmap {
@@ -176,15 +174,13 @@ impl BoVmap {
         let handoff = cleanup::Handoff::new(bo.dev().into())?;
         let vmap = bo.owned_vmap::<0>()?;
         Ok(Self {
-            vmap: Some(vmap),
-            handoff: Some(handoff),
+            vmap: ManuallyDrop::new(vmap),
+            handoff: ManuallyDrop::new(handoff),
         })
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        self.vmap
-            .as_ref()
-            .expect("BoVmap::vmap accessed after drop")
+        &self.vmap
     }
 
     /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
@@ -219,8 +215,13 @@ impl core::ops::Deref for BoVmap {
 
 impl Drop for BoVmap {
     fn drop(&mut self) {
-        let (Some(vmap), Some(handoff)) = (self.vmap.take(), self.handoff.take()) else {
-            return;
+        // SAFETY: `drop` runs once, so this is the only take of either
+        // field, and they are not used afterwards.
+        let (vmap, handoff) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.vmap),
+                ManuallyDrop::take(&mut self.handoff),
+            )
         };
 
         handoff.spawn(vmap, drop);
