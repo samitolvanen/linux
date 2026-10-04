@@ -256,6 +256,7 @@ impl QueueData {
     /// registered the matching pending submit fence.
     pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64> {
         let ringbuf_start = self.ringbuf_space_for(instrs.len())?;
+        let completion_point = ringbuf_start.checked_add(instrs.len() as u64).ok_or(EIO)?;
 
         let ringbuf = self.ringbuf.vmap();
         let size = ringbuf.size();
@@ -279,7 +280,6 @@ impl QueueData {
             );
         }
 
-        let completion_point = ringbuf_start + instrs.len() as u64;
         Ok(completion_point)
     }
 
