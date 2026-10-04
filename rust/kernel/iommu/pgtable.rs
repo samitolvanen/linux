@@ -399,10 +399,11 @@ impl<F: IoPageTableFmt, A> IoPageTable<F, A> {
 
     /// Translate an `iova` to the physical address it maps to.
     ///
-    /// Returns [`None`] if `iova` is not mapped. As in the underlying C op, a mapping to physical
-    /// address 0 is indistinguishable from unmapped and also reports [`None`]. The returned address
-    /// includes the offset of `iova` within the mapping block, so it is exact for any `iova`, not
-    /// just block-aligned ones. This walk is lock-free and does not allocate.
+    /// Returns [`None`] if `iova` is not mapped or the page table format has no `iova_to_phys`
+    /// op. As in the underlying C op, a mapping to physical address 0 is indistinguishable from
+    /// unmapped and also reports [`None`]. The returned address includes the offset of `iova`
+    /// within the mapping block, so it is exact for any `iova`, not just block-aligned ones. This
+    /// walk is lock-free and does not allocate.
     ///
     /// # Safety
     ///
@@ -410,8 +411,8 @@ impl<F: IoPageTableFmt, A> IoPageTable<F, A> {
     /// executes.
     #[inline]
     pub unsafe fn iova_to_phys(&self, iova: usize) -> Option<PhysAddr> {
-        // SAFETY: The `iova_to_phys` function in `io_pgtable_ops` is never null.
-        let iova_to_phys = unsafe { (*self.raw_ops()).iova_to_phys.unwrap_unchecked() };
+        // SAFETY: By the type invariant, `raw_ops()` points to a valid `io_pgtable_ops`.
+        let iova_to_phys = unsafe { (*self.raw_ops()).iova_to_phys }?;
 
         // SAFETY: The safety requirements of this method are sufficient to call `iova_to_phys`.
         let paddr = unsafe { (iova_to_phys)(self.raw_ops(), iova) };
