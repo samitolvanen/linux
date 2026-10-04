@@ -400,6 +400,12 @@ impl<T: DriverObject> Object<T> {
                             unsafe {
                                 bindings::__drm_gem_shmem_free_sgt_locked(self.as_raw_shmem())
                             };
+
+                            // SAFETY: We hold the reservation lock and own the pages reference
+                            // taken for the table above.
+                            unsafe {
+                                bindings::drm_gem_shmem_put_pages_locked(self.as_raw_shmem())
+                            };
                         }
 
                         Err(e)
