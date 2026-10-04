@@ -35,7 +35,10 @@ use crate::{
         TyrIrq,
         TyrIrqTrait, //
     },
-    mmu::faults::decode_faults,
+    mmu::{
+        address_space::AsSlotIdx,
+        faults::decode_faults, //
+    },
     regs::{
         mmu_control,
         MAX_AS, //
@@ -79,9 +82,9 @@ impl PageFaultMask {
 
     /// Unmasks AS slot `as_nr`, dropping the faults it latched while masked.
     ///
-    /// The caller passes a present slot and holds the AS slot manager lock.
-    pub(super) fn unmask_slot(&self, io: &IoMem<'_>, as_nr: usize) {
-        let bit = 1u32 << as_nr;
+    /// The caller holds the AS slot manager lock.
+    pub(super) fn unmask_slot(&self, io: &IoMem<'_>, as_nr: AsSlotIdx) {
+        let bit = as_nr.bit();
         let mut mask = self.mask.lock();
 
         *mask |= bit;
@@ -92,10 +95,10 @@ impl PageFaultMask {
     /// Masks AS slot `as_nr`.
     ///
     /// The caller requirements of `unmask_slot` apply.
-    pub(super) fn mask_slot(&self, io: &IoMem<'_>, as_nr: usize) {
+    pub(super) fn mask_slot(&self, io: &IoMem<'_>, as_nr: AsSlotIdx) {
         let mut mask = self.mask.lock();
 
-        *mask &= !(1u32 << as_nr);
+        *mask &= !as_nr.bit();
         io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
     }
 

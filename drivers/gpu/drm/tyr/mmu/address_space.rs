@@ -48,6 +48,7 @@ use kernel::{
 };
 
 use crate::{
+    mask::MaskIdx,
     mmu::{
         irq::PageFaultMask,
         AsSlotManager,
@@ -75,6 +76,40 @@ use crate::{
         PtAllocator, //
     }, //
 };
+
+/// An AS slot index checked by `AddressSpaceManager::validate_as_slot`.
+///
+/// The four bits cover `0..MAX_AS`, so the index is in range for the
+/// per-slot arrays and masks.
+///
+/// # Invariants
+///
+/// The index is below `MAX_AS`, and its bit is set in `AS_PRESENT`.
+#[derive(Clone, Copy)]
+pub(super) struct AsSlotIdx(MaskIdx<4>);
+
+static_assert!(MAX_AS == 1 << 4);
+
+impl AsSlotIdx {
+    fn new(idx: usize, as_present: u32) -> Option<Self> {
+        let idx = MaskIdx::new(idx)?;
+        if (as_present & idx.bit()) == 0 {
+            return None;
+        }
+        // INVARIANT: `idx` is below `MAX_AS`, and its bit is set in `as_present`.
+        Some(Self(idx))
+    }
+
+    /// Returns the index as a `usize`.
+    pub(super) fn get(self) -> usize {
+        self.0.get()
+    }
+
+    /// Returns the bit of this slot in the MMU IRQ registers.
+    pub(super) fn bit(self) -> u32 {
+        self.0.bit()
+    }
+}
 
 /// Address space configuration values to be written to MMU registers.
 #[derive(Clone, Copy)]
@@ -280,7 +315,7 @@ impl AddressSpaceManager {
     /// the corresponding bit is set in the `as_present` mask read from the GPU.
     ///
     /// Returns [`EINVAL`] if the slot is out of range or not present in hardware.
-    fn validate_as_slot(&self, as_nr: usize) -> Result {
+    fn validate_as_slot(&self, as_nr: usize) -> Result<AsSlotIdx> {
         if as_nr >= MAX_AS {
             dev_err!(
                 &self.pdev,
@@ -291,7 +326,7 @@ impl AddressSpaceManager {
             return Err(EINVAL);
         }
 
-        if (self.as_present & (1 << as_nr)) == 0 {
+        let Some(slot) = AsSlotIdx::new(as_nr, self.as_present) else {
             dev_err!(
                 &self.pdev,
                 "AS slot {} not present in hardware (AS_PRESENT={:#x})",
@@ -299,8 +334,8 @@ impl AddressSpaceManager {
                 self.as_present
             );
             return Err(EINVAL);
-        }
-        Ok(())
+        };
+        Ok(slot)
     }
 
     /// Waits for an AS slot to become ready (not active).
@@ -309,9 +344,9 @@ impl AddressSpaceManager {
     /// register access fails. A slot already known to be stuck fails without
     /// polling.
     fn as_wait_ready(&mut self, as_nr: usize) -> Result {
-        self.validate_as_slot(as_nr)?;
+        let slot = self.validate_as_slot(as_nr)?;
 
-        if self.stuck[as_nr] {
+        if self.stuck[slot.get()] {
             return Err(ETIMEDOUT);
         }
 
@@ -327,7 +362,7 @@ impl AddressSpaceManager {
             // A stuck AS_ACTIVE bit only clears with a GPU reset.
             dev_err!(&self.pdev, "AS_ACTIVE bit stuck\n");
             self.reset.schedule();
-            self.stuck[as_nr] = true;
+            self.stuck[slot.get()] = true;
         }
 
         res.map(|_| ())
@@ -357,12 +392,12 @@ impl AddressSpaceManager {
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
-        self.validate_as_slot(as_nr)?;
+        let slot = self.validate_as_slot(as_nr)?;
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
 
-            self.fault_mask.unmask_slot(&io, as_nr);
+            self.fault_mask.unmask_slot(&io, slot);
 
             let transtab = as_config.transtab;
             io.write(
@@ -397,10 +432,10 @@ impl AddressSpaceManager {
 
         // Cleared before the command because `as_wait_ready` would
         // otherwise fail it.
-        self.stuck[as_nr] = false;
+        self.stuck[slot.get()] = false;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
-        self.faulty[as_nr] = false;
-        self.lock_pending[as_nr] = false;
+        self.faulty[slot.get()] = false;
+        self.lock_pending[slot.get()] = false;
 
         Ok(())
     }
@@ -409,12 +444,12 @@ impl AddressSpaceManager {
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_disable(&mut self, as_nr: usize) -> Result {
-        self.validate_as_slot(as_nr)?;
+        let slot = self.validate_as_slot(as_nr)?;
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
 
-            self.fault_mask.mask_slot(&io, as_nr);
+            self.fault_mask.mask_slot(&io, slot);
         }
 
         self.gpu_flush_caches(
@@ -425,10 +460,10 @@ impl AddressSpaceManager {
 
         // Reclaiming a slot mid-update leaves the region lock from
         // `as_start_update` unbalanced. Release it before the slot is reused.
-        if self.lock_pending[as_nr] {
+        if self.lock_pending[slot.get()] {
             self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
         }
-        self.lock_pending[as_nr] = false;
+        self.lock_pending[slot.get()] = false;
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
@@ -478,7 +513,7 @@ impl AddressSpaceManager {
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>) -> Result {
-        self.validate_as_slot(as_nr)?;
+        let slot = self.validate_as_slot(as_nr)?;
 
         // An empty region locks nothing. `region.end - 1` below would
         // underflow.
@@ -552,7 +587,7 @@ impl AddressSpaceManager {
         }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Lock)?;
-        self.lock_pending[as_nr] = true;
+        self.lock_pending[slot.get()] = true;
         Ok(())
     }
 
@@ -561,14 +596,14 @@ impl AddressSpaceManager {
     /// The flush must complete before the Unlock so the GPU never resumes
     /// against stale translations.
     fn as_end_update(&mut self, as_nr: usize) -> Result {
-        self.validate_as_slot(as_nr)?;
+        let slot = self.validate_as_slot(as_nr)?;
         self.gpu_flush_caches(
             FlushMode::CleanInvalidate,
             FlushMode::CleanInvalidate,
             FlushMode::Invalidate,
         )?;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
-        self.lock_pending[as_nr] = false;
+        self.lock_pending[slot.get()] = false;
         Ok(())
     }
 
@@ -715,13 +750,13 @@ impl AsSlotManager {
     ///
     /// A non-zero count means the VM is bound to a hardware slot, so an extra
     /// user needs no residency change or hardware programming.
-    pub(super) fn bump_resident_vm_users(&mut self, vm_as_data: &VmAsData) -> bool {
+    pub(super) fn bump_resident_vm_users(&mut self, vm_as_data: &VmAsData) -> Result<bool> {
         let users = vm_as_data.as_active_users.access_mut(self);
         if *users == 0 {
-            return false;
+            return Ok(false);
         }
-        *users += 1;
-        true
+        *users = users.checked_add(1).ok_or(EINVAL)?;
+        Ok(true)
     }
 
     /// Activates a VM by assigning it to a hardware slot.
@@ -731,14 +766,16 @@ impl AsSlotManager {
             // but not its hardware programming. Evict so activation
             // programs the hardware again.
             if let Some(slot) = self.resident_slot(&vm_as_data.as_seat) {
-                if self.faulty[slot as usize] {
+                let slot = self.validate_as_slot(slot.into())?;
+                if self.faulty[slot.get()] {
                     self.evict(&vm_as_data.as_seat)?;
                 }
             }
             self.activate(vm_as_data.into())?;
             vm_as_data.unhandled_fault.store(false, Relaxed);
         }
-        *vm_as_data.as_active_users.access_mut(self) += 1;
+        let users = vm_as_data.as_active_users.access_mut(self);
+        *users = users.checked_add(1).ok_or(EINVAL)?;
         Ok(())
     }
 
@@ -783,14 +820,14 @@ impl AsSlotManager {
         let Some(slot) = self.resident_slot(&vm_as_data.as_seat) else {
             return Ok(());
         };
-        let slot = slot as usize;
-        if self.faulty[slot] {
+        let slot = self.validate_as_slot(slot.into())?;
+        if self.faulty[slot.get()] {
             return Ok(());
         }
         // Set the flag before disabling, so a disable that fails on a
         // wedged address space is not retried on every repeat fault.
-        self.faulty[slot] = true;
-        self.as_disable(slot)
+        self.faulty[slot.get()] = true;
+        self.as_disable(slot.get())
     }
 
     /// Returns the AS slot index the VM is currently assigned to, or `None`
