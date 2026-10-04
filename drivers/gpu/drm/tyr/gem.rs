@@ -548,6 +548,11 @@ impl KernelBo {
         &self.va_range
     }
 
+    /// Returns the size of the GPU virtual address range.
+    pub(crate) fn size(&self) -> u64 {
+        va_range_size(&self.va_range)
+    }
+
     /// Returns the kernel-VA pool reservation range, or `None` when the
     /// VA is managed externally.
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
@@ -569,8 +574,7 @@ impl KernelBo {
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
-    va: u64,
-    size: u64,
+    va_range: Range<u64>,
     /// Kernel-VA pool reservation, held until the deferred unmap has
     /// torn down the GPU PTEs.
     kernel_node: Option<range::LiveRange>,
@@ -578,8 +582,7 @@ struct KernelBoCleanup {
 
 impl Drop for KernelBo {
     fn drop(&mut self) {
-        let va = self.va_range.start;
-        let size = self.va_range.end - self.va_range.start;
+        let va_range = self.va_range.clone();
         // SAFETY: `drop` runs once, this is the only take of `self.vm`,
         // and the field is not read afterward.
         let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
@@ -592,8 +595,7 @@ impl Drop for KernelBo {
         let captures = KernelBoCleanup {
             vm,
             bo,
-            va,
-            size,
+            va_range,
             kernel_node,
         };
 
@@ -626,24 +628,27 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
         bo,
-        va,
-        size,
+        va_range,
         kernel_node,
     } = captures;
     let unmapped = vm
-        .unmap_exact(va, size)
+        .unmap_exact(va_range.start, va_range_size(&va_range))
         .inspect_err(|e| {
             dev_err!(
                 vm.dev(),
                 "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-                va,
-                va + size,
+                va_range.start,
+                va_range.end,
                 e
             );
         })
         .is_ok();
     drop(bo);
     release_kernel_va(kernel_node, unmapped);
+}
+
+fn va_range_size(va_range: &Range<u64>) -> u64 {
+    va_range.end.saturating_sub(va_range.start)
 }
 
 /// Frees the kernel-VA reservation, or keeps it out of the pool when the
