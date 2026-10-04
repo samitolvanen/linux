@@ -91,6 +91,7 @@ use crate::{
 use super::{
     group::{
         Group,
+        QueueIdx,
         State, //
     },
     SubmitTick, //
@@ -661,12 +662,12 @@ impl TyrQueueOps {
         match err {
             RingBufferError::Inconsistent { insert, extract } => pr_warn!(
                 "queue {} has inconsistent ring pointers: insert={:#x}, extract={:#x}\n",
-                job.queue_index,
+                job.queue_index.get(),
                 insert,
                 extract
             ),
             RingBufferError::Full | RingBufferError::Other => {
-                pr_warn!("queue {} ring claim failed\n", job.queue_index)
+                pr_warn!("queue {} ring claim failed\n", job.queue_index.get())
             }
         }
         self.cancel_job(job, fence)
@@ -772,7 +773,7 @@ impl QueueOps for TyrQueueOps {
                     return (false, Ok(()), false, false);
                 }
                 let group_idle = inner.is_idle();
-                let blocked = inner.blocked_queues() & (1u32 << queue_index) != 0;
+                let blocked = inner.blocked_queues() & queue_index.bit() != 0;
                 let queue_idle = inner.set_queue_idle(queue_index, false);
                 let resume_tick = group_idle && queue_idle && !blocked;
                 if awake.is_none() {
@@ -854,7 +855,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::Advance;
         }
 
-        match ctx.job.group.read_syncobj(ctx.job.queue_index) {
+        match ctx.job.group.read_syncobj(ctx.job.queue_index.get()) {
             Ok(syncobj_seqno) => self.data.complete_submit_fences(syncobj_seqno),
             Err(err) => {
                 if let Some(done_seqno) = ctx.job.done_seqno() {
@@ -948,11 +949,11 @@ pub(super) struct QueueJob {
     /// Index of the owning queue inside `Group::queues`. Captured
     /// at prepare time so the timeout stage can read the per-queue
     /// syncobj without an extra lookup.
-    queue_index: usize,
+    queue_index: QueueIdx,
 }
 
 impl QueueJob {
-    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>, queue_index: usize) -> Self {
+    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>, queue_index: QueueIdx) -> Self {
         Self {
             stream,
             done_seqno: Atomic::new(0),

@@ -38,6 +38,7 @@ use super::{
     group::{
         work_id,
         Group,
+        QueueIdx,
         MAX_CS_PER_GROUP, //
     },
     CsgSlotManager,
@@ -46,7 +47,7 @@ use super::{
 
 struct PendingOom {
     csg_id: usize,
-    cs_id: u32,
+    cs_id: QueueIdx,
     heap_address: u64,
     vt_start: u32,
     vt_end: u32,
@@ -186,14 +187,14 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
                         return;
                     }
                 };
-                todo &= !(1u32 << oom.cs_id);
+                todo &= !oom.cs_id.bit();
 
                 let grow_result = if oom.frag_end > oom.vt_end || oom.vt_end >= oom.vt_start {
                     dev_err!(
                         tdev.as_ref(),
                         "tiler_oom_work: CSG {} CS {} bad counters vt_start={} vt_end={} frag_end={}\n",
                         oom.csg_id,
-                        oom.cs_id,
+                        oom.cs_id.get(),
                         oom.vt_start,
                         oom.vt_end,
                         oom.frag_end
@@ -217,7 +218,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
                     Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
                     Err(e) if e == ENOMEM => GrowOutcome::Reclaim,
                     Err(_) => {
-                        this.with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id as usize));
+                        this.with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id));
                         TyrDrmDeviceData::schedule_tick(tdev);
                         GrowOutcome::Fatal
                     }
@@ -391,10 +392,7 @@ impl Scheduler {
 
             if cs_fatal_mask != 0 {
                 group.with_locked_inner(|inner| {
-                    let mut mask = cs_fatal_mask;
-                    while mask != 0 {
-                        let cs_id = mask.trailing_zeros() as usize;
-                        mask &= !(1u32 << cs_id);
+                    for cs_id in QueueIdx::iter_mask(cs_fatal_mask) {
                         inner.set_queue_fatal(cs_id);
                     }
                 });
@@ -455,12 +453,10 @@ impl Scheduler {
             let tiler_oom = &group.tiler_oom;
             let mut mask = tiler_oom.load(Relaxed);
             let cs_id = loop {
-                let pending = mask & todo;
-                if pending == 0 {
+                let Some(cs_id) = QueueIdx::iter_mask(mask & todo).next() else {
                     return Ok(None);
-                }
-                let cs_id = pending.trailing_zeros();
-                match tiler_oom.cmpxchg(mask, mask & !(1u32 << cs_id), Relaxed) {
+                };
+                match tiler_oom.cmpxchg(mask, mask & !cs_id.bit(), Relaxed) {
                     Ok(_) => break cs_id,
                     Err(current) => mask = current,
                 }
@@ -478,7 +474,7 @@ impl Scheduler {
             let csg_id = usize::from(slot);
 
             let counters = fw.with_csg_mut(csg_id, |csg| {
-                let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
+                let cs = csg.cs_mut(cs_id.get()).ok_or(EINVAL)?;
                 if cs.read_input_req()?.tiler_oom() == cs.read_output_ack()?.tiler_oom() {
                     return Ok(None);
                 }
@@ -546,7 +542,7 @@ impl Scheduler {
 
         reg_data.fw.with_csg_mut_ring_doorbell(oom.csg_id, |csg| {
             {
-                let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
+                let cs = csg.cs_mut(oom.cs_id.get()).ok_or(EINVAL)?;
                 cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
 
                 let ack = cs.read_output_ack()?.tiler_oom();
@@ -554,7 +550,7 @@ impl Scheduler {
                 cs.write_input_req(req);
             }
 
-            csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
+            csg.toggle_input_db_req(CsDbMask::from_raw(oom.cs_id.bit()))
         })
     }
 }
