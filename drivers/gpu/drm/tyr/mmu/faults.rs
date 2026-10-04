@@ -8,7 +8,6 @@
 //! the raw register layout.
 
 use kernel::{
-    bits::bit_u32,
     io::{
         register::Array,
         Io, //
@@ -22,7 +21,10 @@ use crate::{
         IoMem,
         TyrDrmDevice, //
     },
-    regs::mmu_control::mmu_as_control, //
+    regs::{
+        mmu_control::mmu_as_control,
+        MAX_AS, //
+    }, //
 };
 
 const EXCEPTION_MAP: &[(u32, &CStr)] = &[
@@ -97,17 +99,17 @@ fn access_type_name(fault_status: u32) -> &'static str {
     }
 }
 
-pub(super) fn decode_faults(tdev: &TyrDrmDevice, mut status: u32, io: &IoMem<'_>) -> Result {
-    while status != 0 {
-        let as_index = (status | (status >> 16)).trailing_zeros();
-        let mask = bit_u32(as_index);
+pub(super) fn decode_faults(tdev: &TyrDrmDevice, status: u32, io: &IoMem<'_>) -> Result {
+    let faulted = status | (status >> 16);
 
-        let fault_status_reg =
-            mmu_as_control::FAULTSTATUS::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_lo_reg =
-            mmu_as_control::FAULTADDRESS_LO::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_hi_reg =
-            mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
+    for as_index in 0..MAX_AS {
+        if faulted & (1u32 << as_index) == 0 {
+            continue;
+        }
+
+        let fault_status_reg = mmu_as_control::FAULTSTATUS::try_at(as_index).ok_or(EINVAL)?;
+        let fault_addr_lo_reg = mmu_as_control::FAULTADDRESS_LO::try_at(as_index).ok_or(EINVAL)?;
+        let fault_addr_hi_reg = mmu_as_control::FAULTADDRESS_HI::try_at(as_index).ok_or(EINVAL)?;
 
         let fault_status_raw = io.read(fault_status_reg).into_raw();
         let addr_lo = io.read(fault_addr_lo_reg).into_raw();
@@ -142,8 +144,6 @@ pub(super) fn decode_faults(tdev: &TyrDrmDevice, mut status: u32, io: &IoMem<'_>
             access_type_name(fault_status_raw),
             source_id,
         );
-
-        status &= !mask;
     }
 
     Ok(())
