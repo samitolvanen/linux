@@ -191,14 +191,12 @@ pub(crate) type Bo = gem::shmem::Object<BoData>;
 /// A mapped kernel-owned buffer object with an always-valid kernel mapping.
 pub(crate) struct MappedBo {
     kernel_bo: KernelBo,
-    /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when shipping the vmap to the cleanup
+    /// Taken only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
-    vmap: Option<shmem::VMapOwned<BoData>>,
+    vmap: ManuallyDrop<shmem::VMapOwned<BoData>>,
     /// Ships the vmap to the cleanup workqueue and keeps the device alive
-    /// for its final GEM put. `Some` for the entire lifetime of the value,
-    /// taken by `Drop` with `vmap`.
-    handoff: Option<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
+    /// for its final GEM put. Taken by `Drop` with `vmap`.
+    handoff: ManuallyDrop<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl MappedBo {
@@ -208,17 +206,15 @@ impl MappedBo {
         Ok(Arc::new(
             Self {
                 kernel_bo,
-                vmap: Some(vmap),
-                handoff: Some(handoff),
+                vmap: ManuallyDrop::new(vmap),
+                handoff: ManuallyDrop::new(handoff),
             },
             GFP_KERNEL,
         )?)
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        self.vmap
-            .as_ref()
-            .expect("MappedBo::vmap accessed after drop")
+        &self.vmap
     }
 
     pub(crate) fn kernel_va(&self) -> Option<Range<u64>> {
@@ -253,8 +249,13 @@ impl core::ops::Deref for MappedBo {
 
 impl Drop for MappedBo {
     fn drop(&mut self) {
-        let (Some(vmap), Some(handoff)) = (self.vmap.take(), self.handoff.take()) else {
-            return;
+        // SAFETY: `drop` runs once, so this is the only take of either
+        // field, and they are not used afterwards.
+        let (vmap, handoff) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.vmap),
+                ManuallyDrop::take(&mut self.handoff),
+            )
         };
 
         handoff.spawn(vmap, drop);
@@ -278,14 +279,12 @@ impl Drop for MappedBo {
 /// `dma_resv_lock`, never runs on the dropping context, which may be
 /// a dma-fence signalling section.
 pub(crate) struct MappedUserBo {
-    /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when shipping the vmap to the cleanup
+    /// Taken only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
-    vmap: Option<shmem::VMapOwned<BoData>>,
+    vmap: ManuallyDrop<shmem::VMapOwned<BoData>>,
     /// Ships the vmap to the cleanup workqueue and keeps the device alive
-    /// for its final GEM put. `Some` for the entire lifetime of the value,
-    /// taken by `Drop` with `vmap`.
-    handoff: Option<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
+    /// for its final GEM put. Taken by `Drop` with `vmap`.
+    handoff: ManuallyDrop<cleanup::Handoff<shmem::VMapOwned<BoData>, ARef<TyrDrmDevice>>>,
 }
 
 impl MappedUserBo {
@@ -294,17 +293,15 @@ impl MappedUserBo {
         let vmap = bo.owned_vmap::<0>()?;
         Ok(Arc::new(
             Self {
-                vmap: Some(vmap),
-                handoff: Some(handoff),
+                vmap: ManuallyDrop::new(vmap),
+                handoff: ManuallyDrop::new(handoff),
             },
             GFP_KERNEL,
         )?)
     }
 
     pub(crate) fn vmap(&self) -> &shmem::VMapOwned<BoData> {
-        self.vmap
-            .as_ref()
-            .expect("MappedUserBo::vmap accessed after drop")
+        &self.vmap
     }
 
     /// Verifies that `offset..offset + size_of::<T>()` is in bounds of the
@@ -331,8 +328,13 @@ impl MappedUserBo {
 
 impl Drop for MappedUserBo {
     fn drop(&mut self) {
-        let (Some(vmap), Some(handoff)) = (self.vmap.take(), self.handoff.take()) else {
-            return;
+        // SAFETY: `drop` runs once, so this is the only take of either
+        // field, and they are not used afterwards.
+        let (vmap, handoff) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.vmap),
+                ManuallyDrop::take(&mut self.handoff),
+            )
         };
 
         handoff.spawn(vmap, drop);
