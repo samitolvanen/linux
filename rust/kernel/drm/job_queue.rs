@@ -650,15 +650,12 @@ struct JobEntry<T: QueueOps> {
 /// While a job is being prepared (between [`prepare()`] and [`commit()`]) the
 /// entry exists in the `Reserved` variant.  [`commit()`] transitions it to
 /// `Live` in-place -- no allocation at commit time.  The `Reserved` entry is
-/// erased by [`PreparedJob::drop()`] on rollback.
+/// erased when the [`PreparedJob`] is dropped on rollback.
 #[allow(dead_code)]
 enum XaEntry<T: QueueOps> {
     /// Job reserved by [`prepare()`] but not yet committed.
     Reserved {
         job: Arc<T::Job>,
-        /// `Option` so [`commit()`] can `.take()` it without moving out of the
-        /// `&mut` reference returned by `Guard::get_mut`.
-        uninit_fence: Option<UninitDmaFence<T::FenceData>>,
         deps: KVec<ARef<PublicDmaFence>>,
         /// Pre-allocated callback storage stashed alongside `deps` until
         /// [`commit()`] moves it into the `Live` entry.
@@ -689,6 +686,46 @@ impl<T: QueueOps> XaEntry<T> {
         } else {
             None
         }
+    }
+
+    /// Turns a `Reserved` entry into a `Live` one in place, without
+    /// allocating. Returns `submit_fence_drv` if the entry is not `Reserved`.
+    fn make_live(
+        &mut self,
+        submit_fence: &ARef<PublicDmaFence>,
+        submit_fence_drv: DriverDmaFence<T::FenceData, Published>,
+    ) -> Result<(), DriverDmaFence<T::FenceData, Published>> {
+        let XaEntry::Reserved {
+            job,
+            deps,
+            prealloc_cbs,
+            prealloc_progress_cb,
+            prealloc_stage_cb,
+            counter,
+        } = self
+        else {
+            return Err(submit_fence_drv);
+        };
+        *self = XaEntry::Live(JobEntry {
+            job: job.clone(),
+            submit_fence: submit_fence.clone(),
+            submit_fence_drv: Some(submit_fence_drv),
+            counter: *counter,
+            deps: JobDependencies {
+                fences: core::mem::take(deps),
+                current_idx: 0,
+                active_cb: None,
+                prealloc_cbs: core::mem::take(prealloc_cbs),
+            },
+            progress_cb: None,
+            stage_entered_at: Instant::now(),
+            pipeline_entered_at: Instant::now(),
+            stage_wake_cb: None,
+            prealloc_progress_cb: prealloc_progress_cb.take(),
+            prealloc_stage_cb: prealloc_stage_cb.take(),
+            timed_out: false,
+        });
+        Ok(())
     }
 }
 
@@ -1505,9 +1542,18 @@ impl<T: QueueOps> Drop for CoalesceGuard<T> {
 /// one, so code holding a [`PreparedJob`] must not wait on a job committed
 /// after it.
 pub struct PreparedJob<T: QueueOps> {
+    slot: ReservedSlot<T>,
+    uninit_fence: UninitDmaFence<T::FenceData>,
+}
+
+/// The XArray index reserved for a [`PreparedJob`].
+///
+/// Dropping it while armed removes the `Reserved` entry.
+struct ReservedSlot<T: QueueOps> {
     inner: Arc<JobQueueInner<T>>,
-    /// Reserved XArray slot.  `None` once consumed by `commit()`.
-    xa_index: Option<ReservedIndex>,
+    index: ReservedIndex,
+    /// Cleared once [`PreparedJob::commit`] has consumed the entry.
+    armed: bool,
 }
 
 impl<T: QueueOps> PreparedJob<T> {
@@ -1516,44 +1562,78 @@ impl<T: QueueOps> PreparedJob<T> {
     /// The capacity must have been reserved by the `extra_dep_capacity`
     /// argument to [`JobQueue::prepare`]. The push allocates nothing, so it
     /// is safe inside a dma-fence signalling section. Returns `ENOSPC` if the
-    /// caller asked for too few extra slots, and `EINVAL` if the job has
-    /// already been committed or dropped.
+    /// caller asked for too few extra slots, and `EINVAL` if the reserved
+    /// entry is no longer `Reserved`.
     pub fn add_dep(&mut self, fence: ARef<PublicDmaFence>) -> Result {
-        let Some(idx) = self.xa_index.as_ref() else {
-            return Err(EINVAL);
-        };
-
-        let mut guard = self.inner.fifo.lock();
-        let Some(XaEntry::Reserved { deps, .. }) = guard.get_mut(idx.index()) else {
+        let mut guard = self.slot.inner.fifo.lock();
+        let Some(XaEntry::Reserved { deps, .. }) = guard.get_mut(self.slot.index.index()) else {
             return Err(EINVAL);
         };
 
         deps.push_within_capacity(fence).map_err(|_| ENOSPC)
     }
 
-    /// Returns the reserved job, or `None` if it has already been
-    /// committed or dropped.
+    /// Returns the reserved job, or `None` if the entry is no longer
+    /// `Reserved`.
     ///
     /// The driver may use this to populate interior-mutable fields of
     /// the job after prepare has fully succeeded, so a failure earlier in
     /// prepare leaves no partially initialized state behind.
     pub fn job(&self) -> Option<Arc<T::Job>> {
-        let idx = self.xa_index.as_ref()?;
-        let guard = self.inner.fifo.lock();
-        let XaEntry::Reserved { job, .. } = guard.get(idx.index())? else {
+        let guard = self.slot.inner.fifo.lock();
+        let XaEntry::Reserved { job, .. } = guard.get(self.slot.index.index())? else {
             return None;
         };
         Some(job.clone())
     }
+
+    /// Commits the job to the queue that prepared it. See [`JobQueue::commit`].
+    fn commit(self) -> ARef<PublicDmaFence> {
+        let Self {
+            mut slot,
+            uninit_fence,
+        } = self;
+        let inner = &slot.inner;
+        let index = slot.index.index();
+
+        let (ctx, seqno) = inner.fence_ctx.next_seqno();
+
+        let (submit_fence_drv, submit_fence) = uninit_fence.init(ctx, seqno);
+
+        let refused = {
+            let mut guard = inner.fifo.lock();
+            let cancelled = inner.cancelled.load(Relaxed);
+            let result = match guard.get_mut(index) {
+                Some(entry) if !cancelled => entry.make_live(&submit_fence, submit_fence_drv),
+                _ => Err(submit_fence_drv),
+            };
+            if result.is_err() && !cancelled {
+                pr_err_once!("JobQueue: commit() BUG: entry at {} not Reserved\n", index);
+            }
+            result.err().map(|fence| {
+                let reserved = match guard.get(index) {
+                    Some(XaEntry::Reserved { .. }) => guard.remove(index),
+                    _ => None,
+                };
+                (fence, reserved)
+            })
+        };
+        slot.armed = false;
+
+        if let Some((fence, reserved)) = refused {
+            fence.signal(Err(ECANCELED));
+            drop(reserved);
+        }
+
+        inner.maybe_check_progress();
+        submit_fence
+    }
 }
 
-impl<T: QueueOps> Drop for PreparedJob<T> {
+impl<T: QueueOps> Drop for ReservedSlot<T> {
     fn drop(&mut self) {
-        // Remove and drop XaEntry::Reserved if commit() did not consume it.
-        // The UninitDmaFence inside was never passed to dma_fence_init, so
-        // dropping it is a plain kfree — no ECANCELED, no seqno hole.
-        if let Some(idx) = self.xa_index.take() {
-            let entry = self.inner.fifo.lock().remove(idx.index());
+        if self.armed {
+            let entry = self.inner.fifo.lock().remove(self.index.index());
             drop(entry);
             // Let the pipeline retire the index and pick up whatever was
             // reserved behind it.
@@ -1689,7 +1769,6 @@ impl<T: QueueOps> JobQueue<T> {
         let entry = KBox::new(
             XaEntry::Reserved {
                 job: job.clone(),
-                uninit_fence: Some(uninit_fence),
                 deps: dep_vec,
                 prealloc_cbs,
                 prealloc_progress_cb,
@@ -1737,8 +1816,12 @@ impl<T: QueueOps> JobQueue<T> {
         }
 
         Ok(PreparedJob {
-            inner: self.inner.clone(),
-            xa_index: Some(xa_index),
+            slot: ReservedSlot {
+                inner: self.inner.clone(),
+                index: xa_index,
+                armed: true,
+            },
+            uninit_fence,
         })
     }
 
@@ -1746,10 +1829,8 @@ impl<T: QueueOps> JobQueue<T> {
     ///
     /// Returns the public submit fence.  This function is infallible: all
     /// failable work (allocation, fence creation) was completed by
-    /// [`prepare()`](Self::prepare).  The `xa_index` inside `prepared` must
-    /// refer to a live `XaEntry::Reserved` slot, which is guaranteed as long
-    /// as `prepared` was produced by `prepare()` on the same queue and has
-    /// not yet been committed or dropped.
+    /// [`prepare()`](Self::prepare). The job is committed to the queue that
+    /// prepared it.
     ///
     /// Callers must commit jobs in the order they prepared them, and callers
     /// sharing a queue must serialize from prepare to commit. Interleaving
@@ -1764,99 +1845,8 @@ impl<T: QueueOps> JobQueue<T> {
     /// signals it before `cancel_all` returns. This is safe only while the
     /// fences carry `BOOKKEEP` usage, which implicit sync never reads. A
     /// caller must not wait on its own reservation object at `BOOKKEEP`.
-    pub fn commit(&self, mut prepared: PreparedJob<T>) -> ARef<PublicDmaFence> {
-        let xa_index = prepared
-            .xa_index
-            .take()
-            .expect("JobQueue::commit: xa_index already consumed");
-
-        let (ctx, seqno) = self.inner.fence_ctx.next_seqno();
-
-        // Phase 1: extract Reserved fields under the XArray lock.
-        let (
-            job,
-            uninit_fence,
-            deps,
-            prealloc_cbs,
-            prealloc_progress_cb,
-            prealloc_stage_cb,
-            counter,
-        ) = {
-            let mut guard = self.inner.fifo.lock();
-            match guard.get_mut(xa_index.index()) {
-                Some(XaEntry::Reserved {
-                    ref job,
-                    ref mut uninit_fence,
-                    ref mut deps,
-                    ref mut prealloc_cbs,
-                    ref mut prealloc_progress_cb,
-                    ref mut prealloc_stage_cb,
-                    counter,
-                }) => {
-                    let j = job.clone();
-                    let uf = uninit_fence.take().expect("BUG: double commit");
-                    let d = core::mem::take(deps);
-                    let pc = core::mem::take(prealloc_cbs);
-                    let pp = prealloc_progress_cb.take();
-                    let ps = prealloc_stage_cb.take();
-                    (j, uf, d, pc, pp, ps, *counter)
-                }
-                _ => {
-                    panic!(
-                        "JobQueue: commit() BUG: entry at {} not Reserved",
-                        xa_index.index()
-                    );
-                }
-            }
-        };
-
-        // Phase 2: initialise the fence outside the lock.  dma_fence_init
-        // must not be called under xa_lock (the debug list takes its own
-        // spinlock, creating a potential lock-ordering violation).
-        let (submit_fence_drv, submit_fence) = uninit_fence.init(ctx, seqno);
-
-        // Phase 3: transition Reserved → Live in-place — no allocation.
-        let refused = {
-            let mut guard = self.inner.fifo.lock();
-            if self.inner.cancelled.load(Relaxed) {
-                let reserved = guard
-                    .remove(xa_index.index())
-                    .expect("BUG: XaEntry vanished between commit phases");
-                Some((submit_fence_drv, reserved))
-            } else {
-                let entry = guard
-                    .get_mut(xa_index.index())
-                    .expect("BUG: XaEntry vanished between commit phases");
-                *entry = XaEntry::Live(JobEntry {
-                    job,
-                    submit_fence: submit_fence.clone(),
-                    submit_fence_drv: Some(submit_fence_drv),
-                    counter,
-                    deps: JobDependencies {
-                        fences: deps,
-                        current_idx: 0,
-                        active_cb: None,
-                        prealloc_cbs,
-                    },
-                    progress_cb: None,
-                    stage_entered_at: Instant::now(),
-                    pipeline_entered_at: Instant::now(),
-                    stage_wake_cb: None,
-                    prealloc_progress_cb,
-                    prealloc_stage_cb,
-                    timed_out: false,
-                });
-                None
-            }
-        };
-
-        if let Some((fence, reserved)) = refused {
-            fence.signal(Err(ECANCELED));
-            drop(reserved);
-        }
-
-        self.inner.maybe_check_progress();
-        submit_fence
+    pub fn commit(&self, prepared: PreparedJob<T>) -> ARef<PublicDmaFence> {
+        prepared.commit()
     }
 
     /// Coalesce fence completions into a single deferred tick.
