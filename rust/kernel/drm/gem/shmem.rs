@@ -381,12 +381,9 @@ impl<T: DriverObject> Object<T> {
                 let devres = Devres::new(dev, init!(SGTableMap { obj: self.into() }));
                 match devres {
                     Ok(devres) => {
-                        // SAFETY: We acquired the lock protecting this data above, making it safe
-                        // to write into here
-                        unsafe { (*sgt_res_ptr) = Some(devres) };
-
-                        // SAFETY: We just write Some() into *sgt_res_ptr above
-                        Ok(unsafe { (&*sgt_res_ptr).as_ref().unwrap_unchecked() })
+                        // SAFETY: We acquired the lock protecting this data above, and it is
+                        // `None`, so no reference to it exists.
+                        Ok(unsafe { &*(*sgt_res_ptr).insert(devres) })
                     }
                     Err(e) => {
                         // We can't make sure that the pages for this object are unmapped on
@@ -976,22 +973,6 @@ impl_vmap_io_capable!(VMap, u16);
 impl_vmap_io_capable!(VMap, u32);
 #[cfg(CONFIG_64BIT)]
 impl_vmap_io_capable!(VMap, u64);
-
-impl<D: DriverObject, const SIZE: usize> Clone for VMapOwned<D, SIZE> {
-    #[inline]
-    fn clone(&self) -> Self {
-        // SAFETY: We have a successful vmap already, so this can't fail.
-        unsafe { self.owner.owned_vmap().unwrap_unchecked() }
-    }
-}
-
-impl<'a, D: DriverObject, const SIZE: usize> Clone for VMapRef<'a, D, SIZE> {
-    #[inline]
-    fn clone(&self) -> Self {
-        // SAFETY: We have a successful vmap already, so this can't fail.
-        unsafe { self.owner.vmap().unwrap_unchecked() }
-    }
-}
 
 impl<'a, D: DriverObject, const SIZE: usize> From<VMapRef<'a, D, SIZE>> for VMapOwned<D, SIZE> {
     #[inline]
