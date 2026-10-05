@@ -1210,8 +1210,9 @@ impl Queue {
             queue_args.ringbuf_size() as usize,
             flags,
             tdev.coherent,
+            GFP_KERNEL_ACCOUNT,
         )?;
-        let iface_mem = tdev.fw.alloc_queue_mem(tdev)?;
+        let iface_mem = tdev.fw.alloc_queue_mem(tdev, GFP_KERNEL_ACCOUNT)?;
         let interfaces = Interfaces::new(iface_mem)?;
 
         let max_jobs = queue_args.ringbuf_size() as usize / WRAPPER_RINGBUF_BYTES;
@@ -1226,6 +1227,7 @@ impl Queue {
             profiling_slot_count as usize * size_of::<super::job::JobProfilingData>(),
             flags,
             tdev.coherent,
+            GFP_KERNEL_ACCOUNT,
         )?;
 
         let data = Arc::pin_init(
