@@ -21,6 +21,7 @@ use kernel::{
         Flags,
         NumaNode, //
     },
+    bindings,
     iommu::pgtable::{
         DevresIoPageTable,
         IoPageTable,
@@ -152,10 +153,47 @@ impl Drop for PtPage {
     }
 }
 
+/// A zeroed `PT_SIZE` page table held by a `PtReserve`.
+///
+/// # Invariants
+///
+/// The pointer came from `PtPage::into_raw` for `PT_SIZE`, and this
+/// `ReservedPt` owns the page table.
+struct ReservedPt(NonNull<u8>);
+
+// SAFETY: A `ReservedPt` owns its page table, which has no affinity to the
+// thread that allocated it.
+unsafe impl Send for ReservedPt {}
+
+impl ReservedPt {
+    /// Allocates a zeroed `PT_SIZE` page table.
+    fn new(flags: Flags) -> Option<Self> {
+        // INVARIANT: The pointer comes from `PtPage::into_raw` for `PT_SIZE`.
+        Some(Self(PtPage::new(PT_SIZE, flags)?.into_raw()))
+    }
+
+    /// Gives up ownership of the page table.
+    fn into_raw(self) -> NonNull<u8> {
+        ManuallyDrop::new(self).0
+    }
+}
+
+impl Drop for ReservedPt {
+    fn drop(&mut self) {
+        // SAFETY: By the type invariant, the pointer came from
+        // `PtPage::into_raw` for `PT_SIZE` and is owned by `self`.
+        drop(unsafe { PtPage::from_raw(self.0, PT_SIZE) });
+    }
+}
+
+/// Largest number of page tables one `PtReserve` can hold, so that its
+/// array fits in one kmalloc() allocation.
+const PT_RESERVE_MAX: usize = bindings::KMALLOC_MAX_SIZE as usize / size_of::<ReservedPt>();
+
 /// Page tables reserved for one page table update.
 #[derive(Default)]
 pub(crate) struct PtReserve {
-    pages: KVec<PtPage>,
+    pages: KVec<ReservedPt>,
 }
 
 impl PtReserve {
@@ -212,11 +250,14 @@ impl PtReserve {
 
     /// Allocates `count` page tables.
     fn with_count(count: u64) -> Result<Self> {
-        let count = usize::try_from(count).map_err(|_| EINVAL)?;
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|&count| count <= PT_RESERVE_MAX)
+            .ok_or(ENOMEM)?;
         let mut pages = KVec::with_capacity(count, GFP_KERNEL)?;
 
         for _ in 0..count {
-            let page = PtPage::new(PT_SIZE, GFP_KERNEL).ok_or(ENOMEM)?;
+            let page = ReservedPt::new(GFP_KERNEL).ok_or(ENOMEM)?;
             pages.push(page, GFP_KERNEL)?;
         }
 
