@@ -430,7 +430,7 @@ impl Scheduler {
                 if new_chunk_va != 0 {
                     if let Some(pool) = heap_pool {
                         let _ = pool
-                            .return_chunk(tdev, oom.heap_address, new_chunk_va, cookie)
+                            .return_chunk(oom.heap_address, new_chunk_va, cookie)
                             .inspect_err(|e| {
                                 pr_err!("tiler_oom: failed to return orphaned chunk: {:?}\n", e);
                             });

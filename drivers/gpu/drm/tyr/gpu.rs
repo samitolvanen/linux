@@ -2,6 +2,7 @@
 
 pub(crate) mod irq;
 
+use core::num::NonZero;
 use core::ops::{
     Deref,
     DerefMut, //
@@ -30,6 +31,7 @@ use crate::{
         IoMem,
         TyrPlatformDriverData, //
     },
+    heap,
     pwr,
     regs::{
         gpu_control::*,
@@ -42,6 +44,13 @@ use crate::{
 /// register file for its own wrapper prologue/epilogue. Per the CSF
 /// programming manual; constant across all current CSF chips.
 pub(crate) const UNPRESERVED_CS_REG_COUNT: u32 = 4;
+
+/// Largest supported `L2_FEATURES.line_size`, the log2 of the L2 cache line
+/// size in bytes. A heap context pool at a larger stride does not fit in
+/// `u32`.
+const MAX_L2_LINE_SIZE: u32 = 24;
+
+static_assert!((heap::MAX_HEAPS_PER_POOL as u64) << MAX_L2_LINE_SIZE <= u32::MAX as u64);
 
 /// CSIF (Command Stream Interface) information.
 #[repr(C)]
@@ -193,11 +202,25 @@ impl GpuInfo {
         );
     }
 
-    pub(crate) fn heap_context_stride(&self) -> u32 {
-        let line_size = 1u32 << L2_FEATURES::from_raw(self.l2_features).line_size().get();
+    pub(crate) fn check_l2_line_size(&self, dev: &Device<Bound>) -> Result {
+        let line_size = L2_FEATURES::from_raw(self.l2_features).line_size().get();
+        if line_size > MAX_L2_LINE_SIZE {
+            dev_err!(dev, "Unsupported L2 line size: {}\n", line_size);
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn heap_context_stride(&self) -> Result<NonZero<u32>> {
+        let line_size = 1u32
+            .checked_shl(L2_FEATURES::from_raw(self.l2_features).line_size().get())
+            .ok_or(EINVAL)?;
         let heap_context_size = 32u32;
 
-        heap_context_size.next_multiple_of(line_size)
+        heap_context_size
+            .checked_next_multiple_of(line_size)
+            .and_then(NonZero::new)
+            .ok_or(EINVAL)
     }
 
     /// Returns the product name, or `"unknown"` for an unrecognized GPU.
