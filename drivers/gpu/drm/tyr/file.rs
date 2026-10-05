@@ -603,7 +603,14 @@ impl TyrDrmFileData {
 
                         let flags = VmMapFlags::try_from(op.0.flags & map_flags)?;
 
-                        vm.map_bo_range(&bo, op.0.bo_offset, op.0.size, op.0.va, flags)?;
+                        vm.map_bo_range(
+                            &bo,
+                            op.0.bo_offset,
+                            op.0.size,
+                            op.0.va,
+                            flags,
+                            GFP_KERNEL_ACCOUNT,
+                        )?;
                     }
                     uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP => {
                         if op.0.bo_handle != 0 || op.0.bo_offset != 0 {
@@ -614,7 +621,7 @@ impl TyrDrmFileData {
                             Err(EINVAL)?;
                         }
 
-                        vm.unmap_range(op.0.va, op.0.size)?;
+                        vm.unmap_range(op.0.va, op.0.size, GFP_KERNEL_ACCOUNT)?;
                     }
                     _ => Err(EINVAL)?,
                 }

@@ -14,6 +14,7 @@
 //! [`Section`]: crate::fw::Section
 
 use kernel::{
+    alloc::Flags,
     device::{
         Bound,
         Device, //
@@ -451,6 +452,7 @@ impl Firmware {
                     vm_map_flags,
                     coherent,
                     KernelBoOwner::Firmware,
+                    GFP_KERNEL,
                 )?;
 
                 let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
@@ -833,10 +835,14 @@ impl Firmware {
     }
 
     /// Allocate a CS ring-buffer interface in the FW VM (AS0).
-    pub(crate) fn alloc_queue_mem(&self, tdev: &TyrDrmDevice) -> Result<Arc<gem::MappedBo>> {
+    pub(crate) fn alloc_queue_mem(
+        &self,
+        tdev: &TyrDrmDevice,
+        pt_gfp: Flags,
+    ) -> Result<Arc<gem::MappedBo>> {
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
 
-        let mem = gem::new_kernel_object(tdev, &self.vm, SZ_8K, flags, tdev.coherent)?;
+        let mem = gem::new_kernel_object(tdev, &self.vm, SZ_8K, flags, tdev.coherent, pt_gfp)?;
 
         let vmap = mem.vmap();
         let size = vmap.owner().size();
@@ -872,10 +878,11 @@ impl Firmware {
         &self,
         tdev: &TyrDrmDevice,
         suspend_size: usize,
+        pt_gfp: Flags,
     ) -> Result<gem::KernelBo> {
         let flags = VmMapFlags::from(VmFlag::Noexec);
 
-        gem::new_kernel_object_no_vmap(tdev, &self.vm, suspend_size, flags, tdev.coherent)
+        gem::new_kernel_object_no_vmap(tdev, &self.vm, suspend_size, flags, tdev.coherent, pt_gfp)
     }
 }
 
