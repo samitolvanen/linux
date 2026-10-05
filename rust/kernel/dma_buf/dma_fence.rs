@@ -1486,14 +1486,14 @@ impl<T: FenceCallback> FenceCallbackRegistration<T> {
                 match ret {
                     Ok(()) => Ok(()),
                     Err(e) => {
-                        let cb_back = core::ptr::read(slot_callback)
-                            .expect("callback was just written as Some");
+                        let cb_back = core::ptr::read(slot_callback);
                         let _fence_back = core::ptr::read(slot_fence);
 
-                        if e.to_errno() == ENOENT.to_errno() {
-                            Err(CallbackError::AlreadySignaled(cb_back))
-                        } else {
-                            Err(CallbackError::Other(e))
+                        match cb_back {
+                            Some(cb) if e.to_errno() == ENOENT.to_errno() => {
+                                Err(CallbackError::AlreadySignaled(cb))
+                            }
+                            _ => Err(CallbackError::Other(e)),
                         }
                     }
                 }
