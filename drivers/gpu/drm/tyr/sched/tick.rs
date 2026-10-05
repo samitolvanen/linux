@@ -986,13 +986,15 @@ impl<'a> Tick<'a> {
         };
 
         let mut decision = SchedulingDecision::new();
-        if let Err(e) = decision.evaluate_rules(tdev, self.sched, rules, full_tick) {
+        if let Err(e) = decision
+            .evaluate_rules(tdev, self.sched, rules, full_tick)
+            .and_then(|()| self.apply(tdev, fw, &mut decision))
+        {
             for pending in decision.pending_groups.iter_mut().filter_map(Option::take) {
                 self.requeue_pending_bind(pending);
             }
             return Err(e);
         }
-        self.apply(tdev, fw, &mut decision)?;
 
         if full_tick {
             self.sched.last_full_tick_jiffies = now;
