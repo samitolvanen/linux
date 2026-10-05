@@ -19,8 +19,7 @@ use kernel::{
     device::Device,
     impl_flags,
     prelude::*,
-    sizes::SZ_4K,
-    str::CString, //
+    sizes::SZ_4K, //
 };
 
 use crate::{
@@ -119,73 +118,70 @@ impl<'a> Cursor<'a> {
     ///
     /// This spawns a new cursor, leaving the current cursor unchanged.
     fn view(&self, range: Range<usize>) -> Result<Cursor<'_>> {
-        if range.start < self.pos || range.end > self.data.len() {
-            pr_err!(
-                "Invalid cursor range {:?} for data of length {}",
-                range,
-                self.data.len()
-            );
+        match self.data.get(range.clone()) {
+            Some(data) if range.start >= self.pos => Ok(Self { data, pos: 0 }),
+            _ => {
+                pr_err!(
+                    "Invalid cursor range {:?} for data of length {}\n",
+                    range,
+                    self.data.len()
+                );
 
-            Err(EINVAL)
-        } else {
-            Ok(Self {
-                data: &self.data[range],
-                pos: 0,
-            })
+                Err(EINVAL)
+            }
         }
     }
 
-    /// Reads a slice of bytes from the current position and advances the cursor.
+    /// Reads `N` bytes from the current position and advances the cursor.
     ///
     /// Returns an error if the read would exceed the data bounds.
-    fn read(&mut self, nbytes: usize) -> Result<&[u8]> {
-        let start = self.pos;
-        let end = start + nbytes;
-
-        if end > self.data.len() {
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let end = self.pos.checked_add(N);
+        let bytes = end
+            .and_then(|end| self.data.get(self.pos..end))
+            .and_then(|bytes| bytes.first_chunk::<N>());
+        let (Some(end), Some(bytes)) = (end, bytes) else {
             pr_err!(
-                "Invalid firmware file: read of size {} at position {} is out of bounds",
-                nbytes,
-                start,
+                "Invalid firmware file: read of size {} at position {} is out of bounds\n",
+                N,
+                self.pos,
             );
             return Err(EINVAL);
-        }
+        };
 
-        self.pos += nbytes;
-        Ok(&self.data[start..end])
+        self.pos = end;
+        Ok(*bytes)
     }
 
     /// Reads a little-endian `u8` from the current position and advances the cursor.
     fn read_u8(&mut self) -> Result<u8> {
-        let bytes = self.read(size_of::<u8>())?;
-        Ok(bytes[0])
+        Ok(u8::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `u16` from the current position and advances the cursor.
     fn read_u16(&mut self) -> Result<u16> {
-        let bytes = self.read(size_of::<u16>())?;
-        Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u16::from_le_bytes(self.read_array()?))
     }
 
     /// Reads a little-endian `u32` from the current position and advances the cursor.
     fn read_u32(&mut self) -> Result<u32> {
-        let bytes = self.read(size_of::<u32>())?;
-        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.read_array()?))
     }
 
     /// Advances the cursor position by the specified number of bytes.
     ///
     /// Returns an error if the advance would exceed the data bounds.
     fn advance(&mut self, nbytes: usize) -> Result {
-        if self.pos + nbytes > self.data.len() {
+        let end = self.pos.checked_add(nbytes);
+        let Some(end) = end.filter(|&end| end <= self.data.len()) else {
             pr_err!(
-                "Invalid firmware file: advance of size {} at position {} is out of bounds",
+                "Invalid firmware file: advance of size {} at position {} is out of bounds\n",
                 nbytes,
                 self.pos,
             );
             return Err(EINVAL);
-        }
-        self.pos += nbytes;
+        };
+        self.pos = end;
         Ok(())
     }
 }
@@ -438,17 +434,6 @@ impl<'a> FwParser<'a> {
         if section_hdr.va.is_empty() {
             return Ok(None);
         }
-
-        let name_len = entry_cursor.len() - entry_cursor.pos();
-        let name_bytes = entry_cursor.read(name_len)?;
-
-        let mut name = KVec::with_capacity(name_bytes.len() + 1, GFP_KERNEL)?;
-        name.extend_from_slice(name_bytes, GFP_KERNEL)?;
-        name.push(0, GFP_KERNEL)?;
-
-        let _name = CStr::from_bytes_with_nul(&name)
-            .ok()
-            .and_then(|name| CString::try_from(name).ok());
 
         let cache_mode = section_hdr.section_flags.cache_mode();
         let mut vm_map_flags = VmMapFlags::empty();
