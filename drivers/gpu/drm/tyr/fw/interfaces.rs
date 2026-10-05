@@ -189,7 +189,7 @@ mod iface {
 
             let offset = (shared_iface_addr - shared_mem_start) as usize;
             Ok(FwInterface {
-                vmap: Arc::new(vmap.clone(), GFP_KERNEL)?,
+                vmap: Arc::new(vmap.owner().owned_vmap::<0>()?, GFP_KERNEL)?,
                 offset,
             })
         }
