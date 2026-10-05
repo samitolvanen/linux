@@ -733,6 +733,11 @@ impl Group {
         self.queues.len()
     }
 
+    /// Returns the mask of the group's queue indices.
+    pub(crate) fn queue_mask(&self) -> u32 {
+        QueueIdx::mask_below(self.queues.len())
+    }
+
     /// Returns each queue with its index.
     ///
     /// `Pool::create_group` caps the queue count at `MAX_CS_PER_GROUP`, so
