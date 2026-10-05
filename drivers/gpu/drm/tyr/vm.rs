@@ -1754,6 +1754,21 @@ impl DriverGpuVm for GpuVmData {
             iova += segment_mapped;
         }
 
+        if bytes_left_to_map != 0 {
+            let total_mapped = iova - start_iova;
+
+            if total_mapped > 0 && pt_unmap(context.page_table, start_iova..iova).is_err() {
+                self.mark_failed(context, &(start_iova..iova));
+            }
+
+            pr_err!(
+                "SG table is too small for requested mapping: {} bytes remain\n",
+                bytes_left_to_map
+            );
+
+            return Err(EINVAL);
+        }
+
         let gpuva = context.preallocated_gpuva()?;
         let op = op.insert(gpuva, GpuVaData { prot });
 
