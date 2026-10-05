@@ -133,7 +133,10 @@ fn alloc_chunk_bo(
 impl Context {
     /// Combined size of the context's chunks.
     fn heap_size(&self) -> usize {
-        self.chunk_size as usize * self.chunks.len()
+        self.chunks
+            .iter()
+            .map(|bo| bo.size())
+            .fold(0, usize::saturating_add)
     }
 
     fn push_chunk(&mut self, chunk_bo: Arc<gem::MappedBo>) -> Result {
@@ -301,6 +304,7 @@ impl Pool {
             .and_then(|bo| bo.kernel_va())
             .ok_or(EINVAL)?
             .start;
+        let heap_size = heap_ctx.heap_size();
 
         let stride = self.stride.get() as usize;
         let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
@@ -329,10 +333,7 @@ impl Pool {
 
         // Account only once the context is in the XArray, because a failed
         // `alloc_cyclic` drops `heap_ctx` and frees its chunks.
-        self.pool_total_size.add(
-            args.chunk_size as usize * args.initial_chunk_count as usize,
-            Relaxed,
-        );
+        self.pool_total_size.add(heap_size, Relaxed);
 
         let vmap = self.gpu_contexts.vmap();
         let base = vmap.as_view().as_ptr().cast::<u8>();
