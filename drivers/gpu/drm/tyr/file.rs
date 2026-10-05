@@ -479,7 +479,7 @@ impl TyrDrmFileData {
             };
 
             info.0.duration_nsec = if flags & DURATION != 0 {
-                (time::local_clock() - query_start) as u32
+                time::local_clock().saturating_sub(query_start) as u32
             } else {
                 0
             };

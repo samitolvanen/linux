@@ -596,6 +596,8 @@ pub(crate) struct KernelBo {
     vm: ManuallyDrop<Arc<Vm>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
+    /// The size of `va_range`.
+    size: u64,
     /// Kernel-VA pool reservation backing `va_range`, for BOs whose
     /// VA was handed out by `Vm::alloc_kernel_range`. Dropped from
     /// the deferred cleanup once `Vm::unmap_exact` has torn
@@ -638,6 +640,7 @@ impl KernelBo {
             .ok()
             .and_then(|bytes| bytes.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(EOVERFLOW)?;
+        let va_end = va.checked_add(size).ok_or(EINVAL)?;
         let handoff = match owner {
             KernelBoOwner::Firmware => None,
             KernelBoOwner::User(dev) => Some(cleanup::Handoff::new(dev)?),
@@ -661,7 +664,8 @@ impl KernelBo {
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
             vm: ManuallyDrop::new(vm.into()),
-            va_range: va..(va + size),
+            va_range: va..va_end,
+            size,
             kernel_node: None,
             handoff,
         })
@@ -670,6 +674,11 @@ impl KernelBo {
     /// Returns the GPU virtual address range occupied by this buffer.
     pub(crate) fn va_range(&self) -> Range<u64> {
         self.va_range.clone()
+    }
+
+    /// Returns the size of the GPU virtual address range.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
     }
 
     /// Returns the kernel-VA pool reservation range, if this buffer
@@ -695,7 +704,7 @@ impl KernelBo {
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
-    va: u64,
+    va_range: Range<u64>,
     size: u64,
     /// Kernel-VA pool reservation, held until the deferred unmap has
     /// actually torn down the GPU PTEs. `None` for BOs whose VA is
@@ -706,8 +715,8 @@ struct KernelBoCleanup {
 
 impl Drop for KernelBo {
     fn drop(&mut self) {
-        let va = self.va_range.start;
-        let size = self.va_range.end - self.va_range.start;
+        let va_range = self.va_range.clone();
+        let size = self.size;
         // SAFETY: `drop` runs once, this is the only take of `self.vm`,
         // and the field is not read afterwards. Moving the reference out
         // keeps the final `Arc<Vm>` release off the inline drop path.
@@ -725,7 +734,7 @@ impl Drop for KernelBo {
         let captures = KernelBoCleanup {
             vm,
             bo,
-            va,
+            va_range,
             size,
             kernel_node,
         };
@@ -746,17 +755,17 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
         bo,
-        va,
+        va_range,
         size,
         kernel_node,
     } = captures;
     let unmapped = vm
-        .unmap_exact(va, size)
+        .unmap_exact(va_range.start, size)
         .inspect_err(|e| {
             pr_err!(
                 "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-                va,
-                va + size,
+                va_range.start,
+                va_range.end,
                 e
             );
         })

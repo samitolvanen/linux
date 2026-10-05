@@ -692,13 +692,11 @@ impl Firmware {
     /// takes BO locks.
     fn reload_sections(&self) -> Result {
         for section in self.sections.iter() {
-            let va = section.mem.va_range();
-
             Self::init_section_mem(
                 &section.vmap,
                 &section.data,
                 section.section_flags,
-                va.end - va.start,
+                section.mem.size(),
             )?;
             Self::sync_section(self.pdev.as_ref(), &section.sgt)?;
         }
