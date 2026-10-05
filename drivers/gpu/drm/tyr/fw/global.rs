@@ -16,11 +16,29 @@ use crate::{
     driver::IoMem,
     fw::{
         interfaces::{
-            FwInterface, GlbState, CSG_ACK, CSG_CONTROL_BLOCK_SIZE, CSG_REQ, GLB_ACK,
-            GLB_ACK_IRQ_MASK, GLB_ALLOC_EN, GLB_CONTROL_BLOCK_SIZE, GLB_DB_ACK, GLB_DB_REQ,
-            GLB_GROUP_NUM, GLB_GROUP_STRIDE, GLB_IDLE_TIMER, GLB_INPUT_BLOCK_SIZE, GLB_INPUT_VA,
-            GLB_OUTPUT_BLOCK_SIZE, GLB_OUTPUT_VA, GLB_PROGRESS_TIMER, GLB_PWROFF_TIMER, GLB_REQ,
-            GLB_VERSION,
+            FwInterface,
+            GlbState,
+            TimestampSource,
+            CSG_ACK,
+            CSG_CONTROL_BLOCK_SIZE,
+            CSG_REQ,
+            GLB_ACK,
+            GLB_ACK_IRQ_MASK,
+            GLB_ALLOC_EN,
+            GLB_CONTROL_BLOCK_SIZE,
+            GLB_DB_ACK,
+            GLB_DB_REQ,
+            GLB_GROUP_NUM,
+            GLB_GROUP_STRIDE,
+            GLB_IDLE_TIMER,
+            GLB_INPUT_BLOCK_SIZE,
+            GLB_INPUT_VA,
+            GLB_OUTPUT_BLOCK_SIZE,
+            GLB_OUTPUT_VA,
+            GLB_PROGRESS_TIMER,
+            GLB_PWROFF_TIMER,
+            GLB_REQ,
+            GLB_VERSION, //
         },
         irq::JobIrqState,
         CsgSlotMask,
@@ -52,13 +70,13 @@ pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 use crate::wait::WaitResult;
 
 /// Encodes a GLB timer timeout and selects the backing time source.
-pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, Bounded<u32, 1>)> {
+pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, TimestampSource)> {
     // The max timeout is determined by the 31 bit size of the timeout field.
     let max_timeout = (1u32 << 31) - 1;
 
     let (timer_rate, timer_source) = match arch_timer_get_rate() {
-        Some(rate) => (u64::from(rate), Bounded::try_new(0).unwrap()),
-        _ if core_clk_rate != 0 => (core_clk_rate, Bounded::try_new(1).unwrap()),
+        Some(rate) => (u64::from(rate), TimestampSource::SystemTimestamp),
+        _ if core_clk_rate != 0 => (core_clk_rate, TimestampSource::GpuCounter),
         _ => return Err(EINVAL),
     };
 
@@ -605,7 +623,7 @@ impl InnerGlobalInterface {
             GLB_PWROFF_TIMER,
             GLB_PWROFF_TIMER::zeroed()
                 .with_timeout(pwroff_timeout)
-                .with_timer_source(pwroff_source.into()),
+                .with_timer_source(pwroff_source),
         );
 
         const PROGRESS_TIMEOUT_CYCLES: u32 = 5 * 500 * 1024 * 1024;
@@ -623,7 +641,7 @@ impl InnerGlobalInterface {
             GLB_IDLE_TIMER,
             GLB_IDLE_TIMER::zeroed()
                 .with_timeout(idle_timeout)
-                .with_timer_source(idle_source.into()),
+                .with_timer_source(idle_source),
         );
 
         Ok(())
