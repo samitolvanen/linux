@@ -125,17 +125,20 @@ impl GemRegistry {
         if index == NOT_REGISTERED {
             return;
         }
-
-        let last = bos.len() - 1;
-        if index != last {
-            bos.swap(index, last);
+        if index >= bos.len() {
+            pr_warn_once!("gems debugfs slot {} out of range\n", index);
+            return;
         }
-        bos.pop();
-        if index != last {
+
+        let Some(last) = bos.pop() else {
+            return;
+        };
+        if let Some(entry) = bos.get_mut(index) {
+            *entry = last;
             // The former last entry now sits at `index`. Fix up its slot.
-            // SAFETY: `bos[index].gem` is still in the registry, so its object
+            // SAFETY: `entry.gem` is still in the registry, so its object
             // is alive, and the registry lock is held for exclusive access.
-            unsafe { bos[index].gem.as_ref() }
+            unsafe { entry.gem.as_ref() }
                 .registry_slot()
                 .store(index, Relaxed);
         }
@@ -147,8 +150,8 @@ impl GemRegistry {
         seq_print!(m, "created-by                      global-name     refcount        size            resident-size   file-offset       state      usage       label\n");
         seq_print!(m, "----------------------------------------------------------------------------------------------------------------------------------------------\n");
 
-        let mut total_size = 0usize;
-        let mut total_resident = 0usize;
+        let mut total_size = 0u64;
+        let mut total_resident = 0u64;
 
         {
             let bos = self.bos.lock();
@@ -199,8 +202,8 @@ impl GemRegistry {
                     None => seq_print!(m, "\n"),
                 });
 
-                total_size += size;
-                total_resident += resident;
+                total_size = total_size.saturating_add(size as u64);
+                total_resident = total_resident.saturating_add(resident as u64);
             }
         }
 
