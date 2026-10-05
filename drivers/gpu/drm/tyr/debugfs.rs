@@ -113,7 +113,7 @@ impl GemRegistry {
         match bos.push(entry, GFP_KERNEL) {
             Ok(()) => bo.registry_slot().store(index, Relaxed),
             Err(_) => {
-                pr_warn_once!("tyr: gems debugfs registration failed under memory pressure\n")
+                pr_warn_once!("gems debugfs registration failed under memory pressure\n")
             }
         }
     }
@@ -276,7 +276,7 @@ impl VmRegistry {
         match vms.push(VmEntry { vm: vm.into() }, GFP_KERNEL) {
             Ok(()) => vm.registry_slot().store(index, Relaxed),
             Err(_) => {
-                pr_warn_once!("tyr: gpuvas debugfs registration failed under memory pressure\n")
+                pr_warn_once!("gpuvas debugfs registration failed under memory pressure\n")
             }
         }
     }
