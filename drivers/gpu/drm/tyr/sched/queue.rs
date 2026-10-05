@@ -449,17 +449,23 @@ impl QueueData {
         let ringbuf_sz = self.ringbuf.size() as u64;
 
         let ringbuf_start = ringbuf_input.insert;
+        let completion_point = ringbuf_start.checked_add(instrs.len() as u64).ok_or(EIO)?;
         let cs_insert = (ringbuf_start & (ringbuf_sz - 1)) as usize;
 
-        self.with_ringbuf(|bytes| {
-            let first_chunk = core::cmp::min(bytes.len() - cs_insert, instrs.len());
-            bytes[cs_insert..cs_insert + first_chunk].copy_from_slice(&instrs[..first_chunk]);
-            if first_chunk < instrs.len() {
-                bytes[..instrs.len() - first_chunk].copy_from_slice(&instrs[first_chunk..]);
-            }
-        });
+        self.with_ringbuf(|bytes| -> Result {
+            let (wrapped, linear) = bytes.split_at_mut_checked(cs_insert).ok_or(EIO)?;
+            let (first, rest) = instrs.split_at(core::cmp::min(linear.len(), instrs.len()));
+            linear
+                .get_mut(..first.len())
+                .ok_or(EIO)?
+                .copy_from_slice(first);
+            wrapped
+                .get_mut(..rest.len())
+                .ok_or(EIO)?
+                .copy_from_slice(rest);
+            Ok(())
+        })?;
 
-        let completion_point = ringbuf_start + instrs.len() as u64;
         Ok(completion_point)
     }
 
