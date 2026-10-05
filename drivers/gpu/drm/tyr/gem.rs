@@ -8,6 +8,7 @@ use core::mem::ManuallyDrop;
 use core::ops::Range;
 
 use kernel::{
+    alloc::Flags,
     device::{
         self,
         Bound,
@@ -385,9 +386,10 @@ pub(crate) fn new_kernel_object(
     size: usize,
     flags: VmMapFlags,
     coherent: bool,
+    pt_gfp: Flags,
 ) -> Result<Arc<MappedBo>> {
     MappedBo::new(new_kernel_object_no_vmap(
-        dev, ddev, vm, size, flags, coherent,
+        dev, ddev, vm, size, flags, coherent, pt_gfp,
     )?)
 }
 
@@ -411,6 +413,7 @@ pub(crate) fn new_kernel_object_no_vmap(
     size: usize,
     flags: VmMapFlags,
     coherent: bool,
+    pt_gfp: Flags,
 ) -> Result<KernelBo> {
     let aligned_size = size.checked_next_multiple_of(PAGE_SIZE).ok_or(EINVAL)?;
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -425,6 +428,7 @@ pub(crate) fn new_kernel_object_no_vmap(
         flags,
         coherent,
         KernelBoOwner::User,
+        pt_gfp,
     )?
     .with_va_reservation(node))
 }
@@ -497,6 +501,7 @@ impl KernelBo {
         flags: VmMapFlags,
         coherent: bool,
         owner: KernelBoOwner,
+        pt_gfp: Flags,
     ) -> Result<Self> {
         if size == 0 {
             dev_err!(dev, "Cannot create KernelBo with size 0");
@@ -528,7 +533,7 @@ impl KernelBo {
             },
         )?;
 
-        vm.map_bo_range(dev, &bo, 0, size, va, flags)?;
+        vm.map_bo_range(dev, &bo, 0, size, va, flags, pt_gfp)?;
 
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
