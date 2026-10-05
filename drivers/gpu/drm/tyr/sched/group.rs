@@ -789,6 +789,12 @@ impl Group {
         self.queues.len()
     }
 
+    /// Returns the mask of the group's queue indices.
+    pub(crate) fn queue_mask(&self) -> u32 {
+        self.indexed_queues()
+            .fold(0, |mask, (queue_idx, _)| mask | queue_idx.bit())
+    }
+
     /// Returns each queue with its index.
     ///
     /// `Group::create` caps the queue count at `MAX_CS_PER_GROUP`, so every
