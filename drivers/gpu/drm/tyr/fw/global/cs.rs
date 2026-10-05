@@ -106,9 +106,16 @@ impl CsInterface {
         cs_idx: usize,
         cs_stride: usize,
     ) -> Result {
-        let cs_control_offset = CS_CONTROL_OFFSET + cs_idx * cs_stride;
-        let cs_control_va =
-            shared_section.va_range.start + csg_control_offset as u64 + cs_control_offset as u64;
+        let cs_control_offset = cs_idx
+            .checked_mul(cs_stride)
+            .and_then(|offset| offset.checked_add(CS_CONTROL_OFFSET))
+            .ok_or(EINVAL)?;
+        let cs_control_va = shared_section
+            .va_range
+            .start
+            .checked_add(csg_control_offset as u64)
+            .and_then(|va| va.checked_add(cs_control_offset as u64))
+            .ok_or(EINVAL)?;
 
         let cs_control = FwInterface::<CS_CONTROL_BLOCK_SIZE>::new(
             &shared_section.vmap,

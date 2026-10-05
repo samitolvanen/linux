@@ -140,8 +140,15 @@ impl CsgInterface {
         has_64bit_ep_req: bool,
         first_cs: Option<&CsInterface>,
     ) -> Result {
-        let csg_control_offset = CSG_GROUP_CONTROL_OFFSET + csg_idx * csg_stride;
-        let csg_control_va = shared_section.va_range.start + csg_control_offset as u64;
+        let csg_control_offset = csg_idx
+            .checked_mul(csg_stride)
+            .and_then(|offset| offset.checked_add(CSG_GROUP_CONTROL_OFFSET))
+            .ok_or(EINVAL)?;
+        let csg_control_va = shared_section
+            .va_range
+            .start
+            .checked_add(csg_control_offset as u64)
+            .ok_or(EINVAL)?;
 
         let csg_control = FwInterface::<CSG_CONTROL_BLOCK_SIZE>::new(
             &shared_section.vmap,
