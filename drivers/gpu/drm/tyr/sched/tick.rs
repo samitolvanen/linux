@@ -268,10 +268,6 @@ pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>) {
 /// firmware-event drain for events latched across the suspend, the
 /// sync-update sweep for syncwaits satisfied while no group was
 /// resident, and the tick so evicted-but-runnable groups rebind.
-///
-/// The sweep runs on a separate workqueue and ticks immediately only
-/// for a real-time group. The immediate tick here can therefore run
-/// before the sweep promotes anything, so a delayed tick follows.
 pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
     // Clear the suspend under the scheduler mutex, the counterpart to the
     // store in `suspend`, before reissuing work.

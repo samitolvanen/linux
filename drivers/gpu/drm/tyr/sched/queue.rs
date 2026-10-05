@@ -188,7 +188,7 @@ struct PendingSubmitFence {
 /// signaled it as the oldest live entry. Such a hole is skipped on
 /// drain.
 /// `Queue::maybe_truncate_pending` compacts the prefix away once
-/// `head` exceeds `max(len / 2, 16)`, or once `head` is non-zero in a
+/// `head` reaches `max(len / 2, 16)`, or once `head` is non-zero in a
 /// full vec.
 ///
 /// `next_profiling_slot` is the sample slot the next profiled job takes
@@ -634,7 +634,7 @@ impl QueueData {
         group.accumulate_fdinfo(cycles, time);
     }
 
-    /// Compacts the drained prefix away once `head` has grown past
+    /// Compacts the drained prefix away once `head` reaches
     /// `max(len / 2, 16)`, or once `head` is non-zero in a full vec so that
     /// `push_submit_fence` finds room.
     ///
