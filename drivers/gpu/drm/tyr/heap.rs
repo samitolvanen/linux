@@ -2,6 +2,8 @@
 
 //! Tiler heap management.
 
+use core::num::NonZero;
+
 use kernel::{
     alloc::KVec,
     drm::gem::BaseObject,
@@ -38,7 +40,7 @@ use crate::{
     },
 };
 
-const MAX_HEAPS_PER_POOL: u32 = 128;
+pub(crate) const MAX_HEAPS_PER_POOL: u32 = 128;
 const CHUNK_SIZE_MASK: u64 = !((1u64 << 12) - 1);
 
 #[repr(C)]
@@ -193,6 +195,7 @@ impl Context {
 pub(crate) struct Pool {
     vm: Arc<Vm>,
     gpu_contexts: Arc<gem::MappedBo>,
+    stride: NonZero<u32>,
     xa: Pin<KBox<XArray<KBox<Context>>>>,
     next_id: Atomic<u32>,
     /// Ever-incrementing source of context cookies. Unlike `next_id`, it
@@ -205,8 +208,11 @@ pub(crate) struct Pool {
 
 impl Pool {
     pub(crate) fn create(tdev: &TyrDrmDevice, vm: Arc<Vm>) -> Result<Self> {
-        let stride = tdev.gpu_info.heap_context_stride();
-        let bo_size = (MAX_HEAPS_PER_POOL * stride).next_multiple_of(4096) as usize;
+        let stride = tdev.gpu_info.heap_context_stride()?;
+        let bo_size = MAX_HEAPS_PER_POOL
+            .checked_mul(stride.get())
+            .and_then(|size| size.checked_next_multiple_of(4096))
+            .ok_or(EINVAL)? as usize;
 
         let flags = VmMapFlags::from(VmFlag::Noexec);
         let gpu_contexts = gem::new_kernel_object(tdev, &vm, bo_size, flags, tdev.coherent)?;
@@ -217,6 +223,7 @@ impl Pool {
         Ok(Self {
             vm,
             gpu_contexts,
+            stride,
             xa,
             next_id: Atomic::new(0),
             next_cookie: Atomic::new(0),
@@ -272,7 +279,7 @@ impl Pool {
             .ok_or(EINVAL)?
             .start;
 
-        let stride = tdev.gpu_info.heap_context_stride() as usize;
+        let stride = self.stride.get() as usize;
         let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
 
         let xa = self.xa.as_ref();
@@ -295,14 +302,21 @@ impl Pool {
         };
         self.next_id.store(next, Relaxed);
 
+        let offset = index.checked_mul(stride);
+        let context_gpu_va = offset.and_then(|offset| contexts_va.checked_add(offset as u64));
+        let (Some(offset), Some(context_gpu_va)) = (offset, context_gpu_va) else {
+            let heap_ctx = guard.remove(index);
+            drop(guard);
+            drop(heap_ctx);
+            return Err(EINVAL);
+        };
+
         // Account only once the context is in the XArray, because a failed
         // `alloc_cyclic` drops `heap_ctx` and frees its chunks.
         self.pool_total_size.add(
             args.chunk_size as usize * args.initial_chunk_count as usize,
             Relaxed,
         );
-
-        let offset = index * stride;
 
         let vmap = self.gpu_contexts.vmap();
         // SAFETY: `index` is allocated cyclically within `0..MAX_HEAPS_PER_POOL`.
@@ -314,8 +328,6 @@ impl Pool {
             core::slice::from_raw_parts_mut((vmap.addr() as *mut u8).add(offset), stride)
         };
         slot.fill(0);
-
-        let context_gpu_va = contexts_va + offset as u64;
 
         Ok(CreatedContext {
             context_id: index,
@@ -339,11 +351,11 @@ impl Pool {
         Ok(())
     }
 
-    fn heap_va_to_index(&self, tdev: &TyrDrmDevice, heap_gpu_va: u64) -> Result<usize> {
+    fn heap_va_to_index(&self, heap_gpu_va: u64) -> Result<usize> {
         let contexts_va = self.gpu_contexts.kernel_va().ok_or(EINVAL)?.start;
         let offset = heap_gpu_va.checked_sub(contexts_va).ok_or(EINVAL)?;
         let offset = u32::try_from(offset).map_err(|_| EINVAL)?;
-        Ok((offset / tdev.gpu_info.heap_context_stride()) as usize)
+        Ok((offset / self.stride) as usize)
     }
 
     #[allow(dead_code)]
@@ -354,7 +366,7 @@ impl Pool {
     ) -> Result<(u64, u64)> {
         let _ = args.pending_frag_count;
 
-        let index = self.heap_va_to_index(tdev, args.heap_gpu_va)?;
+        let index = self.heap_va_to_index(args.heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
 
@@ -417,14 +429,8 @@ impl Pool {
         ))
     }
 
-    pub(crate) fn return_chunk(
-        &self,
-        tdev: &TyrDrmDevice,
-        heap_gpu_va: u64,
-        chunk_gpu_va: u64,
-        cookie: u64,
-    ) -> Result {
-        let index = self.heap_va_to_index(tdev, heap_gpu_va)?;
+    pub(crate) fn return_chunk(&self, heap_gpu_va: u64, chunk_gpu_va: u64, cookie: u64) -> Result {
+        let index = self.heap_va_to_index(heap_gpu_va)?;
 
         let xa = self.xa.as_ref();
         let (removed, chunk_size) = {
