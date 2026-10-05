@@ -166,7 +166,7 @@ impl Mmu {
     ) -> Result {
         // The `.lock()` guard is a condition temporary, so it drops before
         // the path below can take the op lock.
-        if self.as_manager.lock().bump_resident_vm_users(&vm) {
+        if self.as_manager.lock().bump_resident_vm_users(&vm)? {
             return Ok(());
         }
         let _op = vm.lock_ops();

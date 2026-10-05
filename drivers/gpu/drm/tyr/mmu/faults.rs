@@ -9,7 +9,13 @@
 
 use kernel::{c_str, devres::Devres, io::register::Array, io::Io, prelude::*, str::CStr};
 
-use crate::{driver::IoMem, regs::mmu_control::mmu_as_control};
+use crate::{
+    driver::IoMem,
+    regs::{
+        mmu_control::mmu_as_control,
+        MAX_AS, //
+    }, //
+};
 
 const EXCEPTION_MAP: &[(u32, &CStr)] = &[
     (0x00, c_str!("OK")),
@@ -83,17 +89,17 @@ fn access_type_name(fault_status: u32) -> &'static str {
     }
 }
 
-pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
-    while status != 0 {
-        let as_index = (status | (status >> 16)).trailing_zeros();
-        let mask = kernel::bits::bit_u32(as_index);
+pub(super) fn decode_faults(status: u32, iomem: &Devres<IoMem>) -> Result {
+    let faulted = status | (status >> 16);
 
-        let fault_status_reg =
-            mmu_as_control::FAULTSTATUS::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_lo_reg =
-            mmu_as_control::FAULTADDRESS_LO::try_at(as_index as usize).ok_or(EINVAL)?;
-        let fault_addr_hi_reg =
-            mmu_as_control::FAULTADDRESS_HI::try_at(as_index as usize).ok_or(EINVAL)?;
+    for as_index in 0..MAX_AS {
+        if faulted & (1u32 << as_index) == 0 {
+            continue;
+        }
+
+        let fault_status_reg = mmu_as_control::FAULTSTATUS::try_at(as_index).ok_or(EINVAL)?;
+        let fault_addr_lo_reg = mmu_as_control::FAULTADDRESS_LO::try_at(as_index).ok_or(EINVAL)?;
+        let fault_addr_hi_reg = mmu_as_control::FAULTADDRESS_HI::try_at(as_index).ok_or(EINVAL)?;
 
         // Drop the IO guard before doing anything that may sleep.
         let (fault_status_raw, addr_lo, addr_hi) = {
@@ -133,8 +139,6 @@ pub(super) fn decode_faults(mut status: u32, iomem: &Devres<IoMem>) -> Result {
             access_type_name(fault_status_raw),
             source_id,
         );
-
-        status &= !mask;
     }
 
     Ok(())
