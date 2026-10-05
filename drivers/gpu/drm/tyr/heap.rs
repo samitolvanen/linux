@@ -5,7 +5,10 @@
 use core::num::NonZero;
 
 use kernel::{
-    alloc::KVec,
+    alloc::{
+        Flags,
+        KVec, //
+    },
     drm::gem::BaseObject,
     io::Io,
     kvec,
@@ -142,9 +145,11 @@ fn alloc_chunk_bo(
     tdev: &TyrDrmDevice,
     vm: &Arc<Vm>,
     chunk_size: u32,
+    pt_gfp: Flags,
 ) -> Result<Arc<gem::MappedBo>> {
     let flags = VmMapFlags::from(VmFlag::Noexec);
-    let chunk_bo = gem::new_kernel_object(tdev, vm, chunk_size as usize, flags, tdev.coherent)?;
+    let chunk_bo =
+        gem::new_kernel_object(tdev, vm, chunk_size as usize, flags, tdev.coherent, pt_gfp)?;
 
     ChunkHeader::write(
         &chunk_bo,
@@ -176,7 +181,7 @@ impl Context {
     }
 
     fn alloc_initial_chunk(&mut self, tdev: &TyrDrmDevice) -> Result {
-        let chunk_bo = alloc_chunk_bo(tdev, &self.vm, self.chunk_size)?;
+        let chunk_bo = alloc_chunk_bo(tdev, &self.vm, self.chunk_size, GFP_KERNEL_ACCOUNT)?;
 
         if let Some(prev) = self.chunks.first() {
             let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
@@ -218,7 +223,8 @@ impl Pool {
             .ok_or(EINVAL)? as usize;
 
         let flags = VmMapFlags::from(VmFlag::Noexec);
-        let gpu_contexts = gem::new_kernel_object(tdev, &vm, bo_size, flags, tdev.coherent)?;
+        let gpu_contexts =
+            gem::new_kernel_object(tdev, &vm, bo_size, flags, tdev.coherent, GFP_KERNEL_ACCOUNT)?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
 
         let initial = gpu_contexts.size();
@@ -395,7 +401,7 @@ impl Pool {
         // Allocate outside the XArray spinlock: the BO allocation takes the
         // kernel-VA range mutex and uses GFP_KERNEL, neither of which is
         // permitted while holding a spinlock.
-        let chunk_bo = alloc_chunk_bo(tdev, &vm, chunk_size)?;
+        let chunk_bo = alloc_chunk_bo(tdev, &vm, chunk_size, GFP_KERNEL)?;
 
         let mut guard = xa.lock();
         let heap_ctx = guard.get_mut(index).ok_or(EINVAL)?;

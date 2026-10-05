@@ -19,6 +19,7 @@ use core::{
 };
 
 use kernel::{
+    alloc::Flags,
     c_str,
     device::{
         Bound,
@@ -381,7 +382,7 @@ impl VmBindJob {
             ],
             vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
             map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
-            pt_reserve: pt_alloc::PtReserve::for_map(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -407,7 +408,7 @@ impl VmBindJob {
             ],
             vm_bo: None,
             map_sgt: None,
-            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -1234,7 +1235,11 @@ impl Vm {
 
         let _ = self
             .exec
-            .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
+            .unmap_range(
+                self.va_range.start,
+                self.va_range.end - self.va_range.start,
+                GFP_KERNEL,
+            )
             .inspect_err(|e| {
                 pr_err!("Failed to unmap range in kill(): {:?}\n", e);
             });
@@ -1605,6 +1610,7 @@ impl VmExec {
         size: u64,
         va: u64,
         flags: VmMapFlags,
+        pt_gfp: Flags,
     ) -> Result {
         // SAFETY: pdev is a bound device.
         let dev = unsafe { self.pdev.as_ref().as_bound() };
@@ -1619,7 +1625,7 @@ impl VmExec {
             ],
             vm_bo: Some(self.gpuvm.obtain(bo, ())?),
             map_sgt: Some(prefetch_map_sgt(bo, dev)?),
-            pt_reserve: pt_alloc::PtReserve::for_map(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_map(va, size, pt_gfp)?,
         };
 
         self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)
@@ -1642,7 +1648,7 @@ impl VmExec {
         Ok(())
     }
 
-    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+    pub(crate) fn unmap_range(&self, va: u64, size: u64, pt_gfp: Flags) -> Result {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         let full_vm = va == self.va_range.start && end == self.va_range.end;
 
@@ -1660,7 +1666,7 @@ impl VmExec {
             },
             vm_bo: None,
             map_sgt: None,
-            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, pt_gfp)?,
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
 

@@ -194,7 +194,7 @@ pub(crate) struct PtReserve {
 
 impl PtReserve {
     /// Reserves the page tables that mapping `size` bytes at `va` can need.
-    pub(crate) fn for_map(va: u64, size: u64) -> Result<Self> {
+    pub(crate) fn for_map(va: u64, size: u64, flags: Flags) -> Result<Self> {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         if size == 0 {
             return Ok(Self::default());
@@ -214,11 +214,11 @@ impl PtReserve {
             .map(|&shift| regions_spanned(va, end, shift))
             .sum();
 
-        Self::with_count(count)
+        Self::with_count(count, flags)
     }
 
     /// Reserves the page tables that unmapping `size` bytes at `va` can need.
-    pub(crate) fn for_unmap(va: u64, size: u64) -> Result<Self> {
+    pub(crate) fn for_unmap(va: u64, size: u64, flags: Flags) -> Result<Self> {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         if size == 0 {
             return Ok(Self::default());
@@ -241,20 +241,20 @@ impl PtReserve {
             count += 1;
         }
 
-        Self::with_count(count)
+        Self::with_count(count, flags)
     }
 
-    /// Allocates `count` page tables.
-    fn with_count(count: u64) -> Result<Self> {
+    /// Allocates `count` page tables with `flags`.
+    fn with_count(count: u64, flags: Flags) -> Result<Self> {
         let count = usize::try_from(count)
             .ok()
             .filter(|&count| count <= PT_RESERVE_MAX)
             .ok_or(ENOMEM)?;
-        let mut pages = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut pages = KVec::with_capacity(count, flags)?;
 
         for _ in 0..count {
-            let page = ReservedPt::new(GFP_KERNEL).ok_or(ENOMEM)?;
-            pages.push(page, GFP_KERNEL)?;
+            let page = ReservedPt::new(flags).ok_or(ENOMEM)?;
+            pages.push(page, flags)?;
         }
 
         Ok(Self { pages })
