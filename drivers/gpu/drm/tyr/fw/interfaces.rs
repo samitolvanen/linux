@@ -84,7 +84,11 @@ pub(in crate::fw) use self::{
             GLB_ACK,
             GLB_DB_ACK, //
         },
-        GlbState, GLB_CONTROL_BLOCK_SIZE, GLB_INPUT_BLOCK_SIZE, GLB_OUTPUT_BLOCK_SIZE,
+        GlbState,
+        TimestampSource,
+        GLB_CONTROL_BLOCK_SIZE,
+        GLB_INPUT_BLOCK_SIZE,
+        GLB_OUTPUT_BLOCK_SIZE, //
     },
     iface::FwInterface,
 };
@@ -298,15 +302,17 @@ mod glb {
         fn from(val: Bounded<u32, 1>) -> Self {
             match val.get() {
                 0 => TimestampSource::SystemTimestamp,
-                1 => TimestampSource::GpuCounter,
-                _ => unreachable!(),
+                _ => TimestampSource::GpuCounter,
             }
         }
     }
 
     impl From<TimestampSource> for Bounded<u32, 1> {
         fn from(src: TimestampSource) -> Self {
-            Bounded::try_new(src as u32).unwrap()
+            match src {
+                TimestampSource::SystemTimestamp => Self::new::<0>(),
+                TimestampSource::GpuCounter => Self::new::<1>(),
+            }
         }
     }
 
@@ -337,7 +343,7 @@ mod glb {
 
     impl From<HaltStatus> for Bounded<u32, 32> {
         fn from(status: HaltStatus) -> Self {
-            Bounded::try_new(status as u32).unwrap()
+            (status as u32).into()
         }
     }
 
@@ -367,7 +373,12 @@ mod glb {
 
     impl From<GlbState> for Bounded<u32, 3> {
         fn from(state: GlbState) -> Self {
-            Bounded::try_new(state as u32).unwrap()
+            match state {
+                GlbState::Active => Self::new::<0>(),
+                GlbState::Halt => Self::new::<1>(),
+                GlbState::Sleep => Self::new::<2>(),
+                GlbState::Suspend => Self::new::<3>(),
+            }
         }
     }
 
@@ -810,7 +821,12 @@ mod csg {
 
     impl From<CsgExecutionState> for Bounded<u32, 3> {
         fn from(state: CsgExecutionState) -> Self {
-            Bounded::try_new(state as u32).unwrap()
+            match state {
+                CsgExecutionState::Terminate => Self::new::<0>(),
+                CsgExecutionState::Start => Self::new::<1>(),
+                CsgExecutionState::Suspend => Self::new::<2>(),
+                CsgExecutionState::Resume => Self::new::<3>(),
+            }
         }
     }
 
@@ -840,7 +856,10 @@ mod csg {
 
     impl From<CsgStateIrqMask> for Bounded<u32, 3> {
         fn from(mask: CsgStateIrqMask) -> Self {
-            Bounded::try_new(mask as u32).unwrap()
+            match mask {
+                CsgStateIrqMask::Disabled => Self::new::<0>(),
+                CsgStateIrqMask::Enabled => Self::new::<7>(),
+            }
         }
     }
 
@@ -1279,7 +1298,10 @@ pub(super) mod cs {
 
     impl From<CsState> for Bounded<u32, 3> {
         fn from(state: CsState) -> Self {
-            Bounded::try_new(state as u32).unwrap()
+            match state {
+                CsState::Stop => Self::new::<0>(),
+                CsState::Start => Self::new::<1>(),
+            }
         }
     }
 
@@ -1309,7 +1331,10 @@ pub(super) mod cs {
 
     impl From<CsStateIrqMask> for Bounded<u32, 3> {
         fn from(mask: CsStateIrqMask) -> Self {
-            Bounded::try_new(mask as u32).unwrap()
+            match mask {
+                CsStateIrqMask::Disabled => Self::new::<0>(),
+                CsStateIrqMask::Enabled => Self::new::<7>(),
+            }
         }
     }
 
@@ -1338,7 +1363,10 @@ pub(super) mod cs {
 
     impl From<CsSbWaitSource> for Bounded<u32, 4> {
         fn from(source: CsSbWaitSource) -> Self {
-            Bounded::try_new(source as u32).unwrap()
+            match source {
+                CsSbWaitSource::None => Self::new::<0>(),
+                CsSbWaitSource::Wait => Self::new::<8>(),
+            }
         }
     }
 
@@ -1365,7 +1393,10 @@ pub(super) mod cs {
 
     impl From<CsWaitCondition> for Bounded<u32, 4> {
         fn from(condition: CsWaitCondition) -> Self {
-            Bounded::try_new(condition as u32).unwrap()
+            match condition {
+                CsWaitCondition::Le => Self::new::<0>(),
+                CsWaitCondition::Gt => Self::new::<1>(),
+            }
         }
     }
 
@@ -1391,8 +1422,7 @@ pub(super) mod cs {
         Resource = 5,
         /// Blocked awaiting completion of a synchronous FLUSH_CACHE2 instruction.
         Flush = 6,
-        /// Reserved encoding, treated as not blocking. The reverse conversion
-        /// casts the discriminant into a four-bit field, so it must stay below 16.
+        /// Reserved encoding, treated as not blocking.
         Unknown,
     }
 
@@ -1413,7 +1443,16 @@ pub(super) mod cs {
 
     impl From<CsBlockedReason> for Bounded<u32, 4> {
         fn from(reason: CsBlockedReason) -> Self {
-            Bounded::try_new(reason as u32).unwrap()
+            match reason {
+                CsBlockedReason::Unblocked => Self::new::<0>(),
+                CsBlockedReason::SbWait => Self::new::<1>(),
+                CsBlockedReason::ProgressWait => Self::new::<2>(),
+                CsBlockedReason::SyncWait => Self::new::<3>(),
+                CsBlockedReason::Deferred => Self::new::<4>(),
+                CsBlockedReason::Resource => Self::new::<5>(),
+                CsBlockedReason::Flush => Self::new::<6>(),
+                CsBlockedReason::Unknown => Self::new::<7>(),
+            }
         }
     }
 
@@ -1474,7 +1513,7 @@ pub(super) mod cs {
 
     impl From<CsFaultExceptionType> for Bounded<u32, 8> {
         fn from(exc_type: CsFaultExceptionType) -> Self {
-            Bounded::try_new(exc_type as u32).unwrap()
+            (exc_type as u8).into()
         }
     }
 
@@ -1520,7 +1559,7 @@ pub(super) mod cs {
 
     impl From<CsFatalExceptionType> for Bounded<u32, 8> {
         fn from(exc_type: CsFatalExceptionType) -> Self {
-            Bounded::try_new(exc_type as u32).unwrap()
+            (exc_type as u8).into()
         }
     }
 
