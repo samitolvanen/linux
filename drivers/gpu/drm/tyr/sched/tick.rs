@@ -48,6 +48,7 @@ use crate::{
             State, //
         },
         CsgSlotData,
+        CsgSlotIdx,
         CsgSlotManager,
         CsgUpdateContext,
         Scheduler,
@@ -955,18 +956,18 @@ impl<'a> Tick<'a> {
         // `apply_csg_updates` re-acquires it itself across its wait
         // phase.
         let csg_slot_manager = data.csg_slot_manager.lock();
-        for i in 0..MAX_CSGS {
-            if (keep_mask & (1u32 << i)) != 0 {
+        for csg_idx in CsgSlotIdx::all() {
+            if (keep_mask & csg_idx.bit()) != 0 {
                 continue;
             }
-            let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+            let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                 continue;
             };
 
             if slot_data.group.can_run() {
-                context.set_state(i, CsgExecutionState::Suspend);
+                context.set_state(csg_idx, CsgExecutionState::Suspend);
             } else {
-                context.set_state(i, CsgExecutionState::Terminate);
+                context.set_state(csg_idx, CsgExecutionState::Terminate);
             }
         }
     }
@@ -985,12 +986,16 @@ impl<'a> Tick<'a> {
         // *before* taking the slot-manager lock below because
         // `process_csg_irq` re-takes the slot-manager lock itself to
         // look the group up.
-        for i in 0..MAX_CSGS {
-            if (keep_mask & (1u32 << i)) != 0 {
+        for csg_idx in CsgSlotIdx::all() {
+            if (keep_mask & csg_idx.bit()) != 0 {
                 continue;
             }
-            if let Err(e) = self.sched.process_csg_irq(data, i) {
-                pr_err!("process_csg_irq {} failed: {}\n", i, e.to_errno());
+            if let Err(e) = self.sched.process_csg_irq(data, csg_idx.get()) {
+                pr_err!(
+                    "process_csg_irq {} failed: {}\n",
+                    csg_idx.get(),
+                    e.to_errno()
+                );
             }
         }
 
@@ -999,20 +1004,20 @@ impl<'a> Tick<'a> {
         // the caller halts the MCU.
         let mut ret = Ok(());
         let mut poll = false;
-        for i in 0..MAX_CSGS {
-            if (keep_mask & (1u32 << i)) != 0 {
+        for csg_idx in CsgSlotIdx::all() {
+            if (keep_mask & csg_idx.bit()) != 0 {
                 continue;
             }
 
             let (group, can_run) = {
-                let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                     continue;
                 };
                 (slot_data.group.clone(), slot_data.group.can_run())
             };
 
             if let Err(e) = csg_slot_manager.evict_forced(&group.csg_seat, context) {
-                pr_err!("evict {} failed: {}\n", i, e.to_errno());
+                pr_err!("evict {} failed: {}\n", csg_idx.get(), e.to_errno());
                 if ret.is_ok() {
                     ret = Err(e);
                 }
@@ -1024,7 +1029,7 @@ impl<'a> Tick<'a> {
                     self.sched.requeue_group(list_arc, is_idle);
                 }
                 poll |= group.blocked_idle_queues() != 0;
-                self.evicted_groups[i] = Some(group.clone());
+                self.evicted_groups[csg_idx.get()] = Some(group.clone());
             } else if self.num_teardown < self.teardown_groups.len() {
                 // Cancelled / faulted: queue for terminal cleanup.
                 self.sched.remove_group_from_wait_list(&group);
@@ -1053,11 +1058,11 @@ impl<'a> Tick<'a> {
         if let Err(e) = self.sched.apply_csg_updates(data, &mut context) {
             pr_err!("apply_csg_updates (halt) failed\n");
             let csg_slot_manager = data.csg_slot_manager.lock();
-            for i in 0..MAX_CSGS {
-                if !context.timedout_mask.contains(i) {
+            for csg_idx in CsgSlotIdx::all() {
+                if !context.timedout_mask.contains(csg_idx) {
                     continue;
                 }
-                if let Some(slot_data) = csg_slot_manager.slot_data(i) {
+                if let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) {
                     slot_data
                         .group
                         .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
@@ -1084,17 +1089,17 @@ impl<'a> Tick<'a> {
             let mut term_context = CsgUpdateContext::new();
             {
                 let csg_slot_manager = data.csg_slot_manager.lock();
-                for i in 0..MAX_CSGS {
-                    if !context.timedout_mask.contains(i) {
+                for csg_idx in CsgSlotIdx::all() {
+                    if !context.timedout_mask.contains(csg_idx) {
                         continue;
                     }
-                    let Some(slot_data) = csg_slot_manager.slot_data(i) else {
+                    let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                         continue;
                     };
                     slot_data
                         .group
                         .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
-                    term_context.set_state(i, CsgExecutionState::Terminate);
+                    term_context.set_state(csg_idx, CsgExecutionState::Terminate);
                 }
             }
             if let Err(e) = self.sched.apply_csg_updates(data, &mut term_context) {
