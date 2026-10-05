@@ -822,10 +822,11 @@ pub(crate) struct GpuVaData {
     prot: u32,
 }
 
-fn max_va_range(gpu_info: &GpuInfo) -> u64 {
-    1u64 << MMU_FEATURES::from_raw(gpu_info.mmu_features)
+fn max_va_range(gpu_info: &GpuInfo) -> Result<u64> {
+    let va_bits = MMU_FEATURES::from_raw(gpu_info.mmu_features)
         .va_bits()
-        .get()
+        .get();
+    1u64.checked_shl(va_bits).ok_or(EINVAL)
 }
 
 /// The user VA range of a new VM, derived from the VM_CREATE request.
@@ -835,7 +836,7 @@ fn max_va_range(gpu_info: &GpuInfo) -> u64 {
 /// address on the CPU and the GPU. Any other value is validated to ensure
 /// sufficient space remains for the kernel window.
 fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> Result<u64> {
-    let full_va_range = max_va_range(gpu_info);
+    let full_va_range = max_va_range(gpu_info)?;
     if full_va_range <= MIN_KERNEL_VA_SIZE {
         return Err(EINVAL);
     }
@@ -866,11 +867,12 @@ fn normalize_user_va_range(gpu_info: &GpuInfo, requested: u64) -> Result<u64> {
 /// the user range. The address space is itself a power of two, so the window
 /// base is aligned to the window size.
 fn kernel_va_window(gpu_info: &GpuInfo, user_va_range: u64) -> Result<Range<u64>> {
-    let full_va_range = max_va_range(gpu_info);
-    let leftover = full_va_range - user_va_range;
+    let full_va_range = max_va_range(gpu_info)?;
+    let leftover = full_va_range.checked_sub(user_va_range).ok_or(EINVAL)?;
     let kernel_va_range = 1u64 << leftover.checked_ilog2().ok_or(EINVAL)?;
+    let kernel_va_start = full_va_range.checked_sub(kernel_va_range).ok_or(EINVAL)?;
 
-    Ok((full_va_range - kernel_va_range)..full_va_range)
+    Ok(kernel_va_start..full_va_range)
 }
 
 /// GPU virtual address space.
@@ -1150,7 +1152,7 @@ impl Vm {
         auto_kernel_va_size: u64,
         coherent: bool,
     ) -> Result<Arc<Vm>> {
-        let total_range = 0..max_va_range(gpu_info);
+        let total_range = 0..max_va_range(gpu_info)?;
         let kernel_range = auto_kernel_va_start..(auto_kernel_va_start + auto_kernel_va_size);
 
         Self::new_with_ranges(
@@ -1173,7 +1175,7 @@ impl Vm {
         gpu_info: &GpuInfo,
         kernel_range: Range<u64>,
     ) -> Result<Arc<Vm>> {
-        let total_range = 0..max_va_range(gpu_info);
+        let total_range = 0..max_va_range(gpu_info)?;
 
         Self::new_with_ranges(
             pdev,
@@ -2096,7 +2098,9 @@ fn pt_unmap(page_table: &Devres<pt_alloc::PageTable>, range: Range<u64>) -> Resu
             return Err(EINVAL);
         }
 
-        bytes_left_to_unmap -= unmapped as u64;
+        bytes_left_to_unmap = bytes_left_to_unmap
+            .checked_sub(unmapped as u64)
+            .ok_or(EINVAL)?;
         iova += unmapped as u64;
     }
 
