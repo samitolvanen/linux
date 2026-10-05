@@ -558,6 +558,7 @@ impl TyrDrmFileData {
                             op.0.size,
                             op.0.va,
                             flags,
+                            GFP_KERNEL_ACCOUNT,
                         )?;
                     }
                     uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP => {
@@ -569,7 +570,7 @@ impl TyrDrmFileData {
                             Err(EINVAL)?;
                         }
 
-                        vm.unmap_range(op.0.va, op.0.size)?;
+                        vm.unmap_range(op.0.va, op.0.size, GFP_KERNEL_ACCOUNT)?;
                     }
                     _ => Err(EINVAL)?,
                 }

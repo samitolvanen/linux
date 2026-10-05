@@ -1043,8 +1043,9 @@ impl Queue {
             queue_args.ringbuf_size() as usize,
             flags,
             tdev.coherent,
+            GFP_KERNEL_ACCOUNT,
         )?;
-        let iface_mem = reg_data.fw.alloc_queue_mem(tdev)?;
+        let iface_mem = reg_data.fw.alloc_queue_mem(tdev, GFP_KERNEL_ACCOUNT)?;
         let interfaces = Interfaces::new(iface_mem)?;
 
         let max_jobs = queue_args.ringbuf_size() as usize / WRAPPER_RINGBUF_BYTES;

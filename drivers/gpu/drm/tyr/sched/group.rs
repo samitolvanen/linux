@@ -440,18 +440,29 @@ impl Group {
             .ok_or(EINVAL)?;
 
         let (suspend_buf_size, protm_suspend_buf_size) = reg_data.fw.group_suspend_buf_sizes()?;
-        let suspend_buf = reg_data
-            .fw
-            .alloc_suspend_buf(ddev, suspend_buf_size as usize)?;
-        let protm_suspend_buf = reg_data
-            .fw
-            .alloc_suspend_buf(ddev, protm_suspend_buf_size as usize)?;
+        let suspend_buf =
+            reg_data
+                .fw
+                .alloc_suspend_buf(ddev, suspend_buf_size as usize, GFP_KERNEL_ACCOUNT)?;
+        let protm_suspend_buf = reg_data.fw.alloc_suspend_buf(
+            ddev,
+            protm_suspend_buf_size as usize,
+            GFP_KERNEL_ACCOUNT,
+        )?;
 
         let num_syncs =
             group_args.queues.count as usize * core::mem::size_of::<syncs::SyncObj64b>();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
         let dev = reg_data.pdev.as_ref();
-        let syncobjs = gem::new_kernel_object(dev, ddev, &vm, num_syncs, flags, ddev.coherent)?;
+        let syncobjs = gem::new_kernel_object(
+            dev,
+            ddev,
+            &vm,
+            num_syncs,
+            flags,
+            ddev.coherent,
+            GFP_KERNEL_ACCOUNT,
+        )?;
 
         let vmap = syncobjs.vmap();
         let size = vmap.owner().size();

@@ -5,7 +5,10 @@
 use core::num::NonZero;
 
 use kernel::{
-    alloc::KVec,
+    alloc::{
+        Flags,
+        KVec, //
+    },
     device::{
         Bound,
         Device, //
@@ -109,10 +112,18 @@ fn alloc_chunk_bo(
     ddev: &TyrDrmDevice,
     vm: &Arc<Vm>,
     chunk_size: u32,
+    pt_gfp: Flags,
 ) -> Result<Arc<gem::MappedBo>> {
     let flags = VmMapFlags::from(VmFlag::Noexec);
-    let chunk_bo =
-        gem::new_kernel_object(dev, ddev, vm, chunk_size as usize, flags, ddev.coherent)?;
+    let chunk_bo = gem::new_kernel_object(
+        dev,
+        ddev,
+        vm,
+        chunk_size as usize,
+        flags,
+        ddev.coherent,
+        pt_gfp,
+    )?;
 
     ChunkHeader::zero(&chunk_bo)?;
 
@@ -129,7 +140,7 @@ impl Context {
     }
 
     fn alloc_initial_chunk(&mut self, dev: &Device<Bound>, ddev: &TyrDrmDevice) -> Result {
-        let chunk_bo = alloc_chunk_bo(dev, ddev, &self.vm, self.chunk_size)?;
+        let chunk_bo = alloc_chunk_bo(dev, ddev, &self.vm, self.chunk_size, GFP_KERNEL_ACCOUNT)?;
 
         if let Some(prev) = self.chunks.first() {
             let next = (prev.kernel_va().ok_or(EINVAL)?.start & CHUNK_SIZE_MASK)
@@ -217,6 +228,7 @@ impl Pool {
             bo_size,
             flags,
             ddev.coherent,
+            GFP_KERNEL_ACCOUNT,
         )?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
 
@@ -365,7 +377,7 @@ impl Pool {
         // Allocate outside the XArray spinlock. The BO allocation takes the
         // kernel-VA range mutex and uses GFP_KERNEL, neither of which is
         // permitted while holding a spinlock.
-        let chunk_bo = alloc_chunk_bo(reg_data.pdev.as_ref(), ddev, &vm, chunk_size)?;
+        let chunk_bo = alloc_chunk_bo(reg_data.pdev.as_ref(), ddev, &vm, chunk_size, GFP_KERNEL)?;
 
         let mut guard = xa.lock();
         let heap_ctx = guard.get_mut(index).ok_or(EINVAL)?;

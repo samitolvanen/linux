@@ -18,6 +18,7 @@ use core::ops::{
 };
 
 use kernel::{
+    alloc::Flags,
     device::{
         Bound,
         Device, //
@@ -366,7 +367,7 @@ impl VmBindJob {
             ],
             vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
             map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
-            pt_reserve: pt_alloc::PtReserve::for_map(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -392,7 +393,7 @@ impl VmBindJob {
             ],
             vm_bo: None,
             map_sgt: None,
-            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -1205,7 +1206,11 @@ impl Vm {
 
         let _ = self
             .exec
-            .unmap_range(self.va_range.start, self.va_range.end - self.va_range.start)
+            .unmap_range(
+                self.va_range.start,
+                self.va_range.end - self.va_range.start,
+                GFP_KERNEL,
+            )
             .inspect_err(|e| {
                 dev_err!(self.dev(), "Failed to unmap range in kill(): {:?}", e);
             });
@@ -1586,6 +1591,7 @@ impl VmExec {
         self.gpuvm.deferred_cleanup();
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn map_bo_range(
         &self,
         dev: &Device<Bound>,
@@ -1594,6 +1600,7 @@ impl VmExec {
         map_size: u64,
         va: u64,
         flags: VmMapFlags,
+        pt_gfp: Flags,
     ) -> Result {
         // Flush inline here. The bind queue's submit defers this to the
         // cleanup workqueue instead.
@@ -1606,7 +1613,7 @@ impl VmExec {
             ],
             vm_bo: Some(self.gpuvm.obtain(bo, ())?),
             map_sgt: Some(prefetch_map_sgt(bo, dev)?),
-            pt_reserve: pt_alloc::PtReserve::for_map(va, map_size)?,
+            pt_reserve: pt_alloc::PtReserve::for_map(va, map_size, pt_gfp)?,
         };
 
         self.map_bo_range_inner(dev, bo_offset, map_size, va, flags, &mut resources)
@@ -1644,7 +1651,7 @@ impl VmExec {
         self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)
     }
 
-    pub(crate) fn unmap_range(&self, va: u64, size: u64) -> Result {
+    pub(crate) fn unmap_range(&self, va: u64, size: u64, pt_gfp: Flags) -> Result {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         let full_vm = va == self.va_range.start && end == self.va_range.end;
 
@@ -1662,7 +1669,7 @@ impl VmExec {
             },
             vm_bo: None,
             map_sgt: None,
-            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size)?,
+            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, pt_gfp)?,
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
 
