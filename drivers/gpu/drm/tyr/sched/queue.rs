@@ -694,7 +694,12 @@ impl QueueData {
         };
         entry.fence = Some(fence);
         if let Some(slot) = profiling_slot {
-            pending.next_profiling_slot = (slot + 1) % self.profiling_slot_count;
+            let next = slot + 1;
+            pending.next_profiling_slot = if next < self.profiling_slot_count {
+                next
+            } else {
+                0
+            };
         }
         Ok(profiling_slot)
     }
