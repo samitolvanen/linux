@@ -38,6 +38,7 @@ use super::{
         QueueIdx,
         MAX_CS_PER_GROUP, //
     },
+    CsgSlotIdx,
     CsgSlotManager,
     Scheduler, //
 };
@@ -178,6 +179,7 @@ impl Scheduler {
         if csg_id >= self.csg_slot_count as usize {
             return Ok(());
         }
+        let csg_slot = CsgSlotIdx::new(csg_id).ok_or(EINVAL)?;
 
         let pending_mask =
             CSG_REQ::IDLE_MASK | CSG_REQ::SYNC_UPDATE_MASK | CSG_REQ::PROGRESS_TIMER_EVENT_MASK;
@@ -341,7 +343,7 @@ impl Scheduler {
         }
 
         let mut mask = CsgSlotMask::empty();
-        mask.insert(csg_id);
+        mask.insert(csg_slot);
         tdev.fw.ring_csg_doorbells(mask)?;
 
         Ok(())

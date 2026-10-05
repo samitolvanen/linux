@@ -105,6 +105,14 @@ impl<const BITS: u32> MaskIdx<BITS> {
     }
 }
 
+/// Index of a scheduler CSG slot.
+///
+/// The four bits cover `0..MAX_CSGS`, so the index is in range for the
+/// per-slot arrays and masks.
+pub(crate) type CsgSlotIdx = MaskIdx<4>;
+
+static_assert!(MAX_CSGS == 1 << 4);
+
 pub(crate) mod deps;
 pub(crate) mod events;
 pub(crate) mod group;
@@ -180,6 +188,24 @@ const CSG_REQ_EP_CFG: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::EP_CFG_MASK);
 /// CSG_REQ::status_update bit (5:5). Status-update toggle.
 const CSG_REQ_STATUS_UPDATE: CSG_REQ = CSG_REQ::from_raw(CSG_REQ::STATUS_UPDATE_MASK);
 
+/// A `CSG_REQ` bit that the firmware expects to be toggled.
+#[derive(Copy, Clone)]
+pub(crate) enum CsgReqToggle {
+    /// The endpoint-configuration toggle, `CSG_REQ::ep_cfg`.
+    EpCfg,
+    /// The status-update toggle, `CSG_REQ::status_update`.
+    StatusUpdate,
+}
+
+impl CsgReqToggle {
+    const fn bit(self) -> CSG_REQ {
+        match self {
+            Self::EpCfg => CSG_REQ_EP_CFG,
+            Self::StatusUpdate => CSG_REQ_STATUS_UPDATE,
+        }
+    }
+}
+
 impl CsgUpdateContext {
     /// Bits that the firmware expects to be toggled instead of set.
     ///
@@ -211,27 +237,21 @@ impl CsgUpdateContext {
     /// and the union of all `mask`s passed for a slot is what
     /// `Scheduler::apply_csg_updates` will toggle in `CSG_REQ` and
     /// wait for.
-    pub(crate) fn queue_reqs(&mut self, csg_idx: usize, value: CSG_REQ, mask: CSG_REQ) {
-        debug_assert!(csg_idx < MAX_CSGS);
-        debug_assert!(!mask.is_empty());
+    fn queue_reqs(&mut self, csg_idx: CsgSlotIdx, value: CSG_REQ, mask: CSG_REQ) {
+        let idx = csg_idx.get();
 
-        self.req_value[csg_idx] = (self.req_value[csg_idx] & !mask) | (value & mask);
-        self.req_mask[csg_idx] |= mask;
+        self.req_value[idx] = (self.req_value[idx] & !mask) | (value & mask);
+        self.req_mask[idx] |= mask;
         self.update_mask.insert(csg_idx);
     }
 
-    /// Stages a toggle of `toggle_bit` in `CSG_REQ` for `csg_idx`.
-    ///
-    /// `toggle_bit` must be a subset of `Self::TOGGLE_BITS`; the
-    /// `apply_csg_updates` partition assumes set and toggle bits never
-    /// overlap.
-    pub(crate) fn toggle_reqs(&mut self, csg_idx: usize, toggle_bit: CSG_REQ) {
-        debug_assert!((toggle_bit & !Self::TOGGLE_BITS).is_empty());
-        self.queue_reqs(csg_idx, toggle_bit, toggle_bit);
+    /// Stages a toggle of `toggle` in `CSG_REQ` for `csg_idx`.
+    pub(crate) fn toggle_reqs(&mut self, csg_idx: CsgSlotIdx, toggle: CsgReqToggle) {
+        self.queue_reqs(csg_idx, toggle.bit(), toggle.bit());
     }
 
     /// Stages a `CSG_REQ.state` transition to `state` for `csg_idx`.
-    pub(crate) fn set_state(&mut self, csg_idx: usize, state: CsgExecutionState) {
+    pub(crate) fn set_state(&mut self, csg_idx: CsgSlotIdx, state: CsgExecutionState) {
         self.queue_reqs(
             csg_idx,
             CSG_REQ::zeroed().with_state(state),
@@ -246,13 +266,13 @@ impl CsgUpdateContext {
     /// against `CSG_DB_ACK` before ringing the per-CSG doorbell.
     /// Calling this also marks the slot as having pending updates so
     /// the apply loop visits it even if no `CSG_REQ` bits were staged.
-    pub(crate) fn add_db_toggle(&mut self, csg_idx: usize, mask: CsDbMask) {
-        debug_assert!(csg_idx < MAX_CSGS);
+    pub(crate) fn add_db_toggle(&mut self, csg_idx: CsgSlotIdx, mask: CsDbMask) {
         if mask.is_empty() {
             return;
         }
-        let raw = self.db_toggle[csg_idx].into_raw() | mask.into_raw();
-        self.db_toggle[csg_idx] = CsDbMask::from_raw(raw);
+        let idx = csg_idx.get();
+        let raw = self.db_toggle[idx].into_raw() | mask.into_raw();
+        self.db_toggle[idx] = CsDbMask::from_raw(raw);
         self.update_mask.insert(csg_idx);
     }
 }
@@ -289,6 +309,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         slot_data: &Self::SlotData,
         ctx: &mut Self::Context,
     ) -> Result {
+        let csg_idx = CsgSlotIdx::new(slot_idx).ok_or(EINVAL)?;
         slot_data.group.vm.activate()?;
 
         // Undo the AS-slot user reference taken above on any failure of
@@ -332,7 +353,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
 
         // Per-CS doorbells follow the slot index (`slot_idx + 1`) and
         // remain stable for as long as the slot is active.
-        let cs_doorbell = (slot_idx as u32) + 1;
+        let cs_doorbell = csg_idx.get() as u32 + 1;
 
         // Fail before any firmware write if a queue's inputs are invalid.
         for queue in group.queues.iter() {
@@ -369,7 +390,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         // callback.
         group.with_locked_inner(|inner| {
             for queue in group.queues.iter() {
-                queue.set_doorbell_id(Some(slot_idx + 1));
+                queue.set_doorbell_id(Some(csg_idx.get() + 1));
             }
             inner.csg_id = Some(slot_idx);
         });
@@ -379,9 +400,9 @@ impl crate::slot::SlotOperations for CsgSlotOps {
             group::State::Suspended => CsgExecutionState::Resume,
             _ => CsgExecutionState::Start,
         };
-        ctx.set_state(slot_idx, state);
-        ctx.toggle_reqs(slot_idx, CSG_REQ_EP_CFG);
-        ctx.add_db_toggle(slot_idx, db_mask);
+        ctx.set_state(csg_idx, state);
+        ctx.toggle_reqs(csg_idx, CsgReqToggle::EpCfg);
+        ctx.add_db_toggle(csg_idx, db_mask);
         rollback.dismiss();
         Ok(())
     }
@@ -710,51 +731,51 @@ impl Scheduler {
 
         const CSG_REQ_ACK_TIMEOUT_MS: u32 = 100;
 
-        for csg_id in 0..MAX_CSGS {
+        for csg_id in CsgSlotIdx::all() {
             if !context.update_mask.contains(csg_id) {
                 continue;
             }
-            let req_mask = context.req_mask[csg_id];
+            let req_mask = context.req_mask[csg_id.get()];
             if req_mask.is_empty() {
                 continue;
             }
             let set_mask = req_mask & !CsgUpdateContext::TOGGLE_BITS;
             let toggle_mask = req_mask & CsgUpdateContext::TOGGLE_BITS;
-            let req_value = context.req_value[csg_id] & !CsgUpdateContext::TOGGLE_BITS;
-            data.fw.with_csg_mut(csg_id, |csg| {
+            let req_value = context.req_value[csg_id.get()] & !CsgUpdateContext::TOGGLE_BITS;
+            data.fw.with_csg_mut(csg_id.get(), |csg| {
                 csg.update_and_toggle_input_req(req_value, set_mask, toggle_mask)
             })?;
         }
 
-        for csg_id in 0..MAX_CSGS {
+        for csg_id in CsgSlotIdx::all() {
             if !context.update_mask.contains(csg_id) {
                 continue;
             }
-            let db_mask = context.db_toggle[csg_id];
+            let db_mask = context.db_toggle[csg_id.get()];
             if db_mask.is_empty() {
                 continue;
             }
             data.fw
-                .with_csg_mut(csg_id, |csg| csg.toggle_input_db_req(db_mask))?;
+                .with_csg_mut(csg_id.get(), |csg| csg.toggle_input_db_req(db_mask))?;
         }
 
         data.fw.ring_csg_doorbells(context.update_mask)?;
 
-        for csg_id in 0..MAX_CSGS {
+        for csg_id in CsgSlotIdx::all() {
             if !context.update_mask.contains(csg_id) {
                 continue;
             }
-            let req_mask = context.req_mask[csg_id];
+            let req_mask = context.req_mask[csg_id.get()];
             match data
                 .fw
-                .wait_csg_acks(csg_id, req_mask, CSG_REQ_ACK_TIMEOUT_MS)
+                .wait_csg_acks(csg_id.get(), req_mask, CSG_REQ_ACK_TIMEOUT_MS)
             {
                 Ok(acked) => {
-                    context.acked_reqs[csg_id] = acked;
+                    context.acked_reqs[csg_id.get()] = acked;
                     if acked != req_mask {
                         pr_err!(
                             "CSG {}: firmware ack timeout: req_mask=0x{:x} acked=0x{:x}\n",
-                            csg_id,
+                            csg_id.get(),
                             req_mask,
                             acked
                         );
@@ -762,7 +783,7 @@ impl Scheduler {
                     }
                 }
                 Err(e) => {
-                    pr_err!("wait_csg_acks {} failed: {}\n", csg_id, e.to_errno());
+                    pr_err!("wait_csg_acks {} failed: {}\n", csg_id.get(), e.to_errno());
                     context.timedout_mask.insert(csg_id);
                 }
             }
@@ -773,20 +794,20 @@ impl Scheduler {
         // `sync_csg_slot_priority` can write back the acknowledged
         // firmware priority into the per-slot `CsgSlotData`.
         let mut csg_slot_manager = data.csg_slot_manager.lock();
-        for csg_id in 0..MAX_CSGS {
+        for csg_id in CsgSlotIdx::all() {
             if !context.update_mask.contains(csg_id) {
                 continue;
             }
-            let acked_reqs = context.acked_reqs[csg_id];
+            let acked_reqs = context.acked_reqs[csg_id.get()];
 
             if !(acked_reqs & CSG_REQ_EP_CFG).is_empty() {
-                self.sync_csg_slot_priority(data, &mut csg_slot_manager, csg_id)?;
+                self.sync_csg_slot_priority(data, &mut csg_slot_manager, csg_id.get())?;
             }
             if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
-                self.sync_csg_slot_state(data, &csg_slot_manager, csg_id)?;
+                self.sync_csg_slot_state(data, &csg_slot_manager, csg_id.get())?;
             }
             if !(acked_reqs & CSG_REQ_STATUS_UPDATE).is_empty() {
-                self.sync_csg_slot_queues_state(data, &csg_slot_manager, csg_id)?;
+                self.sync_csg_slot_queues_state(data, &csg_slot_manager, csg_id.get())?;
             }
         }
 
@@ -814,10 +835,10 @@ impl Scheduler {
             return Err(EINVAL);
         }
 
-        if csg_idx >= MAX_CSGS {
+        let Some(csg_slot) = CsgSlotIdx::new(csg_idx) else {
             pr_err!("update_csg_slot_priority: invalid csg {}\n", csg_idx);
             return Err(EINVAL);
-        }
+        };
 
         let slot_data = csg_slot_manager.slot_data(csg_idx).ok_or(EINVAL)?;
         let group = slot_data.group.clone();
@@ -831,7 +852,7 @@ impl Scheduler {
             csg.write_input_ep_req(ep_req)
         })?;
 
-        context.toggle_reqs(csg_idx, CSG_REQ_EP_CFG);
+        context.toggle_reqs(csg_slot, CsgReqToggle::EpCfg);
         Ok(())
     }
 
@@ -1507,18 +1528,17 @@ impl Scheduler {
 
         {
             let csg_slot_manager = data.csg_slot_manager.lock();
-            for (csg_idx, slot) in faulted_groups
-                .iter_mut()
-                .enumerate()
+            for (csg_idx, slot) in CsgSlotIdx::all()
+                .zip(faulted_groups.iter_mut())
                 .take(csg_slot_manager.slot_count())
             {
-                let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
+                let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                     continue;
                 };
                 if slot_data.group.vm.as_data.unhandled_fault.load(Relaxed) {
-                    *slot = Some((csg_idx, slot_data.group.clone()));
+                    *slot = Some((csg_idx.get(), slot_data.group.clone()));
                 }
-                context.toggle_reqs(csg_idx, CSG_REQ_STATUS_UPDATE);
+                context.toggle_reqs(csg_idx, CsgReqToggle::StatusUpdate);
             }
         }
 
