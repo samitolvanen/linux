@@ -562,6 +562,10 @@ impl WrapRange {
     }
 }
 
+/// Delay in milliseconds before retrying a dependency whose callback
+/// failed to register.
+const DEP_POLL_INTERVAL_MS: u32 = 10;
+
 /// Dependency tracking state for a single job.
 #[allow(dead_code)]
 struct JobDependencies<T: QueueOps> {
@@ -1261,17 +1265,17 @@ impl<T: QueueOps> JobQueueInner<T> {
                     // Continue loop: try the next dependency.
                 }
                 Err(CallbackError::Other(e)) => {
-                    pr_err!(
-                        "JobQueue: process_deps() cb alloc failed: {:?}, skipping dep for entry {}\n",
-                        e,
-                        entry_idx
+                    pr_err_once!(
+                        "JobQueue: cannot wait on a dependency of entry {}: {:?}, polling\n",
+                        entry_idx,
+                        e
                     );
-                    let mut guard = self.fifo.lock();
-                    if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                        entry.deps.active_cb = None;
-                        entry.deps.current_idx += 1;
-                    }
-                    // Continue loop: try the next dependency.
+                    let poll = msecs_to_jiffies(DEP_POLL_INTERVAL_MS);
+                    return match self.pipeline_wait_or_timeout(entry_idx) {
+                        StageAdvance::Wait => StageAdvance::WaitFor(poll),
+                        StageAdvance::WaitFor(delay) => StageAdvance::WaitFor(delay.min(poll)),
+                        other => other,
+                    };
                 }
             }
         }
