@@ -479,23 +479,20 @@ impl SelectedGroup {
     /// behind the other retained idle groups but stays ahead of the
     /// newly bound idle groups.
     pub(crate) fn iter_prioritized(
-        selections: &[Option<SelectedGroup>],
+        selections: &[Option<SelectedGroup>; MAX_CSGS],
         rotated_slots: [Option<usize>; Priority::num_priorities()],
-    ) -> impl Iterator<Item = SelectedGroup> + '_ {
-        let count = selections.len();
-        let mut order: [usize; MAX_CSGS] = core::array::from_fn(|idx| idx);
+    ) -> impl Iterator<Item = SelectedGroup> {
+        let mut order: [Option<(usize, SelectedGroup)>; MAX_CSGS] =
+            core::array::from_fn(|idx| selections[idx].map(|sel| (idx, sel)));
 
-        order[..count].sort_unstable_by_key(|&idx| {
-            selections[idx].map(|sel| {
+        order.sort_unstable_by_key(|entry| {
+            entry.map(|(idx, sel)| {
                 let band = sel.priority() as usize;
                 (Reverse(band), sort_key(&sel, idx, rotated_slots[band]))
             })
         });
 
-        order
-            .into_iter()
-            .take(count)
-            .filter_map(move |idx| selections[idx])
+        order.into_iter().flatten().map(|(_, sel)| sel)
     }
 }
 
@@ -522,9 +519,7 @@ pub(crate) struct PendingBind {
 pub(in crate::sched) struct AsBudget {
     /// Addresses of the VMs of the selected groups, one per address space.
     /// Addresses rather than pointers keep the scheduler `Send`.
-    vms: [usize; MAX_AS],
-    /// Number of entries used in `vms`.
-    count: usize,
+    vms: [Option<usize>; MAX_AS],
     /// Number of AS slots available to user VMs.
     limit: usize,
     /// Whether a group was refused because no address space was left.
@@ -535,8 +530,7 @@ impl AsBudget {
     /// Creates an empty budget of `limit` address spaces, at most `MAX_AS`.
     pub(in crate::sched) fn new(limit: usize) -> Self {
         Self {
-            vms: [0; MAX_AS],
-            count: 0,
+            vms: [None; MAX_AS],
             limit: limit.min(MAX_AS),
             refused: false,
         }
@@ -544,30 +538,34 @@ impl AsBudget {
 
     /// Releases the address spaces taken by the previous tick.
     fn reset(&mut self) {
-        self.count = 0;
+        self.vms = [None; MAX_AS];
         self.refused = false;
     }
 
     /// Takes an address space for `vm`, unless an earlier selection already
     /// took one for it. Returns `false` if none is left.
     fn take(&mut self, vm: &Vm) -> bool {
-        let vm = core::ptr::from_ref(vm).addr();
-        if self.vms[..self.count].contains(&vm) {
+        let vm = Some(core::ptr::from_ref(vm).addr());
+        if self.vms.contains(&vm) {
             return true;
         }
-        if self.count >= self.limit {
+        let free = self
+            .vms
+            .iter_mut()
+            .take(self.limit)
+            .find(|slot| slot.is_none());
+        let Some(slot) = free else {
             self.refused = true;
             return false;
-        }
-        self.vms[self.count] = vm;
-        self.count += 1;
+        };
+        *slot = vm;
         true
     }
 
     /// Returns whether `take` would succeed for `vm`.
     fn can_take(&self, vm: &Vm) -> bool {
-        let vm = core::ptr::from_ref(vm).addr();
-        self.count < self.limit || self.vms[..self.count].contains(&vm)
+        let vm = Some(core::ptr::from_ref(vm).addr());
+        self.vms.iter().take(self.limit).any(Option::is_none) || self.vms.contains(&vm)
     }
 }
 
@@ -651,10 +649,11 @@ impl SchedulingDecision {
                         rule.priority,
                         rule.is_idle,
                         matches!(rule.action, Action::KeepExceptRotated),
-                    );
+                    )?;
                 }
                 Action::Take => {
-                    self.take_unbound(sched, slot_count - reserved, rule.priority, rule.is_idle)?;
+                    let available = slot_count.checked_sub(reserved).ok_or(EINVAL)?;
+                    self.take_unbound(sched, available, rule.priority, rule.is_idle)?;
                 }
             }
         }
@@ -727,13 +726,12 @@ impl SchedulingDecision {
         priority: Priority,
         is_idle: bool,
         skip_rotated: bool,
-    ) -> usize {
+    ) -> Result<usize> {
         let rotated = self.rotated_slots[priority as usize];
         let mut skipped = None;
-        let mut candidates = [(0u32, 0usize); MAX_CSGS];
-        let mut count = 0;
+        let mut candidates = [None; MAX_CSGS];
 
-        for i in 0..slot_count {
+        for (i, candidate) in (0..slot_count).zip(candidates.iter_mut()) {
             let Some(slot_data) = csg_slot_manager.slot_data(i) else {
                 continue;
             };
@@ -753,19 +751,18 @@ impl SchedulingDecision {
                 continue;
             }
 
-            candidates[count] = (slot_data.fw_priority, i);
-            count += 1;
+            *candidate = Some((slot_data.fw_priority, i));
         }
 
-        candidates[..count].sort_unstable_by_key(|&(fw_priority, i)| {
-            (rotated == Some(i), u32::MAX - fw_priority, i)
+        candidates.sort_unstable_by_key(|candidate| {
+            candidate.map(|(fw_priority, i)| (rotated == Some(i), u32::MAX - fw_priority, i))
         });
 
         let rotated_vm = skipped
             .and_then(|i| csg_slot_manager.slot_data(i))
             .map(|slot_data| &slot_data.group.vm);
         let mut reserved = 0;
-        for &(fw_priority, i) in &candidates[..count] {
+        for (fw_priority, i) in candidates.into_iter().flatten() {
             if self.num_selected + reserved >= slot_count {
                 break;
             }
@@ -779,14 +776,14 @@ impl SchedulingDecision {
                 }
                 continue;
             }
+            let selection = self.selections.get_mut(self.num_selected).ok_or(EINVAL)?;
             if !as_budget.take(&slot_data.group.vm) {
                 continue;
             }
 
             self.keep_mask |= 1u32 << i;
 
-            self.selections[self.num_selected] =
-                Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
+            *selection = Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
 
             self.num_selected += 1;
 
@@ -798,7 +795,7 @@ impl SchedulingDecision {
             }
         }
 
-        reserved
+        Ok(reserved)
     }
 
     /// Selects unbound groups matching the priority and idle state to
@@ -814,9 +811,20 @@ impl SchedulingDecision {
             return Ok(());
         }
 
+        let selections = self
+            .selections
+            .get_mut(self.num_selected..slot_count)
+            .ok_or(EINVAL)?;
         // How many slots we are allowed to fill.
-        let available_slots = slot_count - self.num_selected;
-        let target = &mut self.pending_groups[self.num_pending..self.num_pending + available_slots];
+        let available_slots = selections.len();
+        let end = self
+            .num_pending
+            .checked_add(available_slots)
+            .ok_or(EINVAL)?;
+        let target = self
+            .pending_groups
+            .get_mut(self.num_pending..end)
+            .ok_or(EINVAL)?;
 
         let (queue, prior_state) = if is_idle {
             (
@@ -839,8 +847,8 @@ impl SchedulingDecision {
             } else {
                 self.idle_group_count += count;
             }
-            for i in 0..count {
-                self.selections[self.num_selected + i] = Some(SelectedGroup::Pending(
+            for (i, selection) in selections.iter_mut().take(count).enumerate() {
+                *selection = Some(SelectedGroup::Pending(
                     self.num_pending + i,
                     priority,
                     is_idle,
@@ -933,7 +941,12 @@ impl<'a> Tick<'a> {
         };
 
         let mut decision = SchedulingDecision::new();
-        decision.evaluate_rules(data, self.sched, rules, full_tick)?;
+        if let Err(e) = decision.evaluate_rules(data, self.sched, rules, full_tick) {
+            for pending in decision.pending_groups.iter_mut().filter_map(Option::take) {
+                self.requeue_pending_bind(pending);
+            }
+            return Err(e);
+        }
         self.apply(data, &mut decision)?;
 
         if full_tick {
@@ -1156,10 +1169,9 @@ impl<'a> Tick<'a> {
         {
             let mut csg_slot_manager = data.csg_slot_manager.lock();
 
-            for selection in SelectedGroup::iter_prioritized(
-                &decision.selections[..decision.num_selected],
-                decision.rotated_slots,
-            ) {
+            for selection in
+                SelectedGroup::iter_prioritized(&decision.selections, decision.rotated_slots)
+            {
                 let fw_prio = next_fw_prio;
                 next_fw_prio = next_fw_prio.saturating_sub(1);
 
@@ -1184,7 +1196,9 @@ impl<'a> Tick<'a> {
                         }
                     }
                     SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
-                        let Some(pending) = decision.pending_groups[idx].take() else {
+                        let Some(pending) =
+                            decision.pending_groups.get_mut(idx).and_then(Option::take)
+                        else {
                             continue;
                         };
 
