@@ -71,6 +71,7 @@ use crate::{
 use super::{
     group::{
         Group,
+        QueueIdx,
         State, //
     },
     job::JobProfilingData, //
@@ -256,7 +257,7 @@ pub(super) struct QueueJob {
     /// Index of the owning queue inside `Group::queues`. Captured
     /// at prepare time so the timeout stage can read the per-queue
     /// syncobj without an extra lookup.
-    queue_index: usize,
+    queue_index: QueueIdx,
     /// Snapshot of the device profile mask taken at submit time. Selects
     /// which sample deltas the completion path accumulates. `0` when the
     /// job carries no profiling slot.
@@ -270,7 +271,7 @@ impl QueueJob {
     pub(super) fn new(
         stream: KVec<u8>,
         group: Arc<Group>,
-        queue_index: usize,
+        queue_index: QueueIdx,
         profiling_mask: u32,
         profiling_relocs: KVec<usize>,
     ) -> Self {
@@ -1052,7 +1053,7 @@ impl QueueOps for TyrQueueOps {
                 return (false, Ok(()), false);
             }
             let group_idle = inner.is_idle();
-            let blocked = inner.blocked_queues() & (1u32 << queue_index) != 0;
+            let blocked = inner.blocked_queues() & queue_index.bit() != 0;
             let queue_idle = inner.set_queue_idle(queue_index, false);
             if awake.is_none() {
                 return (true, Ok(()), group_idle && queue_idle && !blocked);
@@ -1130,7 +1131,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::Advance;
         }
 
-        match ctx.job.group.read_syncobj(ctx.job.queue_index) {
+        match ctx.job.group.read_syncobj(ctx.job.queue_index.get()) {
             Ok(syncobj) => self
                 .data
                 .complete_submit_fences(&ctx.job.group, syncobj.seqno),

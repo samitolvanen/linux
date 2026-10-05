@@ -35,6 +35,7 @@ use crate::{
 use super::{
     group::{
         Group,
+        QueueIdx,
         MAX_CS_PER_GROUP, //
     },
     CsgSlotManager,
@@ -43,7 +44,7 @@ use super::{
 
 struct PendingOom {
     csg_id: usize,
-    cs_id: u32,
+    cs_id: QueueIdx,
     heap_address: u64,
     vt_start: u32,
     vt_end: u32,
@@ -115,7 +116,7 @@ impl WorkItem<2> for Group {
                 pr_err!(
                     "tiler_oom_work: CSG {} CS {} bad counters vt_start={} vt_end={} frag_end={}\n",
                     oom.csg_id,
-                    oom.cs_id,
+                    oom.cs_id.get(),
                     oom.vt_start,
                     oom.vt_end,
                     oom.frag_end
@@ -138,7 +139,7 @@ impl WorkItem<2> for Group {
                 Ok((va, cookie)) => GrowOutcome::Grown(va, cookie),
                 Err(e) if e == ENOMEM => GrowOutcome::Reclaim,
                 Err(_) => {
-                    this.with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id as usize));
+                    this.with_locked_inner(|inner| inner.set_queue_fatal(oom.cs_id));
                     TyrDrmDeviceData::schedule_tick(tdev);
                     GrowOutcome::Fatal
                 }
@@ -314,10 +315,7 @@ impl Scheduler {
 
             if cs_fatal_mask != 0 {
                 group.with_locked_inner(|inner| {
-                    let mut mask = cs_fatal_mask;
-                    while mask != 0 {
-                        let cs_id = mask.trailing_zeros() as usize;
-                        mask &= !(1u32 << cs_id);
+                    for cs_id in QueueIdx::iter_mask(cs_fatal_mask) {
                         inner.set_queue_fatal(cs_id);
                     }
                 });
@@ -362,11 +360,7 @@ impl Scheduler {
         let mut pending = KVec::with_capacity(MAX_CS_PER_GROUP, GFP_KERNEL)?;
 
         tdev.with_locked_scheduler(|_| {
-            let mut oom_mask = group.tiler_oom.xchg(0, Relaxed);
-            while oom_mask != 0 {
-                let cs_id = oom_mask.trailing_zeros();
-                oom_mask &= !(1u32 << cs_id);
-
+            for cs_id in QueueIdx::iter_mask(group.tiler_oom.xchg(0, Relaxed)) {
                 // The counters are indexed by slot, so resolve the binding and
                 // read under one acquisition. An unbound group makes the rest
                 // of its mask stale, and the firmware re-raises the event when
@@ -380,7 +374,7 @@ impl Scheduler {
 
                     let (heap_address, vt_start, vt_end, frag_end) =
                         tdev.fw.with_csg_mut(csg_id, |csg| {
-                            let cs = csg.cs_mut(cs_id as usize).ok_or(EINVAL)?;
+                            let cs = csg.cs_mut(cs_id.get()).ok_or(EINVAL)?;
                             let heap = cs.read_heap_output_state()?;
 
                             Ok((heap.heap_address, heap.vt_start, heap.vt_end, heap.frag_end))
@@ -441,7 +435,7 @@ impl Scheduler {
 
             tdev.fw.with_csg_mut_ring_doorbell(oom.csg_id, |csg| {
                 {
-                    let cs = csg.cs_mut(oom.cs_id as usize).ok_or(EINVAL)?;
+                    let cs = csg.cs_mut(oom.cs_id.get()).ok_or(EINVAL)?;
                     cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
 
                     let ack = cs.read_output_ack()?.tiler_oom();
@@ -449,7 +443,7 @@ impl Scheduler {
                     cs.write_input_req(req);
                 }
 
-                csg.toggle_input_db_req(CsDbMask::from_raw(1u32 << oom.cs_id))
+                csg.toggle_input_db_req(CsDbMask::from_raw(oom.cs_id.bit()))
             })?;
         }
 
