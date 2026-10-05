@@ -1901,20 +1901,22 @@ fn contiguous_phys(
     page_table: &Devres<pt_alloc::PageTable>,
     range: Range<u64>,
 ) -> Option<PhysAddr> {
+    let start_usize = usize::try_from(range.start).ok()?;
     let pt = page_table.try_access()?;
 
     // SAFETY: The page table is exclusively accessed through the
     // &mut UniqueRefGpuVm held under the gpuvm_unique mutex for the duration of
     // the VM update, so no other io-pgtable operation runs concurrently.
-    let base = unsafe { pt.iova_to_phys(range.start as usize) }?;
+    let base = unsafe { pt.iova_to_phys(start_usize) }?;
 
     let mut iova = range.start + SZ_4K as u64;
     while iova < range.end {
         let offset = (iova - range.start) as PhysAddr;
+        let iova_usize = usize::try_from(iova).ok()?;
         // SAFETY: The page table is accessed exclusively through the
         // &mut UniqueRefGpuVm held under the gpuvm_unique mutex, so no
         // concurrent io-pgtable operation runs.
-        let paddr = unsafe { pt.iova_to_phys(iova as usize) }?;
+        let paddr = unsafe { pt.iova_to_phys(iova_usize) }?;
         if paddr != base + offset {
             return None;
         }
@@ -2002,6 +2004,20 @@ fn pt_map(
 
         let (pgsize, pgcount) = get_pgsize(curr_iova | curr_paddr, remaining);
 
+        let (Ok(iova_usize), Ok(curr_pa)) =
+            (usize::try_from(curr_iova), PhysAddr::try_from(curr_paddr))
+        else {
+            pr_err!(
+                "IOVA {:#x} or PA {:#x} cannot be mapped without truncation\n",
+                curr_iova,
+                curr_paddr
+            );
+            if segment_mapped > 0 {
+                pt_unmap(page_table, iova..(iova + segment_mapped)).ok();
+            }
+            return Err(EOVERFLOW);
+        };
+
         let pt = page_table.try_access().ok_or(ENODEV)?;
 
         // The page tables for this map come from the reserve. The flags only
@@ -2014,8 +2030,8 @@ fn pt_map(
         // modify the page table.
         let (mapped, result) = unsafe {
             pt.map_pages(
-                curr_iova as usize,
-                (curr_paddr as usize).try_into().unwrap(),
+                iova_usize,
+                curr_pa,
                 pgsize as usize,
                 pgcount as usize,
                 prot,
@@ -2056,6 +2072,11 @@ fn pt_unmap(page_table: &Devres<pt_alloc::PageTable>, range: Range<u64>) -> Resu
     while bytes_left_to_unmap > 0 {
         let (pgsize, pgcount) = get_pgsize(iova, bytes_left_to_unmap);
 
+        let iova_usize = usize::try_from(iova).map_err(|_| {
+            pr_err!("IOVA {:#x} cannot be unmapped without truncation\n", iova);
+            EOVERFLOW
+        })?;
+
         // Unbind frees the page table, leaving nothing to unmap.
         let Some(pt) = page_table.try_access() else {
             return Ok(());
@@ -2068,7 +2089,7 @@ fn pt_unmap(page_table: &Devres<pt_alloc::PageTable>, range: Range<u64>) -> Resu
         // Every range passed here is fully mapped, so this page table has one
         // or more consecutive mappings starting at `iova` with the total size
         // of `pgcount * pgsize`.
-        let unmapped = unsafe { pt.unmap_pages(iova as usize, pgsize as usize, pgcount as usize) };
+        let unmapped = unsafe { pt.unmap_pages(iova_usize, pgsize as usize, pgcount as usize) };
 
         if unmapped == 0 {
             pr_err!("Failed to unmap any bytes at iova {:#x}\n", iova);
@@ -2088,12 +2109,16 @@ fn pt_unmap_mapped(page_table: &Devres<pt_alloc::PageTable>, range: Range<u64>) 
     let mut iova = range.start;
 
     while iova < range.end {
+        let iova_usize = usize::try_from(iova).map_err(|_| {
+            pr_err!("IOVA {:#x} cannot be unmapped without truncation\n", iova);
+            EOVERFLOW
+        })?;
         let Some(pt) = page_table.try_access() else {
             return Ok(());
         };
         // SAFETY: The VM update holds the `gpuvm_unique` mutex, so no other
         // io-pgtable operation runs on this page table.
-        let mapped = unsafe { pt.iova_to_phys(iova as usize) }.is_some();
+        let mapped = unsafe { pt.iova_to_phys(iova_usize) }.is_some();
         drop(pt);
 
         match (mapped, run_start) {
