@@ -281,7 +281,10 @@ pub(crate) mod gpu_control {
 
     impl From<ResetMode> for Bounded<u32, 4> {
         fn from(mode: ResetMode) -> Self {
-            Bounded::try_new(mode as u32).unwrap()
+            match mode {
+                ResetMode::SoftReset => Self::new::<1>(),
+                ResetMode::HardReset => Self::new::<2>(),
+            }
         }
     }
 
@@ -315,7 +318,12 @@ pub(crate) mod gpu_control {
 
     impl From<FlushMode> for Bounded<u32, 4> {
         fn from(mode: FlushMode) -> Self {
-            Bounded::try_new(mode as u32).unwrap()
+            match mode {
+                FlushMode::None => Self::new::<0>(),
+                FlushMode::Clean => Self::new::<1>(),
+                FlushMode::Invalidate => Self::new::<2>(),
+                FlushMode::CleanInvalidate => Self::new::<3>(),
+            }
         }
     }
 
@@ -455,15 +463,19 @@ pub(crate) mod gpu_control {
                 0 => AccessType::Atomic,
                 1 => AccessType::Execute,
                 2 => AccessType::Read,
-                3 => AccessType::Write,
-                _ => unreachable!(),
+                _ => AccessType::Write,
             }
         }
     }
 
     impl From<AccessType> for Bounded<u32, 2> {
         fn from(access: AccessType) -> Self {
-            Bounded::try_new(access as u32).unwrap()
+            match access {
+                AccessType::Atomic => Self::new::<0>(),
+                AccessType::Execute => Self::new::<1>(),
+                AccessType::Read => Self::new::<2>(),
+                AccessType::Write => Self::new::<3>(),
+            }
         }
     }
 
@@ -832,7 +844,11 @@ pub(crate) mod gpu_control {
 
     impl From<McuControlMode> for Bounded<u32, 2> {
         fn from(mode: McuControlMode) -> Self {
-            Bounded::try_new(mode as u32).unwrap()
+            match mode {
+                McuControlMode::Disable => Self::new::<0>(),
+                McuControlMode::Enable => Self::new::<1>(),
+                McuControlMode::Auto => Self::new::<2>(),
+            }
         }
     }
 
@@ -865,15 +881,19 @@ pub(crate) mod gpu_control {
                 0 => McuStatus::Disabled,
                 1 => McuStatus::Enabled,
                 2 => McuStatus::Halt,
-                3 => McuStatus::Fatal,
-                _ => unreachable!(),
+                _ => McuStatus::Fatal,
             }
         }
     }
 
     impl From<McuStatus> for Bounded<u32, 2> {
         fn from(status: McuStatus) -> Self {
-            Bounded::try_new(status as u32).unwrap()
+            match status {
+                McuStatus::Disabled => Self::new::<0>(),
+                McuStatus::Enabled => Self::new::<1>(),
+                McuStatus::Halt => Self::new::<2>(),
+                McuStatus::Fatal => Self::new::<3>(),
+            }
         }
     }
 
@@ -1487,7 +1507,10 @@ pub(crate) mod mmu_control {
 
         impl From<AllocPolicySelect> for Bounded<u8, 2> {
             fn from(val: AllocPolicySelect) -> Self {
-                Bounded::try_new(val as u8).unwrap()
+                match val {
+                    AllocPolicySelect::Impl => Self::new::<2>(),
+                    AllocPolicySelect::Alloc => Self::new::<3>(),
+                }
             }
         }
 
@@ -1532,7 +1555,11 @@ pub(crate) mod mmu_control {
 
         impl From<Coherency> for Bounded<u8, 2> {
             fn from(val: Coherency) -> Self {
-                Bounded::try_new(val as u8).unwrap()
+                match val {
+                    Coherency::MidgardInnerDomain => Self::new::<0>(),
+                    Coherency::CpuInnerDomain => Self::new::<1>(),
+                    Coherency::CpuInnerDomainShaderCoh => Self::new::<2>(),
+                }
             }
         }
 
@@ -1555,15 +1582,19 @@ pub(crate) mod mmu_control {
                     0 => Self::Shared,
                     1 => Self::NonCacheable,
                     2 => Self::WriteBack,
-                    3 => Self::Fault,
-                    _ => unreachable!(),
+                    _ => Self::Fault,
                 }
             }
         }
 
         impl From<MemoryType> for Bounded<u8, 2> {
             fn from(val: MemoryType) -> Self {
-                Bounded::try_new(val as u8).unwrap()
+                match val {
+                    MemoryType::Shared => Self::new::<0>(),
+                    MemoryType::NonCacheable => Self::new::<1>(),
+                    MemoryType::WriteBack => Self::new::<2>(),
+                    MemoryType::Fault => Self::new::<3>(),
+                }
             }
         }
 
@@ -1596,7 +1627,7 @@ pub(crate) mod mmu_control {
 
         impl From<MMU_MEMATTR_STAGE1> for Bounded<u64, 8> {
             fn from(val: MMU_MEMATTR_STAGE1) -> Self {
-                Bounded::try_new(u64::from(val.into_raw())).unwrap()
+                val.into_raw().into()
             }
         }
 
@@ -1666,16 +1697,6 @@ pub(crate) mod mmu_control {
                     .with_memory_type(memory_type)
             }
 
-            fn with_encoded_attribute(self, index: usize, attr: MMU_MEMATTR_STAGE1) -> Self {
-                debug_assert!(index < 8);
-
-                let shift = index * 8;
-                let mask = !(0xffu64 << shift);
-                let raw = (self.into_raw() & mask) | ((u64::from(attr.into_raw())) << shift);
-
-                Self::from_raw(raw)
-            }
-
             /// Check if a MAIR attribute byte represents device memory.
             ///
             /// Device memory (memory-mapped I/O, registers) cannot be cached and must
@@ -1739,12 +1760,10 @@ pub(crate) mod mmu_control {
             /// `coherent` selects the shareability domain of the write-back
             /// bytes.
             pub(crate) fn from_mair(mair: u64, coherent: bool) -> Self {
-                mair.to_le_bytes()
-                    .into_iter()
-                    .enumerate()
-                    .fold(Self::zeroed(), |acc, (i, attr)| {
-                        acc.with_encoded_attribute(i, Self::attribute_from_mair(attr, coherent))
-                    })
+                Self::from_raw(u64::from_le_bytes(
+                    mair.to_le_bytes()
+                        .map(|attr| Self::attribute_from_mair(attr, coherent).into_raw()),
+                ))
             }
         }
 
@@ -1924,15 +1943,19 @@ pub(crate) mod mmu_control {
                     0 => MmuAccessType::Atomic,
                     1 => MmuAccessType::Execute,
                     2 => MmuAccessType::Read,
-                    3 => MmuAccessType::Write,
-                    _ => unreachable!(),
+                    _ => MmuAccessType::Write,
                 }
             }
         }
 
         impl From<MmuAccessType> for Bounded<u32, 2> {
             fn from(access: MmuAccessType) -> Self {
-                Bounded::try_new(access as u32).unwrap()
+                match access {
+                    MmuAccessType::Atomic => Self::new::<0>(),
+                    MmuAccessType::Execute => Self::new::<1>(),
+                    MmuAccessType::Read => Self::new::<2>(),
+                    MmuAccessType::Write => Self::new::<3>(),
+                }
             }
         }
 
@@ -1997,7 +2020,12 @@ pub(crate) mod mmu_control {
 
         impl From<AddressSpaceMode> for Bounded<u64, 4> {
             fn from(mode: AddressSpaceMode) -> Self {
-                Bounded::try_new(mode as u64).unwrap()
+                match mode {
+                    AddressSpaceMode::Unmapped => Self::new::<1>(),
+                    AddressSpaceMode::Identity => Self::new::<2>(),
+                    AddressSpaceMode::Aarch64_4K => Self::new::<6>(),
+                    AddressSpaceMode::Aarch64_64K => Self::new::<8>(),
+                }
             }
         }
 
@@ -2094,7 +2122,33 @@ pub(crate) mod mmu_control {
 
         impl From<InaBits> for Bounded<u64, 5> {
             fn from(bits: InaBits) -> Self {
-                Bounded::try_new(bits as u64).unwrap()
+                match bits {
+                    InaBits::Reset => Self::new::<0>(),
+                    InaBits::Bits48 => Self::new::<7>(),
+                    InaBits::Bits47 => Self::new::<8>(),
+                    InaBits::Bits46 => Self::new::<9>(),
+                    InaBits::Bits45 => Self::new::<10>(),
+                    InaBits::Bits44 => Self::new::<11>(),
+                    InaBits::Bits43 => Self::new::<12>(),
+                    InaBits::Bits42 => Self::new::<13>(),
+                    InaBits::Bits41 => Self::new::<14>(),
+                    InaBits::Bits40 => Self::new::<15>(),
+                    InaBits::Bits39 => Self::new::<16>(),
+                    InaBits::Bits38 => Self::new::<17>(),
+                    InaBits::Bits37 => Self::new::<18>(),
+                    InaBits::Bits36 => Self::new::<19>(),
+                    InaBits::Bits35 => Self::new::<20>(),
+                    InaBits::Bits34 => Self::new::<21>(),
+                    InaBits::Bits33 => Self::new::<22>(),
+                    InaBits::Bits32 => Self::new::<23>(),
+                    InaBits::Bits31 => Self::new::<24>(),
+                    InaBits::Bits30 => Self::new::<25>(),
+                    InaBits::Bits29 => Self::new::<26>(),
+                    InaBits::Bits28 => Self::new::<27>(),
+                    InaBits::Bits27 => Self::new::<28>(),
+                    InaBits::Bits26 => Self::new::<29>(),
+                    InaBits::Bits25 => Self::new::<30>(),
+                }
             }
         }
 
@@ -2125,7 +2179,11 @@ pub(crate) mod mmu_control {
 
         impl From<PtwMemattr> for Bounded<u64, 2> {
             fn from(attr: PtwMemattr) -> Self {
-                Bounded::try_new(attr as u64).unwrap()
+                match attr {
+                    PtwMemattr::Invalid => Self::new::<0>(),
+                    PtwMemattr::NonCacheable => Self::new::<1>(),
+                    PtwMemattr::WriteBack => Self::new::<2>(),
+                }
             }
         }
 
@@ -2157,7 +2215,11 @@ pub(crate) mod mmu_control {
 
         impl From<PtwShareability> for Bounded<u64, 2> {
             fn from(sh: PtwShareability) -> Self {
-                Bounded::try_new(sh as u64).unwrap()
+                match sh {
+                    PtwShareability::NonShareable => Self::new::<0>(),
+                    PtwShareability::OuterShareable => Self::new::<2>(),
+                    PtwShareability::InnerShareable => Self::new::<3>(),
+                }
             }
         }
 
