@@ -1178,8 +1178,9 @@ impl TyrPlatformDriverData {
 
         drop(pm.get(PMProfile::new().auto())?);
 
-        let populated = tdev.pm.populate(pm);
-        debug_assert!(populated);
+        if !tdev.pm.populate(pm) {
+            return Err(EBUSY);
+        }
 
         tdev.reset.set_ready();
 
