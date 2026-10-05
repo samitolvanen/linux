@@ -430,7 +430,12 @@ mod glb {
 
     impl From<GlbState> for Bounded<u32, 3> {
         fn from(state: GlbState) -> Self {
-            Bounded::try_new(state as u32).unwrap()
+            match state {
+                GlbState::Active => Self::new::<0>(),
+                GlbState::Halt => Self::new::<1>(),
+                GlbState::Sleep => Self::new::<2>(),
+                GlbState::Suspend => Self::new::<3>(),
+            }
         }
     }
 
