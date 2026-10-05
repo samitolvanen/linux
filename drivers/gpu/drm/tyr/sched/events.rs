@@ -305,6 +305,18 @@ impl Scheduler {
         })?;
 
         if let Some(group) = &group {
+            let queue_mask = group.queue_mask();
+            let stray_mask = (tiler_oom_mask | cs_fatal_mask) & !queue_mask;
+            if stray_mask != 0 {
+                pr_warn!(
+                    "CSG slot {}: fatal or tiler OOM event on CS mask {:#x} with no queue\n",
+                    csg_id,
+                    stray_mask
+                );
+            }
+            tiler_oom_mask &= queue_mask;
+            cs_fatal_mask &= queue_mask;
+
             if tiler_oom_mask != 0 {
                 let tiler_oom = &group.tiler_oom;
                 let mut old = tiler_oom.load(Relaxed);
