@@ -885,9 +885,7 @@ impl Scheduler {
 
         if new_state == group::State::Unknown {
             group.with_locked_inner(|inner| {
-                if inner.fatal_error.is_none() {
-                    inner.fatal_error = Some(EINVAL);
-                }
+                inner.fatal = true;
             });
             tdev.reset.schedule();
         }
@@ -1114,9 +1112,7 @@ impl Scheduler {
             group.with_locked_inner(|inner| {
                 inner.list_state = GroupListState::None;
                 inner.state = group::State::Terminated;
-                if inner.fatal_error.is_none() {
-                    inner.fatal_error = Some(ENODEV);
-                }
+                inner.fatal = true;
             });
             group.schedule_term();
         }
@@ -1141,9 +1137,7 @@ impl Scheduler {
                 let group: Arc<Group> = wait_arc.into_arc();
                 group.with_locked_inner(|inner| {
                     inner.state = group::State::Terminated;
-                    if inner.fatal_error.is_none() {
-                        inner.fatal_error = Some(ENODEV);
-                    }
+                    inner.fatal = true;
                 });
                 group.schedule_term();
             }
@@ -1193,7 +1187,7 @@ impl Scheduler {
         let priority = group.priority as usize;
 
         group.with_locked_inner(|inner| {
-            if inner.fatal_error.is_some() || group.vm.is_unusable() {
+            if inner.fatal || group.vm.is_unusable() {
                 return;
             }
 

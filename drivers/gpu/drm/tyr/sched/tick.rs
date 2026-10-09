@@ -1340,9 +1340,7 @@ impl<'a> Tick<'a> {
                                 // behind it.
                                 group.with_locked_inner(|inner| {
                                     inner.state = State::Unknown;
-                                    if inner.fatal_error.is_none() {
-                                        inner.fatal_error = Some(err);
-                                    }
+                                    inner.fatal = true;
                                 });
                             }
                             self.requeue_pending_bind(pending);
