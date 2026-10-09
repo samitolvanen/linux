@@ -18,8 +18,6 @@
 //! been released. Until its release, a device's own queues can still defer
 //! drops here.
 
-use core::mem::MaybeUninit;
-
 use kernel::{
     prelude::*,
     sync::{
@@ -56,9 +54,9 @@ struct Devices {
 
 /// Registration of the module-wide cleanup workqueue.
 ///
-/// Creating it builds the queue and publishes it to `try_spawn_owned`,
-/// `enqueue` and `Handoff::spawn`. Dropping it waits for every device to be
-/// released, then destroys the queue, which drains every item still queued.
+/// Creating it builds the queue and publishes it to `enqueue` and
+/// `Handoff::spawn`. Dropping it waits for every device to be released, then
+/// destroys the queue, which drains every item still queued.
 ///
 /// The wait is unbounded and uninterruptible, so the last device release must
 /// run on the cleanup worker, in file close (the module is pinned by
@@ -106,88 +104,6 @@ impl Drop for Registration {
         let wq = CLEANUP_WQ.lock().take();
         drop(wq);
     }
-}
-
-/// Why a cleanup item was not queued.
-///
-/// `T` is the value that was not queued.
-pub(crate) enum SpawnError<T = ()> {
-    /// The work item allocation failed.
-    NoMemory(T),
-    /// The module has destroyed the queue. That only happens once every
-    /// device has been released, so the caller is outside any dma-fence
-    /// signalling section and may run its cleanup inline.
-    QueueGone(T),
-}
-
-impl SpawnError<()> {
-    /// Rebuilds the error around the value that was not handed over.
-    fn with_value<T>(self, value: T) -> SpawnError<T> {
-        match self {
-            Self::NoMemory(()) => SpawnError::NoMemory(value),
-            Self::QueueGone(()) => SpawnError::QueueGone(value),
-        }
-    }
-}
-
-/// Queues `func` on the cleanup workqueue.
-///
-/// `func` is dropped with the queue lock held when it cannot be queued, so
-/// it must not carry a destructor. Its only caller is `try_spawn_owned`,
-/// whose closure captures only an `OwnedPtr<T>` and an `fn`.
-fn try_spawn<T: 'static + Send + FnOnce()>(func: T) -> Result<(), SpawnError> {
-    let wq = CLEANUP_WQ.lock();
-    match wq.as_ref() {
-        Some(wq) => wq
-            .try_spawn(GFP_NOWAIT, func)
-            .map_err(|_| SpawnError::NoMemory(())),
-        None => Err(SpawnError::QueueGone(())),
-    }
-}
-
-/// `Send` wrapper for the pointer to the value `try_spawn_owned` parks on
-/// the heap.
-struct OwnedPtr<T>(*mut T);
-
-// SAFETY: `T: Send`, so the value may cross to the worker. The pointer is
-// turned back into a `KBox` exactly once: by the worker when the item was
-// queued, and by `try_spawn_owned` otherwise. The two never alias it.
-unsafe impl<T: Send> Send for OwnedPtr<T> {}
-
-/// Runs `f` on the cleanup workqueue with ownership of `value`.
-///
-/// `value` and the work item are allocated with `GFP_NOWAIT`, so the call is
-/// safe from a dma-fence signalling section. Must not be called before the
-/// module has created the `Registration`.
-///
-/// `value` is parked on the heap and handed over by pointer, so dropping the
-/// closure under the queue lock does not run its destructor. `value` comes
-/// back inside the error when the work cannot be queued.
-pub(crate) fn try_spawn_owned<T: 'static + Send>(value: T, f: fn(T)) -> Result<(), SpawnError<T>> {
-    let slot: KBox<MaybeUninit<T>> = match KBox::new_uninit(GFP_NOWAIT) {
-        Ok(slot) => slot,
-        Err(_) => return Err(SpawnError::NoMemory(value)),
-    };
-    let ptr = KBox::into_raw(KBox::write(slot, value));
-    let owned = OwnedPtr(ptr);
-
-    let res = try_spawn(move || {
-        // Capturing the pointer field on its own would leave the closure
-        // non-`Send`.
-        let owned = owned;
-        // SAFETY: `try_spawn` runs the closure only when the item was
-        // queued, in which case nothing else reclaims the box.
-        f(KBox::into_inner(unsafe { KBox::from_raw(owned.0) }));
-    });
-
-    if let Err(e) = res {
-        // SAFETY: `try_spawn` failed, so it dropped the closure without
-        // running it and the box is still owned here.
-        let value = KBox::into_inner(unsafe { KBox::from_raw(ptr) });
-        return Err(e.with_value(value));
-    }
-
-    Ok(())
 }
 
 /// Enqueues a work item on the cleanup workqueue.
@@ -253,8 +169,9 @@ impl<T: Send + 'static, K: Send + 'static> Handoff<T, K> {
     /// Runs `f(value)` on the cleanup workqueue, then drops `keep`.
     ///
     /// Must not be called before the module has created the `Registration`.
-    /// Once the module has destroyed the queue, runs both inline, as for
-    /// `SpawnError::QueueGone`.
+    /// Once the module has destroyed the queue, runs both inline. That only
+    /// happens once every device has been released, so the caller is outside
+    /// any dma-fence signalling section.
     pub(crate) fn spawn(self, value: T, f: fn(T)) {
         let mut work = self.0;
         *work.as_mut().project().value = Some((value, f));
