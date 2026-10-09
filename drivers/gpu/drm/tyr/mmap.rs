@@ -123,6 +123,10 @@ unsafe extern "C" fn vm_fault_handler(vmf: *mut bindings::vm_fault) -> bindings:
     // mmap read lock for the duration of the callback.
     let vma_ref = unsafe { VmaRef::from_raw(vma) };
 
+    let Some(_guard) = tdev.registration_guard() else {
+        return VM_FAULT_SIGBUS;
+    };
+
     // A read through a live PTE into unclocked MMIO is an external
     // abort, so a suspended device gets the dummy page. The `user_mmio`
     // lock orders the check and the PTE insert against the suspend
