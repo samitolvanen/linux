@@ -35,6 +35,10 @@ use super::{
         SyncOp, //
     },
     group::Group,
+    queue::{
+        MIN_RINGBUF_SIZE,
+        RINGBUF_RESERVED_BYTES, //
+    },
     //
 };
 
@@ -125,8 +129,8 @@ impl Instr {
 }
 
 /// Per-job GPU profiling sample slot. The wrapped command stream writes
-/// the cycle counter and timestamp before the job's first piece and
-/// after its last. Job completion reads back the deltas.
+/// the cycle counter and timestamp before and after the job's stream.
+/// Job completion reads back the deltas.
 #[repr(C)]
 pub(crate) struct JobProfilingData {
     pub(crate) cycles_before: u64,
@@ -284,25 +288,20 @@ pub(crate) fn append_queue_submits(
 
 pub(crate) struct Job {
     queue_index: usize,
-    /// Per-`QueueSubmit` stream descriptors. Empty pieces (sync-only
-    /// submits) are dropped at merge time, so every entry here
-    /// corresponds to one wrapper the prepare path emits.
-    pieces: KVec<StreamPiece>,
+    /// `None` for a sync-only submit.
+    stream: Option<StreamPiece>,
 }
 
 impl Job {
-    fn new(queue_index: usize, pieces: KVec<StreamPiece>) -> Self {
+    fn new(queue_index: usize, stream: Option<StreamPiece>) -> Self {
         Self {
             queue_index,
-            pieces,
+            stream,
         }
     }
 
-    /// Merges `queue_submits` into one `Job` per queue index, paired
-    /// with the flattened sync-op stream for that queue. The
-    /// per-(queue, batch) merge invariant lets the rest of the submit
-    /// path assume there is exactly one pending submit fence and one
-    /// wrapped-stream allocation per Job.
+    /// Turns each queue submit that carries a stream or sync ops into one
+    /// `Job`, in submission order, paired with its sync ops.
     pub(crate) fn from_queue_submits(
         queue_submits: KVec<QueueSubmit>,
     ) -> Result<KVec<(Self, KVec<SyncOp>)>> {
@@ -311,42 +310,13 @@ impl Job {
         for queue_submit in queue_submits.into_iter() {
             let queue_index = queue_submit.queue_index();
             let (piece, syncs) = queue_submit.into_parts();
-            let has_stream = piece.stream_size != 0;
-            let mut syncs = Some(syncs);
+            let stream = (piece.stream_size != 0).then_some(piece);
 
-            if !has_stream && syncs.as_ref().is_some_and(KVec::is_empty) {
+            if stream.is_none() && syncs.is_empty() {
                 continue;
             }
 
-            let mut merged = false;
-            for (job, job_syncs) in jobs.iter_mut() {
-                if job.queue_index == queue_index {
-                    if has_stream {
-                        job.pieces.push(piece, GFP_KERNEL)?;
-                    }
-                    let Some(syncs) = syncs.take() else {
-                        return Err(EINVAL);
-                    };
-                    for sync in syncs.into_iter() {
-                        job_syncs.push(sync, GFP_KERNEL)?;
-                    }
-                    merged = true;
-                    break;
-                }
-            }
-
-            if merged {
-                continue;
-            }
-
-            let mut pieces = KVec::new();
-            if has_stream {
-                pieces.push(piece, GFP_KERNEL)?;
-            }
-            jobs.push(
-                (Self::new(queue_index, pieces), syncs.take().ok_or(EINVAL)?),
-                GFP_KERNEL,
-            )?;
+            jobs.push((Self::new(queue_index, stream), syncs), GFP_KERNEL)?;
         }
 
         Ok(jobs)
@@ -356,31 +326,23 @@ impl Job {
         self.queue_index
     }
 
-    pub(crate) fn piece_count(&self) -> usize {
-        self.pieces.len()
-    }
-
     pub(crate) fn has_stream(&self) -> bool {
-        !self.pieces.is_empty()
+        self.stream.is_some()
     }
 
     /// Builds the wrapped command-stream buffer for this Job.
     ///
-    /// Each piece in `self.pieces` becomes one wrapper sequence in the
-    /// returned KVec, in submit order. A wrapper consists of a
-    /// LATEST_FLUSH-conditional cache flush, a `CALL` into the
-    /// userspace stream at `piece.stream_addr`, and a
+    /// The wrapper consists of a LATEST_FLUSH-conditional cache flush, a
+    /// `CALL` into the userspace stream at `stream_addr`, and a
     /// `SYNC_ADD64` / `ERROR_BARRIER` epilogue that bumps the per-queue
-    /// syncobj at `sync_va` by one. The concatenation is padded to a
-    /// 64-byte boundary so the firmware prefetcher sees cacheline-
-    /// aligned trailing storage.
+    /// syncobj at `sync_va` by one. It is padded to a 64-byte boundary so
+    /// the firmware prefetcher sees cacheline-aligned trailing storage.
     ///
     /// When `profiling_mask` enables sampling, `STORE_STATE` pairs
     /// record the GPU cycle counter and/or timestamp into the sample
-    /// slot at `profiling_va`, before the first piece's `CALL` and
-    /// after the last piece's, so the before/after delta covers the
-    /// whole job. Also returns the offsets of the `MOV48`s that load the
-    /// sample addresses, so the slot can be changed after the build.
+    /// slot at `profiling_va`, before and after the `CALL`. Also returns
+    /// the offsets of the `MOV48`s that load the sample addresses, so the
+    /// slot can be changed after the build.
     pub(crate) fn build_wrapped_stream(
         &self,
         group: &Group,
@@ -389,12 +351,18 @@ impl Job {
         profiling_mask: u32,
     ) -> Result<(KVec<u8>, KVec<usize>)> {
         const INSTR_BYTES: usize = 8;
-        // Instructions in the base wrapper emitted for every piece, and
-        // the per-job `MOV48`/`STORE_STATE` pairs emitted for each enabled
-        // profiling flag, one pair before the first piece's `CALL` and one
-        // after the last piece's.
+        // Instructions in the base wrapper, and the `MOV48`/`STORE_STATE`
+        // pairs emitted for each enabled profiling flag, one pair before
+        // the `CALL` and one after it.
         const BASE_INSTRS: usize = 11;
         const INSTRS_PER_FLAG: usize = 4;
+
+        static_assert!(
+            (INSTR_BYTES * (BASE_INSTRS + 2 * INSTRS_PER_FLAG)).next_multiple_of(64)
+                <= MIN_RINGBUF_SIZE - RINGBUF_RESERVED_BYTES
+        );
+
+        let piece = self.stream.as_ref().ok_or(EINVAL)?;
 
         // Pull the probe-time CSF working-register and scoreboard counts
         // so the wrapper adapts to the per-chip CSIF configuration.
@@ -427,18 +395,8 @@ impl Job {
 
         // Size to the instructions emitted for the enabled flags, so an
         // unprofiled wrapper stays compact.
-        let profiling_bytes = if self.pieces.is_empty() {
-            0
-        } else {
-            INSTR_BYTES * INSTRS_PER_FLAG * (usize::from(cycles) + usize::from(timestamp))
-        };
-        let total = self
-            .pieces
-            .len()
-            .checked_mul(INSTR_BYTES * BASE_INSTRS)
-            .and_then(|bytes| bytes.checked_add(profiling_bytes))
-            .ok_or(EOVERFLOW)?;
-        let padded = total.next_multiple_of(64);
+        let flags = usize::from(cycles) + usize::from(timestamp);
+        let padded = (INSTR_BYTES * (BASE_INSTRS + INSTRS_PER_FLAG * flags)).next_multiple_of(64);
         let mut buf = KVec::<u8>::with_capacity(padded, GFP_KERNEL)?;
         let mut relocs = KVec::new();
 
@@ -449,38 +407,33 @@ impl Job {
                 Ok(offset)
             };
 
-            for (i, piece) in self.pieces.iter().enumerate() {
-                let first = i == 0;
-                let last = i + 1 == self.pieces.len();
-
-                emit(Instr::mov32(val_reg, piece.latest_flush.into()))?;
-                emit(Instr::flush_cache2(val_reg))?;
-                if cycles && first {
-                    relocs.push(emit(Instr::mov48(cycle_reg, cycles_before_va))?, GFP_KERNEL)?;
-                    emit(Instr::store_state(cycle_reg, 1))?;
-                }
-                if timestamp && first {
-                    relocs.push(emit(Instr::mov48(time_reg, time_before_va))?, GFP_KERNEL)?;
-                    emit(Instr::store_state(time_reg, 0))?;
-                }
-                emit(Instr::mov48(addr_reg, piece.stream_addr))?;
-                emit(Instr::mov32(val_reg, piece.stream_size.into()))?;
-                emit(Instr::wait(1))?;
-                emit(Instr::call(addr_reg, val_reg))?;
-                if cycles && last {
-                    relocs.push(emit(Instr::mov48(cycle_reg, cycles_after_va))?, GFP_KERNEL)?;
-                    emit(Instr::store_state(cycle_reg, 1))?;
-                }
-                if timestamp && last {
-                    relocs.push(emit(Instr::mov48(time_reg, time_after_va))?, GFP_KERNEL)?;
-                    emit(Instr::store_state(time_reg, 0))?;
-                }
-                emit(Instr::mov48(addr_reg, sync_va))?;
-                emit(Instr::mov48(val_reg, 1))?;
-                emit(Instr::wait(wait_all_mask))?;
-                emit(Instr::sync_add64(addr_reg, val_reg))?;
-                emit(Instr::error_barrier())?;
+            emit(Instr::mov32(val_reg, piece.latest_flush.into()))?;
+            emit(Instr::flush_cache2(val_reg))?;
+            if cycles {
+                relocs.push(emit(Instr::mov48(cycle_reg, cycles_before_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(cycle_reg, 1))?;
             }
+            if timestamp {
+                relocs.push(emit(Instr::mov48(time_reg, time_before_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(time_reg, 0))?;
+            }
+            emit(Instr::mov48(addr_reg, piece.stream_addr))?;
+            emit(Instr::mov32(val_reg, piece.stream_size.into()))?;
+            emit(Instr::wait(1))?;
+            emit(Instr::call(addr_reg, val_reg))?;
+            if cycles {
+                relocs.push(emit(Instr::mov48(cycle_reg, cycles_after_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(cycle_reg, 1))?;
+            }
+            if timestamp {
+                relocs.push(emit(Instr::mov48(time_reg, time_after_va))?, GFP_KERNEL)?;
+                emit(Instr::store_state(time_reg, 0))?;
+            }
+            emit(Instr::mov48(addr_reg, sync_va))?;
+            emit(Instr::mov48(val_reg, 1))?;
+            emit(Instr::wait(wait_all_mask))?;
+            emit(Instr::sync_add64(addr_reg, val_reg))?;
+            emit(Instr::error_barrier())?;
         }
 
         // Pad to a 64-byte boundary so the trailing instruction sits

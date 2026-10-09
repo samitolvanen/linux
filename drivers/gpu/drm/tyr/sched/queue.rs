@@ -83,17 +83,21 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 
 /// Smallest ringbuffer byte count one wrapped job stream consumes.
 ///
-/// `sched::job::build_wrapped_stream` emits 11 8-byte instructions per
-/// piece and pads the concatenation up to a 64-byte boundary, so the
-/// minimum is `next_multiple_of(88, 64) == 128`. Profiled wrappers are
-/// larger, so this stays a lower bound. Used to size the pre-allocated
-/// pending-fence vec and the per-queue profiling slot count to an upper
-/// bound on the number of jobs a `ringbuf_size`-byte ring can hold.
+/// `sched::job::build_wrapped_stream` emits 11 8-byte instructions and
+/// pads them up to a 64-byte boundary, so the minimum is
+/// `next_multiple_of(88, 64) == 128`. Profiled wrappers are larger, so
+/// this stays a lower bound. Used to size the pre-allocated pending-fence
+/// vec and the per-queue profiling slot count to an upper bound on the
+/// number of jobs a `ringbuf_size`-byte ring can hold. Sync-only jobs take
+/// no ring space but still take a vec entry.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
 
 /// The hardware considers a CSF ring buffer full one 64-byte cache
 /// line short of its allocated size.
-const RINGBUF_RESERVED_BYTES: usize = 64;
+pub(super) const RINGBUF_RESERVED_BYTES: usize = 64;
+
+/// Smallest ring buffer size a queue can be created with.
+pub(super) const MIN_RINGBUF_SIZE: usize = SZ_4K;
 
 // SAFETY: todo
 static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
@@ -127,7 +131,7 @@ impl QueueCreate {
             return Err(EINVAL);
         }
 
-        if self.0.ringbuf_size < SZ_4K as u32
+        if self.0.ringbuf_size < MIN_RINGBUF_SIZE as u32
             || self.0.ringbuf_size > SZ_64K as u32
             || !self.0.ringbuf_size.is_power_of_two()
         {
@@ -162,9 +166,10 @@ impl DriverDmaFenceOps for QueueFenceData {
 
 struct PendingSubmitFence {
     /// Per-queue syncobj seqno value at or above which this fence is
-    /// considered complete. Matches the highest seqno claimed by
-    /// `QueueData::claim_seqnos` for the wrapped job; the firmware's
-    /// `SYNC_ADD64` retires after the per-piece `WAIT(all scoreboards)`
+    /// considered complete. Matches the seqno claimed by
+    /// `QueueData::claim_seqno` for the wrapped job. A sync-only entry
+    /// shares the seqno of the command-stream job before it. The firmware's
+    /// `SYNC_ADD64` retires after the wrapper's `WAIT(all scoreboards)`
     /// so the syncobj only reaches this value once every dispatched
     /// async sub-job has landed in memory.
     done_seqno: u64,
@@ -241,9 +246,9 @@ pub(crate) struct CachedBo {
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    /// Per-queue syncobj seqno at which this job is complete. Zero for a
-    /// sync-only job that advances no syncobj. Claimed at commit time, the
-    /// same key the firmware's `SYNC_ADD64` produces for the job.
+    /// Per-queue syncobj seqno at which this job is complete, set at commit
+    /// time. A sync-only job takes the seqno of the last command-stream job
+    /// on its queue, or zero if there is none.
     done_seqno: Atomic<u64>,
     /// Snapshot of `QueueData::suspend_snapshot` taken at submit
     /// time, folded with any in-flight suspend interval; subtracted
@@ -344,14 +349,6 @@ pub(crate) struct QueueData {
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
     pending_submit_fences: Mutex<PendingFences>,
-    /// Submit fence of the most-recently committed command-stream job
-    /// on this queue, in FIFO submit order. A stream-less job emits no
-    /// GPU work of its own, so it adopts this fence as the producer for
-    /// its signal syncobjs: the syncobj only advances once the prior
-    /// command stream's GPU work retires. `None` until the first
-    /// command-stream job is committed.
-    #[pin]
-    last_submit_fence: Mutex<Option<ARef<PublicDmaFence>>>,
     /// Submit fence of the most recently committed job of any kind.
     #[pin]
     last_job_fence: Mutex<Option<ARef<PublicDmaFence>>>,
@@ -411,10 +408,9 @@ impl QueueData {
         Ok(())
     }
 
-    /// Claims `n` consecutive seqnos in a single atomic step and returns
-    /// the highest one claimed.
-    pub(super) fn claim_seqnos(&self, n: usize) -> u64 {
-        self.next_seqno.fetch_add(n as u64, Relaxed) + n as u64
+    /// Claims the next seqno and returns it.
+    pub(super) fn claim_seqno(&self) -> u64 {
+        self.next_seqno.fetch_add(1, Relaxed) + 1
     }
 
     /// Returns the highest seqno claimed so far on this queue.
@@ -426,20 +422,6 @@ impl QueueData {
     pub(super) fn profiling_slot_va(&self, slot: u32) -> Result<u64> {
         let base = self.profiling_slots.kernel_va().ok_or(EINVAL)?.start;
         Ok(base + u64::from(slot) * size_of::<super::job::JobProfilingData>() as u64)
-    }
-
-    /// Records `fence` as the queue's last command-stream submit fence,
-    /// dropping the previously stored one. Called in FIFO submit order
-    /// from `Context::commit` so a later stream-less job adopts the
-    /// fence of the immediately-FIFO-earlier command stream.
-    pub(in crate::sched) fn set_last_submit_fence(&self, fence: ARef<PublicDmaFence>) {
-        *self.last_submit_fence.lock() = Some(fence);
-    }
-
-    /// Returns a clone of the queue's last command-stream submit fence,
-    /// or `None` if no command-stream job has been committed yet.
-    pub(in crate::sched) fn last_submit_fence(&self) -> Option<ARef<PublicDmaFence>> {
-        self.last_submit_fence.lock().clone()
     }
 
     /// Copies `instrs` into the ringbuffer at the current `INSERT`. The
@@ -712,7 +694,7 @@ impl QueueData {
         let head = pending.head;
         let mut position = None;
         for (idx, entry) in pending.vec.iter().enumerate().skip(head) {
-            if entry.done_seqno == done_seqno {
+            if entry.done_seqno == done_seqno && entry.fence.is_some() {
                 position = Some(idx);
                 break;
             }
@@ -774,9 +756,9 @@ impl QueueData {
     /// syncobj, read with `Group::read_syncobj`. The wrapped command
     /// stream emitted by
     /// `Job::build_wrapped_stream`
-    /// ends each piece with `WAIT(all scoreboards) ; SYNC_ADD64(+1)`, so
+    /// ends with `WAIT(all scoreboards) ; SYNC_ADD64(+1)`, so
     /// the firmware advances the syncobj by one only after every async
-    /// sub-job the piece dispatched has retired through the scoreboards.
+    /// sub-job the job dispatched has retired through the scoreboards.
     /// Gating signalling on the syncobj therefore guarantees waiters see
     /// the fence only once the GPU work is actually complete, where
     /// gating on the firmware's `EXTRACT` decode pointer would race the
@@ -974,9 +956,25 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         }
 
+        // Fold any in-flight suspend interval into the baseline so it
+        // matches the shape the timeout stage uses on the consumer
+        // side; subtraction is exact only when both sides fold.
+        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
+        let baseline = match in_flight_since {
+            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
+            None => accumulated,
+        };
+        job.job.set_baseline_suspend(baseline);
+
         if job.job.stream.is_empty() {
-            fence.signal(Ok(()));
-            return Ok(SubmitResult::Submitted);
+            let Some(done_seqno) = job.job.done_seqno() else {
+                fence.signal(Ok(()));
+                return Ok(SubmitResult::Submitted);
+            };
+            return match self.data.push_submit_fence(job.job, done_seqno, fence) {
+                Ok(_) => Ok(SubmitResult::Submitted),
+                Err(fence) => Ok(SubmitResult::NoResources(fence)),
+            };
         }
 
         if let Err(err) = self.data.can_append(job.job.stream.len()) {
@@ -990,16 +988,6 @@ impl QueueOps for TyrQueueOps {
             }
             return Ok(SubmitResult::Submitted);
         }
-
-        // Fold any in-flight suspend interval into the baseline so it
-        // matches the shape the timeout stage uses on the consumer
-        // side; subtraction is exact only when both sides fold.
-        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
-        let baseline = match in_flight_since {
-            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
-            None => accumulated,
-        };
-        job.job.set_baseline_suspend(baseline);
 
         let ringbuf_completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(completion_point) => completion_point,
@@ -1248,7 +1236,6 @@ impl Queue {
                     head: 0,
                     next_profiling_slot: 0,
                 }),
-                last_submit_fence <- new_mutex!(None),
                 last_job_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
                 suspend_state <- new_mutex!(SuspendState {
@@ -1279,10 +1266,6 @@ impl Queue {
         deps: &[ARef<PublicDmaFence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
-        if job.stream.len() > self.data.ringbuf_capacity() {
-            return Err(ENOSPC);
-        }
-
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
