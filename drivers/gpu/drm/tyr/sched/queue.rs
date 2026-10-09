@@ -372,17 +372,24 @@ impl QueueData {
         self.ringbuf.size() - RINGBUF_RESERVED_BYTES
     }
 
-    fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput> {
+    /// The distance from `EXTRACT` to `INSERT` uses only the low 32 bits, so a
+    /// torn read of `EXTRACT` still gives an exact distance.
+    fn ringbuf_space_for(&self, instr_count: usize) -> Result<RingBufferInput, RingBufferError> {
         let ringbuf_input = self.interfaces.read_input()?;
         let capacity = self.ringbuf_capacity() as u64;
         let ringbuf_output = self.interfaces.read_output()?;
-        let used = ringbuf_input
-            .insert
-            .checked_sub(ringbuf_output.extract)
-            .ok_or(EIO)?;
+        let used =
+            u64::from((ringbuf_input.insert as u32).wrapping_sub(ringbuf_output.extract as u32));
 
-        if used > capacity || instr_count as u64 > capacity - used {
-            return Err(ENOSPC);
+        if used > capacity {
+            return Err(RingBufferError::Inconsistent {
+                insert: ringbuf_input.insert,
+                extract: ringbuf_output.extract,
+            });
+        }
+
+        if instr_count as u64 > capacity - used {
+            return Err(RingBufferError::Full);
         }
 
         Ok(ringbuf_input)
@@ -403,7 +410,7 @@ impl QueueData {
             .store(doorbell_id.unwrap_or(UNASSIGNED_DOORBELL_ID), Relaxed);
     }
 
-    pub(super) fn can_append(&self, instr_count: usize) -> Result {
+    pub(super) fn can_append(&self, instr_count: usize) -> Result<(), RingBufferError> {
         self.ringbuf_space_for(instr_count)?;
         Ok(())
     }
@@ -428,7 +435,7 @@ impl QueueData {
     /// returned completion point is the `INSERT` value
     /// `Self::commit_ringbuf_range` will publish once the caller has
     /// registered the matching pending submit fence.
-    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64> {
+    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64, RingBufferError> {
         let ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let ringbuf_sz = self.ringbuf.size() as u64;
 
@@ -926,6 +933,50 @@ pub(super) struct TyrQueueOps {
     data: Arc<QueueData>,
 }
 
+impl TyrQueueOps {
+    /// Cancels a job of a group that can no longer run.
+    fn cancel_job(
+        &self,
+        job: &QueueJob,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+    ) -> SubmitResult<QueueFenceData> {
+        TyrDrmDeviceData::schedule_tick(&job.group.tdev);
+        match self.data.signal_unpushed_fence(fence, ECANCELED) {
+            Ok(()) => SubmitResult::Submitted,
+            Err(fence) => SubmitResult::NoResources(fence),
+        }
+    }
+
+    /// Fails the queue of `job` after a ring claim error.
+    fn fail_queue(
+        &self,
+        job: &QueueJob,
+        fence: DriverDmaFence<QueueFenceData, Published>,
+        err: RingBufferError,
+    ) -> SubmitResult<QueueFenceData> {
+        let group = &job.group;
+        group.with_locked_inner(|inner| inner.set_queue_fatal(job.queue_index));
+        group.detach_and_terminate();
+        match err {
+            RingBufferError::Inconsistent { insert, extract } => pr_warn!(
+                "queue {} has inconsistent ring pointers: insert={:#x}, extract={:#x}, pid={}, comm={}\n",
+                job.queue_index.get(),
+                insert,
+                extract,
+                group.task_pid(),
+                group.task_comm()
+            ),
+            RingBufferError::Full | RingBufferError::Other => pr_warn!(
+                "queue {} ring claim failed: pid={}, comm={}\n",
+                job.queue_index.get(),
+                group.task_pid(),
+                group.task_comm()
+            ),
+        }
+        self.cancel_job(job, fence)
+    }
+}
+
 impl QueueOps for TyrQueueOps {
     type Job = QueueJob;
     type FenceData = QueueFenceData;
@@ -949,11 +1000,7 @@ impl QueueOps for TyrQueueOps {
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self::FenceData>> {
         if !job.job.group.can_run() {
-            TyrDrmDeviceData::schedule_tick(&job.job.group.tdev);
-            if let Err(fence) = self.data.signal_unpushed_fence(fence, ECANCELED) {
-                return Ok(SubmitResult::NoResources(fence));
-            }
-            return Ok(SubmitResult::Submitted);
+            return Ok(self.cancel_job(job.job, fence));
         }
 
         // Fold any in-flight suspend interval into the baseline so it
@@ -978,26 +1025,15 @@ impl QueueOps for TyrQueueOps {
         }
 
         if let Err(err) = self.data.can_append(job.job.stream.len()) {
-            if err == ENOSPC {
+            if matches!(err, RingBufferError::Full) {
                 return Ok(SubmitResult::NoResources(fence));
             }
-
-            pr_warn_once!("queue ring space check failed: {}\n", err.to_errno());
-            if let Err(fence) = self.data.signal_unpushed_fence(fence, err) {
-                return Ok(SubmitResult::NoResources(fence));
-            }
-            return Ok(SubmitResult::Submitted);
+            return Ok(self.fail_queue(job.job, fence, err));
         }
 
         let ringbuf_completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
             Ok(completion_point) => completion_point,
-            Err(err) => {
-                pr_warn_once!("queue ring claim failed: {}\n", err.to_errno());
-                if let Err(fence) = self.data.signal_unpushed_fence(fence, err) {
-                    return Ok(SubmitResult::NoResources(fence));
-                }
-                return Ok(SubmitResult::Submitted);
-            }
+            Err(err) => return Ok(self.fail_queue(job.job, fence, err)),
         };
 
         let Some(done_seqno) = job.job.done_seqno() else {
@@ -1346,6 +1382,22 @@ pub(super) struct RingBufferInput {
 pub(super) struct RingBufferOutput {
     extract: u64,
     active: u32,
+}
+
+/// Failure to claim ring buffer space for a job.
+pub(super) enum RingBufferError {
+    /// The ring has no room for the job yet.
+    Full,
+    /// `EXTRACT` is past `INSERT` or more than the ring capacity behind it.
+    Inconsistent { insert: u64, extract: u64 },
+    /// Any other failure.
+    Other,
+}
+
+impl From<Error> for RingBufferError {
+    fn from(_: Error) -> Self {
+        Self::Other
+    }
 }
 
 pub(crate) struct Interfaces {
