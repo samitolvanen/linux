@@ -714,31 +714,34 @@ impl QueueOps for TyrQueueOps {
         let device_active = awake.is_some();
         let queue_index = job.job.queue_index;
         let resident = group.tdev.with_locked_scheduler(|sched| {
-            let (active, kick_err, resume_tick) = group.with_locked_inner(|inner| {
+            let (active, kick_err, blocked, resume_tick) = group.with_locked_inner(|inner| {
                 if inner.csg_id.is_none() || inner.state != State::Active {
-                    return (false, Ok(()), false);
+                    return (false, Ok(()), false, false);
                 }
                 let group_idle = inner.is_idle();
                 let blocked = inner.blocked_queues() & queue_index.bit() != 0;
                 let queue_idle = inner.set_queue_idle(queue_index, false);
+                let resume_tick = group_idle && queue_idle && !blocked;
                 if awake.is_none() {
-                    return (true, Ok(()), group_idle && queue_idle && !blocked);
+                    return (true, Ok(()), blocked, resume_tick);
                 }
                 let kick_res = self.data.kick();
-                (true, kick_res, group_idle && queue_idle && !blocked)
+                (true, kick_res, blocked, resume_tick)
             });
             if !active {
                 return Ok(None);
             }
             kick_err?;
-            // This path does not always schedule a tick, so record the busy
-            // edge here.
-            group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
             if device_active {
                 self.data.resume_timeout();
             }
-            if sched.pm_ref.is_none() {
-                sched.pm_ref = group.tdev.sched_pm_get();
+            if !blocked {
+                // This path does not always schedule a tick, so record the busy
+                // edge here.
+                group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
+                if sched.pm_ref.is_none() {
+                    sched.pm_ref = group.tdev.sched_pm_get();
+                }
             }
             let tick = if resume_tick {
                 sched.resident_submit_tick()
