@@ -1027,9 +1027,7 @@ impl Group {
 struct PreparedSubmit {
     queue_index: usize,
     queue_job: PreparedQueueJob,
-    /// Number of command-stream pieces the job carries, and the number
-    /// of seqnos the commit claims for it. Zero for a sync-only job.
-    piece_count: usize,
+    has_stream: bool,
 }
 
 /// Runs the jobs of a group submit through `deps::Context`.
@@ -1096,7 +1094,7 @@ impl deps::BatchOps for SubmitOps {
         Ok(PreparedSubmit {
             queue_index: queue_index.get(),
             queue_job: prepared,
-            piece_count: job.piece_count(),
+            has_stream,
         })
     }
 
@@ -1104,38 +1102,24 @@ impl deps::BatchOps for SubmitOps {
         prepared.queue_job.add_dep(fence)
     }
 
-    /// Returns the job's own submit fence for a command-stream job, or
-    /// the adopted prior command-stream fence for a stream-less job.
     fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<PublicDmaFence>> {
         let PreparedSubmit {
             queue_index,
             queue_job,
-            piece_count,
+            has_stream,
         } = prepared;
-        let has_stream = piece_count != 0;
 
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+        let job = queue_job.job().ok_or(EINVAL)?;
 
-        // The wrapped stream emits exactly one `SYNC_ADD64(+1)` per piece,
-        // so the syncobj reaches the highest claimed seqno precisely when
-        // every piece has retired.
-        if has_stream {
-            let job = queue_job.job().ok_or(EINVAL)?;
-            job.set_done_seqno(queue.claim_seqnos(piece_count));
-        }
-
-        let submit_fence = queue.commit_job(queue_job);
-
-        let signal_fence = if has_stream {
-            queue.set_last_submit_fence(submit_fence.clone());
-            submit_fence.clone()
+        let done_seqno = if has_stream {
+            queue.claim_seqno()
         } else {
-            queue
-                .last_submit_fence()
-                .unwrap_or_else(|| submit_fence.clone())
+            queue.next_seqno()
         };
+        job.set_done_seqno(done_seqno);
 
-        Ok(signal_fence)
+        Ok(queue.commit_job(queue_job))
     }
 }
 
