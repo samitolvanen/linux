@@ -163,7 +163,8 @@ pub(crate) struct GroupInner {
     blocked_queues: u32,
     idle_queues: u32,
     fatal_queues: u32,
-    pub(crate) fatal_error: Option<Error>,
+    /// Set once the group is permanently unrunnable.
+    pub(crate) fatal: bool,
     /// Set when a queue job or the CSG progress timer times out, or when the
     /// group's CSG fails to halt for a reset or power-down.
     pub(crate) timedout: bool,
@@ -183,16 +184,14 @@ impl GroupInner {
     pub(crate) fn can_run(&self) -> bool {
         self.state != State::Terminated
             && self.state != State::Unknown
-            && self.fatal_error.is_none()
+            && !self.fatal
             && !self.timedout
     }
 
     /// Records that a timeout forced the group off the GPU.
     pub(crate) fn mark_timedout(&mut self) {
         self.timedout = true;
-        if self.fatal_error.is_none() {
-            self.fatal_error = Some(ETIMEDOUT);
-        }
+        self.fatal = true;
     }
 
     /// Records a timeout eviction, marking the group innocent if it could still run.
@@ -249,7 +248,7 @@ impl GroupInner {
     pub(crate) fn set_queue_fatal(&mut self, queue_idx: QueueIdx) {
         if (self.fatal_queues & queue_idx.bit()) == 0 {
             self.fatal_queues |= queue_idx.bit();
-            self.fatal_error = Some(EFAULT);
+            self.fatal = true;
         }
     }
 
@@ -492,7 +491,7 @@ impl Group {
                     blocked_queues: 0,
                     idle_queues: QueueIdx::mask_below(queue_count),
                     fatal_queues: 0,
-                    fatal_error: None,
+                    fatal: false,
                     timedout: false,
                     innocent: false,
                     queue_count,
@@ -1210,7 +1209,7 @@ impl Pool {
         let group = self.0.remove(index)?;
 
         group.with_locked_inner(|inner| {
-            inner.fatal_error = Some(ECANCELED);
+            inner.fatal = true;
         });
 
         group.detach_and_terminate();
