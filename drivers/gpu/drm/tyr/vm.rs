@@ -61,7 +61,6 @@ use kernel::{
     iommu::pgtable::prot,
     new_mutex,
     platform,
-    pr_warn_once,
     prelude::*,
     ptr::{
         Alignable,
@@ -86,7 +85,13 @@ use kernel::{
         MutexGuard, //
     },
     types::ScopeGuard,
-    uapi, //
+    uapi,
+    workqueue::{
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
+    }, //
 };
 
 use crate::{
@@ -491,14 +496,7 @@ impl QueueOps for VmBindQueueOps {
             }
         }
 
-        let exec = self.exec.clone();
-        let queued = cleanup::try_spawn_owned(exec, |exec| exec.flush_deferred_cleanup());
-
-        if queued.is_err() {
-            pr_warn_once!(
-                "VM_BIND cleanup enqueue failed, so deferred vm_bos wait for the next flush\n",
-            );
-        }
+        let _ = cleanup::enqueue(self.exec.clone());
 
         Ok(SubmitResult::Submitted)
     }
@@ -910,6 +908,22 @@ pub(crate) struct VmExec {
     /// device alive until they are released. `None` for the firmware VM,
     /// which the device owns.
     handoff: Option<cleanup::Handoff<GpuVmRelease, ARef<TyrDrmDevice>>>,
+    /// Flushes the deferred `vm_bo` list on the cleanup workqueue after an
+    /// async bind.
+    #[pin]
+    cleanup_work: Work<VmExec>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for VmExec { self.cleanup_work }
+}
+
+impl WorkItem for VmExec {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        this.flush_deferred_cleanup();
+    }
 }
 
 /// References that `VmExec::drop` hands to `release_gpuvm`.
@@ -1099,6 +1113,7 @@ impl Vm {
                 fw,
                 va_range: total_range,
                 handoff,
+                cleanup_work <- new_work!("tyr-vm-cleanup"),
             }),
             GFP_KERNEL,
         )?;
