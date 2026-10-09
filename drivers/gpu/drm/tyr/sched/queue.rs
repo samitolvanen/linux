@@ -74,7 +74,8 @@ use super::{
         QueueIdx,
         State, //
     },
-    job::JobProfilingData, //
+    job::JobProfilingData,
+    SubmitTick, //
 };
 
 const UNASSIGNED_DOORBELL_ID: usize = usize::MAX;
@@ -1048,51 +1049,53 @@ impl QueueOps for TyrQueueOps {
         let awake = group.tdev.pm_get_if_active();
         let device_active = awake.is_some();
         let queue_index = job.job.queue_index;
-        let (active, kick_err, resume_tick) = group.with_locked_inner(|inner| {
-            if inner.csg_id.is_none() || inner.state != State::Active {
-                return (false, Ok(()), false);
+        let resident = group.tdev.with_locked_scheduler(|sched| {
+            let (active, kick_err, resume_tick) = group.with_locked_inner(|inner| {
+                if inner.csg_id.is_none() || inner.state != State::Active {
+                    return (false, Ok(()), false);
+                }
+                let group_idle = inner.is_idle();
+                let blocked = inner.blocked_queues() & queue_index.bit() != 0;
+                let queue_idle = inner.set_queue_idle(queue_index, false);
+                if awake.is_none() {
+                    return (true, Ok(()), group_idle && queue_idle && !blocked);
+                }
+                let kick_res = self.data.kick();
+                (true, kick_res, group_idle && queue_idle && !blocked)
+            });
+            if !active {
+                return Ok(None);
             }
-            let group_idle = inner.is_idle();
-            let blocked = inner.blocked_queues() & queue_index.bit() != 0;
-            let queue_idle = inner.set_queue_idle(queue_index, false);
-            if awake.is_none() {
-                return (true, Ok(()), group_idle && queue_idle && !blocked);
+            kick_err?;
+            // This path does not always schedule a tick, so record the busy
+            // edge here.
+            group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
+            if device_active {
+                self.data.resume_timeout();
             }
-            let kick_res = self.data.kick();
-            (true, kick_res, group_idle && queue_idle && !blocked)
+            if sched.pm_ref.is_none() {
+                sched.pm_ref = group.tdev.sched_pm_get();
+            }
+            let tick = if resume_tick {
+                sched.resident_submit_tick()
+            } else {
+                SubmitTick::None
+            };
+            Ok(Some(tick))
         });
         drop(awake);
 
-        if active {
-            if let Err(err) = kick_err {
+        let resident = match resident {
+            Ok(resident) => resident,
+            Err(err) => {
                 pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
                 self.data.fail_submit_fence(done_seqno, err);
                 return Ok(SubmitResult::Submitted);
             }
-            // This path does not always schedule a tick, so record the busy
-            // edge here.
-            group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
-            let _ = group.tdev.with_locked_scheduler(|sched| {
-                // Close the interval only if the group is still bound. A
-                // rotation tick may have evicted it since the kick saw it
-                // resident.
-                if device_active && group.with_locked_inner(|inner| inner.csg_id.is_some()) {
-                    self.data.resume_timeout();
-                }
-                if sched.pm_ref.is_none() {
-                    sched.pm_ref = group.tdev.sched_pm_get();
-                }
-                Ok(())
-            });
+        };
 
-            if resume_tick {
-                if let Ok(tick) = group
-                    .tdev
-                    .with_locked_scheduler(|sched| Ok(sched.resident_submit_tick()))
-                {
-                    tick.dispatch(&group.tdev);
-                }
-            }
+        if let Some(tick) = resident {
+            tick.dispatch(&group.tdev);
         } else {
             // A concurrent eviction requeues by live ring state, so the
             // bytes committed above are still kicked.
