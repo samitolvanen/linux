@@ -67,7 +67,6 @@ use kernel::{
     iommu::pgtable::prot,
     new_mutex,
     platform,
-    pr_warn_once,
     prelude::*,
     ptr::{
         Alignable,
@@ -92,7 +91,13 @@ use kernel::{
         MutexGuard, //
     },
     types::ScopeGuard,
-    uapi, //
+    uapi,
+    workqueue::{
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
+    }, //
 };
 
 use crate::{
@@ -483,14 +488,8 @@ impl QueueOps for VmBindQueueOps {
             }
         }
 
-        let exec = self.exec.clone();
-        let queued = cleanup::try_spawn_owned(exec, |exec| exec.flush_deferred_cleanup());
-
-        if queued.is_err() {
-            pr_warn_once!(
-                "VM_BIND cleanup workqueue enqueue failed, so deferred vm_bos wait for the next flush\n",
-            );
-        }
+        // A pending flush also covers the vm_bos this job deferred.
+        let _ = cleanup::enqueue(self.exec.clone());
 
         Ok(SubmitResult::Submitted)
     }
@@ -905,6 +904,21 @@ pub(crate) struct VmExec {
     /// Passes the gpuvm references to the cleanup workqueue. `Some` for the
     /// entire lifetime of the value, taken by `Drop`.
     handoff: Option<cleanup::Handoff<GpuVmRelease>>,
+    /// Flushes the deferred `vm_bo` list on the cleanup workqueue.
+    #[pin]
+    cleanup_work: Work<VmExec>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for VmExec { self.cleanup_work }
+}
+
+impl WorkItem for VmExec {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        this.flush_deferred_cleanup();
+    }
 }
 
 /// References that `VmExec::drop` passes to `release_gpuvm`.
@@ -1067,6 +1081,7 @@ impl Vm {
                 fw,
                 va_range: total_range,
                 handoff: Some(handoff),
+                cleanup_work <- new_work!("tyr-vm-cleanup"),
             }),
             GFP_KERNEL,
         )?;

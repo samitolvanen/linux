@@ -325,9 +325,7 @@ pub(crate) struct Group {
     /// The drain waits on fences, which is not allowed inside the
     /// signalling annotation.
     ///
-    /// The item is embedded in the group, so the enqueue allocates
-    /// nothing and has no `NoMemory` case to handle, unlike
-    /// `cleanup::try_spawn_owned`.
+    /// The item is embedded in the group, so the enqueue allocates nothing.
     #[pin]
     release_work: Work<Group, { work_id::RELEASE }>,
     /// Worker that services this group's pending tiler OOMs on the
