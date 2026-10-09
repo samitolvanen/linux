@@ -23,6 +23,7 @@ use crate::{
         TyrDrmDeviceData, //
     },
     fw::{
+        global::CsgInterface,
         CsDbMask,
         CsFatalExceptionType,
         CsFaultExceptionType,
@@ -67,6 +68,78 @@ enum GrowOutcome {
     /// The grow failed for an unexpected reason; the queue is marked fatal
     /// and the firmware write is skipped.
     Fatal,
+}
+
+/// CS events of one CSG IRQ, as masks of CS indices.
+#[derive(Default)]
+struct CsIrqEvents {
+    tiler_oom_mask: u32,
+    cs_fatal_mask: u32,
+    /// Whether a fatal event was unrecoverable.
+    cs_unrecoverable: bool,
+    cs_inherit_fault_mask: u32,
+}
+
+impl CsIrqEvents {
+    /// Records the fatal, fault and tiler OOM events of CS `cs_id`, and
+    /// acknowledges the fatal and fault events.
+    fn process_cs_irq(
+        &mut self,
+        csg: &mut CsgInterface,
+        csg_id: usize,
+        cs_id: u32,
+        group: Option<&Group>,
+    ) -> Result {
+        let Some(cs) = csg.cs_mut(cs_id as usize) else {
+            return Ok(());
+        };
+        let input_req = cs.read_input_req()?;
+        let output_ack = cs.read_output_ack()?;
+
+        if input_req.tiler_oom() != output_ack.tiler_oom() {
+            self.tiler_oom_mask |= 1u32 << cs_id;
+        }
+
+        let fatal_event = input_req.fatal() != output_ack.fatal();
+        let fault_event = input_req.fault() != output_ack.fault();
+
+        if fatal_event {
+            if let Some(group) = group {
+                pr_warn!(
+                    "CS_FATAL: pid={}, comm={}\n",
+                    group.task_pid(),
+                    group.task_comm()
+                );
+            }
+            let exception_type = cs.decode_fatal(csg_id, cs_id)?;
+            if exception_type == CsFatalExceptionType::CsUnrecoverable as u32 {
+                self.cs_unrecoverable = true;
+            }
+            self.cs_fatal_mask |= 1u32 << cs_id;
+        }
+
+        if fault_event {
+            if let Some(group) = group {
+                pr_warn!(
+                    "CS_FAULT: pid={}, comm={}\n",
+                    group.task_pid(),
+                    group.task_comm()
+                );
+            }
+            if cs.decode_fault(csg_id, cs_id)? == CsFaultExceptionType::CsInheritFault as u32 {
+                self.cs_inherit_fault_mask |= 1u32 << cs_id;
+            }
+        }
+
+        if fatal_event || fault_event {
+            let new_req = input_req
+                .with_fatal(output_ack.fatal())
+                .with_fault(output_ack.fault());
+            cs.write_input_req(new_req);
+        }
+
+        Ok(())
+    }
 }
 
 fn slot_holds(slot_manager: &CsgSlotManager, csg_id: usize, group: &Arc<Group>) -> bool {
@@ -238,10 +311,7 @@ impl Scheduler {
             TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
-        let mut tiler_oom_mask: u32 = 0;
-        let mut cs_fatal_mask: u32 = 0;
-        let mut cs_unrecoverable = false;
-        let mut cs_inherit_fault_mask: u32 = 0;
+        let mut events = CsIrqEvents::default();
         tdev.fw.with_csg_mut(csg_id, |csg| {
             let mut cs_irqs = pending_cs_irqs;
 
@@ -249,60 +319,24 @@ impl Scheduler {
                 let cs_id = cs_irqs.trailing_zeros();
                 cs_irqs &= !(1u32 << cs_id);
 
-                let cs = match csg.cs_mut(cs_id as usize) {
-                    Some(cs) => cs,
-                    None => continue,
-                };
-                let input_req = cs.read_input_req()?;
-                let output_ack = cs.read_output_ack()?;
-
-                if input_req.tiler_oom() != output_ack.tiler_oom() {
-                    tiler_oom_mask |= 1u32 << cs_id;
-                }
-
-                let fatal_event = input_req.fatal() != output_ack.fatal();
-                let fault_event = input_req.fault() != output_ack.fault();
-
-                if fatal_event {
-                    if let Some(group) = &group {
-                        pr_warn!(
-                            "CS_FATAL: pid={}, comm={}\n",
-                            group.task_pid(),
-                            group.task_comm()
-                        );
-                    }
-                    let exception_type = cs.decode_fatal(csg_id, cs_id)?;
-                    if exception_type == CsFatalExceptionType::CsUnrecoverable as u32 {
-                        cs_unrecoverable = true;
-                    }
-                    cs_fatal_mask |= 1u32 << cs_id;
-                }
-
-                if fault_event {
-                    if let Some(group) = &group {
-                        pr_warn!(
-                            "CS_FAULT: pid={}, comm={}\n",
-                            group.task_pid(),
-                            group.task_comm()
-                        );
-                    }
-                    if cs.decode_fault(csg_id, cs_id)?
-                        == CsFaultExceptionType::CsInheritFault as u32
-                    {
-                        cs_inherit_fault_mask |= 1u32 << cs_id;
-                    }
-                }
-
-                if fatal_event || fault_event {
-                    let new_req = input_req
-                        .with_fatal(output_ack.fatal())
-                        .with_fault(output_ack.fault());
-                    cs.write_input_req(new_req);
+                if let Err(e) = events.process_cs_irq(csg, csg_id, cs_id, group.as_deref()) {
+                    pr_err!(
+                        "Failed to process the CSG slot {} CS {} IRQ: {:?}\n",
+                        csg_id,
+                        cs_id,
+                        e
+                    );
                 }
             }
 
             Ok(())
         })?;
+        let CsIrqEvents {
+            mut tiler_oom_mask,
+            mut cs_fatal_mask,
+            cs_unrecoverable,
+            cs_inherit_fault_mask,
+        } = events;
 
         if let Some(group) = &group {
             let queue_mask = group.queue_mask();
@@ -340,8 +374,15 @@ impl Scheduler {
                 let cs_id = mask.trailing_zeros() as usize;
                 mask &= !(1u32 << cs_id);
                 if let Some(queue) = group.queues.get(cs_id) {
-                    let syncobj_seqno = group.read_syncobj(cs_id)?.seqno;
-                    queue.fail_inflight_submit_fences(syncobj_seqno, EINVAL);
+                    match group.read_syncobj(cs_id) {
+                        Ok(syncobj) => queue.fail_inflight_submit_fences(syncobj.seqno, EINVAL),
+                        Err(e) => pr_err!(
+                            "Failed to read the CSG slot {} CS {} syncobj: {:?}\n",
+                            csg_id,
+                            cs_id,
+                            e
+                        ),
+                    }
                 }
             }
         }
