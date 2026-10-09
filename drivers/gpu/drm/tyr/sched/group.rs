@@ -327,8 +327,7 @@ pub(crate) struct Group {
     /// signalling annotation.
     ///
     /// The item is embedded in the group, so the enqueue allocates
-    /// nothing and has no `NoMemory` case to handle, unlike
-    /// `cleanup::try_spawn_owned`.
+    /// nothing.
     #[pin]
     release_work: Work<Group, 3>,
     #[pin]
