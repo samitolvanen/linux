@@ -29,9 +29,15 @@ use crate::{
     }, //
 };
 
-use super::deps::{
-    self,
-    SyncOp, //
+use super::{
+    deps::{
+        self,
+        SyncOp, //
+    },
+    queue::{
+        MIN_RINGBUF_SIZE,
+        RINGBUF_RESERVED_BYTES, //
+    }, //
 };
 
 /// Encoder for Mali CSF command-stream instructions. Opcodes match the
@@ -245,25 +251,20 @@ pub(crate) fn append_queue_submits(
 
 pub(crate) struct Job {
     queue_index: usize,
-    /// Per-`QueueSubmit` stream descriptors. Empty pieces (sync-only
-    /// submits) are dropped at merge time, so every entry here
-    /// corresponds to one wrapper the prepare path emits.
-    pieces: KVec<StreamPiece>,
+    /// `None` for a sync-only submit.
+    stream: Option<StreamPiece>,
 }
 
 impl Job {
-    fn new(queue_index: usize, pieces: KVec<StreamPiece>) -> Self {
+    fn new(queue_index: usize, stream: Option<StreamPiece>) -> Self {
         Self {
             queue_index,
-            pieces,
+            stream,
         }
     }
 
-    /// Merges `queue_submits` into one `Job` per queue index, paired
-    /// with the flattened sync-op stream for that queue. The
-    /// per-(queue, batch) merge invariant lets the rest of the submit
-    /// path assume there is exactly one pending submit fence and one
-    /// wrapped-stream allocation per Job.
+    /// Turns each queue submit that carries a stream or sync ops into one
+    /// `Job`, in submission order, paired with its sync ops.
     pub(crate) fn from_queue_submits(
         queue_submits: KVec<QueueSubmit>,
     ) -> Result<KVec<(Self, KVec<SyncOp>)>> {
@@ -272,42 +273,13 @@ impl Job {
         for queue_submit in queue_submits.into_iter() {
             let queue_index = queue_submit.queue_index();
             let (piece, syncs) = queue_submit.into_parts();
-            let has_stream = piece.stream_size != 0;
-            let mut syncs = Some(syncs);
+            let stream = (piece.stream_size != 0).then_some(piece);
 
-            if !has_stream && syncs.as_ref().is_some_and(KVec::is_empty) {
+            if stream.is_none() && syncs.is_empty() {
                 continue;
             }
 
-            let mut merged = false;
-            for (job, job_syncs) in jobs.iter_mut() {
-                if job.queue_index == queue_index {
-                    if has_stream {
-                        job.pieces.push(piece, GFP_KERNEL)?;
-                    }
-                    let Some(syncs) = syncs.take() else {
-                        return Err(EINVAL);
-                    };
-                    for sync in syncs.into_iter() {
-                        job_syncs.push(sync, GFP_KERNEL)?;
-                    }
-                    merged = true;
-                    break;
-                }
-            }
-
-            if merged {
-                continue;
-            }
-
-            let mut pieces = KVec::new();
-            if has_stream {
-                pieces.push(piece, GFP_KERNEL)?;
-            }
-            jobs.push(
-                (Self::new(queue_index, pieces), syncs.take().ok_or(EINVAL)?),
-                GFP_KERNEL,
-            )?;
+            jobs.push((Self::new(queue_index, stream), syncs), GFP_KERNEL)?;
         }
 
         Ok(jobs)
@@ -317,28 +289,27 @@ impl Job {
         self.queue_index
     }
 
-    pub(crate) fn piece_count(&self) -> usize {
-        self.pieces.len()
-    }
-
     pub(crate) fn has_stream(&self) -> bool {
-        !self.pieces.is_empty()
+        self.stream.is_some()
     }
 
     /// Builds the wrapped command-stream buffer for this Job.
     ///
-    /// Each piece in `self.pieces` becomes one wrapper sequence in the
-    /// returned KVec, in submit order. A wrapper consists of a
-    /// LATEST_FLUSH-conditional cache flush, a `CALL` into the
-    /// userspace stream at `piece.stream_addr`, and a
+    /// The wrapper consists of a LATEST_FLUSH-conditional cache flush, a
+    /// `CALL` into the userspace stream at `stream_addr`, and a
     /// `SYNC_ADD64` / `ERROR_BARRIER` epilogue that bumps the per-queue
-    /// syncobj at `sync_va` by one. The concatenation is padded to a
-    /// 64-byte boundary so the firmware prefetcher sees cacheline-
-    /// aligned trailing storage.
+    /// syncobj at `sync_va` by one. It is padded to a 64-byte boundary so
+    /// the firmware prefetcher sees cacheline-aligned trailing storage.
     pub(crate) fn build_wrapped_stream(&self, csif: &CsifInfo, sync_va: u64) -> Result<KVec<u8>> {
         const INSTR_BYTES: usize = 8;
         const INSTRS_PER_WRAPPER: usize = 11;
         const WRAPPER_BYTES: usize = INSTR_BYTES * INSTRS_PER_WRAPPER;
+
+        static_assert!(
+            WRAPPER_BYTES.next_multiple_of(64) <= MIN_RINGBUF_SIZE - RINGBUF_RESERVED_BYTES
+        );
+
+        let piece = self.stream.as_ref().ok_or(EINVAL)?;
 
         // `cs_reg_count` is the total CS register count for this chip.
         // The firmware reserves the top `UNPRESERVED_CS_REG_COUNT` of
@@ -352,30 +323,23 @@ impl Job {
         let top_sb = csif.scoreboard_slot_count.checked_sub(1).ok_or(EINVAL)?;
         let wait_all_mask = genmask_checked_u64(0..=top_sb).ok_or(EINVAL)?;
 
-        let total = self
-            .pieces
-            .len()
-            .checked_mul(WRAPPER_BYTES)
-            .ok_or(EOVERFLOW)?;
-        let padded = total.next_multiple_of(64);
+        let padded = WRAPPER_BYTES.next_multiple_of(64);
         let mut buf = KVec::<u8>::with_capacity(padded, GFP_KERNEL)?;
 
-        for piece in self.pieces.iter() {
-            for word in [
-                Instr::mov32(val_reg, piece.latest_flush.into()),
-                Instr::flush_cache2(val_reg),
-                Instr::mov48(addr_reg, piece.stream_addr),
-                Instr::mov32(val_reg, piece.stream_size.into()),
-                Instr::wait(1),
-                Instr::call(addr_reg, val_reg),
-                Instr::mov48(addr_reg, sync_va),
-                Instr::mov48(val_reg, 1),
-                Instr::wait(wait_all_mask),
-                Instr::sync_add64(addr_reg, val_reg),
-                Instr::error_barrier(),
-            ] {
-                buf.extend_from_slice(&word.to_le_bytes(), GFP_KERNEL)?;
-            }
+        for word in [
+            Instr::mov32(val_reg, piece.latest_flush.into()),
+            Instr::flush_cache2(val_reg),
+            Instr::mov48(addr_reg, piece.stream_addr),
+            Instr::mov32(val_reg, piece.stream_size.into()),
+            Instr::wait(1),
+            Instr::call(addr_reg, val_reg),
+            Instr::mov48(addr_reg, sync_va),
+            Instr::mov48(val_reg, 1),
+            Instr::wait(wait_all_mask),
+            Instr::sync_add64(addr_reg, val_reg),
+            Instr::error_barrier(),
+        ] {
+            buf.extend_from_slice(&word.to_le_bytes(), GFP_KERNEL)?;
         }
 
         // Pad to a 64-byte boundary so the trailing instruction sits

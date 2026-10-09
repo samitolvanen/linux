@@ -933,9 +933,7 @@ impl Group {
 struct PreparedSubmit {
     queue_index: usize,
     queue_job: PreparedQueueJob,
-    /// Number of command-stream pieces the job carries, and the number
-    /// of seqnos the commit claims for it. Zero for a sync-only job.
-    piece_count: usize,
+    has_stream: bool,
 }
 
 /// Runs the jobs of a group submit through `deps::Context`.
@@ -974,18 +972,16 @@ impl deps::BatchOps for SubmitOps {
             KVec::new()
         };
 
-        // The extra slot holds the prior-work dependency that
-        // `SubmitOps::commit` adds.
         let prepared = queue.prepare_job(
             QueueJob::new(wrapped, self.group.clone(), queue_index),
             deps,
-            extra_dep_capacity + usize::from(!has_stream),
+            extra_dep_capacity,
         )?;
 
         Ok(PreparedSubmit {
             queue_index: queue_index.get(),
             queue_job: prepared,
-            piece_count: job.piece_count(),
+            has_stream,
         })
     }
 
@@ -996,32 +992,21 @@ impl deps::BatchOps for SubmitOps {
     fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<PublicDmaFence>> {
         let PreparedSubmit {
             queue_index,
-            mut queue_job,
-            piece_count,
+            queue_job,
+            has_stream,
         } = prepared;
-        let has_stream = piece_count != 0;
 
         let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
+        let job = queue_job.job().ok_or(EINVAL)?;
 
-        // The wrapped stream emits exactly one `SYNC_ADD64(+1)` per piece,
-        // so the syncobj reaches the highest claimed seqno precisely when
-        // every piece has retired. A stream-less job emits no GPU work, so
-        // it waits on the queue's last command stream instead of signalling
-        // as soon as its dependencies resolve.
-        if has_stream {
-            let job = queue_job.job().ok_or(EINVAL)?;
-            job.set_done_seqno(queue.claim_seqnos(piece_count));
-        } else if let Some(fence) = queue.last_submit_fence() {
-            queue_job.add_dep(fence)?;
-        }
+        let done_seqno = if has_stream {
+            queue.claim_seqno()
+        } else {
+            queue.next_seqno()
+        };
+        job.set_done_seqno(done_seqno);
 
-        let submit_fence = queue.commit_job(queue_job);
-
-        if has_stream {
-            queue.set_last_submit_fence(submit_fence.clone());
-        }
-
-        Ok(submit_fence)
+        Ok(queue.commit_job(queue_job))
     }
 }
 

@@ -440,7 +440,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
     ///
     /// A batch commits in prepare order, and the caller holds the lock
     /// that serializes the whole prepare-to-commit window, so a queue
-    /// claims its seqno ranges in the order its pipeline runs the jobs.
+    /// claims its seqnos in the order its pipeline runs the jobs.
     pub(crate) fn commit(&mut self, job_idx: usize) -> Result<ARef<PublicDmaFence>> {
         let state = self.jobs.get_mut(job_idx).ok_or(EINVAL)?.state.take();
         let (mut prepared, intra_batch_deps) = match state {
