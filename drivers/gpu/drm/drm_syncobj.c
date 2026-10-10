@@ -742,8 +742,18 @@ static int drm_syncobj_import_sync_file_fence(struct drm_file *file_private,
 	}
 
 	if (point) {
-		struct dma_fence_chain *chain = dma_fence_chain_alloc();
+		struct dma_fence_chain *chain;
+		struct dma_fence *tmp;
 
+		tmp = dma_fence_unwrap_merge(fence);
+		dma_fence_put(fence);
+		fence = tmp;
+		if (!fence) {
+			drm_syncobj_put(syncobj);
+			return -ENOMEM;
+		}
+
+		chain = dma_fence_chain_alloc();
 		if (!chain) {
 			ret = -ENOMEM;
 			goto out;
