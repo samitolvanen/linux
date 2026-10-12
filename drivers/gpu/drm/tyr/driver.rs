@@ -642,7 +642,7 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
             let (tick, poll) = this
                 .with_locked_scheduler(|sched| {
-                    let tick = sched.apply_syncwait_results(&results);
+                    let tick = sched.apply_syncwait_results(&this, &results);
                     Ok((tick, sched.needs_syncwait_poll()))
                 })
                 .unwrap_or((SubmitTick::None, false));

@@ -1414,6 +1414,8 @@ impl Scheduler {
     ///
     /// An unbound group becomes runnable once any of its queues is
     /// unblocked, and a group leaves the wait list once none is blocked.
+    /// Unblocking a queue of a resident group marks devfreq busy and takes
+    /// the scheduler runtime-PM reference.
     /// Results are re-validated against the live wait list, so a group
     /// that another path removed between the snapshot and the apply is
     /// skipped.
@@ -1422,10 +1424,17 @@ impl Scheduler {
     /// mutex.
     ///
     /// Returns an immediate tick for a promoted real-time group and a
-    /// periodic one for any other promotion.
-    pub(crate) fn apply_syncwait_results(&mut self, results: &KVec<SyncwaitResult>) -> SubmitTick {
+    /// periodic one for any other promotion. Without a promotion, an
+    /// unblocked queue on an idle resident group restarts a stopped tick.
+    pub(crate) fn apply_syncwait_results(
+        &mut self,
+        tdev: &TyrDrmDevice,
+        results: &KVec<SyncwaitResult>,
+    ) -> SubmitTick {
         let mut immediate_tick = false;
         let mut promoted = false;
+        let mut resident_unblocked = false;
+        let mut resident_woken = false;
 
         for prio in 0..GROUP_PRIORITY_COUNT {
             // Stage the wait-list links of groups that should move to
@@ -1448,12 +1457,18 @@ impl Scheduler {
                     };
 
                     let (unblocked, move_to_runnable) = result.group.with_locked_inner(|inner| {
+                        let was_idle = inner.is_idle();
+                        let cleared = result.unblocked & inner.blocked_queues();
                         for cs_id in QueueIdx::iter_mask(result.unblocked) {
                             inner.set_queue_blocked(cs_id, false);
                         }
 
                         let unblocked = !inner.has_blocked_queues();
                         let move_to_runnable = result.unblocked != 0 && inner.csg_id.is_none();
+                        if cleared != 0 && inner.csg_id.is_some() {
+                            resident_unblocked = true;
+                            resident_woken |= was_idle && !inner.is_idle();
+                        }
                         (unblocked, move_to_runnable)
                     });
 
@@ -1483,10 +1498,19 @@ impl Scheduler {
             }
         }
 
+        if resident_unblocked {
+            tdev.devfreq_data.devfreq_state.lock().mark_busy();
+            if self.pm_ref.is_none() {
+                self.pm_ref = tdev.sched_pm_get();
+            }
+        }
+
         if immediate_tick {
             SubmitTick::Immediate
         } else if promoted {
             SubmitTick::Periodic(msecs_to_jiffies(tick::TICK_PERIOD_MS))
+        } else if resident_woken {
+            self.resident_submit_tick()
         } else {
             SubmitTick::None
         }
