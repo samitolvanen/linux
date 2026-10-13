@@ -702,7 +702,7 @@ impl TyrDrmFileData {
 
     pub(crate) fn bo_create(
         ddev: &TyrDrmDevice<Registered>,
-        reg_data: &TyrDrmRegistrationData<'_>,
+        _reg_data: &TyrDrmRegistrationData<'_>,
         bocreate: &mut uapi::drm_panthor_bo_create,
         file: &TyrDrmFile,
     ) -> Result<u32> {
@@ -735,7 +735,6 @@ impl TyrDrmFileData {
         };
 
         let bo = gem::new_bo(
-            reg_data.pdev.as_ref(),
             ddev,
             bocreate.size as usize,
             bocreate.flags,
