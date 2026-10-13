@@ -146,7 +146,7 @@ impl<T: DriverObject> Object<T> {
         get_sg_table: Some(bindings::drm_gem_shmem_object_get_sg_table),
         vmap: Some(bindings::drm_gem_shmem_object_vmap),
         vunmap: Some(bindings::drm_gem_shmem_object_vunmap),
-        mmap: Some(bindings::drm_gem_shmem_object_mmap),
+        mmap: Some(Self::mmap_callback),
         status: None,
         rss: None,
         #[allow(unused_unsafe, reason = "Safe since Rust 1.82.0")]
@@ -251,6 +251,29 @@ impl<T: DriverObject> Object<T> {
             Ok(()) => unsafe { bindings::drm_gem_prime_export(raw_obj, flags) },
             Err(e) => e.to_ptr(),
         }
+    }
+
+    /// Maps the GEM object into userspace, after running the driver's `mmap` hook.
+    extern "C" fn mmap_callback(
+        raw_obj: *mut bindings::drm_gem_object,
+        vma: *mut bindings::vm_area_struct,
+    ) -> c_int {
+        // SAFETY: `mmap_callback` is only installed in the vtable of `Self`, ensuring that
+        // `raw_obj` is contained within a `DriverAllocImpl<T>`.
+        let obj: &gem::DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+        if let Err(e) = T::mmap(obj) {
+            // mmap(2) has no EINTR, so restart it after an interrupted wait.
+            if e == EINTR || e == ERESTARTSYS {
+                return ERESTARTNOINTR.to_errno();
+            }
+
+            return e.to_errno();
+        }
+
+        // SAFETY: `raw_obj` is a valid shmem GEM object (see above), and `vma` is the VMA the DRM
+        // core is setting up for it.
+        unsafe { bindings::drm_gem_shmem_object_mmap(raw_obj, vma) }
     }
 
     /// Attempt to create a vmap from the gem object, and confirm the size of said vmap.
