@@ -75,7 +75,7 @@ pub(crate) const BO_LABEL_MAXLEN: usize = 4096;
 /// buffer object creation and management.
 #[pin_data]
 pub(crate) struct BoData {
-    /// Buffer object creation flags (currently unused).
+    /// Buffer object creation flags.
     flags: u32,
     /// Root GEM object of the VM whose `dma_resv` this BO shares, if any.
     exclusive_vm_root_gem: Option<ARef<Bo>>,
@@ -122,7 +122,7 @@ impl BoData {
 /// This structure is used to pass creation parameters when instantiating
 /// a new buffer object, as required by the [`gem::DriverObject`] trait.
 pub(crate) struct BoCreateArgs {
-    /// Buffer object creation flags (currently unused).
+    /// Buffer object creation flags.
     flags: u32,
     /// Root GEM object of the VM whose `dma_resv` this BO shares, if any.
     exclusive_vm_root_gem: Option<ARef<Bo>>,
@@ -177,6 +177,10 @@ impl gem::DriverObject for BoData {
     }
 
     fn mmap(obj: &Bo) -> Result {
+        if obj.flags & uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
+            return Err(EPERM);
+        }
+
         flush_wc_pages(obj)
     }
 
