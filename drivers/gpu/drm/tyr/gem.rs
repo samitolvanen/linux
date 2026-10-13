@@ -31,6 +31,11 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
+        atomic::{
+            Acquire,
+            Atomic,
+            Release, //
+        },
         Arc,
         Mutex, //
     },
@@ -63,6 +68,9 @@ pub(crate) struct BoData {
     /// User-assigned label.
     #[pin]
     label: Mutex<Option<CString>>,
+    /// Set once `flush_wc_pages` has built the DMA mapping. The pages stay
+    /// pinned until the BO is freed, even after unbind frees the mapping.
+    wc_flushed: Atomic<bool>,
 }
 
 impl BoData {
@@ -100,6 +108,7 @@ impl gem::DriverObject for BoData {
             flags: args.flags,
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
             label <- new_mutex!(None),
+            wc_flushed: Atomic::new(false),
         })
     }
 
@@ -108,6 +117,7 @@ impl gem::DriverObject for BoData {
             flags: 0,
             exclusive_vm_root_gem: None,
             label <- new_mutex!(None),
+            wc_flushed: Atomic::new(false),
         })
     }
 
@@ -116,7 +126,11 @@ impl gem::DriverObject for BoData {
             return Err(EINVAL);
         }
 
-        Ok(())
+        flush_wc_pages(obj)
+    }
+
+    fn mmap(obj: &Bo) -> Result {
+        flush_wc_pages(obj)
     }
 }
 
@@ -261,7 +275,6 @@ pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice, coherent: bool) -> Result<AR
 }
 
 pub(crate) fn new_bo(
-    dev: &Device<Bound>,
     ddev: &TyrDrmDevice,
     size: usize,
     flags: u32,
@@ -287,11 +300,25 @@ pub(crate) fn new_bo(
         },
     )?;
 
-    if map_wc {
-        bo.sg_table(dev)?;
+    Ok(bo)
+}
+
+/// Builds a write-combine BO's DMA mapping, which flushes its zeroed pages
+/// from the CPU caches before the first uncached access.
+/// Allocates and pins the backing pages for the BO's lifetime.
+fn flush_wc_pages(bo: &Bo) -> Result {
+    if !bo.map_wc() || bo.wc_flushed.load(Acquire) {
+        return Ok(());
     }
 
-    Ok(bo)
+    let guard = bo.dev().registration_guard().ok_or(ENODEV)?;
+    guard.registration_data_with(|reg_data| -> Result {
+        bo.sg_table(reg_data.pdev.as_ref())?;
+        Ok(())
+    })?;
+    bo.wc_flushed.store(true, Release);
+
+    Ok(())
 }
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
