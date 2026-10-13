@@ -130,6 +130,10 @@ impl gem::DriverObject for BoData {
     }
 
     fn mmap(obj: &Bo) -> Result {
+        if obj.flags & uapi::drm_panthor_bo_flags_DRM_PANTHOR_BO_NO_MMAP != 0 {
+            return Err(EPERM);
+        }
+
         flush_wc_pages(obj)
     }
 }
