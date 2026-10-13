@@ -212,6 +212,23 @@ pub trait DriverObject: Sync + Send + Sized {
         Ok(())
     }
 
+    /// Called before a shmem-backed object is mapped into a userspace
+    /// address space. Imported objects also reach this hook.
+    ///
+    /// The hook runs with the mmap lock held for writing. It may take the
+    /// object's reservation lock and allocate with [`GFP_KERNEL`], but must
+    /// not take the mmap lock or fault in user memory.
+    ///
+    /// Returning an error rejects the mapping. An [`EINTR`] or
+    /// [`ERESTARTSYS`] error restarts the mmap(2) call instead.
+    ///
+    /// Objects that are not shmem-backed cannot be mapped and never reach
+    /// this hook. The hook also does not run when fork, a VMA split or
+    /// mremap duplicates an existing mapping.
+    fn mmap(_obj: &DriverAllocImpl<Self>) -> Result {
+        Ok(())
+    }
+
     /// Whether dma-bufs exported from this driver's GEM objects synchronize
     /// CPU caches around CPU access.
     ///
