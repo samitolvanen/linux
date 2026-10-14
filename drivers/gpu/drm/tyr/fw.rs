@@ -20,8 +20,9 @@ use kernel::{
         Device, //
     },
     dma::{
-        sync_sgtable_for_device,
-        DataDirection, //
+        sync_single_for_device,
+        DataDirection,
+        DmaAddress, //
     },
     drm::gem::{
         shmem::VMapOwned,
@@ -34,6 +35,7 @@ use kernel::{
         Io,
         IoBase, //
     },
+    page::PAGE_SIZE,
     platform,
     prelude::*,
     sizes::{
@@ -70,7 +72,6 @@ use crate::{
     },
     gem,
     gem::{
-        Bo,
         BoData,
         KernelBo,
         KernelBoOwner,
@@ -243,6 +244,8 @@ pub(crate) struct Section {
     // rewrite the section without allocating a fresh vmap.
     vmap: VMapOwned<BoData>,
 
+    dma_segments: KVVec<(DmaAddress, u64)>,
+
     // Keep the BO backing this firmware section so that both the
     // GPU mapping and CPU mapping remain valid until the Section is dropped.
     mem: gem::KernelBo,
@@ -378,15 +381,30 @@ impl<'drm> Firmware<'drm> {
 
     /// Restores device ownership of a section buffer once its contents
     /// have been written through the CPU mapping.
-    fn sync_section(dev: &Device<Bound>, bo: &Bo) -> Result {
-        let sgt = bo.sg_table(dev)?;
+    fn sync_section(dev: &Device<Bound>, dma_segments: &[(DmaAddress, u64)]) {
+        for &(addr, len) in dma_segments {
+            // An IOMMU can merge discontiguous pages into one segment, so
+            // sync each page on its own.
+            let mut done = 0;
+            while done < len {
+                let size = (len - done).min(PAGE_SIZE as u64);
 
-        // SAFETY: `sg_table` returns EINVAL unless `dev` is the BO's own
-        // device, so `sgt` is DMA-mapped for `dev`, and the borrow keeps that
-        // mapping alive for the call.
-        unsafe { sync_sgtable_for_device(dev, sgt, DataDirection::ToDevice) };
+                // SAFETY: The range is part of a segment of the section
+                // BO's sg table, which `sg_table()` checked is DMA-mapped
+                // for `dev`. Nothing releases the table of a section BO
+                // while the device is bound.
+                unsafe {
+                    sync_single_for_device(
+                        dev,
+                        addr.wrapping_add(done as DmaAddress),
+                        size as usize,
+                        DataDirection::ToDevice,
+                    )
+                };
 
-        Ok(())
+                done += size;
+            }
+        }
     }
 
     fn request(ddev: &TyrDrmDevice, gpu_info: &GpuInfo) -> Result<kernel::firmware::Firmware> {
@@ -474,13 +492,15 @@ impl<'drm> Firmware<'drm> {
 
                 let vmap = mem.bo().owned_vmap::<0>()?;
                 Self::init_section_mem(dev, &vmap, &data, section_flags, size)?;
-                Self::sync_section(dev, mem.bo())?;
+                let dma_segments = gem::dma_segments(mem.bo().lock_resv().sg_table(dev)?)?;
+                Self::sync_section(dev, &dma_segments);
 
                 sections.push(
                     Section {
                         data,
                         section_flags,
                         vmap,
+                        dma_segments,
                         mem,
                     },
                     GFP_KERNEL,
@@ -703,8 +723,8 @@ impl<'drm> Firmware<'drm> {
     /// time.
     ///
     /// Writes go through the vmaps retained in `Section` and the sync
-    /// through the scatter-gather tables mapped at load, so the reset
-    /// path neither allocates nor takes BO locks.
+    /// through the DMA segments retained at load, so the reset path
+    /// neither allocates nor takes BO locks.
     fn reload_sections(&self) -> Result {
         let dev = self.dev.as_ref();
 
@@ -716,7 +736,7 @@ impl<'drm> Firmware<'drm> {
                 section.section_flags,
                 section.mem.size(),
             )?;
-            Self::sync_section(dev, section.mem.bo())?;
+            Self::sync_section(dev, &section.dma_segments);
         }
         Ok(())
     }

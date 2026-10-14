@@ -2072,25 +2072,16 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 /// Collects the BO's scatter-gather segments outside the VM_BIND
 /// signalling section.
 ///
-/// The first call for a buffer populates the cached SG table under
-/// `dma_resv_lock`, which must not be taken on the path to
-/// `dma_fence_signal()`. Later calls are lock-free. The segments are
-/// consumed lock-free inside the signalling section.
+/// Reading the SG table takes `dma_resv_lock`, which must not be taken on
+/// the path to `dma_fence_signal()`. The segments are consumed lock-free
+/// inside the signalling section.
 fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(DmaAddress, u64)>> {
-    let sgt = bo.sg_table(dev).inspect_err(|e| {
+    let mut resv = bo.lock_resv();
+    let sgt = resv.sg_table(dev).inspect_err(|e| {
         dev_err!(dev, "Failed to get sg_table: {:?}", e);
     })?;
 
-    let mut segments = KVVec::new();
-    for sgt_entry in sgt.iter() {
-        // Expressly convert to u64 to work with arm 32-bit builds.
-        #[allow(clippy::useless_conversion)]
-        let len = u64::from(sgt_entry.dma_len());
-
-        segments.push((sgt_entry.dma_address(), len), GFP_KERNEL)?;
-    }
-
-    Ok(segments)
+    gem::dma_segments(sgt)
 }
 
 /// Maps `size` bytes of `sgt` into the page table at `iova`, starting
