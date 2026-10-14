@@ -193,6 +193,13 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
         Ok(())
     }
 
+    /// Called when a shmem-backed object with [`Self::RECLAIMABLE`] set gains
+    /// or loses its pages or its pins.
+    ///
+    /// The hook runs with the object's reservation lock held, and must not
+    /// take that lock again.
+    fn residency_changed(_guard: &ResvGuard<'_, DriverAllocImpl<Self>>) {}
+
     /// Whether dma-bufs exported from this driver's GEM objects synchronize
     /// CPU caches around CPU access.
     ///
@@ -212,6 +219,12 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
     /// through the generic helper. Objects that are not shmem-backed ignore
     /// this constant.
     const EXPOSE_DUMB_CREATE: bool = true;
+
+    /// Whether the pages of this driver's shmem-backed objects may be released
+    /// while the objects are alive.
+    ///
+    /// Objects that are not shmem-backed ignore this constant.
+    const RECLAIMABLE: bool = false;
 }
 
 /// Trait that represents a GEM object subtype
@@ -418,6 +431,7 @@ pub trait BaseObject: IntoGEMObject {
         // INVARIANT: The lock was acquired above.
         ResvGuard {
             obj: self,
+            unlock: true,
             _not_send: NotThreadSafe,
         }
     }
@@ -435,6 +449,7 @@ pub trait BaseObject: IntoGEMObject {
         // INVARIANT: The lock was acquired above.
         Ok(ResvGuard {
             obj: self,
+            unlock: true,
             _not_send: NotThreadSafe,
         })
     }
@@ -452,6 +467,7 @@ pub trait BaseObject: IntoGEMObject {
         // INVARIANT: The lock was acquired above.
         Some(ResvGuard {
             obj: self,
+            unlock: true,
             _not_send: NotThreadSafe,
         })
     }
@@ -465,14 +481,35 @@ impl<T: IntoGEMObject> BaseObject for T {}
 ///
 /// # Invariants
 ///
-/// The current thread holds the reservation lock of `obj` for the lifetime of the guard.
+/// The current thread holds the reservation lock of `obj` for the lifetime of the guard. If
+/// `unlock` is set, nothing else releases the lock.
 #[must_use = "the lock unlocks immediately when the guard is unused"]
 pub struct ResvGuard<'a, O: IntoGEMObject> {
     obj: &'a O,
+    /// Whether dropping the guard releases the lock.
+    unlock: bool,
     _not_send: NotThreadSafe,
 }
 
 impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
+    /// Creates a guard for a reservation lock that the caller already holds.
+    ///
+    /// Dropping the returned guard does not release the lock.
+    ///
+    /// # Safety
+    ///
+    /// The current thread holds the reservation lock of `obj` for `'a`, and no other guard of it
+    /// is used while the returned guard exists.
+    #[cfg_attr(not(CONFIG_RUST_DRM_GEM_SHMEM_HELPER), expect(unused))]
+    pub(crate) unsafe fn assume_locked(obj: &'a O) -> Self {
+        // INVARIANT: The caller holds the lock for `'a`.
+        Self {
+            obj,
+            unlock: false,
+            _not_send: NotThreadSafe,
+        }
+    }
+
     /// Returns the object whose reservation lock is held.
     #[inline]
     pub fn obj(&self) -> &'a O {
@@ -483,8 +520,11 @@ impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
 impl<O: IntoGEMObject> Drop for ResvGuard<'_, O> {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: By the type invariants, the current thread holds the lock.
-        unsafe { bindings::dma_resv_unlock(self.obj.raw_dma_resv()) };
+        if self.unlock {
+            // SAFETY: By the type invariants, the current thread holds the lock, and nothing else
+            // releases it.
+            unsafe { bindings::dma_resv_unlock(self.obj.raw_dma_resv()) };
+        }
     }
 }
 
