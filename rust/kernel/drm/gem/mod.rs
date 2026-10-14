@@ -31,6 +31,7 @@ use crate::{
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
+    mem::ManuallyDrop,
     ops::Deref,
     ptr::{
         self,
@@ -236,6 +237,13 @@ pub trait DriverObject: Sync + Send + Sized {
         Ok(())
     }
 
+    /// Called when a shmem-backed object with [`Self::RECLAIMABLE`] set gains
+    /// or loses its pages or its pins.
+    ///
+    /// The hook runs with the object's reservation lock held, and must not
+    /// take that lock again.
+    fn residency_changed(_guard: &ResvGuard<'_, DriverAllocImpl<Self>>) {}
+
     /// Whether dma-bufs exported from this driver's GEM objects synchronize
     /// CPU caches around CPU access.
     ///
@@ -255,6 +263,12 @@ pub trait DriverObject: Sync + Send + Sized {
     /// through the generic helper. Objects that are not shmem-backed ignore
     /// this constant.
     const EXPOSE_DUMB_CREATE: bool = true;
+
+    /// Whether the pages of this driver's shmem-backed objects may be released
+    /// while the objects are alive.
+    ///
+    /// Objects that are not shmem-backed ignore this constant.
+    const RECLAIMABLE: bool = false;
 }
 
 /// Trait that represents a GEM object subtype
@@ -511,6 +525,23 @@ pub struct ResvGuard<'a, O: IntoGEMObject> {
 }
 
 impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
+    /// Creates a guard for a reservation lock that the caller already holds.
+    ///
+    /// Dropping the returned guard does not release the lock.
+    ///
+    /// # Safety
+    ///
+    /// The current thread holds the reservation lock of `obj` for `'a`, and no other guard of it
+    /// is used while the returned guard exists.
+    #[cfg_attr(not(CONFIG_RUST_DRM_GEM_SHMEM_HELPER), expect(unused))]
+    pub(crate) unsafe fn assume_locked(obj: &'a O) -> ManuallyDrop<Self> {
+        // INVARIANT: The caller holds the lock for `'a`.
+        ManuallyDrop::new(Self {
+            obj,
+            _not_send: NotThreadSafe,
+        })
+    }
+
     /// Returns the object whose reservation lock is held.
     #[inline]
     pub fn obj(&self) -> &'a O {
