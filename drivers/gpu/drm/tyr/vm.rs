@@ -993,10 +993,9 @@ impl PinnedDrop for VmExec {
 
         // SAFETY: `Drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `gpuvm`; the field is never read again
-        // afterward. Moving out the reference here (rather than dropping
-        // it inline) keeps the final `drm_gpuvm_put`, which frees the
-        // GPUVM's r_obj GEM under `dma_resv_lock`, off the dma-fence
-        // signalling section this drop may run under.
+        // afterward. `release_gpuvm` needs the reference to flush the
+        // deferred `vm_bo` list off the dma-fence signalling section this
+        // drop may run under.
         let gpuvm = unsafe { ManuallyDrop::take(&mut this.gpuvm) };
         // The last `VmExec` reference is dropping, so nothing else can
         // hold the lock and `try_lock` cannot block here on the
