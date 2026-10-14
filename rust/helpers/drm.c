@@ -36,6 +36,13 @@ rust_helper_drm_vma_node_start(const struct drm_vma_offset_node *node)
 	return drm_vma_node_start(node);
 }
 
+__rust_helper void
+rust_helper_drm_vma_node_unmap(struct drm_vma_offset_node *node,
+			       struct address_space *file_mapping)
+{
+	drm_vma_node_unmap(node, file_mapping);
+}
+
 #ifndef CONFIG_TRANSPARENT_HUGEPAGE
 __rust_helper int
 rust_helper_drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
