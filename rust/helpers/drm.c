@@ -29,6 +29,13 @@ rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
 	return drm_vma_node_offset_addr(node);
 }
 
+__rust_helper void
+rust_helper_drm_vma_node_unmap(struct drm_vma_offset_node *node,
+			       struct address_space *file_mapping)
+{
+	drm_vma_node_unmap(node, file_mapping);
+}
+
 __rust_helper unsigned long
 rust_helper_drm_vma_node_start(const struct drm_vma_offset_node *node)
 {
