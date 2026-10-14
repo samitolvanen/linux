@@ -14,6 +14,16 @@ __rust_helper pgprot_t rust_helper_pgprot_writecombine(pgprot_t prot)
 	return pgprot_writecombine(prot);
 }
 
+__rust_helper struct folio *rust_helper_page_folio(struct page *page)
+{
+	return page_folio(page);
+}
+
+__rust_helper bool rust_helper_folio_test_pmd_mappable(struct folio *folio)
+{
+	return folio_test_pmd_mappable(folio);
+}
+
 __rust_helper void rust_helper_mmgrab(struct mm_struct *mm)
 {
 	mmgrab(mm);
