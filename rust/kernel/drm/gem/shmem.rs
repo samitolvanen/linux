@@ -402,6 +402,15 @@ impl<T: DriverObject> Object<T> {
             return Err(EINVAL);
         }
 
+        // `evict()` only removes mappings in the DRM device's address space.
+        // SAFETY: `vma` maps a file. The DRM device of the object outlives the object.
+        let foreign = unsafe {
+            (*(*vma).vm_file).f_mapping != (*(*(*self.as_raw()).dev).anon_inode).i_mapping
+        };
+        if foreign {
+            return Err(EINVAL);
+        }
+
         new_vma.set_dontexpand();
         new_vma.set_dontdump();
 
@@ -920,6 +929,104 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
 
         // INVARIANT: The object was pinned above, unless it is imported.
         Ok(PinGuard { obj: obj.into() })
+    }
+
+    /// Returns whether the pages of the object are present.
+    #[inline]
+    pub fn is_resident(&self) -> bool {
+        self.residency().resident
+    }
+
+    /// Returns whether the pages of the object are pinned.
+    #[inline]
+    pub fn is_pinned(&self) -> bool {
+        self.residency().pinned
+    }
+
+    /// Returns whether the object has userspace mappings.
+    #[inline]
+    pub fn is_mmapped(&self) -> bool {
+        self.residency().mapped
+    }
+
+    /// Releases the reference that the scatter-gather table of the object holds on its pages, so
+    /// that the system can reclaim them.
+    ///
+    /// The userspace mappings of the object are removed first. A later fault or call to
+    /// [`Self::sg_table()`] allocates the pages again. The object must have
+    /// [`DriverObject::RECLAIMABLE`] set and must not be imported, otherwise this returns
+    /// [`EINVAL`]. A pinned object returns [`EBUSY`], and an object that is not resident returns
+    /// `Ok(())`.
+    ///
+    /// # Safety
+    ///
+    /// The device must no longer access the pages through mappings created from the table.
+    pub unsafe fn evict(&mut self) -> Result {
+        let obj = self.obj();
+        if !T::RECLAIMABLE || obj.is_imported() {
+            return Err(EINVAL);
+        }
+
+        let before = self.residency();
+        if before.pinned {
+            return Err(EBUSY);
+        }
+
+        if !self.holds_pages() {
+            return Ok(());
+        }
+
+        let base = obj.as_raw();
+        let shmem = obj.as_raw_shmem();
+
+        // SAFETY: `base` is a valid GEM object. Its DRM device outlives it, and the device's
+        // `anon_inode` backs every userspace mapping of the object.
+        unsafe {
+            bindings::drm_vma_node_unmap(
+                &raw mut (*base).vma_node,
+                (*(*(*base).dev).anon_inode).i_mapping,
+            )
+        };
+
+        // The DMA unmap may discard dirty cache lines of a write-back object, so clean them first.
+        if !obj.map_wc() {
+            // SAFETY: `sgt_res` lies within `obj`, whose lock `self` holds.
+            let sgt_res = unsafe { obj.sgt_res.access_unchecked(self) };
+
+            if let Some(sgt_dma) = sgt_res.as_ref().and_then(|sgt_res| sgt_res.try_access()) {
+                // SAFETY: `sgt_dma` keeps the table mapped for `sgt_dma.dev`, and the reservation
+                // lock keeps the table valid.
+                unsafe {
+                    dma::sync_sgtable_for_device(
+                        &sgt_dma.dev,
+                        scatterlist::SGTable::from_raw(sgt_dma.sgt.as_ptr()),
+                        dma::DataDirection::Bidirectional,
+                    )
+                };
+            }
+        }
+
+        self.release_sgt();
+
+        // SAFETY: We hold the reservation lock of an object that is not imported, and the sg
+        // table held a reference to its pages.
+        unsafe { bindings::drm_gem_shmem_put_pages_locked(shmem) };
+
+        self.notify_residency(before);
+
+        Ok(())
+    }
+
+    /// Unmaps and frees the sg table of the object.
+    fn release_sgt(&mut self) {
+        let obj = self.obj();
+
+        // SAFETY: `sgt_res` lies within `obj`, whose lock `self` holds.
+        drop(unsafe { obj.sgt_res.access_unchecked_mut(self) }.take());
+
+        // SAFETY: We hold the reservation lock, and `&mut self` excludes live table references.
+        // The table is unmapped once the `Devres` is dropped.
+        unsafe { obj.free_sgt() };
     }
 
     /// Pins the pages of the object for a CPU mapping or a dma-buf attachment.
@@ -1736,8 +1843,13 @@ mod tests {
         let pin = obj.lock_resv().pin()?;
         assert!(obj.pages_present());
 
+        let resv = obj.lock_resv();
+        assert!(resv.is_resident() && resv.is_pinned() && !resv.is_mmapped());
+        drop(resv);
+
         drop(pin);
         assert!(!obj.pages_present());
+        assert!(!obj.lock_resv().is_pinned());
 
         Ok(())
     }
