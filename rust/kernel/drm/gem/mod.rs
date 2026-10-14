@@ -237,7 +237,7 @@ pub trait DriverObject: Sync + Send + Sized {
     }
 
     /// Called when a shmem-backed object with [`Self::RECLAIMABLE`] set gains
-    /// or loses its pages or its pins.
+    /// or loses its pages, its pins, or its userspace mappings.
     ///
     /// The hook runs with the object's reservation lock held, and must not
     /// take that lock again.
@@ -266,7 +266,9 @@ pub trait DriverObject: Sync + Send + Sized {
     /// Whether the pages of this driver's shmem-backed objects may be released
     /// while the objects are alive.
     ///
-    /// Objects that are not shmem-backed ignore this constant.
+    /// When `true`, a userspace mapping does not hold the pages of an object.
+    /// The first fault allocates them, and the object's scatter-gather table
+    /// holds them. Objects that are not shmem-backed ignore this constant.
     const RECLAIMABLE: bool = false;
 }
 
