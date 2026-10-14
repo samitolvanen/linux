@@ -425,6 +425,8 @@ impl VmBindJob {
         va: u64,
         flags: VmMapFlags,
     ) -> Result {
+        let handoff = cleanup::Handoff::new(bo.dev().into())?;
+        let (pin, map_sgt) = prefetch_map_sgt(&bo, dev)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -432,7 +434,8 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
-            map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
+            map_sgt: Some(map_sgt),
+            _map_pin: Some(MapPin::Deferred(Some((pin, handoff)))),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
@@ -459,6 +462,7 @@ impl VmBindJob {
             ],
             vm_bo: None,
             map_sgt: None,
+            _map_pin: None,
             pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
@@ -650,10 +654,36 @@ pub(crate) struct VmOpResources {
     /// `(dma_address, dma_len)` pair, in the order yielded by the BO's
     /// scatter-gather table. `None` for Unmap.
     map_sgt: Option<KVVec<(DmaAddress, u64)>>,
+    /// Keeps `map_sgt` valid until the op is cleaned up. `None` for Unmap.
+    _map_pin: Option<MapPin>,
     /// Page tables the operation can need, reserved outside the VM_BIND
     /// dma-fence signalling section because that section must not make
     /// allocations that can wait for reclaim.
     pt_reserve: pt_alloc::PtReserve,
+}
+
+/// A pin on the BO of a map op.
+///
+/// `Deferred` unpins on the cleanup workqueue, because unpinning takes
+/// `dma_resv_lock`, which the VM_BIND signalling section must not take.
+/// The cleanup work holds a device reference until it drops the pin.
+/// `Inline` unpins when dropped, so the signalling section must not drop it.
+enum MapPin {
+    Inline { _pin: BoPin },
+    Deferred(Option<(BoPin, PinHandoff)>),
+}
+
+type BoPin = shmem::PinGuard<BoData>;
+type PinHandoff = cleanup::Handoff<BoPin, ARef<TyrDrmDevice>>;
+
+impl Drop for MapPin {
+    fn drop(&mut self) {
+        if let Self::Deferred(deferred) = self {
+            if let Some((pin, handoff)) = deferred.take() {
+                handoff.spawn(pin, drop);
+            }
+        }
+    }
 }
 
 /// Request to execute a virtual memory operation.
@@ -1725,6 +1755,7 @@ impl VmExec {
         // Flush inline here. The bind queue's submit defers this to the
         // cleanup workqueue instead.
         let _flush = ScopeGuard::new(|| self.flush_deferred_cleanup());
+        let (pin, map_sgt) = prefetch_map_sgt(bo, dev)?;
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -1732,7 +1763,8 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: Some(self.gpuvm.obtain(bo, ())?),
-            map_sgt: Some(prefetch_map_sgt(bo, dev)?),
+            map_sgt: Some(map_sgt),
+            _map_pin: Some(MapPin::Inline { _pin: pin }),
             pt_reserve: pt_alloc::PtReserve::for_map(va, map_size, pt_gfp)?,
         };
 
@@ -1789,6 +1821,7 @@ impl VmExec {
             },
             vm_bo: None,
             map_sgt: None,
+            _map_pin: None,
             pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, pt_gfp)?,
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
@@ -1808,6 +1841,7 @@ impl VmExec {
             preallocated_gpuvas: [None, None, None],
             vm_bo: None,
             map_sgt: None,
+            _map_pin: None,
             pt_reserve: pt_alloc::PtReserve::default(),
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
@@ -2091,19 +2125,28 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
     (SZ_2M as u64, pgcount)
 }
 
-/// Collects the BO's scatter-gather segments outside the VM_BIND
+/// Pins the BO and collects its scatter-gather segments outside the VM_BIND
 /// signalling section.
 ///
 /// Reading the SG table takes `dma_resv_lock`, which must not be taken on
-/// the path to `dma_fence_signal()`. The segments are consumed lock-free
-/// inside the signalling section.
-fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(DmaAddress, u64)>> {
+/// the path to `dma_fence_signal()`. An async bind consumes the segments
+/// lock-free inside the signalling section.
+fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<(BoPin, KVVec<(DmaAddress, u64)>)> {
     let mut resv = bo.lock_resv();
-    let sgt = resv.sg_table(dev).inspect_err(|e| {
-        dev_err!(dev, "Failed to get sg_table: {:?}", e);
-    })?;
+    let pin = resv.pin()?;
+    let segments = resv
+        .sg_table(dev)
+        .inspect_err(|e| {
+            dev_err!(dev, "Failed to get sg_table: {:?}", e);
+        })
+        .and_then(gem::dma_segments);
 
-    gem::dma_segments(sgt)
+    // Dropping the pin takes `dma_resv_lock`, so unlock before an error
+    // drops it.
+    drop(resv);
+    let segments = segments?;
+
+    Ok((pin, segments))
 }
 
 /// Maps `size` bytes of `sgt` into the page table at `iova`, starting
