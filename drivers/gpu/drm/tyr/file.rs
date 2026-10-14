@@ -133,13 +133,14 @@ pub(crate) fn read_padding_zero(reader: &mut UserSliceReader, len: usize) -> Res
     Ok(())
 }
 
-/// Validate a single `drm_panthor_vm_bind_op` at the ioctl entry, before any
-/// state is mutated or any job is queued. Rejects `EINVAL` if `va`, `size`,
+/// Validate a single `drm_panthor_vm_bind_op` at the ioctl entry, before the
+/// VM changes or any job is queued. Rejects `EINVAL` if `va`, `size`,
 /// or `bo_offset` is not GPU-page-aligned, if `[va, va + size)` falls outside
 /// the VM's user VA range, and for `MAP` ops if `bo_handle` is invalid, if
 /// `bo_offset + size` is out of bounds for the target BO, or if the BO is
 /// exclusive to a VM other than `vm`. A `MAP_SPARSE` op must carry no BO
-/// handle and no BO offset, and must be non-executable.
+/// handle and no BO offset, and must be non-executable. Validating one pins
+/// the sparse backing object until the file is closed.
 ///
 /// For `MAP` ops, returns the `Bo` to bind: the object the handle names, or
 /// the VM's sparse backing object. The caller binds against the same BO that
@@ -171,6 +172,7 @@ fn validate_bind_op(
                 return Err(EINVAL);
             }
 
+            file.inner().vm_pool().pin_sparse_bo()?;
             return Ok(Some(vm.sparse_bo().ok_or(EINVAL)?.into()));
         }
 
