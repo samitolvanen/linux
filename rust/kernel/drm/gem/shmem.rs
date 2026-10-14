@@ -22,7 +22,8 @@ use crate::{
         gem,
         private::Sealed,
         Device,
-        DeviceContext, //
+        DeviceContext,
+        RegistrationGuard, //
     },
     error::{
         from_err_ptr,
@@ -36,7 +37,13 @@ use crate::{
     },
     prelude::*,
     scatterlist,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        }, //
+    },
     types::Opaque, //
 };
 use core::{
@@ -100,6 +107,9 @@ pub struct Object<T: DriverObject> {
     parent_resv_obj: Option<ARef<Object<T>>>,
     /// Devres object for unmapping the SGTable on driver-unbind, set when the table is created.
     sgt_res: ManuallyDrop<ResvLocked<Option<Devres<SgtDma>>>>,
+    /// Copy of `drm_gem_shmem_object::map_wc`, whose storage is shared with flags that change
+    /// under the reservation lock.
+    map_wc: bool,
     #[pin]
     inner: T,
 }
@@ -120,11 +130,27 @@ impl<T: DriverObject> Object<T> {
         close: Some(super::close_callback::<T>),
         print_info: Some(bindings::drm_gem_shmem_object_print_info),
         export: Some(Self::export_callback),
-        pin: Some(bindings::drm_gem_shmem_object_pin),
-        unpin: Some(bindings::drm_gem_shmem_object_unpin),
+        pin: if T::RECLAIMABLE {
+            Some(Self::pin_callback)
+        } else {
+            Some(bindings::drm_gem_shmem_object_pin)
+        },
+        unpin: if T::RECLAIMABLE {
+            Some(Self::unpin_callback)
+        } else {
+            Some(bindings::drm_gem_shmem_object_unpin)
+        },
         get_sg_table: Some(bindings::drm_gem_shmem_object_get_sg_table),
-        vmap: Some(bindings::drm_gem_shmem_object_vmap),
-        vunmap: Some(bindings::drm_gem_shmem_object_vunmap),
+        vmap: if T::RECLAIMABLE {
+            Some(Self::vmap_callback)
+        } else {
+            Some(bindings::drm_gem_shmem_object_vmap)
+        },
+        vunmap: if T::RECLAIMABLE {
+            Some(Self::vunmap_callback)
+        } else {
+            Some(bindings::drm_gem_shmem_object_vunmap)
+        },
         mmap: Some(Self::mmap_callback),
         status: Some(super::status_callback::<T>),
         rss: None,
@@ -170,6 +196,7 @@ impl<T: DriverObject> Object<T> {
             try_pin_init!(Self {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
+                map_wc: config.map_wc,
                 sgt_res: ManuallyDrop::new(ResvLocked::new(None)),
                 inner <- T::new(dev, size, args),
             }),
@@ -212,9 +239,7 @@ impl<T: DriverObject> Object<T> {
     /// Returns whether the object's CPU mappings are write-combined.
     #[inline]
     pub fn map_wc(&self) -> bool {
-        // SAFETY: `as_raw_shmem()` returns a valid pointer to this object's shmem object for the
-        // lifetime of `&self`.
-        unsafe { bindings::drm_gem_shmem_object::map_wc_raw(self.as_raw_shmem()) }
+        self.map_wc
     }
 
     /// Allocates the full [`Object<T>`] wrapper and zero-initialises the embedded shmem object;
@@ -237,6 +262,7 @@ impl<T: DriverObject> Object<T> {
             try_pin_init!(Self {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: None,
+                map_wc: false,
                 sgt_res: ManuallyDrop::new(ResvLocked::new(None)),
                 inner <- T::create_imported(dev, size),
             }),
@@ -400,6 +426,93 @@ impl<T: DriverObject> Object<T> {
         unsafe { bindings::drm_gem_shmem_object_mmap(raw_obj, vma) }
     }
 
+    /// Returns a registration guard if mapping the object for CPU access needs the bound device.
+    fn cpu_map_registration(&self) -> Option<RegistrationGuard<'_, T::Driver>> {
+        if T::RECLAIMABLE && self.map_wc() {
+            self.dev().registration_guard()
+        } else {
+            None
+        }
+    }
+
+    /// Returns the parent device of the object's DRM device, which `reg` keeps bound.
+    fn bound_parent<'a>(reg: &'a RegistrationGuard<'_, T::Driver>) -> &'a device::Device<Bound> {
+        let parent: &device::Device = (**reg).as_ref();
+
+        // SAFETY: `reg` keeps the parent device bound for `'a`.
+        unsafe { parent.as_bound() }
+    }
+
+    extern "C" fn pin_callback(raw_obj: *mut bindings::drm_gem_object) -> c_int {
+        // SAFETY: `pin_callback` is only installed in the vtable of `Self`.
+        let obj: &Self = unsafe { IntoGEMObject::from_raw(raw_obj) };
+        let reg = obj.cpu_map_registration();
+
+        // SAFETY: The DRM core calls this with the reservation lock held.
+        let mut resv = unsafe { ResvGuard::assume_locked(obj) };
+
+        match resv.pin_prepared(reg.as_ref()) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        }
+    }
+
+    extern "C" fn unpin_callback(raw_obj: *mut bindings::drm_gem_object) {
+        // SAFETY: `unpin_callback` is only installed in the vtable of `Self`.
+        let obj: &Self = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+        // SAFETY: The DRM core calls this with the reservation lock held.
+        let resv = unsafe { ResvGuard::assume_locked(obj) };
+        let before = resv.residency();
+
+        // SAFETY: We hold the reservation lock, and the DRM core pinned the object earlier.
+        unsafe { bindings::drm_gem_shmem_object_unpin(raw_obj) };
+
+        resv.notify_residency(before);
+    }
+
+    extern "C" fn vmap_callback(
+        raw_obj: *mut bindings::drm_gem_object,
+        map: *mut bindings::iosys_map,
+    ) -> c_int {
+        // SAFETY: `vmap_callback` is only installed in the vtable of `Self`.
+        let obj: &Self = unsafe { IntoGEMObject::from_raw(raw_obj) };
+        let reg = obj.cpu_map_registration();
+
+        // SAFETY: The DRM core calls this with the reservation lock held.
+        let mut resv = unsafe { ResvGuard::assume_locked(obj) };
+        let before = resv.residency();
+
+        let ret = resv.prep_cpu_map(reg.as_ref()).and_then(|()| {
+            // SAFETY: We hold the reservation lock, and `map` is valid for writes.
+            to_result(unsafe { bindings::drm_gem_shmem_object_vmap(raw_obj, map) })
+        });
+
+        resv.notify_residency(before);
+
+        match ret {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        }
+    }
+
+    extern "C" fn vunmap_callback(
+        raw_obj: *mut bindings::drm_gem_object,
+        map: *mut bindings::iosys_map,
+    ) {
+        // SAFETY: `vunmap_callback` is only installed in the vtable of `Self`.
+        let obj: &Self = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+        // SAFETY: The DRM core calls this with the reservation lock held.
+        let resv = unsafe { ResvGuard::assume_locked(obj) };
+        let before = resv.residency();
+
+        // SAFETY: We hold the reservation lock, and `map` is a mapping of the object.
+        unsafe { bindings::drm_gem_shmem_object_vunmap(raw_obj, map) };
+
+        resv.notify_residency(before);
+    }
+
     /// Attempt to create a vmap from the gem object, and confirm the size of said vmap.
     fn raw_vmap(&self, min_size: usize) -> Result<*mut c_void> {
         if self.size() < min_size {
@@ -407,16 +520,23 @@ impl<T: DriverObject> Object<T> {
         }
 
         let mut map: MaybeUninit<bindings::iosys_map> = MaybeUninit::uninit();
-        let guard = self.lock_resv();
+        let reg = self.cpu_map_registration();
+        let mut guard = self.lock_resv();
+        let before = guard.residency();
 
-        // SAFETY: drm_gem_shmem_vmap can be called with the DMA reservation lock held
-        to_result(unsafe {
-            bindings::drm_gem_shmem_vmap_locked(self.as_raw_shmem(), map.as_mut_ptr())
-        })?;
+        let ret = guard.prep_cpu_map(reg.as_ref()).and_then(|()| {
+            // SAFETY: `drm_gem_shmem_vmap()` can be called with the DMA reservation lock held.
+            to_result(unsafe {
+                bindings::drm_gem_shmem_vmap_locked(self.as_raw_shmem(), map.as_mut_ptr())
+            })
+        });
+
+        guard.notify_residency(before);
 
         // Drop the guard explicitly here, since we may need to call `raw_vunmap()` (which
         // re-acquires the lock).
         drop(guard);
+        ret?;
 
         // SAFETY: The call to drm_gem_shmem_vmap_locked succeeded above, so we are guaranteed that
         // map is properly initialized.
@@ -445,13 +565,16 @@ impl<T: DriverObject> Object<T> {
     /// - The caller promises that the memory pointed to by map will no longer be accesed through
     ///   this instance.
     unsafe fn raw_vunmap(&self, mut map: bindings::iosys_map) {
-        let _guard = self.lock_resv();
+        let guard = self.lock_resv();
+        let before = guard.residency();
 
         // SAFETY:
         // - This function is safe to call with the DMA reservation lock held
         // - Our `ARef` is proof that the underlying gem object here is initialized and thus safe to
         //   dereference.
         unsafe { bindings::drm_gem_shmem_vunmap_locked(self.as_raw_shmem(), &mut map) };
+
+        guard.notify_residency(before);
     }
 
     /// Creates and returns a virtual kernel memory mapping for this object.
@@ -490,6 +613,8 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
         if dev.as_raw() != parent.as_raw() {
             return Err(EINVAL);
         }
+
+        let before = self.residency();
 
         // SAFETY: `sgt_res` lies within `obj`, whose lock `self` holds.
         let sgt_res = unsafe { obj.sgt_res.access_unchecked_mut(self) };
@@ -530,6 +655,8 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
             }
         }
 
+        self.notify_residency(before);
+
         // SAFETY: The table is freed under the reservation lock, which we hold for `'a`, or once
         // `obj` has no references. Driver unbind does not unmap the table while `dev` is bound.
         Ok(unsafe { scatterlist::SGTable::from_raw(sgt) })
@@ -541,13 +668,112 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
     pub fn pin(&self) -> Result<PinGuard<T>> {
         let obj = self.obj();
         if !obj.is_imported() {
+            let before = self.residency();
+
             // SAFETY: We hold the reservation lock of an object that is not imported.
-            to_result(unsafe { bindings::drm_gem_shmem_pin_locked(obj.as_raw_shmem()) })?;
+            let ret = to_result(unsafe { bindings::drm_gem_shmem_pin_locked(obj.as_raw_shmem()) });
+
+            self.notify_residency(before);
+            ret?;
         }
 
         // INVARIANT: The object was pinned above, unless it is imported.
         Ok(PinGuard { obj: obj.into() })
     }
+
+    /// Pins the pages of the object for a CPU mapping or a dma-buf attachment.
+    fn pin_prepared(&mut self, reg: Option<&RegistrationGuard<'_, T::Driver>>) -> Result {
+        if self.obj().is_imported() {
+            return Err(EINVAL);
+        }
+
+        let before = self.residency();
+
+        let ret = self.prep_cpu_map(reg).and_then(|()| {
+            // SAFETY: We hold the reservation lock of an object that is not imported.
+            to_result(unsafe { bindings::drm_gem_shmem_pin_locked(self.obj().as_raw_shmem()) })
+        });
+
+        self.notify_residency(before);
+        ret
+    }
+
+    /// Builds the scatter-gather table of a write-combined object, unless it holds the pages.
+    ///
+    /// Creating the DMA mapping flushes newly allocated pages from the CPU caches, which must
+    /// happen before the pages are mapped without caching.
+    fn prep_cpu_map(&mut self, reg: Option<&RegistrationGuard<'_, T::Driver>>) -> Result {
+        let obj = self.obj();
+        if !T::RECLAIMABLE || !obj.map_wc() || self.holds_pages() {
+            return Ok(());
+        }
+
+        self.sg_table(Object::<T>::bound_parent(reg.ok_or(ENODEV)?))
+            .map(|_| ())
+    }
+
+    /// Returns whether the sg table of the object holds a reference to its pages.
+    fn holds_pages(&self) -> bool {
+        // SAFETY: `sgt_res` lies within the object whose lock `self` holds.
+        unsafe { self.obj().sgt_res.access_unchecked(self) }.is_some()
+    }
+
+    /// Returns the residency of the object.
+    fn residency(&self) -> Residency {
+        let obj = self.obj();
+        let shmem = obj.as_raw_shmem();
+
+        // SAFETY: We hold the reservation lock, which protects `pages`.
+        let pages = unsafe { (*shmem).pages };
+
+        // SAFETY: `pages_pin_count` is a valid `refcount_t`, which wraps an atomic `int`.
+        let pin_count =
+            unsafe { Atomic::<i32>::from_ptr(&raw mut (*shmem).pages_pin_count.refs.counter) };
+
+        Residency {
+            resident: !pages.is_null(),
+            pinned: pin_count.load(Relaxed) != 0,
+        }
+    }
+
+    /// Reports a residency change since `before` to the driver.
+    fn notify_residency(&self, before: Residency) {
+        if !T::RECLAIMABLE {
+            return;
+        }
+
+        let after = self.residency();
+        if after == before {
+            return;
+        }
+
+        let obj = self.obj();
+        if after.resident && !before.resident {
+            // The device may write to the pages, so any put that releases them marks them dirty.
+            // SAFETY: We hold the reservation lock, which protects the flag.
+            unsafe {
+                bindings::drm_gem_shmem_object::set_pages_mark_dirty_on_put_raw(
+                    obj.as_raw_shmem(),
+                    true,
+                )
+            };
+        }
+
+        // SAFETY: Only objects of the driver's object type use the vtable of `Object<T>`, so `obj`
+        // is contained within a `DriverAllocImpl<T>`.
+        let drv_obj: &gem::DriverAllocImpl<T> = unsafe { IntoGEMObject::from_raw(obj.as_raw()) };
+
+        // SAFETY: We hold the reservation lock, and `self` is not used while the hook runs.
+        let guard = unsafe { ResvGuard::assume_locked(drv_obj) };
+        T::residency_changed(&guard);
+    }
+}
+
+/// The residency state that [`DriverObject::residency_changed`] reports on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Residency {
+    resident: bool,
+    pinned: bool,
 }
 
 /// A pin on the pages of a shmem-backed GEM object.
@@ -576,11 +802,14 @@ impl<T: DriverObject> Drop for PinGuard<T> {
             return;
         }
 
-        let _resv = self.obj.lock_resv();
+        let resv = self.obj.lock_resv();
+        let before = resv.residency();
 
         // SAFETY: We hold the reservation lock, and by the type invariants the object holds the
         // pin released here.
         unsafe { bindings::drm_gem_shmem_unpin_locked(self.obj.as_raw_shmem()) };
+
+        resv.notify_residency(before);
     }
 }
 
