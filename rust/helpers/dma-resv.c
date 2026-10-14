@@ -8,6 +8,18 @@ int rust_helper_dma_resv_lock(struct dma_resv *obj, struct ww_acquire_ctx *ctx)
 	return dma_resv_lock(obj, ctx);
 }
 
+__rust_helper
+int rust_helper_dma_resv_lock_interruptible(struct dma_resv *obj,
+					    struct ww_acquire_ctx *ctx)
+{
+	return dma_resv_lock_interruptible(obj, ctx);
+}
+
+__rust_helper bool rust_helper_dma_resv_trylock(struct dma_resv *obj)
+{
+	return dma_resv_trylock(obj);
+}
+
 __rust_helper void rust_helper_dma_resv_unlock(struct dma_resv *obj)
 {
 	dma_resv_unlock(obj);
