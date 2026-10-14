@@ -269,10 +269,17 @@ impl<T: DriverObject> Object<T> {
         // dropped.
         unsafe { (*this).free_sgt() };
 
-        // SAFETY:
-        // - We're in free_callback - so this function is safe to call.
-        // - We won't be using the gem resources on `this` after this call.
-        unsafe { bindings::drm_gem_shmem_release(base) };
+        // SAFETY: `this` is valid (see above).
+        if T::RECLAIMABLE && !unsafe { (*this).is_imported() } {
+            // SAFETY: We are in free_callback, so we have exclusive access to `this`, and its sg
+            // table was freed above.
+            unsafe { (*this).release_dying() };
+        } else {
+            // SAFETY:
+            // - We're in free_callback - so this function is safe to call.
+            // - We won't be using the gem resources on `this` after this call.
+            unsafe { bindings::drm_gem_shmem_release(base) };
+        }
 
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(this) };
@@ -302,6 +309,66 @@ impl<T: DriverObject> Object<T> {
                 (*shmem).sgt = ptr::null_mut();
             }
         }
+    }
+
+    /// Acquires the reservation lock of an object whose last reference is gone, without blocking.
+    ///
+    /// Memory reclaim may drop the last reference, and must not wait for a reservation lock.
+    ///
+    /// # Safety
+    ///
+    /// The last reference to the object is gone, and no other thread accesses the object.
+    unsafe fn lock_dying(&self) -> Option<ResvGuard<'_, Self>> {
+        let base = self.as_raw();
+
+        // SAFETY: Per the safety requirements, no other thread accesses `base`. Its embedded
+        // reservation object is valid and only reachable through it.
+        unsafe { (*base).resv = &raw mut (*base)._resv };
+
+        // Nothing else can hold the embedded reservation lock, so this cannot fail.
+        let resv = self.try_lock_resv();
+        crate::warn_on!(resv.is_none());
+        resv
+    }
+
+    /// Releases a reclaimable object whose last reference is gone, like `drm_gem_shmem_release()`
+    /// but under the embedded reservation lock of the object.
+    ///
+    /// # Safety
+    ///
+    /// The object is not imported, its last reference is gone, its sg table was freed, and no
+    /// other thread accesses the object.
+    unsafe fn release_dying(&self) {
+        let shmem = self.as_raw_shmem();
+
+        // SAFETY: Per the safety requirements.
+        let resv = unsafe { self.lock_dying() };
+
+        if resv.is_some() {
+            // SAFETY: We hold the reservation lock of an object that is not imported, and only
+            // the page reference taken with its sg table can remain.
+            unsafe {
+                if !(*shmem).pages.is_null() {
+                    bindings::drm_gem_shmem_put_pages_locked(shmem);
+                }
+            }
+
+            // SAFETY: The counts are valid `refcount_t`s, which wrap an atomic `int`.
+            let counts = unsafe {
+                [
+                    &raw mut (*shmem).vmap_use_count.refs.counter,
+                    &raw mut (*shmem).pages_use_count.refs.counter,
+                    &raw mut (*shmem).pages_pin_count.refs.counter,
+                ]
+                .map(|count| Atomic::<i32>::from_ptr(count).load(Relaxed))
+            };
+            crate::warn_on!(counts != [0; 3]);
+        }
+
+        drop(resv);
+
+        // SAFETY: The object state is not used after this call.
+        unsafe { bindings::drm_gem_object_release(self.as_raw()) };
     }
 
     /// Exports the GEM object as a dma-buf, after running the driver's `export` hook.
