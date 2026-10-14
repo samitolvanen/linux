@@ -9,6 +9,11 @@ __rust_helper pgprot_t rust_helper_pgprot_noncached(pgprot_t prot)
 	return pgprot_noncached(prot);
 }
 
+__rust_helper pgprot_t rust_helper_pgprot_writecombine(pgprot_t prot)
+{
+	return pgprot_writecombine(prot);
+}
+
 __rust_helper void rust_helper_mmgrab(struct mm_struct *mm)
 {
 	mmgrab(mm);
@@ -53,6 +58,11 @@ rust_helper_vma_lookup(struct mm_struct *mm, unsigned long addr)
 __rust_helper void rust_helper_vma_end_read(struct vm_area_struct *vma)
 {
 	vma_end_read(vma);
+}
+
+__rust_helper void rust_helper_release_fault_lock(struct vm_fault *vmf)
+{
+	release_fault_lock(vmf);
 }
 
 /*
