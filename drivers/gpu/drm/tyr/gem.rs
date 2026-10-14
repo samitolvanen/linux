@@ -32,11 +32,6 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
-        atomic::{
-            Acquire,
-            Atomic,
-            Release, //
-        },
         Arc,
         ArcBorrow,
         Mutex, //
@@ -66,6 +61,8 @@ use crate::debugfs::{
 };
 #[cfg(CONFIG_DEBUG_FS)]
 use kernel::str::CStr;
+#[cfg(CONFIG_DEBUG_FS)]
+use kernel::sync::atomic::Atomic;
 
 /// Maximum length of a BO label, including the NUL terminator.
 pub(crate) const BO_LABEL_MAXLEN: usize = 4096;
@@ -84,9 +81,6 @@ pub(crate) struct BoData {
     /// User-assigned label.
     #[pin]
     label: Mutex<Option<CString>>,
-    /// Set once `flush_wc_pages` has built the DMA mapping. The pages stay
-    /// pinned until the BO is freed, even after unbind frees the mapping.
-    wc_flushed: Atomic<bool>,
     /// Index of this BO in the device-wide debugfs registry, or
     /// `NOT_REGISTERED`. Only ever touched under the registry lock.
     #[cfg(CONFIG_DEBUG_FS)]
@@ -138,6 +132,8 @@ impl gem::DriverObject for BoData {
 
     const EXPOSE_DUMB_CREATE: bool = false;
 
+    const RECLAIMABLE: bool = true;
+
     /// Constructs a new [`BoData`] instance for a GEM object.
     ///
     /// This function is called by the GEM subsystem when creating a new buffer
@@ -153,7 +149,6 @@ impl gem::DriverObject for BoData {
             flags: args.flags,
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
             label <- new_mutex!(None),
-            wc_flushed: Atomic::new(false),
             #[cfg(CONFIG_DEBUG_FS)]
             registry_slot: Atomic::new(NOT_REGISTERED),
         })
@@ -164,7 +159,6 @@ impl gem::DriverObject for BoData {
             flags: 0,
             exclusive_vm_root_gem: None,
             label <- new_mutex!(None),
-            wc_flushed: Atomic::new(false),
             #[cfg(CONFIG_DEBUG_FS)]
             registry_slot: Atomic::new(NOT_REGISTERED),
         })
@@ -175,7 +169,7 @@ impl gem::DriverObject for BoData {
             return Err(EINVAL);
         }
 
-        flush_wc_pages(obj)
+        Ok(())
     }
 
     fn mmap(obj: &Bo) -> Result {
@@ -183,7 +177,7 @@ impl gem::DriverObject for BoData {
             return Err(EPERM);
         }
 
-        flush_wc_pages(obj)
+        Ok(())
     }
 
     fn status(obj: &Bo) -> gem::ObjectStatus {
@@ -289,14 +283,10 @@ impl Drop for MappedBo {
 /// exists so the scheduler's foreign-BO sync-wait evaluator can read
 /// sync values out of user BOs without those BOs being kernel-owned.
 ///
-/// The BO must be pinned (i.e. it has at least one live GPU mapping)
-/// for the vmap to be safe.
-///
 /// The vmap's `owner` is the only GEM reference this type holds.
-/// `Drop` ships the vmap to the cleanup workqueue, so the final GEM put,
-/// whose `free_callback` tears down the cached sg table under
-/// `dma_resv_lock`, never runs on the dropping context, which may be
-/// a dma-fence signalling section.
+/// `Drop` ships the vmap to the cleanup workqueue, because unmapping it
+/// takes `dma_resv_lock`, which a dma-fence signalling section must not
+/// take.
 pub(crate) struct MappedUserBo {
     /// Taken only by `Drop` when shipping the vmap to the cleanup
     /// workqueue.
@@ -426,23 +416,6 @@ pub(crate) fn new_bo(
     Ok(bo)
 }
 
-/// Builds a write-combine BO's DMA mapping, which flushes its zeroed pages
-/// from the CPU caches before the first uncached access.
-/// Allocates and pins the backing pages for the BO's lifetime.
-fn flush_wc_pages(bo: &Bo) -> Result {
-    if !bo.map_wc() || bo.wc_flushed.load(Acquire) {
-        return Ok(());
-    }
-
-    let guard = bo.dev().registration_guard().ok_or(ENODEV)?;
-    // SAFETY: The parent device stays bound while `guard` is held.
-    let dev = unsafe { guard.as_ref().as_bound() };
-    bo.lock_resv().sg_table(dev)?;
-    bo.wc_flushed.store(true, Release);
-
-    Ok(())
-}
-
 /// Returns the DMA segments of `sgt` as `(dma_address, dma_len)` pairs.
 pub(crate) fn dma_segments(sgt: &SGTable) -> Result<KVVec<(DmaAddress, u64)>> {
     let mut segments = KVVec::new();
@@ -494,6 +467,10 @@ pub(crate) fn sync(
     }
 
     let mut resv = bo.lock_resv();
+    if !resv.is_resident() {
+        return Ok(());
+    }
+
     let sgt = resv.sg_table(dev)?;
 
     let mut offset = offset;
@@ -630,12 +607,8 @@ pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
     ///
     /// Wrapped in `ManuallyDrop` so that `Drop` can move the single
-    /// owning reference into the deferred cleanup, leaving nothing for
-    /// `drop_in_place` to release inline. The GEM object's final drop
-    /// runs `Object::free_callback`, whose cached sg-table teardown
-    /// takes `dma_resv_lock`; on the success path that must happen on
-    /// the cleanup workqueue, never on the dma-fence signalling path
-    /// that may be dropping this `KernelBo`.
+    /// owning reference into the deferred cleanup, which drops it after
+    /// the unmap.
     pub(crate) bo: ManuallyDrop<ARef<Bo>>,
     /// The GPU VM this buffer is mapped into.
     ///
@@ -779,11 +752,7 @@ impl Drop for KernelBo {
         let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
         // SAFETY: `Drop::drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `self.bo`; the field is never read
-        // again afterwards. Moving out the single owning reference here
-        // (rather than cloning) means `drop_in_place` has nothing left
-        // to release inline, so the GEM object's final drop, with its
-        // `dma_resv_lock`-taking sg-table teardown, can only run from
-        // the cleanup workqueue or the inline path below.
+        // again afterwards.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
         let pin = self.pin.take();
         let kernel_node = self.kernel_node.take();
