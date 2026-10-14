@@ -28,6 +28,7 @@ use kernel::{
     new_mutex,
     page::PAGE_SIZE,
     prelude::*,
+    scatterlist::SGTable,
     str::CString,
     sync::{
         aref::ARef,
@@ -371,12 +372,26 @@ fn flush_wc_pages(bo: &Bo) -> Result {
 
     let guard = bo.dev().registration_guard().ok_or(ENODEV)?;
     guard.registration_data_with(|reg_data| -> Result {
-        bo.sg_table(reg_data.pdev.as_ref())?;
+        bo.lock_resv().sg_table(reg_data.pdev.as_ref())?;
         Ok(())
     })?;
     bo.wc_flushed.store(true, Release);
 
     Ok(())
+}
+
+/// Returns the DMA segments of `sgt` as `(dma_address, dma_len)` pairs.
+pub(crate) fn dma_segments(sgt: &SGTable) -> Result<KVVec<(DmaAddress, u64)>> {
+    let mut segments = KVVec::new();
+    for sgt_entry in sgt.iter() {
+        // Expressly convert to u64 to work with arm 32-bit builds.
+        #[allow(clippy::useless_conversion)]
+        let len = u64::from(sgt_entry.dma_len());
+
+        segments.push((sgt_entry.dma_address(), len), GFP_KERNEL)?;
+    }
+
+    Ok(segments)
 }
 
 pub(crate) fn lookup_handle(file: &TyrDrmFile, handle: u32) -> Result<ARef<Bo>> {
@@ -415,7 +430,8 @@ pub(crate) fn sync(
         return Ok(());
     }
 
-    let sgt = bo.sg_table(dev)?;
+    let mut resv = bo.lock_resv();
+    let sgt = resv.sg_table(dev)?;
 
     let mut offset = offset;
     let mut size = size;
@@ -448,7 +464,7 @@ pub(crate) fn sync(
         // A single bidirectional sync does not both flush and invalidate on arm64,
         // so the invalidate case needs a second sync in the other direction.
         // SAFETY: `paddr` and `len` describe a sub-range of `sgt`, DMA-mapped for `dev` as
-        // DMA_BIDIRECTIONAL by `bo.sg_table(dev)` and live for this call. DMA_TO_DEVICE and
+        // DMA_BIDIRECTIONAL by `sg_table()` and live while `resv` is held. DMA_TO_DEVICE and
         // DMA_FROM_DEVICE are valid subsets of that direction.
         unsafe { sync_single_for_device(dev, paddr, len as usize, DataDirection::ToDevice) };
         if type_
