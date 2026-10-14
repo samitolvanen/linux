@@ -225,14 +225,9 @@ impl<T: DriverGpuVm> GpuVmBoAlloc<T> {
         // Note that we must call `extobj_add` even if `ptr != me` to avoid a race condition where
         // we could end up using the extobj before the thread with `ptr == me` calls extobj_add.
         if ret.gpuvm().is_extobj(ret.obj()) {
-            let resv_lock = ret.gpuvm().raw_resv();
-            // TODO: Use a proper lock guard here once a dma_resv lock abstraction exists.
-            // SAFETY: The GPUVM is still alive, so its resv lock is too.
-            unsafe { bindings::dma_resv_lock(resv_lock, ptr::null_mut()) };
+            let _resv = ret.gpuvm().root_obj().lock_resv();
             // SAFETY: We hold the GPUVMs resv lock.
             unsafe { bindings::drm_gpuvm_bo_extobj_add(ptr) };
-            // SAFETY: We took the lock, so we can unlock it.
-            unsafe { bindings::dma_resv_unlock(resv_lock) };
         }
 
         ret
