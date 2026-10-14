@@ -26,7 +26,10 @@ use kernel::{
         ExecFlags,
         Prepared, //
     },
-    drm::gem::IntoGEMObject,
+    drm::gem::{
+        BaseObject,
+        IntoGEMObject, //
+    },
     error::to_result,
     prelude::*,
     sync::aref::{
@@ -316,6 +319,14 @@ impl<T: DriverGpuVm> GpuVm<T> {
     fn raw_resv(&self) -> *mut bindings::dma_resv {
         // SAFETY: `r_obj` is immutable and valid for duration of GPUVM.
         unsafe { (*(*self.as_raw()).r_obj).resv }
+    }
+
+    /// Returns the GEM object whose reservation lock protects this GPUVM.
+    #[inline]
+    fn root_obj(&self) -> &T::Object {
+        // SAFETY: `r_obj` is immutable, points to the `T::Object` passed to `new()`, and the GPUVM
+        // holds a reference to it for its whole lifetime.
+        unsafe { T::Object::from_raw((*self.as_raw()).r_obj) }
     }
 }
 

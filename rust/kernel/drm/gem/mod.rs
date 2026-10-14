@@ -23,12 +23,19 @@ use crate::{
         ARef,
         AlwaysRefCounted, //
     },
-    types::Opaque,
+    types::{
+        NotThreadSafe,
+        Opaque, //
+    },
 };
 use core::{
+    cell::UnsafeCell,
     marker::PhantomData,
     ops::Deref,
-    ptr::NonNull, //
+    ptr::{
+        self,
+        NonNull, //
+    },
 };
 
 #[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
@@ -400,12 +407,181 @@ pub trait BaseObject: IntoGEMObject {
         // SAFETY: The arguments are valid per the type invariant.
         Ok(unsafe { bindings::drm_vma_node_offset_addr(&raw mut (*self.as_raw()).vma_node) })
     }
+
+    /// Acquires the reservation lock of the object, sleeping until it is available.
+    #[inline]
+    fn lock_resv(&self) -> ResvGuard<'_, Self> {
+        // SAFETY: The reservation object is valid for the lifetime of `self`. Without an acquire
+        // context, `dma_resv_lock()` cannot fail.
+        unsafe { bindings::dma_resv_lock(self.raw_dma_resv(), ptr::null_mut()) };
+
+        // INVARIANT: The lock was acquired above.
+        ResvGuard {
+            obj: self,
+            _not_send: NotThreadSafe,
+        }
+    }
+
+    /// Acquires the reservation lock of the object, sleeping interruptibly until it is available.
+    ///
+    /// Returns [`EINTR`] if a signal interrupts the wait.
+    #[inline]
+    fn lock_resv_interruptible(&self) -> Result<ResvGuard<'_, Self>> {
+        // SAFETY: The reservation object is valid for the lifetime of `self`.
+        to_result(unsafe {
+            bindings::dma_resv_lock_interruptible(self.raw_dma_resv(), ptr::null_mut())
+        })?;
+
+        // INVARIANT: The lock was acquired above.
+        Ok(ResvGuard {
+            obj: self,
+            _not_send: NotThreadSafe,
+        })
+    }
+
+    /// Tries to acquire the reservation lock of the object without sleeping.
+    ///
+    /// Returns `None` if the lock is already held.
+    #[inline]
+    fn try_lock_resv(&self) -> Option<ResvGuard<'_, Self>> {
+        // SAFETY: The reservation object is valid for the lifetime of `self`.
+        if !unsafe { bindings::dma_resv_trylock(self.raw_dma_resv()) } {
+            return None;
+        }
+
+        // INVARIANT: The lock was acquired above.
+        Some(ResvGuard {
+            obj: self,
+            _not_send: NotThreadSafe,
+        })
+    }
 }
 
 impl<T: IntoGEMObject> BaseObject for T {}
 
+/// A guard that holds the reservation lock of a GEM object.
+///
+/// The lock is released when the guard is dropped.
+///
+/// # Invariants
+///
+/// The current thread holds the reservation lock of `obj` for the lifetime of the guard.
+#[must_use = "the lock unlocks immediately when the guard is unused"]
+pub struct ResvGuard<'a, O: IntoGEMObject> {
+    obj: &'a O,
+    _not_send: NotThreadSafe,
+}
+
+impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
+    /// Returns the object whose reservation lock is held.
+    #[inline]
+    pub fn obj(&self) -> &'a O {
+        self.obj
+    }
+}
+
+impl<O: IntoGEMObject> Drop for ResvGuard<'_, O> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: By the type invariants, the current thread holds the lock.
+        unsafe { bindings::dma_resv_unlock(self.obj.raw_dma_resv()) };
+    }
+}
+
+/// Data protected by the reservation lock of the GEM object that contains it.
+///
+/// A [`ResvLocked`] must be stored inline in a GEM object, for example in the driver's object
+/// data. Access requires a [`ResvGuard`] of that object. A guard of any other object is rejected
+/// with [`EINVAL`].
+pub struct ResvLocked<T> {
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: `ResvLocked` serializes the interior mutability it provides with the reservation lock,
+// so it is `Sync` as long as the data it protects is `Send`.
+unsafe impl<T: Send> Sync for ResvLocked<T> {}
+
+impl<T> ResvLocked<T> {
+    /// Creates a new [`ResvLocked`] holding `data`.
+    #[inline]
+    pub const fn new(data: T) -> Self {
+        Self {
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    /// Returns a reference to the data, given a guard of the object that contains `self`.
+    pub fn access<'a, O: IntoGEMObject>(&'a self, guard: &'a ResvGuard<'_, O>) -> Result<&'a T> {
+        self.check_owner(guard.obj)?;
+
+        // SAFETY: `self` lies within the object of `guard`, as checked above.
+        Ok(unsafe { self.access_unchecked(guard) })
+    }
+
+    /// Returns a mutable reference to the data, given a guard of the object that contains `self`.
+    pub fn access_mut<'a, O: IntoGEMObject>(
+        &'a self,
+        guard: &'a mut ResvGuard<'_, O>,
+    ) -> Result<&'a mut T> {
+        self.check_owner(guard.obj)?;
+
+        // SAFETY: `self` lies within the object of `guard`, as checked above.
+        Ok(unsafe { self.access_unchecked_mut(guard) })
+    }
+
+    /// Returns a reference to the data without checking the object of the guard.
+    ///
+    /// # Safety
+    ///
+    /// `self` lies within the object of the guard.
+    #[inline]
+    pub(crate) unsafe fn access_unchecked<'a, O: IntoGEMObject>(
+        &'a self,
+        _guard: &'a ResvGuard<'_, O>,
+    ) -> &'a T {
+        // SAFETY: Per the safety requirements, the guard holds the reservation lock of the object
+        // that contains `self`. Mutable access needs a mutable borrow of that guard, so the data
+        // is not mutated while the returned reference exists.
+        unsafe { &*self.data.get() }
+    }
+
+    /// Returns a mutable reference to the data without checking the object of the guard.
+    ///
+    /// # Safety
+    ///
+    /// `self` lies within the object of the guard.
+    #[inline]
+    pub(crate) unsafe fn access_unchecked_mut<'a, O: IntoGEMObject>(
+        &'a self,
+        _guard: &'a mut ResvGuard<'_, O>,
+    ) -> &'a mut T {
+        // SAFETY: Per the safety requirements, the guard holds the reservation lock of the object
+        // that contains `self`, and is mutably borrowed for the lifetime of the returned
+        // reference, so no other reference to the data exists.
+        unsafe { &mut *self.data.get() }
+    }
+
+    /// Returns a mutable reference to the data.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
+    /// Checks that `self` lies within `obj`.
+    fn check_owner<O>(&self, obj: &O) -> Result {
+        let end = ptr::from_ref(self)
+            .addr()
+            .checked_sub(ptr::from_ref(obj).addr())
+            .and_then(|offset| offset.checked_add(size_of::<Self>()));
+
+        match end {
+            Some(end) if end <= size_of::<O>() => Ok(()),
+            _ => Err(EINVAL),
+        }
+    }
+}
+
 /// Crate-private base operations shared by all GEM object classes.
-#[cfg_attr(not(CONFIG_RUST_DRM_GEM_SHMEM_HELPER), expect(unused))]
 pub(crate) trait BaseObjectPrivate: IntoGEMObject {
     /// Return a pointer to this object's dma_resv.
     fn raw_dma_resv(&self) -> *mut bindings::dma_resv {
