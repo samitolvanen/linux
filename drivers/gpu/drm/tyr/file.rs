@@ -164,6 +164,7 @@ fn validate_bind_op(
                 return Err(EINVAL);
             }
 
+            file.inner().vm_pool().pin_sparse_bo()?;
             return Ok(Some(vm.sparse_bo().ok_or(EINVAL)?.into()));
         }
 

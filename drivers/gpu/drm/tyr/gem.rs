@@ -572,6 +572,8 @@ pub(crate) struct KernelBo {
     /// `ManuallyDrop` so `Drop` can move the reference into
     /// `kernel_bo_unmap`.
     vm: ManuallyDrop<Arc<Vm>>,
+    /// Keeps the pages of `bo` in memory. Taken by `Drop`.
+    pin: Option<shmem::PinGuard<BoData>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`. Dropped from the
@@ -641,6 +643,7 @@ impl KernelBo {
             },
         )?;
 
+        let pin = bo.lock_resv().pin()?;
         vm.map_bo_range(dev, &bo, 0, size, va, flags, pt_gfp)?;
 
         let usage = GEM_USAGE_KERNEL | if vm.is_fw() { GEM_USAGE_FW_MAPPED } else { 0 };
@@ -649,6 +652,7 @@ impl KernelBo {
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
             vm: ManuallyDrop::new(vm),
+            pin: Some(pin),
             va_range: va..va_end,
             kernel_node: None,
             handoff,
@@ -690,6 +694,7 @@ impl KernelBo {
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
+    pin: Option<shmem::PinGuard<BoData>>,
     va_range: Range<u64>,
     /// Kernel-VA pool reservation, held until the deferred unmap has
     /// torn down the GPU PTEs.
@@ -706,11 +711,13 @@ impl Drop for KernelBo {
         // `ManuallyDrop::take` of `self.bo`, and the field is never
         // read again afterwards.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
+        let pin = self.pin.take();
         let kernel_node = self.kernel_node.take();
 
         let captures = KernelBoCleanup {
             vm,
             bo,
+            pin,
             va_range,
             kernel_node,
         };
@@ -731,6 +738,7 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
         bo,
+        pin,
         va_range,
         kernel_node,
     } = captures;
@@ -746,6 +754,14 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
             );
         })
         .is_ok();
+
+    if unmapped {
+        drop(pin);
+    } else {
+        // A live mapping may still cover the BO, so keep its pages pinned.
+        core::mem::forget(pin);
+    }
+
     drop(bo);
     release_kernel_va(kernel_node, unmapped);
 }
