@@ -183,6 +183,8 @@ impl<T: DriverObject> Object<T> {
         open: Some(Self::vm_open_callback),
         close: Some(Self::vm_close_callback),
         fault: Some(Self::fault_callback),
+        #[cfg(CONFIG_ARCH_SUPPORTS_PMD_PFNMAP)]
+        huge_fault: Some(Self::huge_fault_callback),
         ..pin_init::zeroed()
     };
 
@@ -550,15 +552,28 @@ impl<T: DriverObject> Object<T> {
     extern "C" fn fault_callback(vmf: *mut bindings::vm_fault) -> bindings::vm_fault_t {
         // SAFETY: These operations are only installed for mappings of `Self`, and the VM core
         // passes a valid fault.
-        unsafe { Self::handle_fault(vmf) }
+        unsafe { Self::handle_fault(vmf, 0) }
     }
 
-    /// Handles a fault on a userspace mapping of the object.
+    #[cfg(CONFIG_ARCH_SUPPORTS_PMD_PFNMAP)]
+    extern "C" fn huge_fault_callback(
+        vmf: *mut bindings::vm_fault,
+        order: c_uint,
+    ) -> bindings::vm_fault_t {
+        if order != bindings::PMD_ORDER {
+            return bindings::vm_fault_reason_VM_FAULT_FALLBACK;
+        }
+
+        // SAFETY: As above.
+        unsafe { Self::handle_fault(vmf, order) }
+    }
+
+    /// Handles a fault of `order` on a userspace mapping of the object.
     ///
     /// # Safety
     ///
     /// `vmf` is a valid fault on a mapping of an object of type `Self`.
-    unsafe fn handle_fault(vmf: *mut bindings::vm_fault) -> bindings::vm_fault_t {
+    unsafe fn handle_fault(vmf: *mut bindings::vm_fault, order: c_uint) -> bindings::vm_fault_t {
         // SAFETY: Per the safety requirements, `vmf` is valid and `vma` maps an object of type
         // `Self`. A fault holds the mmap lock or the VMA lock.
         let (obj, vma, pgoff, flags) = unsafe {
@@ -587,7 +602,7 @@ impl<T: DriverObject> Object<T> {
         if let Some(resv) = obj.try_lock_resv().filter(|resv| resv.holds_pages()) {
             // SAFETY: Per the safety requirements, `vmf` is a valid fault on `vma`. `index` is a
             // page of the object, and the sg table holds the pages.
-            return unsafe { resv.insert_page(vmf, vma, index) };
+            return unsafe { resv.insert_page(vmf, vma, order, index) };
         }
 
         if flags & bindings::fault_flag_FAULT_FLAG_ALLOW_RETRY != 0
@@ -619,7 +634,7 @@ impl<T: DriverObject> Object<T> {
         match obj.lock_for_fault() {
             // SAFETY: `vmf` is a valid fault on `vma`, `index` is a page of the object, and
             // `lock_for_fault()` made the sg table hold the pages.
-            Ok(resv) => unsafe { resv.insert_page(vmf, vma, index) },
+            Ok(resv) => unsafe { resv.insert_page(vmf, vma, order, index) },
             Err(ret) => ret,
         }
     }
@@ -929,7 +944,7 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
             .map(|_| ())
     }
 
-    /// Maps page `index` of the object at the faulting address.
+    /// Maps page `index` of the object for a fault of `order`.
     ///
     /// # Safety
     ///
@@ -939,6 +954,7 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
         &self,
         vmf: *mut bindings::vm_fault,
         vma: &VmaRef,
+        order: c_uint,
         index: usize,
     ) -> bindings::vm_fault_t {
         // SAFETY: Per the safety requirements, `vmf` is valid.
@@ -956,7 +972,41 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
 
         // The pages stay valid until the sg table releases its reference, which first removes
         // the userspace mappings.
-        vma.vmf_insert_pfn_prot(address, page.pfn(), vma.vm_page_prot())
+        if order == 0 {
+            return vma.vmf_insert_pfn_prot(address, page.pfn(), vma.vm_page_prot());
+        }
+
+        #[cfg(CONFIG_ARCH_SUPPORTS_PMD_PFNMAP)]
+        {
+            let pmd_size = bindings::PMD_SIZE;
+            let pmd_pages = pmd_size >> PAGE_SHIFT;
+            let pmd_start = address & !(pmd_size - 1);
+
+            // The PMD must stay within the VMA and map the page at `address`.
+            let in_range = vma.start() <= pmd_start
+                && pmd_start
+                    .checked_add(pmd_size)
+                    .is_some_and(|end| end <= vma.end());
+            let aligned = (address >> PAGE_SHIFT) & (pmd_pages - 1) == page.pfn() & (pmd_pages - 1);
+
+            // SAFETY: `page` is a valid page.
+            let folio = unsafe { bindings::page_folio(page.as_ptr()) };
+
+            // SAFETY: `folio` is the valid folio of `page`.
+            if in_range && aligned && unsafe { bindings::folio_test_pmd_mappable(folio) } {
+                // SAFETY: `vmf` is valid, and the PMD maps the folio of `page`, which the pages
+                // of the object hold.
+                return unsafe {
+                    bindings::vmf_insert_pfn_pmd(
+                        vmf,
+                        page.pfn() & !(pmd_pages - 1),
+                        (*vmf).flags & bindings::fault_flag_FAULT_FLAG_WRITE != 0,
+                    )
+                };
+            }
+        }
+
+        bindings::vm_fault_reason_VM_FAULT_FALLBACK
     }
 
     /// Returns whether the sg table of the object holds a reference to its pages.
