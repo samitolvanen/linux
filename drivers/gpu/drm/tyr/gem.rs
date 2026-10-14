@@ -32,11 +32,6 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
-        atomic::{
-            Acquire,
-            Atomic,
-            Release, //
-        },
         Arc,
         Mutex, //
     },
@@ -79,9 +74,6 @@ pub(crate) struct BoData {
     /// User-assigned label.
     #[pin]
     label: Mutex<Option<CString>>,
-    /// Set once `flush_wc_pages` has built the DMA mapping. The pages stay
-    /// pinned until the BO is freed, even after unbind frees the mapping.
-    wc_flushed: Atomic<bool>,
     /// Link to the device-wide `gems` debugfs registry.
     gem_link: GemLink,
 }
@@ -123,12 +115,13 @@ impl gem::DriverObject for BoData {
 
     const EXPOSE_DUMB_CREATE: bool = false;
 
+    const RECLAIMABLE: bool = true;
+
     fn new(dev: &TyrDrmDevice, _size: usize, args: BoCreateArgs) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             flags: args.flags,
             exclusive_vm_root_gem: args.exclusive_vm_root_gem,
             label <- new_mutex!(None),
-            wc_flushed: Atomic::new(false),
             gem_link: GemLink::new(&dev.gem_registry),
         })
     }
@@ -138,7 +131,6 @@ impl gem::DriverObject for BoData {
             flags: 0,
             exclusive_vm_root_gem: None,
             label <- new_mutex!(None),
-            wc_flushed: Atomic::new(false),
             gem_link: GemLink::new(&dev.gem_registry),
         })
     }
@@ -148,7 +140,7 @@ impl gem::DriverObject for BoData {
             return Err(EINVAL);
         }
 
-        flush_wc_pages(obj)
+        Ok(())
     }
 
     fn mmap(obj: &Bo) -> Result {
@@ -156,7 +148,7 @@ impl gem::DriverObject for BoData {
             return Err(EPERM);
         }
 
-        flush_wc_pages(obj)
+        Ok(())
     }
 
     fn status(obj: &Bo) -> gem::ObjectStatus {
@@ -205,14 +197,10 @@ impl core::ops::Deref for MappedBo {
 
 /// An owned CPU mapping of a GPU buffer object.
 ///
-/// The BO must be pinned (i.e. it has at least one live GPU mapping)
-/// for the vmap to be safe.
-///
 /// The vmap's `owner` is the only GEM reference this type holds.
-/// `Drop` ships the vmap to the cleanup workqueue, so the final GEM put,
-/// whose `free_callback` tears down the cached sg table under
-/// `dma_resv_lock`, never runs on the dropping context, which may be
-/// a dma-fence signalling section.
+/// `Drop` passes the vmap to the cleanup workqueue, because unmapping it
+/// takes `dma_resv_lock`, which a dma-fence signalling section must not
+/// take.
 pub(crate) struct BoVmap {
     /// Taken only by `Drop` when passing the vmap to the cleanup
     /// workqueue.
@@ -362,24 +350,6 @@ pub(crate) fn new_bo(
     Ok(bo)
 }
 
-/// Builds a write-combine BO's DMA mapping, which flushes its zeroed pages
-/// from the CPU caches before the first uncached access.
-/// Allocates and pins the backing pages for the BO's lifetime.
-fn flush_wc_pages(bo: &Bo) -> Result {
-    if !bo.map_wc() || bo.wc_flushed.load(Acquire) {
-        return Ok(());
-    }
-
-    let guard = bo.dev().registration_guard().ok_or(ENODEV)?;
-    guard.registration_data_with(|reg_data| -> Result {
-        bo.lock_resv().sg_table(reg_data.pdev.as_ref())?;
-        Ok(())
-    })?;
-    bo.wc_flushed.store(true, Release);
-
-    Ok(())
-}
-
 /// Returns the DMA segments of `sgt` as `(dma_address, dma_len)` pairs.
 pub(crate) fn dma_segments(sgt: &SGTable) -> Result<KVVec<(DmaAddress, u64)>> {
     let mut segments = KVVec::new();
@@ -431,6 +401,10 @@ pub(crate) fn sync(
     }
 
     let mut resv = bo.lock_resv();
+    if !resv.is_resident() {
+        return Ok(());
+    }
+
     let sgt = resv.sg_table(dev)?;
 
     let mut offset = offset;
@@ -562,10 +536,7 @@ pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
     ///
     /// Wrapped in `ManuallyDrop` so `Drop` can move the single owning
-    /// reference into `kernel_bo_unmap`. The GEM object's final drop
-    /// runs `Object::free_callback`, whose cached sg-table teardown
-    /// takes `dma_resv_lock`, so it must not run on the dma-fence
-    /// signalling path that may be dropping this `KernelBo`.
+    /// reference into `kernel_bo_unmap`, which drops it after the unmap.
     bo: ManuallyDrop<ARef<Bo>>,
     /// The GPU VM this buffer is mapped into.
     ///
