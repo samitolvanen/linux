@@ -36,7 +36,10 @@ use kernel::{
             ExecFlag,
             Prepared, //
         },
-        gem::BaseObject,
+        gem::{
+            shmem,
+            BaseObject, //
+        },
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
@@ -89,7 +92,8 @@ use kernel::{
         ArcBorrow,
         LockClassKey,
         Mutex,
-        MutexGuard, //
+        MutexGuard,
+        SetOnce, //
     },
     types::ScopeGuard,
     uapi,
@@ -109,7 +113,10 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     gem,
-    gem::Bo,
+    gem::{
+        Bo,
+        BoData, //
+    },
     gpu::GpuInfo,
     heap,
     mmu::{
@@ -151,6 +158,8 @@ pub(crate) struct Pool {
     entries: ObjectPool<Vm>,
     /// Buffer object that backs the sparse mappings of every VM in this pool.
     sparse_bo: ARef<Bo>,
+    /// Keeps the pages of `sparse_bo` in memory from its first sparse mapping.
+    sparse_pin: SetOnce<shmem::PinGuard<BoData>>,
 }
 
 impl Pool {
@@ -158,7 +167,20 @@ impl Pool {
         Ok(Self {
             entries: ObjectPool::create(MAX_VMS_PER_POOL)?,
             sparse_bo: gem::new_sparse_bo(ddev, ddev.coherent)?,
+            sparse_pin: SetOnce::new(),
         })
+    }
+
+    /// Pins the pages of the BO that backs sparse mappings, unless already pinned.
+    pub(crate) fn pin_sparse_bo(&self) -> Result {
+        if self.sparse_pin.as_ref().is_none() {
+            let pin = self.sparse_bo.lock_resv().pin()?;
+
+            // A concurrent caller may have pinned it first, which drops this pin.
+            self.sparse_pin.populate(pin);
+        }
+
+        Ok(())
     }
 
     fn create_vm_range(
