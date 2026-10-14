@@ -35,6 +35,15 @@ use crate::{
         IoCapable,
         IoKnownSize, //
     },
+    mm::virt::{
+        flags as vm_flags,
+        VmaNew,
+        VmaRef, //
+    },
+    page::{
+        BorrowedPage,
+        PAGE_SHIFT, //
+    },
     prelude::*,
     scatterlist,
     sync::{
@@ -107,6 +116,8 @@ pub struct Object<T: DriverObject> {
     parent_resv_obj: Option<ARef<Object<T>>>,
     /// Devres object for unmapping the SGTable on driver-unbind, set when the table is created.
     sgt_res: ManuallyDrop<ResvLocked<Option<Devres<SgtDma>>>>,
+    /// Mapping state, protected by the reservation lock.
+    map_state: ResvLocked<MapState>,
     /// Copy of `drm_gem_shmem_object::map_wc`, whose storage is shared with flags that change
     /// under the reservation lock.
     map_wc: bool,
@@ -154,10 +165,25 @@ impl<T: DriverObject> Object<T> {
         mmap: Some(Self::mmap_callback),
         status: Some(super::status_callback::<T>),
         rss: None,
-        #[allow(unused_unsafe, reason = "Safe since Rust 1.82.0")]
-        // SAFETY: `drm_gem_shmem_vm_ops` is a valid, static const on the C side.
-        vm_ops: unsafe { &raw const bindings::drm_gem_shmem_vm_ops },
+        vm_ops: if T::RECLAIMABLE {
+            ptr::from_ref(&Self::RECLAIMABLE_VM_OPS)
+        } else {
+            #[allow(unused_unsafe, reason = "Safe since Rust 1.82.0")]
+            // SAFETY: `drm_gem_shmem_vm_ops` is a valid, static const on the C side.
+            unsafe {
+                &raw const bindings::drm_gem_shmem_vm_ops
+            }
+        },
         evict: None,
+    };
+
+    /// `vm_operations_struct` for objects with [`DriverObject::RECLAIMABLE`] set, whose
+    /// userspace mappings do not hold the pages.
+    const RECLAIMABLE_VM_OPS: bindings::vm_operations_struct = bindings::vm_operations_struct {
+        open: Some(Self::vm_open_callback),
+        close: Some(Self::vm_close_callback),
+        fault: Some(Self::fault_callback),
+        ..pin_init::zeroed()
     };
 
     /// Return a raw pointer to the embedded drm_gem_shmem_object.
@@ -198,6 +224,7 @@ impl<T: DriverObject> Object<T> {
                 parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
                 map_wc: config.map_wc,
                 sgt_res: ManuallyDrop::new(ResvLocked::new(None)),
+                map_state: ResvLocked::new(MapState { mmap_count: 0 }),
                 inner <- T::new(dev, size, args),
             }),
             GFP_KERNEL,
@@ -264,6 +291,7 @@ impl<T: DriverObject> Object<T> {
                 parent_resv_obj: None,
                 map_wc: false,
                 sgt_res: ManuallyDrop::new(ResvLocked::new(None)),
+                map_state: ResvLocked::new(MapState { mmap_count: 0 }),
                 inner <- T::create_imported(dev, size),
             }),
             GFP_KERNEL,
@@ -421,9 +449,198 @@ impl<T: DriverObject> Object<T> {
             return e.to_errno();
         }
 
+        if T::RECLAIMABLE && !obj.is_imported() {
+            // SAFETY: `mmap_callback` is only installed in the vtable of `Self`.
+            let this: &Self = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+            // SAFETY: `vma` is the VMA the DRM core is setting up for `this`.
+            return match unsafe { this.mmap_reclaimable(vma) } {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            };
+        }
+
         // SAFETY: `raw_obj` is a valid shmem GEM object (see above), and `vma` is the VMA the DRM
         // core is setting up for it.
         unsafe { bindings::drm_gem_shmem_object_mmap(raw_obj, vma) }
+    }
+
+    /// Sets up a userspace mapping that does not hold the pages of the object.
+    ///
+    /// # Safety
+    ///
+    /// `vma` is a VMA of `self` that the DRM core is setting up, and no other thread can access it
+    /// yet.
+    unsafe fn mmap_reclaimable(&self, vma: *mut bindings::vm_area_struct) -> Result {
+        // SAFETY: Per the safety requirements, `vma` is undergoing its initial setup.
+        let new_vma = unsafe { VmaNew::from_raw(vma) };
+        let flags = new_vma.flags();
+
+        if flags & (vm_flags::SHARED | vm_flags::MAYWRITE) == vm_flags::MAYWRITE {
+            return Err(EINVAL);
+        }
+
+        new_vma.set_dontexpand();
+        new_vma.set_dontdump();
+
+        // SAFETY: Per the safety requirements, `vma` is valid and only accessed by this thread.
+        // Mappings of `self` never have `VM_MIXEDMAP` set.
+        unsafe {
+            (*vma).__bindgen_anon_2.vm_flags |= vm_flags::PFNMAP;
+
+            if self.map_wc() {
+                (*vma).vm_page_prot = bindings::pgprot_writecombine((*vma).vm_page_prot);
+            }
+        }
+
+        self.update_mmap_count(true);
+        Ok(())
+    }
+
+    /// Records that a userspace mapping of the object was added or removed.
+    fn update_mmap_count(&self, add: bool) {
+        let mut resv = self.lock_resv();
+        let before = resv.residency();
+
+        let state = resv.map_state_mut();
+        let count = if add {
+            state.mmap_count.checked_add(1)
+        } else {
+            state.mmap_count.checked_sub(1)
+        };
+
+        crate::warn_on!(count.is_none());
+        if let Some(count) = count {
+            state.mmap_count = count;
+        }
+
+        resv.notify_residency(before);
+    }
+
+    /// Returns the object that `vma` maps.
+    ///
+    /// # Safety
+    ///
+    /// `vma` is a valid mapping of an object of type `Self` for `'a`.
+    unsafe fn from_vma<'a>(vma: *mut bindings::vm_area_struct) -> &'a Self {
+        // SAFETY: The DRM core stores the mapped object in `vm_private_data`, and each VMA holds
+        // a reference to it.
+        unsafe { IntoGEMObject::from_raw((*vma).vm_private_data.cast()) }
+    }
+
+    extern "C" fn vm_open_callback(vma: *mut bindings::vm_area_struct) {
+        // SAFETY: These operations are only installed for mappings of `Self`.
+        let obj = unsafe { Self::from_vma(vma) };
+        obj.update_mmap_count(true);
+
+        // SAFETY: `vma` is a valid mapping of a GEM object.
+        unsafe { bindings::drm_gem_vm_open(vma) };
+    }
+
+    extern "C" fn vm_close_callback(vma: *mut bindings::vm_area_struct) {
+        // SAFETY: These operations are only installed for mappings of `Self`.
+        let obj = unsafe { Self::from_vma(vma) };
+        obj.update_mmap_count(false);
+
+        // SAFETY: `vma` is a valid mapping of a GEM object. This drops the reference of the
+        // mapping, so `obj` is not used afterward.
+        unsafe { bindings::drm_gem_vm_close(vma) };
+    }
+
+    extern "C" fn fault_callback(vmf: *mut bindings::vm_fault) -> bindings::vm_fault_t {
+        // SAFETY: These operations are only installed for mappings of `Self`, and the VM core
+        // passes a valid fault.
+        unsafe { Self::handle_fault(vmf) }
+    }
+
+    /// Handles a fault on a userspace mapping of the object.
+    ///
+    /// # Safety
+    ///
+    /// `vmf` is a valid fault on a mapping of an object of type `Self`.
+    unsafe fn handle_fault(vmf: *mut bindings::vm_fault) -> bindings::vm_fault_t {
+        // SAFETY: Per the safety requirements, `vmf` is valid and `vma` maps an object of type
+        // `Self`. A fault holds the mmap lock or the VMA lock.
+        let (obj, vma, pgoff, flags) = unsafe {
+            let vma = (*vmf).__bindgen_anon_1.vma;
+            (
+                Self::from_vma(vma),
+                VmaRef::from_raw(vma),
+                (*vmf).__bindgen_anon_1.pgoff,
+                (*vmf).flags,
+            )
+        };
+
+        // `vm_pgoff` moves when a VMA is split, so index from the object's mmap offset.
+        // SAFETY: The mmap offset of a mapped object exists, and it does not change until the
+        // object is freed.
+        let start = unsafe { (*obj.as_raw()).vma_node.vm_node.start };
+        let index = u64::try_from(pgoff)
+            .ok()
+            .and_then(|pgoff| pgoff.checked_sub(start))
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|&index| index < obj.size() >> PAGE_SHIFT);
+        let Some(index) = index else {
+            return bindings::vm_fault_reason_VM_FAULT_SIGBUS;
+        };
+
+        if let Some(resv) = obj.try_lock_resv().filter(|resv| resv.holds_pages()) {
+            // SAFETY: Per the safety requirements, `vmf` is a valid fault on `vma`. `index` is a
+            // page of the object, and the sg table holds the pages.
+            return unsafe { resv.insert_page(vmf, vma, index) };
+        }
+
+        if flags & bindings::fault_flag_FAULT_FLAG_ALLOW_RETRY != 0
+            && flags & bindings::fault_flag_FAULT_FLAG_TRIED == 0
+        {
+            if flags & bindings::fault_flag_FAULT_FLAG_RETRY_NOWAIT != 0 {
+                return bindings::vm_fault_reason_VM_FAULT_RETRY;
+            }
+
+            let obj = ARef::from(obj);
+
+            // The file keeps the device and the module alive after the fault lock is released.
+            // SAFETY: The fault lock keeps `vma` valid, and `vma` holds a reference to its file.
+            let file = unsafe { bindings::get_file((*vma.as_ptr()).vm_file) };
+
+            // SAFETY: The fault holds the lock that `vmf` describes, and its flags allow releasing
+            // it before returning `VM_FAULT_RETRY`. Only `obj` and `file` are used afterward.
+            unsafe { bindings::release_fault_lock(vmf) };
+
+            // The retried fault maps the page.
+            let _ = obj.lock_for_fault();
+            drop(obj);
+
+            // SAFETY: `file` holds the reference taken above.
+            unsafe { bindings::fput(file) };
+            return bindings::vm_fault_reason_VM_FAULT_RETRY;
+        }
+
+        match obj.lock_for_fault() {
+            // SAFETY: `vmf` is a valid fault on `vma`, `index` is a page of the object, and
+            // `lock_for_fault()` made the sg table hold the pages.
+            Ok(resv) => unsafe { resv.insert_page(vmf, vma, index) },
+            Err(ret) => ret,
+        }
+    }
+
+    /// Takes the reservation lock for a fault, and makes the pages of the object present.
+    fn lock_for_fault(&self) -> Result<ResvGuard<'_, Self>, bindings::vm_fault_t> {
+        let reg = self.dev().registration_guard();
+        let Ok(mut resv) = self.lock_resv_interruptible() else {
+            return Err(bindings::vm_fault_reason_VM_FAULT_NOPAGE);
+        };
+
+        // Once the device is unbound, only pages that the object still holds can be mapped.
+        let present = match &reg {
+            Some(reg) => resv.sg_table(Self::bound_parent(reg)).is_ok(),
+            None => resv.holds_pages(),
+        };
+        if !present {
+            return Err(bindings::vm_fault_reason_VM_FAULT_SIGBUS);
+        }
+
+        Ok(resv)
     }
 
     /// Returns a registration guard if mapping the object for CPU access needs the bound device.
@@ -712,10 +929,54 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
             .map(|_| ())
     }
 
+    /// Maps page `index` of the object at the faulting address.
+    ///
+    /// # Safety
+    ///
+    /// `vmf` is a valid fault on `vma`, `index` is a page of the object, and the sg table of the
+    /// object holds its pages.
+    unsafe fn insert_page(
+        &self,
+        vmf: *mut bindings::vm_fault,
+        vma: &VmaRef,
+        index: usize,
+    ) -> bindings::vm_fault_t {
+        // SAFETY: Per the safety requirements, `vmf` is valid.
+        let address = unsafe { (*vmf).__bindgen_anon_1.address };
+
+        // SAFETY: We hold the reservation lock and the sg table holds the pages, so `pages` holds
+        // `size >> PAGE_SHIFT` valid entries.
+        let page = unsafe { *(*self.obj().as_raw_shmem()).pages.add(index) };
+        let Some(page) = NonNull::new(page) else {
+            return bindings::vm_fault_reason_VM_FAULT_SIGBUS;
+        };
+
+        // SAFETY: The page stays valid while the reservation lock is held.
+        let page = unsafe { BorrowedPage::from_raw(page) };
+
+        // The pages stay valid until the sg table releases its reference, which first removes
+        // the userspace mappings.
+        vma.vmf_insert_pfn_prot(address, page.pfn(), vma.vm_page_prot())
+    }
+
     /// Returns whether the sg table of the object holds a reference to its pages.
     fn holds_pages(&self) -> bool {
         // SAFETY: `sgt_res` lies within the object whose lock `self` holds.
         unsafe { self.obj().sgt_res.access_unchecked(self) }.is_some()
+    }
+
+    /// Returns the mapping state of the object.
+    fn map_state(&self) -> &MapState {
+        // SAFETY: `map_state` lies within the object whose lock `self` holds.
+        unsafe { self.obj().map_state.access_unchecked(self) }
+    }
+
+    /// Returns the mapping state of the object for updating.
+    fn map_state_mut(&mut self) -> &mut MapState {
+        let obj = self.obj();
+
+        // SAFETY: `map_state` lies within `obj`, whose lock `self` holds.
+        unsafe { obj.map_state.access_unchecked_mut(self) }
     }
 
     /// Returns the residency of the object.
@@ -733,6 +994,7 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
         Residency {
             resident: !pages.is_null(),
             pinned: pin_count.load(Relaxed) != 0,
+            mapped: self.map_state().mmap_count != 0,
         }
     }
 
@@ -749,7 +1011,8 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
 
         let obj = self.obj();
         if after.resident && !before.resident {
-            // The device may write to the pages, so any put that releases them marks them dirty.
+            // The device and userspace mappings may write to the pages untracked, so any put that
+            // releases them marks them dirty.
             // SAFETY: We hold the reservation lock, which protects the flag.
             unsafe {
                 bindings::drm_gem_shmem_object::set_pages_mark_dirty_on_put_raw(
@@ -769,11 +1032,18 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
     }
 }
 
+/// Mapping state of an [`Object`], protected by its reservation lock.
+struct MapState {
+    /// Number of userspace mappings of an object with [`DriverObject::RECLAIMABLE`] set.
+    mmap_count: usize,
+}
+
 /// The residency state that [`DriverObject::residency_changed`] reports on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Residency {
     resident: bool,
     pinned: bool,
+    mapped: bool,
 }
 
 /// A pin on the pages of a shmem-backed GEM object.
