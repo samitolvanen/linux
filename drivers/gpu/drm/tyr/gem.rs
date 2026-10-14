@@ -571,6 +571,8 @@ pub(crate) struct KernelBo {
     /// `ManuallyDrop` so `Drop` can move the reference into
     /// `KernelBoCleanup`.
     vm: ManuallyDrop<Arc<Vm>>,
+    /// Keeps the pages of `bo` in memory. Taken by `Drop`.
+    pin: Option<shmem::PinGuard<BoData>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`. Dropped from the
@@ -641,6 +643,7 @@ impl KernelBo {
             },
         )?;
 
+        let pin = bo.lock_resv().pin()?;
         vm.map_bo_range(dev, &bo, 0, size, va, flags, pt_gfp)?;
 
         let usage = GEM_USAGE_KERNEL | if vm.is_fw() { GEM_USAGE_FW_MAPPED } else { 0 };
@@ -649,6 +652,7 @@ impl KernelBo {
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
             vm: ManuallyDrop::new(vm),
+            pin: Some(pin),
             va_range: va..va_end,
             kernel_node: None,
             handoff,
@@ -689,6 +693,7 @@ impl KernelBo {
 /// The captures that `KernelBo::drop` passes to the unmap.
 pub(crate) struct KernelBoCleanup {
     bo: ARef<Bo>,
+    pin: Option<shmem::PinGuard<BoData>>,
     /// Declared after `bo`, since the VM may hold the last device reference.
     vm: Arc<Vm>,
     va_range: Range<u64>,
@@ -698,10 +703,11 @@ pub(crate) struct KernelBoCleanup {
 }
 
 impl KernelBoCleanup {
-    /// Tears down the mapping, then releases the VA reservation.
+    /// Tears down the mapping, then releases the pin and the VA reservation.
     fn unmap(&mut self) -> Result {
         self.vm
             .unmap_exact(self.va_range.start, va_range_size(&self.va_range))?;
+        self.pin = None;
         self.kernel_node = None;
         Ok(())
     }
@@ -732,7 +738,10 @@ impl KernelBoCleanup {
 
 impl Drop for KernelBoCleanup {
     fn drop(&mut self) {
-        // The unmap failed, and the live mapping still covers the address.
+        // The unmap failed, and the live mapping still covers the BO and its VA.
+        if let Some(pin) = self.pin.take() {
+            core::mem::forget(pin);
+        }
         if let Some(node) = self.kernel_node.take() {
             node.leak();
         }
@@ -749,11 +758,13 @@ impl Drop for KernelBo {
         // `ManuallyDrop::take` of `self.bo`, and the field is never
         // read again afterward.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
+        let pin = self.pin.take();
         let kernel_node = self.kernel_node.take();
 
         let captures = KernelBoCleanup {
             vm,
             bo,
+            pin,
             va_range,
             kernel_node,
         };
