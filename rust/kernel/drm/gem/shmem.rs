@@ -534,6 +534,54 @@ impl<T: DriverObject> ResvGuard<'_, Object<T>> {
         // `obj` has no references. Driver unbind does not unmap the table while `dev` is bound.
         Ok(unsafe { scatterlist::SGTable::from_raw(sgt) })
     }
+
+    /// Pins the pages of the object, or does nothing if the object is imported.
+    ///
+    /// Allocates the pages if needed. The pages of an imported object belong to the exporter.
+    pub fn pin(&self) -> Result<PinGuard<T>> {
+        let obj = self.obj();
+        if !obj.is_imported() {
+            // SAFETY: We hold the reservation lock of an object that is not imported.
+            to_result(unsafe { bindings::drm_gem_shmem_pin_locked(obj.as_raw_shmem()) })?;
+        }
+
+        // INVARIANT: The object was pinned above, unless it is imported.
+        Ok(PinGuard { obj: obj.into() })
+    }
+}
+
+/// A pin on the pages of a shmem-backed GEM object.
+///
+/// The pages stay in memory until the guard is dropped. Dropping the guard takes the reservation
+/// lock of the object.
+///
+/// # Invariants
+///
+/// `obj` holds a pin on its pages for the lifetime of the guard, unless it is imported.
+pub struct PinGuard<T: DriverObject> {
+    obj: ARef<Object<T>>,
+}
+
+impl<T: DriverObject> PinGuard<T> {
+    /// Returns the pinned object.
+    #[inline]
+    pub fn obj(&self) -> &Object<T> {
+        &self.obj
+    }
+}
+
+impl<T: DriverObject> Drop for PinGuard<T> {
+    fn drop(&mut self) {
+        if self.obj.is_imported() {
+            return;
+        }
+
+        let _resv = self.obj.lock_resv();
+
+        // SAFETY: We hold the reservation lock, and by the type invariants the object holds the
+        // pin released here.
+        unsafe { bindings::drm_gem_shmem_unpin_locked(self.obj.as_raw_shmem()) };
+    }
 }
 
 impl<T: DriverObject> Deref for Object<T> {
@@ -1165,6 +1213,27 @@ mod tests {
 
         let guard = obj.try_lock_resv().ok_or(EBUSY)?;
         assert_eq!(*obj.value.access(&guard)?, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn pin_guards() -> Result {
+        let dev = faux::Registration::new(c"Kunit", None)?;
+        let drm = create_drm_dev(&dev)?;
+
+        let cfg_ = ObjectConfig::<KunitObject> {
+            map_wc: false,
+            parent_resv_obj: None,
+        };
+        let obj = Object::<KunitObject>::new(drm, PAGE_SIZE, cfg_, ())?;
+        assert!(!obj.pages_present());
+
+        let pin = obj.lock_resv().pin()?;
+        assert!(obj.pages_present());
+
+        drop(pin);
+        assert!(!obj.pages_present());
 
         Ok(())
     }
