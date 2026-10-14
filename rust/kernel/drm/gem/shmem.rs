@@ -42,10 +42,7 @@ use crate::{
         Mutex,
         SetOnce, //
     },
-    types::{
-        NotThreadSafe,
-        Opaque, //
-    },
+    types::Opaque,
 };
 use core::{
     ffi::c_void,
@@ -313,7 +310,7 @@ impl<T: DriverObject> Object<T> {
         }
 
         let mut map: MaybeUninit<bindings::iosys_map> = MaybeUninit::uninit();
-        let guard = DmaResvGuard::new(self);
+        let guard = self.lock_resv();
 
         // SAFETY: `drm_gem_shmem_vmap()` can be called with the DMA reservation lock held.
         to_result(unsafe {
@@ -355,7 +352,7 @@ impl<T: DriverObject> Object<T> {
     /// - The caller promises that the memory pointed to by map will no longer be accesed through
     ///   this instance.
     unsafe fn raw_vunmap(&self, mut map: bindings::iosys_map) {
-        let _guard = DmaResvGuard::new(self);
+        let _guard = self.lock_resv();
 
         // SAFETY:
         // - This function is safe to call with the DMA reservation lock held.
@@ -788,31 +785,6 @@ extern "C" fn prime_import_callback(
     unsafe { bindings::drm_gem_prime_import(raw_dev, dma_buf) }
 }
 
-/// Private helper-type for holding the `dma_resv` object for a GEM shmem object.
-///
-/// When this is dropped, the `dma_resv` lock is dropped as well.
-///
-// TODO: This should be replace with a WwMutex equivalent once we have such bindings in the kernel.
-struct DmaResvGuard<'a, T: DriverObject>(&'a Object<T>, NotThreadSafe);
-
-impl<'a, T: DriverObject> DmaResvGuard<'a, T> {
-    #[inline]
-    fn new(obj: &'a Object<T>) -> Self {
-        // SAFETY: This lock is initialized throughout the lifetime of `object`.
-        unsafe { bindings::dma_resv_lock(obj.raw_dma_resv(), ptr::null_mut()) };
-
-        Self(obj, NotThreadSafe)
-    }
-}
-
-impl<'a, T: DriverObject> Drop for DmaResvGuard<'a, T> {
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: We are releasing the lock grabbed during the creation of this object.
-        unsafe { bindings::dma_resv_unlock(self.0.raw_dma_resv()) };
-    }
-}
-
 /// A reference to a virtual mapping for an shmem-based GEM object in kernel address space.
 ///
 /// # Invariants
@@ -941,7 +913,7 @@ impl<T: DriverObject> Drop for SGTableMap<T> {
             return;
         }
 
-        let _lock = DmaResvGuard::new(obj);
+        let _lock = obj.lock_resv();
 
         // SAFETY: We hold the reservation lock, and the table of an object that is not imported
         // belongs to the shmem helper.
@@ -991,7 +963,9 @@ mod tests {
     struct KunitDriver;
     struct KunitFile;
     #[pin_data]
-    struct KunitObject {}
+    struct KunitObject {
+        value: gem::ResvLocked<u32>,
+    }
 
     const INFO: drm::DriverInfo = drm::DriverInfo {
         major: 0,
@@ -1019,14 +993,18 @@ mod tests {
             _size: usize,
             _args: Self::Args,
         ) -> impl PinInit<Self, Error> {
-            try_pin_init!(KunitObject {})
+            try_pin_init!(KunitObject {
+                value: gem::ResvLocked::new(0),
+            })
         }
 
         fn create_imported(
             _dev: &drm::Device<KunitDriver>,
             _size: usize,
         ) -> impl PinInit<Self, Error> {
-            try_pin_init!(KunitObject {})
+            try_pin_init!(KunitObject {
+                value: gem::ResvLocked::new(0),
+            })
         }
     }
 
@@ -1095,6 +1073,29 @@ mod tests {
         for (offset, expected) in (0x20..=0x23).zip(expected) {
             assert_eq!(vmap.try_read8(offset).unwrap(), expected);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn resv_guards() -> Result {
+        let (_dev, drm) = create_drm_dev()?;
+
+        let obj = Object::<KunitObject>::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+        let other = Object::<KunitObject>::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+
+        let mut guard = obj.lock_resv();
+        assert!(obj.try_lock_resv().is_none());
+        *obj.value.access_mut(&mut guard)? += 1;
+        drop(guard);
+
+        // A guard of another object does not give access.
+        let other_guard = other.lock_resv();
+        assert_eq!(obj.value.access(&other_guard).err(), Some(EINVAL));
+        drop(other_guard);
+
+        let guard = obj.try_lock_resv().ok_or(EBUSY)?;
+        assert_eq!(*obj.value.access(&guard)?, 1);
 
         Ok(())
     }
