@@ -18,6 +18,7 @@ use crate::{
 };
 use core::{ops::Deref, ptr::NonNull};
 
+pub mod reclaim;
 pub mod virt;
 use virt::VmaRef;
 
