@@ -87,6 +87,22 @@ __rust_helper long rust_helper_get_nr_swap_pages(void)
 }
 
 /*
+ * The "inline" implementation of the fs_reclaim annotations is only available
+ * when CONFIG_LOCKDEP isn't set.
+ */
+#ifndef CONFIG_LOCKDEP
+__rust_helper void rust_helper_fs_reclaim_acquire(gfp_t gfp_mask)
+{
+	fs_reclaim_acquire(gfp_mask);
+}
+
+__rust_helper void rust_helper_fs_reclaim_release(gfp_t gfp_mask)
+{
+	fs_reclaim_release(gfp_mask);
+}
+#endif
+
+/*
  * The "inline" implementation of unmap_mapping_range() is only available
  * when CONFIG_MMU isn't set.
  */
