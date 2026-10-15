@@ -330,3 +330,20 @@ pub trait SeqShow<T> {
     /// Writes debugfs output for the file.
     fn show(data: &T, m: &SeqFile) -> Result;
 }
+
+/// Reads and writes a `u64` attribute of `data` as text.
+///
+/// Reading the file formats the value that [`Attribute::get`] returns with [`Attribute::FORMAT`].
+/// Writing a number to the file passes it to [`Attribute::set`]. The number is decimal, octal or
+/// hexadecimal, as its prefix selects. The file does not support seeking.
+pub trait Attribute<T> {
+    /// The `printf` format of the value, with one conversion of an `unsigned long long`, for
+    /// example `c"%llu\n"`. A file with another format does not compile.
+    const FORMAT: &'static CStr;
+
+    /// Returns the value of the attribute.
+    fn get(data: &T) -> Result<u64>;
+
+    /// Sets the value of the attribute.
+    fn set(data: &T, val: u64) -> Result;
+}
