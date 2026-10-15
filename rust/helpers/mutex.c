@@ -24,6 +24,11 @@ __rust_helper void rust_helper_mutex_assert_is_held(struct mutex *mutex)
 	lockdep_assert_held(mutex);
 }
 
+__rust_helper void rust_helper_mutex_might_lock(struct mutex *mutex)
+{
+	might_lock(mutex);
+}
+
 __rust_helper void rust_helper_mutex_destroy(struct mutex *lock)
 {
 	mutex_destroy(lock);

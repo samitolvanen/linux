@@ -94,6 +94,18 @@ pub type Mutex<T> = super::Lock<T, MutexBackend>;
 /// [`Guard`]: super::Guard
 pub type MutexGuard<'a, T> = super::Guard<'a, T, MutexBackend>;
 
+impl<T: ?Sized> Mutex<T> {
+    /// Tells lockdep that the current context may take the mutex, without taking it.
+    ///
+    /// Lockdep records the lock dependencies of taking the mutex here. Without
+    /// `CONFIG_PROVE_LOCKING`, this does nothing.
+    #[inline]
+    pub fn might_lock(&self) {
+        // SAFETY: The mutex was initialized when `self` was created.
+        unsafe { bindings::mutex_might_lock(self.state.get()) };
+    }
+}
+
 /// A kernel `struct mutex` lock backend.
 pub struct MutexBackend;
 
