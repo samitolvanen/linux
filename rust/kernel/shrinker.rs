@@ -189,6 +189,9 @@ impl<T: Shrinker> Drop for ShrinkerRegistration<T> {
 ///
 /// The callbacks are called from memory reclaim, possibly in kswapd, and possibly on several CPUs
 /// at once.
+///
+/// A callback may wait for the hardware, for example for a fence, only when
+/// [`ShrinkControl::can_block`] returns true.
 pub trait Shrinker {
     /// The pointer type used to store the private data of the shrinker.
     ///
@@ -313,6 +316,25 @@ impl<'a> ShrinkControl<'a> {
         let mask = unsafe { (*self.ptr.as_ptr()).gfp_mask };
 
         (mask & bindings::__GFP_IO) != 0
+    }
+
+    /// Determines whether the shrinker may wait for the hardware, for example for a fence.
+    ///
+    /// This is the case when the allocation that started the reclaim allows direct reclaim, or
+    /// when it allows kswapd reclaim and kswapd runs the shrinker.
+    #[inline]
+    pub fn can_block(&self) -> bool {
+        // SAFETY: Okay by type invariants.
+        let mask = unsafe { (*self.ptr.as_ptr()).gfp_mask };
+
+        if (mask & bindings::__GFP_DIRECT_RECLAIM) != 0 {
+            return true;
+        }
+
+        // SAFETY: `current_is_kswapd()` only reads the flags of the current task.
+        let kswapd = unsafe { bindings::current_is_kswapd() } != 0;
+
+        (mask & bindings::__GFP_KSWAPD_RECLAIM) != 0 && kswapd
     }
 
     /// Returns the number of objects that `scan_objects` should try to reclaim.
