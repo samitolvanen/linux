@@ -143,6 +143,9 @@ impl Drop for ShrinkerBuilder {
 
 /// A shrinker that is registered with the kernel.
 ///
+/// Dropping the registration waits for running callbacks to return. It must not be dropped in
+/// atomic context, from its own callbacks, or while holding a lock that a callback takes.
+///
 /// # Invariants
 ///
 /// The `shrinker` pointer refers to a registered shrinker using `T` as the private data.
@@ -183,6 +186,9 @@ impl<T: Shrinker> Drop for ShrinkerRegistration<T> {
 }
 
 /// Callbacks for a shrinker.
+///
+/// The callbacks are called from memory reclaim, possibly in kswapd, and possibly on several CPUs
+/// at once.
 pub trait Shrinker {
     /// The pointer type used to store the private data of the shrinker.
     ///
