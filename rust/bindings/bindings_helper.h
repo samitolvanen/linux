@@ -102,6 +102,7 @@
 #include <linux/serdev.h>
 #include <linux/shrinker.h>
 #include <linux/slab.h>
+#include <linux/swap.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
 #include <linux/tracepoint.h>
@@ -139,6 +140,8 @@ const gfp_t RUST_CONST_HELPER___GFP_HIGHMEM = ___GFP_HIGHMEM;
 const gfp_t RUST_CONST_HELPER___GFP_NOWARN = ___GFP_NOWARN;
 const gfp_t RUST_CONST_HELPER___GFP_FS = ___GFP_FS;
 const gfp_t RUST_CONST_HELPER___GFP_IO = ___GFP_IO;
+const gfp_t RUST_CONST_HELPER___GFP_DIRECT_RECLAIM = ___GFP_DIRECT_RECLAIM;
+const gfp_t RUST_CONST_HELPER___GFP_KSWAPD_RECLAIM = ___GFP_KSWAPD_RECLAIM;
 const blk_features_t RUST_CONST_HELPER_BLK_FEAT_ROTATIONAL = BLK_FEAT_ROTATIONAL;
 const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
 
