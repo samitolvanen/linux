@@ -2,7 +2,11 @@
 
 //! A wrapper for data protected by a lock that does not wrap it.
 
-use super::{lock::Backend, lock::Lock};
+use super::lock::{
+    Backend,
+    Guard,
+    Lock, //
+};
 use crate::build_assert;
 use core::{cell::UnsafeCell, mem::size_of, ptr};
 
@@ -84,10 +88,10 @@ pub struct LockedBy<T: ?Sized, U: ?Sized> {
 unsafe impl<T: ?Sized + Send, U: ?Sized> Send for LockedBy<T, U> {}
 
 // SAFETY: If `T` is not `Sync`, then parallel shared access to this `LockedBy` allows you to use
-// `access_mut` to hand out `&mut T` on one thread at the time. The requirement that `T: Send` is
-// sufficient to allow that.
+// the mutable access methods to hand out `&mut T` on one thread at the time. The requirement that
+// `T: Send` is sufficient to allow that.
 //
-// If `T` is `Sync`, then the `access` method also becomes available, which allows you to obtain
+// If `T` is `Sync`, then the shared access methods also become available, which allow you to obtain
 // several `&T` from several threads at once. However, this is okay as `T` is `Sync`.
 unsafe impl<T: ?Sized + Send, U: ?Sized> Sync for LockedBy<T, U> {}
 
@@ -165,5 +169,72 @@ impl<T: ?Sized, U> LockedBy<T, U> {
 
         // SAFETY: `owner` is evidence that there is only one reference to the owner.
         unsafe { &mut *self.data.get() }
+    }
+
+    /// Returns a reference to the protected data when the caller provides a guard of the owner
+    /// lock.
+    ///
+    /// Unlike [`access`](LockedBy::access), this also works when `U` is a zero-sized type (ZST),
+    /// because the guard identifies the lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard` does not hold the lock used in [`new`](LockedBy::new).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kernel::new_mutex;
+    /// use kernel::sync::LockedBy;
+    /// use pin_init::stack_pin_init;
+    ///
+    /// stack_pin_init!(let lock = new_mutex!(()));
+    /// let count = LockedBy::new(&lock, 0u32);
+    ///
+    /// let mut guard = lock.lock();
+    /// *count.access_with_guard_mut(&mut guard) += 1;
+    /// assert_eq!(*count.access_with_guard(&guard), 1);
+    /// ```
+    pub fn access_with_guard<'a, B: Backend>(&'a self, guard: &'a Guard<'_, U, B>) -> &'a T
+    where
+        T: Sync,
+    {
+        self.check_guard(guard);
+
+        // SAFETY: `guard` holds the owner lock, as checked above, and is shared for `'a`, so no
+        // mutable reference to the protected data can be obtained for `'a`. The type is `Sync` so
+        // there are no other requirements.
+        unsafe { &*self.data.get() }
+    }
+
+    /// Returns a mutable reference to the protected data when the caller provides a mutable guard
+    /// of the owner lock.
+    ///
+    /// Unlike [`access_mut`](LockedBy::access_mut), this also works when `U` is a zero-sized type
+    /// (ZST), because the guard identifies the lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard` does not hold the lock used in [`new`](LockedBy::new).
+    pub fn access_with_guard_mut<'a, B: Backend>(
+        &'a self,
+        guard: &'a mut Guard<'_, U, B>,
+    ) -> &'a mut T {
+        self.check_guard(guard);
+
+        // SAFETY: `guard` holds the owner lock, as checked above, and is borrowed mutably for `'a`,
+        // so no other reference to the protected data exists for `'a`.
+        unsafe { &mut *self.data.get() }
+    }
+
+    /// Checks that `guard` holds the lock used in [`new`](LockedBy::new).
+    fn check_guard<B: Backend>(&self, guard: &Guard<'_, U, B>) {
+        build_assert!(
+            size_of::<Lock<U, B>>() > 0,
+            "The lock type cannot be a ZST because it may be impossible to distinguish instances"
+        );
+        if !ptr::eq(guard.lock_ref().data.get(), self.owner) {
+            panic!("mismatched owners");
+        }
     }
 }
