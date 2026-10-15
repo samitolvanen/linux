@@ -15,3 +15,8 @@ __rust_helper void rust_helper_list_add_tail(struct list_head *new, struct list_
 {
 	list_add_tail(new, head);
 }
+
+__rust_helper void rust_helper_list_del_init(struct list_head *entry)
+{
+	list_del_init(entry);
+}
