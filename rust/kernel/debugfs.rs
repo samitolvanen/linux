@@ -30,6 +30,7 @@ use core::{
 
 mod traits;
 pub use traits::{
+    Attribute,
     BinaryReader,
     BinaryReaderMut,
     BinaryWriter,
@@ -47,6 +48,7 @@ use callback_adapters::{
 
 mod file_ops;
 use file_ops::{
+    AttributeFile,
     BinaryReadFile,
     BinaryReadWriteFile,
     BinaryWriteFile,
@@ -624,6 +626,14 @@ impl<'data, 'dir, M: ModuleMetadata> ScopedDir<'data, 'dir, M> {
         self.create_file(name, data, &<S as SeqReadFile<M, U>>::FILE_OPS)
     }
 
+    /// Creates an attribute file in this directory, which reads and writes a `u64` with `A`.
+    ///
+    /// This function does not produce an owning handle to the file. The created file is removed
+    /// when the [`Scope`] that this directory belongs to is dropped.
+    pub fn attribute_file<A: Attribute<U>, U: Sync>(&self, name: &CStr, data: &'data U) {
+        self.create_file(name, data, &<A as AttributeFile<M, U>>::FILE_OPS)
+    }
+
     /// Creates a read-write file in this directory.
     ///
     /// Reading the file uses the [`Writer`] implementation on `data`. Writing to the file uses
@@ -833,6 +843,27 @@ impl<'a, T, M: ModuleMetadata> ScopeRef<'a, T, M> {
     /// Debugfs is disabled, so no file is created.
     #[cfg(not(CONFIG_DEBUG_FS))]
     pub fn seq_file<S: SeqShow<T>>(&self, _name: &CStr)
+    where
+        T: Sync,
+    {
+        let _ = self.data;
+    }
+
+    /// Creates an attribute file in this directory, which reads and writes a `u64` of `data`
+    /// with `A`.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub fn attribute_file<A: Attribute<T>>(&self, name: &CStr)
+    where
+        T: Sync,
+    {
+        self.inner.attribute_file::<A, T>(name, self.data);
+    }
+
+    /// Creates an attribute file in this directory.
+    ///
+    /// Debugfs is disabled, so no file is created.
+    #[cfg(not(CONFIG_DEBUG_FS))]
+    pub fn attribute_file<A: Attribute<T>>(&self, _name: &CStr)
     where
         T: Sync,
     {
