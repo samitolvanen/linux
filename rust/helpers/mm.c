@@ -81,6 +81,11 @@ __rust_helper int rust_helper_current_is_kswapd(void)
 	return current_is_kswapd();
 }
 
+__rust_helper long rust_helper_get_nr_swap_pages(void)
+{
+	return get_nr_swap_pages();
+}
+
 /*
  * The "inline" implementation of unmap_mapping_range() is only available
  * when CONFIG_MMU isn't set.
