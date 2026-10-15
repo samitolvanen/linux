@@ -22,9 +22,12 @@ use crate::{
         to_result, //
     },
     prelude::*,
-    sync::aref::{
-        ARef,
-        AlwaysRefCounted, //
+    sync::{
+        aref::{
+            ARef,
+            AlwaysRefCounted, //
+        },
+        Mutex, //
     },
     types::{
         NotThreadSafe,
@@ -476,6 +479,24 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         } else {
             None
         }
+    }
+
+    /// Returns the mutex that protects the GEM LRU lists of the device.
+    ///
+    /// Freeing a GEM object of the device, dropping an [`Lru`], and calling [`lru::remove()`] or an
+    /// [`Lru`] method that takes no guard all take the mutex, so none of them may run while the
+    /// mutex is held.
+    ///
+    /// Shrinkers take the mutex from memory reclaim, so memory must not be allocated with reclaim
+    /// allowed while the mutex is held.
+    ///
+    /// [`Lru`]: drm::gem::lru::Lru
+    /// [`lru::remove()`]: drm::gem::lru::remove
+    #[inline]
+    pub fn gem_lru_mutex(&self) -> &Mutex<()> {
+        // SAFETY: `drm_dev_init()` initializes `gem_lru_mutex`, and the mutex is destroyed only
+        // when the device is released, which `&self` prevents.
+        unsafe { Mutex::from_raw(&raw mut (*self.as_raw()).gem_lru_mutex) }
     }
 
     /// Change the [`DeviceContext`] for a [`Device`].
