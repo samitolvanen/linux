@@ -17,6 +17,7 @@ use crate::{
     error::to_result,
     prelude::*,
     types::ForeignOwnable,
+    types::NotThreadSafe,
     types::Opaque, //
 };
 
@@ -613,6 +614,69 @@ unsafe impl AlwaysRefCounted for Fence {
     }
 }
 
+/// A dma-fence signalling critical section on the current task.
+///
+/// All code needed to signal a [`DriverFence`] must run in such a section,
+/// from the point where its [`Fence`] becomes visible to other threads up to
+/// [`DriverFence::signal`]. With `CONFIG_LOCKDEP`, lockdep checks the locks
+/// taken and the memory allocated inside the section against the
+/// [DMA Fence Cross-Driver Contract], as described in
+/// [DMA Fence Signalling Annotations]. Without it, the section has no effect.
+///
+/// A function that is part of the signalling path can take a
+/// `&SignallingSection` to require that its caller opened one. Sections nest.
+///
+/// [DMA Fence Cross-Driver Contract]: https://docs.kernel.org/driver-api/dma-buf.html#dma-fence-cross-driver-contract
+/// [DMA Fence Signalling Annotations]: https://docs.kernel.org/driver-api/dma-buf.html#dma-fence-signalling-annotations
+///
+/// # Examples
+///
+/// ```
+/// use kernel::dma_buf::SignallingSection;
+///
+/// // Code on the signalling path takes the section as proof that one is open.
+/// fn on_signalling_path(_section: &SignallingSection) {}
+///
+/// let section = SignallingSection::begin();
+/// on_signalling_path(&section);
+/// ```
+///
+/// # Invariants
+///
+/// `cookie` was returned by `dma_fence_begin_signalling()` on the current task
+/// and has not been passed to `dma_fence_end_signalling()` yet.
+#[must_use = "the signalling section ends immediately when the value is unused"]
+pub struct SignallingSection {
+    cookie: bool,
+    _not_send: NotThreadSafe,
+}
+
+impl SignallingSection {
+    /// Begins a signalling section on the current task.
+    #[inline]
+    pub fn begin() -> Self {
+        // SAFETY: `dma_fence_begin_signalling()` has no preconditions.
+        let cookie = unsafe { bindings::dma_fence_begin_signalling() };
+
+        // INVARIANT: `cookie` was just returned by `dma_fence_begin_signalling()`
+        // on the current task.
+        Self {
+            cookie,
+            _not_send: NotThreadSafe,
+        }
+    }
+}
+
+impl Drop for SignallingSection {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: By the type invariants, `cookie` comes from
+        // `dma_fence_begin_signalling()` on the current task and has not been
+        // passed to `dma_fence_end_signalling()` yet.
+        unsafe { bindings::dma_fence_end_signalling(self.cookie) };
+    }
+}
+
 // Necessary to guarantee that `inner` always comes first and can be freed by C.
 // Also useful for using casts instead of container_of().
 #[repr(C)]
@@ -677,7 +741,8 @@ struct DriverFenceData<'a, T: Send + Sync + FenceContextOps> {
 ///         FenceContextOps,
 ///         FenceCallback,
 ///         FenceCallbackRegistration,
-///         FenceStatus, //
+///         FenceStatus,
+///         SignallingSection, //
 ///     },
 ///     str::CString,
 ///     sync::aref::ARef, //
@@ -732,13 +797,13 @@ struct DriverFenceData<'a, T: Send + Sync + FenceContextOps> {
 /// let cb_reg = unsafe { FenceCallbackRegistration::new(&waiting_fence, cb_data) };
 /// let cb_reg = KBox::pin_init(cb_reg, GFP_KERNEL)?;
 ///
-/// // TODO signalling guards
-///
 /// // TODO: add support for `assert_matches!()`.
 /// if let FenceStatus::Signaled(_) = waiting_fence.status() {
 ///      return Err(ENOMSG);
 /// }
+/// let section = SignallingSection::begin();
 /// fence.signal(Ok(()));
+/// drop(section);
 /// if let FenceStatus::Unsignaled = waiting_fence.status() {
 ///     return Err(ENOENT);
 /// }

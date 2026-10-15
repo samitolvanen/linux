@@ -12,7 +12,8 @@ pub use self::dma_fence::{
     FenceCallbackRegistration,
     FenceContext,
     FenceContextOps,
-    FenceStatus, //
+    FenceStatus,
+    SignallingSection, //
 };
 
 use crate::bindings;
