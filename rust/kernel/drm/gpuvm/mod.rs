@@ -379,6 +379,16 @@ where
     ) -> Result<OpRemapped<'op, Self>, Error>;
 }
 
+/// A [`DriverGpuVm`] that is the only kind of GPUVM that maps its GEM objects.
+///
+/// This allows finding the [`GpuVmBo`]s of an object from the object, with [`GemGpuvaGuard`].
+///
+/// # Safety
+///
+/// Every `drm_gpuvm_bo` of an object of type [`DriverGpuVm::Object`] belongs to a
+/// [`GpuVm<Self>`].
+pub unsafe trait ExclusiveObjects: DriverGpuVm {}
+
 /// The core of the DRM GPU VA manager.
 ///
 /// This object is a unique reference to the VM that can access the interval tree and the Rust
