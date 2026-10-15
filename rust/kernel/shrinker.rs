@@ -8,13 +8,25 @@
 
 use crate::{
     alloc::AllocError,
-    bindings, c_str,
-    ffi::{c_int, c_long, c_ulong, c_void},
-    str::{CStr, CStrExt as _},
-    types::ForeignOwnable,
+    bindings,
+    c_str,
+    ffi::{
+        c_int,
+        c_long,
+        c_ulong,
+        c_void, //
+    },
+    str::{
+        CStr,
+        CStrExt as _, //
+    },
+    types::ForeignOwnable, //
 };
 
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{
+    marker::PhantomData,
+    ptr::NonNull, //
+};
 
 const SHRINK_STOP: c_ulong = bindings::SHRINK_STOP as c_ulong;
 const SHRINK_EMPTY: c_ulong = bindings::SHRINK_EMPTY as c_ulong;
@@ -67,7 +79,7 @@ impl ShrinkerBuilder {
             bindings::shrinker_alloc(
                 flags,
                 c_str!("%pA").as_char_ptr(),
-                &name as *const _ as *const c_void,
+                core::ptr::from_ref(&name).cast::<c_void>(),
             )
         };
 
@@ -79,11 +91,15 @@ impl ShrinkerBuilder {
 
     /// Set the number of seeks needed to recreate an object.
     pub fn set_seeks(&mut self, seeks: u32) {
+        // SAFETY: The shrinker is valid and not yet registered, and `&mut self` gives exclusive
+        // access to it.
         unsafe { (*self.shrinker.as_ptr()).seeks = seeks as c_int };
     }
 
     /// Set the batch size for reclaiming on this shrinker.
     pub fn set_batch(&mut self, batch: usize) {
+        // SAFETY: The shrinker is valid and not yet registered, and `&mut self` gives exclusive
+        // access to it.
         unsafe { (*self.shrinker.as_ptr()).batch = batch as c_long };
     }
 
@@ -214,7 +230,7 @@ impl CountObjects {
     /// If `count` is zero, then this indicates that the real count is unknown. Use
     /// `CountObjects::EMPTY` to indicate that the shrinker is empty.
     pub fn new(count: usize) -> Self {
-        if count > Self::MAX.inner as usize {
+        if count > Self::MAX.inner {
             return Self::MAX;
         }
 
@@ -243,7 +259,7 @@ impl ScanObjects {
 
     /// Creates a new `CountObjects` with the given value.
     pub fn from_count(count: usize) -> Self {
-        if count > Self::MAX.inner as usize {
+        if count > Self::MAX.inner {
             return Self::MAX;
         }
 
@@ -296,7 +312,7 @@ impl<'a> ShrinkControl<'a> {
     /// Returns the number of objects that `scan_objects` should try to reclaim.
     pub fn nr_to_scan(&self) -> usize {
         // SAFETY: Okay by type invariants.
-        unsafe { (*self.ptr.as_ptr()).nr_to_scan as usize }
+        unsafe { (*self.ptr.as_ptr()).nr_to_scan }
     }
 
     /// The callback should set this value to the number of objects inspected by the shrinker.
@@ -306,6 +322,10 @@ impl<'a> ShrinkControl<'a> {
     }
 }
 
+/// # Safety
+///
+/// `shrink` must be a shrinker registered with `T` by [`ShrinkerBuilder::register`], and `sc` must
+/// point to a valid `shrink_control` for the duration of the call.
 unsafe extern "C" fn rust_count_objects<T: Shrinker>(
     shrink: *mut bindings::shrinker,
     sc: *mut bindings::shrink_control,
@@ -321,6 +341,10 @@ unsafe extern "C" fn rust_count_objects<T: Shrinker>(
     ret.inner
 }
 
+/// # Safety
+///
+/// `shrink` must be a shrinker registered with `T` by [`ShrinkerBuilder::register`], and `sc` must
+/// point to a valid `shrink_control` for the duration of the call.
 unsafe extern "C" fn rust_scan_objects<T: Shrinker>(
     shrink: *mut bindings::shrinker,
     sc: *mut bindings::shrink_control,
