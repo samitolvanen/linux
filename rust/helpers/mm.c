@@ -3,6 +3,7 @@
 #include <linux/mm.h>
 #include <linux/pgtable.h>
 #include <linux/sched/mm.h>
+#include <linux/swap.h>
 
 __rust_helper pgprot_t rust_helper_pgprot_noncached(pgprot_t prot)
 {
@@ -73,6 +74,11 @@ __rust_helper void rust_helper_vma_end_read(struct vm_area_struct *vma)
 __rust_helper void rust_helper_release_fault_lock(struct vm_fault *vmf)
 {
 	release_fault_lock(vmf);
+}
+
+__rust_helper int rust_helper_current_is_kswapd(void)
+{
+	return current_is_kswapd();
 }
 
 /*
