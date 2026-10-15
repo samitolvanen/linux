@@ -165,6 +165,37 @@ impl<T: DriverGpuVm> GpuVmBo<T> {
         gpuva_mutex(self.obj()).lock()
     }
 
+    /// Marks this `vm_bo` as evicted, or as no longer evicted.
+    ///
+    /// [`GpuVmExec::validate()`] walks the evicted `vm_bo`s of the GPUVM. Returns [`EINVAL`] if
+    /// `guard` holds the reservation lock of another object.
+    #[inline]
+    pub fn evict(&self, guard: &ResvGuard<'_, T::Object>, evict: bool) -> Result {
+        if !ptr::eq(guard.obj(), self.obj()) {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `guard` holds the reservation lock of the object. It protects the evicted state,
+        // and the evicted list of the GPUVM when the object shares the reservation of the GPUVM.
+        unsafe { bindings::drm_gpuvm_bo_evict(self.as_raw(), evict) };
+
+        Ok(())
+    }
+
+    /// Returns whether this `vm_bo` is evicted.
+    ///
+    /// Returns [`EINVAL`] if `guard` holds the reservation lock of another object.
+    #[inline]
+    pub fn is_evicted(&self, guard: &ResvGuard<'_, T::Object>) -> Result<bool> {
+        if !ptr::eq(guard.obj(), self.obj()) {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `guard` holds the reservation lock of the object, which protects the evicted
+        // state.
+        Ok(unsafe { (*self.as_raw()).evicted })
+    }
+
     /// Returns an iterator over the [`GpuVa`]s of this `vm_bo`.
     ///
     /// Returns [`EINVAL`] if `guard` holds the gpuva lock of another object. An `ARef<GpuVmBo>`

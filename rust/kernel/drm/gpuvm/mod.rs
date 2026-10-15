@@ -28,7 +28,8 @@ use kernel::{
     },
     drm::gem::{
         BaseObject,
-        IntoGEMObject, //
+        IntoGEMObject,
+        ResvGuard, //
     },
     error::to_result,
     prelude::*,
@@ -76,12 +77,17 @@ pub use self::va::*;
 /// * Stored in an allocation managed by the refcount in `self.vm`.
 /// * Access to `data` and the gpuvm interval tree is controlled via the [`UniqueRefGpuVm`] type.
 /// * Does not contain any sparse [`GpuVa<T>`] instances.
+/// * `validate` is accessed only with the reservation lock of the GPUVM held. It is null, or
+///   points at a `&mut ValidateFn<'_, T>` to the closure of the running
+///   [`GpuVmExec::validate()`].
 #[pin_data]
 pub struct GpuVm<T: DriverGpuVm> {
     #[pin]
     vm: Opaque<bindings::drm_gpuvm>,
     /// Accessed only through the [`UniqueRefGpuVm`] reference.
     data: UnsafeCell<T>,
+    /// The closure of a running [`GpuVmExec::validate()`].
+    validate: UnsafeCell<*mut c_void>,
 }
 
 // SAFETY: It is safe to send a `GpuVm<T>` to another thread: all data reachable through it
@@ -89,7 +95,8 @@ pub struct GpuVm<T: DriverGpuVm> {
 unsafe impl<T: DriverGpuVm> Send for GpuVm<T> {}
 // SAFETY: It is safe to share a `&GpuVm<T>` between threads: `&self` methods only alias data
 // that is `Sync` by the `DriverGpuVm` bounds, and any thread may drop that data, or upgrade the
-// reference and ultimately drop `T`, which the same bounds make `Send`.
+// reference and ultimately drop `T`, which the same bounds make `Send`. Only the thread that holds
+// the reservation lock of the GPUVM uses the `validate` closure.
 unsafe impl<T: DriverGpuVm> Sync for GpuVm<T> {}
 
 // SAFETY: By type invariants, the allocation is managed by the refcount in `self.vm`.
@@ -121,7 +128,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
             op_free: None,
             vm_bo_alloc: GpuVmBo::<T>::ALLOC_FN,
             vm_bo_free: GpuVmBo::<T>::FREE_FN,
-            vm_bo_validate: None,
+            vm_bo_validate: Some(Self::vm_bo_validate),
             sm_step_map: Some(Self::sm_step_map),
             sm_step_unmap: Some(Self::sm_step_unmap),
             sm_step_remap: Some(Self::sm_step_remap),
@@ -145,6 +152,7 @@ impl<T: DriverGpuVm> GpuVm<T> {
         let obj = KBox::try_pin_init::<E>(
             try_pin_init!(Self {
                 data: UnsafeCell::new(data),
+                validate: UnsafeCell::new(ptr::null_mut()),
                 vm <- Opaque::ffi_init(|vm| {
                     // SAFETY: These arguments are valid. `vm` is valid until refcount drops to
                     // zero. The `vm` is zeroed before calling this method by `__GFP_ZERO` flag
@@ -301,6 +309,59 @@ impl<T: DriverGpuVm> GpuVm<T> {
     pub fn is_extobj(&self, obj: &T::Object) -> bool {
         // SAFETY: We may call this with any GPUVM and GEM object.
         unsafe { bindings::drm_gpuvm_is_extobj(self.as_raw(), obj.as_raw()) }
+    }
+
+    /// Validates an evicted `vm_bo` with the closure of [`GpuVmExec::validate()`].
+    ///
+    /// # Safety
+    ///
+    /// `vm_bo` must be on the evicted list of a `GpuVm<T>`. The caller must hold the reservation
+    /// locks of the GPUVM and of the object of `vm_bo` for the duration of the call, and must have
+    /// taken them without guards.
+    unsafe extern "C" fn vm_bo_validate(
+        vm_bo: *mut bindings::drm_gpuvm_bo,
+        _exec: *mut bindings::drm_exec,
+    ) -> c_int {
+        // SAFETY: Per the safety requirements, `vm_bo` is a valid `drm_gpuvm_bo` of a `GpuVm<T>`,
+        // which it holds a reference to.
+        let gpuvm = unsafe { Self::from_raw((*vm_bo).vm) };
+
+        // SAFETY: The caller holds the reservation lock of the GPUVM, which protects `validate`.
+        let validate = unsafe { *gpuvm.validate.get() }.cast::<&mut ValidateFn<'_, T>>();
+        if validate.is_null() {
+            return EOPNOTSUPP.to_errno();
+        }
+
+        // Clearing the evicted state of an external object leaves its `vm_bo` on the evicted list.
+        // SAFETY: The caller holds the reservation lock of the object, which protects the evicted
+        // state.
+        if !unsafe { (*vm_bo).evicted } {
+            return 0;
+        }
+
+        // SAFETY: The reservation lock of the GPUVM keeps an evicted `vm_bo` allocated, even when
+        // its refcount drops to zero.
+        if unsafe { bindings::kref_get_unless_zero(&raw mut (*vm_bo).kref) } == 0 {
+            return 0;
+        }
+
+        // SAFETY: We took a reference to `vm_bo` above, which keeps it on the GEM list. It is a
+        // `GpuVmBo<T>` of this GPUVM.
+        let vm_bo = unsafe { ARef::from_raw(NonNull::new_unchecked(vm_bo.cast::<GpuVmBo<T>>())) };
+
+        // SAFETY: Per the safety requirements, the caller holds the reservation lock of the object
+        // without a guard for the duration of the call.
+        let mut guard = unsafe { ResvGuard::assume_locked(vm_bo.obj()) };
+
+        // SAFETY: `validate` is not null, as checked above, so by the type invariants it points at
+        // the `&mut ValidateFn<'_, T>` of the running `GpuVmExec::validate()`, which nothing else
+        // uses during this call.
+        let validate = unsafe { &mut *validate };
+
+        match validate(&vm_bo, &mut guard) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        }
     }
 
     /// Free this GPUVM.
@@ -481,6 +542,10 @@ impl<T: DriverGpuVm> Deref for UniqueRefGpuVm<T> {
     }
 }
 
+/// A closure that validates an evicted [`GpuVmBo`] for [`GpuVmExec::validate()`].
+type ValidateFn<'a, T> =
+    dyn FnMut(&GpuVmBo<T>, &mut ResvGuard<'_, <T as DriverGpuVm>::Object>) -> Result + 'a;
+
 /// The exec token for preparing the objects.
 ///
 /// # Invariants
@@ -517,6 +582,39 @@ impl<'vm, T: DriverGpuVm> GpuVmExec<'vm, T> {
             )
         }
     }
+
+    /// Calls `f` for each evicted [`GpuVmBo`] of the GPUVM, with the reservation lock of its
+    /// object held.
+    ///
+    /// `f` makes the object resident again and clears its evicted state with
+    /// [`GpuVmBo::evict()`], after which the `vm_bo` leaves the evicted list. The walk stops at the
+    /// first error that `f` returns. `f` must not take the reservation lock of the GPUVM, for
+    /// example with [`GpuVm::deferred_cleanup()`].
+    pub fn validate<F>(self: Pin<&mut Self>, mut f: F) -> Result
+    where
+        F: FnMut(&GpuVmBo<T>, &mut ResvGuard<'_, T::Object>) -> Result,
+    {
+        let mut f: &mut ValidateFn<'_, T> = &mut f;
+        let exec = self.exec.get();
+
+        // SAFETY: `exec` is valid, and its GPUVM is a `GpuVm<T>` that outlives `self`.
+        let gpuvm = unsafe { GpuVm::<T>::from_raw((*exec).vm) };
+        let slot = gpuvm.validate.get();
+
+        // SAFETY: `self` holds the reservation lock of the GPUVM, which protects `validate`.
+        unsafe { *slot = ptr::from_mut(&mut f).cast() };
+
+        // SAFETY: `exec` holds the reservation locks of the GPUVM and of its external objects.
+        // Locking it added the evicted external objects to the evicted list.
+        let ret = to_result(unsafe {
+            bindings::drm_gpuvm_validate(gpuvm.as_raw(), &raw mut (*exec).exec)
+        });
+
+        // SAFETY: `self` holds the reservation lock of the GPUVM, which protects `validate`.
+        unsafe { *slot = ptr::null_mut() };
+
+        ret
+    }
 }
 
 #[pinned_drop]
@@ -524,5 +622,247 @@ impl<'vm, T: DriverGpuVm> PinnedDrop for GpuVmExec<'vm, T> {
     fn drop(self: Pin<&mut Self>) {
         // SAFETY: We hold the lock, so it's safe to unlock.
         unsafe { bindings::drm_gpuvm_exec_unlock(self.exec.get()) };
+    }
+}
+
+#[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
+#[kunit_tests(rust_drm_gpuvm)]
+mod tests {
+    use super::*;
+    use crate::{
+        device,
+        drm::{
+            gem::shmem::{
+                Object,
+                ObjectConfig, //
+            },
+            UnregisteredDevice, //
+        },
+        faux,
+        page::PAGE_SIZE, //
+    };
+
+    #[pin_data]
+    struct KunitData {}
+    struct KunitDriver;
+    struct KunitFile;
+    #[pin_data]
+    struct KunitObject {}
+
+    type KunitGem = Object<KunitObject>;
+
+    impl drm::file::DriverFile for KunitFile {
+        type Driver = KunitDriver;
+
+        fn open(_dev: &drm::Device<KunitDriver>) -> Result<Pin<KBox<Self>>> {
+            Ok(KBox::new(Self, GFP_KERNEL)?.into())
+        }
+    }
+
+    #[vtable]
+    impl drm::gem::DriverObject for KunitObject {
+        type Driver = KunitDriver;
+        type Args = ();
+
+        fn new(
+            _dev: &drm::Device<KunitDriver>,
+            _size: usize,
+            _args: Self::Args,
+        ) -> impl PinInit<Self, Error> {
+            try_pin_init!(KunitObject {})
+        }
+
+        fn create_imported(
+            _dev: &drm::Device<KunitDriver>,
+            _size: usize,
+        ) -> impl PinInit<Self, Error> {
+            try_pin_init!(KunitObject {})
+        }
+    }
+
+    #[vtable]
+    impl drm::Driver for KunitDriver {
+        type Data = KunitData;
+        type RegistrationData<'a> = ();
+        type File = KunitFile;
+        type Object = KunitGem;
+        type ParentDevice<Ctx: device::DeviceContext> = faux::Device<Ctx>;
+
+        const INFO: drm::DriverInfo = drm::DriverInfo {
+            major: 0,
+            minor: 0,
+            patchlevel: 0,
+            name: c"kunit",
+            desc: c"Kunit",
+        };
+        const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor] = &[];
+    }
+
+    struct KunitVm;
+
+    impl DriverGpuVm for KunitVm {
+        type Driver = KunitDriver;
+        type Object = KunitGem;
+        type VaData = u64;
+        type VmBoData = ();
+        type SmContext<'ctx>
+            = Option<GpuVaAlloc<Self>>
+        where
+            Self: 'ctx;
+
+        fn sm_step_map<'op, 'ctx>(
+            &mut self,
+            op: OpMap<'op, Self>,
+            context: &mut Self::SmContext<'ctx>,
+        ) -> Result<OpMapped<'op, Self>, Error> {
+            let addr = op.addr();
+            Ok(op.insert(context.take().ok_or(EINVAL)?, addr))
+        }
+
+        fn sm_step_unmap<'op, 'ctx>(
+            &mut self,
+            op: OpUnmap<'op, Self>,
+            _context: &mut Self::SmContext<'ctx>,
+        ) -> Result<OpUnmapped<'op, Self>, Error> {
+            Ok(op.remove().0)
+        }
+
+        fn sm_step_remap<'op, 'ctx>(
+            &mut self,
+            _op: OpRemap<'op, Self>,
+            _context: &mut Self::SmContext<'ctx>,
+        ) -> Result<OpRemapped<'op, Self>, Error> {
+            Err(EINVAL)
+        }
+    }
+
+    // SAFETY: The tests map `KunitGem` objects only in `GpuVm<KunitVm>`.
+    unsafe impl ExclusiveObjects for KunitVm {}
+
+    fn map(vm: &mut UniqueRefGpuVm<KunitVm>, vm_bo: &GpuVmBo<KunitVm>, addr: u64) -> Result {
+        vm.sm_map(OpMapRequest {
+            addr,
+            range: PAGE_SIZE as u64,
+            gem_offset: 0,
+            vm_bo,
+            context: &mut Some(GpuVaAlloc::new(GFP_KERNEL)?),
+        })
+    }
+
+    #[test]
+    fn evict_and_validate() -> Result {
+        let reg = faux::Registration::new(c"Kunit", None)?;
+        let drm =
+            UnregisteredDevice::<KunitDriver>::new(reg.as_ref(), try_pin_init!(KunitData {}))?;
+
+        let root = KunitGem::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+        let config = ObjectConfig {
+            parent_resv_obj: Some(&root),
+            ..Default::default()
+        };
+        let private = KunitGem::new(&drm, PAGE_SIZE, config, ())?;
+        let shared = KunitGem::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+
+        let mut vm = GpuVm::new::<Error, _>(c"kunit", &drm, &*root, 0..1 << 32, 0..0, KunitVm)?;
+        let objs = [&*private, &*shared];
+        let vm_bos = [vm.obtain(&private, ())?, vm.obtain(&shared, ())?];
+        for (addr, vm_bo) in [0x10000, 0x20000].into_iter().zip(&vm_bos) {
+            map(&mut vm, vm_bo, addr)?;
+        }
+
+        for (addr, (obj, vm_bo)) in [0x10000, 0x20000].into_iter().zip(objs.iter().zip(&vm_bos)) {
+            let gpuva = GemGpuvaGuard::<KunitVm>::lock(obj);
+            let mut obj_vm_bos = gpuva.vm_bos();
+            assert!(obj_vm_bos.next().is_some_and(|b| b == &**vm_bo));
+            assert!(obj_vm_bos.next().is_none());
+
+            let mut vas = vm_bo.vas(&gpuva)?;
+            assert!(vas
+                .next()
+                .is_some_and(|va| va.addr() == addr && *va.data_ref() == addr));
+            assert!(vas.next().is_none());
+        }
+
+        let gpuva = GemGpuvaGuard::<KunitVm>::lock(&root);
+        assert!(gpuva.vm_bos().next().is_none());
+        assert_eq!(vm_bos[0].vas(&gpuva).err(), Some(EINVAL));
+        drop(gpuva);
+
+        let resv = root.lock_resv();
+        assert_eq!(vm_bos[1].evict(&resv, true).err(), Some(EINVAL));
+        assert_eq!(vm_bos[1].is_evicted(&resv).err(), Some(EINVAL));
+        drop(resv);
+
+        for (obj, vm_bo) in objs.iter().zip(&vm_bos) {
+            let resv = obj.lock_resv();
+            vm_bo.evict(&resv, true)?;
+            assert!(vm_bo.is_evicted(&resv)?);
+        }
+
+        let mut exec = KBox::pin_init(vm.prepare(ExecFlags::default(), 0), GFP_KERNEL)?;
+
+        // An error stops the walk, and the `vm_bo`s stay evicted.
+        let mut calls = 0;
+        let ret = exec.as_mut().validate(|_, _| {
+            calls += 1;
+            Err(EIO)
+        });
+        assert_eq!(ret, Err(EIO));
+        assert_eq!(calls, 1);
+
+        let mut validated = 0;
+        exec.as_mut().validate(|vm_bo, resv| {
+            if vm_bos.iter().any(|b| &**b == vm_bo) {
+                validated += 1;
+            }
+            vm_bo.evict(resv, false)
+        })?;
+        assert_eq!(validated, 2);
+
+        // The validated `vm_bo`s left the evicted list.
+        exec.as_mut().validate(|_, _| Err(EIO))?;
+        drop(exec);
+
+        for (obj, vm_bo) in objs.iter().zip(&vm_bos) {
+            assert!(!vm_bo.is_evicted(&obj.lock_resv())?);
+        }
+
+        vm.sm_unmap(0, 1 << 32, &mut None)?;
+        drop(vm_bos);
+        vm.deferred_cleanup();
+
+        Ok(())
+    }
+
+    #[test]
+    fn validate_skips_restored_extobj() -> Result {
+        let reg = faux::Registration::new(c"Kunit", None)?;
+        let drm =
+            UnregisteredDevice::<KunitDriver>::new(reg.as_ref(), try_pin_init!(KunitData {}))?;
+
+        let root = KunitGem::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+        let shared = KunitGem::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+
+        let vm = GpuVm::new::<Error, _>(c"kunit", &drm, &*root, 0..1 << 32, 0..0, KunitVm)?;
+        let vm_bo = vm.obtain(&shared, ())?;
+
+        vm_bo.evict(&shared.lock_resv(), true)?;
+        let exec = KBox::pin_init(vm.prepare(ExecFlags::default(), 0), GFP_KERNEL)?;
+        drop(exec);
+        vm_bo.evict(&shared.lock_resv(), false)?;
+
+        let mut exec = KBox::pin_init(vm.prepare(ExecFlags::default(), 0), GFP_KERNEL)?;
+        let mut calls = 0;
+        exec.as_mut().validate(|_, _| {
+            calls += 1;
+            Ok(())
+        })?;
+        assert_eq!(calls, 0);
+        drop(exec);
+
+        drop(vm_bo);
+        vm.deferred_cleanup();
+
+        Ok(())
     }
 }
