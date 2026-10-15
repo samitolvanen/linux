@@ -38,6 +38,7 @@ use core::{
     },
 };
 
+pub mod lru;
 #[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
 pub mod shmem;
 
@@ -502,7 +503,6 @@ impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
     ///
     /// The current thread holds the reservation lock of `obj` for `'a`, and no other guard of it
     /// is used while the returned guard exists.
-    #[cfg_attr(not(CONFIG_RUST_DRM_GEM_SHMEM_HELPER), expect(unused))]
     pub(crate) unsafe fn assume_locked(obj: &'a O) -> Self {
         // INVARIANT: The caller holds the lock for `'a`.
         Self {
