@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 
 use super::*;
+use crate::{
+    interop::list::clist_create,
+    sync::{
+        Mutex,
+        MutexGuard, //
+    }, //
+};
 
 /// Represents that a given GEM object has at least one mapping on this [`GpuVm`] instance.
 ///
@@ -155,11 +162,109 @@ impl<T: DriverGpuVm> GpuVmBo<T> {
     }
 
     pub(super) fn lock_gpuva(&self) -> crate::sync::MutexGuard<'_, ()> {
-        // SAFETY: The GEM object is valid.
-        let ptr = unsafe { &raw mut (*self.obj().as_raw()).gpuva.lock };
-        // SAFETY: The GEM object is valid, so the mutex is properly initialized.
-        let mutex = unsafe { crate::sync::Mutex::from_raw(ptr) };
-        mutex.lock()
+        gpuva_mutex(self.obj()).lock()
+    }
+
+    /// Returns an iterator over the [`GpuVa`]s of this `vm_bo`.
+    ///
+    /// Returns [`EINVAL`] if `guard` holds the gpuva lock of another object. An `ARef<GpuVmBo>`
+    /// made from the returned `GpuVa`s must not be dropped while `guard` is held. The `GpuVa`s
+    /// match the VA tree only while no `sm_map()` or `sm_unmap()` runs on the GPUVM.
+    pub fn vas<'a>(
+        &'a self,
+        guard: &'a GemGpuvaGuard<'_, T>,
+    ) -> Result<impl Iterator<Item = &'a GpuVa<T>>>
+    where
+        T::VaData: Sync,
+    {
+        if !ptr::eq(guard.obj, self.obj()) {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `self` is a valid `drm_gpuvm_bo`.
+        let head = unsafe { &raw mut (*self.as_raw()).list.gpuva };
+
+        // SAFETY: By the type invariants of `GemGpuvaGuard`, `guard` holds the gpuva lock of the
+        // object of `self`, as checked above, which keeps the list unchanged while `guard` is
+        // borrowed. The list links the `drm_gpuva`s of this `vm_bo` through `gem.entry`, and each
+        // is the first field of a `repr(C)` `GpuVa<T>`. `T::VaData: Sync` allows sharing their data
+        // with the threads of the GPUVM.
+        let vas = unsafe { clist_create!(head, GpuVa<T>, bindings::drm_gpuva, gem.entry) };
+
+        Ok(vas.iter())
+    }
+}
+
+/// Returns the mutex that protects the GPU VA lists of `obj`.
+fn gpuva_mutex<O: IntoGEMObject>(obj: &O) -> &Mutex<()> {
+    // SAFETY: The GEM object is valid, so its gpuva lock is initialized and lives as long as
+    // `obj`.
+    unsafe { Mutex::from_raw(&raw mut (*obj.as_raw()).gpuva.lock) }
+}
+
+/// A guard that holds the gpuva lock of a GEM object.
+///
+/// The gpuva lock protects the list of [`GpuVmBo`]s of the object, and the list of [`GpuVa`]s of
+/// each of them. Dropping the last reference to a [`GpuVmBo`] takes the gpuva lock of its object,
+/// so no `ARef<GpuVmBo>` may be dropped while the guard is held.
+///
+/// The gpuva locks of all objects share one lockdep class, so two guards must not be nested.
+///
+/// # Invariants
+///
+/// `_guard` holds the gpuva lock of `obj`.
+#[must_use = "the lock unlocks immediately when the guard is unused"]
+pub struct GemGpuvaGuard<'a, T: DriverGpuVm> {
+    obj: &'a T::Object,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl<'a, T: DriverGpuVm> GemGpuvaGuard<'a, T> {
+    /// Takes the gpuva lock of `obj`, sleeping until it is available.
+    #[inline]
+    pub fn lock(obj: &'a T::Object) -> Self {
+        // INVARIANT: The guard holds the gpuva lock of `obj`.
+        Self {
+            obj,
+            _guard: gpuva_mutex(obj).lock(),
+        }
+    }
+
+    /// Tries to take the gpuva lock of `obj` without sleeping.
+    ///
+    /// Returns `None` if the lock is held.
+    #[inline]
+    pub fn try_lock(obj: &'a T::Object) -> Option<Self> {
+        // INVARIANT: The guard holds the gpuva lock of `obj`.
+        Some(Self {
+            obj,
+            _guard: gpuva_mutex(obj).try_lock()?,
+        })
+    }
+
+    /// Returns the object whose gpuva lock is held.
+    #[inline]
+    pub fn obj(&self) -> &'a T::Object {
+        self.obj
+    }
+}
+
+impl<T: ExclusiveObjects> GemGpuvaGuard<'_, T> {
+    /// Returns an iterator over the [`GpuVmBo`]s of the object.
+    ///
+    /// An `ARef` made from the returned references must not be dropped while the guard is held.
+    pub fn vm_bos(&self) -> impl Iterator<Item = &GpuVmBo<T>> {
+        // SAFETY: The object is valid.
+        let head = unsafe { &raw mut (*self.obj.as_raw()).gpuva.list };
+
+        // SAFETY: By the type invariants, `self` holds the gpuva lock, which keeps the list
+        // unchanged while `self` is borrowed. The list links the `drm_gpuvm_bo`s of the object
+        // through `list.entry.gem`. By `T: ExclusiveObjects`, each belongs to a `GpuVm<T>`, so it
+        // is the first field of a `repr(C)` `GpuVmBo<T>`.
+        let vm_bos =
+            unsafe { clist_create!(head, GpuVmBo<T>, bindings::drm_gpuvm_bo, list.entry.gem) };
+
+        vm_bos.iter()
     }
 }
 
