@@ -31,7 +31,6 @@ use crate::{
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
-    mem::ManuallyDrop,
     ops::Deref,
     ptr::{
         self,
@@ -472,6 +471,7 @@ pub trait BaseObject: IntoGEMObject {
         // INVARIANT: The lock was acquired above.
         ResvGuard {
             obj: self,
+            unlock: true,
             _not_send: NotThreadSafe,
         }
     }
@@ -489,6 +489,7 @@ pub trait BaseObject: IntoGEMObject {
         // INVARIANT: The lock was acquired above.
         Ok(ResvGuard {
             obj: self,
+            unlock: true,
             _not_send: NotThreadSafe,
         })
     }
@@ -506,6 +507,7 @@ pub trait BaseObject: IntoGEMObject {
         // INVARIANT: The lock was acquired above.
         Some(ResvGuard {
             obj: self,
+            unlock: true,
             _not_send: NotThreadSafe,
         })
     }
@@ -519,10 +521,13 @@ impl<T: IntoGEMObject> BaseObject for T {}
 ///
 /// # Invariants
 ///
-/// The current thread holds the reservation lock of `obj` for the lifetime of the guard.
+/// The current thread holds the reservation lock of `obj` for the lifetime of the guard. If
+/// `unlock` is set, nothing else releases the lock.
 #[must_use = "the lock unlocks immediately when the guard is unused"]
 pub struct ResvGuard<'a, O: IntoGEMObject> {
     obj: &'a O,
+    /// Whether dropping the guard releases the lock.
+    unlock: bool,
     _not_send: NotThreadSafe,
 }
 
@@ -536,12 +541,13 @@ impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
     /// The current thread holds the reservation lock of `obj` for `'a`, and no other guard of it
     /// is used while the returned guard exists.
     #[cfg_attr(not(CONFIG_RUST_DRM_GEM_SHMEM_HELPER), expect(unused))]
-    pub(crate) unsafe fn assume_locked(obj: &'a O) -> ManuallyDrop<Self> {
+    pub(crate) unsafe fn assume_locked(obj: &'a O) -> Self {
         // INVARIANT: The caller holds the lock for `'a`.
-        ManuallyDrop::new(Self {
+        Self {
             obj,
+            unlock: false,
             _not_send: NotThreadSafe,
-        })
+        }
     }
 
     /// Returns the object whose reservation lock is held.
@@ -554,8 +560,11 @@ impl<'a, O: IntoGEMObject> ResvGuard<'a, O> {
 impl<O: IntoGEMObject> Drop for ResvGuard<'_, O> {
     #[inline]
     fn drop(&mut self) {
-        // SAFETY: By the type invariants, the current thread holds the lock.
-        unsafe { bindings::dma_resv_unlock(self.obj.raw_dma_resv()) };
+        if self.unlock {
+            // SAFETY: By the type invariants, the current thread holds the lock, and nothing else
+            // releases it.
+            unsafe { bindings::dma_resv_unlock(self.obj.raw_dma_resv()) };
+        }
     }
 }
 
