@@ -872,7 +872,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Device-wide registry of live BOs, dumped by the `gems` debugfs file.
     pub(crate) gem_registry: Arc<GemRegistry>,
 
-    /// LRUs of the BOs that no VM maps.
+    /// LRUs of the BOs and the VMs that the shrinker scans.
     pub(crate) reclaim: Arc<Reclaim>,
 }
 

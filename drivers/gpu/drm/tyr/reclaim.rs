@@ -23,6 +23,13 @@ use kernel::{
             GpuVmBo, //
         }, //
     },
+    list::{
+        impl_list_arc_safe,
+        impl_list_item,
+        List,
+        ListArc,
+        ListLinks, //
+    },
     mm::reclaim::{
         nr_swap_pages,
         FsReclaimGuard, //
@@ -43,11 +50,15 @@ use kernel::{
             AtomicType,
             Relaxed, //
         },
+        new_mutex,
         new_spinlock,
         Arc,
         ArcBorrow,
+        LockedBy,
+        Mutex,
         SpinLock, //
     },
+    time::Jiffies,
 };
 
 use crate::{
@@ -82,7 +93,10 @@ unsafe impl AtomicType for ReclaimState {
     type Repr = i32;
 }
 
-/// The LRUs of the BOs of a device that no VM maps.
+/// How long a scan waits for a VM to finish its jobs before it skips the BOs of the VM.
+const IDLE_TIMEOUT: Jiffies = 10;
+
+/// The LRUs of the BOs and the VMs of a device.
 #[pin_data]
 pub(crate) struct Reclaim {
     /// BOs that nothing maps.
@@ -91,6 +105,12 @@ pub(crate) struct Reclaim {
     /// BOs that only userspace maps.
     #[pin]
     mmapped: Lru<Bo>,
+    /// User VMs, from the least to the most recently active. A scan moves each VM that it is done
+    /// with to the tail.
+    vms: LockedBy<List<VmReclaim>, ()>,
+    /// Generation of the last scan of the VMs, held while the VMs are scanned.
+    #[pin]
+    vm_scan: Mutex<u32>,
     /// Number of scans in a row that freed nothing while BOs remained.
     retry_count: Atomic<u32>,
     /// Device whose GEM LRU mutex protects the LRUs.
@@ -101,28 +121,40 @@ impl Reclaim {
     pub(crate) fn new(dev: &TyrDrmDevice) -> impl PinInit<Self> {
         let unused = Lru::new(dev);
         let mmapped = Lru::new(dev);
+        let vms = LockedBy::new(dev.gem_lru_mutex(), List::new());
         let dev = dev.into();
 
         pin_init!(Self {
             unused <- unused,
             mmapped <- mmapped,
+            vms,
+            vm_scan <- new_mutex!(0),
             retry_count: Atomic::new(0),
             dev,
         })
     }
 
-    /// Returns the number of pages on the LRUs.
-    fn count(&self) -> usize {
+    /// Returns the number of pages on the LRUs that a scan reaches.
+    fn count(&self, can_block: bool) -> usize {
         let guard = self.dev.gem_lru_mutex().lock();
 
-        [&self.unused, &self.mmapped]
+        let mut count = [&self.unused, &self.mmapped]
             .iter()
             .map(|lru| lru.count(&guard).unwrap_or(0))
-            .sum()
+            .sum();
+
+        if can_block {
+            for vm in self.vms.access_with_guard(&guard).iter() {
+                count += vm.lru.count(&guard).unwrap_or(0);
+            }
+        }
+
+        count
     }
 
-    /// Reclaims up to `nr_to_scan` pages.
-    fn scan(&self, nr_to_scan: usize) -> ScanObjects {
+    /// Reclaims up to `nr_to_scan` pages. The BOs that a VM maps are only reclaimed if
+    /// `can_block` allows waiting for the VM to finish its jobs.
+    fn scan(&self, nr_to_scan: usize, can_block: bool) -> ScanObjects {
         let mut freed = 0;
         let mut remaining = 0;
 
@@ -133,6 +165,10 @@ impl Reclaim {
                 }
 
                 freed += lru.scan::<EvictNoWait>(nr_to_scan - freed, &mut remaining);
+            }
+
+            if can_block && freed < nr_to_scan {
+                freed += self.scan_vms(nr_to_scan - freed, &mut remaining);
             }
         }
 
@@ -148,6 +184,52 @@ impl Reclaim {
             ScanObjects::STOP
         }
     }
+
+    /// Reclaims up to `nr_to_scan` pages of the BOs that one VM maps, starting with the least
+    /// recently active VM.
+    fn scan_vms(&self, nr_to_scan: usize, remaining: &mut usize) -> usize {
+        // Concurrent scans would overwrite each other's marks and could revisit the VMs forever.
+        let Some(mut scan_gen) = self.vm_scan.try_lock() else {
+            return 0;
+        };
+        *scan_gen = scan_gen.wrapping_add(1);
+
+        let mut freed = 0;
+        let mut done = None;
+        while freed < nr_to_scan {
+            let Some(vm) = self.next_vm(*scan_gen, done.as_deref()) else {
+                break;
+            };
+
+            freed += vm.lru.scan::<EvictIdle>(nr_to_scan - freed, remaining);
+            done = Some(vm);
+        }
+
+        freed
+    }
+
+    /// Returns the first VM that has BOs to reclaim and that scan `scan_gen` has not visited.
+    /// Moves `done` and the skipped VMs to the tail, as the scan is done with them.
+    fn next_vm(&self, scan_gen: u32, mut done: Option<&VmReclaim>) -> Option<Arc<VmReclaim>> {
+        let mut guard = self.dev.gem_lru_mutex().lock();
+
+        loop {
+            let vm = self.vms.access_with_guard(&guard).iter().next()?;
+
+            if vm.scan_gen.xchg(scan_gen, Relaxed) == scan_gen {
+                if !done.take().is_some_and(|done| ptr::eq(done, &*vm)) {
+                    return None;
+                }
+            } else if vm.lru.count(&guard).is_ok_and(|count| count > 0) {
+                return Some(vm.into());
+            }
+
+            let vms = self.vms.access_with_guard_mut(&mut guard);
+            if let Some(vm) = vms.pop_front() {
+                vms.push_back(vm);
+            }
+        }
+    }
 }
 
 /// Runs `f` with the reclaim state of `dev`, unless the device is unbound.
@@ -155,6 +237,16 @@ fn with_reclaim<R>(dev: &TyrDrmDevice, f: impl FnOnce(&Reclaim) -> R) -> Option<
     let guard = dev.registration_guard()?;
 
     Some(guard.registration_data_with(|reg_data| f(&reg_data.reclaim)))
+}
+
+/// Adds the reclaim state of a new user VM to the VMs of the device.
+pub(crate) fn add_vm(vm: ListArc<VmReclaim>) {
+    let dev = ARef::from(vm.root_gem.dev());
+
+    with_reclaim(&dev, |reclaim| {
+        let mut guard = reclaim.dev.gem_lru_mutex().lock();
+        reclaim.vms.access_with_guard_mut(&mut guard).push_back(vm);
+    });
 }
 
 /// Registers the shrinker of the BOs of a device.
@@ -175,19 +267,19 @@ pub(crate) struct GemShrinker;
 impl Shrinker for GemShrinker {
     type Ptr = Arc<Reclaim>;
 
-    fn count_objects(reclaim: ArcBorrow<'_, Reclaim>, _sc: ShrinkControl<'_>) -> CountObjects {
+    fn count_objects(reclaim: ArcBorrow<'_, Reclaim>, sc: ShrinkControl<'_>) -> CountObjects {
         if !can_swap() {
             return CountObjects::new(0);
         }
 
-        match reclaim.count() {
+        match reclaim.count(sc.can_block()) {
             0 => CountObjects::EMPTY,
             count => CountObjects::new(count),
         }
     }
 
     fn scan_objects(reclaim: ArcBorrow<'_, Reclaim>, sc: ShrinkControl<'_>) -> ScanObjects {
-        reclaim.scan(sc.nr_to_scan())
+        reclaim.scan(sc.nr_to_scan(), sc.can_block())
     }
 }
 
@@ -201,14 +293,54 @@ struct EvictNoWait;
 
 impl Shrink<Bo> for EvictNoWait {
     fn shrink(resv: &mut ResvGuard<'_, Bo>) -> bool {
-        evict(resv, ReclaimState::Mmapped).is_ok()
+        evict(resv, ReclaimState::Mmapped, None).is_ok()
     }
+}
+
+/// Reclaims the pages of the BOs that one VM maps, once the VM has finished its jobs.
+struct EvictIdle;
+
+impl Shrink<Bo> for EvictIdle {
+    fn shrink(resv: &mut ResvGuard<'_, Bo>) -> bool {
+        evict_idle(resv).is_ok()
+    }
+}
+
+/// Reclaims the pages of the BO whose reservation lock `resv` holds, once the only VM that maps
+/// the BO has finished its jobs.
+fn evict_idle(resv: &mut ResvGuard<'_, Bo>) -> Result {
+    let vm = mapping_vm(resv)?;
+    let exec = vm.exec().ok_or(EBUSY)?;
+
+    if vm.shares_resv(resv.obj()) {
+        vm.wait_idle_in_scan(&exec, resv)?;
+        return evict(resv, ReclaimState::GpuMappedSingleVm, None);
+    }
+
+    let vm_resv = vm.root_gem.try_lock_resv().ok_or(EBUSY)?;
+    vm.wait_idle_in_scan(&exec, &vm_resv)?;
+
+    evict(resv, ReclaimState::GpuMappedSingleVm, Some(&vm))
+}
+
+/// Returns the only VM that maps the BO whose reservation lock `resv` holds.
+fn mapping_vm(resv: &ResvGuard<'_, Bo>) -> Result<Arc<VmReclaim>> {
+    let gpuva = GemGpuvaGuard::try_lock(resv.obj()).ok_or(EBUSY)?;
+    let mut vm_bos = mapped_vm_bos(resv, &gpuva);
+
+    if let (Some(vm_bo), None) = (vm_bos.next(), vm_bos.next()) {
+        return Ok(vm_bo.data().vm().clone());
+    }
+
+    update_state(resv, Some(&gpuva));
+    Err(EAGAIN)
 }
 
 /// Reclaims the pages of the BO whose reservation lock `resv` holds.
 ///
 /// Fails with `EAGAIN` if the BO is now harder to reclaim than its state says, or than `max`.
-fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState) -> Result {
+/// The caller holds the reservation lock of `held`.
+fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState, held: Option<&VmReclaim>) -> Result {
     {
         let gpuva = GemGpuvaGuard::try_lock(resv.obj()).ok_or(EBUSY)?;
         let (old, new) = update_state(resv, Some(&gpuva));
@@ -223,7 +355,8 @@ fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState) -> Result {
 
             let vm = vm_bo.data().vm();
             let exec = vm.exec().ok_or(EBUSY)?;
-            let _vm_resv = if vm.shares_resv(resv.obj()) {
+            let locked = held.is_some_and(|held| ptr::eq(held, &**vm));
+            let _vm_resv = if locked || vm.shares_resv(resv.obj()) {
                 None
             } else {
                 Some(vm.root_gem.try_lock_resv().ok_or(EBUSY)?)
@@ -246,6 +379,13 @@ pub(crate) struct VmReclaim {
     /// BOs that only this VM maps.
     #[pin]
     lru: Lru<Bo>,
+    /// Links in the VMs of the device.
+    #[pin]
+    links: ListLinks,
+    /// Generation of the last scan that visited this VM.
+    scan_gen: Atomic<u32>,
+    /// Value of `scan_gen` when a wait for this VM to finish its jobs last timed out.
+    busy_gen: Atomic<u32>,
     /// Execution state of the VM until the VM drops. `VmExec` holds this reclaim state, so
     /// `Vm::drop` clears the field to break the cycle.
     #[pin]
@@ -264,10 +404,37 @@ impl VmReclaim {
 
         pin_init!(Self {
             lru <- lru,
+            links <- ListLinks::new(),
+            scan_gen: Atomic::new(0),
+            busy_gen: Atomic::new(0),
             exec <- new_spinlock!(None),
             root_gem,
             ddev,
         })
+    }
+
+    /// Moves the VM to the tail of the VMs of the device, as the most recently active one.
+    pub(crate) fn activate(&self) {
+        with_reclaim(self.root_gem.dev(), |reclaim| {
+            let mut guard = reclaim.dev.gem_lru_mutex().lock();
+            let vms = reclaim.vms.access_with_guard_mut(&mut guard);
+
+            // SAFETY: The reclaim state of a VM is only added to the VMs of its own device.
+            if let Some(vm) = unsafe { vms.remove(self) } {
+                vms.push_back(vm);
+            }
+        });
+    }
+
+    /// Removes the VM from the VMs of the device.
+    pub(crate) fn remove(&self) -> Option<ListArc<Self>> {
+        with_reclaim(self.root_gem.dev(), |reclaim| {
+            let mut guard = reclaim.dev.gem_lru_mutex().lock();
+
+            // SAFETY: The reclaim state of a VM is only added to the VMs of its own device.
+            unsafe { reclaim.vms.access_with_guard_mut(&mut guard).remove(self) }
+        })
+        .flatten()
     }
 
     /// Sets the execution state of the VM.
@@ -284,6 +451,24 @@ impl VmReclaim {
         self.exec.lock().clone()
     }
 
+    /// Waits up to `IDLE_TIMEOUT` for the VM to finish its jobs. Fails with `EBUSY` without
+    /// waiting if a wait timed out since a scan last visited the VM.
+    fn wait_idle_in_scan(&self, exec: &VmExec, resv: &ResvGuard<'_, Bo>) -> Result {
+        // Both generations only change with `vm_scan` held, so no other scan changes them while
+        // this one runs.
+        let scan_gen = self.scan_gen.load(Relaxed);
+        if self.busy_gen.load(Relaxed) == scan_gen {
+            return Err(EBUSY);
+        }
+
+        if !exec.wait_idle(resv, IDLE_TIMEOUT) {
+            self.busy_gen.store(scan_gen, Relaxed);
+            return Err(EBUSY);
+        }
+
+        Ok(())
+    }
+
     /// Returns whether `bo` uses the reservation lock of the VM.
     pub(crate) fn shares_resv(&self, bo: &Bo) -> bool {
         let root_gem = &*self.root_gem;
@@ -292,6 +477,16 @@ impl VmReclaim {
             || bo
                 .exclusive_vm_root_gem()
                 .is_some_and(|root| ptr::eq(root, root_gem))
+    }
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<0> for VmReclaim { untracked; }
+}
+
+impl_list_item! {
+    impl ListItem<0> for VmReclaim {
+        using ListLinks { self.links };
     }
 }
 
