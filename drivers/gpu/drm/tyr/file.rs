@@ -913,7 +913,7 @@ impl TyrDrmFileData {
 
         file.inner()
             .group_pool()
-            .submit_group(&reg_data.csif_info, groupsubmit, file)?;
+            .submit_group(reg_data, groupsubmit, file)?;
 
         Ok(0)
     }

@@ -969,7 +969,7 @@ impl Group {
 
     pub(super) fn submit(
         self: &Arc<Self>,
-        csif: &CsifInfo,
+        reg_data: &TyrDrmRegistrationData<'_>,
         queue_submits: KVVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
@@ -977,11 +977,13 @@ impl Group {
             return Err(EINVAL);
         }
 
+        let _awake = self.tdev.resume_for_vm_update(reg_data, &self.vm.as_data)?;
+
         let jobs = Job::from_queue_submits(queue_submits)?;
         let job_count = jobs.len();
         let mut ctx = deps::Context::new(
             file,
-            SubmitOps::new(self.clone(), *csif, self.tdev.profile_mask()),
+            SubmitOps::new(self.clone(), reg_data.csif_info, self.tdev.profile_mask()),
         );
 
         for (job, syncs) in jobs.into_iter() {
@@ -1000,7 +1002,8 @@ impl Group {
             ctx.prepare(idx)?;
         }
 
-        self.vm.with_prepared_vm(job_count as u32, |vm_exec| {
+        let dev = reg_data.pdev.as_ref();
+        self.vm.with_prepared_vm(dev, job_count as u32, |vm_exec| {
             for idx in 0..job_count {
                 let signal_fence = ctx.commit(idx)?;
                 vm_exec.resv_add_fence(
@@ -1267,7 +1270,7 @@ impl Pool {
 
     pub(crate) fn submit_group(
         &self,
-        csif: &CsifInfo,
+        reg_data: &TyrDrmRegistrationData<'_>,
         groupsubmit: &uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result {
@@ -1293,7 +1296,7 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        group.submit(csif, queue_submits, file)
+        group.submit(reg_data, queue_submits, file)
     }
 
     pub(crate) fn get_group_state(
