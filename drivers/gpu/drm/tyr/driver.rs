@@ -176,7 +176,8 @@ use crate::{
 use crate::debugfs::{
     GemsShow,
     GpuvasShow,
-    SchedGroupsShow, //
+    SchedGroupsShow,
+    ShrinkAttr, //
 };
 #[cfg(CONFIG_DEBUG_FS)]
 use kernel::debugfs::ScopeRef;
@@ -1510,6 +1511,7 @@ impl drm::Driver for TyrDrmDriver {
         dir.seq_file::<GemsShow>(c"gems");
         dir.seq_file::<GpuvasShow>(c"gpuvas");
         dir.seq_file::<SchedGroupsShow>(c"sched_groups");
+        dir.attribute_file::<ShrinkAttr>(c"shrink");
     }
 }
 
