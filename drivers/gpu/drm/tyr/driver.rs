@@ -56,6 +56,7 @@ use kernel::{
     },
     prelude::*,
     regulator,
+    shrinker::ShrinkerRegistration,
     sizes::SZ_2M,
     str::Formatter,
     sync::{
@@ -151,7 +152,11 @@ use crate::{
         pwr_irq_init,
         PwrIrq, //
     },
-    reclaim::Reclaim,
+    reclaim::{
+        self,
+        GemShrinker,
+        Reclaim, //
+    },
     regs::gpu_control::*,
     reset,
     sched::{
@@ -895,6 +900,9 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
 /// and is accessible only while the DRM device is registered with userspace.
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrDrmRegistrationData<'drm> {
+    /// Declared first, so that running scans finish before the rest of the data drops.
+    shrinker: ShrinkerRegistration<GemShrinker>,
+
     /// Parent platform device.
     pub(crate) pdev: &'drm platform::Device<Bound>,
 
@@ -1285,6 +1293,7 @@ impl platform::Driver for TyrPlatformDriver {
             }
 
             let reclaim = Arc::pin_init(Reclaim::new(&unreg_dev), GFP_KERNEL)?;
+            let shrinker = reclaim::register_shrinker(reclaim.clone())?;
 
             // The data below owns the clocks and halts the GPU if the
             // registration fails.
@@ -1301,6 +1310,7 @@ impl platform::Driver for TyrPlatformDriver {
                     pdev.as_ref(),
                     unreg_dev,
                     pin_init!(TyrDrmRegistrationData {
+                        shrinker,
                         pdev,
                         mmu,
                         fw: firmware,
