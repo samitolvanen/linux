@@ -987,6 +987,7 @@ impl Group {
 
     pub(super) fn submit(
         self: &Arc<Self>,
+        dev: &Device<Bound>,
         queue_submits: KVVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
@@ -1018,7 +1019,7 @@ impl Group {
         }
 
         self.vm
-            .with_prepared_vm(batch_queues.count_ones(), |vm_exec| {
+            .with_prepared_vm(dev, batch_queues.count_ones(), |vm_exec| {
                 let res = (0..job_count).try_for_each(|idx| ctx.commit(idx).map(|_| ()));
 
                 let queues = self
@@ -1280,6 +1281,7 @@ impl Pool {
 
     pub(crate) fn submit_group(
         &self,
+        dev: &Device<Bound>,
         groupsubmit: &uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result {
@@ -1305,7 +1307,7 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        group.submit(queue_submits, file)
+        group.submit(dev, queue_submits, file)
     }
 
     pub(crate) fn get_group_state(
