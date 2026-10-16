@@ -15,9 +15,13 @@ use kernel::{
                 Lru,
                 Shrink, //
             },
+            BaseObject,
             ResvGuard, //
         },
-        gpuvm::GemGpuvaGuard, //
+        gpuvm::{
+            GemGpuvaGuard,
+            GpuVmBo, //
+        }, //
     },
     mm::reclaim::{
         nr_swap_pages,
@@ -39,18 +43,24 @@ use kernel::{
             AtomicType,
             Relaxed, //
         },
+        new_spinlock,
         Arc,
-        ArcBorrow, //
+        ArcBorrow,
+        SpinLock, //
     },
 };
 
 use crate::{
     driver::TyrDrmDevice,
     gem::Bo,
-    vm::GpuVmData, //
+    vm::{
+        GpuVmData,
+        VmExec, //
+    },
 };
 
-/// Reclaim state of a BO, from the most to the least reclaimable.
+/// Reclaim state of a BO, from the most to the least reclaimable. The states ignore the mappings
+/// of evicted `GpuVmBo`s.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(i32)]
 pub(crate) enum ReclaimState {
@@ -210,9 +220,25 @@ fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState) -> Result {
         if new > old || new > max {
             return Err(EAGAIN);
         }
+
+        for vm_bo in gpuva.vm_bos() {
+            if is_fully_evicted(vm_bo, resv, &gpuva) {
+                continue;
+            }
+
+            let vm = vm_bo.data().vm().ok_or(EBUSY)?;
+            let exec = vm.exec().ok_or(EBUSY)?;
+            let _vm_resv = if vm.shares_resv(resv.obj()) {
+                None
+            } else {
+                Some(vm.root_gem.try_lock_resv().ok_or(EBUSY)?)
+            };
+
+            exec.evict_mappings(vm_bo, resv, &gpuva)?;
+        }
     }
 
-    // SAFETY: No VM maps the BO, as its state shows. A new mapping pins the BO, which takes the
+    // SAFETY: Every GPU mapping of the BO is evicted. A new mapping pins the BO, which takes the
     // reservation lock that `resv` holds.
     unsafe { resv.evict() }?;
     resv.obj().count_eviction();
@@ -225,15 +251,52 @@ pub(crate) struct VmReclaim {
     /// BOs that only this VM maps.
     #[pin]
     lru: Lru<Bo>,
+    /// Execution state of the VM until the VM drops. `VmExec` holds this reclaim state, so
+    /// `Vm::drop` clears the field to break the cycle.
+    #[pin]
+    exec: SpinLock<Option<Arc<VmExec>>>,
+    /// GEM object whose reservation lock protects the VM.
+    root_gem: ARef<Bo>,
+    /// Declared last, so the device outlives the drop of every other field.
+    ddev: ARef<TyrDrmDevice>,
 }
 
 impl VmReclaim {
-    pub(crate) fn new(dev: &TyrDrmDevice) -> impl PinInit<Self> {
+    pub(crate) fn new(dev: &TyrDrmDevice, root_gem: &Bo) -> impl PinInit<Self> {
         let lru = Lru::new(dev);
+        let root_gem = root_gem.into();
+        let ddev = dev.into();
 
         pin_init!(Self {
             lru <- lru,
+            exec <- new_spinlock!(None),
+            root_gem,
+            ddev,
         })
+    }
+
+    /// Sets the execution state of the VM.
+    pub(crate) fn attach(&self, exec: Arc<VmExec>) {
+        *self.exec.lock() = Some(exec);
+    }
+
+    /// Clears the execution state of the VM, and returns it.
+    pub(crate) fn detach(&self) -> Option<Arc<VmExec>> {
+        self.exec.lock().take()
+    }
+
+    fn exec(&self) -> Option<Arc<VmExec>> {
+        self.exec.lock().clone()
+    }
+
+    /// Returns whether `bo` uses the reservation lock of the VM.
+    pub(crate) fn shares_resv(&self, bo: &Bo) -> bool {
+        let root_gem = &*self.root_gem;
+
+        ptr::eq(bo, root_gem)
+            || bo
+                .exclusive_vm_root_gem()
+                .is_some_and(|root| ptr::eq(root, root_gem))
     }
 }
 
@@ -262,7 +325,7 @@ fn update_resident(
     gpuva: &GemGpuvaGuard<'_, GpuVmData>,
 ) -> (ReclaimState, ReclaimState) {
     let bo = resv.obj();
-    let mut vm_bos = gpuva.vm_bos();
+    let mut vm_bos = mapped_vm_bos(resv, gpuva);
 
     match (vm_bos.next(), vm_bos.next()) {
         (None, _) if resv.is_mmapped() => set_state(bo, ReclaimState::Mmapped, None),
@@ -274,6 +337,29 @@ fn update_resident(
         ),
         (Some(_), Some(_)) => set_state(bo, ReclaimState::GpuMappedMultiVm, None),
     }
+}
+
+/// Returns the `GpuVmBo`s of a BO that are not evicted.
+fn mapped_vm_bos<'a>(
+    resv: &'a ResvGuard<'_, Bo>,
+    gpuva: &'a GemGpuvaGuard<'_, GpuVmData>,
+) -> impl Iterator<Item = &'a GpuVmBo<GpuVmData>> {
+    gpuva
+        .vm_bos()
+        .filter(|vm_bo| matches!(vm_bo.is_evicted(resv), Ok(false)))
+}
+
+/// Returns whether `vm_bo` and all its mappings are evicted. A map on an evicted `GpuVmBo` adds a
+/// mapping that is not evicted.
+fn is_fully_evicted(
+    vm_bo: &GpuVmBo<GpuVmData>,
+    resv: &ResvGuard<'_, Bo>,
+    gpuva: &GemGpuvaGuard<'_, GpuVmData>,
+) -> bool {
+    matches!(vm_bo.is_evicted(resv), Ok(true))
+        && vm_bo
+            .vas(gpuva)
+            .is_ok_and(|mut vas| vas.all(|va| va.data_ref().is_evicted()))
 }
 
 /// Stores `state` as the reclaim state of `bo`, and moves `bo` to the LRU of `state` if the
