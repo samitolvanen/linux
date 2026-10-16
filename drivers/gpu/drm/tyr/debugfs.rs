@@ -61,6 +61,7 @@ pub(crate) const NOT_REGISTERED: usize = usize::MAX;
 
 const GEM_STATE_IMPORTED: u32 = 1 << 0;
 const GEM_STATE_EXPORTED: u32 = 1 << 1;
+const GEM_STATE_EVICTED: u32 = 1 << 2;
 
 /// BO is used only by the kernel driver.
 pub(crate) const GEM_USAGE_KERNEL: u32 = 1 << 0;
@@ -177,10 +178,13 @@ impl GemRegistry {
     }
 
     fn print_bos(&self, m: &SeqFile) {
-        seq_print!(m, "GEM state flags: imported (0x1), exported (0x2)\n");
+        seq_print!(
+            m,
+            "GEM state flags: imported (0x1), exported (0x2), evicted (0x4)\n"
+        );
         seq_print!(m, "GEM usage flags: kernel (0x1), fw-mapped (0x2)\n\n");
-        seq_print!(m, "created-by                      global-name     refcount        size            resident-size   file-offset       state      usage       label\n");
-        seq_print!(m, "----------------------------------------------------------------------------------------------------------------------------------------------\n");
+        seq_print!(m, "created-by                      global-name     refcount   evictions  size            resident-size   file-offset       state      usage       label\n");
+        seq_print!(m, "----------------------------------------------------------------------------------------------------------------------------------------------------\n");
 
         let mut total_size = 0u64;
         let mut total_resident = 0u64;
@@ -200,6 +204,7 @@ impl GemRegistry {
                     continue;
                 }
 
+                let evictions = bo.evictions();
                 let size = bo.size();
                 let resident = if bo.pages_present() || bo.is_imported() {
                     size
@@ -216,6 +221,8 @@ impl GemRegistry {
                 let mut state = 0u32;
                 if bo.is_imported() {
                     state |= GEM_STATE_IMPORTED;
+                } else if resident == 0 && evictions != 0 {
+                    state |= GEM_STATE_EVICTED;
                 }
                 if bo.has_dma_buf() {
                     state |= GEM_STATE_EXPORTED;
@@ -224,10 +231,11 @@ impl GemRegistry {
                 // The creator is left-justified in 32 columns, capped at 31.
                 seq_print!(
                     m,
-                    "{:<32.31}{:<16}{:<16}{:<16}{:<16}0x{:<16x}0x{:<8x} 0x{:<10x}",
+                    "{:<32.31}{:<16}{:<11}{:<11}{:<16}{:<16}0x{:<16x}0x{:<8x} 0x{:<10x}",
                     creator,
                     bo.global_name(),
                     refcount,
+                    evictions,
                     size,
                     resident,
                     bo.vma_node_start(),
@@ -247,7 +255,7 @@ impl GemRegistry {
             }
         }
 
-        seq_print!(m, "==============================================================================================================================================\n");
+        seq_print!(m, "====================================================================================================================================================\n");
         seq_print!(
             m,
             "Total size: {}, Total resident: {}, Total reclaimable: {}\n",
