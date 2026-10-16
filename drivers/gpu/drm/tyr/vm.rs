@@ -42,6 +42,7 @@ use kernel::{
         },
         gpuvm::{
             DriverGpuVm,
+            ExclusiveObjects,
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
@@ -124,6 +125,10 @@ use crate::{
         Mmu, //
     },
     pool::Pool as ObjectPool,
+    reclaim::{
+        self,
+        VmReclaim, //
+    },
     regs::gpu_control::MMU_FEATURES,
     reset::hw_gate::HwReadGuard,
     sched::{
@@ -432,7 +437,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
-            vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
+            vm_bo: Some(vm.exec.obtain(&bo)?),
             map_sgt: Some(map_sgt),
             _map_pin: Some(MapPin::Deferred(Some((pin, handoff)))),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
@@ -905,6 +910,30 @@ impl GpuVmData {
     }
 }
 
+/// Per-BO private data stored on each `GpuVmBo`.
+pub(crate) struct VmBoData {
+    /// The BO, whose reclaim state changes when the `GpuVmBo` is freed.
+    bo: ARef<Bo>,
+    /// Reclaim state of the VM.
+    vm: Arc<VmReclaim>,
+}
+
+impl VmBoData {
+    pub(crate) fn vm(&self) -> &Arc<VmReclaim> {
+        &self.vm
+    }
+}
+
+impl Drop for VmBoData {
+    fn drop(&mut self) {
+        // A `GpuVmBo` is only freed by the deferred cleanup of its VM or by
+        // discarding a preallocated one, and neither holds the BO's
+        // reservation lock.
+        let resv = self.bo.lock_resv();
+        reclaim::update_state(&resv, None);
+    }
+}
+
 /// Per-mapping private data stored on each `GpuVa`.
 ///
 /// A remap splits an existing mapping and may have to rebuild page-table
@@ -994,6 +1023,8 @@ pub(crate) struct VmExec {
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
+    /// Reclaim state of the VM.
+    reclaim: Arc<VmReclaim>,
     /// Whether this is the firmware VM.
     fw: bool,
     /// VA range for this VM.
@@ -1177,6 +1208,7 @@ impl Vm {
         } else {
             Some(cleanup::Handoff::new(())?)
         };
+        let reclaim = Arc::pin_init(VmReclaim::new(ddev), GFP_KERNEL)?;
 
         let exec = Arc::pin_init(
             pin_init!(VmExec {
@@ -1186,6 +1218,7 @@ impl Vm {
                 gpuvm: ManuallyDrop::new(gpuvm),
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: Atomic::new(false),
+                reclaim,
                 fw,
                 va_range: total_range,
                 handoff,
@@ -1741,6 +1774,16 @@ impl VmExec {
         self.gpuvm.deferred_cleanup();
     }
 
+    /// Returns the `GpuVmBo` of `bo` in this VM, creating it if needed.
+    fn obtain(&self, bo: &Bo) -> Result<ARef<GpuVmBo<GpuVmData>>> {
+        let data = VmBoData {
+            bo: bo.into(),
+            vm: self.reclaim.clone(),
+        };
+
+        Ok(self.gpuvm.obtain(bo, data)?)
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn map_bo_range(
         &self,
@@ -1762,7 +1805,7 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
-            vm_bo: Some(self.gpuvm.obtain(bo, ())?),
+            vm_bo: Some(self.obtain(bo)?),
             map_sgt: Some(map_sgt),
             _map_pin: Some(MapPin::Inline { _pin: pin }),
             pt_reserve: pt_alloc::PtReserve::for_map(va, map_size, pt_gfp)?,
@@ -1854,7 +1897,7 @@ impl VmExec {
 impl DriverGpuVm for GpuVmData {
     type Driver = TyrDrmDriver;
     type Object = Bo;
-    type VmBoData = ();
+    type VmBoData = VmBoData;
     type VaData = GpuVaData;
     type SmContext<'ctx>
         = PtUpdateContext<'ctx>
@@ -2058,6 +2101,9 @@ impl DriverGpuVm for GpuVmData {
         Ok(op_remapped)
     }
 }
+
+// SAFETY: Tyr BOs are only mapped by Tyr VMs, which are all `GpuVm<GpuVmData>`.
+unsafe impl ExclusiveObjects for GpuVmData {}
 
 /// Returns the base physical address of `range` if every 4KB page in it is
 /// mapped and the whole range is physically contiguous, otherwise `None`.

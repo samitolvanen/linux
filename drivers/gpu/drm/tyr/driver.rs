@@ -141,6 +141,7 @@ use crate::{
         pwr_irq_init,
         PwrIrq, //
     },
+    reclaim::Reclaim,
     regs::gpu_control::*,
     reset,
     sched::{
@@ -862,6 +863,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Device-wide registry of live BOs, dumped by the `gems` debugfs file.
     pub(crate) gem_registry: Arc<GemRegistry>,
+
+    /// LRUs of the BOs that no VM maps.
+    pub(crate) reclaim: Arc<Reclaim>,
 }
 
 kernel::of_device_table!(
@@ -1179,6 +1183,8 @@ impl platform::Driver for TyrPlatformDriver {
             return Err(EBUSY);
         }
 
+        let reclaim = Arc::pin_init(Reclaim::new(&unreg_dev), GFP_KERNEL)?;
+
         // The clocks move into the data below.
         power_guard.dismiss();
 
@@ -1198,6 +1204,7 @@ impl platform::Driver for TyrPlatformDriver {
                 csif_info,
                 vm_registry,
                 gem_registry,
+                reclaim,
         });
 
         // SAFETY: `reg` is stored in `TyrPlatformDriverData` and dropped when the driver is
