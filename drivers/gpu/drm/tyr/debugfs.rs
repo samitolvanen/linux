@@ -52,6 +52,7 @@ use crate::{
         TyrDrmDriver, //
     },
     gem::Bo,
+    reclaim::ReclaimState,
     vm::Vm,
 };
 
@@ -183,6 +184,7 @@ impl GemRegistry {
 
         let mut total_size = 0u64;
         let mut total_resident = 0u64;
+        let mut total_reclaimable = 0u64;
 
         {
             let bos = self.bos.lock();
@@ -239,6 +241,9 @@ impl GemRegistry {
 
                 total_size = total_size.saturating_add(size as u64);
                 total_resident = total_resident.saturating_add(resident as u64);
+                if bo.reclaim_state() != ReclaimState::Unreclaimable {
+                    total_reclaimable = total_reclaimable.saturating_add(resident as u64);
+                }
             }
         }
 
@@ -248,7 +253,7 @@ impl GemRegistry {
             "Total size: {}, Total resident: {}, Total reclaimable: {}\n",
             total_size,
             total_resident,
-            0
+            total_reclaimable
         );
     }
 }
