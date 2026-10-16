@@ -74,6 +74,7 @@ mod enabled {
 
     const GEM_STATE_IMPORTED: u32 = 1 << 0;
     const GEM_STATE_EXPORTED: u32 = 1 << 1;
+    const GEM_STATE_EVICTED: u32 = 1 << 2;
 
     /// One registry entry, holding a non-owning pointer to a live BO plus the
     /// immutable creator and usage snapshot captured at registration.
@@ -119,7 +120,8 @@ mod enabled {
     ///
     /// Entries are allocated before the lock is taken, so the lock never
     /// covers an allocation. The free hook can run in a dma-fence signalling
-    /// section, where an allocation under the lock would be a lockdep cycle.
+    /// section or in memory reclaim, where an allocation under the lock would
+    /// be a lockdep cycle.
     ///
     /// The registry lock is acquired before a BO's label lock, never the
     /// reverse.
@@ -176,6 +178,7 @@ mod enabled {
                         continue;
                     }
 
+                    let evictions = bo.evictions();
                     let size = bo.size();
                     let resident = if bo.pages_present() || bo.is_imported() {
                         size
@@ -192,6 +195,8 @@ mod enabled {
                     let mut state = 0u32;
                     if bo.is_imported() {
                         state |= GEM_STATE_IMPORTED;
+                    } else if resident == 0 && evictions != 0 {
+                        state |= GEM_STATE_EVICTED;
                     }
                     if bo.has_dma_buf() {
                         state |= GEM_STATE_EXPORTED;
@@ -203,7 +208,7 @@ mod enabled {
                         creator,
                         bo.global_name().unwrap_or(0),
                         refcount,
-                        0,
+                        evictions,
                         size,
                         resident,
                         bo.vma_node_start(),
