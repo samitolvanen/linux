@@ -901,9 +901,12 @@ impl TyrDrmFileData {
             return Err(ENODEV);
         }
 
-        file.inner()
-            .group_pool()
-            .submit_group(&reg_data.csif_info, groupsubmit, file)?;
+        file.inner().group_pool().submit_group(
+            reg_data.pdev.as_ref(),
+            &reg_data.csif_info,
+            groupsubmit,
+            file,
+        )?;
 
         Ok(0)
     }
