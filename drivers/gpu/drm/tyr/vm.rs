@@ -41,6 +41,7 @@ use kernel::{
         },
         gpuvm::{
             DriverGpuVm,
+            ExclusiveObjects,
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
@@ -116,6 +117,10 @@ use crate::{
         Mmu, //
     },
     pool::Pool as ObjectPool,
+    reclaim::{
+        self,
+        VmReclaim, //
+    },
     regs::gpu_control::MMU_FEATURES,
     reset::hw_gate::HwReadGuard,
     sched::{
@@ -394,7 +399,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
-            vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
+            vm_bo: Some(vm.exec.obtain(&bo)?),
             map_sgt: Some(map_sgt),
             _map_pin: Some(MapPin::Deferred(Some((pin, handoff)))),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
@@ -848,6 +853,30 @@ impl GpuVmData {
     }
 }
 
+/// Per-BO private data stored on each `GpuVmBo`.
+pub(crate) struct VmBoData {
+    /// The BO, whose reclaim state changes when the `GpuVmBo` is freed.
+    bo: ARef<Bo>,
+    /// Reclaim state of the VM. `None` for the firmware VM.
+    vm: Option<Arc<VmReclaim>>,
+}
+
+impl VmBoData {
+    pub(crate) fn vm(&self) -> Option<&Arc<VmReclaim>> {
+        self.vm.as_ref()
+    }
+}
+
+impl Drop for VmBoData {
+    fn drop(&mut self) {
+        // A `GpuVmBo` is only freed by the deferred cleanup of its VM or by
+        // discarding a preallocated one, and neither holds the BO's
+        // reservation lock.
+        let resv = self.bo.lock_resv();
+        reclaim::update_state(&resv, None);
+    }
+}
+
 /// Per-mapping private data stored on each `GpuVa`.
 ///
 /// A remap splits an existing mapping and may have to rebuild page-table
@@ -937,6 +966,9 @@ pub(crate) struct VmExec {
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
+    /// Reclaim state of the VM. `None` for the firmware VM, which is created
+    /// before the device is registered. Taken by `Drop`.
+    reclaim: Option<Arc<VmReclaim>>,
     /// Whether this is the firmware VM.
     fw: bool,
     /// VA range for this VM.
@@ -967,18 +999,26 @@ impl WorkItem for VmExec {
 struct GpuVmRelease {
     gpuvm: ARef<GpuVm<GpuVmData>>,
     unique: Option<UniqueRefGpuVm<GpuVmData>>,
+    reclaim: Option<Arc<VmReclaim>>,
 }
 
 /// Flushes the deferred `vm_bo` list, then drops the gpuvm references
-/// that `VmExec::drop` moved out.
+/// and the reclaim state that `VmExec::drop` moved out.
 ///
 /// The flush takes the gpuvm reservation lock, so `VmExec::drop` hands
-/// this off to the cleanup workqueue, except for the firmware VM.
+/// this off to the cleanup workqueue, except for the firmware VM. The
+/// reclaim state holds a device reference, so it is dropped here, before
+/// the hand-off drops its own.
 fn release_gpuvm(release: GpuVmRelease) {
-    let GpuVmRelease { gpuvm, unique } = release;
+    let GpuVmRelease {
+        gpuvm,
+        unique,
+        reclaim,
+    } = release;
     gpuvm.deferred_cleanup();
     drop(unique);
     drop(gpuvm);
+    drop(reclaim);
 }
 
 #[pinned_drop]
@@ -986,8 +1026,8 @@ impl PinnedDrop for VmExec {
     fn drop(self: Pin<&mut Self>) {
         // SAFETY: We do not move out of any structurally pinned field.
         // The `Mutex` is only accessed through `try_lock` in place, and
-        // the only fields moved out are `gpuvm` and `handoff`, neither of
-        // which is `#[pin]`.
+        // the only fields moved out are `gpuvm`, `reclaim` and `handoff`,
+        // none of which is `#[pin]`.
         let this = unsafe { self.get_unchecked_mut() };
 
         // SAFETY: `Drop` runs at most once, and this is the only
@@ -1004,6 +1044,7 @@ impl PinnedDrop for VmExec {
         let release = GpuVmRelease {
             gpuvm,
             unique: gpuvm_unique,
+            reclaim: this.reclaim.take(),
         };
 
         // The firmware VM has no hand-off. It is dropped only by probe and
@@ -1138,6 +1179,10 @@ impl Vm {
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
 
         let handoff = device_ref.clone().map(cleanup::Handoff::new).transpose()?;
+        let reclaim = device_ref
+            .as_deref()
+            .map(|dev| Arc::pin_init(VmReclaim::new(dev), GFP_KERNEL))
+            .transpose()?;
         let exec = Arc::pin_init(
             pin_init!(VmExec {
                 as_data,
@@ -1146,6 +1191,7 @@ impl Vm {
                 gpuvm: ManuallyDrop::new(gpuvm),
                 gpuvm_unique <- new_mutex!(Some(gpuvm_unique)),
                 unusable: Atomic::new(false),
+                reclaim,
                 fw,
                 va_range: total_range,
                 handoff,
@@ -1654,6 +1700,16 @@ impl VmExec {
         self.gpuvm.deferred_cleanup();
     }
 
+    /// Returns the `GpuVmBo` of `bo` in this VM, creating it if needed.
+    fn obtain(&self, bo: &Bo) -> Result<ARef<GpuVmBo<GpuVmData>>> {
+        let data = VmBoData {
+            bo: bo.into(),
+            vm: self.reclaim.clone(),
+        };
+
+        Ok(self.gpuvm.obtain(bo, data)?)
+    }
+
     pub(crate) fn map_bo_range(
         &self,
         bo: &Bo,
@@ -1675,7 +1731,7 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
-            vm_bo: Some(self.gpuvm.obtain(bo, ())?),
+            vm_bo: Some(self.obtain(bo)?),
             map_sgt: Some(map_sgt),
             _map_pin: Some(MapPin::Inline { _pin: pin }),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size, pt_gfp)?,
@@ -1752,7 +1808,7 @@ impl VmExec {
 impl DriverGpuVm for GpuVmData {
     type Driver = TyrDrmDriver;
     type Object = Bo;
-    type VmBoData = ();
+    type VmBoData = VmBoData;
     type VaData = GpuVaData;
     type SmContext<'ctx> = PtUpdateContext<'ctx>;
 
@@ -1968,6 +2024,9 @@ impl DriverGpuVm for GpuVmData {
         Ok(op_remapped)
     }
 }
+
+// SAFETY: Tyr BOs are only mapped by Tyr VMs, which are all `GpuVm<GpuVmData>`.
+unsafe impl ExclusiveObjects for GpuVmData {}
 
 /// Returns the base physical address of `range` if every 4KB page in it is
 /// mapped and the whole range is physically contiguous, otherwise `None`.

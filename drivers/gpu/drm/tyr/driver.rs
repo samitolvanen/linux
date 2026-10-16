@@ -133,6 +133,7 @@ use crate::{
         self,
         PwrIrq, //
     },
+    reclaim::Reclaim,
     regs::gpu_control::*,
     reset, //
     sched::{
@@ -442,6 +443,10 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Runtime PM context, `None` until the end of probe.
     pub(crate) pm: SetOnce<PMContext<TyrPmOps>>,
+
+    /// LRUs of the BOs that no VM maps, set once the device is registered.
+    /// Revoked at unbind, which drops the device reference that they hold.
+    pub(crate) reclaim: SetOnce<Devres<Arc<Reclaim>>>,
 
     /// Set once runtime suspend can no longer fail and cleared when resume
     /// brings the hardware back, a different window from the mmap `powered`
@@ -1068,6 +1073,7 @@ impl TyrPlatformDriverData {
                 max_freq: Atomic::new(0),
                 devfreq_data,
                 pm: SetOnce::new(),
+                reclaim: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
                 unbinding: Atomic::new(false),
                 unusable: Atomic::new(false),
@@ -1106,6 +1112,12 @@ impl TyrPlatformDriverData {
 
         tdev.reset
             .set_device(Devres::new(pdev.as_ref(), tdev.clone())?);
+
+        let reclaim = Arc::pin_init(Reclaim::new(&tdev), GFP_KERNEL)?;
+        let reclaim_res = Devres::new(pdev.as_ref(), reclaim)?;
+        if !tdev.reclaim.populate(reclaim_res) {
+            return Err(EBUSY);
+        }
 
         let gpu_irq = Arc::pin_init(
             gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
