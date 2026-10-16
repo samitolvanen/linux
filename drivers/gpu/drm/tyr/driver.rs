@@ -455,8 +455,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// Runtime PM context, `None` until the end of probe.
     pub(crate) pm: SetOnce<PMContext<TyrPmOps>>,
 
-    /// LRUs of the BOs that no VM maps, set once the device is registered.
-    /// Revoked at unbind, which drops the device reference that they hold.
+    /// LRUs of the BOs and the VMs that the shrinker scans, set once the
+    /// device is registered. Revoked at unbind, which drops the device
+    /// reference that they hold.
     pub(crate) reclaim: SetOnce<Devres<Arc<Reclaim>>>,
 
     /// Set once runtime suspend can no longer fail and cleared when resume
