@@ -12,14 +12,36 @@ use kernel::{
         gem::{
             lru::{
                 self,
-                Lru, //
+                Lru,
+                Shrink, //
             },
             ResvGuard, //
         },
         gpuvm::GemGpuvaGuard, //
     },
+    mm::reclaim::{
+        nr_swap_pages,
+        FsReclaimGuard, //
+    },
     prelude::*,
-    sync::atomic::AtomicType, //
+    shrinker::{
+        CountObjects,
+        ScanObjects,
+        ShrinkControl,
+        Shrinker,
+        ShrinkerBuilder,
+        ShrinkerRegistration, //
+    },
+    sync::{
+        aref::ARef,
+        atomic::{
+            Atomic,
+            AtomicType,
+            Relaxed, //
+        },
+        Arc,
+        ArcBorrow, //
+    },
 };
 
 use crate::{
@@ -59,17 +81,62 @@ pub(crate) struct Reclaim {
     /// BOs that only userspace maps.
     #[pin]
     mmapped: Lru<Bo>,
+    /// Number of scans in a row that freed nothing while BOs remained.
+    retry_count: Atomic<u32>,
+    /// Device whose GEM LRU mutex protects the LRUs.
+    dev: ARef<TyrDrmDevice>,
 }
 
 impl Reclaim {
     pub(crate) fn new(dev: &TyrDrmDevice) -> impl PinInit<Self> {
         let unused = Lru::new(dev);
         let mmapped = Lru::new(dev);
+        let dev = dev.into();
 
         pin_init!(Self {
             unused <- unused,
             mmapped <- mmapped,
+            retry_count: Atomic::new(0),
+            dev,
         })
+    }
+
+    /// Returns the number of pages on the LRUs.
+    fn count(&self) -> usize {
+        let guard = self.dev.gem_lru_mutex().lock();
+
+        [&self.unused, &self.mmapped]
+            .iter()
+            .map(|lru| lru.count(&guard).unwrap_or(0))
+            .sum()
+    }
+
+    /// Reclaims up to `nr_to_scan` pages.
+    fn scan(&self, nr_to_scan: usize) -> ScanObjects {
+        let mut freed = 0;
+        let mut remaining = 0;
+
+        if can_swap() {
+            for lru in [&self.unused, &self.mmapped] {
+                if freed >= nr_to_scan {
+                    break;
+                }
+
+                freed += lru.scan::<EvictNoWait>(nr_to_scan - freed, &mut remaining);
+            }
+        }
+
+        if freed == 0 && remaining > 0 && self.retry_count.fetch_add(1, Relaxed) < 1 {
+            return ScanObjects::from_count(0);
+        }
+
+        self.retry_count.store(0, Relaxed);
+
+        if freed > 0 {
+            ScanObjects::from_count(freed)
+        } else {
+            ScanObjects::STOP
+        }
     }
 }
 
@@ -83,6 +150,71 @@ fn with_reclaim<R>(dev: &TyrDrmDevice, f: impl FnOnce(&Reclaim) -> R) -> Option<
     let reclaim = data.reclaim.as_ref()?.access(bound).ok()?;
 
     Some(f(reclaim))
+}
+
+/// Registers the shrinker of the BOs of a device.
+pub(crate) fn register_shrinker(
+    reclaim: Arc<Reclaim>,
+) -> Result<ShrinkerRegistration<GemShrinker>> {
+    {
+        let _scope = FsReclaimGuard::new(GFP_KERNEL);
+        reclaim.dev.gem_lru_mutex().might_lock();
+    }
+
+    Ok(ShrinkerBuilder::new(c"drm-tyr-gem")?.register::<GemShrinker>(reclaim))
+}
+
+/// The shrinker of the BOs of a device.
+pub(crate) struct GemShrinker;
+
+impl Shrinker for GemShrinker {
+    type Ptr = Arc<Reclaim>;
+
+    fn count_objects(reclaim: ArcBorrow<'_, Reclaim>, _sc: ShrinkControl<'_>) -> CountObjects {
+        if !can_swap() {
+            return CountObjects::new(0);
+        }
+
+        match reclaim.count() {
+            0 => CountObjects::EMPTY,
+            count => CountObjects::new(count),
+        }
+    }
+
+    fn scan_objects(reclaim: ArcBorrow<'_, Reclaim>, sc: ShrinkControl<'_>) -> ScanObjects {
+        reclaim.scan(sc.nr_to_scan())
+    }
+}
+
+/// Returns whether reclaimed pages can be written to swap.
+fn can_swap() -> bool {
+    nr_swap_pages() > 0
+}
+
+/// Reclaims the pages of the BOs on the LRUs of the device, without waiting for fences.
+struct EvictNoWait;
+
+impl Shrink<Bo> for EvictNoWait {
+    fn shrink(resv: &mut ResvGuard<'_, Bo>) -> bool {
+        evict(resv, ReclaimState::Mmapped).is_ok()
+    }
+}
+
+/// Reclaims the pages of the BO whose reservation lock `resv` holds.
+///
+/// Fails with `EAGAIN` if the BO is now harder to reclaim than its state says, or than `max`.
+fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState) -> Result {
+    {
+        let gpuva = GemGpuvaGuard::try_lock(resv.obj()).ok_or(EBUSY)?;
+        let (old, new) = update_state(resv, Some(&gpuva));
+        if new > old || new > max {
+            return Err(EAGAIN);
+        }
+    }
+
+    // SAFETY: No VM maps the BO, as its state shows. A new mapping pins the BO, which takes the
+    // reservation lock that `resv` holds.
+    unsafe { resv.evict() }
 }
 
 /// Reclaim state of a VM.
