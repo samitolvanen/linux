@@ -197,6 +197,11 @@ pub trait DriverObject: Sync + Send + Sized {
     /// data, so a driver must drop the objects a hook frees before the data
     /// fields that hook reads.
     ///
+    /// For a [`RECLAIMABLE`] object, it can run in memory reclaim, when a
+    /// shrinker drops the last reference. The hook then must not take a lock
+    /// that is held while memory is allocated with reclaim allowed.
+    ///
+    /// [`RECLAIMABLE`]: Self::RECLAIMABLE
     /// [`dev()`]: crate::drm::gem::Object::dev
     /// [`Device::data`]: crate::drm::device::Device::data
     fn free(_obj: &DriverAllocImpl<Self>) {}
