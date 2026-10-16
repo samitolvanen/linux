@@ -68,6 +68,7 @@ mod enabled {
     use crate::{
         driver::TyrDrmRegistrationData,
         gem::Bo,
+        reclaim::ReclaimState,
         vm::Vm, //
     };
 
@@ -159,6 +160,7 @@ mod enabled {
 
             let mut total_size = 0usize;
             let mut total_resident = 0usize;
+            let mut total_reclaimable = 0usize;
 
             {
                 let bos = self.bos.lock();
@@ -215,6 +217,9 @@ mod enabled {
 
                     total_size += size;
                     total_resident += resident;
+                    if bo.reclaim_state() != ReclaimState::Unreclaimable {
+                        total_reclaimable += resident;
+                    }
                 }
             }
 
@@ -224,7 +229,7 @@ mod enabled {
                 "Total size: {}, Total resident: {}, Total reclaimable: {}\n",
                 total_size,
                 total_resident,
-                0
+                total_reclaimable
             );
         }
     }
