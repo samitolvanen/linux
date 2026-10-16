@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! Device-wide object registries and their debugfs files.
+//! Device-wide object registries and their debugfs files, and the `shrink`
+//! file.
 //!
 //! Each registry tracks live objects without referencing them, so a debugfs
 //! file can dump them without walking per-file state. Without
@@ -18,6 +19,7 @@ pub(crate) use self::enabled::{
     GemRegistry,
     GemsShow,
     GpuvasShow,
+    ShrinkAttr,
     VmRegistry, //
 };
 
@@ -35,7 +37,10 @@ mod enabled {
     };
 
     use kernel::{
-        debugfs::SeqShow,
+        debugfs::{
+            Attribute,
+            SeqShow, //
+        },
         drm::gem::BaseObject,
         list::{
             impl_list_arc_safe,
@@ -413,6 +418,25 @@ mod enabled {
     impl SeqShow<TyrDrmRegistrationData<'_>> for GpuvasShow {
         fn show(reg_data: &TyrDrmRegistrationData<'_>, m: &SeqFile) -> Result {
             reg_data.vm_registry.print_gpuvas(m)
+        }
+    }
+
+    /// The `shrink` debugfs file. Reading it returns the number of pages that
+    /// the last scan reclaimed. Writing `n` scans `n` pages.
+    pub(crate) struct ShrinkAttr;
+
+    impl Attribute<TyrDrmRegistrationData<'_>> for ShrinkAttr {
+        const FORMAT: &'static CStr = c"0x%08llx\n";
+
+        fn get(reg_data: &TyrDrmRegistrationData<'_>) -> Result<u64> {
+            Ok(reg_data.reclaim.last_scan_pages() as u64)
+        }
+
+        fn set(reg_data: &TyrDrmRegistrationData<'_>, val: u64) -> Result {
+            reg_data
+                .reclaim
+                .shrink(usize::try_from(val).unwrap_or(usize::MAX));
+            Ok(())
         }
     }
 }
