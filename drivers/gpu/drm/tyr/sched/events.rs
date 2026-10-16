@@ -35,6 +35,7 @@ use crate::{
         CsgSlotMask,
         CSG_REQ, //
     },
+    gem::Bo,
     heap, trace,
     vm::Vm,
 };
@@ -744,13 +745,14 @@ fn tiler_heap_readback(
 /// copies up to 256 bytes centred on `info_va` into the trace payload.
 /// Mesa-owned user BOs typically have no kernel vmap, in which case
 /// the trace records the metadata with an empty byte payload so the
-/// consumer can still see which BO covers the fault VA.
+/// consumer can still see which BO covers the fault VA. The payload is
+/// also empty when the BO's reservation lock is contended.
 ///
 /// Safe for use from the dma-fence signalling section that runs the CSG event
 /// handler, because the GPUVM lookup uses [`Vm::try_get_bo_for_va`] (returns
 /// immediately on lock contention) and the byte read goes through whatever
-/// kernel vmap was already installed on the BO; no allocation, no
-/// `dma_resv_lock` acquisition, no sleeping wait.
+/// kernel vmap was already installed on the BO, under a trylock of its
+/// reservation lock. It does not allocate, block on `dma_resv_lock` or sleep.
 fn dump_cs_fault_info(group_id: u64, cs_id: u32, info_va: u64, vm: &Vm) {
     let (bo, bo_offset) = match vm.try_get_bo_for_va(info_va) {
         Ok(Some(hit)) => hit,
@@ -763,68 +765,8 @@ fn dump_cs_fault_info(group_id: u64, cs_id: u32, info_va: u64, vm: &Vm) {
     let bo_size = bo.size() as u64;
     let bo_va_base = info_va.saturating_sub(bo_offset);
 
-    let shmem = IntoGEMObject::as_raw(&*bo).cast::<bindings::drm_gem_shmem_object>();
-    // SAFETY: `bo` is an `ARef<Bo>` where `Bo = gem::shmem::Object<_>`.
-    // `Bo` is `repr(C)` with `obj: Opaque<drm_gem_shmem_object>` as its
-    // first field, and `drm_gem_shmem_object` is `repr(C)` with `base:
-    // drm_gem_object` as its first field, so the address returned by
-    // `IntoGEMObject::as_raw` coincides with the embedded shmem
-    // object. The `ARef` keeps the allocation alive for the duration
-    // of this borrow. A racing `drm_gem_shmem_vunmap` could clear
-    // `vaddr` between this load and the bytes loop below; if it does
-    // the volatile read returns NULL and the helper falls through to
-    // the no-bytes path. A racing vunmap that drops `vmap_use_count`
-    // to zero after this load could in theory tear the mapping down
-    // under the subsequent reads; this is a downstream-only debug aid
-    // running in the dma-fence signalling section where the safe
-    // alternative (re-vmap under `dma_resv_lock`) is forbidden. The
-    // same direct-binding pattern is used in
-    // `sched::queue::QueueData::user_stream_window_around` to read
-    // `import_attach`.
-    let vaddr = unsafe { core::ptr::read_volatile(&raw const (*shmem).vaddr) };
-    if vaddr.is_null() {
-        trace::cs_fault_info_dump(
-            group_id,
-            cs_id,
-            info_va,
-            bo_va_base,
-            bo_size,
-            bo_offset,
-            &[],
-        );
-        return;
-    }
-
-    let bo_size_usz = bo_size as usize;
-    let offset = bo_offset as usize;
-    if offset >= bo_size_usz {
-        trace::cs_fault_info_dump(
-            group_id,
-            cs_id,
-            info_va,
-            bo_va_base,
-            bo_size,
-            bo_offset,
-            &[],
-        );
-        return;
-    }
-
-    let start = offset.saturating_sub(128);
-    let end = offset.saturating_add(128).min(bo_size_usz);
-    let len = end - start;
     let mut bytes = [0u8; 256];
-    // SAFETY: `vaddr` was non-NULL on a `READ_ONCE`-style read above,
-    // indicating the shmem helpers have an installed kernel mapping
-    // covering `bo_size_usz` bytes starting at `vaddr`. `start..end`
-    // is in bounds by construction; the mapping is shared with the
-    // GPU so the reads are volatile to defeat compiler caching.
-    unsafe {
-        let src = (vaddr as *const u8).add(start);
-        for (i, slot) in bytes[..len].iter_mut().enumerate() {
-            *slot = core::ptr::read_volatile(src.add(i));
-        }
-    }
+    let len = read_vmap_bytes(&bo, bo_offset as usize, &mut bytes);
 
     trace::cs_fault_info_dump(
         group_id,
@@ -835,6 +777,47 @@ fn dump_cs_fault_info(group_id: u64, cs_id: u32, info_va: u64, vm: &Vm) {
         bo_offset,
         &bytes[..len],
     );
+}
+
+/// Copies up to 256 bytes of `bo` centered on `offset` into `bytes` through
+/// the existing kernel vmap of `bo`.
+///
+/// Returns the number of bytes copied, or 0 if the reservation lock is
+/// contended, `bo` has no kernel vmap, or `offset` is out of bounds.
+fn read_vmap_bytes(bo: &Bo, offset: usize, bytes: &mut [u8; 256]) -> usize {
+    let Some(_resv) = bo.try_lock_resv() else {
+        return 0;
+    };
+
+    let shmem = IntoGEMObject::as_raw(bo).cast::<bindings::drm_gem_shmem_object>();
+    // SAFETY: `bo` is a `gem::shmem::Object<_>`, so the `as_raw` pointer coincides with the
+    // embedded shmem object. `_resv` holds the reservation lock, which protects `vaddr`.
+    let vaddr = unsafe { core::ptr::read_volatile(&raw const (*shmem).vaddr) };
+    if vaddr.is_null() {
+        return 0;
+    }
+
+    let bo_size_usz = bo.size();
+    if offset >= bo_size_usz {
+        return 0;
+    }
+
+    let start = offset.saturating_sub(128);
+    let end = offset.saturating_add(128).min(bo_size_usz);
+    let len = end - start;
+    // SAFETY: `vaddr` was non-NULL on a `READ_ONCE`-style read above,
+    // indicating the shmem helpers have an installed kernel mapping
+    // covering `bo_size_usz` bytes starting at `vaddr`. The mapping
+    // stays installed while `_resv` is held. `start..end` is in bounds
+    // by construction. The mapping is shared with the GPU, so the reads
+    // are volatile to defeat compiler caching.
+    unsafe {
+        let src = (vaddr as *const u8).add(start);
+        for (i, slot) in bytes[..len].iter_mut().enumerate() {
+            *slot = core::ptr::read_volatile(src.add(i));
+        }
+    }
+    len
 }
 
 /// Reads back the value currently stored at the scoreboard slot a CS
