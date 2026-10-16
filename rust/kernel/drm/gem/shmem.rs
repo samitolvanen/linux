@@ -380,13 +380,12 @@ impl<T: DriverObject> Object<T> {
     ) -> Result<&'a Devres<SGTableMap<T>>> {
         let sgt_res_ptr = self.sgt_res.get();
 
-        // SAFETY: This lock is initialized throughout the lifetime of the gem object
-        unsafe { bindings::dma_resv_lock(self.raw_dma_resv(), ptr::null_mut()) };
+        let _guard = self.lock_resv();
 
         // SAFETY: We just grabbed the lock required for reading this data above.
         let sgt_res = unsafe { (*sgt_res_ptr).as_ref() };
 
-        let ret = if let Some(sgt_res) = sgt_res {
+        if let Some(sgt_res) = sgt_res {
             // We already have a Devres object for this sg table, return it
             Ok(sgt_res)
         } else {
@@ -435,12 +434,7 @@ impl<T: DriverObject> Object<T> {
                     }
                 }
             }
-        };
-
-        // SAFETY: We're releasing the lock that we grabbed above.
-        unsafe { bindings::dma_resv_unlock(self.raw_dma_resv()) };
-
-        ret
+        }
     }
 
     /// Creates (if necessary) and returns an immutable reference to a scatter-gather table of DMA
@@ -482,15 +476,16 @@ impl<T: DriverObject> Object<T> {
         }
 
         let mut map: MaybeUninit<bindings::iosys_map> = MaybeUninit::uninit();
+        let guard = self.lock_resv();
 
         // SAFETY: drm_gem_shmem_vmap can be called with the DMA reservation lock held
         to_result(unsafe {
-            // TODO: see top of file
-            bindings::dma_resv_lock(self.raw_dma_resv(), ptr::null_mut());
-            let ret = bindings::drm_gem_shmem_vmap_locked(self.as_raw_shmem(), map.as_mut_ptr());
-            bindings::dma_resv_unlock(self.raw_dma_resv());
-            ret
+            bindings::drm_gem_shmem_vmap_locked(self.as_raw_shmem(), map.as_mut_ptr())
         })?;
+
+        // Drop the guard explicitly here, since we may need to call `raw_vunmap()` (which
+        // re-acquires the lock).
+        drop(guard);
 
         // SAFETY: The call to drm_gem_shmem_vmap_locked succeeded above, so we are guaranteed that
         // map is properly initialized.
@@ -519,18 +514,13 @@ impl<T: DriverObject> Object<T> {
     /// - The caller promises that the memory pointed to by map will no longer be accesed through
     ///   this instance.
     unsafe fn raw_vunmap(&self, mut map: bindings::iosys_map) {
-        let resv = self.raw_dma_resv();
+        let _guard = self.lock_resv();
 
         // SAFETY:
         // - This function is safe to call with the DMA reservation lock held
         // - Our `ARef` is proof that the underlying gem object here is initialized and thus safe to
         //   dereference.
-        unsafe {
-            // TODO: see top of file
-            bindings::dma_resv_lock(resv, ptr::null_mut());
-            bindings::drm_gem_shmem_vunmap_locked(self.as_raw_shmem(), &mut map);
-            bindings::dma_resv_unlock(resv);
-        }
+        unsafe { bindings::drm_gem_shmem_vunmap_locked(self.as_raw_shmem(), &mut map) };
     }
 
     /// Creates and returns a virtual kernel memory mapping for this object.
@@ -868,15 +858,11 @@ impl<T: DriverObject> Drop for SGTableMap<T> {
             return;
         }
 
-        // SAFETY: The dma_resv for GEM objects is initialized throughout its lifetime
-        unsafe { bindings::dma_resv_lock(obj.raw_dma_resv(), ptr::null_mut()) };
+        let _lock = obj.lock_resv();
 
         // SAFETY: We hold the reservation lock, and the table of an object that is not imported
         // belongs to the shmem helper.
         unsafe { bindings::__drm_gem_shmem_free_sgt_locked(obj.as_raw_shmem()) };
-
-        // SAFETY: We are releasing the lock we acquired above.
-        unsafe { bindings::dma_resv_unlock(obj.raw_dma_resv()) };
     }
 }
 
@@ -1064,7 +1050,9 @@ mod tests {
     struct KunitDriver;
     struct KunitFile;
     #[pin_data]
-    struct KunitObject {}
+    struct KunitObject {
+        value: gem::ResvLocked<u32>,
+    }
 
     const INFO: drm::DriverInfo = drm::DriverInfo {
         major: 0,
@@ -1091,14 +1079,18 @@ mod tests {
             _size: usize,
             _args: Self::Args,
         ) -> impl PinInit<Self, Error> {
-            try_pin_init!(KunitObject {})
+            try_pin_init!(KunitObject {
+                value: gem::ResvLocked::new(0),
+            })
         }
 
         fn create_imported(
             _dev: &drm::Device<KunitDriver>,
             _size: usize,
         ) -> impl PinInit<Self, Error> {
-            try_pin_init!(KunitObject {})
+            try_pin_init!(KunitObject {
+                value: gem::ResvLocked::new(0),
+            })
         }
     }
 
@@ -1175,6 +1167,34 @@ mod tests {
         assert_eq!(vmap.read8(0x21), 0xFF);
         assert_eq!(vmap.read8(0x22), 0xFF);
         assert_eq!(vmap.read8(0x23), 0xFF);
+
+        Ok(())
+    }
+
+    #[test]
+    fn resv_guards() -> Result {
+        let dev = faux::Registration::new(c"Kunit", None)?;
+        let drm = create_drm_dev(&dev)?;
+
+        let cfg_ = || ObjectConfig::<KunitObject> {
+            map_wc: false,
+            parent_resv_obj: None,
+        };
+        let obj = Object::<KunitObject>::new(drm, PAGE_SIZE, cfg_(), ())?;
+        let other = Object::<KunitObject>::new(drm, PAGE_SIZE, cfg_(), ())?;
+
+        let mut guard = obj.lock_resv();
+        assert!(obj.try_lock_resv().is_none());
+        *obj.value.access_mut(&mut guard)? += 1;
+        drop(guard);
+
+        // A guard of another object does not give access.
+        let other_guard = other.lock_resv();
+        assert_eq!(obj.value.access(&other_guard).err(), Some(EINVAL));
+        drop(other_guard);
+
+        let guard = obj.try_lock_resv().ok_or(EBUSY)?;
+        assert_eq!(*obj.value.access(&guard)?, 1);
 
         Ok(())
     }
