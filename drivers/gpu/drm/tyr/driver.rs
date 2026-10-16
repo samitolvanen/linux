@@ -55,6 +55,7 @@ use kernel::{
     },
     prelude::*,
     regulator,
+    shrinker::ShrinkerRegistration,
     sizes::SZ_2M,
     str::Formatter,
     sync::{
@@ -133,7 +134,11 @@ use crate::{
         self,
         PwrIrq, //
     },
-    reclaim::Reclaim,
+    reclaim::{
+        self,
+        GemShrinker,
+        Reclaim, //
+    },
     regs::gpu_control::*,
     reset, //
     sched::{
@@ -201,6 +206,10 @@ pub(crate) mod work_id {
 }
 
 pub(crate) struct TyrPlatformDriverData {
+    /// GEM shrinker registration, taken by `unbind` first so that running
+    /// scans finish before any teardown.
+    shrinker: Pin<KBox<Mutex<Option<ShrinkerRegistration<GemShrinker>>>>>,
+
     /// Devfreq registration, `None` on devices without an OPP table.
     devfreq_registration: Arc<Mutex<Option<TyrDevfreq>>>,
 
@@ -1114,10 +1123,15 @@ impl TyrPlatformDriverData {
             .set_device(Devres::new(pdev.as_ref(), tdev.clone())?);
 
         let reclaim = Arc::pin_init(Reclaim::new(&tdev), GFP_KERNEL)?;
-        let reclaim_res = Devres::new(pdev.as_ref(), reclaim)?;
+        let reclaim_res = Devres::new(pdev.as_ref(), reclaim.clone())?;
         if !tdev.reclaim.populate(reclaim_res) {
             return Err(EBUSY);
         }
+
+        let shrinker = KBox::pin_init(
+            new_mutex!(Some(reclaim::register_shrinker(reclaim)?)),
+            GFP_KERNEL,
+        )?;
 
         let gpu_irq = Arc::pin_init(
             gpu::irq::gpu_irq_init(tdev.clone(), pdev, tdev.iomem.clone())?,
@@ -1206,6 +1220,7 @@ impl TyrPlatformDriverData {
         hw_guard.dismiss();
         probe_guard.dismiss().finish(ProbeState::Ready);
         Ok(TyrPlatformDriverData {
+            shrinker,
             devfreq_registration,
             pm: pm_registration,
             drm_registration,
@@ -1230,7 +1245,9 @@ impl platform::Driver for TyrPlatformDriverData {
     }
 
     fn unbind(pdev: &platform::Device<Core>, this: Pin<&Self>) {
-        // Unplug first, so the ioctls in flight finish before any teardown.
+        // Free the shrinker and unplug first, so the scans and ioctls in
+        // flight finish before any teardown.
+        drop(this.shrinker.lock().take());
         let reg = this.drm_registration.lock().take();
         drop(reg);
         // Runtime PM outlives unbind, so refuse resumes before the rest of
