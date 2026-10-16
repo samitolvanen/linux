@@ -8,13 +8,23 @@
 use core::{
     cmp::min,
     fmt::Write,
-    ptr::NonNull, //
+    ptr::{
+        self,
+        NonNull, //
+    },
 };
 
 use kernel::{
     drm::{
         debugfs::Info,
         gem::BaseObject, //
+    },
+    list::{
+        impl_list_arc_safe,
+        impl_list_item,
+        List,
+        ListArc,
+        ListLinks, //
     },
     pr_warn_once,
     prelude::*,
@@ -45,7 +55,7 @@ use crate::{
     vm::Vm,
 };
 
-/// Sentinel `BoData` registry-slot value for a BO absent from the registry.
+/// Sentinel `Vm` registry-slot value for a VM absent from the `gpuvas` registry.
 pub(crate) const NOT_REGISTERED: usize = usize::MAX;
 
 const GEM_STATE_IMPORTED: u32 = 1 << 0;
@@ -58,11 +68,24 @@ pub(crate) const GEM_USAGE_FW_MAPPED: u32 = 1 << 1;
 
 /// One registry entry, holding a non-owning pointer to a live BO plus the
 /// immutable creator and usage snapshot captured at registration.
+#[pin_data]
 struct GemEntry {
     gem: NonNull<Bo>,
     creator_comm: TaskComm,
     creator_tgid: Pid,
     usage_flags: u32,
+    #[pin]
+    links: ListLinks,
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<0> for GemEntry { untracked; }
+}
+
+impl_list_item! {
+    impl ListItem<0> for GemEntry {
+        using ListLinks { self.links };
+    }
 }
 
 // SAFETY: It is safe to send a `GemEntry` to another thread because the
@@ -72,6 +95,21 @@ struct GemEntry {
 // fields are plain data.
 unsafe impl Send for GemEntry {}
 
+// SAFETY: It is safe to share a `GemEntry` between threads because its
+// pointer is only dereferenced under the registry lock and `Bo` is `Sync`.
+// The other fields are plain data.
+unsafe impl Sync for GemEntry {}
+
+/// A BO's entry in the `gems` registry, or null if the BO is not listed. Only
+/// ever touched under the registry lock.
+pub(crate) struct GemSlot(Atomic<*const GemEntry>);
+
+impl GemSlot {
+    pub(crate) fn new() -> Self {
+        Self(Atomic::new(ptr::null()))
+    }
+}
+
 /// Device-wide registry of live BOs backing the `gems` debugfs file.
 ///
 /// The registry holds no reference to its BOs. A BO registers itself just after
@@ -80,18 +118,21 @@ unsafe impl Send for GemEntry {}
 /// deregistration take the registry lock, so while the dump holds it a listed
 /// BO can neither be removed nor start teardown, keeping every entry valid.
 ///
+/// The free hook can run in memory reclaim, so entries are allocated before
+/// the registry lock is taken.
+///
 /// Lock ordering: the registry lock is acquired before a BO's label lock, never
 /// the reverse.
 #[pin_data]
 pub(crate) struct GemRegistry {
     #[pin]
-    bos: Mutex<KVec<GemEntry>>,
+    bos: Mutex<List<GemEntry>>,
 }
 
 impl GemRegistry {
     pub(crate) fn new() -> impl PinInit<Self> {
         pin_init!(Self {
-            bos <- kernel::new_mutex!(KVec::new()),
+            bos <- kernel::new_mutex!(List::new()),
         })
     }
 
@@ -101,47 +142,37 @@ impl GemRegistry {
     pub(crate) fn register(&self, bo: &Bo, usage_flags: u32) {
         let current = kernel::current!();
         let leader = current.group_leader();
-        let entry = GemEntry {
-            gem: bo.into(),
-            creator_comm: leader.comm(),
-            creator_tgid: leader.pid(),
-            usage_flags,
+        let entry = ListArc::pin_init(
+            try_pin_init!(GemEntry {
+                gem: bo.into(),
+                creator_comm: leader.comm(),
+                creator_tgid: leader.pid(),
+                usage_flags,
+                links <- ListLinks::new(),
+            }? Error),
+            GFP_KERNEL,
+        );
+        let Ok(entry) = entry else {
+            pr_warn_once!("gems debugfs registration failed under memory pressure\n");
+            return;
         };
 
         let mut bos = self.bos.lock();
-        let index = bos.len();
-        match bos.push(entry, GFP_KERNEL) {
-            Ok(()) => bo.registry_slot().store(index, Relaxed),
-            Err(_) => {
-                pr_warn_once!("gems debugfs registration failed under memory pressure\n")
-            }
-        }
+        bo.registry_slot().0.store(ptr::from_ref(&*entry), Relaxed);
+        bos.push_back(entry);
     }
 
     /// Removes the BO owning `slot`. A no-op if the BO was never registered.
-    pub(crate) fn unregister(&self, slot: &Atomic<usize>) {
+    pub(crate) fn unregister(&self, slot: &GemSlot) {
         let mut bos = self.bos.lock();
-        let index = slot.xchg(NOT_REGISTERED, Relaxed);
-        if index == NOT_REGISTERED {
-            return;
-        }
-        if index >= bos.len() {
-            pr_warn_once!("gems debugfs slot {} out of range\n", index);
+        let entry = slot.0.xchg(ptr::null(), Relaxed);
+        if entry.is_null() {
             return;
         }
 
-        let Some(last) = bos.pop() else {
-            return;
-        };
-        if let Some(entry) = bos.get_mut(index) {
-            *entry = last;
-            // The former last entry now sits at `index`. Fix up its slot.
-            // SAFETY: `entry.gem` is still in the registry, so its object
-            // is alive, and the registry lock is held for exclusive access.
-            unsafe { entry.gem.as_ref() }
-                .registry_slot()
-                .store(index, Relaxed);
-        }
+        // SAFETY: A non-null slot points to the entry of its BO, which this
+        // list owns until the BO unregisters, and no other list holds it.
+        drop(unsafe { bos.remove(&*entry) });
     }
 
     fn print_bos(&self, m: &SeqFile) {
