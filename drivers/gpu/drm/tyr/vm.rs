@@ -35,11 +35,13 @@ use kernel::{
         },
         gem::{
             shmem,
-            BaseObject, //
+            BaseObject,
+            ResvGuard, //
         },
         gpuvm::{
             DriverGpuVm,
             ExclusiveObjects,
+            GemGpuvaGuard,
             GpuVaAlloc,
             GpuVaRemoved,
             GpuVm,
@@ -659,6 +661,19 @@ pub(crate) struct VmOpResources {
     pt_reserve: pt_alloc::PtReserve,
 }
 
+impl VmOpResources {
+    /// Returns the resources of an update that creates and splits no mapping.
+    fn with_pt_reserve(pt_reserve: pt_alloc::PtReserve) -> Self {
+        Self {
+            preallocated_gpuvas: [None, None, None],
+            vm_bo: None,
+            map_sgt: None,
+            _map_pin: None,
+            pt_reserve,
+        }
+    }
+}
+
 /// A pin on the BO of a map op.
 ///
 /// `Deferred` unpins on the cleanup workqueue, because unpinning takes
@@ -758,8 +773,34 @@ impl<'ctx> PtUpdateContext<'ctx> {
         op_type: PtOpType<'ctx>,
         resources: &'ctx mut VmOpResources,
     ) -> Result<PtUpdateContext<'ctx>> {
-        let _op_lock = vm.as_data.lock_ops();
-        let _hw = vm.mmu.begin_hw_access();
+        let op_lock = vm.as_data.lock_ops();
+        let hw = vm.mmu.begin_hw_access();
+
+        Self::start(vm, region, op_type, resources, op_lock, hw)
+    }
+
+    /// Creates a page table update context like `new`, but fails with `EBUSY` instead of
+    /// waiting for the op lock or for a GPU reset.
+    fn try_new(
+        vm: &'ctx VmExec,
+        region: Range<u64>,
+        op_type: PtOpType<'ctx>,
+        resources: &'ctx mut VmOpResources,
+    ) -> Result<PtUpdateContext<'ctx>> {
+        let op_lock = vm.as_data.try_lock_ops().ok_or(EBUSY)?;
+        let hw = vm.mmu.try_begin_hw_access().ok_or(EBUSY)?;
+
+        Self::start(vm, region, op_type, resources, op_lock, hw)
+    }
+
+    fn start(
+        vm: &'ctx VmExec,
+        region: Range<u64>,
+        op_type: PtOpType<'ctx>,
+        resources: &'ctx mut VmOpResources,
+        _op_lock: MutexGuard<'ctx, ()>,
+        _hw: HwReadGuard<'ctx>,
+    ) -> Result<PtUpdateContext<'ctx>> {
         vm.mmu.start_vm_update(&vm.as_data, &region)?;
         vm.as_data
             .pt_allocator
@@ -909,6 +950,15 @@ impl GpuVmData {
     }
 }
 
+/// A mapping whose page table entries were removed to reclaim the pages of
+/// its BO.
+struct EvictedVa {
+    range: Range<u64>,
+    gem_offset: u64,
+    prot: u32,
+    sparse: bool,
+}
+
 /// Per-BO private data stored on each `GpuVmBo`.
 pub(crate) struct VmBoData {
     /// The BO, whose reclaim state changes when the `GpuVmBo` is freed.
@@ -943,6 +993,9 @@ pub(crate) struct GpuVaData {
     prot: u32,
     /// Whether this mapping repeats the buffer object over its range.
     sparse: bool,
+    /// Whether the page table entries of this mapping were removed. Written
+    /// with the op lock held.
+    evicted: Atomic<bool>,
     /// Holds the BO while the mapping is on a `RemovedVas`.
     removed_vm_bo: Option<ARef<GpuVmBo<GpuVmData>>>,
     /// The next mapping on a `RemovedVas`.
@@ -950,13 +1003,22 @@ pub(crate) struct GpuVaData {
 }
 
 impl GpuVaData {
-    fn new(prot: u32, sparse: bool) -> Self {
+    fn new(prot: u32, sparse: bool, evicted: bool) -> Self {
         Self {
             prot,
             sparse,
+            evicted: Atomic::new(evicted),
             removed_vm_bo: None,
             next_removed: RemovedVas::default(),
         }
+    }
+
+    pub(crate) fn is_evicted(&self) -> bool {
+        self.evicted.load(Relaxed)
+    }
+
+    fn set_evicted(&self, evicted: bool) {
+        self.evicted.store(evicted, Relaxed);
     }
 }
 
@@ -1154,7 +1216,8 @@ impl PinnedDrop for VmExec {
 
         // SAFETY: `Drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `gpuvm`. The field is never read again
-        // afterward.
+        // afterward. Dropping `reclaim` can free the root GEM object
+        // inline, without waiting for a reservation lock.
         let gpuvm = unsafe { ManuallyDrop::take(&mut this.gpuvm) };
         // The last `VmExec` reference is dropping, so nothing else can
         // hold the lock and `try_lock` cannot block here on the
@@ -1283,7 +1346,7 @@ impl Vm {
         } else {
             Some(cleanup::Handoff::new(())?)
         };
-        let reclaim = Arc::pin_init(VmReclaim::new(ddev), GFP_KERNEL)?;
+        let reclaim = Arc::pin_init(VmReclaim::new(ddev, &dummy_obj), GFP_KERNEL)?;
 
         let exec = Arc::pin_init(
             pin_init!(VmExec {
@@ -1345,6 +1408,8 @@ impl Vm {
             }),
             GFP_KERNEL,
         )?;
+
+        vm.exec.reclaim.attach(vm.exec.clone());
 
         Ok(vm)
     }
@@ -1501,14 +1566,21 @@ impl Vm {
     }
 
     /// Locks this VM's reservation together with those of every external
-    /// object mapped in it, reserving `num_slots` fence slots on each, and
-    /// runs `f` while they are held.
+    /// object mapped in it, reserving `num_slots` fence slots on each,
+    /// restores the evicted BOs of the VM, and runs `f` while the locks are
+    /// held.
+    ///
+    /// May sleep and allocate memory, so it must not run in a dma-fence
+    /// signalling section. The caller holds no lock of this VM, and may hold
+    /// `mmap_lock`. A caller outside GROUP_SUBMIT can pass zero fence slots
+    /// to restore the evicted BOs.
     pub(crate) fn with_prepared_vm<R>(
         &self,
+        dev: &Device<Bound>,
         num_slots: u32,
         f: impl FnOnce(&GpuVmExec<'_, GpuVmData>) -> Result<R>,
     ) -> Result<R> {
-        let vm_exec = KBox::pin_init(
+        let mut vm_exec = KBox::pin_init(
             self.exec.gpuvm.prepare(
                 ExecFlag::InterruptibleWait | ExecFlag::IgnoreDuplicates,
                 num_slots,
@@ -1516,7 +1588,26 @@ impl Vm {
             GFP_KERNEL,
         )?;
 
+        self.restore_locked(dev, vm_exec.as_mut())?;
         f(&vm_exec)
+    }
+
+    /// Makes the evicted BOs of this VM resident, and maps them again.
+    ///
+    /// `vm_exec` holds the reservation locks of this VM and of its external
+    /// objects. Allocates memory, so it must not run in a dma-fence signalling
+    /// section.
+    fn restore_locked(
+        &self,
+        dev: &Device<Bound>,
+        vm_exec: Pin<&mut GpuVmExec<'_, GpuVmData>>,
+    ) -> Result {
+        vm_exec.validate(|vm_bo, resv| {
+            self.exec.restore_vm_bo(dev, vm_bo, resv)?;
+            vm_bo.evict(resv, false)?;
+            reclaim::update_state(resv, None);
+            Ok(())
+        })
     }
 
     /// Locks this VM's reservation in `ctx` and reserves one fence slot on it.
@@ -1600,6 +1691,8 @@ fn release_bind_queue(release: BindQueueRelease) {
 impl PinnedDrop for Vm {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
+        drop(this.exec.reclaim.detach());
+
         let (Some(queue), Some(handoff)) = (this.bind_queue.take(), this.bind_queue_handoff.take())
         else {
             return;
@@ -1850,6 +1943,159 @@ impl VmExec {
         self.gpuvm.deferred_cleanup();
     }
 
+    /// Fails with `EBUSY` while an update of this VM can still be flushing. A mapping added after
+    /// an eviction and then unmapped leaves a fully evicted `GpuVmBo` while its flush runs.
+    pub(crate) fn check_no_update(&self) -> Result {
+        self.gpuvm_unique.try_lock().map(drop).ok_or(EBUSY)
+    }
+
+    /// Removes the page table entries of the mappings of `vm_bo`, and marks
+    /// `vm_bo` and its mappings evicted.
+    ///
+    /// `resv` and `gpuva` hold the reservation lock and the gpuva lock of the
+    /// BO, and the caller holds the reservation lock of this VM. Fails with
+    /// `EBUSY` instead of waiting for a VM lock or a GPU reset.
+    pub(crate) fn evict_mappings(
+        &self,
+        vm_bo: &GpuVmBo<GpuVmData>,
+        resv: &ResvGuard<'_, Bo>,
+        gpuva: &GemGpuvaGuard<'_, GpuVmData>,
+    ) -> Result {
+        let _reg = vm_bo.obj().dev().registration_guard().ok_or(ENODEV)?;
+        let mut unique = self.gpuvm_unique.try_lock().ok_or(EBUSY)?;
+        let gpuvm = (*unique).as_mut().ok_or(EINVAL)?;
+
+        let region = vm_bo
+            .vas(gpuva)?
+            .filter(|va| !va.data_ref().is_evicted())
+            .map(|va| va.range())
+            .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end));
+
+        let mut resources = VmOpResources::with_pt_reserve(pt_alloc::PtReserve::default());
+        let context = match region {
+            Some(region) => Some(PtUpdateContext::try_new(
+                self,
+                region,
+                PtOpType::Unmap,
+                &mut resources,
+            )?),
+            None => None,
+        };
+
+        if !vm_bo.is_evicted(resv)? {
+            vm_bo.evict(resv, true)?;
+        }
+
+        let Some(context) = context else {
+            return Ok(());
+        };
+
+        for va in vm_bo.vas(gpuva)? {
+            let data = va.data_ref();
+            if !data.is_evicted() {
+                gpuvm.data().unmap(&context, va.range())?;
+                data.set_evicted(true);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Makes the BO of `vm_bo` resident, and maps the evicted mappings of
+    /// `vm_bo` again.
+    fn restore_vm_bo(
+        &self,
+        dev: &Device<Bound>,
+        vm_bo: &GpuVmBo<GpuVmData>,
+        resv: &mut ResvGuard<'_, Bo>,
+    ) -> Result {
+        let bo_size = u64::from_safe_cast(vm_bo.obj().size());
+        let segments = dma_segments_in_range(resv.sg_table(dev)?, 0..bo_size, GFP_KERNEL)?;
+
+        while let Some(va) = self.first_evicted_va(vm_bo)? {
+            let size = va.range.end - va.range.start;
+            let pt_reserve =
+                pt_alloc::PtReserve::for_map(va.range.start, size, GFP_KERNEL_ACCOUNT)?;
+
+            self.map_evicted_va(dev, vm_bo, &va, &segments, pt_reserve)?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the first evicted mapping of `vm_bo`.
+    fn first_evicted_va(&self, vm_bo: &GpuVmBo<GpuVmData>) -> Result<Option<EvictedVa>> {
+        let _unique = self.gpuvm_unique.lock();
+        let gpuva = GemGpuvaGuard::lock(vm_bo.obj());
+
+        let va = vm_bo
+            .vas(&gpuva)?
+            .find(|va| va.data_ref().is_evicted())
+            .map(|va| EvictedVa {
+                range: va.range(),
+                gem_offset: va.gem_offset(),
+                prot: va.data_ref().prot,
+                sparse: va.data_ref().sparse,
+            });
+
+        Ok(va)
+    }
+
+    /// Maps the evicted mapping `va` of `vm_bo` from `segments`.
+    ///
+    /// Does nothing if the mapping was unmapped or replaced since it was found.
+    fn map_evicted_va(
+        &self,
+        dev: &Device<Bound>,
+        vm_bo: &GpuVmBo<GpuVmData>,
+        va: &EvictedVa,
+        segments: &[(u64, u64)],
+        pt_reserve: pt_alloc::PtReserve,
+    ) -> Result {
+        let mut resources = VmOpResources::with_pt_reserve(pt_reserve);
+        let mut unique = self.gpuvm_unique.lock();
+        let gpuvm = (*unique).as_mut().ok_or(EINVAL)?;
+        let size = va.range.end - va.range.start;
+
+        let Some(found) = gpuvm.find_first(va.range.start, size) else {
+            return Ok(());
+        };
+
+        if found.vm_bo() != vm_bo
+            || found.range() != va.range
+            || found.gem_offset() != va.gem_offset
+            || !found.data_ref().is_evicted()
+        {
+            return Ok(());
+        }
+
+        let op_type = PtOpType::Map(PtMapArgs {
+            prot: va.prot,
+            sparse: va.sparse,
+            dev,
+        });
+        let context = PtUpdateContext::new(self, va.range.clone(), op_type, &mut resources)?;
+
+        match pt_map_va(
+            dev,
+            context.pt(),
+            va.range.clone(),
+            va.gem_offset,
+            va.prot,
+            va.sparse,
+            segments,
+        ) {
+            Ok(()) => {
+                found.data_ref().set_evicted(false);
+                Ok(())
+            }
+            Err(e) => {
+                gpuvm.data().mark_failed(&context, &va.range);
+                Err(e)
+            }
+        }
+    }
+
     /// Returns the `GpuVmBo` of `bo` in this VM, creating it if needed.
     fn obtain(&self, bo: &Bo) -> Result<ARef<GpuVmBo<GpuVmData>>> {
         let data = VmBoData {
@@ -2025,7 +2271,7 @@ impl DriverGpuVm for GpuVmData {
             .inspect_err(|_| self.mark_failed(context, &range))?;
 
         let gpuva = context.preallocated_gpuva()?;
-        let op = op.insert(gpuva, GpuVaData::new(prot, sparse));
+        let op = op.insert(gpuva, GpuVaData::new(prot, sparse, false));
 
         Ok(op)
     }
@@ -2036,6 +2282,10 @@ impl DriverGpuVm for GpuVmData {
         op: OpUnmap<'op, Self>,
         context: &mut Self::SmContext<'_>,
     ) -> Result<OpUnmapped<'op, Self>, Error> {
+        if op.va().data_ref().is_evicted() {
+            return Ok(context.remove_va(op));
+        }
+
         let start_iova = op.va().addr();
         let length = op.va().length();
 
@@ -2076,7 +2326,8 @@ impl DriverGpuVm for GpuVmData {
             op.va_to_unmap().addr() + op.va_to_unmap().length()
         };
 
-        let &GpuVaData { prot, sparse, .. } = op.va_to_unmap().data_ref();
+        let data = op.va_to_unmap().data_ref();
+        let (prot, sparse, evicted) = (data.prot, data.sparse, data.is_evicted());
 
         let block = Alignment::new::<{ pt_alloc::PT_MIN_BLOCK_SIZE }>();
         let aligned_start = unmap_start.align_down(block);
@@ -2089,13 +2340,19 @@ impl DriverGpuVm for GpuVmData {
         // partial-block unmap can never reach arm-lpae. A fragmented region is
         // never expanded, so its sub-range unmap stays correct.
         let head_paddr = match op.prev() {
-            Some(prev) if aligned_start < unmap_start && prev.addr() <= aligned_start => {
+            Some(prev)
+                if !evicted && aligned_start < unmap_start && prev.addr() <= aligned_start =>
+            {
                 contiguous_phys(context.pt(), aligned_start..unmap_start)
             }
             _ => None,
         };
         let tail_paddr = match op.next() {
-            Some(next) if aligned_end > unmap_end && next.addr() + next.length() >= aligned_end => {
+            Some(next)
+                if !evicted
+                    && aligned_end > unmap_end
+                    && next.addr() + next.length() >= aligned_end =>
+            {
                 contiguous_phys(context.pt(), unmap_end..aligned_end)
             }
             _ => None,
@@ -2115,7 +2372,7 @@ impl DriverGpuVm for GpuVmData {
         let prev_va = context.preallocated_gpuva()?;
         let next_va = context.preallocated_gpuva()?;
 
-        if region_end > region_start {
+        if !evicted && region_end > region_start {
             let region = region_start..region_end;
             context.extend_lock(region.clone())?;
             self.unmap(context, region.clone()).inspect_err(|e| {
@@ -2160,8 +2417,8 @@ impl DriverGpuVm for GpuVmData {
 
         let (op_remapped, remap_ret) = op.remap(
             [prev_va, next_va],
-            GpuVaData::new(prot, sparse),
-            GpuVaData::new(prot, sparse),
+            GpuVaData::new(prot, sparse, evicted),
+            GpuVaData::new(prot, sparse, evicted),
         );
 
         if let Some(unused_va) = remap_ret.unused_va {
