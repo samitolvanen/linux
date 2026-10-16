@@ -18,12 +18,14 @@ use core::ops::{
 
 use kernel::{
     alloc::Flags,
+    bindings,
     device::{
         Bound,
         Device, //
     },
     dma_buf::{
         fence_work::DmaFenceWorkqueue,
+        DmaResvUsage,
         Fence,
         SignallingSection, //
     },
@@ -36,6 +38,7 @@ use kernel::{
         gem::{
             shmem,
             BaseObject,
+            IntoGEMObject,
             ResvGuard, //
         },
         gpuvm::{
@@ -71,6 +74,7 @@ use kernel::{
         impl_list_arc_safe,
         impl_list_item,
         AtomicTracker,
+        ListArc,
         ListLinks,
         TryNewListArc, //
     },
@@ -103,8 +107,10 @@ use kernel::{
         ArcBorrow,
         Mutex,
         MutexGuard,
-        SetOnce, //
+        SetOnce,
+        UniqueArc, //
     },
+    time::Jiffies,
     types::ScopeGuard,
     uapi,
     workqueue::{
@@ -1346,7 +1352,9 @@ impl Vm {
         } else {
             Some(cleanup::Handoff::new(())?)
         };
-        let reclaim = Arc::pin_init(VmReclaim::new(ddev, &dummy_obj), GFP_KERNEL)?;
+        let vm_reclaim = UniqueArc::pin_init(VmReclaim::new(ddev, &dummy_obj), GFP_KERNEL)?;
+        let vm_reclaim = ListArc::<VmReclaim>::from(vm_reclaim);
+        let reclaim = vm_reclaim.clone_arc();
 
         let exec = Arc::pin_init(
             pin_init!(VmExec {
@@ -1410,6 +1418,9 @@ impl Vm {
         )?;
 
         vm.exec.reclaim.attach(vm.exec.clone());
+        if !fw {
+            reclaim::add_vm(vm_reclaim);
+        }
 
         Ok(vm)
     }
@@ -1691,6 +1702,7 @@ fn release_bind_queue(release: BindQueueRelease) {
 impl PinnedDrop for Vm {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
+        drop(this.exec.reclaim.remove());
         drop(this.exec.reclaim.detach());
 
         let (Some(queue), Some(handoff)) = (this.bind_queue.take(), this.bind_queue_handoff.take())
@@ -1726,6 +1738,10 @@ impl VmExec {
 
     /// Activate the VM in a hardware address space slot.
     pub(crate) fn activate(&self) -> Result {
+        if !self.fw {
+            self.reclaim.activate();
+        }
+
         self.mmu
             .activate_vm(self.as_data.as_arc_borrow(), || self.must_disable_as())
             .inspect_err(|e| {
@@ -1947,6 +1963,28 @@ impl VmExec {
     /// an eviction and then unmapped leaves a fully evicted `GpuVmBo` while its flush runs.
     pub(crate) fn check_no_update(&self) -> Result {
         self.gpuvm_unique.try_lock().map(drop).ok_or(EBUSY)
+    }
+
+    /// Returns whether the VM has no jobs in flight, waiting up to `timeout`
+    /// for them to finish.
+    ///
+    /// Returns `false` unless `resv` holds the reservation lock of the VM.
+    pub(crate) fn wait_idle(&self, resv: &ResvGuard<'_, Bo>, timeout: Jiffies) -> bool {
+        if !self.reclaim.shares_resv(resv.obj()) {
+            return false;
+        }
+
+        // SAFETY: `resv.obj()` is a valid GEM object, so its reservation object is valid.
+        let ret = unsafe {
+            bindings::dma_resv_wait_timeout(
+                (*resv.obj().as_raw()).resv,
+                DmaResvUsage::Bookkeep as bindings::dma_resv_usage,
+                false,
+                timeout,
+            )
+        };
+
+        ret > 0
     }
 
     /// Removes the page table entries of the mappings of `vm_bo`, and marks
