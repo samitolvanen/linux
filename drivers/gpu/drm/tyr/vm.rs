@@ -35,6 +35,7 @@ use kernel::{
             ExecFlag,
             Prepared, //
         },
+        gem::BaseObject,
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
@@ -2066,7 +2067,7 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 /// signalling section. The segments are trimmed to the `size` bytes at
 /// `bo_offset`.
 ///
-/// `Object::sg_table` takes `dma_resv_lock`, which must not be taken on
+/// Reading the SG table takes `dma_resv_lock`, which must not be taken on
 /// the path to `dma_fence_signal()`. The segments are consumed lock-free
 /// inside the signalling section.
 fn prefetch_map_sgt(
@@ -2076,7 +2077,8 @@ fn prefetch_map_sgt(
     size: u64,
     gfp: Flags,
 ) -> Result<KVVec<(PhysAddr, u64)>> {
-    let sgt = bo.sg_table(dev).inspect_err(|e| {
+    let mut resv = bo.lock_resv();
+    let sgt = resv.sg_table(dev).inspect_err(|e| {
         pr_err!("Failed to get sg_table: {:?}\n", e);
     })?;
     let range = bo_offset..bo_offset.saturating_add(size);
