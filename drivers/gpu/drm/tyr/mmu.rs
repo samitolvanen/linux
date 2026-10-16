@@ -147,6 +147,12 @@ impl Mmu {
         self.hw_gate.read()
     }
 
+    /// Enters a read section like `begin_hw_access`, or returns `None` while a reset owns the
+    /// hardware.
+    pub(crate) fn try_begin_hw_access(&self) -> Option<HwReadGuard<'_>> {
+        self.hw_gate.try_read()
+    }
+
     /// Clears and unmasks the page-fault IRQs of the programmed AS slots.
     pub(crate) fn enable_irq(&self, io: &IoMem) {
         self.fault_mask.enable(io);
