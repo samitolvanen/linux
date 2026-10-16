@@ -40,10 +40,10 @@ use crate::{
     types::Opaque, //
 };
 use core::{
-    cell::UnsafeCell,
     ffi::c_void,
     mem::{
         self,
+        ManuallyDrop,
         MaybeUninit, //
     },
     ops::{
@@ -59,7 +59,9 @@ use gem::{
     BaseObject,
     BaseObjectPrivate,
     DriverObject,
-    IntoGEMObject, //
+    IntoGEMObject,
+    ResvGuard,
+    ResvLocked, //
 };
 
 /// A struct for controlling the creation of shmem-backed GEM objects.
@@ -94,14 +96,10 @@ pub struct Object<T: DriverObject> {
     /// the start of the allocation.
     #[pin]
     obj: Opaque<bindings::drm_gem_shmem_object>,
-    /// Devres object for unmapping any SGTable on driver-unbind.
-    ///
-    /// This is protected by the object's dma_resv lock. `Opaque<drm_gem_shmem_object>` has no
-    /// `Drop`, so declaring `obj` first does not affect the SGTable teardown order: the
-    /// underlying memory remains valid until the whole [`Object`] allocation is freed.
-    sgt_res: UnsafeCell<Option<Devres<SGTableMap<T>>>>,
     /// Parent object that owns this object's DMA reservation object.
     parent_resv_obj: Option<ARef<Object<T>>>,
+    /// Devres object for unmapping the SGTable on driver-unbind, set when the table is created.
+    sgt_res: ManuallyDrop<ResvLocked<Option<Devres<SgtDma>>>>,
     #[pin]
     inner: T,
 }
@@ -172,7 +170,7 @@ impl<T: DriverObject> Object<T> {
             try_pin_init!(Self {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
-                sgt_res: UnsafeCell::new(None),
+                sgt_res: ManuallyDrop::new(ResvLocked::new(None)),
                 inner <- T::new(dev, size, args),
             }),
             GFP_KERNEL,
@@ -239,7 +237,7 @@ impl<T: DriverObject> Object<T> {
             try_pin_init!(Self {
                 obj <- Opaque::init_zeroed(),
                 parent_resv_obj: None,
-                sgt_res: UnsafeCell::new(None),
+                sgt_res: ManuallyDrop::new(ResvLocked::new(None)),
                 inner <- T::create_imported(dev, size),
             }),
             GFP_KERNEL,
@@ -280,13 +278,17 @@ impl<T: DriverObject> Object<T> {
         //   `Object<T>`.
         let rust_this = unsafe { container_of!(Opaque::cast_from(this), Self, obj) }.cast_mut();
 
-        // Drop any SGTableMap before calling drm_gem_shmem_release(). Otherwise the release path
-        // can clear `shmem->sgt` first, and the subsequent SGTableMap drop will try to free it a
-        // second time.
-        // SAFETY: `free_callback()` runs when the last GEM reference is dropped, so we have
-        // exclusive access to the object state while taking the optional devres out.
-        let sgt_res = unsafe { (*(*rust_this).sgt_res.get()).take() };
-        drop(sgt_res);
+        // Dropping `sgt_res` unmaps the table, so it must happen before the table is freed.
+        // SAFETY:
+        // - We verified above that `rust_this` is valid.
+        // - We are in free_callback, guaranteeing we have exclusive access to `rust_this` and that
+        //   `sgt_res` will not be used after dropping it here.
+        unsafe { ManuallyDrop::drop(&mut (*rust_this).sgt_res) };
+
+        // `drm_gem_shmem_release()` would unmap the table a second time, so free it here.
+        // SAFETY: We have exclusive access to `rust_this`, and the table is unmapped once `sgt_res`
+        // is dropped.
+        unsafe { (*rust_this).free_sgt() };
 
         // SAFETY:
         // - We're in free_callback - so this function is safe to call.
@@ -295,6 +297,32 @@ impl<T: DriverObject> Object<T> {
 
         // SAFETY: We're recovering the Kbox<> we created in gem_create_object()
         let _ = unsafe { KBox::from_raw(rust_this) };
+    }
+
+    /// Frees the sg table of the object, unless the object is imported.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the reservation lock or has exclusive access to the object, the table is
+    /// not DMA-mapped unless the object is imported, and no table reference from
+    /// [`ResvGuard::sg_table()`] is alive.
+    unsafe fn free_sgt(&self) {
+        if self.is_imported() {
+            return;
+        }
+
+        let shmem = self.as_raw_shmem();
+
+        // SAFETY: Per the safety requirements, nothing else accesses `sgt`. The shmem helper
+        // allocates the table with `kmalloc()`.
+        unsafe {
+            let sgt = (*shmem).sgt;
+            if !sgt.is_null() {
+                bindings::sg_free_table(sgt);
+                bindings::kfree(sgt.cast());
+                (*shmem).sgt = ptr::null_mut();
+            }
+        }
     }
 
     /// Exports the GEM object as a dma-buf, after running the driver's `export` hook.
@@ -372,103 +400,6 @@ impl<T: DriverObject> Object<T> {
         unsafe { bindings::drm_gem_shmem_object_mmap(raw_obj, vma) }
     }
 
-    // If necessary, create an SGTable for the gem object and register a Devres for it to ensure
-    // that it is unmapped on driver unbind.
-    fn get_sg_table<'a>(
-        &'a self,
-        dev: &'a device::Device<Bound>,
-    ) -> Result<&'a Devres<SGTableMap<T>>> {
-        let sgt_res_ptr = self.sgt_res.get();
-
-        let _guard = self.lock_resv();
-
-        // SAFETY: We just grabbed the lock required for reading this data above.
-        let sgt_res = unsafe { (*sgt_res_ptr).as_ref() };
-
-        if let Some(sgt_res) = sgt_res {
-            // We already have a Devres object for this sg table, return it
-            Ok(sgt_res)
-        } else {
-            // SAFETY: We grabbed the lock required for calling this function above */
-            let sgt = from_err_ptr(unsafe {
-                bindings::drm_gem_shmem_get_pages_sgt_locked(self.as_raw_shmem())
-            });
-
-            if let Err(e) = sgt {
-                Err(e)
-            } else {
-                // INVARIANT:
-                // - We called drm_gem_shmem_get_pages_sgt_locked above and checked that it
-                //   succeeded, fulfilling the invariant of SGTableRef that the object's `sgt` field
-                //   is initialized.
-                // - We store this Devres in the object itself and don't move it, ensuring that the
-                //   object it points to remains valid for the lifetime of the SGTableRef.
-                let devres = Devres::new(dev, init!(SGTableMap { obj: self.into() }));
-                match devres {
-                    Ok(devres) => {
-                        // SAFETY: We acquired the lock protecting this data above, and it is
-                        // `None`, so no reference to it exists.
-                        Ok(unsafe { &*(*sgt_res_ptr).insert(devres) })
-                    }
-                    Err(e) => {
-                        // We can't make sure that the pages for this object are unmapped on
-                        // driver-unbind, so we need to release the sgt
-                        if !self.is_imported() {
-                            // SAFETY:
-                            // - We grabbed the lock required for calling this function above
-                            // - We checked above that get_pages_sgt_locked() was successful
-                            // - The table of an object that is not imported belongs to the shmem
-                            //   helper
-                            unsafe {
-                                bindings::__drm_gem_shmem_free_sgt_locked(self.as_raw_shmem())
-                            };
-
-                            // SAFETY: We hold the reservation lock and own the pages reference
-                            // taken for the table above.
-                            unsafe {
-                                bindings::drm_gem_shmem_put_pages_locked(self.as_raw_shmem())
-                            };
-                        }
-
-                        Err(e)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Creates (if necessary) and returns an immutable reference to a scatter-gather table of DMA
-    /// pages for this object.
-    ///
-    /// This will pin the object in memory.
-    #[inline]
-    pub fn sg_table<'a>(
-        &'a self,
-        dev: &'a device::Device<Bound>,
-    ) -> Result<&'a scatterlist::SGTable> {
-        let sgt = self.get_sg_table(dev)?;
-
-        Ok(sgt.access(dev)?.deref())
-    }
-
-    /// Creates (if necessary) and returns an owned reference to a scatter-gather table of DMA pages
-    /// for this object.
-    ///
-    /// This is the same as [`sg_table`](Self::sg_table), except that it instead returns an
-    /// [`shmem::SGTable`] which holds a reference to the associated gem object, instead of a
-    /// reference to an [`scatterlist::SGTable`].
-    ///
-    /// This will pin the object in memory.
-    ///
-    /// [`shmem::SGTable`]: SGTable
-    pub fn owned_sg_table(&self, dev: &device::Device<Bound>) -> Result<SGTable<T>> {
-        self.get_sg_table(dev)?;
-
-        // INVARIANT: We just ensured above that `self.sgt_res` is initialized with
-        // `Some(Devres<SGTableMap<T>>)`.
-        Ok(SGTable(self.into()))
-    }
-
     /// Attempt to create a vmap from the gem object, and confirm the size of said vmap.
     fn raw_vmap(&self, min_size: usize) -> Result<*mut c_void> {
         if self.size() < min_size {
@@ -541,6 +472,67 @@ impl<T: DriverObject> Object<T> {
             addr: self.raw_vmap(SIZE)?,
             owner: self.into(),
         })
+    }
+}
+
+impl<T: DriverObject> ResvGuard<'_, Object<T>> {
+    /// Creates (if necessary) and returns the scatter-gather table of DMA pages for the object.
+    ///
+    /// The table holds a reference to the object's pages. `dev` must be the [`device::Device`]
+    /// the object belongs to, otherwise this returns [`EINVAL`]. Once driver unbind has unmapped
+    /// the table, this returns [`ENODEV`].
+    pub fn sg_table<'a>(
+        &'a mut self,
+        dev: &'a device::Device<Bound>,
+    ) -> Result<&'a scatterlist::SGTable> {
+        let obj = self.obj();
+        let parent: &device::Device = obj.dev().as_ref();
+        if dev.as_raw() != parent.as_raw() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `sgt_res` lies within `obj`, whose lock `self` holds.
+        let sgt_res = unsafe { obj.sgt_res.access_unchecked_mut(self) };
+        if sgt_res
+            .as_ref()
+            .is_some_and(|sgt_res| sgt_res.try_access().is_none())
+        {
+            return Err(ENODEV);
+        }
+
+        let shmem = obj.as_raw_shmem();
+
+        // SAFETY: We hold the reservation lock of `obj`.
+        let sgt = from_err_ptr(unsafe { bindings::drm_gem_shmem_get_pages_sgt_locked(shmem) })?;
+
+        if sgt_res.is_none() && !obj.is_imported() {
+            // INVARIANT: The shmem helper mapped the new table for `dev`, and nothing frees it
+            // before `dma` is dropped.
+            let dma = SgtDma {
+                // SAFETY: `drm_gem_shmem_get_pages_sgt_locked()` returns a valid table or an
+                // error.
+                sgt: unsafe { NonNull::new_unchecked(sgt) },
+                dev: dev.into(),
+            };
+
+            match Devres::new(dev, dma) {
+                Ok(dma) => *sgt_res = Some(dma),
+                Err(e) => {
+                    // SAFETY: We hold the reservation lock, and `&mut self` excludes live table
+                    // references. `Devres::new()` dropped `dma`, which unmapped the table, and
+                    // the table holds a reference to the pages.
+                    unsafe {
+                        obj.free_sgt();
+                        bindings::drm_gem_shmem_put_pages_locked(shmem);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // SAFETY: The table is freed under the reservation lock, which we hold for `'a`, or once
+        // `obj` has no references. Driver unbind does not unmap the table while `dev` is bound.
+        Ok(unsafe { scatterlist::SGTable::from_raw(sgt) })
     }
 }
 
@@ -714,14 +706,19 @@ extern "C" fn begin_cpu_access_callback(
     // SAFETY: As above.
     let shmem = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
 
+    let mut idx = 0;
+    // SAFETY: `obj` is valid, so its DRM device is valid.
+    let entered = unsafe { bindings::drm_dev_enter((*obj).dev, &mut idx) };
+
     // SAFETY: The object's reservation lock is initialized for its whole lifetime.
     unsafe { bindings::dma_resv_lock((*obj).resv, ptr::null_mut()) };
 
     // SAFETY: `shmem` is valid (see above) and this read is under the reservation lock.
     let sgt = unsafe { (*shmem).sgt };
-    if !sgt.is_null() {
+    if entered && !sgt.is_null() {
         // SAFETY: Under the reservation lock, a non-NULL `shmem->sgt` is a live scatter-gather
-        // table mapped for the DRM device's parent device, both valid for the object's lifetime.
+        // table. The successful `drm_dev_enter()` keeps the DRM device's parent device bound, so
+        // the table stays mapped for it.
         unsafe {
             dma::sync_sgtable_for_cpu(
                 device::Device::from_raw((*(*obj).dev).dev),
@@ -745,6 +742,11 @@ extern "C" fn begin_cpu_access_callback(
     // SAFETY: We are releasing the lock acquired above.
     unsafe { bindings::dma_resv_unlock((*obj).resv) };
 
+    if entered {
+        // SAFETY: `idx` is from the successful `drm_dev_enter()` above.
+        unsafe { bindings::drm_dev_exit(idx) };
+    }
+
     0
 }
 
@@ -765,6 +767,10 @@ extern "C" fn end_cpu_access_callback(
     // SAFETY: As above.
     let shmem = unsafe { container_of!(obj, bindings::drm_gem_shmem_object, base) };
 
+    let mut idx = 0;
+    // SAFETY: `obj` is valid, so its DRM device is valid.
+    let entered = unsafe { bindings::drm_dev_enter((*obj).dev, &mut idx) };
+
     // SAFETY: The object's reservation lock is initialized for its whole lifetime.
     unsafe { bindings::dma_resv_lock((*obj).resv, ptr::null_mut()) };
 
@@ -781,9 +787,10 @@ extern "C" fn end_cpu_access_callback(
 
     // SAFETY: `shmem` is valid (see above) and this read is under the reservation lock.
     let sgt = unsafe { (*shmem).sgt };
-    if !sgt.is_null() {
+    if entered && !sgt.is_null() {
         // SAFETY: Under the reservation lock, a non-NULL `shmem->sgt` is a live scatter-gather
-        // table mapped for the DRM device's parent device, both valid for the object's lifetime.
+        // table. The successful `drm_dev_enter()` keeps the DRM device's parent device bound, so
+        // the table stays mapped for it.
         unsafe {
             dma::sync_sgtable_for_device(
                 device::Device::from_raw((*(*obj).dev).dev),
@@ -795,6 +802,11 @@ extern "C" fn end_cpu_access_callback(
 
     // SAFETY: We are releasing the lock acquired above.
     unsafe { bindings::dma_resv_unlock((*obj).resv) };
+
+    if entered {
+        // SAFETY: `idx` is from the successful `drm_dev_enter()` above.
+        unsafe { bindings::drm_dev_exit(idx) };
+    }
 
     0
 }
@@ -824,54 +836,6 @@ extern "C" fn prime_import_callback(
     // SAFETY: `raw_dev` and `dma_buf` are valid.
     unsafe { bindings::drm_gem_prime_import(raw_dev, dma_buf) }
 }
-
-/// A reference to a GEM object that is known to have a mapped [`SGTable`].
-///
-/// This is used by the Rust bindings with [`Devres`] in order to ensure that mappings for SGTables
-/// on GEM shmem objects are revoked on driver-unbind. The table of an imported object belongs to
-/// the exporter and stays mapped until the object is released.
-///
-/// # Invariants
-///
-/// - `self.obj` always points to a valid GEM object.
-/// - This object is proof that `self.0.owner.sgt` has an initialized and valid SGTable.
-pub struct SGTableMap<T: DriverObject> {
-    obj: NonNull<Object<T>>,
-}
-
-impl<T: DriverObject> Deref for SGTableMap<T> {
-    type Target = scatterlist::SGTable;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY:
-        // - The NonNull is guaranteed to be valid via our type invariants.
-        // - The sgt field is guaranteed to be initialized and valid via our type invariants.
-        unsafe { scatterlist::SGTable::from_raw((*self.obj.as_ref().as_raw_shmem()).sgt) }
-    }
-}
-
-impl<T: DriverObject> Drop for SGTableMap<T> {
-    fn drop(&mut self) {
-        // SAFETY: `obj` is always valid via our type invariants
-        let obj = unsafe { self.obj.as_ref() };
-        if obj.is_imported() {
-            return;
-        }
-
-        let _lock = obj.lock_resv();
-
-        // SAFETY: We hold the reservation lock, and the table of an object that is not imported
-        // belongs to the shmem helper.
-        unsafe { bindings::__drm_gem_shmem_free_sgt_locked(obj.as_raw_shmem()) };
-    }
-}
-
-// SAFETY: The NonNull in SGTableRef is guaranteed valid by our type invariants, and the GEM object
-// it points to is guaranteed to be thread-safe.
-unsafe impl<T: DriverObject> Send for SGTableMap<T> {}
-// SAFETY: The NonNull in SGTableRef is guaranteed valid by our type invariants, and the GEM object
-// it points to is guaranteed to be thread-safe.
-unsafe impl<T: DriverObject> Sync for SGTableMap<T> {}
 
 macro_rules! impl_vmap_io_capable {
     ($impl:ident, $ty:ty) => {
@@ -1006,33 +970,39 @@ unsafe impl<D: DriverObject, const SIZE: usize> Send for VMapOwned<D, SIZE> {}
 // means this object will remain valid until dropped.
 unsafe impl<D: DriverObject, const SIZE: usize> Sync for VMapOwned<D, SIZE> {}
 
-/// An owned reference to a scatter-gather table of DMA address spans for a GEM shmem object.
+/// The DMA mapping of the sg table of a shmem object, removed on drop.
 ///
-/// This object holds an owned reference to the underlying GEM shmem object, ensuring that the
-/// [`scatterlist::SGTable`] referenced by this type remains valid for the lifetime of this object.
+/// It is kept in a [`Devres`], so that driver unbind unmaps the table. The table itself belongs to
+/// the object.
 ///
 /// # Invariants
 ///
-/// - This type is proof that `self.0.sgt_res` is initialized with a `Some(Devres<SGTableMap<T>>)`.
-/// - This object is only exposed in situations where we know the underlying `SGTable` will not be
-///   modified for the lifetime of this object. Thus, it is safe to send/access this type across
-///   threads.
-pub struct SGTable<T: DriverObject>(ARef<Object<T>>);
+/// `sgt` is a valid table that the shmem helper mapped for `dev`, and it is not freed until this
+/// is dropped.
+struct SgtDma {
+    sgt: NonNull<bindings::sg_table>,
+    dev: ARef<device::Device>,
+}
 
-// SAFETY: This object is thread-safe via our type invariants.
-unsafe impl<T: DriverObject> Send for SGTable<T> {}
-// SAFETY: This object is thread-safe via our type invariants.
-unsafe impl<T: DriverObject> Sync for SGTable<T> {}
-
-impl<T: DriverObject> Deref for SGTable<T> {
-    type Target = Devres<SGTableMap<T>>;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: `self.owner.sgt_res` is guaranteed to be initialized with
-        // `Some(Devres<SGTableMap<T>>)` via our type invariants
-        unsafe { (*self.0.sgt_res.get()).as_ref().unwrap_unchecked() }
+impl Drop for SgtDma {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: By the type invariants, `sgt` is valid, and the shmem helper mapped it for `dev`
+        // with the same direction and attributes.
+        unsafe {
+            bindings::dma_unmap_sgtable(
+                self.dev.as_raw(),
+                self.sgt.as_ptr(),
+                dma::DataDirection::Bidirectional.into(),
+                0,
+            )
+        };
     }
 }
+
+// SAFETY: It is safe to send `SgtDma` to another thread because the DMA mapping can be removed
+// from any thread.
+unsafe impl Send for SgtDma {}
 
 #[kunit_tests(rust_drm_gem_shmem)]
 mod tests {
