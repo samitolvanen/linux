@@ -6,6 +6,7 @@
 
 use core::mem::ManuallyDrop;
 use core::ops::Range;
+use core::ptr;
 
 use kernel::{
     alloc::Flags,
@@ -23,6 +24,7 @@ use kernel::{
         gem,
         gem::shmem,
         gem::BaseObject,
+        gem::ResvGuard,
         DeviceContext, //
     },
     new_mutex,
@@ -32,6 +34,10 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         Mutex, //
@@ -46,6 +52,11 @@ use crate::{
         TyrDrmDriver, //
     },
     file::TyrDrmFile,
+    reclaim::{
+        self,
+        ReclaimState,
+        VmReclaim, //
+    },
     vm::{
         range,
         Vm,
@@ -82,6 +93,11 @@ pub(crate) struct BoData {
     /// Entry of this BO in the device-wide debugfs registry.
     #[cfg(CONFIG_DEBUG_FS)]
     registry_slot: GemSlot,
+    /// Reclaim state, written with the reservation lock held.
+    reclaim_state: Atomic<ReclaimState>,
+    /// VM whose LRU holds the BO in the single-VM state, written with the reservation lock held.
+    /// Freeing the `GpuVmBo` of the BO in that VM updates it, so it never points to a freed VM.
+    reclaim_vm: Atomic<*const VmReclaim>,
 }
 
 impl BoData {
@@ -97,6 +113,18 @@ impl BoData {
         *self.label.lock() = label;
     }
 
+    /// Sets the reclaim state and its VM, returning the previous ones.
+    pub(crate) fn replace_reclaim_state(
+        &self,
+        state: ReclaimState,
+        vm: *const VmReclaim,
+    ) -> (ReclaimState, *const VmReclaim) {
+        (
+            self.reclaim_state.xchg(state, Relaxed),
+            self.reclaim_vm.xchg(vm, Relaxed),
+        )
+    }
+
     /// Returns this BO's slot in the device-wide debugfs registry.
     #[cfg(CONFIG_DEBUG_FS)]
     pub(crate) fn registry_slot(&self) -> &GemSlot {
@@ -107,6 +135,11 @@ impl BoData {
     #[cfg(CONFIG_DEBUG_FS)]
     pub(crate) fn with_label<R>(&self, f: impl FnOnce(Option<&CStr>) -> R) -> R {
         f(self.label.lock().as_deref())
+    }
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn reclaim_state(&self) -> ReclaimState {
+        self.reclaim_state.load(Relaxed)
     }
 }
 
@@ -148,6 +181,8 @@ impl gem::DriverObject for BoData {
             label <- new_mutex!(None),
             #[cfg(CONFIG_DEBUG_FS)]
             registry_slot: GemSlot::new(),
+            reclaim_state: Atomic::new(ReclaimState::Unreclaimable),
+            reclaim_vm: Atomic::new(ptr::null()),
         })
     }
 
@@ -158,6 +193,8 @@ impl gem::DriverObject for BoData {
             label <- new_mutex!(None),
             #[cfg(CONFIG_DEBUG_FS)]
             registry_slot: GemSlot::new(),
+            reclaim_state: Atomic::new(ReclaimState::Unreclaimable),
+            reclaim_vm: Atomic::new(ptr::null()),
         })
     }
 
@@ -183,6 +220,10 @@ impl gem::DriverObject for BoData {
         } else {
             gem::ObjectStatus::empty()
         }
+    }
+
+    fn residency_changed(guard: &ResvGuard<'_, Bo>) {
+        reclaim::update_state(guard, None);
     }
 
     #[cfg(CONFIG_DEBUG_FS)]
