@@ -643,6 +643,8 @@ pub(crate) struct KernelBo {
     /// deferred cleanup rather than inline on the dma-fence signalling
     /// path.
     vm: ManuallyDrop<Arc<Vm>>,
+    /// Keeps the pages of `bo` in memory. Taken by `Drop`.
+    pin: Option<shmem::PinGuard<BoData>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// The size of `va_range`.
@@ -710,11 +712,13 @@ impl KernelBo {
             },
         )?;
 
+        let pin = bo.lock_resv().pin()?;
         vm.map_bo_range(&bo, 0, size, va, flags, pt_gfp)?;
 
         Ok(KernelBo {
             bo: ManuallyDrop::new(bo),
             vm: ManuallyDrop::new(vm.into()),
+            pin: Some(pin),
             va_range: va..va_end,
             size,
             kernel_node: None,
@@ -755,6 +759,7 @@ impl KernelBo {
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
+    pin: Option<shmem::PinGuard<BoData>>,
     va_range: Range<u64>,
     size: u64,
     /// Kernel-VA pool reservation, held until the deferred unmap has
@@ -780,11 +785,13 @@ impl Drop for KernelBo {
         // `dma_resv_lock`-taking sg-table teardown, can only run from
         // the cleanup workqueue or the inline path below.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
+        let pin = self.pin.take();
         let kernel_node = self.kernel_node.take();
 
         let captures = KernelBoCleanup {
             vm,
             bo,
+            pin,
             va_range,
             size,
             kernel_node,
@@ -806,6 +813,7 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,
         bo,
+        pin,
         va_range,
         size,
         kernel_node,
@@ -821,6 +829,14 @@ fn kernel_bo_unmap(captures: KernelBoCleanup) {
             );
         })
         .is_ok();
+
+    if unmapped {
+        drop(pin);
+    } else {
+        // A live mapping may still cover the BO, so keep its pages pinned.
+        core::mem::forget(pin);
+    }
+
     drop(bo);
     release_kernel_va(kernel_node, unmapped);
 }
