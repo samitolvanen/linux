@@ -156,6 +156,11 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
     /// `Registered` typestate must not be assumed. The driver data reached
     /// through the [`dev()`] deref is always initialized.
     ///
+    /// For a [`RECLAIMABLE`] object, it can run in memory reclaim, when a
+    /// shrinker drops the last reference. The hook then must not take a lock
+    /// that is held while memory is allocated with reclaim allowed.
+    ///
+    /// [`RECLAIMABLE`]: Self::RECLAIMABLE
     /// [`dev()`]: crate::drm::gem::Object::dev
     fn free(_obj: &DriverAllocImpl<Self>) {}
 
