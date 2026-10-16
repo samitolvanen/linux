@@ -857,7 +857,13 @@ impl TyrDrmFileData {
             return Err(ENODEV);
         }
 
-        file.inner().group_pool().submit_group(groupsubmit, file)?;
+        let reg = ddev.registration_guard().ok_or(ENODEV)?;
+        // SAFETY: The parent device stays bound while `reg` is held.
+        let dev = unsafe { reg.as_ref().as_bound() };
+
+        file.inner()
+            .group_pool()
+            .submit_group(dev, groupsubmit, file)?;
 
         Ok(0)
     }

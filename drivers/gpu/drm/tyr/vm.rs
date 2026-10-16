@@ -37,11 +37,13 @@ use kernel::{
         },
         gem::{
             shmem,
-            BaseObject, //
+            BaseObject,
+            ResvGuard, //
         },
         gpuvm::{
             DriverGpuVm,
             ExclusiveObjects,
+            GemGpuvaGuard,
             GpuVaAlloc,
             GpuVm,
             GpuVmBo,
@@ -620,6 +622,19 @@ pub(crate) struct VmOpResources {
     pt_reserve: pt_alloc::PtReserve,
 }
 
+impl VmOpResources {
+    /// Returns the resources of an update that creates and splits no mapping.
+    fn with_pt_reserve(pt_reserve: pt_alloc::PtReserve) -> Self {
+        Self {
+            preallocated_gpuvas: [None, None, None],
+            vm_bo: None,
+            map_sgt: None,
+            _map_pin: None,
+            pt_reserve,
+        }
+    }
+}
+
 /// A pin on the BO of a map op.
 ///
 /// `Deferred` unpins on the cleanup workqueue, because unpinning takes
@@ -715,25 +730,48 @@ impl<'ctx> PtUpdateContext<'ctx> {
     /// complete the update when dropped.
     fn new(
         vm: &'ctx VmExec,
-        page_table: &'ctx Devres<pt_alloc::PageTable>,
-        mmu: &'ctx Mmu,
-        as_data: &'ctx VmAsData,
         region: Range<u64>,
         op_type: PtOpType,
         resources: &'ctx mut VmOpResources,
     ) -> Result<PtUpdateContext<'ctx>> {
-        let _op_lock = as_data.lock_ops();
-        let _hw = mmu.begin_hw_access();
-        mmu.start_vm_update(as_data, &region)?;
-        as_data
+        let op_lock = vm.as_data.lock_ops();
+        let hw = vm.mmu.begin_hw_access();
+
+        Self::start(vm, region, op_type, resources, op_lock, hw)
+    }
+
+    /// Creates a page table update context like `new`, but fails with `EBUSY` instead of
+    /// waiting for the op lock or for a GPU reset.
+    fn try_new(
+        vm: &'ctx VmExec,
+        region: Range<u64>,
+        op_type: PtOpType,
+        resources: &'ctx mut VmOpResources,
+    ) -> Result<PtUpdateContext<'ctx>> {
+        let op_lock = vm.as_data.try_lock_ops().ok_or(EBUSY)?;
+        let hw = vm.mmu.try_begin_hw_access().ok_or(EBUSY)?;
+
+        Self::start(vm, region, op_type, resources, op_lock, hw)
+    }
+
+    fn start(
+        vm: &'ctx VmExec,
+        region: Range<u64>,
+        op_type: PtOpType,
+        resources: &'ctx mut VmOpResources,
+        _op_lock: MutexGuard<'ctx, ()>,
+        _hw: HwReadGuard<'ctx>,
+    ) -> Result<PtUpdateContext<'ctx>> {
+        vm.mmu.start_vm_update(&vm.as_data, &region)?;
+        vm.as_data
             .pt_allocator
             .set_reserve(core::mem::take(&mut resources.pt_reserve));
 
         Ok(Self {
             vm,
-            page_table,
-            mmu,
-            as_data,
+            page_table: &vm.as_data.page_table,
+            mmu: &vm.mmu,
+            as_data: &vm.as_data,
             region,
             op_type,
             resources,
@@ -854,6 +892,14 @@ impl GpuVmData {
     }
 }
 
+/// A mapping whose page table entries were removed to reclaim the pages of
+/// its BO.
+struct EvictedVa {
+    range: Range<u64>,
+    gem_offset: u64,
+    prot: u32,
+}
+
 /// Per-BO private data stored on each `GpuVmBo`.
 pub(crate) struct VmBoData {
     /// The BO, whose reclaim state changes when the `GpuVmBo` is freed.
@@ -886,6 +932,26 @@ impl Drop for VmBoData {
 pub(crate) struct GpuVaData {
     /// Memory protection flags of this mapping, as passed to `pt_map`.
     prot: u32,
+    /// Whether the page table entries of this mapping were removed. Written
+    /// with the op lock held.
+    evicted: Atomic<bool>,
+}
+
+impl GpuVaData {
+    fn new(prot: u32, evicted: bool) -> Self {
+        Self {
+            prot,
+            evicted: Atomic::new(evicted),
+        }
+    }
+
+    pub(crate) fn is_evicted(&self) -> bool {
+        self.evicted.load(Relaxed)
+    }
+
+    fn set_evicted(&self, evicted: bool) {
+        self.evicted.store(evicted, Relaxed);
+    }
 }
 
 fn max_va_range(gpu_info: &GpuInfo) -> Result<u64> {
@@ -1182,7 +1248,7 @@ impl Vm {
         let handoff = device_ref.clone().map(cleanup::Handoff::new).transpose()?;
         let reclaim = device_ref
             .as_deref()
-            .map(|dev| Arc::pin_init(VmReclaim::new(dev), GFP_KERNEL))
+            .map(|dev| Arc::pin_init(VmReclaim::new(dev, &dummy_obj), GFP_KERNEL))
             .transpose()?;
         let exec = Arc::pin_init(
             pin_init!(VmExec {
@@ -1232,6 +1298,10 @@ impl Vm {
             }),
             GFP_KERNEL,
         )?;
+
+        if let Some(reclaim) = &vm.exec.reclaim {
+            reclaim.attach(vm.exec.clone());
+        }
 
         Ok(vm)
     }
@@ -1392,14 +1462,21 @@ impl Vm {
     }
 
     /// Locks this VM's reservation together with those of every external
-    /// object mapped in it, reserving `num_slots` fence slots on each, and
-    /// runs `f` while they are held.
+    /// object mapped in it, reserving `num_slots` fence slots on each,
+    /// restores the evicted BOs of the VM, and runs `f` while the locks are
+    /// held.
+    ///
+    /// May sleep and allocate memory, so it must not run in a dma-fence
+    /// signalling section. The caller holds no lock of this VM, and may hold
+    /// `mmap_lock`. A caller outside GROUP_SUBMIT can pass zero fence slots
+    /// to restore the evicted BOs.
     pub(crate) fn with_prepared_vm<R>(
         &self,
+        dev: &Device<Bound>,
         num_slots: u32,
         f: impl FnOnce(&GpuVmExec<'_, GpuVmData>) -> Result<R>,
     ) -> Result<R> {
-        let vm_exec = KBox::pin_init(
+        let mut vm_exec = KBox::pin_init(
             self.exec.gpuvm.prepare(
                 ExecFlag::InterruptibleWait | ExecFlag::IgnoreDuplicates,
                 num_slots,
@@ -1407,7 +1484,26 @@ impl Vm {
             GFP_KERNEL,
         )?;
 
+        self.restore_locked(dev, vm_exec.as_mut())?;
         f(&vm_exec)
+    }
+
+    /// Makes the evicted BOs of this VM resident, and maps them again.
+    ///
+    /// `vm_exec` holds the reservation locks of this VM and of its external
+    /// objects. Allocates memory, so it must not run in a dma-fence signalling
+    /// section.
+    fn restore_locked(
+        &self,
+        dev: &Device<Bound>,
+        vm_exec: Pin<&mut GpuVmExec<'_, GpuVmData>>,
+    ) -> Result {
+        vm_exec.validate(|vm_bo, resv| {
+            self.exec.restore_vm_bo(dev, vm_bo, resv)?;
+            vm_bo.evict(resv, false)?;
+            reclaim::update_state(resv, None);
+            Ok(())
+        })
     }
 
     /// Locks this VM's reservation in `ctx` and reserves one fence slot on it.
@@ -1483,6 +1579,10 @@ fn release_bind_queue(release: BindQueueRelease) {
 impl PinnedDrop for Vm {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
+        if let Some(reclaim) = &this.exec.reclaim {
+            drop(reclaim.detach());
+        }
+
         let (Some(queue), Some(handoff)) = (this.bind_queue.take(), this.bind_queue_handoff.take())
         else {
             return;
@@ -1614,15 +1714,10 @@ impl VmExec {
         req: VmOpRequest,
         resources: &mut VmOpResources,
     ) -> Result {
-        let page_table = &self.as_data.page_table;
-
         match req.op_type {
             VmOpType::Map(args) => {
                 let mut pt_upd = PtUpdateContext::new(
                     self,
-                    page_table,
-                    &self.mmu,
-                    &self.as_data,
                     req.region,
                     PtOpType::Map(PtMapArgs {
                         prot: args.flags.to_prot(),
@@ -1640,15 +1735,8 @@ impl VmExec {
                 //PtUpdateContext drops here flushing the page table
             }
             VmOpType::Unmap => {
-                let mut pt_upd = PtUpdateContext::new(
-                    self,
-                    page_table,
-                    &self.mmu,
-                    &self.as_data,
-                    req.region,
-                    PtOpType::Unmap,
-                    resources,
-                )?;
+                let mut pt_upd =
+                    PtUpdateContext::new(self, req.region, PtOpType::Unmap, resources)?;
 
                 gpuvm_unique.sm_unmap(
                     pt_upd.region.start,
@@ -1699,6 +1787,144 @@ impl VmExec {
 
     pub(crate) fn flush_deferred_cleanup(&self) {
         self.gpuvm.deferred_cleanup();
+    }
+
+    /// Removes the page table entries of the mappings of `vm_bo`, and marks
+    /// `vm_bo` and its mappings evicted.
+    ///
+    /// `resv` and `gpuva` hold the reservation lock and the gpuva lock of the
+    /// BO, and the caller holds the reservation lock of this VM. Fails with
+    /// `EBUSY` instead of waiting for a VM lock or a GPU reset.
+    pub(crate) fn evict_mappings(
+        &self,
+        vm_bo: &GpuVmBo<GpuVmData>,
+        resv: &ResvGuard<'_, Bo>,
+        gpuva: &GemGpuvaGuard<'_, GpuVmData>,
+    ) -> Result {
+        let _reg = vm_bo.obj().dev().registration_guard().ok_or(ENODEV)?;
+        let mut unique = self.gpuvm_unique.try_lock().ok_or(EBUSY)?;
+        let gpuvm = (*unique).as_mut().ok_or(EINVAL)?;
+
+        let region = vm_bo
+            .vas(gpuva)?
+            .filter(|va| !va.data_ref().is_evicted())
+            .map(|va| va.range())
+            .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end));
+
+        let mut resources = VmOpResources::with_pt_reserve(pt_alloc::PtReserve::default());
+        let context = match region {
+            Some(region) => Some(PtUpdateContext::try_new(
+                self,
+                region,
+                PtOpType::Unmap,
+                &mut resources,
+            )?),
+            None => None,
+        };
+
+        if !vm_bo.is_evicted(resv)? {
+            vm_bo.evict(resv, true)?;
+        }
+
+        let Some(context) = context else {
+            return Ok(());
+        };
+
+        for va in vm_bo.vas(gpuva)? {
+            let data = va.data_ref();
+            if !data.is_evicted() {
+                gpuvm.data().unmap(&context, va.range())?;
+                data.set_evicted(true);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Makes the BO of `vm_bo` resident, and maps the evicted mappings of
+    /// `vm_bo` again.
+    fn restore_vm_bo(
+        &self,
+        dev: &Device<Bound>,
+        vm_bo: &GpuVmBo<GpuVmData>,
+        resv: &mut ResvGuard<'_, Bo>,
+    ) -> Result {
+        let segments = gem::dma_segments(resv.sg_table(dev)?)?;
+
+        while let Some(va) = self.first_evicted_va(vm_bo)? {
+            let size = va.range.end - va.range.start;
+            let pt_reserve =
+                pt_alloc::PtReserve::for_map(va.range.start, size, GFP_KERNEL_ACCOUNT)?;
+
+            self.map_evicted_va(vm_bo, &va, &segments, pt_reserve)?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the first evicted mapping of `vm_bo`.
+    fn first_evicted_va(&self, vm_bo: &GpuVmBo<GpuVmData>) -> Result<Option<EvictedVa>> {
+        let _unique = self.gpuvm_unique.lock();
+        let gpuva = GemGpuvaGuard::lock(vm_bo.obj());
+
+        let va = vm_bo
+            .vas(&gpuva)?
+            .find(|va| va.data_ref().is_evicted())
+            .map(|va| EvictedVa {
+                range: va.range(),
+                gem_offset: va.gem_offset(),
+                prot: va.data_ref().prot,
+            });
+
+        Ok(va)
+    }
+
+    /// Maps the evicted mapping `va` of `vm_bo` from `segments`.
+    ///
+    /// Does nothing if the mapping was unmapped or replaced since it was found.
+    fn map_evicted_va(
+        &self,
+        vm_bo: &GpuVmBo<GpuVmData>,
+        va: &EvictedVa,
+        segments: &[(PhysAddr, u64)],
+        pt_reserve: pt_alloc::PtReserve,
+    ) -> Result {
+        let mut resources = VmOpResources::with_pt_reserve(pt_reserve);
+        let mut unique = self.gpuvm_unique.lock();
+        let gpuvm = (*unique).as_mut().ok_or(EINVAL)?;
+        let size = va.range.end - va.range.start;
+
+        let Some(found) = gpuvm.find_first(va.range.start, size) else {
+            return Ok(());
+        };
+
+        if found.vm_bo() != vm_bo
+            || found.range() != va.range
+            || found.gem_offset() != va.gem_offset
+            || !found.data_ref().is_evicted()
+        {
+            return Ok(());
+        }
+
+        let op_type = PtOpType::Map(PtMapArgs { prot: va.prot });
+        let context = PtUpdateContext::new(self, va.range.clone(), op_type, &mut resources)?;
+
+        match pt_map_va(
+            context.page_table,
+            va.range.clone(),
+            va.gem_offset,
+            va.prot,
+            segments,
+        ) {
+            Ok(()) => {
+                found.data_ref().set_evicted(false);
+                Ok(())
+            }
+            Err(e) => {
+                gpuvm.data().mark_failed(&context, &va.range);
+                Err(e)
+            }
+        }
     }
 
     /// Returns the `GpuVmBo` of `bo` in this VM, creating it if needed.
@@ -1819,10 +2045,6 @@ impl DriverGpuVm for GpuVmData {
         op: OpMap<'op, Self>,
         context: &mut Self::SmContext<'_>,
     ) -> Result<OpMapped<'op, Self>, Error> {
-        let start_iova = op.addr();
-        let mut iova = start_iova;
-        let mut bytes_left_to_map = op.length();
-        let mut gem_offset = op.gem_offset();
         let map_sgt = context.resources.map_sgt.as_ref().ok_or(EINVAL)?;
         let prot = match &context.op_type {
             PtOpType::Map(args) => args.prot,
@@ -1830,65 +2052,19 @@ impl DriverGpuVm for GpuVmData {
                 return Err(EINVAL);
             }
         };
+        let range = op.addr()..op.addr() + op.length();
 
-        for &(mut paddr, mut sgt_entry_length) in map_sgt.iter() {
-            if bytes_left_to_map == 0 {
-                break;
-            }
-
-            if gem_offset > 0 {
-                // Skip the entire SGT entry if the gem_offset exceeds its length
-                let skip = sgt_entry_length.min(gem_offset);
-                paddr += skip;
-                sgt_entry_length -= skip;
-                gem_offset -= skip;
-            }
-
-            if sgt_entry_length == 0 {
-                continue;
-            }
-
-            if gem_offset != 0 {
-                pr_err!("Invalid gem_offset {} in page table mapping.\n", gem_offset);
-                return Err(EINVAL);
-            }
-            let len = sgt_entry_length.min(bytes_left_to_map);
-
-            let segment_mapped = match pt_map(context.page_table, iova, paddr, len, prot) {
-                Ok(segment_mapped) => segment_mapped,
-                Err(e) => {
-                    // clean up any successful mappings from previous SGT entries.
-                    let total_mapped = iova - start_iova;
-                    if total_mapped > 0 {
-                        pt_unmap(context.page_table, start_iova..(start_iova + total_mapped)).ok();
-                    }
-                    self.mark_failed(context, &(start_iova..start_iova + op.length()));
-                    return Err(e);
-                }
-            };
-
-            // Since there could be a partial mapping, only advance by the actual amount mapped
-            bytes_left_to_map -= segment_mapped;
-            iova += segment_mapped;
-        }
-
-        if bytes_left_to_map != 0 {
-            let total_mapped = iova - start_iova;
-
-            if total_mapped > 0 && pt_unmap(context.page_table, start_iova..iova).is_err() {
-                self.mark_failed(context, &(start_iova..iova));
-            }
-
-            pr_err!(
-                "SG table is too small for requested mapping: {} bytes remain\n",
-                bytes_left_to_map
-            );
-
-            return Err(EINVAL);
-        }
+        pt_map_va(
+            context.page_table,
+            range.clone(),
+            op.gem_offset(),
+            prot,
+            map_sgt,
+        )
+        .inspect_err(|_| self.mark_failed(context, &range))?;
 
         let gpuva = context.preallocated_gpuva()?;
-        let op = op.insert(gpuva, GpuVaData { prot });
+        let op = op.insert(gpuva, GpuVaData::new(prot, false));
 
         Ok(op)
     }
@@ -1899,6 +2075,11 @@ impl DriverGpuVm for GpuVmData {
         op: OpUnmap<'op, Self>,
         context: &mut Self::SmContext<'_>,
     ) -> Result<OpUnmapped<'op, Self>, Error> {
+        if op.va().data_ref().is_evicted() {
+            let (op_unmapped, _va_removed) = op.remove();
+            return Ok(op_unmapped);
+        }
+
         let start_iova = op.va().addr();
         let length = op.va().length();
 
@@ -1940,9 +2121,10 @@ impl DriverGpuVm for GpuVmData {
             op.va_to_unmap().addr() + op.va_to_unmap().length()
         };
 
-        // The surviving fragments inherit the protection of the mapping being
-        // split.
-        let prot = op.va_to_unmap().data_ref().prot;
+        // The surviving fragments inherit the protection and the evicted state
+        // of the mapping being split.
+        let data = op.va_to_unmap().data_ref();
+        let (prot, evicted) = (data.prot, data.is_evicted());
 
         let block = Alignment::new::<{ pt_alloc::PT_MIN_BLOCK_SIZE }>();
         let aligned_start = unmap_start.align_down(block);
@@ -1955,13 +2137,19 @@ impl DriverGpuVm for GpuVmData {
         // partial-block unmap can never reach arm-lpae; a fragmented region is
         // never expanded, so its sub-range unmap stays correct.
         let head_paddr = match op.prev() {
-            Some(prev) if aligned_start < unmap_start && prev.addr() <= aligned_start => {
+            Some(prev)
+                if !evicted && aligned_start < unmap_start && prev.addr() <= aligned_start =>
+            {
                 contiguous_phys(context.page_table, aligned_start..unmap_start)
             }
             _ => None,
         };
         let tail_paddr = match op.next() {
-            Some(next) if aligned_end > unmap_end && next.addr() + next.length() >= aligned_end => {
+            Some(next)
+                if !evicted
+                    && aligned_end > unmap_end
+                    && next.addr() + next.length() >= aligned_end =>
+            {
                 contiguous_phys(context.page_table, unmap_end..aligned_end)
             }
             _ => None,
@@ -1981,7 +2169,7 @@ impl DriverGpuVm for GpuVmData {
         let prev_va = context.preallocated_gpuva()?;
         let next_va = context.preallocated_gpuva()?;
 
-        if region_end > region_start {
+        if !evicted && region_end > region_start {
             let region = region_start..region_end;
             context.extend_lock(region.clone())?;
             self.unmap(context, region.clone()).inspect_err(|e| {
@@ -2015,8 +2203,11 @@ impl DriverGpuVm for GpuVmData {
             .inspect_err(|_| self.mark_failed(context, &(region_start..region_end)))?;
         }
 
-        let (op_remapped, remap_ret) =
-            op.remap([prev_va, next_va], GpuVaData { prot }, GpuVaData { prot });
+        let (op_remapped, remap_ret) = op.remap(
+            [prev_va, next_va],
+            GpuVaData::new(prot, evicted),
+            GpuVaData::new(prot, evicted),
+        );
 
         if let Some(unused_va) = remap_ret.unused_va {
             context.return_preallocated_gpuva(unused_va);
@@ -2119,6 +2310,80 @@ fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<(BoPin, KVVec<(PhysA
     let segments = segments?;
 
     Ok((pin, segments))
+}
+
+/// Maps `range` from `segments`, starting `gem_offset` bytes into `segments`.
+///
+/// If a segment fails to map, the part of the range already mapped is torn
+/// down before returning.
+fn pt_map_va(
+    page_table: &Devres<pt_alloc::PageTable>,
+    range: Range<u64>,
+    gem_offset: u64,
+    prot: u32,
+    segments: &[(PhysAddr, u64)],
+) -> Result {
+    let start_iova = range.start;
+    let mut iova = start_iova;
+    let mut bytes_left_to_map = range.end - range.start;
+    let mut gem_offset = gem_offset;
+
+    for &(mut paddr, mut sgt_entry_length) in segments.iter() {
+        if bytes_left_to_map == 0 {
+            break;
+        }
+
+        if gem_offset > 0 {
+            // Skip the entire SGT entry if the gem_offset exceeds its length
+            let skip = sgt_entry_length.min(gem_offset);
+            paddr += skip;
+            sgt_entry_length -= skip;
+            gem_offset -= skip;
+        }
+
+        if sgt_entry_length == 0 {
+            continue;
+        }
+
+        if gem_offset != 0 {
+            pr_err!("Invalid gem_offset {} in page table mapping.\n", gem_offset);
+            return Err(EINVAL);
+        }
+        let len = sgt_entry_length.min(bytes_left_to_map);
+
+        let segment_mapped = match pt_map(page_table, iova, paddr, len, prot) {
+            Ok(segment_mapped) => segment_mapped,
+            Err(e) => {
+                // clean up any successful mappings from previous SGT entries.
+                let total_mapped = iova - start_iova;
+                if total_mapped > 0 {
+                    pt_unmap(page_table, start_iova..(start_iova + total_mapped)).ok();
+                }
+                return Err(e);
+            }
+        };
+
+        // Since there could be a partial mapping, only advance by the actual amount mapped
+        bytes_left_to_map -= segment_mapped;
+        iova += segment_mapped;
+    }
+
+    if bytes_left_to_map != 0 {
+        let total_mapped = iova - start_iova;
+
+        if total_mapped > 0 {
+            pt_unmap(page_table, start_iova..iova).ok();
+        }
+
+        pr_err!(
+            "SG table is too small for requested mapping: {} bytes remain\n",
+            bytes_left_to_map
+        );
+
+        return Err(EINVAL);
+    }
+
+    Ok(())
 }
 
 /// Maps a physical address range into the page table at the specified virtual address.
