@@ -204,6 +204,11 @@ impl VmAsData {
         self.op_lock.lock()
     }
 
+    /// Tries to acquire the per-VM operation lock without waiting.
+    pub(crate) fn try_lock_ops(&self) -> Option<MutexGuard<'_, ()>> {
+        self.op_lock.try_lock()
+    }
+
     /// Computes the hardware configuration for this address space.
     fn as_config(&self) -> Result<AddressSpaceConfig> {
         let pt = self.page_table.try_access().ok_or(ENODEV)?;
