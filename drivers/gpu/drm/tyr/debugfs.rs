@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! Device-wide object registries and their debugfs files.
+//! Device-wide object registries, their debugfs files, and the `shrink`
+//! debugfs file.
 //!
 //! Each registry tracks live objects, without referencing them, so a debugfs
 //! file can dump them without walking per-file state.
@@ -16,7 +17,10 @@ use core::{
 
 use kernel::{
     drm::{
-        debugfs::Info,
+        debugfs::{
+            Attribute,
+            Info, //
+        },
         gem::BaseObject, //
     },
     list::{
@@ -52,6 +56,7 @@ use crate::{
         TyrDrmDriver, //
     },
     gem::Bo,
+    reclaim,
     vm::Vm,
 };
 
@@ -359,5 +364,26 @@ impl Info for GpuvasFile {
 
     fn show(device: &TyrDrmDevice, m: &SeqFile) -> Result {
         device.vm_registry().print_gpuvas(m)
+    }
+}
+
+/// The `shrink` debugfs file. Reading it returns the number of pages that
+/// the last scan reclaimed. Writing `n` scans `n` pages.
+pub(crate) struct ShrinkAttr;
+
+impl Attribute<TyrDrmDevice> for ShrinkAttr {
+    const FORMAT: &'static CStr = c"0x%08llx\n";
+
+    fn get(device: &TyrDrmDevice) -> Result<u64> {
+        let pages = reclaim::with_reclaim(device, |reclaim| reclaim.last_scan_pages());
+
+        Ok(pages.unwrap_or(0) as u64)
+    }
+
+    fn set(device: &TyrDrmDevice, val: u64) -> Result {
+        reclaim::with_reclaim(device, |reclaim| {
+            reclaim.shrink(usize::try_from(val).unwrap_or(usize::MAX))
+        });
+        Ok(())
     }
 }

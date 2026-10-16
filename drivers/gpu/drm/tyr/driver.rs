@@ -159,6 +159,7 @@ use crate::debugfs::{
     GemRegistry,
     GemsFile,
     GpuvasFile,
+    ShrinkAttr,
     VmRegistry, //
 };
 
@@ -1219,6 +1220,7 @@ impl TyrPlatformDriverData {
             tdev.fw.register_vm(tdev.vm_registry());
             tdev.debugfs_add_file::<GemsFile>();
             tdev.debugfs_add_file::<GpuvasFile>();
+            tdev.debugfs_add_attribute::<ShrinkAttr>(c"shrink");
         }
 
         // We need this to be dev_info!() because dev_dbg!() does not work at
