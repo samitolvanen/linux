@@ -113,6 +113,9 @@ pub(crate) struct Reclaim {
     vm_scan: Mutex<u32>,
     /// Number of scans in a row that freed nothing while BOs remained.
     retry_count: Atomic<u32>,
+    /// Number of pages that the last scan reclaimed.
+    #[cfg(CONFIG_DEBUG_FS)]
+    last_scan_pages: Atomic<usize>,
     /// Device whose GEM LRU mutex protects the LRUs.
     dev: ARef<TyrDrmDevice>,
 }
@@ -130,6 +133,8 @@ impl Reclaim {
             vms,
             vm_scan <- new_mutex!(0),
             retry_count: Atomic::new(0),
+            #[cfg(CONFIG_DEBUG_FS)]
+            last_scan_pages: Atomic::new(0),
             dev,
         })
     }
@@ -172,6 +177,9 @@ impl Reclaim {
             }
         }
 
+        #[cfg(CONFIG_DEBUG_FS)]
+        self.last_scan_pages.store(freed, Relaxed);
+
         if freed == 0 && remaining > 0 && self.retry_count.fetch_add(1, Relaxed) < 1 {
             return ScanObjects::from_count(0);
         }
@@ -183,6 +191,19 @@ impl Reclaim {
         } else {
             ScanObjects::STOP
         }
+    }
+
+    /// Returns the number of pages that the last scan reclaimed.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn last_scan_pages(&self) -> usize {
+        self.last_scan_pages.load(Relaxed)
+    }
+
+    /// Reclaims up to `nr_to_scan` pages, as memory reclaim would.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn shrink(&self, nr_to_scan: usize) {
+        let _scope = FsReclaimGuard::new(GFP_KERNEL);
+        self.scan(nr_to_scan, true);
     }
 
     /// Reclaims up to `nr_to_scan` pages of the BOs that one VM maps, starting with the least
@@ -234,7 +255,7 @@ impl Reclaim {
 
 /// Runs `f` with the reclaim state of `dev`, unless the device is unbound or
 /// not yet registered.
-fn with_reclaim<R>(dev: &TyrDrmDevice, f: impl FnOnce(&Reclaim) -> R) -> Option<R> {
+pub(crate) fn with_reclaim<R>(dev: &TyrDrmDevice, f: impl FnOnce(&Reclaim) -> R) -> Option<R> {
     let reg = dev.registration_guard()?;
     let data = dev.data()?;
     // SAFETY: The parent device stays bound while `reg` is held.
