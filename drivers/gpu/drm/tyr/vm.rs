@@ -35,6 +35,7 @@ use kernel::{
             ExecFlag,
             Prepared, //
         },
+        gem::BaseObject,
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
@@ -2000,20 +2001,16 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 /// Collects the BO's scatter-gather segments outside the VM_BIND
 /// signalling section.
 ///
-/// `Object::sg_table` takes `dma_resv_lock`, which must not be taken on
+/// Reading the SG table takes `dma_resv_lock`, which must not be taken on
 /// the path to `dma_fence_signal()`. The segments are consumed lock-free
 /// inside the signalling section.
 fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(PhysAddr, u64)>> {
-    let sgt = bo.sg_table(dev).inspect_err(|e| {
+    let mut resv = bo.lock_resv();
+    let sgt = resv.sg_table(dev).inspect_err(|e| {
         pr_err!("Failed to get sg_table: {:?}\n", e);
     })?;
 
-    let mut segments = KVVec::new();
-    for sgt_entry in sgt.iter() {
-        segments.push((sgt_entry.dma_address(), sgt_entry.dma_len()), GFP_KERNEL)?;
-    }
-
-    Ok(segments)
+    gem::dma_segments(sgt)
 }
 
 /// Maps a physical address range into the page table at the specified virtual address.
