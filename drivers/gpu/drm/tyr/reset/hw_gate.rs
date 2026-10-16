@@ -90,6 +90,16 @@ impl HwGate {
         }
     }
 
+    /// Enters a hardware-access read section, or returns `None` while the gate is closed.
+    pub(crate) fn try_read(&self) -> Option<HwReadGuard<'_>> {
+        let guard = self.srcu.read_lock();
+        if self.closed.load(Relaxed) {
+            return None;
+        }
+
+        Some(HwReadGuard { _srcu: guard })
+    }
+
     /// Closes the gate and drains in-flight readers for the reset worker.
     pub(crate) fn close(&self) -> HwWriteGuard<'_> {
         self.closed.store(true, Relaxed);
