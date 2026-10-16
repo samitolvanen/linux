@@ -32,6 +32,7 @@ mod mmu;
 mod pm;
 mod pool;
 mod pwr;
+mod reclaim;
 mod regs;
 mod reset;
 mod sched;
