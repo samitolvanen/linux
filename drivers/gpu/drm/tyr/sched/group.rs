@@ -983,6 +983,7 @@ impl Group {
 
     pub(super) fn submit(
         self: &Arc<Self>,
+        dev: &Device<Bound>,
         queue_submits: KVVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
@@ -1011,7 +1012,7 @@ impl Group {
             ctx.prepare(idx)?;
         }
 
-        self.vm.with_prepared_vm(job_count as u32, |vm_exec| {
+        self.vm.with_prepared_vm(dev, job_count as u32, |vm_exec| {
             for idx in 0..job_count {
                 let signal_fence = ctx.commit(idx)?;
                 vm_exec.resv_add_fence(
@@ -1273,6 +1274,7 @@ impl Pool {
 
     pub(crate) fn submit_group(
         &self,
+        dev: &Device<Bound>,
         groupsubmit: &uapi::drm_panthor_group_submit,
         file: &TyrDrmFile,
     ) -> Result {
@@ -1298,7 +1300,7 @@ impl Pool {
             group.queue_count(),
         )?;
 
-        group.submit(queue_submits, file)
+        group.submit(dev, queue_submits, file)
     }
 
     pub(crate) fn get_group_state(
