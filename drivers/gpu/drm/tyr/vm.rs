@@ -20,14 +20,22 @@ use core::{
 
 use kernel::{
     alloc::Flags,
+    bindings,
     c_str,
     device::{
         Bound,
         Device, //
     },
     devres::Devres,
-    dma_buf::dma_fence::{
-        DmaFenceWorkqueue, DriverDmaFence, DriverDmaFenceOps, PublicDmaFence, Published,
+    dma_buf::{
+        dma_fence::{
+            DmaFenceWorkqueue,
+            DriverDmaFence,
+            DriverDmaFenceOps,
+            PublicDmaFence,
+            Published, //
+        },
+        DmaResvUsage, //
     },
     drm::{
         exec::{
@@ -38,6 +46,7 @@ use kernel::{
         gem::{
             shmem,
             BaseObject,
+            IntoGEMObject,
             ResvGuard, //
         },
         gpuvm::{
@@ -67,6 +76,7 @@ use kernel::{
     impl_flags,
     io::PhysAddr,
     iommu::pgtable::prot,
+    list::ListArc,
     new_mutex,
     platform,
     prelude::*,
@@ -90,8 +100,10 @@ use kernel::{
         ArcBorrow,
         LockClassKey,
         Mutex,
-        MutexGuard, //
+        MutexGuard,
+        UniqueArc, //
     },
+    time::Jiffies,
     types::ScopeGuard,
     uapi,
     workqueue::{
@@ -1314,10 +1326,12 @@ impl Vm {
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
 
         let handoff = device_ref.clone().map(cleanup::Handoff::new).transpose()?;
-        let reclaim = device_ref
+        let vm_reclaim = device_ref
             .as_deref()
-            .map(|dev| Arc::pin_init(VmReclaim::new(dev, &dummy_obj), GFP_KERNEL))
-            .transpose()?;
+            .map(|dev| UniqueArc::pin_init(VmReclaim::new(dev, &dummy_obj), GFP_KERNEL))
+            .transpose()?
+            .map(ListArc::<VmReclaim>::from);
+        let reclaim = vm_reclaim.as_ref().map(ListArc::clone_arc);
         let exec = Arc::pin_init(
             pin_init!(VmExec {
                 as_data,
@@ -1369,6 +1383,9 @@ impl Vm {
 
         if let Some(reclaim) = &vm.exec.reclaim {
             reclaim.attach(vm.exec.clone());
+        }
+        if let Some(vm_reclaim) = vm_reclaim {
+            reclaim::add_vm(vm_reclaim);
         }
 
         Ok(vm)
@@ -1646,6 +1663,7 @@ impl PinnedDrop for Vm {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
         if let Some(reclaim) = &this.exec.reclaim {
+            drop(reclaim.remove());
             drop(reclaim.detach());
         }
 
@@ -1669,6 +1687,10 @@ impl Deref for Vm {
 impl VmExec {
     /// Activate the VM in a hardware address space slot.
     pub(crate) fn activate(&self) -> Result {
+        if let Some(reclaim) = &self.reclaim {
+            reclaim.activate();
+        }
+
         self.mmu
             .activate_vm(self.as_data.as_arc_borrow(), || self.must_disable_as())
             .inspect_err(|e| {
@@ -1853,6 +1875,32 @@ impl VmExec {
 
     pub(crate) fn flush_deferred_cleanup(&self) {
         self.gpuvm.deferred_cleanup();
+    }
+
+    /// Returns whether the VM has no jobs in flight, waiting up to `timeout`
+    /// for them to finish.
+    ///
+    /// Returns `false` unless `resv` holds the reservation lock of the VM.
+    pub(crate) fn wait_idle(&self, resv: &ResvGuard<'_, Bo>, timeout: Jiffies) -> bool {
+        if !self
+            .reclaim
+            .as_ref()
+            .is_some_and(|reclaim| reclaim.shares_resv(resv.obj()))
+        {
+            return false;
+        }
+
+        // SAFETY: `resv.obj()` is a valid GEM object, so its reservation object is valid.
+        let ret = unsafe {
+            bindings::dma_resv_wait_timeout(
+                (*resv.obj().as_raw()).resv,
+                DmaResvUsage::Bookkeep as bindings::dma_resv_usage,
+                false,
+                timeout,
+            )
+        };
+
+        ret > 0
     }
 
     /// Removes the page table entries of the mappings of `vm_bo`, and marks
