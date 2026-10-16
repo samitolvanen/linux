@@ -90,6 +90,8 @@ pub(crate) struct BoData {
     /// VM whose LRU holds the BO in the single-VM state, written with the reservation lock held.
     /// Freeing the `GpuVmBo` of the BO in that VM updates it, so it never points to a freed VM.
     reclaim_vm: Atomic<*const VmReclaim>,
+    /// Number of times the BO was evicted, written with the reservation lock held.
+    evictions: Atomic<u32>,
     /// Link to the device-wide `gems` debugfs registry.
     gem_link: GemLink,
 }
@@ -116,6 +118,17 @@ impl BoData {
     #[cfg(CONFIG_DEBUG_FS)]
     pub(crate) fn reclaim_state(&self) -> ReclaimState {
         self.reclaim_state.load(Relaxed)
+    }
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn evictions(&self) -> u32 {
+        self.evictions.load(Relaxed)
+    }
+
+    /// Counts an eviction. The count saturates so that it never returns to zero.
+    pub(crate) fn count_eviction(&self) {
+        let evictions = self.evictions.load(Relaxed);
+        self.evictions.store(evictions.saturating_add(1), Relaxed);
     }
 
     /// Sets the reclaim state and its VM, returning the previous ones.
@@ -157,6 +170,7 @@ impl gem::DriverObject for BoData {
             label <- new_mutex!(None),
             reclaim_state: Atomic::new(ReclaimState::Unreclaimable),
             reclaim_vm: Atomic::new(ptr::null()),
+            evictions: Atomic::new(0),
             gem_link: GemLink::new(&dev.gem_registry),
         })
     }
@@ -168,6 +182,7 @@ impl gem::DriverObject for BoData {
             label <- new_mutex!(None),
             reclaim_state: Atomic::new(ReclaimState::Unreclaimable),
             reclaim_vm: Atomic::new(ptr::null()),
+            evictions: Atomic::new(0),
             gem_link: GemLink::new(&dev.gem_registry),
         })
     }
