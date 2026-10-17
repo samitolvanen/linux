@@ -1408,7 +1408,7 @@ pub(crate) enum CsFaultEventKind {
 pub(crate) enum CsUserStreamDumpStatus {
     /// `bytes` carries a full 256-byte window read from a kernel vmap.
     Ok = 0,
-    /// `Vm::try_get_bo_for_va` returned no mapping; payload is empty.
+    /// `Vm::try_with_bo_for_va` returned no mapping; payload is empty.
     NoBoAtVa = 1,
     /// A BO was found but no kernel vmap is reachable from this
     /// context; payload is empty.

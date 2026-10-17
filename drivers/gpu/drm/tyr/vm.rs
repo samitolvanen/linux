@@ -1884,8 +1884,8 @@ impl VmExec {
 
     /// Classifies `va` against this VM's mapping tree.
     ///
-    /// Returns `Err(())` when `gpuvm_unique` is held by another thread
-    /// or the VM is tearing down, like `try_get_bo_for_va`.
+    /// Returns `Err(())` when `gpuvm_unique` is held by another thread, like
+    /// `try_with_bo_for_va`, or when the VM is tearing down.
     pub(crate) fn try_classify_va(&self, va: u64) -> Result<VaClass, ()> {
         let guard = self.gpuvm_unique.try_lock().ok_or(())?;
         let gpuvm = guard.as_ref().ok_or(())?;
@@ -1931,7 +1931,7 @@ impl VmExec {
     ///
     /// Returns `Err(())` when `gpuvm_unique` is currently held by
     /// another thread, `Ok(None)` when no mapping covers `va`, and
-    /// `Ok(Some((bo, offset)))` on a hit.
+    /// `Ok(Some(f(bo, offset)))` on a hit.
     ///
     /// `get_bo_for_va` is unsafe to call from a dma-fence signalling section,
     /// because `gpuvm_unique` composes with `GFP_KERNEL` allocation on the
@@ -1941,15 +1941,23 @@ impl VmExec {
     /// must use this variant and treat `Err(())` as a transient
     /// best-effort miss.
     ///
+    /// `f` runs with `gpuvm_unique` held. It borrows the BO instead of
+    /// taking a reference, because dropping the last reference to an
+    /// imported BO takes a blocking reservation lock.
+    ///
     /// [`get_bo_for_va`]: Self::get_bo_for_va
-    pub(crate) fn try_get_bo_for_va(&self, va: u64) -> Result<Option<(ARef<Bo>, u64)>, ()> {
+    pub(crate) fn try_with_bo_for_va<R>(
+        &self,
+        va: u64,
+        f: impl FnOnce(&Bo, u64) -> R,
+    ) -> Result<Option<R>, ()> {
         let guard = self.gpuvm_unique.try_lock().ok_or(())?;
         let Some(gpuva) = guard.as_ref().and_then(|g| g.find_first(va, 1)) else {
             return Ok(None);
         };
         let bo = gpuva.obj();
         let bo_offset = gpuva.gem_offset() + (va - gpuva.addr());
-        Ok(Some((ARef::from(bo), bo_offset)))
+        Ok(Some(f(bo, bo_offset)))
     }
 
     /// Counts unsignalled fences currently attached to the VM's reservation
