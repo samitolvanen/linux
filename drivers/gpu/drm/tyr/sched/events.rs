@@ -718,12 +718,17 @@ fn tiler_heap_readback(
 /// also empty when the BO's reservation lock is contended.
 ///
 /// Safe for use from the dma-fence signalling section that runs the CSG event
-/// handler, because the GPUVM lookup uses [`Vm::try_get_bo_for_va`] (returns
+/// handler, because the GPUVM lookup uses `Vm::try_with_bo_for_va` (returns
 /// immediately on lock contention) and the byte read goes through whatever
 /// kernel vmap was already installed on the BO, under a trylock of its
 /// reservation lock. It does not allocate, block on `dma_resv_lock` or sleep.
 fn dump_cs_fault_info(group_id: u64, cs_id: u32, info_va: u64, vm: &Vm) {
-    let (bo, bo_offset) = match vm.try_get_bo_for_va(info_va) {
+    let mut bytes = [0u8; 256];
+    let hit = vm.try_with_bo_for_va(info_va, |bo, bo_offset| {
+        let len = read_vmap_bytes(bo, bo_offset as usize, &mut bytes);
+        (bo.size() as u64, bo_offset, len)
+    });
+    let (bo_size, bo_offset, len) = match hit {
         Ok(Some(hit)) => hit,
         Ok(None) | Err(()) => {
             trace::cs_fault_info_dump(group_id, cs_id, info_va, 0, 0, 0, &[]);
@@ -731,11 +736,7 @@ fn dump_cs_fault_info(group_id: u64, cs_id: u32, info_va: u64, vm: &Vm) {
         }
     };
 
-    let bo_size = bo.size() as u64;
     let bo_va_base = info_va.saturating_sub(bo_offset);
-
-    let mut bytes = [0u8; 256];
-    let len = read_vmap_bytes(&bo, bo_offset as usize, &mut bytes);
 
     trace::cs_fault_info_dump(
         group_id,
@@ -801,16 +802,22 @@ fn read_vmap_bytes(bo: &Bo, offset: usize, bytes: &mut [u8; 256]) -> usize {
 ///
 /// Safe for use from the dma-fence signalling section that runs the CSG event
 /// handler and the blocked-group poll, because the GPUVM lookup uses
-/// [`Vm::try_get_bo_for_va`] (returns immediately on lock contention) and the
+/// `Vm::try_with_bo_for_va` (returns immediately on lock contention) and the
 /// value is read through a transient `kmap_local_page` of a backing page held
 /// resident by a reservation trylock; no allocation, no blocking
 /// `dma_resv_lock` acquisition, no sleeping wait.
 pub(super) fn read_syncwait_cur_val(vm: &Vm, gpu_va: u64, sync64: bool) -> (u64, bool) {
-    let (bo, bo_offset) = match vm.try_get_bo_for_va(gpu_va) {
-        Ok(Some(hit)) => hit,
-        Ok(None) | Err(()) => return (0, false),
-    };
+    let hit = vm.try_with_bo_for_va(gpu_va, |bo, bo_offset| {
+        read_sync_value(bo, bo_offset, sync64)
+    });
+    match hit {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(()) => (0, false),
+    }
+}
 
+/// Reads the `u32` or `u64` sync object value at `bo_offset` in `bo`.
+fn read_sync_value(bo: &Bo, bo_offset: u64, sync64: bool) -> (u64, bool) {
     let width = if sync64 { 8u64 } else { 4u64 };
     let bo_size = bo.size() as u64;
     if bo_offset >= bo_size || bo_size - bo_offset < width {
@@ -830,15 +837,11 @@ pub(super) fn read_syncwait_cur_val(vm: &Vm, gpu_va: u64, sync64: bool) -> (u64,
         return (0, false);
     };
 
-    let shmem = IntoGEMObject::as_raw(&*bo).cast::<bindings::drm_gem_shmem_object>();
-    // SAFETY: `bo` is an `ARef<Bo>` where `Bo = gem::shmem::Object<_>`,
-    // which is `repr(C)` with the embedded `drm_gem_shmem_object` as
-    // its first field, so `IntoGEMObject::as_raw` coincides with the
-    // shmem object. The `ARef` keeps the allocation alive for this
-    // borrow. The pages are only freed under the reservation lock,
-    // which `_resv` holds, so a non-NULL `pages` is a populated
-    // `*mut *mut page` array; `page_index` is in bounds because
-    // `bo_offset + width <= bo_size` and the array spans the whole BO.
+    let shmem = IntoGEMObject::as_raw(bo).cast::<bindings::drm_gem_shmem_object>();
+    // SAFETY: `bo` is a `gem::shmem::Object<_>`, so the `as_raw` pointer coincides with the
+    // embedded shmem object. The pages are only freed under the reservation lock, which `_resv`
+    // holds, so a non-NULL `pages` is a populated `*mut *mut page` array. `page_index` is in
+    // bounds because `bo_offset + width <= bo_size` and the array spans the whole BO.
     let pages = unsafe { core::ptr::read_volatile(&raw const (*shmem).pages) };
     if pages.is_null() {
         return (0, false);
