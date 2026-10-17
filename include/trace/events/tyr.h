@@ -2104,7 +2104,7 @@ TRACE_EVENT(tyr_bo_set_label,
  * lookup-and-read attempt for `cs_extract`.
  *   OK              - `bytes`/`len` carry payload read from a kernel
  *                     vmap.
- *   NO_BO_AT_VA     - `Vm::try_get_bo_for_va` returned no mapping
+ *   NO_BO_AT_VA     - `Vm::try_with_bo_for_va` returned no mapping
  *                     covering the resolved GPU VA; payload is empty.
  *   BO_NOT_VMAPPED  - a BO was located but no kernel vmap is reachable
  *                     in IRQ context without taking dma_resv_lock;

@@ -18,7 +18,11 @@ use kernel::{
         Published, //
     },
     drm::{
-        gem::BaseObject,
+        gem::{
+            BaseObject,
+            IntoGEMObject,
+            //
+        },
         job_queue::{
             JobQueue, JobQueueLockClasses, JobRef, PipelineBuilder, PreparedJob, QueueOps,
             StageAdvance, StageContext, StageOps, SubmitResult,
@@ -1048,7 +1052,7 @@ impl QueueData {
     /// ringbuf_size)`.
     ///
     /// This is best-effort tracing. The GPU VA lookup uses
-    /// [`Vm::try_get_bo_for_va`], which takes `gpuvm_unique` via
+    /// `Vm::try_with_bo_for_va`, which takes `gpuvm_unique` via
     /// `try_lock()` to keep the helper safe from the dma-fence
     /// signalling section that wraps `fw_events_work`, because that mutex
     /// composes with `GFP_KERNEL` allocation on the `vm_bind_ioctl`
@@ -1058,8 +1062,6 @@ impl QueueData {
     /// rather than waiting. The read goes through the queue's
     /// existing kernel vmap; no allocation, no `dma_resv_lock`, no
     /// `mmu_notifier` callback.
-    ///
-    /// [`Vm::try_get_bo_for_va`]: crate::vm::Vm::try_get_bo_for_va
     pub(crate) fn user_stream_window_around(
         &self,
         cs_extract: u64,
@@ -1074,7 +1076,14 @@ impl QueueData {
         };
         let gpu_va = ringbuf_base.wrapping_add(cs_extract & (ringbuf_size - 1));
 
-        let (bo, bo_offset) = match vm.try_get_bo_for_va(gpu_va) {
+        let lookup = vm.try_with_bo_for_va(gpu_va, |bo, bo_offset| {
+            let ringbuf_obj = core::ptr::eq(
+                IntoGEMObject::as_raw(&**self.ringbuf),
+                IntoGEMObject::as_raw(bo),
+            );
+            (bo_offset, bo.is_imported(), ringbuf_obj)
+        });
+        let (bo_offset, imported, ringbuf_obj) = match lookup {
             Ok(Some(hit)) => hit,
             Ok(None) => return trace::CsUserStreamDump::default(),
             Err(()) => {
@@ -1085,13 +1094,6 @@ impl QueueData {
             }
         };
 
-        let bo_raw = kernel::drm::gem::IntoGEMObject::as_raw(&*bo);
-        // SAFETY: `bo_raw` is a valid pointer to a `drm_gem_object`
-        // for the lifetime of the `ARef<Bo>` held in `bo`.
-        // `import_attach` is set at most once at gem creation and
-        // never cleared, so a plain read is sound. The same idiom is
-        // used in `gem::sync`.
-        let imported = unsafe { !(*bo_raw).import_attach.is_null() };
         let bo_va_base = gpu_va.saturating_sub(bo_offset);
         if imported {
             return trace::CsUserStreamDump {
@@ -1110,10 +1112,6 @@ impl QueueData {
         // `dma_resv_lock` and a `GFP_KERNEL` vmap, both forbidden
         // here. Report those cases via `BoNotVmapped` so the trace
         // consumer can see that we located the BO but could not read.
-        let ringbuf_obj = core::ptr::eq(
-            kernel::drm::gem::IntoGEMObject::as_raw(&**self.ringbuf),
-            bo_raw,
-        );
         if !ringbuf_obj {
             return trace::CsUserStreamDump {
                 bo_va_base,
