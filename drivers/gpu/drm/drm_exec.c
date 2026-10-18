@@ -126,20 +126,17 @@ EXPORT_SYMBOL(drm_exec_fini);
  * @exec: the drm_exec object to cleanup
  *
  * Cleanup the current state and return true if we should stay inside the retry
- * loop, false if there wasn't any contention detected and we can keep the
- * objects locked.
+ * loop, false if there wasn't any contention detected, no prelocked object is
+ * left over and we can keep the objects locked.
  */
 bool drm_exec_cleanup(struct drm_exec *exec)
 {
-	if (likely(!exec->contended)) {
-
-		/*
-		 * The contended and prelocked object might never be passed to
-		 * drm_exec_lock_obj() again. This can happen when the object
-		 * is about to be cleaned up and we now hold the last reference
-		 * to it. Make sure that we don't unnecessarily keep it around.
-		 */
-		drm_exec_drop_prelocked(exec);
+	/*
+	 * A prelocked object that wasn't locked again needs another round, so
+	 * that it is put with no reservation held and objects sharing its
+	 * reservation lock it themselves.
+	 */
+	if (likely(!exec->contended && !exec->prelocked)) {
 		ww_acquire_done(&exec->ticket);
 		return false;
 	}
