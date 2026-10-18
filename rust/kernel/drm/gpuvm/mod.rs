@@ -253,7 +253,28 @@ impl<T: DriverGpuVm> GpuVm<T> {
                 // SAFETY: If successful, this `struct drm_gpuvm_exec` remains valid until this is
                 // unlocked because it's pinned and unlocks it in drop. The contained pointer to
                 // `self` remains valid because `GpuVmExec` borrows from `self`.
-                to_result(unsafe { bindings::drm_gpuvm_exec_lock(exec) })
+                to_result(unsafe { bindings::drm_gpuvm_exec_lock(exec) })?;
+
+                // SAFETY: `exec` is initialized and not yet shared, so a plain read cannot race.
+                let obj = unsafe { (*exec).exec.prelocked };
+
+                // A drm_exec that adds the prelocked object to its locked set leaves it without
+                // fence slots when the last round skips it.
+                if !obj.is_null() && num_fences != 0 {
+                    // SAFETY: While set, `prelocked` holds a reference owned by `exec` and its
+                    // reservation is locked by this thread.
+                    let ret = to_result(unsafe {
+                        bindings::dma_resv_reserve_fences((*obj).resv, num_fences)
+                    });
+                    if ret.is_err() {
+                        // SAFETY: `exec` is locked, and the drop of `GpuVmExec` does not run when
+                        // the initializer fails, so this is the only unlock.
+                        unsafe { bindings::drm_gpuvm_exec_unlock(exec) };
+                        return ret;
+                    }
+                }
+
+                Ok(())
             }),
             _gpuvm: PhantomData,
         })
