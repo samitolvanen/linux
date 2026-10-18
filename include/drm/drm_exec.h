@@ -100,6 +100,9 @@ drm_exec_obj(struct drm_exec *exec, unsigned long index)
  * locked and no more contention exists. At the beginning of the loop it is
  * guaranteed that no GEM object is locked.
  *
+ * The body must be restartable, since it can run again after a round without
+ * contention if that round did not lock the previously contended object again.
+ *
  * Since labels can't be defined local to the loops body we use a jump pointer
  * to make sure that the retry is only used from within the loops body.
  */
