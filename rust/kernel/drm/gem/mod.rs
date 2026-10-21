@@ -600,6 +600,10 @@ pub(super) const fn create_fops(owner: *mut bindings::module) -> bindings::file_
     fops.poll = Some(bindings::drm_poll);
     fops.read = Some(bindings::drm_read);
     fops.llseek = Some(bindings::noop_llseek);
+    #[cfg(CONFIG_MMU)]
+    {
+        fops.get_unmapped_area = Some(bindings::drm_gem_get_unmapped_area);
+    }
     fops.mmap = Some(bindings::drm_gem_mmap);
     fops.fop_flags = bindings::FOP_UNSIGNED_OFFSET;
 
