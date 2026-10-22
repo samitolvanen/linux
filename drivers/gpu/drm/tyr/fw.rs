@@ -72,6 +72,7 @@ use crate::{
         Bo,
         BoData,
         KernelBo,
+        KernelBoOwner,
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
@@ -455,6 +456,7 @@ impl<'drm> Firmware<'drm> {
                     KernelBoVaAlloc::Explicit(va),
                     vm_map_flags,
                     coherent,
+                    KernelBoOwner::Firmware,
                     GFP_KERNEL,
                 )?;
 

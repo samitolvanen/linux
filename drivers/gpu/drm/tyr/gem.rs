@@ -460,6 +460,7 @@ pub(crate) fn new_kernel_object_no_vmap(
         KernelBoVaAlloc::Explicit(va),
         flags,
         coherent,
+        KernelBoOwner::User,
         pt_gfp,
     )?
     .with_va_reservation(node))
@@ -470,6 +471,14 @@ pub(crate) fn new_kernel_object_no_vmap(
 pub(crate) enum KernelBoVaAlloc {
     /// Explicit VA address specified by the caller.
     Explicit(u64),
+}
+
+/// Owner of a `KernelBo`.
+pub(crate) enum KernelBoOwner {
+    /// A firmware section.
+    Firmware,
+    /// A group, queue or heap object.
+    User,
 }
 
 /// A kernel-owned buffer object with automatic GPU virtual address mapping.
@@ -483,16 +492,15 @@ pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
     ///
     /// Wrapped in `ManuallyDrop` so `Drop` can move the single owning
-    /// reference into the deferred cleanup. The GEM object's final drop
+    /// reference into `kernel_bo_unmap`. The GEM object's final drop
     /// runs `Object::free_callback`, whose cached sg-table teardown
     /// takes `dma_resv_lock`, so it must not run on the dma-fence
     /// signalling path that may be dropping this `KernelBo`.
     bo: ManuallyDrop<ARef<Bo>>,
     /// The GPU VM this buffer is mapped into.
     ///
-    /// `ManuallyDrop` so the final `Arc<Vm>` release runs from the
-    /// deferred cleanup rather than inline on the dma-fence signalling
-    /// path.
+    /// `ManuallyDrop` so `Drop` can move the reference into
+    /// `kernel_bo_unmap`.
     vm: ManuallyDrop<Arc<Vm>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
@@ -502,8 +510,8 @@ pub(crate) struct KernelBo {
     /// covers the address. `None` when the VA is managed externally,
     /// as on the firmware load path.
     kernel_node: Option<range::LiveRange>,
-    /// Passes the unmap to the cleanup workqueue. `Some` for the entire
-    /// lifetime of the value, taken by `Drop`.
+    /// Passes the unmap to the cleanup workqueue. `None` for a firmware
+    /// section. Taken by `Drop`.
     handoff: Option<cleanup::Handoff<KernelBoCleanup>>,
 }
 
@@ -525,6 +533,7 @@ impl KernelBo {
         va_alloc: KernelBoVaAlloc,
         flags: VmMapFlags,
         coherent: bool,
+        owner: KernelBoOwner,
         pt_gfp: Flags,
     ) -> Result<Self> {
         if size == 0 {
@@ -539,7 +548,10 @@ impl KernelBo {
             .and_then(|bytes| bytes.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(EOVERFLOW)?;
         let va_end = va.checked_add(size).ok_or(EINVAL)?;
-        let handoff = cleanup::Handoff::new(())?;
+        let handoff = match owner {
+            KernelBoOwner::Firmware => None,
+            KernelBoOwner::User => Some(cleanup::Handoff::new(())?),
+        };
 
         let bo = Bo::new(
             ddev,
@@ -561,7 +573,7 @@ impl KernelBo {
             vm: ManuallyDrop::new(vm),
             va_range: va..va_end,
             kernel_node: None,
-            handoff: Some(handoff),
+            handoff,
         })
     }
 
@@ -596,7 +608,7 @@ impl KernelBo {
     }
 }
 
-/// The captures that `KernelBo::drop` passes to the cleanup workqueue.
+/// The captures that `KernelBo::drop` passes to `kernel_bo_unmap`.
 struct KernelBoCleanup {
     vm: Arc<Vm>,
     bo: ARef<Bo>,
@@ -610,8 +622,7 @@ impl Drop for KernelBo {
     fn drop(&mut self) {
         let va_range = self.va_range.clone();
         // SAFETY: `drop` runs once, this is the only take of `self.vm`,
-        // and the field is not read afterwards. Moving the reference out
-        // keeps the final `Arc<Vm>` release off the inline drop path.
+        // and the field is not read afterwards.
         let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
         // SAFETY: `Drop::drop` runs at most once, this is the only
         // `ManuallyDrop::take` of `self.bo`, and the field is never
@@ -626,14 +637,18 @@ impl Drop for KernelBo {
             kernel_node,
         };
 
-        if let Some(handoff) = self.handoff.take() {
-            handoff.spawn(captures, kernel_bo_unmap);
+        // Firmware sections are dropped only by probe and unbind, outside any
+        // signalling section.
+        match self.handoff.take() {
+            Some(handoff) => handoff.spawn(captures, kernel_bo_unmap),
+            None => kernel_bo_unmap(captures),
         }
     }
 }
 
 /// Tears down a `KernelBo` mapping and then releases the VA
-/// reservation. Runs on the cleanup workqueue.
+/// reservation. Runs on the cleanup workqueue, or inline for a firmware
+/// section.
 fn kernel_bo_unmap(captures: KernelBoCleanup) {
     let KernelBoCleanup {
         vm,

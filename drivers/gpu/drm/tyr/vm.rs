@@ -885,15 +885,14 @@ pub(crate) struct VmExec {
     /// DRM GPUVM core for managing virtual address space.
     ///
     /// `Some` for the entire lifetime of the value; taken to `None`
-    /// only by `Drop` when handing the gpuvm reference to the cleanup
-    /// workqueue.
+    /// only by `Drop`.
     #[pin]
     gpuvm_unique: Mutex<Option<UniqueRefGpuVm<GpuVmData>>>,
     /// Non-core part of the GPUVM. Can be used for stuff that doesn't modify the
     /// internal mapping tree, like GpuVm::obtain()
     ///
-    /// Wrapped in `ManuallyDrop` so `Drop` can move this reference into
-    /// the cleanup workqueue work item rather than dropping it inline.
+    /// Wrapped in `ManuallyDrop` so `Drop` can pass this reference to
+    /// `release_gpuvm`.
     gpuvm: ManuallyDrop<ARef<GpuVm<GpuVmData>>>,
     /// Whether the VM can no longer service user requests.
     unusable: Atomic<bool>,
@@ -901,8 +900,8 @@ pub(crate) struct VmExec {
     fw: bool,
     /// VA range for this VM.
     va_range: Range<u64>,
-    /// Passes the gpuvm references to the cleanup workqueue. `Some` for the
-    /// entire lifetime of the value, taken by `Drop`.
+    /// Passes the gpuvm references to the cleanup workqueue. `None` for the
+    /// firmware VM. Taken by `Drop`.
     handoff: Option<cleanup::Handoff<GpuVmRelease>>,
     /// Flushes the deferred `vm_bo` list on the cleanup workqueue.
     #[pin]
@@ -931,7 +930,7 @@ struct GpuVmRelease {
 /// that `VmExec::drop` moved out.
 ///
 /// The flush takes the gpuvm reservation lock, so `VmExec::drop` defers
-/// it to the cleanup workqueue.
+/// it to the cleanup workqueue, except for the firmware VM.
 fn release_gpuvm(release: GpuVmRelease) {
     let GpuVmRelease { gpuvm, unique } = release;
     gpuvm.deferred_cleanup();
@@ -950,10 +949,7 @@ impl PinnedDrop for VmExec {
 
         // SAFETY: `Drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `gpuvm`. The field is never read again
-        // afterwards. Moving out the reference here (rather than dropping
-        // it inline) keeps the final `drm_gpuvm_put`, which frees the
-        // GPUVM's r_obj GEM under `dma_resv_lock`, off the dma-fence
-        // signalling section this drop may run under.
+        // afterwards.
         let gpuvm = unsafe { ManuallyDrop::take(&mut this.gpuvm) };
         // The last `VmExec` reference is dropping, so nothing else can
         // hold the lock and `try_lock` cannot block here on the
@@ -964,8 +960,11 @@ impl PinnedDrop for VmExec {
             gpuvm,
             unique: gpuvm_unique,
         };
-        if let Some(handoff) = this.handoff.take() {
-            handoff.spawn(release, release_gpuvm);
+        // The firmware VM is dropped only by probe, unbind and the cleanup
+        // workqueue, outside any signalling section.
+        match this.handoff.take() {
+            Some(handoff) => handoff.spawn(release, release_gpuvm),
+            None => release_gpuvm(release),
         }
     }
 }
@@ -1068,7 +1067,11 @@ impl Vm {
             GFP_KERNEL,
         )?;
         let kernel_va = range::RangeAlloc::new(kernel_range.start, kernel_range.end, GFP_KERNEL)?;
-        let handoff = cleanup::Handoff::new(())?;
+        let handoff = if fw {
+            None
+        } else {
+            Some(cleanup::Handoff::new(())?)
+        };
 
         let exec = Arc::pin_init(
             pin_init!(VmExec {
@@ -1080,7 +1083,7 @@ impl Vm {
                 unusable: Atomic::new(false),
                 fw,
                 va_range: total_range,
-                handoff: Some(handoff),
+                handoff,
                 cleanup_work <- new_work!("tyr-vm-cleanup"),
             }),
             GFP_KERNEL,
