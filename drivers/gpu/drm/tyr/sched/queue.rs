@@ -206,6 +206,9 @@ struct PendingFences {
     vec: KVec<PendingSubmitFence>,
     head: usize,
     next_profiling_slot: u32,
+    /// `done_seqno` and error of the last job a CS fault failed. A sync-only
+    /// job pushed later with the same seqno takes the error.
+    fault: Option<(u64, Error)>,
 }
 
 /// Per-queue snapshot of the active GPU sync-wait. Populated when the
@@ -674,6 +677,7 @@ impl QueueData {
         let mut pending = self.pending_submit_fences.lock();
         Self::maybe_truncate_pending(&mut pending);
         let profiling_slot = (job.profiling_mask != 0).then_some(pending.next_profiling_slot);
+        let fault = pending.fault.filter(|(seqno, _)| *seqno == done_seqno);
         // The fence goes in after the push, so a failed push can hand it back.
         let pending_fence = PendingSubmitFence {
             done_seqno,
@@ -688,7 +692,10 @@ impl QueueData {
         let Some(entry) = pending.vec.last_mut() else {
             return Err(fence);
         };
-        entry.fence = Some(fence);
+        let fence = entry.fence.insert(fence);
+        if let Some((_, err)) = fault {
+            fence.set_error(err);
+        }
         if let Some(slot) = profiling_slot {
             let next = slot + 1;
             pending.next_profiling_slot = if next < self.profiling_slot_count {
@@ -806,6 +813,7 @@ impl QueueData {
         else {
             return;
         };
+        pending.fault = Some((done_seqno, err));
         for entry in pending.vec.iter_mut().skip(head) {
             if entry.done_seqno == done_seqno {
                 if let Some(fence) = entry.fence.as_mut() {
@@ -1290,6 +1298,7 @@ impl Queue {
                     vec: pending_fence_vec,
                     head: 0,
                     next_profiling_slot: 0,
+                    fault: None,
                 }),
                 last_job_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
