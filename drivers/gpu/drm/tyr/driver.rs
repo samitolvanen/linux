@@ -5,7 +5,6 @@ use kernel::{
         Clk,
         OptionalClk, //
     },
-    devfreq::Registration as DevfreqRegistration,
     device::{
         self,
         Bound,
@@ -32,7 +31,6 @@ use kernel::{
     new_mutex,
     new_spinlock,
     of,
-    opp::ConfigToken,
     platform,
     pm::{
         self,
@@ -79,7 +77,7 @@ use kernel::{
 use crate::{
     devfreq::{
         self,
-        TyrDevfreqCallbacks,
+        TyrDevfreq,
         TyrDevfreqData, //
     },
     file::TyrDrmFileData,
@@ -325,9 +323,6 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
-
-    #[pin]
-    pub(crate) opp_config: Mutex<Option<ConfigToken>>,
 }
 
 impl TyrDrmDeviceData {
@@ -713,7 +708,7 @@ pub(crate) struct TyrPlatformDriver;
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData<'bound> {
     /// Devfreq registration, `None` on devices without an OPP table.
-    devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
+    devfreq_registration: Arc<Mutex<Option<TyrDevfreq>>>,
 
     /// Runtime PM registration. Owns the callback payload and disables
     /// runtime PM on unbind. Held only for its `Drop`.
@@ -885,7 +880,6 @@ impl platform::Driver for TyrPlatformDriver {
                 unbinding: Atomic::new(false),
                 unusable: Atomic::new(false),
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
-                opp_config <- new_mutex!(None),
             }? Error),
         )?;
 
