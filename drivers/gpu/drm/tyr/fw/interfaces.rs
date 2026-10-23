@@ -158,7 +158,6 @@ pub(crate) use self::cs::output::{
     CS_FAULT_INFO, //
 };
 pub(crate) use self::cs::CsFatalExceptionType;
-pub(crate) use self::cs::CsFaultExceptionType;
 
 /// Generic firmware interface infrastructure.
 ///

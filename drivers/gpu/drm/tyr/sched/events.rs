@@ -28,7 +28,6 @@ use crate::{
         global::CsgInterface,
         CsDbMask,
         CsFatalExceptionType,
-        CsFaultExceptionType,
         CsgSlotMask,
         Firmware,
         CSG_REQ, //
@@ -80,7 +79,8 @@ struct CsIrqEvents {
     tiler_oom_mask: u32,
     cs_fatal_mask: u32,
     cs_unrecoverable: bool,
-    cs_inherit_fault_mask: u32,
+    /// `EXTRACT` of each faulted queue, read before the fault is acknowledged.
+    cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP],
 }
 
 impl CsIrqEvents {
@@ -92,6 +92,7 @@ impl CsIrqEvents {
         csg: &mut CsgInterface,
         csg_id: usize,
         cs_id: u32,
+        group: Option<&Group>,
     ) -> Result {
         let Some(cs) = csg.cs_mut(cs_id as usize) else {
             return Ok(());
@@ -114,11 +115,13 @@ impl CsIrqEvents {
             self.cs_fatal_mask |= 1u32 << cs_id;
         }
 
-        if fault_event
-            && cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?
-                == CsFaultExceptionType::CsInheritFault as u32
-        {
-            self.cs_inherit_fault_mask |= 1u32 << cs_id;
+        if fault_event {
+            cs.decode_fault(parent_dev(tdev), csg_id, cs_id)?;
+            let queue = group.and_then(|group| group.queues.get(cs_id as usize));
+            let extract = self.cs_fault_extract.get_mut(cs_id as usize);
+            if let (Some(queue), Some(extract)) = (queue, extract) {
+                *extract = queue.read_extract().ok();
+            }
         }
 
         if fatal_event || fault_event {
@@ -338,7 +341,7 @@ impl Scheduler {
                 let cs_id = cs_irqs.trailing_zeros();
                 cs_irqs &= !(1u32 << cs_id);
 
-                if let Err(e) = events.process_cs_irq(tdev, csg, csg_id, cs_id) {
+                if let Err(e) = events.process_cs_irq(tdev, csg, csg_id, cs_id, group.as_deref()) {
                     dev_err!(
                         tdev.as_ref(),
                         "Failed to process the CSG slot {} CS {} IRQ: {:?}\n",
@@ -355,7 +358,7 @@ impl Scheduler {
             mut tiler_oom_mask,
             mut cs_fatal_mask,
             cs_unrecoverable,
-            cs_inherit_fault_mask,
+            cs_fault_extract,
         } = events;
 
         if let Some(group) = &group {
@@ -391,23 +394,9 @@ impl Scheduler {
                 });
             }
 
-            let mut mask = cs_inherit_fault_mask;
-            while mask != 0 {
-                let cs_id = mask.trailing_zeros() as usize;
-                mask &= !(1u32 << cs_id);
-                if let Some(queue) = group.queues.get(cs_id) {
-                    match group.read_syncobj(cs_id) {
-                        Ok(syncobj_seqno) => {
-                            queue.fail_inflight_submit_fences(syncobj_seqno, EINVAL)
-                        }
-                        Err(e) => dev_err!(
-                            tdev.as_ref(),
-                            "Failed to read the CSG slot {} CS {} syncobj: {:?}\n",
-                            csg_id,
-                            cs_id,
-                            e
-                        ),
-                    }
+            for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
+                if let Some(extract) = extract {
+                    queue.fail_job_at_extract(extract, EINVAL);
                 }
             }
         }

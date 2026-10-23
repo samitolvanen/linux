@@ -115,7 +115,6 @@ mod region;
 pub(crate) use interfaces::{
     CsBlockedReason,
     CsFatalExceptionType,
-    CsFaultExceptionType,
     CsWaitCondition,
     CsgExecutionState,
     CSG_CONFIG,
