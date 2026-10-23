@@ -173,6 +173,9 @@ struct PendingSubmitFence {
     /// so the syncobj only reaches this value once every dispatched
     /// async sub-job has landed in memory.
     done_seqno: u64,
+    /// Ring buffer offsets of the job's wrapped stream. Empty for a
+    /// sync-only job.
+    ringbuf_range: Range<u64>,
     /// Profiling slot the wrapped stream sampled into, read back at
     /// completion to accumulate the group's GPU usage.
     profiling_slot: u32,
@@ -431,11 +434,11 @@ impl QueueData {
         Ok(base + u64::from(slot) * size_of::<super::job::JobProfilingData>() as u64)
     }
 
-    /// Copies `instrs` into the ringbuffer at the current `INSERT`. The
-    /// returned completion point is the `INSERT` value
+    /// Copies `instrs` into the ringbuffer at the current `INSERT` and returns
+    /// the ring offsets they occupy. The range end is the `INSERT` value
     /// `Self::commit_ringbuf_range` will publish once the caller has
     /// registered the matching pending submit fence.
-    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<u64, RingBufferError> {
+    pub(super) fn claim_ringbuf_range(&self, instrs: &[u8]) -> Result<Range<u64>, RingBufferError> {
         let ringbuf_input = self.ringbuf_space_for(instrs.len())?;
         let ringbuf_sz = self.ringbuf.size() as u64;
 
@@ -457,7 +460,7 @@ impl QueueData {
             Ok(())
         })?;
 
-        Ok(completion_point)
+        Ok(ringbuf_start..completion_point)
     }
 
     /// Points the ring copy of `job` at sample slot `slot`. The copy ends at
@@ -500,7 +503,7 @@ impl QueueData {
 
     /// Publishes a previously claimed ringbuffer range to the firmware.
     ///
-    /// `completion_point` must equal the value returned from the matching
+    /// `completion_point` must equal the range end returned by the matching
     /// `claim_ringbuf_range`. `extract_init` and the ringbuffer bytes are
     /// written before the leading `wmb()`, so they land before `insert`. The
     /// trailing `wmb()` orders `insert` before the doorbell ring.
@@ -665,6 +668,7 @@ impl QueueData {
         &self,
         job: &QueueJob,
         done_seqno: u64,
+        ringbuf_range: Range<u64>,
         fence: DriverDmaFence<QueueFenceData, Published>,
     ) -> Result<Option<u32>, DriverDmaFence<QueueFenceData, Published>> {
         let mut pending = self.pending_submit_fences.lock();
@@ -673,6 +677,7 @@ impl QueueData {
         // The fence goes in after the push, so a failed push can hand it back.
         let pending_fence = PendingSubmitFence {
             done_seqno,
+            ringbuf_range,
             profiling_slot: profiling_slot.unwrap_or(0),
             profiling_mask: job.profiling_mask,
             fence: None,
@@ -781,23 +786,28 @@ impl QueueData {
         self.complete_pending_fences_up_to(group, syncobj_seqno);
     }
 
-    /// Stages `err` on every pending submit fence whose `done_seqno`
-    /// is strictly past `syncobj_seqno`, i.e. submissions whose
-    /// `SYNC_ADD64` the firmware has not yet retired.
-    ///
-    /// The caller is expected to pass the value of the per-queue
-    /// syncobj, read with `Group::read_syncobj`. The fences are left
-    /// in the pending list; the regular seqno-ordered drain in
-    /// `Self::complete_pending_fences_up_to` will signal them at
-    /// their natural completion points so waiters still observe a
-    /// monotonic submit-order signal sequence.
-    ///
-    /// Safe to call from inside a `DmaFenceSignallingAnnotation` section.
-    pub(in crate::sched) fn fail_inflight_submit_fences(&self, syncobj_seqno: u64, err: Error) {
+    /// Returns the firmware's current `EXTRACT` offset.
+    pub(super) fn read_extract(&self) -> Result<u64> {
+        Ok(self.interfaces.read_output()?.extract)
+    }
+
+    /// Stages `err` on the pending submit fence of the job whose ring range
+    /// holds `extract`, and on the sync-only jobs that complete with it. The
+    /// in-order drain signals the fences once the job retires.
+    pub(in crate::sched) fn fail_job_at_extract(&self, extract: u64, err: Error) {
         let mut pending = self.pending_submit_fences.lock();
         let head = pending.head;
+        let Some(done_seqno) = pending
+            .vec
+            .iter()
+            .skip(head)
+            .find(|entry| entry.ringbuf_range.contains(&extract))
+            .map(|entry| entry.done_seqno)
+        else {
+            return;
+        };
         for entry in pending.vec.iter_mut().skip(head) {
-            if entry.done_seqno > syncobj_seqno {
+            if entry.done_seqno == done_seqno {
                 if let Some(fence) = entry.fence.as_mut() {
                     fence.set_error(err);
                 }
@@ -1018,7 +1028,10 @@ impl QueueOps for TyrQueueOps {
                 fence.signal(Ok(()));
                 return Ok(SubmitResult::Submitted);
             };
-            return match self.data.push_submit_fence(job.job, done_seqno, fence) {
+            return match self
+                .data
+                .push_submit_fence(job.job, done_seqno, 0..0, fence)
+            {
                 Ok(_) => Ok(SubmitResult::Submitted),
                 Err(fence) => Ok(SubmitResult::NoResources(fence)),
             };
@@ -1031,8 +1044,8 @@ impl QueueOps for TyrQueueOps {
             return Ok(self.fail_queue(job.job, fence, err));
         }
 
-        let ringbuf_completion_point = match self.data.claim_ringbuf_range(&job.job.stream) {
-            Ok(completion_point) => completion_point,
+        let ringbuf_range = match self.data.claim_ringbuf_range(&job.job.stream) {
+            Ok(range) => range,
             Err(err) => return Ok(self.fail_queue(job.job, fence, err)),
         };
 
@@ -1044,17 +1057,20 @@ impl QueueOps for TyrQueueOps {
             return Ok(SubmitResult::Submitted);
         };
 
-        let profiling_slot = match self.data.push_submit_fence(job.job, done_seqno, fence) {
+        let pushed = self
+            .data
+            .push_submit_fence(job.job, done_seqno, ringbuf_range.clone(), fence);
+        let profiling_slot = match pushed {
             Ok(slot) => slot,
             Err(fence) => return Ok(SubmitResult::NoResources(fence)),
         };
 
         if let Some(slot) = profiling_slot {
             self.data
-                .relocate_profiling(job.job, ringbuf_completion_point, slot);
+                .relocate_profiling(job.job, ringbuf_range.end, slot);
         }
 
-        if let Err(err) = self.data.commit_ringbuf_range(ringbuf_completion_point) {
+        if let Err(err) = self.data.commit_ringbuf_range(ringbuf_range.end) {
             pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
             self.data.fail_submit_fence(done_seqno, err);
             return Ok(SubmitResult::Submitted);

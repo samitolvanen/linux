@@ -26,7 +26,6 @@ use crate::{
         global::CsgInterface,
         CsDbMask,
         CsFatalExceptionType,
-        CsFaultExceptionType,
         CsgSlotMask,
         CSG_REQ, //
     },
@@ -77,7 +76,8 @@ struct CsIrqEvents {
     cs_fatal_mask: u32,
     /// Whether a fatal event was unrecoverable.
     cs_unrecoverable: bool,
-    cs_inherit_fault_mask: u32,
+    /// `EXTRACT` of each faulted queue, read before the fault is acknowledged.
+    cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP],
 }
 
 impl CsIrqEvents {
@@ -126,8 +126,11 @@ impl CsIrqEvents {
                     group.task_comm()
                 );
             }
-            if cs.decode_fault(csg_id, cs_id)? == CsFaultExceptionType::CsInheritFault as u32 {
-                self.cs_inherit_fault_mask |= 1u32 << cs_id;
+            cs.decode_fault(csg_id, cs_id)?;
+            let queue = group.and_then(|group| group.queues.get(cs_id as usize));
+            let extract = self.cs_fault_extract.get_mut(cs_id as usize);
+            if let (Some(queue), Some(extract)) = (queue, extract) {
+                *extract = queue.read_extract().ok();
             }
         }
 
@@ -335,7 +338,7 @@ impl Scheduler {
             mut tiler_oom_mask,
             mut cs_fatal_mask,
             cs_unrecoverable,
-            cs_inherit_fault_mask,
+            cs_fault_extract,
         } = events;
 
         if let Some(group) = &group {
@@ -369,20 +372,9 @@ impl Scheduler {
                 });
             }
 
-            let mut mask = cs_inherit_fault_mask;
-            while mask != 0 {
-                let cs_id = mask.trailing_zeros() as usize;
-                mask &= !(1u32 << cs_id);
-                if let Some(queue) = group.queues.get(cs_id) {
-                    match group.read_syncobj(cs_id) {
-                        Ok(syncobj) => queue.fail_inflight_submit_fences(syncobj.seqno, EINVAL),
-                        Err(e) => pr_err!(
-                            "Failed to read the CSG slot {} CS {} syncobj: {:?}\n",
-                            csg_id,
-                            cs_id,
-                            e
-                        ),
-                    }
+            for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
+                if let Some(extract) = extract {
+                    queue.fail_job_at_extract(extract, EINVAL);
                 }
             }
         }
