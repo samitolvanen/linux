@@ -113,7 +113,6 @@ pub(crate) use self::cs::output::{
     CsBlockedReason, CsWaitCondition, CS_FATAL, CS_FATAL_INFO, CS_FAULT, CS_FAULT_INFO,
 };
 pub(crate) use self::cs::CsFatalExceptionType;
-pub(crate) use self::cs::CsFaultExceptionType;
 
 /// Generic firmware interface infrastructure.
 ///
