@@ -9,7 +9,6 @@ use kernel::{
         Clk,
         OptionalClk, //
     },
-    devfreq::Registration as DevfreqRegistration,
     device,
     device::{
         Bound,
@@ -42,7 +41,6 @@ use kernel::{
     new_mutex,
     new_spinlock,
     of,
-    opp::ConfigToken,
     platform,
     platform::{
         AttributeGroups,
@@ -98,7 +96,7 @@ use crate::{
     cleanup,
     devfreq::{
         self,
-        TyrDevfreqCallbacks,
+        TyrDevfreq,
         TyrDevfreqData, //
     },
     file::TyrDrmFileData,
@@ -203,7 +201,7 @@ pub(crate) mod work_id {
 
 pub(crate) struct TyrPlatformDriverData {
     /// Devfreq registration, `None` on devices without an OPP table.
-    devfreq_registration: Arc<Mutex<Option<DevfreqRegistration<TyrDevfreqCallbacks>>>>,
+    devfreq_registration: Arc<Mutex<Option<TyrDevfreq>>>,
 
     /// Runtime PM registration. Owns the callback payload and disables
     /// runtime PM on unbind. Held only for its `Drop`.
@@ -469,9 +467,6 @@ pub(crate) struct TyrDrmDeviceData {
 
     #[pin]
     pub(crate) user_mmio: Mutex<mmap::UserMmio>,
-
-    #[pin]
-    pub(crate) opp_config: Mutex<Option<ConfigToken>>,
 
     /// Device-wide registry of live BOs backing the `gems` debugfs file.
     ///
@@ -1078,7 +1073,6 @@ impl TyrPlatformDriverData {
                 unusable: Atomic::new(false),
                 probe_gate,
                 user_mmio <- new_mutex!(mmap::UserMmio::new()?),
-                opp_config <- new_mutex!(None),
                 #[cfg(CONFIG_DEBUG_FS)]
                 gem_registry <- GemRegistry::new(),
                 #[cfg(CONFIG_DEBUG_FS)]

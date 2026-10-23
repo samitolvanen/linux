@@ -167,12 +167,35 @@ struct OppConfigOps;
 #[vtable]
 impl opp::ConfigOps for OppConfigOps {}
 
+/// OPP table and regulator config set up by `init`. The table is cleared
+/// from the callback data before the config is released.
+struct OppSetup {
+    data: Arc<TyrDevfreqData>,
+    _config: Option<opp::ConfigToken>,
+}
+
+impl Drop for OppSetup {
+    fn drop(&mut self) {
+        *self.data.opp_table.lock() = None;
+    }
+}
+
+/// Devfreq resources owned by the device binding. The registration drops
+/// first, so devfreq is removed before the OPP setup is released.
+pub(crate) struct TyrDevfreq {
+    registration: Registration<TyrDevfreqCallbacks>,
+    _opp: OppSetup,
+}
+
+impl TyrDevfreq {
+    fn devfreq(&self) -> &devfreq::Devfreq {
+        self.registration.devfreq()
+    }
+}
+
 /// Sets up devfreq for the GPU. Returns `None` when the device node
 /// declares no OPP table.
-pub(crate) fn init(
-    tdev: &TyrDrmDevice,
-    pdev: &Device<Bound>,
-) -> Result<Option<Registration<TyrDevfreqCallbacks>>> {
+pub(crate) fn init(tdev: &TyrDrmDevice, pdev: &Device<Bound>) -> Result<Option<TyrDevfreq>> {
     tdev.devfreq_data.devfreq_state.lock().reset();
 
     // The "sram" rail must be enabled explicitly even where DT couples it to
@@ -184,6 +207,7 @@ pub(crate) fn init(
     }
 
     let dev: ARef<Device> = tdev.pdev.as_ref().into();
+    let mut config = None;
     let table = match opp::Table::from_dev(&dev) {
         Ok(t) => t,
         Err(_) => {
@@ -193,7 +217,7 @@ pub(crate) fn init(
                 .set_regulator_names(names)?
                 .set(pdev)
             {
-                Ok(config_token) => *tdev.opp_config.lock() = Some(config_token),
+                Ok(config_token) => config = Some(config_token),
                 Err(e) if e == ENODEV => {}
                 Err(e) => return Err(e),
             }
@@ -225,6 +249,10 @@ pub(crate) fn init(
     }
 
     *tdev.devfreq_data.opp_table.lock() = Some(table);
+    let opp_setup = OppSetup {
+        data: tdev.devfreq_data.clone(),
+        _config: config,
+    };
 
     let cur_freq = tdev.clks.lock().core.rate();
     let (opp, recommended_freq) =
@@ -259,13 +287,16 @@ pub(crate) fn init(
         dev_info!(pdev, "Energy Model cooling device not registered");
     }
 
-    Ok(Some(registration))
+    Ok(Some(TyrDevfreq {
+        registration,
+        _opp: opp_setup,
+    }))
 }
 
 /// The runtime-PM payload is the devfreq registration slot, shared with
 /// `TyrPlatformDriverData`. The inner `Option` is `None` on devices without
 /// an OPP table and after `unbind`, making the devfreq steps no-ops.
-pub(crate) type DevfreqSlot = Mutex<Option<Registration<TyrDevfreqCallbacks>>>;
+pub(crate) type DevfreqSlot = Mutex<Option<TyrDevfreq>>;
 
 /// Runs `f` against the registered devfreq device, if any.
 fn with_devfreq(slot: Option<&DevfreqSlot>, f: impl FnOnce(&devfreq::Devfreq) -> Result) -> Result {
