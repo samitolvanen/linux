@@ -381,13 +381,17 @@ impl QueueData {
 
         let mut pending = self.pending_submit_fences.lock();
         Self::maybe_truncate_pending(&mut pending);
+        let fault = pending.fault.filter(|(seqno, _)| *seqno == done_seqno);
         if pending.vec.push_within_capacity(pending_fence).is_err() {
             return Err(fence);
         }
         let Some(entry) = pending.vec.last_mut() else {
             return Err(fence);
         };
-        entry.fence = Some(fence);
+        let fence = entry.fence.insert(fence);
+        if let Some((_, err)) = fault {
+            fence.set_error(err);
+        }
         Ok(())
     }
 
@@ -486,6 +490,7 @@ impl QueueData {
         else {
             return;
         };
+        pending.fault = Some((done_seqno, err));
         for entry in pending.vec.iter_mut().skip(head) {
             if entry.done_seqno == done_seqno {
                 if let Some(fence) = entry.fence.as_mut() {
@@ -1060,6 +1065,9 @@ struct PendingSubmitFence {
 struct PendingFences {
     vec: KVec<PendingSubmitFence>,
     head: usize,
+    /// `done_seqno` and error of the last job a CS fault failed. A sync-only
+    /// job pushed later with the same seqno takes the error.
+    fault: Option<(u64, Error)>,
 }
 
 /// A minimal hardware queue object owned by a scheduling group.
@@ -1102,6 +1110,7 @@ impl Queue {
                 pending_submit_fences <- new_mutex!(PendingFences {
                     vec: pending_fence_vec,
                     head: 0,
+                    fault: None,
                 }),
                 last_job_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
