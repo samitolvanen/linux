@@ -54,6 +54,7 @@ use kernel::{
             Release, //
         },
         Arc,
+        Completion,
         Mutex,
         SetOnce,
         SpinLock, //
@@ -290,6 +291,10 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     work_gate_closed: SpinLock<bool>,
 
+    /// Completed once unbind has halted the firmware.
+    #[pin]
+    unbind_halted: Completion,
+
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
     pub(crate) devfreq_data: Arc<TyrDevfreqData>,
@@ -524,6 +529,16 @@ impl TyrDrmDeviceData {
         let _ = self.periodic_tick_work.cancel_sync();
         let _ = self.syncwait_poll_work.cancel_sync();
         self.cancel_fw_ping();
+    }
+
+    /// Waits for unbind to halt the firmware and evict the resident groups if
+    /// unbind has stopped the tick. The halt waits for driver workers and PM
+    /// callbacks, so callers must not run in them or hold a lock it takes.
+    pub(crate) fn wait_unbind_halt(&self) {
+        let closed = *self.work_gate_closed.lock();
+        if closed {
+            self.unbind_halted.wait_for_completion();
+        }
     }
 }
 
@@ -874,6 +889,7 @@ impl platform::Driver for TyrPlatformDriver {
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                 work_gate_closed <- new_spinlock!(false),
+                unbind_halted <- Completion::new(),
                 devfreq_data,
                 pm: SetOnce::new(),
                 pm_powered_down: Atomic::new(false),
@@ -1050,6 +1066,7 @@ impl PinnedDrop for TyrPlatformDriverData<'_> {
         self.reg.device().reset.unbind();
         drop(self.devfreq_registration.lock().take());
         suspend_at_unbind(self.reg.device());
+        self.reg.device().unbind_halted.complete_all();
         // Let the queued terminations hand their groups to the cleanup
         // workqueue before the module can exit.
         self.reg.device().term_wq.flush();
