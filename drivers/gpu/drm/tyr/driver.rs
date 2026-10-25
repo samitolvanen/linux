@@ -68,6 +68,7 @@ use kernel::{
             Release, //
         },
         Arc,
+        Completion,
         CondVar,
         Mutex,
         SetOnce,
@@ -426,6 +427,10 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     system_work_closed: SpinLock<bool>,
 
+    /// Completed once unbind or a failed probe has halted the firmware.
+    #[pin]
+    unbind_halted: Completion,
+
     /// Device-wide job profiling enablement bitmask, a combination of
     /// `DEVICE_PROFILING_*`. Read at job submit time and baked into the
     /// wrapped command stream. `0` (the default) disables profiling.
@@ -727,6 +732,16 @@ impl TyrDrmDeviceData {
         let _ = self.periodic_tick_work.cancel_sync();
         let _ = self.syncwait_poll_work.cancel_sync();
         self.cancel_fw_ping();
+    }
+
+    /// Waits for unbind to halt the firmware and evict the resident groups if
+    /// unbind has stopped the tick. The halt waits for driver workers and PM
+    /// callbacks, so callers must not run in them or hold a lock it takes.
+    pub(crate) fn wait_unbind_halt(&self) {
+        let closed = *self.system_work_closed.lock();
+        if closed {
+            self.unbind_halted.wait_for_completion();
+        }
     }
 }
 
@@ -1064,6 +1079,7 @@ impl TyrPlatformDriverData {
                 fw_ping_work <- kernel::new_delayed_work!("TyrDrmDeviceData::fw_ping_work"),
                 syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                 system_work_closed <- new_spinlock!(false),
+                unbind_halted <- Completion::new(),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
                 devfreq_data,
@@ -1099,6 +1115,7 @@ impl TyrPlatformDriverData {
             tdev.fw.stop_mcu();
             tdev.mmu.suspend();
             let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
+            tdev.unbind_halted.complete_all();
         });
 
         // Devres drops this reference after the entries below that hold the device.
@@ -1228,6 +1245,7 @@ impl platform::Driver for TyrPlatformDriverData {
         this.device.reset.unbind();
         drop(this.devfreq_registration.lock().take());
         Self::suspend_at_unbind(pdev, this);
+        this.device.unbind_halted.complete_all();
         let _ = this.device.with_locked_scheduler(|sched| {
             sched.fail_all_groups();
             Ok(())
