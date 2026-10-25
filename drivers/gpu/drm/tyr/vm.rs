@@ -228,6 +228,7 @@ impl Pool {
         vm.mark_unusable();
         if vm.as_slot().is_some() {
             tdev.flush_tick();
+            tdev.wait_unbind_halt();
         }
 
         vm.kill();
