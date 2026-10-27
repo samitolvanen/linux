@@ -45,6 +45,7 @@ use kernel::{
         },
         rcu::synchronize_rcu, //
     }, //
+    time::Jiffies,
 };
 
 /// VTable for dma_fence backend_ops callbacks.
@@ -521,6 +522,15 @@ pub enum FenceStatus {
     Signaled(Result),
 }
 
+/// The result of [`Fence::wait_timeout`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum FenceWaitResult {
+    /// The fence was signaled before the timeout elapsed.
+    Signaled,
+    /// The timeout elapsed before the fence was signaled.
+    TimedOut,
+}
+
 impl Fence {
     /// Query a fence's error code and turn it into a [`Result`].
     ///
@@ -577,6 +587,43 @@ impl Fence {
     pub fn seqno(&self) -> u64 {
         // SAFETY: Valid because `self` is valid.
         unsafe { (*self.as_raw()).seqno }
+    }
+
+    /// Wait until the fence is signaled.
+    ///
+    /// The wait is not interruptible. It returns `Ok(())` once the fence is
+    /// signaled, also when it was signaled with an error.
+    pub fn wait(&self) -> Result {
+        // SAFETY: `self.as_raw()` is a valid fence. `isize::MAX` is
+        // `MAX_SCHEDULE_TIMEOUT`, which waits without a timeout.
+        let ret = unsafe { bindings::dma_fence_wait_timeout(self.as_raw(), false, isize::MAX) };
+
+        // A successful wait returns the remaining timeout, which does not fit
+        // in an `i32`. Only a negative value is an error.
+        if ret < 0 {
+            Err(Error::from_errno(ret as i32))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Wait until the fence is signaled, for at most `timeout` jiffies.
+    ///
+    /// The wait is not interruptible. A fence signaled with an error counts as
+    /// signaled.
+    pub fn wait_timeout(&self, timeout: Jiffies) -> Result<FenceWaitResult> {
+        let timeout = isize::try_from(timeout).unwrap_or(isize::MAX);
+
+        // SAFETY: `self.as_raw()` is a valid fence.
+        let ret = unsafe { bindings::dma_fence_wait_timeout(self.as_raw(), false, timeout) };
+
+        if ret < 0 {
+            Err(Error::from_errno(ret as i32))
+        } else if ret == 0 {
+            Ok(FenceWaitResult::TimedOut)
+        } else {
+            Ok(FenceWaitResult::Signaled)
+        }
     }
 
     fn as_raw(&self) -> *mut bindings::dma_fence {
