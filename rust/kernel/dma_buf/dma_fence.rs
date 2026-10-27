@@ -626,7 +626,11 @@ impl Fence {
         }
     }
 
-    fn as_raw(&self) -> *mut bindings::dma_fence {
+    /// Returns a raw pointer to the underlying C `struct dma_fence`.
+    ///
+    /// The pointer is valid for as long as `self` is.
+    #[inline]
+    pub fn as_raw(&self) -> *mut bindings::dma_fence {
         self.inner.get()
     }
 
