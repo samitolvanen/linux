@@ -11,12 +11,14 @@ use kernel::{
         Bound,
         Device, //
     },
-    dma_buf::legacy_fence::{
-        impl_has_dma_fence_work,
-        new_dma_fence_work,
-        DmaFenceWork,
-        DmaFenceWorkItem,
-        PublicDmaFence, //
+    dma_buf::{
+        fence_work::{
+            impl_has_dma_fence_work,
+            new_dma_fence_work,
+            DmaFenceWork,
+            DmaFenceWorkItem, //
+        },
+        legacy_fence::PublicDmaFence,
     },
     drm::gem::BaseObject,
     io::IoBase,

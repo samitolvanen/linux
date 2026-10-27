@@ -3,6 +3,7 @@
 //! DMA-buf subsystem abstractions.
 
 pub mod dma_fence;
+pub mod fence_work;
 pub mod legacy_fence;
 
 pub use self::dma_fence::{

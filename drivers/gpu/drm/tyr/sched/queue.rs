@@ -8,8 +8,8 @@ use core::ops::{
 use kernel::{
     alloc::KVec,
     dma_buf::{
+        fence_work::DmaFenceWorkqueue,
         legacy_fence::{
-            DmaFenceWorkqueue,
             DriverDmaFence,
             DriverDmaFenceOps,
             FenceWaitResult,

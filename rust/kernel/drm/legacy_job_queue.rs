@@ -159,22 +159,24 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::{
     c_str,
     dma_buf::{
-        legacy_fence::{
-            CallbackError,
-            DmaFenceContext,
+        fence_work::{
             DmaFenceDelayedWork,
             DmaFenceDelayedWorkItem,
             DmaFenceWork,
             DmaFenceWorkItem,
-            DmaFenceWorkqueue,
+            DmaFenceWorkqueue, //
+        },
+        legacy_fence::{
+            CallbackError,
+            DmaFenceContext,
             DriverDmaFence,
             DriverDmaFenceOps,
             FenceCallback,
             FenceCallbackRegistration,
             FenceWaitResult,
-            PublicDmaFence, //
+            PublicDmaFence,
             Published,
-            UninitDmaFence,
+            UninitDmaFence, //
         },
         SignallingSection, //
     },

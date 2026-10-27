@@ -24,12 +24,14 @@ use kernel::{
         Device, //
     },
     dma::DmaAddress,
-    dma_buf::legacy_fence::{
-        DmaFenceWorkqueue,
-        DriverDmaFence,
-        DriverDmaFenceOps,
-        PublicDmaFence,
-        Published, //
+    dma_buf::{
+        fence_work::DmaFenceWorkqueue,
+        legacy_fence::{
+            DriverDmaFence,
+            DriverDmaFenceOps,
+            PublicDmaFence,
+            Published, //
+        },
     },
     drm::{
         exec::{

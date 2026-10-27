@@ -8,7 +8,7 @@ use crate::{
     alloc::allocator::Kmalloc,
     bindings,
     device,
-    dma_buf::legacy_fence::{
+    dma_buf::fence_work::{
         DmaFenceDelayedWorkItem,
         DmaFenceWorkItem, //
     },
