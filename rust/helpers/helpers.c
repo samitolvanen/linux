@@ -62,7 +62,7 @@
 #include "dma.c"
 #ifdef CONFIG_DMA_SHARED_BUFFER
 #include "dma_fence.c"
-#include "legacy_dma_fence.c"
+#include "dma_fence_chain.c"
 #include "dma-resv.c"
 #endif
 #include "drm.c"

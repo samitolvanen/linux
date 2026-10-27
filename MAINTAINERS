@@ -7879,6 +7879,7 @@ F:	include/linux/dma-buf/
 F:	include/linux/dma-resv.h
 F:	rust/helpers/dma-resv.c
 F:	rust/helpers/dma_fence.c
+F:	rust/helpers/dma_fence_chain.c
 F:	rust/kernel/dma_buf/
 K:	\bdma_(?:buf|fence|resv)\b
 
@@ -8908,6 +8909,7 @@ F:	drivers/gpu/drm/nova/
 F:	drivers/gpu/drm/tyr/
 F:	drivers/gpu/nova-core/
 F:	rust/helpers/dma_fence.c
+F:	rust/helpers/dma_fence_chain.c
 F:	rust/helpers/gpu.c
 F:	rust/kernel/dma_buf/
 F:	rust/kernel/drm/

@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 
 use crate::{
     bindings,
-    dma_buf::legacy_fence::{FenceChain, PublicDmaFence},
+    dma_buf::{dma_fence_chain::FenceChain, legacy_fence::PublicDmaFence},
     drm,
     error::Result,
     prelude::*,

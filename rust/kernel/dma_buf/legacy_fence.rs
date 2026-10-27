@@ -41,42 +41,6 @@ pub enum FenceWaitResult {
     TimedOut,
 }
 
-/// A wrapper around a `dma_fence_chain` object.
-///
-/// # Invariants
-///
-/// - `ptr` is a valid, non-null pointer to a dma_fence_chain which we own.
-pub struct FenceChain {
-    ptr: NonNull<bindings::dma_fence_chain>,
-}
-
-impl FenceChain {
-    /// Create a new `FenceChain` object.
-    pub fn new() -> Result<Self> {
-        // SAFETY: This function is safe to call and takes no arguments.
-        let ptr = unsafe { bindings::dma_fence_chain_alloc() };
-
-        let ptr = NonNull::new(ptr).ok_or(ENOMEM)?;
-        Ok(Self { ptr })
-    }
-
-    /// Convert the `FenceChain` into the underlying raw pointer.
-    ///
-    /// This transfers ownership of the allocation to the caller.
-    pub(crate) fn into_raw(self) -> *mut bindings::dma_fence_chain {
-        let ptr = self.ptr.as_ptr();
-        core::mem::forget(self);
-        ptr
-    }
-}
-
-impl Drop for FenceChain {
-    fn drop(&mut self) {
-        // SAFETY: We own this dma_fence_chain allocation.
-        unsafe { bindings::dma_fence_chain_free(self.ptr.as_ptr()) };
-    }
-}
-
 /// A public DMA fence reference.
 ///
 /// This is a reference-counted handle to a `dma_fence` that can be shared with
