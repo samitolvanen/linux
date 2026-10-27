@@ -5,7 +5,6 @@
 pub mod dma_fence;
 pub mod dma_fence_chain;
 pub mod fence_work;
-pub mod legacy_fence;
 
 pub use self::dma_fence::{
     DriverFence,
