@@ -158,23 +158,25 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{
     c_str,
-    dma_buf::legacy_fence::{
-        CallbackError,
-        DmaFenceContext,
-        DmaFenceDelayedWork,
-        DmaFenceDelayedWorkItem,
-        DmaFenceSignallingAnnotation,
-        DmaFenceWork,
-        DmaFenceWorkItem,
-        DmaFenceWorkqueue,
-        DriverDmaFence,
-        DriverDmaFenceOps,
-        FenceCallback,
-        FenceCallbackRegistration,
-        FenceWaitResult,
-        PublicDmaFence, //
-        Published,
-        UninitDmaFence,
+    dma_buf::{
+        legacy_fence::{
+            CallbackError,
+            DmaFenceContext,
+            DmaFenceDelayedWork,
+            DmaFenceDelayedWorkItem,
+            DmaFenceWork,
+            DmaFenceWorkItem,
+            DmaFenceWorkqueue,
+            DriverDmaFence,
+            DriverDmaFenceOps,
+            FenceCallback,
+            FenceCallbackRegistration,
+            FenceWaitResult,
+            PublicDmaFence, //
+            Published,
+            UninitDmaFence,
+        },
+        SignallingSection, //
     },
     error::Result,
     impl_has_dma_fence_delayed_work,
@@ -1989,11 +1991,11 @@ impl<T: QueueOps> JobQueue<T> {
                 drop(entry.progress_cb.take());
                 drop(entry.stage_wake_cb.take());
                 if let StageKind::Driver(s) = &self.inner.stages[stage_i] {
-                    let _annotation = DmaFenceSignallingAnnotation::new();
+                    let _section = SignallingSection::begin();
                     s.teardown(&*entry.job, entry.counter);
                 }
                 if let Some(f) = entry.submit_fence_drv.take() {
-                    let _annotation = DmaFenceSignallingAnnotation::new();
+                    let _section = SignallingSection::begin();
                     f.signal(Err(Error::from_errno(-(bindings::ECANCELED as i32))));
                 }
             }

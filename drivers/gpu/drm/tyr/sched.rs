@@ -1268,7 +1268,7 @@ impl Scheduler {
     ///
     /// Must be called outside `TyrDrmDeviceData::with_locked_scheduler`.
     /// The per-queue `complete_submit_fences` opens a
-    /// `DmaFenceSignallingAnnotation` and signals user-visible
+    /// `SignallingSection` and signals user-visible
     /// dma-fences, and signalling-section code may not nest inside a
     /// wide driver lock like the scheduler mutex.
     ///

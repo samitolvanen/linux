@@ -7,14 +7,16 @@ use core::ops::{
 
 use kernel::{
     alloc::KVec,
-    dma_buf::legacy_fence::{
-        DmaFenceSignallingAnnotation,
-        DmaFenceWorkqueue,
-        DriverDmaFence,
-        DriverDmaFenceOps,
-        FenceWaitResult,
-        PublicDmaFence,
-        Published, //
+    dma_buf::{
+        legacy_fence::{
+            DmaFenceWorkqueue,
+            DriverDmaFence,
+            DriverDmaFenceOps,
+            FenceWaitResult,
+            PublicDmaFence,
+            Published, //
+        },
+        SignallingSection, //
     },
     drm::{
         legacy_job_queue::{
@@ -315,7 +317,7 @@ impl QueueData {
     /// so concurrent drains signal in seqno order.
     fn signal_submit_fences_up_to(&self, up_to_seqno: u64, result: Result) {
         loop {
-            let _annotation = DmaFenceSignallingAnnotation::new();
+            let _section = SignallingSection::begin();
             let mut pending = self.pending_submit_fences.lock();
             let head = pending.head;
             let Some(entry) = pending.vec.get_mut(head) else {
@@ -399,7 +401,7 @@ impl QueueData {
     }
 
     fn signal_submit_fence(&self, done_seqno: u64, result: Result) -> bool {
-        let _annotation = DmaFenceSignallingAnnotation::new();
+        let _section = SignallingSection::begin();
         let mut pending = self.pending_submit_fences.lock();
         let head = pending.head;
         let mut position = None;
@@ -426,7 +428,7 @@ impl QueueData {
         fence: DriverDmaFence<QueueFenceData, Published>,
         err: Error,
     ) -> Result<(), DriverDmaFence<QueueFenceData, Published>> {
-        let _annotation = DmaFenceSignallingAnnotation::new();
+        let _section = SignallingSection::begin();
         let pending = self.pending_submit_fences.lock();
         let head = pending.head;
         if pending.vec.iter().skip(head).any(|e| e.fence.is_some()) {
@@ -439,7 +441,7 @@ impl QueueData {
     /// Fails the pending fence for `done_seqno` with `err`. While an older
     /// pending fence is live, the error is staged for the in-order drain.
     fn fail_submit_fence(&self, done_seqno: u64, err: Error) {
-        let _annotation = DmaFenceSignallingAnnotation::new();
+        let _section = SignallingSection::begin();
         let mut pending = self.pending_submit_fences.lock();
         let head = pending.head;
         let mut older_live = false;

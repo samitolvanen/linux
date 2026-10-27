@@ -20,6 +20,7 @@ use pin_init::pin_init_from_closure;
 use crate::{
     alloc::AllocError,
     bindings, c_str,
+    dma_buf::SignallingSection,
     error::to_result,
     irq::{IrqReturn, ThreadedHandler, ThreadedIrqReturn},
     prelude::*,
@@ -28,7 +29,7 @@ use crate::{
         Arc, LockClassKey,
     },
     time::Jiffies,
-    types::{ForeignOwnable, NotThreadSafe, Opaque},
+    types::{ForeignOwnable, Opaque},
     workqueue::{
         DelayedWork,
         HasDelayedWork,
@@ -267,43 +268,6 @@ impl DmaFenceContext {
     /// Return the last allocated sequence number.
     pub fn last_seqno(&self) -> u64 {
         self.seqno.load(Ordering::Relaxed)
-    }
-}
-
-/// DMA fence signalling guard used to annotate a section of code responsible
-/// for signaling `dma_fence` objects.
-pub struct DmaFenceSignallingAnnotation {
-    /// The cookie returned by `dma_fence_begin_signalling()`.
-    cookie: bool,
-
-    /// Keep the annotation on the current thread.
-    _not_send: NotThreadSafe,
-}
-
-impl DmaFenceSignallingAnnotation {
-    /// Begin a DMA-fence signalling section.
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            // SAFETY: Drop always pairs this with a matching
-            // `dma_fence_end_signalling()` call.
-            cookie: unsafe { bindings::dma_fence_begin_signalling() },
-            _not_send: NotThreadSafe,
-        }
-    }
-}
-
-impl Default for DmaFenceSignallingAnnotation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for DmaFenceSignallingAnnotation {
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: The cookie was returned by `dma_fence_begin_signalling()`.
-        unsafe { bindings::dma_fence_end_signalling(self.cookie) };
     }
 }
 
@@ -1039,7 +1003,7 @@ macro_rules! impl_has_dma_fence_work {
             type Pointer = <Self as $crate::dma_buf::legacy_fence::DmaFenceWorkItem<$($id)?>>::Pointer;
 
             fn run(this: Self::Pointer) {
-                let _annotation = $crate::dma_buf::legacy_fence::DmaFenceSignallingAnnotation::new();
+                let _section = $crate::dma_buf::SignallingSection::begin();
 
                 <Self as $crate::dma_buf::legacy_fence::DmaFenceWorkItem<$($id)?>>::run(this)
             }
@@ -1065,7 +1029,7 @@ pub use new_dma_fence_work;
 /// This is a wrapper around [`DelayedWork`] allowing us to re-use the existing workqueue
 /// infrastructure while adding constraints on the type of workqueue such work items
 /// can be scheduled on, and ensuring the work item runs inside a
-/// [`DmaFenceSignallingAnnotation`] section.
+/// [`SignallingSection`].
 #[pin_data]
 pub struct DmaFenceDelayedWork<T: ?Sized, const ID: u64 = 0> {
     #[pin]
@@ -1155,7 +1119,7 @@ macro_rules! impl_has_dma_fence_delayed_work {
                 <Self as $crate::dma_buf::legacy_fence::DmaFenceDelayedWorkItem<$($id)?>>::Pointer;
 
             fn run(this: Self::Pointer) {
-                let _annotation = $crate::dma_buf::legacy_fence::DmaFenceSignallingAnnotation::new();
+                let _section = $crate::dma_buf::SignallingSection::begin();
                 <Self as $crate::dma_buf::legacy_fence::DmaFenceDelayedWorkItem<$($id)?>>::run(this)
             }
         }
@@ -1341,7 +1305,7 @@ pub trait DmaFenceIrqThreadedHandler: Sync {
         ThreadedIrqReturn::WakeThread
     }
 
-    /// The threaded IRQ handler, called within a [`DmaFenceSignallingAnnotation`] section.
+    /// The threaded IRQ handler, called within a [`SignallingSection`].
     fn handle_dma_fence_threaded(&self) -> IrqReturn;
 }
 
@@ -1354,7 +1318,7 @@ impl<T: DmaFenceIrqThreadedHandler + Send + 'static> ThreadedHandler for DmaFenc
     }
 
     fn handle_threaded(&self) -> IrqReturn {
-        let _annotation = DmaFenceSignallingAnnotation::new();
+        let _section = SignallingSection::begin();
         self.0.handle_dma_fence_threaded()
     }
 }
