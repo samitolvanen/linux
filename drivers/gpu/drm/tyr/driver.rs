@@ -631,7 +631,7 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
         // SYNC_UPDATE that fires after the snapshot re-arms the worker
         // for the next pass. Clearing at the end would silently drop
         // IRQs racing the snapshot.
-        this.sync_upd_pending.store(false, Release);
+        let _ = this.sync_upd_pending.xchg(false, Full);
 
         // The drain runs before the guard so an unplug racing this worker
         // cannot strand pending submit fences. It touches no
