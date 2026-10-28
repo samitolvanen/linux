@@ -824,7 +824,7 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
         // SYNC_UPDATE that fires after the snapshot re-arms the worker
         // for the next pass; clearing at the end would silently drop
         // IRQs racing the snapshot.
-        tdev.sync_upd_pending.store(false, Release);
+        let _ = tdev.sync_upd_pending.xchg(false, Full);
 
         Scheduler::drain_resident_queue_completions(tdev);
 
