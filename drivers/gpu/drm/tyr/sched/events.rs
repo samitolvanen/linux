@@ -82,16 +82,17 @@ struct CsIrqEvents {
 
 impl CsIrqEvents {
     /// Records the fatal, fault and tiler OOM events of CS `cs_id`, and
-    /// acknowledges the fatal and fault events.
+    /// acknowledges the fatal and fault events. Returns `true` if a fault
+    /// was acknowledged.
     fn process_cs_irq(
         &mut self,
         csg: &mut CsgInterface,
         csg_id: usize,
         cs_id: u32,
         group: Option<&Group>,
-    ) -> Result {
+    ) -> Result<bool> {
         let Some(cs) = csg.cs_mut(cs_id as usize) else {
-            return Ok(());
+            return Ok(false);
         };
         let input_req = cs.read_input_req()?;
         let output_ack = cs.read_output_ack()?;
@@ -141,7 +142,7 @@ impl CsIrqEvents {
             cs.write_input_req(new_req);
         }
 
-        Ok(())
+        Ok(fault_event)
     }
 }
 
@@ -315,24 +316,27 @@ impl Scheduler {
         }
 
         let mut events = CsIrqEvents::default();
-        tdev.fw.with_csg_mut(csg_id, |csg| {
+        let ring_cs_db_mask = tdev.fw.with_csg_mut(csg_id, |csg| {
             let mut cs_irqs = pending_cs_irqs;
+            let mut ring_cs_db_mask = 0u32;
 
             while cs_irqs != 0 {
                 let cs_id = cs_irqs.trailing_zeros();
                 cs_irqs &= !(1u32 << cs_id);
 
-                if let Err(e) = events.process_cs_irq(csg, csg_id, cs_id, group.as_deref()) {
-                    pr_err!(
+                match events.process_cs_irq(csg, csg_id, cs_id, group.as_deref()) {
+                    Ok(true) => ring_cs_db_mask |= 1u32 << cs_id,
+                    Ok(false) => {}
+                    Err(e) => pr_err!(
                         "Failed to process the CSG slot {} CS {} IRQ: {:?}\n",
                         csg_id,
                         cs_id,
                         e
-                    );
+                    ),
                 }
             }
 
-            Ok(())
+            Ok(ring_cs_db_mask)
         })?;
         let CsIrqEvents {
             mut tiler_oom_mask,
@@ -387,9 +391,22 @@ impl Scheduler {
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
 
-        let mut mask = CsgSlotMask::empty();
-        mask.insert(csg_slot);
-        tdev.fw.ring_csg_doorbells(mask)?;
+        if ring_cs_db_mask != 0 {
+            tdev.fw.with_csg_mut_ring_doorbell(csg_id, |csg| {
+                if let Err(e) = csg.toggle_input_db_req(CsDbMask::from_raw(ring_cs_db_mask)) {
+                    pr_err!(
+                        "Failed to toggle the CSG slot {} CS doorbell requests: {:?}\n",
+                        csg_id,
+                        e
+                    );
+                }
+                Ok(())
+            })?;
+        } else {
+            let mut mask = CsgSlotMask::empty();
+            mask.insert(csg_slot);
+            tdev.fw.ring_csg_doorbells(mask)?;
+        }
 
         Ok(())
     }
