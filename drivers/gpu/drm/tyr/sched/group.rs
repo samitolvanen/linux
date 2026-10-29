@@ -70,7 +70,8 @@ use crate::{
     },
     fw::{
         self,
-        global::csg::Priority, //
+        global::csg::Priority,
+        CsWaitCondition, //
     },
     gem, pool,
     sched::CsgSlotManager,
@@ -857,6 +858,11 @@ impl Group {
             }
         }
 
+        // A reserved condition leaves the queue blocked until the job times out.
+        let Some(condition) = syncwait.condition else {
+            return Ok(false);
+        };
+
         let syncobjs_va = self._syncobjs.kernel_va().ok_or(EINVAL)?;
 
         // Resolve the awaited sync object's CPU mapping.
@@ -909,10 +915,10 @@ impl Group {
             }
         };
 
-        let satisfied = if syncwait.gt {
-            value > syncwait.ref_val
-        } else {
-            value <= syncwait.ref_val
+        let satisfied = match condition {
+            CsWaitCondition::Le => value <= syncwait.ref_val,
+            CsWaitCondition::Gt => value > syncwait.ref_val,
+            CsWaitCondition::Ge => value >= syncwait.ref_val,
         };
         if satisfied {
             // Drop the cached BO resolution so the next wait does a

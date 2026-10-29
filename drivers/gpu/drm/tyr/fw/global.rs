@@ -65,7 +65,10 @@ use kernel::{
     time::arch_timer_get_rate,
 };
 
-pub(crate) use self::cs::CsActivateInputs;
+pub(crate) use self::cs::{
+    CsActivateInputs,
+    CsStatusWait, //
+};
 pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 
 use crate::wait::WaitResult;

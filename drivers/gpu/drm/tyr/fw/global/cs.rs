@@ -78,8 +78,8 @@ pub(crate) struct CsActivateInputs {
 /// Snapshot of the per-CS sync-wait state captured from
 /// `CS_STATUS_WAIT` and the matching `CS_STATUS_WAIT_SYNC_*` words.
 pub(crate) struct CsStatusWait {
-    /// Wait condition (`Le` or `Gt`).
-    pub(crate) condition: CsWaitCondition,
+    /// Wait condition, or `None` for a reserved encoding.
+    pub(crate) condition: Option<CsWaitCondition>,
     /// Whether the wait observes a 64-bit (`true`) or 32-bit (`false`)
     /// sync object.
     pub(crate) sync64: bool,
@@ -348,7 +348,7 @@ impl CsInterface {
         };
 
         let wait = enabled.cs_output.read(CS_STATUS_WAIT);
-        let condition = wait.sync_wait_condition();
+        let condition = wait.sync_wait_condition().ok();
         let sync64 = wait.sync_wait_size();
 
         let sync_ptr = enabled
