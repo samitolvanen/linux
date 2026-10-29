@@ -17,6 +17,8 @@ use kernel::str::{
     CStrExt, //
 };
 
+use crate::fw::CsWaitCondition;
+
 /// Helper that formats a byte slice as space-separated lowercase hex
 /// digits for the downstream-debug `pr_err!` fallback emitted alongside
 /// the byte-dump tracepoints. libtraceevent has repeatedly failed to
@@ -556,7 +558,7 @@ kernel::declare_trace! {
         gpu_va: u64,
         ref_val: u64,
         sync64: u32,
-        gt: u32,
+        condition: u32,
         cur_val: u64,
         cur_val_valid: u32,
     );
@@ -2259,6 +2261,10 @@ pub(crate) fn cs_sync_wait_operand(
     unsafe { tyr_cs_sync_wait_operand(group_id, cs_id, gpu_va, ref_val, sync_size) }
 }
 
+/// `syncwait_capture` condition for a reserved encoding. Keep in sync with
+/// `TYR_CS_WAIT_CONDITIONS` in `include/trace/events/tyr.h`.
+const CS_WAIT_CONDITION_RESERVED: u32 = u32::MAX;
+
 /// Sync-wait operand about to be installed into a queue's syncwait
 /// snapshot by `sync_csg_slot_queues_state`. Fires on the SyncWait
 /// branch only, immediately before [`crate::sched::queue::Queue::set_syncwait`]
@@ -2275,7 +2281,7 @@ pub(crate) fn syncwait_capture(
     gpu_va: u64,
     ref_val: u64,
     sync64: bool,
-    gt: bool,
+    condition: Option<CsWaitCondition>,
     cur_val: u64,
     cur_val_valid: bool,
 ) {
@@ -2289,7 +2295,7 @@ pub(crate) fn syncwait_capture(
             gpu_va,
             ref_val,
             u32::from(sync64),
-            u32::from(gt),
+            condition.map_or(CS_WAIT_CONDITION_RESERVED, |c| c as u32),
             cur_val,
             u32::from(cur_val_valid),
         )
