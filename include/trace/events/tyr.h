@@ -1719,6 +1719,17 @@ TRACE_EVENT(tyr_cs_sync_wait_operand,
 );
 
 /*
+ * Sync-wait condition for `tyr_syncwait_capture`. Keep in sync with
+ * `CsWaitCondition` in drivers/gpu/drm/tyr/fw/interfaces.rs and
+ * `CS_WAIT_CONDITION_RESERVED` in drivers/gpu/drm/tyr/trace.rs.
+ */
+#define TYR_CS_WAIT_CONDITIONS		\
+	{ 0, "LE" },			\
+	{ 1, "GT" },			\
+	{ 5, "GE" },			\
+	{ 0xffffffff, "RESERVED" }
+
+/*
  * Sync-wait operand about to be stored into the queue's syncwait
  * snapshot in `sync_csg_slot_queues_state`. Fires only on the branch
  * that observed BlockedReason::SyncWait, just before the
@@ -1729,9 +1740,10 @@ TRACE_EVENT(tyr_cs_sync_wait_operand,
  */
 TRACE_EVENT(tyr_syncwait_capture,
 	TP_PROTO(u64 vm_id, u64 group_id, u64 group_uid, u32 cs_id, u64 gpu_va,
-		 u64 ref_val, u32 sync64, u32 gt, u64 cur_val, u32 cur_val_valid),
-	TP_ARGS(vm_id, group_id, group_uid, cs_id, gpu_va, ref_val, sync64, gt,
-		cur_val, cur_val_valid),
+		 u64 ref_val, u32 sync64, u32 condition, u64 cur_val,
+		 u32 cur_val_valid),
+	TP_ARGS(vm_id, group_id, group_uid, cs_id, gpu_va, ref_val, sync64,
+		condition, cur_val, cur_val_valid),
 	TP_STRUCT__entry(
 		__field(u64, vm_id)
 		__field(u64, group_id)
@@ -1740,7 +1752,7 @@ TRACE_EVENT(tyr_syncwait_capture,
 		__field(u64, gpu_va)
 		__field(u64, ref_val)
 		__field(u32, sync64)
-		__field(u32, gt)
+		__field(u32, condition)
 		__field(u64, cur_val)
 		__field(u32, cur_val_valid)
 	),
@@ -1752,15 +1764,16 @@ TRACE_EVENT(tyr_syncwait_capture,
 		__entry->gpu_va = gpu_va;
 		__entry->ref_val = ref_val;
 		__entry->sync64 = sync64;
-		__entry->gt = gt;
+		__entry->condition = condition;
 		__entry->cur_val = cur_val;
 		__entry->cur_val_valid = cur_val_valid;
 	),
-	TP_printk("vm=%llu group=%llu group_uid=%llu cs=%u gpu_va=0x%llx ref_val=0x%llx sync64=%u gt=%u cur_val=0x%llx cur_val_valid=%u",
+	TP_printk("vm=%llu group=%llu group_uid=%llu cs=%u gpu_va=0x%llx ref_val=0x%llx sync64=%u condition=%s cur_val=0x%llx cur_val_valid=%u",
 		  __entry->vm_id, __entry->group_id, __entry->group_uid,
 		  __entry->cs_id, __entry->gpu_va, __entry->ref_val,
-		  __entry->sync64, __entry->gt, __entry->cur_val,
-		  __entry->cur_val_valid)
+		  __entry->sync64,
+		  __print_symbolic(__entry->condition, TYR_CS_WAIT_CONDITIONS),
+		  __entry->cur_val, __entry->cur_val_valid)
 );
 
 /*
