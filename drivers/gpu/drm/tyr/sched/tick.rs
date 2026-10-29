@@ -1122,21 +1122,9 @@ impl<'a> Tick<'a> {
 
         self.stage_evictions(tdev, decision.keep_mask, &mut context);
 
-        if let Err(e) = self.sched.apply_csg_updates(tdev, fw, &mut context) {
-            dev_err!(tdev.as_ref(), "apply_csg_updates (halt) failed\n");
-            let csg_slot_manager = tdev.csg_slot_manager.lock();
-            for csg_idx in CsgSlotIdx::all() {
-                if !context.timedout_mask.contains(csg_idx) {
-                    continue;
-                }
-                if let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) {
-                    slot_data
-                        .group
-                        .with_locked_inner(|inner| inner.mark_evicted_by_timeout());
-                }
-            }
-            return Err(e);
-        }
+        self.sched
+            .apply_csg_updates(tdev, fw, &mut context)
+            .inspect_err(|_| dev_err!(tdev.as_ref(), "apply_csg_updates (halt) failed\n"))?;
 
         self.unbind_evicted_groups(tdev, fw, decision.keep_mask)
     }
