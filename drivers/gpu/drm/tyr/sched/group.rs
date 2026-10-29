@@ -175,8 +175,8 @@ pub(crate) struct GroupInner {
     fatal_queues: u32,
     /// Set once the group must not run again.
     pub(crate) fatal: bool,
-    /// Set when a timeout occurred on any of the queues owned by this
-    /// group, or when a CSG request targeting the group timed out.
+    /// Set when a queue job or the CSG progress timer times out, or when the
+    /// group's CSG fails to halt for a reset or power-down.
     pub(crate) timedout: bool,
     /// Set when a CSG update failure forced a still-runnable group off its slot.
     pub(crate) innocent: bool,
