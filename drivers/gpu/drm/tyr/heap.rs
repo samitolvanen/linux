@@ -401,7 +401,11 @@ impl Pool {
         // Allocate outside the XArray spinlock: the BO allocation takes the
         // kernel-VA range mutex and uses GFP_KERNEL, neither of which is
         // permitted while holding a spinlock.
-        let chunk_bo = alloc_chunk_bo(tdev, &vm, chunk_size, GFP_KERNEL)?;
+        let chunk_bo = match alloc_chunk_bo(tdev, &vm, chunk_size, GFP_KERNEL) {
+            Ok(chunk_bo) => chunk_bo,
+            Err(e) if e == ENOSPC => return Err(ENOMEM),
+            Err(e) => return Err(e),
+        };
 
         let mut guard = xa.lock();
         let heap_ctx = guard.get_mut(index).ok_or(EINVAL)?;
