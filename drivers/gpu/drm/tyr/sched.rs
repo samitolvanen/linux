@@ -44,7 +44,6 @@ use crate::{
         },
         CsBlockedReason,
         CsDbMask,
-        CsWaitCondition,
         CsgExecutionState,
         CsgSlotMask,
         Firmware,
@@ -1509,7 +1508,7 @@ impl Scheduler {
                     wait.sync_ptr,
                     wait.ref_val,
                     wait.sync64,
-                    wait.condition == Some(CsWaitCondition::Gt),
+                    wait.condition,
                     cur_val,
                     cur_val_valid,
                 );
