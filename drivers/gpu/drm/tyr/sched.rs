@@ -36,11 +36,11 @@ use crate::{
     fw::{
         global::{
             csg::Priority,
+            CsStatusWait,
             CsgActivateInputs, //
         },
         CsBlockedReason,
         CsDbMask,
-        CsWaitCondition,
         CsgExecutionState,
         CsgSlotMask,
         Firmware,
@@ -982,7 +982,7 @@ impl Scheduler {
         let mut blocked_reasons: [Option<CsBlockedReason>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
         let mut scoreboards: [u32; group::MAX_CS_PER_GROUP] = [0; group::MAX_CS_PER_GROUP];
-        let mut sync_waits: [Option<(u64, u64, bool, bool)>; group::MAX_CS_PER_GROUP] =
+        let mut sync_waits: [Option<CsStatusWait>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
 
         fw.with_csg_mut(csg_idx, |csg| {
@@ -995,9 +995,7 @@ impl Scheduler {
                 scoreboards[cs_id.get()] = cs.read_status_scoreboards()?;
 
                 if reason == CsBlockedReason::SyncWait {
-                    let wait = cs.read_status_wait_sync()?;
-                    let gt = matches!(wait.condition, CsWaitCondition::Gt);
-                    sync_waits[cs_id.get()] = Some((wait.sync_ptr, wait.ref_val, wait.sync64, gt));
+                    sync_waits[cs_id.get()] = Some(cs.read_status_wait_sync()?);
                 }
             }
 
@@ -1005,8 +1003,8 @@ impl Scheduler {
         })?;
 
         for (queue, sync_wait) in group.queues.iter().zip(sync_waits.iter_mut()) {
-            if let Some((gpu_va, ref_val, sync64, gt)) = sync_wait.take() {
-                queue.set_syncwait(gpu_va, ref_val, sync64, gt);
+            if let Some(wait) = sync_wait.take() {
+                queue.set_syncwait(wait.sync_ptr, wait.ref_val, wait.sync64, wait.condition);
             }
         }
 

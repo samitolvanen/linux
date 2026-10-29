@@ -75,7 +75,10 @@ use crate::{
         TyrDrmDeviceData,
         TyrDrmRegistrationData, //
     },
-    fw::global::CsActivateInputs,
+    fw::{
+        global::CsActivateInputs,
+        CsWaitCondition, //
+    },
     gem,
     regs::doorbell_block,
     vm::{
@@ -509,12 +512,18 @@ impl QueueData {
     /// snapshot. The cached BO resolution is keyed independently by
     /// its own `(gpu_va, sync64)`. `Group::eval_syncwait` detects
     /// when the live wait has moved to a different key and rebuilds.
-    pub(crate) fn set_syncwait(&self, gpu_va: u64, ref_val: u64, sync64: bool, gt: bool) {
+    pub(crate) fn set_syncwait(
+        &self,
+        gpu_va: u64,
+        ref_val: u64,
+        sync64: bool,
+        condition: Option<CsWaitCondition>,
+    ) {
         let mut wait = self.syncwait.lock();
         wait.gpu_va = gpu_va;
         wait.ref_val = ref_val;
         wait.sync64 = sync64;
-        wait.gt = gt;
+        wait.condition = condition;
     }
 
     /// Stores a resolved BO cache on the active sync-wait snapshot if
@@ -1009,8 +1018,8 @@ pub(crate) struct SyncWait {
     pub(crate) ref_val: u64,
     /// Whether the awaited sync object is 64-bit (`true`) or 32-bit.
     pub(crate) sync64: bool,
-    /// Wait condition: `true` for `>` (Gt), `false` for `<=` (Le).
-    pub(crate) gt: bool,
+    /// Wait condition, or `None` for a reserved encoding.
+    pub(crate) condition: Option<CsWaitCondition>,
     /// Memoized BO resolution from a prior evaluation, keyed by its
     /// own `(gpu_va, sync64)`.
     ///
