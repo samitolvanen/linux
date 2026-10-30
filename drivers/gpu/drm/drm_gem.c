@@ -88,7 +88,7 @@
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 static void drm_gem_huge_mnt_free(struct drm_device *dev, void *data)
 {
-	kern_unmount(dev->huge_mnt);
+	kern_unmount(data);
 }
 
 /**
@@ -113,6 +113,7 @@ int drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 {
 	struct file_system_type *type;
 	struct fs_context *fc;
+	struct vfsmount *mnt;
 	int ret;
 
 	if (unlikely(drm_gem_get_huge_mnt(dev)))
@@ -132,10 +133,18 @@ int drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 	if (unlikely(ret))
 		goto err;
 
-	dev->huge_mnt = fc_mount_longterm(fc);
+	mnt = fc_mount_longterm(fc);
 	put_fs_context(fc);
+	if (IS_ERR(mnt))
+		return PTR_ERR(mnt);
 
-	return drmm_add_action_or_reset(dev, drm_gem_huge_mnt_free, NULL);
+	ret = drmm_add_action_or_reset(dev, drm_gem_huge_mnt_free, mnt);
+	if (ret)
+		return ret;
+
+	dev->huge_mnt = mnt;
+
+	return 0;
 
 err:
 	put_fs_context(fc);
