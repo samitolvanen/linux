@@ -70,6 +70,7 @@
 
 use core::{
     convert::Infallible,
+    mem::MaybeUninit,
     ops::Deref, //
 };
 
@@ -185,7 +186,31 @@ pub struct Job<'a, T: JobQueueOps + Send + Sync> {
     fence_allocation: DriverFenceAllocation<'a, DriverDataWrapper<T>>,
 }
 
+/// The memory for one dependency of a [`Job`], allocated in advance.
+///
+/// Only useful for [`Job::add_dependency_with`], which, unlike
+/// [`Job::add_dependency`], cannot fail.
+pub struct DependencyAllocation<'a, T: JobQueueOps + Send + Sync> {
+    // INVARIANT: Never initialized.
+    mem: UniqueArc<MaybeUninit<Dependency<'a, 'a, T>>>,
+}
+
+impl<'a, T: JobQueueOps + Send + Sync> DependencyAllocation<'a, T> {
+    fn into_mem<'nr_of_deps>(self) -> UniqueArc<MaybeUninit<Dependency<'a, 'nr_of_deps, T>>> {
+        // SAFETY: By the type invariant, `self.mem` holds no value whose
+        // lifetimes could be wrong, and lifetimes do not change the layout.
+        unsafe { core::mem::transmute(self.mem) }
+    }
+}
+
 impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
+    /// Allocate the memory for one dependency of the job.
+    pub fn new_dependency_allocation(&self) -> Result<DependencyAllocation<'a, T>> {
+        Ok(DependencyAllocation {
+            mem: UniqueArc::new_uninit(GFP_KERNEL)?,
+        })
+    }
+
     /// Add a dependency for the job.
     ///
     /// A JobQueue will only run a job once `fence` has been signaled, with or
@@ -193,6 +218,23 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     ///
     /// Fails only if the memory for the dependency cannot be allocated.
     pub fn add_dependency(&mut self, fence: &Fence) -> Result {
+        let allocation = self.new_dependency_allocation()?;
+        self.add_dependency_in(fence, allocation)
+    }
+
+    /// Add a dependency for the job in `allocation`.
+    ///
+    /// Like [`Job::add_dependency`], but does not allocate and cannot fail.
+    pub fn add_dependency_with(&mut self, fence: &Fence, allocation: DependencyAllocation<'a, T>) {
+        let _ = self.add_dependency_in(fence, allocation);
+    }
+
+    /// Add a dependency in `allocation`.
+    fn add_dependency_in(
+        &mut self,
+        fence: &Fence,
+        allocation: DependencyAllocation<'a, T>,
+    ) -> Result {
         self.inner.as_mut().with_project(|job| {
             // If the registration below gets registered successfully, a signaling
             // fence will decrement the atomic. That could race. Thus, increment in
@@ -212,7 +254,7 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
                     )
                 }
             });
-            match UniqueArc::pin_init(dependency, GFP_KERNEL) {
+            match allocation.into_mem().pin_init_with(dependency) {
                 Err(e) => {
                     let _ = job.nr_of_deps.fetch_sub(1, Relaxed);
                     if e == ENOENT {
