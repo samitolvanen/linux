@@ -186,12 +186,12 @@ struct StreamPiece {
 pub(crate) struct QueueSubmit {
     queue_index: usize,
     piece: StreamPiece,
-    syncs: KVec<SyncOp>,
+    syncs: KVVec<SyncOp>,
 }
 
 impl QueueSubmit {
     pub(crate) fn from_uapi(uapi_submit: &uapi::drm_panthor_queue_submit) -> Result<Self> {
-        let mut syncs = KVec::new();
+        let mut syncs = KVVec::new();
 
         deps::append_syncops(
             &mut syncs,
@@ -215,7 +215,7 @@ impl QueueSubmit {
         self.queue_index
     }
 
-    fn into_parts(self) -> (StreamPiece, KVec<SyncOp>) {
+    fn into_parts(self) -> (StreamPiece, KVVec<SyncOp>) {
         (self.piece, self.syncs)
     }
 }
@@ -251,7 +251,7 @@ impl RawQueueSubmit {
 }
 
 pub(crate) fn append_queue_submits(
-    queue_submits: &mut KVec<QueueSubmit>,
+    queue_submits: &mut KVVec<QueueSubmit>,
     array: u64,
     count: u32,
     stride: u32,
@@ -302,9 +302,9 @@ impl Job {
     /// Turns each queue submit that carries a stream or sync ops into one
     /// `Job`, in submission order, paired with its sync ops.
     pub(crate) fn from_queue_submits(
-        queue_submits: KVec<QueueSubmit>,
-    ) -> Result<KVec<(Self, KVec<SyncOp>)>> {
-        let mut jobs = KVec::<(Self, KVec<SyncOp>)>::new();
+        queue_submits: KVVec<QueueSubmit>,
+    ) -> Result<KVVec<(Self, KVVec<SyncOp>)>> {
+        let mut jobs = KVVec::<(Self, KVVec<SyncOp>)>::new();
 
         for queue_submit in queue_submits.into_iter() {
             let queue_index = queue_submit.queue_index();

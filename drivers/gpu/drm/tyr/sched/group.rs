@@ -980,7 +980,7 @@ impl Group {
 
     pub(super) fn submit(
         self: &Arc<Self>,
-        queue_submits: KVec<QueueSubmit>,
+        queue_submits: KVVec<QueueSubmit>,
         file: &TyrDrmFile,
     ) -> Result {
         if !self.can_run() {
@@ -1285,7 +1285,7 @@ impl Pool {
             .group(groupsubmit.group_handle as usize)
             .ok_or(EINVAL)?;
 
-        let mut queue_submits = KVec::new();
+        let mut queue_submits = KVVec::new();
 
         super::job::append_queue_submits(
             &mut queue_submits,
