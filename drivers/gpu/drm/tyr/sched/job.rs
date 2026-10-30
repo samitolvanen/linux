@@ -242,7 +242,7 @@ pub(crate) fn append_queue_submits(
         let queue: RawQueueSubmit = reader.read()?;
         read_padding_zero(&mut reader, stride - min_size)?;
         queue.validate(queue_count)?;
-        queue_submits.push(queue.capture()?, GFP_KERNEL)?;
+        queue_submits.push(queue.capture()?, GFP_KERNEL | __GFP_NOWARN)?;
     }
 
     Ok(())
@@ -278,7 +278,10 @@ impl Job {
                 continue;
             }
 
-            jobs.push((Self::new(queue_index, stream), syncs), GFP_KERNEL)?;
+            jobs.push(
+                (Self::new(queue_index, stream), syncs),
+                GFP_KERNEL | __GFP_NOWARN,
+            )?;
         }
 
         Ok(jobs)

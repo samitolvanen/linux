@@ -634,7 +634,7 @@ impl TyrDrmFileData {
         let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
         ctx.reserve_jobs(count)?;
 
-        let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL)?;
+        let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL | __GFP_NOWARN)?;
 
         for _ in 0..count {
             let op: VmBindOp = reader.read()?;
@@ -664,7 +664,7 @@ impl TyrDrmFileData {
             0,
             |exec_ctx| {
                 let vm_resv = vm.prepare_resv(exec_ctx)?;
-                let mut obj_resvs = KVVec::with_capacity(op_bos.len(), GFP_KERNEL)?;
+                let mut obj_resvs = KVVec::with_capacity(op_bos.len(), GFP_KERNEL | __GFP_NOWARN)?;
 
                 for bo in op_bos.iter() {
                     let obj_resv = match bo.as_deref() {
