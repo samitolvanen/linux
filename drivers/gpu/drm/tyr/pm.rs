@@ -66,7 +66,7 @@ pub(crate) struct TyrPmPayload {
 
 /// Powers the hardware components down for runtime suspend, the reverse
 /// of `resume_hw_components`. Shared by runtime suspend and the
-/// resume-failure unwind. The caller gates the clocks afterwards.
+/// resume-failure unwind. The caller gates the clocks afterward.
 fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
     let Ok(io) = reg_data.iomem.access(reg_data.pdev.as_ref()) else {
         dev_err!(

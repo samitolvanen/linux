@@ -39,8 +39,8 @@ use crate::{
 };
 
 /// Number of CS work registers the kernel reserves at the top of the
-/// register file for its own wrapper prologue/epilogue. Per the CSF
-/// programming manual. The value is constant across all current CSF chips.
+/// register file for its own wrapper prologue/epilogue. The value is constant
+/// across all current CSF chips.
 pub(crate) const UNPRESERVED_CS_REG_COUNT: u32 = 4;
 
 /// Largest supported `L2_FEATURES.line_size`, the log2 of the L2 cache line

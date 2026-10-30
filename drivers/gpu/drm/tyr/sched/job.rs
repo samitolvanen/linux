@@ -40,9 +40,8 @@ use super::{
     }, //
 };
 
-/// Encoder for Mali CSF command-stream instructions. Opcodes match the
-/// Mali CSF programming manual, and value operands are masked to their
-/// architectural width so out-of-range arguments truncate cleanly.
+/// Encoder for Mali CSF command-stream instructions. Value operands are masked
+/// to their architectural width so out-of-range arguments truncate cleanly.
 struct Instr;
 
 impl Instr {

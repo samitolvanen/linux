@@ -950,7 +950,7 @@ impl PinnedDrop for VmExec {
 
         // SAFETY: `Drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `gpuvm`. The field is never read again
-        // afterwards.
+        // afterward.
         let gpuvm = unsafe { ManuallyDrop::take(&mut this.gpuvm) };
         // The last `VmExec` reference is dropping, so nothing else can
         // hold the lock and `try_lock` cannot block here on the

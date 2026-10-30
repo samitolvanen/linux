@@ -235,7 +235,7 @@ impl core::ops::Deref for BoVmap {
 impl Drop for BoVmap {
     fn drop(&mut self) {
         // SAFETY: `drop` runs once, so this is the only take of either
-        // field, and they are not used afterwards.
+        // field, and they are not used afterward.
         let (vmap, handoff) = unsafe {
             (
                 ManuallyDrop::take(&mut self.vmap),
@@ -622,11 +622,11 @@ impl Drop for KernelBo {
     fn drop(&mut self) {
         let va_range = self.va_range.clone();
         // SAFETY: `drop` runs once, this is the only take of `self.vm`,
-        // and the field is not read afterwards.
+        // and the field is not read afterward.
         let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
         // SAFETY: `Drop::drop` runs at most once, this is the only
         // `ManuallyDrop::take` of `self.bo`, and the field is never
-        // read again afterwards.
+        // read again afterward.
         let bo = unsafe { ManuallyDrop::take(&mut self.bo) };
         let kernel_node = self.kernel_node.take();
 
