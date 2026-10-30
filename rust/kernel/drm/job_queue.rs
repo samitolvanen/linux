@@ -327,6 +327,11 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
         let mut jq = work.inner.lock();
 
         while let Some(job) = jq.waiting_jobs.pop_front() {
+            // A parked queue runs no job until `JobQueue::unpark()`.
+            if jq.parked {
+                jq.waiting_jobs.push_front(job);
+                break;
+            }
             // While we didn't hold the lock below for `run_job()`, it could be
             // that a new job entered the waiting list which has an unfulfilled
             // dependency.
@@ -428,6 +433,8 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
     capacity: u64,
     /// The sequence number of the last completed job.
     last_completed: u64,
+    /// Set by [`JobQueue::park`]. While set, no job is run.
+    parked: bool,
     #[pin]
     /// Jobs that have finished executing and whose payload data `T` implements
     /// `Drop`. These jobs are dropped in process context, which also allows for
@@ -720,6 +727,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             inner <- new_spinlock_irq!(try_pin_init!(JobQueueInner {
                 capacity: capacity_param,
                 last_completed: 0,
+                parked: false,
                 waiting_jobs: UniqueList::new(),
                 running_jobs: UniqueList::new(),
                 drop_list: UniqueList::new(),
@@ -856,6 +864,36 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
                 self.check_start_drop_worker();
             }
         })
+    }
+
+    /// Park the JobQueue: run no job until [`JobQueue::unpark`].
+    ///
+    /// When this returns, no [`JobQueueOps::run_job`] call is in progress, and
+    /// none starts until the JobQueue is unparked. Dependencies are still
+    /// resolved and jobs can still be completed. A driver uses this, for
+    /// example, to keep its hardware from receiving jobs across a reset.
+    ///
+    /// Calls do not nest: one [`JobQueue::unpark`] undoes any number of
+    /// [`JobQueue::park`] calls.
+    ///
+    /// This function must be called from non-atomic context, and not from
+    /// [`JobQueueOps::run_job`], which it would wait for.
+    pub fn park(&self) {
+        self.with_inner(|inner| {
+            *inner.lock().as_mut().project().parked = true;
+        });
+
+        // A SubmitWorker holds the SRCU read lock across `run_job()`, and stops
+        // at its next job once it sees `parked`.
+        self.srcu.synchronize();
+    }
+
+    /// Unpark the JobQueue and run the jobs that are ready.
+    pub fn unpark(&self) {
+        self.with_inner(|inner| {
+            *inner.lock().as_mut().project().parked = false;
+        });
+        self.check_start_submit_worker();
     }
 
     /// Set the error with which this JobQueue will signal all running jobs'
