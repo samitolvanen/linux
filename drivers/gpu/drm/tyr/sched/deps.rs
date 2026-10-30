@@ -9,7 +9,6 @@
 use core::mem::offset_of;
 
 use kernel::{
-    alloc::KVec,
     dma_buf::dma_fence::{
         FenceChain,
         PublicDmaFence, //
@@ -211,7 +210,7 @@ impl TryFrom<&uapi::drm_panthor_sync_op> for SyncOp {
 }
 
 pub(crate) fn append_syncops(
-    syncops: &mut KVec<SyncOp>,
+    syncops: &mut KVVec<SyncOp>,
     array: u64,
     count: u32,
     stride: u32,
@@ -287,10 +286,10 @@ pub(crate) trait BatchOps {
 struct CollectedDeps {
     /// Fences that already exist when the job is prepared, passed to
     /// `BatchOps::prepare`.
-    external: KVec<ARef<PublicDmaFence>>,
+    external: KVVec<ARef<PublicDmaFence>>,
     /// (handle, point) keys of WAITs met by a producer earlier in the
     /// batch.
-    intra_batch: KVec<(u32, u64)>,
+    intra_batch: KVVec<(u32, u64)>,
 }
 
 /// One SIGNAL syncop held by `Context::collect_signal_ops` while the job
@@ -311,7 +310,7 @@ enum JobState<T: BatchOps> {
         /// to a SIGNAL produced earlier in the same batch. The producer's
         /// fence is looked up from `Context::signals` at commit time and
         /// pushed into `prepared` via `BatchOps::add_dep`.
-        intra_batch_deps: KVec<(u32, u64)>,
+        intra_batch_deps: KVVec<(u32, u64)>,
     },
 }
 
@@ -321,7 +320,7 @@ struct JobContext<T: BatchOps> {
     state: Option<JobState<T>>,
     /// Shared so `Context::update_job_syncs` can scan the signal ops
     /// while `Context::signals` is borrowed mutably.
-    syncops: Arc<KVec<SyncOp>>,
+    syncops: Arc<KVVec<SyncOp>>,
 }
 
 /// Tracks intra-batch dependencies across a single batch of jobs.
@@ -344,7 +343,7 @@ pub(crate) struct Context<'a, T: BatchOps> {
     file: &'a TyrDrmFile,
     ops: T,
     jobs: KVVec<JobContext<T>>,
-    signals: KVec<PendingSignal>,
+    signals: KVVec<PendingSignal>,
 }
 
 impl<'a, T: BatchOps> Context<'a, T> {
@@ -353,7 +352,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
             file,
             ops,
             jobs: KVVec::new(),
-            signals: KVec::new(),
+            signals: KVVec::new(),
         }
     }
 
@@ -362,7 +361,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
         Ok(())
     }
 
-    pub(crate) fn add_job(&mut self, job: T::Job, syncops: Arc<KVec<SyncOp>>) -> Result {
+    pub(crate) fn add_job(&mut self, job: T::Job, syncops: Arc<KVVec<SyncOp>>) -> Result {
         self.jobs.push(
             JobContext {
                 state: Some(JobState::Pending(job)),
@@ -376,7 +375,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
     /// Builds the per-batch signal registry. Must be called once, after
     /// every `Self::add_job`, and before any `Self::prepare`.
     pub(crate) fn collect_signal_ops(&mut self) -> Result {
-        let mut to_add = KVec::new();
+        let mut to_add = KVVec::new();
         for (job_idx, job_ctx) in self.jobs.iter().enumerate() {
             for syncop in job_ctx.syncops.iter() {
                 if !syncop.is_signal() {
@@ -516,8 +515,8 @@ impl<'a, T: BatchOps> Context<'a, T> {
     }
 
     fn collect_job_deps(&self, job_idx: usize) -> Result<CollectedDeps> {
-        let mut external = KVec::new();
-        let mut intra_batch = KVec::new();
+        let mut external = KVVec::new();
+        let mut intra_batch = KVVec::new();
 
         for syncop in self.jobs.get(job_idx).ok_or(EINVAL)?.syncops.iter() {
             if !syncop.is_wait() {
