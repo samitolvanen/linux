@@ -17,7 +17,7 @@ use kernel::{
         Published, //
     },
     drm::{
-        job_queue::{
+        legacy_job_queue::{
             JobQueue,
             JobQueueLockClasses,
             JobRef,

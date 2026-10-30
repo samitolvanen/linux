@@ -51,7 +51,7 @@ use kernel::{
             OpUnmapped,
             UniqueRefGpuVm, //
         },
-        job_queue::{
+        legacy_job_queue::{
             JobQueue,
             JobQueueLockClasses,
             JobRef,

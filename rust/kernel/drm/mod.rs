@@ -10,7 +10,7 @@ pub mod file;
 pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
-pub mod job_queue;
+pub mod legacy_job_queue;
 pub mod syncobj;
 
 pub use self::device::Device;
