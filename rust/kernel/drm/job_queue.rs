@@ -1752,14 +1752,14 @@ impl<T: QueueOps> JobQueue<T> {
             .len()
             .checked_add(extra_dep_capacity)
             .ok_or(EOVERFLOW)?;
-        let mut dep_vec = KVVec::with_capacity(dep_capacity, GFP_KERNEL)?;
+        let mut dep_vec = KVVec::with_capacity(dep_capacity, GFP_KERNEL | __GFP_NOWARN)?;
         dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
 
         // One uninitialized callback slot per dep slot, so that
         // process_deps() can register a callback without allocating under
         // the pipeline state mutex (which would close the
         // state -> dma_fence_map -> fs_reclaim lockdep cycle).
-        let mut prealloc_cbs = KVVec::with_capacity(dep_capacity, GFP_KERNEL)?;
+        let mut prealloc_cbs = KVVec::with_capacity(dep_capacity, GFP_KERNEL | __GFP_NOWARN)?;
         for _ in 0..dep_capacity {
             prealloc_cbs.push(KBox::new_uninit(GFP_KERNEL)?, GFP_KERNEL)?;
         }
