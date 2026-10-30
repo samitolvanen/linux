@@ -1019,13 +1019,13 @@ impl VmBindOp {
         vm: &vm::Vm,
         is_async: bool,
         validated_bo: Option<ARef<gem::Bo>>,
-    ) -> Result<(vm::VmBindJob, KVec<deps::SyncOp>)> {
+    ) -> Result<(vm::VmBindJob, KVVec<deps::SyncOp>)> {
         let type_mask = uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
         let map_flags = (uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_READONLY
             | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC
             | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
             as u32;
-        let mut syncs = KVec::new();
+        let mut syncs = KVVec::new();
 
         if is_async {
             deps::append_syncops(
