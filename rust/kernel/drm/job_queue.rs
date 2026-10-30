@@ -362,7 +362,7 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
             // we could re-take the lock.
             if jq.last_completed >= seqno {
                 *jq.as_mut().project().capacity += u64::from(job.cost);
-                fence.signal(Ok(()));
+                fence.signal(jq.last_result);
 
                 // Drop here directly if possible. Otherwise, let the DropWorker
                 // take care of it.
@@ -433,6 +433,9 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
     capacity: u64,
     /// The sequence number of the last completed job.
     last_completed: u64,
+    /// The `result` of the last [`JobQueue::complete_jobs_up_to_seqno`] call,
+    /// for a job that call completed while the job was in `run_job()`.
+    last_result: Result,
     /// Set by [`JobQueue::park`]. While set, no job is run.
     parked: bool,
     #[pin]
@@ -749,6 +752,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             inner <- new_spinlock_irq!(try_pin_init!(JobQueueInner {
                 capacity: capacity_param,
                 last_completed: 0,
+                last_result: Ok(()),
                 parked: false,
                 waiting_jobs: UniqueList::new(),
                 running_jobs: UniqueList::new(),
@@ -834,17 +838,22 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
     /// This signals the jobs' fences and schedules dropping of both the [`Job`]
     /// and its [`DriverFence`].
     ///
-    /// This signals the associated fences with the `Ok(())` status.
+    /// This signals the associated fences with `result`: every job up to
+    /// `seqno` that is not completed yet gets it. A driver passes an error to
+    /// fail the jobs, e.g. after a fault in the context they ran in.
     ///
     /// This function tells the implementation that there is now more capacity
     /// for more jobs to be run.
-    pub fn complete_jobs_up_to_seqno(&self, seqno: u64) {
+    pub fn complete_jobs_up_to_seqno(&self, seqno: u64, result: Result) {
         self.with_inner(|inner| {
             let needs_drop = core::mem::needs_drop::<T::JobDataType>();
             let mut jq_locked = inner.lock();
             let mut jq = jq_locked.as_mut().project();
 
-            if seqno < *jq.last_completed {
+            // Every job in `running_jobs` has a higher sequence number, so a
+            // second call for the same `seqno` has nothing left to complete.
+            // It must not replace `last_result` either.
+            if seqno <= *jq.last_completed {
                 return;
             }
 
@@ -866,7 +875,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
                 *jq.capacity += u64::from(job.cost);
 
                 let fence = job.fence.as_ref().expect("fence not present");
-                fence.signal(Ok(()));
+                fence.signal(result);
 
                 if needs_drop {
                     jq.drop_list.push_back(job);
@@ -878,6 +887,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             // This enables the SubmitWorker to complete a job that is not yet
             // in 'running_jobs', in case of a race against the lock.
             *jq.last_completed = seqno;
+            *jq.last_result = result;
             drop(jq_locked);
 
             self.check_start_submit_worker();
