@@ -267,7 +267,7 @@ impl core::ops::Deref for MappedBo {
 impl Drop for MappedBo {
     fn drop(&mut self) {
         // SAFETY: `drop` runs once, so this is the only take of either
-        // field, and they are not used afterwards.
+        // field, and they are not used afterward.
         let (vmap, handoff) = unsafe {
             (
                 ManuallyDrop::take(&mut self.vmap),
@@ -346,7 +346,7 @@ impl MappedUserBo {
 impl Drop for MappedUserBo {
     fn drop(&mut self) {
         // SAFETY: `drop` runs once, so this is the only take of either
-        // field, and they are not used afterwards.
+        // field, and they are not used afterward.
         let (vmap, handoff) = unsafe {
             (
                 ManuallyDrop::take(&mut self.vmap),
@@ -752,12 +752,12 @@ impl Drop for KernelBo {
         let va_range = self.va_range.clone();
         let size = self.size;
         // SAFETY: `drop` runs once, this is the only take of `self.vm`,
-        // and the field is not read afterwards. Moving the reference out
+        // and the field is not read afterward. Moving the reference out
         // keeps the final `Arc<Vm>` release off the inline drop path.
         let vm = unsafe { ManuallyDrop::take(&mut self.vm) };
         // SAFETY: `Drop::drop` runs at most once, and this is the only
         // `ManuallyDrop::take` of `self.bo`; the field is never read
-        // again afterwards. Moving out the single owning reference here
+        // again afterward. Moving out the single owning reference here
         // (rather than cloning) means `drop_in_place` has nothing left
         // to release inline, so the GEM object's final drop, with its
         // `dma_resv_lock`-taking sg-table teardown, can only run from

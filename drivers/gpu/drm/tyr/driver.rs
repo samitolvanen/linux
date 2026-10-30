@@ -352,7 +352,7 @@ pub(crate) struct TyrDrmDeviceData {
     /// Pinned at probe time with `MAX_CSGS` as an upper bound so the
     /// per-group `Seat` field
     /// (`LockedBy<Seat, CsgSlotManager>`) has a stable owner address
-    /// from the moment the device data is initialised. The actual
+    /// from the moment the device data is initialized. The actual
     /// hardware slot count, which is only known after firmware boot,
     /// is applied by `Scheduler::init` via
     /// `SlotManager::set_slot_count`.

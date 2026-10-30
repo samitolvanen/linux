@@ -231,7 +231,7 @@ pub(crate) struct SyncWait {
     pub(crate) sync64: bool,
     /// Wait condition, or `None` for a reserved encoding.
     pub(crate) condition: Option<CsWaitCondition>,
-    /// Memoised BO resolution from a prior evaluation, keyed by its
+    /// Memoized BO resolution from a prior evaluation, keyed by its
     /// own `(gpu_va, sync64)`.
     ///
     /// Only populated when the awaited sync object lives in a
@@ -241,7 +241,7 @@ pub(crate) struct SyncWait {
     pub(crate) cached: Option<CachedBo>,
 }
 
-/// Memoised BO resolution for a foreign-BO sync-wait. Keyed by its
+/// Memoized BO resolution for a foreign-BO sync-wait. Keyed by its
 /// own `(gpu_va, sync64)` so an evaluation against a wait whose live
 /// `(gpu_va, sync64)` no longer matches falls through to a fresh
 /// gpuvm walk instead of reading from a stale BO.
@@ -892,7 +892,7 @@ impl QueueData {
         Ok(input.insert == output.extract)
     }
 
-    /// Synchronises the queue's `input.extract_init` from the firmware's
+    /// Synchronizes the queue's `input.extract_init` from the firmware's
     /// current `output.extract` value.
     ///
     /// Must be called before staging `CS_REQ.state = Start` at CSG-bind

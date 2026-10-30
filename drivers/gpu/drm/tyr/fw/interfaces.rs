@@ -788,7 +788,7 @@ mod csg {
     /// Size of the CSG_OUTPUT_BLOCK register block (up to and including CSG_RESOURCE_DEP at 0x1C + 4 bytes).
     pub(in crate::fw) const CSG_OUTPUT_BLOCK_SIZE: usize = 0x20;
 
-    /// CSG execution state (csg_execution_state_t in spec).
+    /// CSG execution state.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsgExecutionState {
@@ -829,7 +829,7 @@ mod csg {
         }
     }
 
-    /// CSG state interrupt mask (csf_state_irq_mask_t in spec).
+    /// CSG state interrupt mask.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(super) enum CsgStateIrqMask {
@@ -1270,7 +1270,7 @@ pub(super) mod cs {
     /// Size of the CS_KERNEL_OUTPUT_BLOCK register block.
     pub(in crate::fw) const CS_KERNEL_OUTPUT_BLOCK_SIZE: usize = 0xD8;
 
-    /// CS execution state (cs_state_t in spec).
+    /// CS execution state.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsState {
@@ -1304,7 +1304,7 @@ pub(super) mod cs {
         }
     }
 
-    /// CS state interrupt mask (csf_state_irq_mask_t in spec).
+    /// CS state interrupt mask.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(super) enum CsStateIrqMask {
@@ -1337,7 +1337,7 @@ pub(super) mod cs {
         }
     }
 
-    /// CS scoreboard wait source (cs_sb_wait_source_t in spec).
+    /// CS scoreboard wait source.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(super) enum CsSbWaitSource {
@@ -1369,7 +1369,7 @@ pub(super) mod cs {
         }
     }
 
-    /// CS wait condition (csf_wait_condition_t in spec).
+    /// CS wait condition.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsWaitCondition {
@@ -1404,7 +1404,7 @@ pub(super) mod cs {
         }
     }
 
-    /// CS blocked reason (cs_blocked_reason_t in spec).
+    /// CS blocked reason.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsBlockedReason {
@@ -1460,7 +1460,7 @@ pub(super) mod cs {
         }
     }
 
-    /// CS_FAULT exception type (restricted subset of exception_type_t in spec).
+    /// CS_FAULT exception type.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsFaultExceptionType {
@@ -1521,7 +1521,7 @@ pub(super) mod cs {
         }
     }
 
-    /// CS_FATAL exception type (restricted subset of exception_type_t in spec).
+    /// CS_FATAL exception type.
     #[derive(Copy, Clone, Debug, PartialEq)]
     #[repr(u8)]
     pub(crate) enum CsFatalExceptionType {

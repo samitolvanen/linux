@@ -822,7 +822,7 @@ impl Group {
     /// On error the caller unblocks the queue so the group does not stall.
     /// The firmware still evaluates the wait itself.
     ///
-    /// First-time foreign-BO resolutions are memoised on the
+    /// First-time foreign-BO resolutions are memoized on the
     /// `SyncWait` snapshot via `QueueData::cache_syncwait_bo` so
     /// subsequent re-evaluations skip the gpuvm walk. The cache is
     /// keyed by its own `(gpu_va, sync64)` and the snapshot's live
@@ -889,7 +889,7 @@ impl Group {
             let mapped_bo = gem::MappedUserBo::new(&bo)?;
             let bo_offset = bo_offset as usize;
 
-            // Memoise the resolved BO so subsequent re-evaluations
+            // Memoize the resolved BO so subsequent re-evaluations
             // of the same wait take the cached-BO path.
             // `cache_syncwait_bo` re-checks that the snapshot still
             // names the same `(gpu_va, sync64)` before installing

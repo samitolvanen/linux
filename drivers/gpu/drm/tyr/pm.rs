@@ -54,7 +54,7 @@ type PMCallbackResult = Result<Option<Arc<DevfreqSlot>>, (Option<Arc<DevfreqSlot
 
 /// Powers the hardware components down for runtime suspend, the reverse
 /// of `resume_hw_components`. Shared by runtime suspend and the
-/// resume-failure unwind. The caller gates the clocks afterwards.
+/// resume-failure unwind. The caller gates the clocks afterward.
 fn suspend_hw_components(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
     let bound = dev.as_ref();
     let tdev = &data.device;

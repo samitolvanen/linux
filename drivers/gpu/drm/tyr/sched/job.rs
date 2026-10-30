@@ -42,9 +42,8 @@ use super::{
     //
 };
 
-/// Encoder for Mali CSF command-stream instructions. Opcodes match the
-/// Mali CSF programming manual, and value operands are masked to their
-/// architectural width so out-of-range arguments truncate cleanly.
+/// Encoder for Mali CSF command-stream instructions. Value operands are masked
+/// to their architectural width so out-of-range arguments truncate cleanly.
 struct Instr;
 
 impl Instr {
@@ -167,7 +166,7 @@ unsafe impl FromBytes for RawQueueSubmit {}
 ///
 /// `stream_size == 0` (and `stream_addr == 0`) describes a sync-only
 /// submit that runs no GPU work; only the dependency / signal
-/// `SyncOp`s carried alongside the piece are honoured.
+/// `SyncOp`s carried alongside the piece are honored.
 #[derive(Copy, Clone)]
 struct StreamPiece {
     /// GPU virtual address of the userspace command stream the wrapper
