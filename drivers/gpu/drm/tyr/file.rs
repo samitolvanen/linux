@@ -635,7 +635,7 @@ impl TyrDrmFileData {
         let _flush = ScopeGuard::new(|| vm.flush_deferred_cleanup());
 
         // `count` is unbounded, so the arrays come from kvmalloc.
-        let mut ctx = deps::Context::new(file, vm::BindOps::new(vm.clone()));
+        let mut ctx = deps::Context::new(file, vm::BindOps::new(&vm));
         ctx.reserve_jobs(count)?;
 
         let mut op_bos = KVVec::with_capacity(count, GFP_KERNEL | __GFP_NOWARN)?;

@@ -26,7 +26,8 @@ use kernel::{
     dma::DmaAddress,
     dma_buf::{
         fence_work::DmaFenceWorkqueue,
-        Fence, //
+        Fence,
+        SignallingSection, //
     },
     drm::{
         exec::{
@@ -48,15 +49,10 @@ use kernel::{
             OpUnmapped,
             UniqueRefGpuVm, //
         },
-        legacy_job_queue::{
+        job_queue::{
             JobQueue,
-            JobQueueLockClasses,
-            JobRef,
-            PipelineBuilder,
-            PreparedJob,
-            QueueOps,
-            SubmitFence,
-            SubmitResult, //
+            JobQueueOps,
+            JobRunnable, //
         }, //
     },
     fmt,
@@ -76,6 +72,7 @@ use kernel::{
         SZ_2M,
         SZ_4K, //
     },
+    str::CString,
     sync::{
         aref::ARef,
         atomic::{
@@ -84,13 +81,13 @@ use kernel::{
         },
         Arc,
         ArcBorrow,
-        LockClassKey,
         Mutex,
         MutexGuard, //
     },
     types::ScopeGuard,
     uapi,
     workqueue::{
+        self,
         impl_has_work,
         new_work,
         Work,
@@ -118,24 +115,13 @@ use crate::{
     regs::gpu_control::MMU_FEATURES,
     reset::hw_gate::HwReadGuard,
     sched::{
-        deps,
+        deps::{
+            self,
+            PreparedJob, //
+        },
         queue::wait_for_fence, //
     }, //
 };
-
-// SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
-// static is never dropped.
-static VM_BIND_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static VM_BIND_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static VM_BIND_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 /// Maximum number of live VMs per file.
 const MAX_VMS_PER_POOL: u32 = 32;
@@ -313,9 +299,6 @@ impl fmt::Display for VmMapFlags {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct VmBindFenceData;
-
 pub(crate) enum VmBindJobOp {
     Map {
         bo_offset: u64,
@@ -404,39 +387,35 @@ impl VmBindJob {
 pub(crate) struct VmBindQueueOps {
     ddev: ARef<TyrDrmDevice>,
     exec: Arc<VmExec>,
+    wq: Arc<DmaFenceWorkqueue>,
 }
 
-impl QueueOps for VmBindQueueOps {
-    type Job = VmBindJob;
-    type FenceData = VmBindFenceData;
+/// A job on a VM's bind queue.
+pub(crate) struct BindQueueJob {
+    job: VmBindJob,
+    /// The VM whose bind queue runs the job, for `VmBindQueueOps::run_job`
+    /// to complete it.
+    vm: Arc<Vm>,
+}
 
-    const DRIVER_NAME: &'static CStr = c"tyr";
-    const TIMELINE_NAME: &'static CStr = c"tyr_vm_bind";
+impl JobQueueOps for VmBindQueueOps {
+    type JobDataType = BindQueueJob;
 
-    fn lock_classes() -> JobQueueLockClasses {
-        JobQueueLockClasses {
-            inbox: &VM_BIND_QUEUE_INBOX_LOCK_CLASS,
-            state: &VM_BIND_QUEUE_STATE_LOCK_CLASS,
-            work: &VM_BIND_QUEUE_WORK_LOCK_CLASS,
-            cleanup_work: &VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS,
-            stage_work: &VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS,
-            stage_timer: &VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS,
-        }
-    }
+    /// Performs the bind ops of the job and completes it.
+    fn run_job<'a>(&self, job: JobRunnable<'a, BindQueueJob>) {
+        let _section = SignallingSection::begin();
+        let JobRunnable { seqno, data } = job;
+        let Ok(queue) = data.vm.bind_queue() else {
+            return;
+        };
 
-    fn submit(
-        &self,
-        job: &JobRef<'_, Self::Job>,
-        fence: SubmitFence<Self>,
-        _wq: &DmaFenceWorkqueue,
-    ) -> Result<SubmitResult<Self>> {
         let Some(guard) = self.ddev.registration_guard() else {
-            fence.signal(Err(ENODEV));
-            return Ok(SubmitResult::Submitted);
+            queue.complete_jobs_up_to_seqno(seqno, Err(ENODEV));
+            return;
         };
 
         let result = guard.registration_data_with(|reg_data| {
-            for op in job.job.ops.iter() {
+            for op in data.job.ops.iter() {
                 match op {
                     VmBindJobOp::Map {
                         bo_offset,
@@ -469,53 +448,58 @@ impl QueueOps for VmBindQueueOps {
             Ok(())
         });
 
-        match result {
-            Ok(()) => fence.signal(Ok(())),
-            Err(err) => {
-                self.exec.declare_unusable();
-                fence.signal(Err(err));
-            }
+        if result.is_err() {
+            self.exec.declare_unusable();
         }
+        queue.complete_jobs_up_to_seqno(seqno, result);
 
         // A pending flush also covers the vm_bos this job deferred.
         let _ = cleanup::enqueue(self.exec.clone());
+    }
 
-        Ok(SubmitResult::Submitted)
+    fn workqueue(&self) -> &workqueue::Queue {
+        self.wq.queue()
+    }
+
+    fn kill(&self, _jq_id: u64, _err: Error) {
+        // A dependency of a bind failed. As in panthor under drm_sched, the
+        // bind still runs.
     }
 }
 
-pub(crate) type PreparedVmBindJob = PreparedJob<VmBindQueueOps>;
+pub(crate) type PreparedVmBindJob<'a> = PreparedJob<'a, VmBindQueueOps>;
 
 /// Runs the ops of an async VM bind through `deps::Context`.
-pub(crate) struct BindOps {
-    vm: Arc<Vm>,
+pub(crate) struct BindOps<'a> {
+    vm: &'a Arc<Vm>,
 }
 
-impl BindOps {
-    pub(crate) fn new(vm: Arc<Vm>) -> Self {
+impl<'a> BindOps<'a> {
+    pub(crate) fn new(vm: &'a Arc<Vm>) -> Self {
         Self { vm }
     }
 }
 
-impl deps::BatchOps for BindOps {
+impl<'a> deps::BatchOps for BindOps<'a> {
     type Job = VmBindJob;
-    type Prepared = PreparedVmBindJob;
+    type Prepared = PreparedVmBindJob<'a>;
 
     fn prepare(
         &self,
         job: VmBindJob,
         deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
-    ) -> Result<PreparedVmBindJob> {
-        self.vm.prepare_bind_job(job, deps, extra_dep_capacity)
+    ) -> Result<PreparedVmBindJob<'a>> {
+        let vm: &'a Arc<Vm> = self.vm;
+        vm.prepare_bind_job(job, deps, extra_dep_capacity)
     }
 
-    fn add_dep(&self, prepared: &mut PreparedVmBindJob, fence: ARef<Fence>) -> Result {
-        prepared.add_dep(fence)
+    fn add_dep(&self, prepared: &mut PreparedVmBindJob<'a>, fence: ARef<Fence>) -> Result {
+        prepared.add_dep(&fence)
     }
 
-    fn commit(&self, prepared: PreparedVmBindJob) -> Result<ARef<Fence>> {
-        self.vm.commit_bind_job(prepared)
+    fn commit(&self, prepared: PreparedVmBindJob<'a>) -> Result<ARef<Fence>> {
+        Ok(self.vm.commit_bind_job(prepared))
     }
 }
 
@@ -966,13 +950,13 @@ impl PinnedDrop for VmExec {
 #[pin_data(PinnedDrop)]
 pub(crate) struct Vm {
     exec: Arc<VmExec>,
-    bind_queue: Option<JobQueue<VmBindQueueOps>>,
+    bind_queue: Option<Pin<KBox<JobQueue<VmBindQueueOps>>>>,
     /// Passes `bind_queue` to the cleanup workqueue when the VM drops.
     /// `Some` exactly when `bind_queue` is, taken by `Drop`.
     bind_queue_handoff: Option<cleanup::Handoff<BindQueueRelease>>,
     /// Serializes the window from prepare to commit of an async bind,
-    /// so the bind queue claims its pipeline slots and its fence
-    /// sequence numbers in the same order.
+    /// so the bind queue's fences reach the reservations in sequence
+    /// number order and each replaces the one before it.
     #[pin]
     bind_lock: Mutex<()>,
     /// Submit fence of the most recently committed async bind.
@@ -1078,15 +1062,21 @@ impl Vm {
             GFP_KERNEL,
         )?;
 
+        // A bind completes in `VmBindQueueOps::run_job`, so the queue runs
+        // one at a time.
         let bind_queue = match bind_wq {
-            Some(wq) => Some(JobQueue::new(
-                VmBindQueueOps {
-                    ddev: ddev.into(),
-                    exec: exec.clone(),
-                },
-                wq.clone(),
-                wq,
-                PipelineBuilder::new(),
+            Some(wq) => Some(KBox::pin_init(
+                JobQueue::new(
+                    CString::try_from_fmt(fmt!("tyr"))?,
+                    CString::try_from_fmt(fmt!("tyr_vm_bind"))?,
+                    1,
+                    VmBindQueueOps {
+                        ddev: ddev.into(),
+                        exec: exec.clone(),
+                        wq,
+                    },
+                ),
+                GFP_KERNEL,
             )?),
             None => None,
         };
@@ -1272,7 +1262,7 @@ impl Vm {
 
     /// Returns the bind queue, which only a user VM has.
     fn bind_queue(&self) -> Result<&JobQueue<VmBindQueueOps>> {
-        self.bind_queue.as_ref().ok_or(EINVAL)
+        self.bind_queue.as_deref().ok_or(EINVAL)
     }
 
     /// Acquires the lock that serializes the window from prepare to
@@ -1287,27 +1277,30 @@ impl Vm {
     }
 
     pub(crate) fn prepare_bind_job(
-        &self,
+        self: &Arc<Self>,
         job: VmBindJob,
         deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
-    ) -> Result<PreparedVmBindJob> {
+    ) -> Result<PreparedVmBindJob<'_>> {
         self.flush_deferred_cleanup();
 
-        self.bind_queue()?
-            .prepare(job, deps, extra_dep_capacity, VmBindFenceData)
+        let data = BindQueueJob {
+            job,
+            vm: self.clone(),
+        };
+        PreparedJob::new(self.bind_queue()?, data, deps, extra_dep_capacity)
     }
 
-    pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob) -> Result<ARef<Fence>> {
-        let fence = self.bind_queue()?.commit(prepared);
+    pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob<'_>) -> ARef<Fence> {
+        let fence = prepared.submit();
         *self.last_bind_fence.lock() = Some(fence.clone());
-        Ok(fence)
+        fence
     }
 }
 
 /// The bind queue and fence that `Vm::drop` passes to `release_bind_queue`.
 struct BindQueueRelease {
-    queue: JobQueue<VmBindQueueOps>,
+    queue: Pin<KBox<JobQueue<VmBindQueueOps>>>,
     last_fence: Option<ARef<Fence>>,
 }
 
@@ -1597,7 +1590,7 @@ impl VmExec {
         flags: VmMapFlags,
         pt_gfp: Flags,
     ) -> Result {
-        // Flush inline here. The bind queue's submit defers this to the
+        // Flush inline here. The bind queue's run_job() defers this to the
         // cleanup workqueue instead.
         let _flush = ScopeGuard::new(|| self.flush_deferred_cleanup());
         let mut resources = VmOpResources {
