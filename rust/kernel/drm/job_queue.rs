@@ -569,7 +569,7 @@ impl WrapRange {
 #[allow(dead_code)]
 struct JobDependencies<T: QueueOps> {
     /// All dependency fences, set at submit time.
-    fences: KVec<ARef<PublicDmaFence>>,
+    fences: KVVec<ARef<PublicDmaFence>>,
     /// Which dependency we're currently waiting on.
     current_idx: usize,
     /// The currently active dependency callback (at most one at a time).
@@ -578,7 +578,7 @@ struct JobDependencies<T: QueueOps> {
     /// registrations. Sized at `prepare()` time to match the total dep
     /// capacity, so `process_deps()` can register a callback with no
     /// allocation under the pipeline state mutex.
-    prealloc_cbs: KVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
+    prealloc_cbs: KVVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
 }
 
 /// A single per-job allocation stored in the XArray.
@@ -656,10 +656,11 @@ enum XaEntry<T: QueueOps> {
     /// Job reserved by [`prepare()`] but not yet committed.
     Reserved {
         job: Arc<T::Job>,
-        deps: KVec<ARef<PublicDmaFence>>,
+        deps: KVVec<ARef<PublicDmaFence>>,
         /// Pre-allocated callback storage stashed alongside `deps` until
         /// [`commit()`] moves it into the `Live` entry.
-        prealloc_cbs: KVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
+        prealloc_cbs:
+            KVVec<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<DepCallback<T>>>>>,
         prealloc_progress_cb:
             Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<ProgressCallback<T>>>>>,
         prealloc_stage_cb:
@@ -1194,10 +1195,13 @@ impl<T: QueueOps> JobQueueInner<T> {
 
             let Some(dep_fence) = current_dependency else {
                 // All deps met — free the allocation and advance.
-                let mut guard = self.fifo.lock();
-                if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                    entry.deps.fences = KVec::new();
-                }
+                let fences = self
+                    .fifo
+                    .lock()
+                    .get_mut(entry_idx as usize)
+                    .and_then(|e| e.as_live_mut())
+                    .map(|e| core::mem::take(&mut e.deps.fences));
+                drop(fences);
                 return StageAdvance::Advance;
             };
 
@@ -1748,14 +1752,14 @@ impl<T: QueueOps> JobQueue<T> {
             .len()
             .checked_add(extra_dep_capacity)
             .ok_or(EOVERFLOW)?;
-        let mut dep_vec = KVec::with_capacity(dep_capacity, GFP_KERNEL)?;
+        let mut dep_vec = KVVec::with_capacity(dep_capacity, GFP_KERNEL)?;
         dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
 
         // One uninitialized callback slot per dep slot, so that
         // process_deps() can register a callback without allocating under
         // the pipeline state mutex (which would close the
         // state -> dma_fence_map -> fs_reclaim lockdep cycle).
-        let mut prealloc_cbs = KVec::with_capacity(dep_capacity, GFP_KERNEL)?;
+        let mut prealloc_cbs = KVVec::with_capacity(dep_capacity, GFP_KERNEL)?;
         for _ in 0..dep_capacity {
             prealloc_cbs.push(KBox::new_uninit(GFP_KERNEL)?, GFP_KERNEL)?;
         }
@@ -1808,8 +1812,9 @@ impl<T: QueueOps> JobQueue<T> {
                 return Err(ENOMEM);
             }
             if let Err(store_err) = guard.store_reserved(xa_index, entry) {
-                drop(store_err);
                 guard.release(xa_index);
+                drop(guard);
+                drop(store_err);
                 return Err(ENOMEM);
             }
             inbox.cyclic_next = next;
