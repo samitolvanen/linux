@@ -235,7 +235,7 @@ pub(crate) fn append_syncops(
     for _ in 0..count {
         let sync: RawSyncOp = reader.read()?;
         read_padding_zero(&mut reader, stride - min_size)?;
-        syncops.push(SyncOp::try_from(&sync.0)?, GFP_KERNEL)?;
+        syncops.push(SyncOp::try_from(&sync.0)?, GFP_KERNEL | __GFP_NOWARN)?;
     }
 
     Ok(())
@@ -364,7 +364,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
     }
 
     pub(crate) fn reserve_jobs(&mut self, count: usize) -> Result {
-        self.jobs.reserve(count, GFP_KERNEL)?;
+        self.jobs.reserve(count, GFP_KERNEL | __GFP_NOWARN)?;
         Ok(())
     }
 
@@ -374,7 +374,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
                 state: Some(JobState::Pending(job)),
                 syncops,
             },
-            GFP_KERNEL,
+            GFP_KERNEL | __GFP_NOWARN,
         )?;
         Ok(())
     }
@@ -393,7 +393,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
                     handle: syncop.handle.handle(),
                     point: syncop.handle.timeline_value(),
                 };
-                to_add.push(staged, GFP_KERNEL)?;
+                to_add.push(staged, GFP_KERNEL | __GFP_NOWARN)?;
             }
         }
         for staged in to_add.into_iter() {
@@ -517,7 +517,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
             }
         };
 
-        self.signals.push(signal, GFP_KERNEL)?;
+        self.signals.push(signal, GFP_KERNEL | __GFP_NOWARN)?;
         Ok(())
     }
 
@@ -535,20 +535,23 @@ impl<'a, T: BatchOps> Context<'a, T> {
 
             if let Some(signal) = self.search_sync_signal(handle, point) {
                 if signal.job_idx() < job_idx {
-                    intra_batch.push((handle, point), GFP_KERNEL)?;
+                    intra_batch.push((handle, point), GFP_KERNEL | __GFP_NOWARN)?;
                     continue;
                 }
 
                 // The producer commits at or after this job, so only the
                 // fence the syncobj carried at registration can meet
                 // the wait.
-                external.push(signal.fence().ok_or(EINVAL)?.clone(), GFP_KERNEL)?;
+                external.push(
+                    signal.fence().ok_or(EINVAL)?.clone(),
+                    GFP_KERNEL | __GFP_NOWARN,
+                )?;
                 continue;
             }
 
             let fence =
                 SyncObj::<TyrDrmDriver>::find_fence(self.file, handle, point, 0)?.ok_or(EINVAL)?;
-            external.push(fence, GFP_KERNEL)?;
+            external.push(fence, GFP_KERNEL | __GFP_NOWARN)?;
         }
 
         Ok(CollectedDeps {
