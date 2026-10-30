@@ -108,8 +108,8 @@ use kernel::{
     },
     sync::{rcu::synchronize_rcu, Arc, UniqueArc},
     workqueue::{
-        self,
         new_scoped_work,
+        Queue,
         ScopedWork,
         ScopedWorkItem,
         ScopedWorkRef,
@@ -475,6 +475,10 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
 ///         JobQueueOps,
 ///         JobRunnable,
 ///     },
+///     workqueue::{
+///         OwnedQueue,
+///         Queue,
+///     },
 /// };
 ///
 /// let driver_name = CString::try_from_fmt(fmt!("dummy_driver"))?;
@@ -504,11 +508,13 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
 /// let dependency2 = fctx.new_fence_allocation(())?.new_fence();
 ///
 /// #[pin_data]
-/// struct JqData {}
+/// struct JqData {
+///     wq: OwnedQueue,
+/// }
 ///
 /// impl JqData {
-///     fn new() -> impl PinInit<Self> {
-///         pin_init!(Self {})
+///     fn new(wq: OwnedQueue) -> impl PinInit<Self> {
+///         pin_init!(Self { wq })
 ///     }
 /// }
 ///
@@ -531,9 +537,14 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
 ///         // We can't drop here right away because `kill()` is called with a
 ///         // fence lock held.
 ///     }
+///
+///     fn workqueue(&self) -> &Queue {
+///         &self.wq
+///     }
 /// }
 ///
-/// let jq_data = JqData::new();
+/// let wq = Queue::new_unbound().mem_reclaim().build(c"jq_example")?;
+/// let jq_data = JqData::new(wq);
 /// let jq = KBox::pin_init(
 ///     JobQueue::new(driver_name, timeline_name, 1000, jq_data),
 ///     GFP_KERNEL
@@ -595,6 +606,8 @@ pub struct JobQueue<T: JobQueueOps + Send + Sync> {
     #[uses('fctx: invariant)]
     /// The inner queue.
     inner: SpinLockIrq<JobQueueInner<'fctx, T>>,
+    /// The workqueue from [`JobQueueOps::workqueue`], asked for once.
+    wq: &'fctx Queue,
     #[pin]
     /// The [`dma_buf::FenceContext`] on which the queue creates
     /// [`dma_buf::DriverFence`]s for the jobs.
@@ -663,6 +676,14 @@ pub trait JobQueueOps {
     /// The backend might call this function multiple times until the driver has
     /// dropped the Jobqueue.
     fn kill(&self, jq_id: u64, err: Error);
+
+    /// Returns the workqueue the JobQueue runs its workers on.
+    ///
+    /// [`JobQueue::new`] calls this once. Jobs are run from this workqueue, so
+    /// their fences depend on it making progress under memory pressure: it
+    /// must be created with
+    /// [`Builder::mem_reclaim`](kernel::workqueue::Builder::mem_reclaim).
+    fn workqueue(&self) -> &Queue;
 }
 
 #[pin_data]
@@ -724,6 +745,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             // initialized to 0. Also makes internal logic easier.
             fctx <- FenceContext::new(1, &driver_name, &timeline_name,
                                       DriverDataWrapper::new(data)),
+            wq: Pin::get_ref(fctx).workqueue(),
             inner <- new_spinlock_irq!(try_pin_init!(JobQueueInner {
                 capacity: capacity_param,
                 last_completed: 0,
@@ -790,21 +812,20 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
     }
 
     fn check_start_submit_worker(&self) {
+        let wq = self.wq();
         self.with_submit_worker(|submit_worker| {
-            // TODO this shouldn't be the system wq
             // SAFETY: The worker is carried by the JobQueue and, thus, cannot be
-            // forgotten.
-            let _ = unsafe { workqueue::system_dfl().enqueue_scoped(submit_worker) };
+            // forgotten. It is only ever queued on `wq`.
+            let _ = unsafe { wq.enqueue_scoped(submit_worker) };
         })
     }
 
     fn check_start_drop_worker(&self) {
+        let wq = self.wq();
         self.with_drop_worker(|drop_worker| {
-            // TODO this shouldn't be the system wq
-            // Use the long-running wq for now, since here all the RCU delays manifest.
             // SAFETY: The worker is carried by the JobQueue and, thus, cannot be
-            // forgotten.
-            let _ = unsafe { workqueue::system_long().enqueue_scoped(drop_worker) };
+            // forgotten. It is only ever queued on `wq`.
+            let _ = unsafe { wq.enqueue_scoped(drop_worker) };
         })
     }
 
