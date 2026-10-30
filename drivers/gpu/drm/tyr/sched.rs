@@ -429,7 +429,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
     }
 }
 
-/// Type alias for the SlotManager parameterised for CSG slots.
+/// Type alias for the SlotManager parameterized for CSG slots.
 pub(crate) type CsgSlotManager = SlotManager<CsgSlotOps, MAX_CSGS>;
 
 /// One wait-list entry captured by `Scheduler::collect_syncwait_candidates`.
@@ -966,7 +966,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Synchronises the per-CS in-memory state from the CSG output area
+    /// Synchronizes the per-CS in-memory state from the CSG output area
     /// after a `CSG_REQ.status_update` ack is observed.
     ///
     /// Walks every CS in the group to classify each queue's state from

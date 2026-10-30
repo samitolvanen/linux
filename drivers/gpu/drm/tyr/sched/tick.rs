@@ -926,7 +926,7 @@ impl<'a> Tick<'a> {
                 KeepExceptRotated Low,      Take Low,      Keep Low,
             ],
             // A normal tick prefers to keep currently bound active
-            // groups running to minimise context-switching overhead.
+            // groups running to minimize context-switching overhead.
             // Evaluate all `Keep`s for non-RT priorities before any
             // `Take`.
             else => [
@@ -1042,7 +1042,7 @@ impl<'a> Tick<'a> {
                 poll |= group.blocked_idle_queues() != 0;
                 self.evicted_groups[csg_idx.get()] = Some(group.clone());
             } else if self.num_teardown < self.teardown_groups.len() {
-                // Cancelled / faulted: queue for terminal cleanup.
+                // Canceled / faulted: queue for terminal cleanup.
                 self.sched.remove_group_from_wait_list(&group);
                 self.teardown_groups[self.num_teardown] = Some(group.clone());
                 self.num_teardown += 1;

@@ -219,7 +219,7 @@ impl Mmu {
     /// until it is reclaimed.
     ///
     /// The returned value is a snapshot taken under the AS slot manager
-    /// mutex. Callers that act on the slot id must serialise their use
+    /// mutex. Callers that act on the slot id must serialize their use
     /// against `Mmu::deactivate_vm`; otherwise the AS slot manager
     /// may evict the VM in between.
     pub(crate) fn vm_as_slot(&self, vm: &VmAsData) -> Option<u8> {
