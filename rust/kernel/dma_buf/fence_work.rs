@@ -5,7 +5,8 @@
 //! The work items run inside a [`SignallingSection`](super::SignallingSection),
 //! so lockdep checks their bodies against the dma-fence locking rules.
 //! [`DmaFenceWorkqueue`] is always created with `WQ_MEM_RECLAIM` and only
-//! accepts these work items.
+//! accepts these work items, unless its [`Queue`] is handed out with
+//! [`DmaFenceWorkqueue::queue`].
 //!
 //! C header: [`include/linux/workqueue.h`](srctree/include/linux/workqueue.h)
 
@@ -357,7 +358,8 @@ where
 {
 }
 
-/// Workqueue that can only be used to schedule [`DmaFenceWork`] items.
+/// Workqueue that only takes [`DmaFenceWork`] items, unless its [`Queue`] is handed out with
+/// [`DmaFenceWorkqueue::queue`].
 pub struct DmaFenceWorkqueue(OwnedQueue);
 
 impl DmaFenceWorkqueue {
@@ -373,6 +375,12 @@ impl DmaFenceWorkqueue {
         Ok(Self(
             Queue::new_percpu().highpri().mem_reclaim().build(name)?,
         ))
+    }
+
+    /// Returns the workqueue this wraps.
+    #[inline]
+    pub fn queue(&self) -> &Queue {
+        &self.0
     }
 
     /// Flushes this workqueue.
