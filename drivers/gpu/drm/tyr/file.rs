@@ -546,6 +546,16 @@ impl TyrDrmFileData {
             return Self::vm_bind_async(ddev, vmbind, file);
         }
 
+        let vm = file
+            .inner()
+            .vm_pool()
+            .get_vm(vmbind.vm_id as usize)
+            .ok_or(EINVAL)?;
+
+        if vmbind.ops.count == 0 {
+            return Ok(0);
+        }
+
         static_assert!(
             size_of::<uapi::drm_panthor_vm_bind_op>()
                 == offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
@@ -559,11 +569,6 @@ impl TyrDrmFileData {
         }
 
         let count = vmbind.ops.count as usize;
-        let vm = file
-            .inner()
-            .vm_pool()
-            .get_vm(vmbind.vm_id as usize)
-            .ok_or(EINVAL)?;
 
         let mut reader = UserSlice::new(
             UserPtr::from_addr(vmbind.ops.array as usize),
@@ -582,7 +587,7 @@ impl TyrDrmFileData {
                         | uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
                         as u32;
 
-                if op.0.syncs.count != 0 || op.0.syncs.array != 0 {
+                if op.0.syncs.count != 0 {
                     Err(EINVAL)?;
                 }
 
@@ -643,6 +648,16 @@ impl TyrDrmFileData {
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
+        let vm = file
+            .inner()
+            .vm_pool()
+            .get_vm(vmbind.vm_id as usize)
+            .ok_or(EINVAL)?;
+
+        if vmbind.ops.count == 0 {
+            return Ok(0);
+        }
+
         let min_size = offset_of!(uapi::drm_panthor_vm_bind_op, syncs)
             + size_of::<uapi::drm_panthor_obj_array>();
         let stride = vmbind.ops.stride as usize;
@@ -651,11 +666,6 @@ impl TyrDrmFileData {
         }
 
         let count = vmbind.ops.count as usize;
-        let vm = file
-            .inner()
-            .vm_pool()
-            .get_vm(vmbind.vm_id as usize)
-            .ok_or(EINVAL)?;
 
         if vm.is_unusable() {
             return Err(EINVAL);
@@ -684,10 +694,6 @@ impl TyrDrmFileData {
 
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
             op_bos.push(validated_bo, GFP_KERNEL)?;
-        }
-
-        if op_bos.is_empty() {
-            return Ok(0);
         }
 
         ctx.collect_signal_ops()?;
