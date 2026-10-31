@@ -271,7 +271,8 @@ impl Mmu {
 /// may have been scheduled because an AS command or cache flush is
 /// stuck.
 pub(crate) fn pre_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
-    tdev.mmu_irq.reset_suspend(iomem, irq::mmu_irq_disable);
+    tdev.mmu_irq
+        .reset_suspend(iomem, |io| tdev.mmu.fault_mask.disable(io));
 }
 
 /// Restores the MMU after a GPU reset.
@@ -281,20 +282,18 @@ pub(crate) fn pre_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
 /// reprograms the slot. The MMU IRQ is then re-enabled.
 pub(crate) fn post_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>) {
     {
-        // The reset worker holds the closed gate here, so eviction must not
+        // The reset worker holds the closed gate here, so the release must not
         // take a VM op lock and goes through the AS slot manager directly. A
         // span parked on the closed gate re-checks residency when it resumes,
         // so releasing the binding is enough.
         let mut as_manager = tdev.mmu.as_manager.lock();
         for as_idx in 0..tdev.mmu.as_slot_count {
             // Clone the VM here because slot_data borrows as_manager and
-            // deactivate_vm takes &mut self.
+            // release_vm takes &mut self.
             let Some(vm) = as_manager.slot_data(as_idx).cloned() else {
                 continue;
             };
-            if let Err(e) = as_manager.deactivate_vm(&vm) {
-                pr_err!("post_reset: releasing AS slot {} failed: {:?}\n", as_idx, e);
-            }
+            as_manager.release_vm(&vm);
         }
         if let Some(io) = iomem.try_access() {
             tdev.mmu.fault_mask.mask_all(&io);
