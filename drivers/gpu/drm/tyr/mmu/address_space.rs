@@ -364,11 +364,6 @@ impl SlotOperations for AddressSpaceManager {
         _slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
-        // The reset may have been scheduled for a stuck AS command, and it
-        // leaves the slot unprogrammed anyway, so release only the bookkeeping.
-        if self.reset.in_progress() {
-            return Ok(());
-        }
         if self.iomem.try_access().is_some() {
             self.as_disable(slot_idx)?;
         }
@@ -873,6 +868,13 @@ impl AsSlotManager {
     pub(super) fn deactivate_vm(&mut self, vm: &VmAsData) -> Result {
         *vm.as_active_users.access_mut(self) = 0;
         self.evict(&vm.as_seat, &mut ())
+    }
+
+    /// Releases a VM's slot binding without touching the hardware. The caller
+    /// guarantees the slot is no longer programmed.
+    pub(super) fn release_vm(&mut self, vm: &VmAsData) {
+        *vm.as_active_users.access_mut(self) = 0;
+        self.release(&vm.as_seat);
     }
 
     /// Disables a faulted or unusable VM's hardware address space while

@@ -45,9 +45,9 @@ const PAGE_FAULT_BITS: u16 = ((1u32 << MAX_AS) - 1) as u16;
 /// Live `IRQ_MASK` value for the page-fault sources, one bit per hardware
 /// AS slot.
 ///
-/// The lock covers the `IRQ_MASK` write and the value. The hard handler
-/// never takes the lock, and `mmu_irq_disable` writes `IRQ_MASK` without
-/// it, so a quiesced window must run no AS programming.
+/// The lock covers the value and the `IRQ_MASK` writes, except in the hard
+/// handler and the runtime-suspend quiesce. A quiesce masks `IRQ_MASK` but
+/// keeps the value, so a quiesced window must enable no AS slot.
 #[pin_data]
 pub(crate) struct PageFaultMask {
     #[pin]
@@ -94,7 +94,8 @@ impl PageFaultMask {
         let mut mask = self.mask.lock();
 
         *mask &= !as_nr.bit();
-        io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+        let live = io.read(mmu_control::IRQ_MASK).into_raw();
+        io.write_reg(mmu_control::IRQ_MASK::from_raw(live & *mask));
     }
 
     /// Clears the latched faults of the slots in the mask and unmasks them.
@@ -103,6 +104,15 @@ impl PageFaultMask {
 
         io.write_reg(mmu_control::IRQ_CLEAR::from_raw(*mask));
         io.write_reg(mmu_control::IRQ_MASK::from_raw(*mask));
+    }
+
+    /// Masks every slot in `IRQ_MASK`, keeping the value for `enable`.
+    ///
+    /// Holds the lock so the write cannot interleave with `mask_slot`.
+    pub(super) fn disable(&self, io: &IoMem) {
+        let _mask = self.mask.lock();
+
+        mmu_irq_disable(io);
     }
 
     /// Writes the mask back to `IRQ_MASK`.
