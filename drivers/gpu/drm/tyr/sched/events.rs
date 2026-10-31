@@ -425,7 +425,7 @@ impl Scheduler {
         group: &Group,
         todo: u32,
     ) -> Result<Option<PendingOom>> {
-        tdev.with_locked_scheduler(|_| {
+        tdev.with_locked_scheduler(|_| loop {
             // The kernel atomics have no fetch_and.
             let tiler_oom = &group.tiler_oom;
             let mut mask = tiler_oom.load(Relaxed);
@@ -450,22 +450,32 @@ impl Scheduler {
             };
             let csg_id = usize::from(slot);
 
-            let (heap_address, vt_start, vt_end, frag_end) =
-                tdev.fw.with_csg_mut(csg_id, |csg| {
-                    let cs = csg.cs_mut(cs_id.get()).ok_or(EINVAL)?;
-                    let heap = cs.read_heap_output_state()?;
+            let counters = tdev.fw.with_csg_mut(csg_id, |csg| {
+                let cs = csg.cs_mut(cs_id.get()).ok_or(EINVAL)?;
+                if cs.read_input_req()?.tiler_oom() == cs.read_output_ack()?.tiler_oom() {
+                    return Ok(None);
+                }
+                let heap = cs.read_heap_output_state()?;
 
-                    Ok((heap.heap_address, heap.vt_start, heap.vt_end, heap.frag_end))
-                })?;
+                Ok(Some((
+                    heap.heap_address,
+                    heap.vt_start,
+                    heap.vt_end,
+                    heap.frag_end,
+                )))
+            })?;
+            let Some((heap_address, vt_start, vt_end, frag_end)) = counters else {
+                continue;
+            };
 
-            Ok(Some(PendingOom {
+            return Ok(Some(PendingOom {
                 csg_id,
                 cs_id,
                 heap_address,
                 vt_start,
                 vt_end,
                 frag_end,
-            }))
+            }));
         })
     }
 
