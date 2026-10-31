@@ -380,7 +380,7 @@ impl Pool {
         let chunk_bo =
             match alloc_chunk_bo(reg_data.pdev.as_ref(), ddev, &vm, chunk_size, GFP_KERNEL) {
                 Ok(chunk_bo) => chunk_bo,
-                Err(e) if e == ENOSPC => return Err(ENOMEM),
+                Err(e) if e == ENOSPC || e == EBUSY => return Err(ENOMEM),
                 Err(e) => return Err(e),
             };
 
