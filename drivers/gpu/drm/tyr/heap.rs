@@ -403,7 +403,7 @@ impl Pool {
         // permitted while holding a spinlock.
         let chunk_bo = match alloc_chunk_bo(tdev, &vm, chunk_size, GFP_KERNEL) {
             Ok(chunk_bo) => chunk_bo,
-            Err(e) if e == ENOSPC => return Err(ENOMEM),
+            Err(e) if e == ENOSPC || e == EBUSY => return Err(ENOMEM),
             Err(e) => return Err(e),
         };
 
