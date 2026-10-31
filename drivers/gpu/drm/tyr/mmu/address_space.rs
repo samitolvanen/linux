@@ -557,7 +557,7 @@ impl AddressSpaceManager {
         self.gpu_flush_caches(
             FlushMode::CleanInvalidate,
             FlushMode::CleanInvalidate,
-            FlushMode::Invalidate,
+            FlushMode::None,
         )?;
 
         // Reclaiming a slot mid-update leaves the region lock from
@@ -690,7 +690,7 @@ impl AddressSpaceManager {
         self.gpu_flush_caches(
             FlushMode::CleanInvalidate,
             FlushMode::CleanInvalidate,
-            FlushMode::Invalidate,
+            FlushMode::None,
         )?;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
         self.lock_pending[slot.get()] = false;
