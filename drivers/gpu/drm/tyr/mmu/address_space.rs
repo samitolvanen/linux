@@ -452,18 +452,11 @@ impl AddressSpaceManager {
             self.fault_mask.mask_slot(&io, slot);
         }
 
-        self.gpu_flush_caches(
-            FlushMode::CleanInvalidate,
-            FlushMode::CleanInvalidate,
-            FlushMode::None,
-        )?;
-
         // Reclaiming a slot mid-update leaves the region lock from
         // `as_start_update` unbalanced. Release it before the slot is reused.
         if self.lock_pending[slot.get()] {
-            self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
+            self.as_end_update(as_nr)?;
         }
-        self.lock_pending[slot.get()] = false;
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
@@ -501,6 +494,12 @@ impl AddressSpaceManager {
         }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
+
+        self.gpu_flush_caches(
+            FlushMode::CleanInvalidate,
+            FlushMode::CleanInvalidate,
+            FlushMode::None,
+        )?;
 
         Ok(())
     }
