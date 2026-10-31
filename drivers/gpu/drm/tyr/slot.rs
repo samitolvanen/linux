@@ -450,6 +450,18 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
         self.evict_common(locked_seat, true)
     }
 
+    /// Frees a resource's slot without the eviction callback. The slot data
+    /// is dropped, so the caller guarantees the hardware no longer uses the
+    /// slot, e.g. after a reset cleared it.
+    pub(crate) fn release(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) {
+        if let Some(slot_idx) = self.resident_slot(locked_seat) {
+            if let Some(slot) = self.slots.get_mut(usize::from(slot_idx)) {
+                mem::take(slot);
+            }
+            *locked_seat.access_mut(self) = Seat::NoSeat;
+        }
+    }
+
     fn evict_common(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>, force: bool) -> Result {
         self.check_seat(locked_seat);
 

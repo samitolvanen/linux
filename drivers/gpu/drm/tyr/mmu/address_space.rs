@@ -676,11 +676,6 @@ impl SlotOperations<MAX_AS> for AddressSpaceManager {
 
     /// Evicts a VM from a hardware slot.
     fn evict(&mut self, slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
-        // The reset may have been scheduled for a stuck AS command, and it
-        // leaves the slot unprogrammed anyway, so release only the bookkeeping.
-        if self.reset.in_progress() {
-            return Ok(());
-        }
         self.as_disable(slot_idx)?;
         Ok(())
     }
@@ -803,6 +798,13 @@ impl AsSlotManager {
     pub(super) fn deactivate_vm(&mut self, vm_as_data: &VmAsData) -> Result {
         *vm_as_data.as_active_users.access_mut(self) = 0;
         self.evict(&vm_as_data.as_seat)
+    }
+
+    /// Releases a VM's slot binding without touching the hardware. The caller
+    /// guarantees the slot is no longer programmed.
+    pub(super) fn release_vm(&mut self, vm_as_data: &VmAsData) {
+        *vm_as_data.as_active_users.access_mut(self) = 0;
+        self.release(&vm_as_data.as_seat);
     }
 
     /// Disables a faulted or unusable VM's hardware address space while
