@@ -237,7 +237,7 @@ impl GpuInfo {
             (10, 4) => "g310",
             (10, 7) => "g610",
             (11, 2) => {
-                if shader_core_count > 10 && ray_intersection {
+                if shader_core_count >= 10 && ray_intersection {
                     "g715-immortalis"
                 } else if shader_core_count >= 7 {
                     "g715"
