@@ -95,7 +95,7 @@ fn resume_hw_components(
     let io = reg_data.iomem.access(reg_data.pdev.as_ref())?;
 
     gpu::resume(reg_data, io)?;
-    mmu::resume(reg_data, io);
+    mmu::resume(reg_data, io, !tdev.is_unusable());
     let core_clk_rate = reg_data.clks.lock().core.rate().as_hz() as u64;
     if reload {
         reg_data
@@ -346,6 +346,10 @@ pub(crate) fn suspend_at_unbind(tdev: &TyrDrmDevice) {
     // the halt.
     if awake.is_some() || ctx.active() {
         halt_at_unbind(&tdev);
+    }
+
+    if let Some(guard) = tdev.registration_guard() {
+        guard.registration_data_with(mmu::unbind);
     }
 
     sched::tick::unbind(&tdev);

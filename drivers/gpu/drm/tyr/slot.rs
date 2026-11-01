@@ -444,8 +444,7 @@ impl<T: SlotOperations<MAX_SLOTS>, const MAX_SLOTS: usize> SlotManager<T, MAX_SL
     /// Like `evict`, but frees the slot even when the eviction callback fails,
     /// for teardown paths that must leave nothing bound. The caller must justify
     /// freeing a slot whose callback failed. `CsgSlotOps::evict` clears the
-    /// binding before its first fallible step, and `AsSlotManager::suspend`
-    /// runs on the way to a power cycle that clears the slot.
+    /// binding before its first fallible step.
     pub(crate) fn evict_forced(&mut self, locked_seat: &LockedSeat<T, MAX_SLOTS>) -> Result {
         self.evict_common(locked_seat, true)
     }
