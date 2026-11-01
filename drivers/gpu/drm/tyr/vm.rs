@@ -104,6 +104,7 @@ use crate::{
     cleanup,
     driver::{
         TyrDrmDevice,
+        TyrDrmDeviceData,
         TyrDrmDriver,
         TyrDrmRegistrationData, //
     },
@@ -1223,17 +1224,13 @@ impl Vm {
 
         drop(previous);
 
-        let _ = self
-            .exec
-            .unmap_range(
-                self.va_range.start,
-                self.va_range.end - self.va_range.start,
-                GFP_KERNEL,
-            )
-            .inspect_err(|e| {
-                dev_err!(self.dev(), "Failed to unmap range in kill(): {:?}", e);
-            });
+        let unmapped = self.exec.unmap_all().inspect_err(|e| {
+            dev_err!(self.dev(), "Failed to unmap range in kill(): {:?}", e);
+        });
         let _ = self.exec.deactivate();
+        if unmapped.is_err() {
+            TyrDrmDeviceData::defer_vm_teardown(&self.ddev, self.exec.clone());
+        }
     }
 
     pub(crate) fn alloc_kernel_range(&self, size: usize) -> Result<range::LiveRange> {
@@ -1668,6 +1665,15 @@ impl VmExec {
 
         let mut gpuvm_unique = self.gpuvm_unique.lock();
         self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)
+    }
+
+    /// Unmaps the whole VA range of the VM.
+    pub(crate) fn unmap_all(&self) -> Result {
+        self.unmap_range(
+            self.va_range.start,
+            self.va_range.end - self.va_range.start,
+            GFP_KERNEL,
+        )
     }
 
     pub(crate) fn unmap_range(&self, va: u64, size: u64, pt_gfp: Flags) -> Result {
