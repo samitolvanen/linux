@@ -78,7 +78,7 @@ fn resume_hw_components(
     let tdev = &data.device;
 
     gpu::resume(dev, data)?;
-    mmu::resume(dev, data)?;
+    mmu::resume(dev, data, !tdev.is_unusable())?;
     if reload {
         tdev.fw.reload(tdev)
     } else {
@@ -289,13 +289,13 @@ impl TyrPlatformDriverData {
         // A sticky runtime error or disabled runtime PM fails the call even
         // on a powered device. The powered-down latch inside the halt
         // covers those.
-        if !resumed && !ctx.active() {
-            return;
+        if resumed || ctx.active() {
+            // A resume here re-arms the ping watchdog and remaps the user MMIO
+            // page, so run the software steps too, not only the hardware halt.
+            quiesce_and_suspend(dev, data);
         }
 
-        // A resume here re-arms the ping watchdog and remaps the user MMIO
-        // page, so run the software steps too, not only the hardware halt.
-        quiesce_and_suspend(dev, data);
+        mmu::unbind(&data.device);
     }
 }
 

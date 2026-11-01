@@ -206,8 +206,8 @@ impl Mmu {
     /// Releases every resident VM's hardware AS slot for runtime suspend.
     ///
     /// Runs with the GPU still clocked and the MCU halted, so the eviction
-    /// MMIO completes and no AS slot is programmed when the clocks gate.
-    /// Takes no VM op lock.
+    /// MMIO completes. A slot whose eviction fails keeps its binding and
+    /// page tables. Takes no VM op lock.
     pub(crate) fn suspend(&self) {
         self.as_manager.lock().suspend()
     }
@@ -289,14 +289,7 @@ pub(crate) fn post_reset(tdev: &TyrDrmDeviceData, iomem: &Devres<IoMem>, reset_f
         // span parked on the closed gate re-checks residency when it resumes,
         // so releasing the binding is enough.
         let mut as_manager = tdev.mmu.as_manager.lock();
-        for as_idx in 0..tdev.mmu.as_slot_count {
-            // Clone the VM here because slot_data borrows as_manager and
-            // release_vm takes &mut self.
-            let Some(vm) = as_manager.slot_data(as_idx).cloned() else {
-                continue;
-            };
-            as_manager.release_vm(&vm);
-        }
+        as_manager.release_vms();
         if let Some(io) = iomem.try_access() {
             tdev.mmu.fault_mask.mask_all(&io);
         }
@@ -317,9 +310,30 @@ pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDrive
 }
 
 /// Re-enables the MMU IRQ for runtime resume.
-pub(crate) fn resume(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
+///
+/// Bindings kept by failed suspend evictions are released after the power
+/// cycle if `release` is set. The caller clears it on an unusable device,
+/// which keeps them as `post_reset` does after a failed reset. The MCU VM's
+/// binding is always released. `Firmware` keeps its page table alive, and
+/// the boot reprograms its slot.
+pub(crate) fn resume(
+    dev: &platform::Device<Bound>,
+    data: Pin<&TyrPlatformDriverData>,
+    release: bool,
+) -> Result {
     let io = data.device.iomem.access(dev.as_ref())?;
+    {
+        let mut as_manager = data.device.mmu.as_manager.lock();
+        as_manager.resume(release);
+        as_manager.release_vm(data.device.fw.vm_as_data());
+    }
     data.device.mmu_irq.clear_suspended();
     data.device.mmu.enable_irq(io);
     Ok(())
+}
+
+/// Releases the AS slot bindings kept by failed evictions, once unbind has
+/// halted the GPU.
+pub(crate) fn unbind(tdev: &TyrDrmDeviceData) {
+    tdev.mmu.as_manager.lock().release_vms();
 }
