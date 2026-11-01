@@ -299,7 +299,7 @@ pub(crate) fn run_hw_reset(
         dev_err!(dev, "GPU reset failed: {:?}\n", e);
     }
 
-    mmu::post_reset(tdev, iomem);
+    mmu::post_reset(tdev, iomem, reset_result.is_err());
 
     tdev.gpu_irq.reset_resume(iomem, gpu::irq::gpu_irq_enable);
     if let Some(pwr_irq) = &tdev.pwr_irq {
