@@ -272,11 +272,17 @@ pub(crate) fn pre_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
 
 /// Restores the MMU after a GPU reset.
 ///
-/// The reset left every AS slot unprogrammed, so every recorded binding is
-/// released, the page-fault mask is emptied, and the next activation
-/// reprograms the slot. The MMU IRQ is then re-enabled.
-pub(crate) fn post_reset(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
-    {
+/// A completed reset left every AS slot unprogrammed, so every recorded
+/// binding is released, the page-fault mask is emptied, and the next
+/// activation reprograms the slot. A failed reset may have left the slots
+/// programmed, so their bindings and page tables are kept. The MMU IRQ is
+/// then re-enabled.
+pub(crate) fn post_reset(
+    reg_data: &TyrDrmRegistrationData<'_>,
+    io: &IoMem<'_>,
+    reset_failed: bool,
+) {
+    if !reset_failed {
         // The reset worker holds the closed gate here, so the release must not
         // take a VM op lock and goes through the AS slot manager directly. A
         // span parked on the closed gate re-checks residency when it resumes,

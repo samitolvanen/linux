@@ -311,7 +311,7 @@ pub(crate) fn run_hw_reset(
         dev_err!(reg_data.pdev, "GPU reset failed: {:?}\n", e);
     }
 
-    mmu::post_reset(reg_data, io);
+    mmu::post_reset(reg_data, io, reset_result.is_err());
 
     unquiesce(&reg_data.gpu_irq, io, gpu::irq::gpu_irq_enable);
 
