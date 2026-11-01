@@ -336,6 +336,11 @@ pub(crate) struct AddressSpaceManager {
     /// next activation to land on the slot clears it.
     stuck: [bool; MAX_AS],
 
+    /// Set from runtime suspend until resume. A binding kept by a failed
+    /// eviction leaves its VM resident, so AS commands fail before touching
+    /// the registers while this is set.
+    suspended: bool,
+
     /// Reset handle for escalating stuck AS commands and cache flushes.
     reset: ResetHandle,
 }
@@ -400,6 +405,7 @@ impl AddressSpaceManager {
             lock_pending: [false; MAX_AS],
             faulty: [false; MAX_AS],
             stuck: [false; MAX_AS],
+            suspended: false,
             reset,
         })
     }
@@ -431,6 +437,14 @@ impl AddressSpaceManager {
             return Err(EINVAL);
         };
         Ok(slot)
+    }
+
+    /// Fails while the GPU is powered down for runtime suspend.
+    fn check_powered(&self) -> Result {
+        if self.suspended {
+            return Err(EBUSY);
+        }
+        Ok(())
     }
 
     /// Waits for an AS slot to become ready (not active).
@@ -490,6 +504,7 @@ impl AddressSpaceManager {
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
         let slot = self.validate_as_slot(as_nr)?;
+        self.check_powered()?;
 
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
@@ -541,6 +556,7 @@ impl AddressSpaceManager {
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_disable(&mut self, as_nr: usize) -> Result {
         let slot = self.validate_as_slot(as_nr)?;
+        self.check_powered()?;
 
         {
             let dev = self.dev();
@@ -609,6 +625,7 @@ impl AddressSpaceManager {
     /// Returns an error if the slot is invalid or if register writes/commands fail.
     fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>) -> Result {
         let slot = self.validate_as_slot(as_nr)?;
+        self.check_powered()?;
 
         // An empty region locks nothing. `region.end - 1` below would
         // underflow.
@@ -702,6 +719,8 @@ impl AddressSpaceManager {
         lsc: FlushMode,
         other: FlushMode,
     ) -> Result {
+        self.check_powered()?;
+
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
 
@@ -877,6 +896,19 @@ impl AsSlotManager {
         self.release(&vm.as_seat);
     }
 
+    /// Releases every slot binding without touching the hardware. The caller
+    /// guarantees no slot is programmed.
+    pub(super) fn release_vms(&mut self) {
+        for slot_idx in 0..self.slot_count() {
+            // Clone the VM here because slot_data borrows self and release_vm
+            // takes &mut self.
+            let Some(vm) = self.slot_data(slot_idx).cloned() else {
+                continue;
+            };
+            self.release_vm(&vm);
+        }
+    }
+
     /// Disables a faulted or unusable VM's hardware address space while
     /// keeping the slot bound to the VM.
     ///
@@ -914,23 +946,33 @@ impl AsSlotManager {
         vm.as_seat.access(self).slot()
     }
 
-    /// Evicts every resident VM from its hardware AS slot.
+    /// Evicts every resident VM from its hardware AS slot, then fails AS
+    /// commands until resume.
     pub(super) fn suspend(&mut self) {
         for slot_idx in 0..self.slot_count() {
             let Some(vm) = self.slot_data(slot_idx).cloned() else {
                 continue;
             };
-            // On a flush timeout the slot is freed anyway so the clocks can
-            // gate with nothing programmed, and the reset on resume reprograms
-            // it. Keeping it would fault the next VM bound there.
+            // The power cycle clears the slot. Reset the count so the next
+            // `activate_vm` reprograms it instead of treating the VM as still
+            // bound.
             *vm.as_active_users.access_mut(self) = 0;
-            if let Err(e) = self.evict_forced(&vm.as_seat, &mut ()) {
+            if let Err(e) = self.evict(&vm.as_seat, &mut ()) {
                 pr_err!(
                     "AS slot {} suspend evict failed: {}\n",
                     slot_idx,
                     e.to_errno()
                 );
             }
+        }
+        self.suspended = true;
+    }
+
+    /// Accepts AS commands again, releasing every binding if `release` is set.
+    pub(super) fn resume(&mut self, release: bool) {
+        self.suspended = false;
+        if release {
+            self.release_vms();
         }
     }
 }

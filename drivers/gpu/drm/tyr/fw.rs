@@ -79,7 +79,10 @@ use crate::{
         KernelBoVaAlloc, //
     },
     gpu::GpuInfo,
-    mmu::Mmu,
+    mmu::{
+        address_space::VmAsData,
+        Mmu, //
+    },
     regs::gpu_control::{
         McuControlMode,
         McuStatus,
@@ -595,6 +598,11 @@ impl Firmware {
         {
             dev_err!(self.pdev.as_ref(), "Failed to stop MCU\n");
         }
+    }
+
+    /// Returns the address space data of the MCU VM.
+    pub(crate) fn vm_as_data(&self) -> &VmAsData {
+        &self.vm.as_data
     }
 
     /// Returns whether the next boot has to reload the firmware sections.
