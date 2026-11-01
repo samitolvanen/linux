@@ -255,6 +255,8 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
             }
         }
 
+        TyrDrmDeviceData::schedule_dead_vms(tdev);
+
         // The work reissued below tests this flag, so clear it first. A failed
         // resume returns before this point, and the flag stays set until a
         // later resume succeeds.
@@ -354,6 +356,7 @@ pub(crate) fn suspend_at_unbind(tdev: &TyrDrmDevice) {
     if let Some(guard) = tdev.registration_guard() {
         guard.registration_data_with(|reg_data| mmu::unbind(&reg_data.mmu));
     }
+    tdev.unbind_dead_vms();
 
     sched::tick::unbind(&tdev);
 }

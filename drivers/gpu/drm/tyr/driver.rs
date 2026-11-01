@@ -76,6 +76,7 @@ use kernel::{
 };
 
 use crate::{
+    cleanup,
     devfreq::{
         self,
         TyrDevfreq,
@@ -130,7 +131,8 @@ use crate::{
         SubmitTick,
         MAX_CSGS, //
     },
-    slot::SlotManager, //
+    slot::SlotManager,
+    vm::VmExec, //
 };
 
 pub(crate) type IoMem<'a> = kernel::io::mem::IoMem<'a, SZ_2M>;
@@ -172,6 +174,8 @@ pub(crate) mod work_id {
     pub(crate) const FW_PING: u64 = 5;
     /// Syncwait poll of evicted groups.
     pub(crate) const SYNCWAIT_POLL: u64 = 6;
+    /// Retry of the deferred VM teardowns.
+    pub(crate) const DEAD_VMS: u64 = 7;
 }
 
 /// Data owned by the DRM device.
@@ -295,6 +299,16 @@ pub(crate) struct TyrDrmDeviceData {
     /// Completed once unbind has halted the firmware.
     #[pin]
     unbind_halted: Completion,
+
+    /// Killed VMs whose unmap failed, retried by `dead_vm_work` and at unbind.
+    /// Lock order `dead_vms > {gpuvm, VM op_lock, AS slot manager, dma_resv}`,
+    /// because the retried unmaps run under the lock.
+    #[pin]
+    dead_vms: Mutex<KVec<Arc<VmExec>>>,
+
+    /// Retries the unmap of `dead_vms` on the cleanup workqueue.
+    #[pin]
+    dead_vm_work: Work<TyrDrmDevice, { work_id::DEAD_VMS }>,
 
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
@@ -532,6 +546,37 @@ impl TyrDrmDeviceData {
         self.cancel_fw_ping();
     }
 
+    /// Defers the teardown of a killed VM whose unmap failed.
+    pub(crate) fn defer_vm_teardown(tdev: &ARef<TyrDrmDevice>, exec: Arc<VmExec>) {
+        if tdev.dead_vms.lock().push(exec, GFP_KERNEL).is_err() {
+            return;
+        }
+        // A reset may have released the address space since the unmap failed.
+        Self::schedule_dead_vms(tdev);
+    }
+
+    /// Retries the deferred VM teardowns on the cleanup workqueue, after a
+    /// reset or resume that may have released their address spaces.
+    pub(crate) fn schedule_dead_vms(tdev: &ARef<TyrDrmDevice>) {
+        let _ = cleanup::enqueue::<ARef<TyrDrmDevice>, { work_id::DEAD_VMS }>(tdev.clone());
+    }
+
+    /// Retries the deferred VM teardowns inline at unbind, after their address
+    /// spaces are released, so no queued retry holds a device reference past
+    /// unbind.
+    pub(crate) fn unbind_dead_vms(&self) {
+        let _ = self.dead_vm_work.cancel_sync();
+        self.retry_dead_vms();
+    }
+
+    /// Retries the unmap of each deferred VM teardown, dropping the VMs whose
+    /// unmap succeeds.
+    fn retry_dead_vms(&self) {
+        self.dead_vms
+            .lock()
+            .retain(|exec| exec.unmap_all().is_err());
+    }
+
     /// Waits for unbind to halt the firmware and evict the resident groups if
     /// unbind has stopped the tick. The halt waits for driver workers and PM
     /// callbacks, so callers must not run in them or hold a lock it takes.
@@ -557,6 +602,10 @@ kernel::impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<TyrDrmDevice, { work_id::PERIODIC_TICK }> for TyrDrmDeviceData { self.periodic_tick_work }
+}
+
+kernel::impl_has_work! {
+    impl HasWork<TyrDrmDevice, { work_id::DEAD_VMS }> for TyrDrmDeviceData { self.dead_vm_work }
 }
 
 impl_has_delayed_work! {
@@ -680,6 +729,14 @@ impl WorkItem<{ work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData {
 
     fn run(this: Self::Pointer) {
         Self::schedule_sync_upd(&this);
+    }
+}
+
+impl WorkItem<{ work_id::DEAD_VMS }> for TyrDrmDeviceData {
+    type Pointer = ARef<TyrDrmDevice>;
+
+    fn run(this: Self::Pointer) {
+        this.retry_dead_vms();
     }
 }
 
@@ -891,6 +948,8 @@ impl platform::Driver for TyrPlatformDriver {
                     syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                     work_gate_closed <- new_spinlock!(false),
                     unbind_halted <- Completion::new(),
+                    dead_vms <- new_mutex!(KVec::new()),
+                    dead_vm_work <- kernel::new_work!("TyrDrmDeviceData::dead_vm_work"),
                     devfreq_data,
                     pm: SetOnce::new(),
                     pm_powered_down: Atomic::new(false),
