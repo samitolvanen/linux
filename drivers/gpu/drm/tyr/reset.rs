@@ -60,7 +60,8 @@ use kernel::{
 use crate::{
     driver::{
         IoMem,
-        TyrDrmDevice, //
+        TyrDrmDevice,
+        TyrDrmDeviceData, //
     },
     gpu,
     mmu,
@@ -267,6 +268,8 @@ impl Controller {
             // drain the firmware events that arrived during the reset.
             tick::resume(&tdev);
         }
+
+        TyrDrmDeviceData::schedule_dead_vms(&tdev);
     }
 }
 

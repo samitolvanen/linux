@@ -212,6 +212,8 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
         }
     }
 
+    TyrDrmDeviceData::schedule_dead_vms(tdev);
+
     // The work reissued below tests this flag, so clear it first. A failed
     // resume leaves the flag set, since the device then stays unusable until
     // unbind.
@@ -296,6 +298,7 @@ impl TyrPlatformDriverData {
         }
 
         mmu::unbind(&data.device);
+        data.device.unbind_dead_vms();
     }
 }
 
