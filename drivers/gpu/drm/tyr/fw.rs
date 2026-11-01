@@ -635,7 +635,8 @@ impl Firmware {
     ///
     /// The firmware VM is left resident so page-table updates on it keep
     /// issuing cache and TLB maintenance up to the soft reset. It is released
-    /// after the soft reset by `mmu::post_reset`, together with the user VMs.
+    /// after a completed reset by `mmu::post_reset`, together with the user
+    /// VMs.
     pub(crate) fn pre_reset(&self, tdev: &TyrDrmDevice) {
         self.unclean_stop.store(true, Release);
         tdev.job_irq

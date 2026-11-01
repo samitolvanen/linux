@@ -332,8 +332,8 @@ pub(crate) struct AddressSpaceManager {
     faulty: [bool; MAX_AS],
 
     /// Whether hardware AS slot N stopped completing commands. A command
-    /// timeout sets it. A reset releases the slot binding, and the next
-    /// activation to land on the slot clears it.
+    /// timeout sets it. A completed reset releases the slot binding, and the
+    /// next activation to land on the slot clears it.
     stuck: [bool; MAX_AS],
 
     /// Reset handle for escalating stuck AS commands and cache flushes.
