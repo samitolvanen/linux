@@ -32,7 +32,10 @@
 //! until `set_ready` enqueues the worker.
 
 use kernel::{
-    device::Device,
+    device::{
+        Bound,
+        Device, //
+    },
     devres::Devres,
     new_mutex,
     platform,
@@ -251,7 +254,11 @@ impl Controller {
 
         tdev.cancel_fw_ping();
         let parked = tick::pre_reset(&tdev);
-        let reset_result = run_hw_reset(&tdev, self.pdev.as_ref(), &self.iomem, &self.gate);
+        // SAFETY: This worker is queued only after probe can no longer fail.
+        // `ResetHandle::unbind` empties the device slot and flushes this worker
+        // before the device unbinds.
+        let dev = unsafe { self.pdev.as_ref().as_bound() };
+        let reset_result = run_hw_reset(&tdev, dev, &self.iomem, &self.gate);
 
         // Latched before the sweep below, so a concurrent group create
         // cannot slip past both.
@@ -290,7 +297,7 @@ impl Controller {
 /// failed.
 pub(crate) fn run_hw_reset(
     tdev: &TyrDrmDevice,
-    dev: &Device,
+    dev: &Device<Bound>,
     iomem: &Devres<IoMem>,
     gate: &HwGate,
 ) -> Result {
@@ -317,7 +324,7 @@ pub(crate) fn run_hw_reset(
     // Reopen before fw.post_reset reactivates the MCU VM through the gate.
     drop(hw);
 
-    let reboot_result = tdev.fw.post_reset(tdev);
+    let reboot_result = tdev.fw.post_reset(tdev, dev);
     if let Err(e) = &reboot_result {
         dev_err!(dev, "Firmware reboot after reset failed: {:?}\n", e);
     }
