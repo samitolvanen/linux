@@ -85,7 +85,7 @@ fn resume_hw_components(
     gpu::resume(dev, data)?;
     mmu::resume(dev, data, !tdev.is_unusable())?;
     if reload {
-        tdev.fw.reload(tdev)
+        tdev.fw.reload(tdev, dev.as_ref())
     } else {
         tdev.fw.resume(tdev)
     }
