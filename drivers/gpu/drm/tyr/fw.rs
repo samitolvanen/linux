@@ -673,11 +673,11 @@ impl Firmware {
     /// rewritten from the data retained at load time before the MCU
     /// restarts. The reload also clears the halt request in the global
     /// input block, so no explicit `set_mcu_active` is needed.
-    pub(crate) fn post_reset(&self, tdev: &TyrDrmDevice) -> Result {
+    pub(crate) fn post_reset(&self, tdev: &TyrDrmDevice, dev: &Device<Bound>) -> Result {
         tdev.job_irq.clear_suspended();
 
         self.vm.activate()?;
-        self.reload_sections(tdev)?;
+        self.reload_sections(dev)?;
         self.irq_state.clear_ready();
 
         {
@@ -702,9 +702,9 @@ impl Firmware {
     /// Cold-boots the firmware from the retained sections after a power
     /// cycle or wedge. The stop step forces the interface through the
     /// suspended state so bring-up starts from a known point.
-    pub(crate) fn reload(&self, tdev: &TyrDrmDevice) -> Result {
+    pub(crate) fn reload(&self, tdev: &TyrDrmDevice, dev: &Device<Bound>) -> Result {
         self.pre_reset(tdev);
-        self.post_reset(tdev)
+        self.post_reset(tdev, dev)
     }
 
     /// Rewrites every firmware section from the data retained at load
@@ -713,11 +713,7 @@ impl Firmware {
     /// Writes go through the vmaps retained in `Section` and the sync
     /// through the DMA segments retained at load, so the reset path
     /// neither allocates nor takes BO locks.
-    fn reload_sections(&self, tdev: &TyrDrmDevice) -> Result {
-        let reg = tdev.registration_guard().ok_or(ENODEV)?;
-        // SAFETY: The parent device stays bound while `reg` is held.
-        let dev = unsafe { reg.as_ref().as_bound() };
-
+    fn reload_sections(&self, dev: &Device<Bound>) -> Result {
         for section in self.sections.iter() {
             Self::init_section_mem(
                 &section.vmap,
