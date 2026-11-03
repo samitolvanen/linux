@@ -104,6 +104,7 @@ pub(crate) fn create_context(
     };
 
     let vm = vm_pool.get_vm(heapcreate.vm_id as usize).ok_or(EINVAL)?;
+    let _awake = tdev.resume_for_vm_update(&vm.as_data)?;
     let pool = vm.get_or_create_heap_pool(tdev)?;
     let created_context = pool.create_heap_context(tdev, args)?;
 

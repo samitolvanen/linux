@@ -975,4 +975,9 @@ impl AsSlotManager {
             self.release_vms();
         }
     }
+
+    /// Returns whether `vm` kept its AS slot across a runtime suspend.
+    pub(super) fn needs_resume_for_update(&mut self, vm: &VmAsData) -> bool {
+        self.suspended && self.resident_slot(&vm.as_seat).is_some()
+    }
 }

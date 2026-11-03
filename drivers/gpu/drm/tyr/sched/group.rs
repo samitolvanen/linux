@@ -491,6 +491,9 @@ impl Group {
             .get_vm(group_args.vm_id as usize)
             .ok_or(EINVAL)?;
 
+        let _fw_awake = ddev.resume_for_vm_update(ddev.fw.vm_as_data())?;
+        let _vm_awake = ddev.resume_for_vm_update(&vm.as_data)?;
+
         let (suspend_buf_size, protm_suspend_buf_size) = ddev.fw.group_suspend_buf_sizes()?;
         let suspend_buf =
             ddev.fw
