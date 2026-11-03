@@ -337,8 +337,8 @@ pub(crate) fn resume(
     Ok(())
 }
 
-/// Releases the AS slot bindings kept by failed evictions, once unbind has
-/// halted the GPU.
+/// Releases the AS slot bindings kept by failed evictions, once the GPU is
+/// halted.
 pub(crate) fn unbind(tdev: &TyrDrmDeviceData) {
     tdev.mmu.as_manager.lock().release_vms();
 }
