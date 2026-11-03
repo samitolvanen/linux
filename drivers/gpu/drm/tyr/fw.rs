@@ -220,7 +220,6 @@ impl<'drm> Firmware<'drm> {
         gpu_info: &GpuInfo,
     ) -> Result<Firmware<'drm>> {
         let vm = Vm::new(dev, ddev, mmu, gpu_info)?;
-        vm.activate()?;
 
         let result = (|| {
             let (fw, parsed_sections) = Self::load(dev, ddev, gpu_info)?;
@@ -251,6 +250,8 @@ impl<'drm> Firmware<'drm> {
 
                 sections.push(Section { data, mem }, GFP_KERNEL)?;
             }
+
+            vm.activate()?;
 
             Ok(Firmware {
                 iomem,
