@@ -120,6 +120,7 @@ use crate::{
     irq::IrqSlot,
     mmap,
     mmu::{
+        self,
         irq::{
             mmu_irq_init,
             MmuIrq, //
@@ -1173,6 +1174,7 @@ impl TyrPlatformDriverData {
             tdev.fw.stop_mcu();
             tdev.mmu.suspend();
             let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
+            mmu::unbind(&tdev);
             tdev.unbind_halted.complete_all();
         });
 
