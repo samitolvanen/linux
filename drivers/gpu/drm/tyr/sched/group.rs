@@ -723,18 +723,8 @@ impl Group {
     /// the highest seqno so GPU-side consumers observe the queue as
     /// done.
     pub(crate) fn cancel_queues(self: &Arc<Self>) {
-        let (fatal_queues, timedout) =
-            self.with_locked_inner(|inner| (inner.fatal_queues(), inner.timedout));
-
         for (queue_idx, queue) in self.indexed_queues() {
-            let err = if fatal_queues & queue_idx.bit() != 0 {
-                EINVAL
-            } else if timedout {
-                ETIMEDOUT
-            } else {
-                ECANCELED
-            };
-            queue.cancel(err);
+            queue.cancel(self.queue_error(queue_idx));
 
             let seqno = queue.next_seqno();
             let _ = self.write_syncobj(
@@ -800,6 +790,21 @@ impl Group {
         }
 
         self.arm_timeout();
+    }
+
+    /// Returns the error the jobs of queue `queue_idx` fail with once the
+    /// group can no longer run.
+    pub(super) fn queue_error(&self, queue_idx: QueueIdx) -> Error {
+        let (fatal_queues, timedout) =
+            self.with_locked_inner(|inner| (inner.fatal_queues(), inner.timedout));
+
+        if fatal_queues & queue_idx.bit() != 0 {
+            EINVAL
+        } else if timedout {
+            ETIMEDOUT
+        } else {
+            ECANCELED
+        }
     }
 
     /// Drains every queue. Same context rule as `Queue::drain`.
