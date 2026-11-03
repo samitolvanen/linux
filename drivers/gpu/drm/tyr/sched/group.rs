@@ -991,6 +991,8 @@ impl Group {
             return Err(EINVAL);
         }
 
+        let _awake = self.tdev.resume_for_vm_update(&self.vm.as_data)?;
+
         let jobs = Job::from_queue_submits(queue_submits)?;
         let job_count = jobs.len();
         let mut ctx =
