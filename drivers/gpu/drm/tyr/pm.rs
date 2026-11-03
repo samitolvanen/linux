@@ -32,7 +32,10 @@ use crate::{
         TyrPlatformDriverData, //
     },
     gpu,
-    mmu,
+    mmu::{
+        self,
+        address_space::VmAsData, //
+    },
     reset,
     sched, //
 };
@@ -383,5 +386,18 @@ impl TyrDrmDeviceData {
             // powered-down flag tells the two apart.
             Err(_) => (!self.pm_powered_down()).then_some(ActiveDevice { _scope: None }),
         }
+    }
+
+    /// Resumes the device if `vm` kept its AS slot across a runtime suspend,
+    /// since AS commands fail until resume. Must not be called in a dma-fence
+    /// signalling section or under a lock that the resume takes.
+    pub(crate) fn resume_for_vm_update(&self, vm: &VmAsData) -> Result<Option<AwakeScope>> {
+        if !self.mmu.needs_resume_for_update(vm) {
+            return Ok(None);
+        }
+
+        self.pm_context()
+            .map(|ctx| ctx.get(PMProfile::new().auto()))
+            .transpose()
     }
 }

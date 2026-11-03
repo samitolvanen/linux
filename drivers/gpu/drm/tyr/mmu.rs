@@ -212,6 +212,11 @@ impl Mmu {
         self.as_manager.lock().suspend()
     }
 
+    /// Returns whether `vm` kept its AS slot across a runtime suspend.
+    pub(crate) fn needs_resume_for_update(&self, vm: &VmAsData) -> bool {
+        self.as_manager.lock().needs_resume_for_update(vm)
+    }
+
     /// Returns the AS slot index `vm` is currently bound to, or `None`
     /// if it has no bound users.
     ///

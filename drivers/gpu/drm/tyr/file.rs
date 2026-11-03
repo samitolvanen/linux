@@ -576,6 +576,8 @@ impl TyrDrmFileData {
         )
         .reader();
 
+        let _awake = ddev.resume_for_vm_update(&vm.as_data)?;
+
         for i in 0..count {
             let res: Result = (|| {
                 let op: VmBindOp = reader.read()?;
@@ -644,7 +646,7 @@ impl TyrDrmFileData {
     }
 
     fn vm_bind_async(
-        _ddev: &TyrDrmDevice,
+        ddev: &TyrDrmDevice,
         vmbind: &mut uapi::drm_panthor_vm_bind,
         file: &TyrDrmFile,
     ) -> Result<u32> {
@@ -676,6 +678,8 @@ impl TyrDrmFileData {
             stride.checked_mul(count).ok_or(EINVAL)?,
         )
         .reader();
+
+        let _awake = ddev.resume_for_vm_update(&vm.as_data)?;
 
         // Declared before `ctx` so it flushes after the uncommitted jobs drop.
         let _flush = ScopeGuard::new(|| vm.flush_deferred_cleanup());
