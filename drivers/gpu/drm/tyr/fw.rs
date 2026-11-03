@@ -418,8 +418,6 @@ impl Firmware {
 
         let parsed_sections = Self::load(ddev, gpu_info)?;
 
-        vm.activate()?;
-
         // SAFETY: `new` is only called from probe, so the device is bound.
         let dev = unsafe { pdev.as_ref().as_bound() };
 
@@ -485,6 +483,8 @@ impl Firmware {
             let shared_section = Self::find_shared_section(&sections)?;
             let global_iface =
                 GlobalInterface::new(pdev, iomem.clone(), shared_section, *gpu_info, &irq_state)?;
+
+            vm.activate()?;
 
             let vm = vm.clone();
             let firmware = Arc::pin_init(
