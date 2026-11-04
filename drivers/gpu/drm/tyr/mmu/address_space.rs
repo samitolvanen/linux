@@ -270,8 +270,7 @@ pub(crate) struct AddressSpaceManager {
     faulty: [bool; MAX_AS],
 
     /// Whether hardware AS slot N stopped completing commands. A command
-    /// timeout sets it. A completed reset releases the slot binding, and the
-    /// next activation to land on the slot clears it.
+    /// timeout sets it, and a completed reset or a resume clears it.
     stuck: [bool; MAX_AS],
 
     /// Set from runtime suspend until resume. A binding kept by a failed
@@ -406,10 +405,14 @@ impl AddressSpaceManager {
 
     /// Enables an AS slot with the provided configuration.
     ///
-    /// Returns an error if the slot is invalid or if register writes/commands fail.
+    /// Returns an error if the slot is invalid or stuck, or if register writes/commands fail.
     fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
         let slot = self.validate_as_slot(as_nr)?;
         self.check_powered()?;
+
+        if self.stuck[slot.get()] {
+            return Err(ETIMEDOUT);
+        }
 
         {
             let io = self.iomem.try_access().ok_or(ENODEV)?;
@@ -447,9 +450,6 @@ impl AddressSpaceManager {
             );
         }
 
-        // Cleared before the command because `as_wait_ready` would
-        // otherwise fail it.
-        self.stuck[slot.get()] = false;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
         self.faulty[slot.get()] = false;
         self.lock_pending[slot.get()] = false;
@@ -828,9 +828,10 @@ impl AsSlotManager {
         self.release(&vm_as_data.as_seat);
     }
 
-    /// Releases every slot binding without touching the hardware. The caller
-    /// guarantees no slot is programmed.
+    /// Releases every slot binding and clears the stuck flags without touching
+    /// the hardware. The caller guarantees no slot is programmed.
     pub(super) fn release_vms(&mut self) {
+        self.stuck = [false; MAX_AS];
         for slot_idx in 0..self.slot_count() {
             // Clone the VM here because slot_data borrows self and release_vm
             // takes &mut self.
@@ -898,9 +899,11 @@ impl AsSlotManager {
         self.suspended = true;
     }
 
-    /// Accepts AS commands again, releasing every binding if `release` is set.
+    /// Accepts AS commands again and clears the stuck flags, releasing every
+    /// binding if `release` is set.
     pub(super) fn resume(&mut self, release: bool) {
         self.suspended = false;
+        self.stuck = [false; MAX_AS];
         if release {
             self.release_vms();
         }
