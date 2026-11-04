@@ -61,6 +61,7 @@
 #include "device.c"
 #include "dma.c"
 #ifdef CONFIG_DMA_SHARED_BUFFER
+#include "dma_fence.c"
 #include "legacy_dma_fence.c"
 #include "dma-resv.c"
 #endif

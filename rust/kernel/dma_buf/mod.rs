@@ -1,10 +1,18 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0 OR MIT
 
-//! DMA buffer abstractions.
-//!
-//! Rust abstractions for the kernel's DMA buffer subsystem (drivers/dma-buf/).
+//! DMA-buf subsystem abstractions.
 
+pub mod dma_fence;
 pub mod legacy_fence;
+
+pub use self::dma_fence::{
+    DriverFence,
+    Fence,
+    FenceCallback,
+    FenceCallbackRegistration,
+    FenceContext,
+    FenceContextOps, //
+};
 
 use crate::bindings;
 
