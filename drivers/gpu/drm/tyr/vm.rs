@@ -97,6 +97,7 @@ use kernel::{
 use crate::{
     cleanup,
     driver::{
+        DeadMapping,
         TyrDrmDevice,
         TyrDrmDeviceData,
         TyrDrmDriver, //
@@ -1258,7 +1259,7 @@ impl Vm {
         });
         if unmapped.is_err() {
             if let Some(ddev) = &self.ddev {
-                TyrDrmDeviceData::defer_vm_teardown(ddev, self.exec.clone());
+                TyrDrmDeviceData::defer_unmap(ddev, DeadMapping::Vm(self.exec.clone()));
             }
         }
     }

@@ -269,7 +269,7 @@ impl Controller {
             tick::resume(&tdev);
         }
 
-        TyrDrmDeviceData::schedule_dead_vms(&tdev);
+        TyrDrmDeviceData::schedule_dead_mappings(&tdev);
     }
 }
 
