@@ -264,6 +264,12 @@ impl Mmu {
     }
 }
 
+/// Returns whether a VM update failed with `e` because the VM's address space
+/// is stuck or kept across a suspend. A reset, resume or unbind releases it.
+pub(crate) fn update_blocked(e: Error) -> bool {
+    e == EBUSY || e == ETIMEDOUT
+}
+
 /// Stops the MMU for a GPU reset.
 ///
 /// Only the MMU IRQ is suspended. No AS commands are issued. The reset
