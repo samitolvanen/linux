@@ -91,7 +91,10 @@ use crate::{
         },
         Firmware, //
     },
-    gem::Bo,
+    gem::{
+        Bo,
+        KernelBoCleanup, //
+    },
     gpu::{
         self,
         irq::{
@@ -174,8 +177,16 @@ pub(crate) mod work_id {
     pub(crate) const FW_PING: u64 = 5;
     /// Syncwait poll of evicted groups.
     pub(crate) const SYNCWAIT_POLL: u64 = 6;
-    /// Retry of the deferred VM teardowns.
-    pub(crate) const DEAD_VMS: u64 = 7;
+    /// Retry of the dead mapping unmaps.
+    pub(crate) const DEAD_MAPPINGS: u64 = 7;
+}
+
+/// A mapping whose unmap failed, retried after a reset, resume or unbind.
+pub(crate) enum DeadMapping {
+    /// The whole VA range of a killed VM.
+    Vm(Arc<VmExec>),
+    /// The VA range of a dropped kernel BO.
+    KernelBo(KernelBoCleanup),
 }
 
 /// Data owned by the DRM device.
@@ -300,15 +311,16 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     unbind_halted: Completion,
 
-    /// Killed VMs whose unmap failed, retried by `dead_vm_work` and at unbind.
-    /// Lock order `dead_vms > {gpuvm, VM op_lock, AS slot manager, dma_resv}`,
-    /// because the retried unmaps run under the lock.
+    /// Mappings whose unmap failed, retried by `dead_mapping_work` and at
+    /// unbind. Lock order `dead_mappings > {gpuvm, VM op_lock, hw_gate, AS slot
+    /// manager, kernel VA, dma_resv}`, because the retried unmaps run under the
+    /// lock.
     #[pin]
-    dead_vms: Mutex<KVec<Arc<VmExec>>>,
+    dead_mappings: Mutex<KVec<DeadMapping>>,
 
-    /// Retries the unmap of `dead_vms` on the cleanup workqueue.
+    /// Retries the unmap of `dead_mappings` on the cleanup workqueue.
     #[pin]
-    dead_vm_work: Work<TyrDrmDevice, { work_id::DEAD_VMS }>,
+    dead_mapping_work: Work<TyrDrmDevice, { work_id::DEAD_MAPPINGS }>,
 
     /// State the devfreq callbacks reach through their `data` argument,
     /// shared with the devfreq registration via the `Arc`.
@@ -546,35 +558,36 @@ impl TyrDrmDeviceData {
         self.cancel_fw_ping();
     }
 
-    /// Defers the teardown of a killed VM whose unmap failed.
-    pub(crate) fn defer_vm_teardown(tdev: &ARef<TyrDrmDevice>, exec: Arc<VmExec>) {
-        if tdev.dead_vms.lock().push(exec, GFP_KERNEL).is_err() {
+    /// Defers a failed unmap to a later retry.
+    pub(crate) fn defer_unmap(tdev: &ARef<TyrDrmDevice>, mapping: DeadMapping) {
+        if tdev.dead_mappings.lock().push(mapping, GFP_KERNEL).is_err() {
             return;
         }
         // A reset may have released the address space since the unmap failed.
-        Self::schedule_dead_vms(tdev);
+        Self::schedule_dead_mappings(tdev);
     }
 
-    /// Retries the deferred VM teardowns on the cleanup workqueue, after a
+    /// Retries the dead mapping unmaps on the cleanup workqueue, after a
     /// reset or resume that may have released their address spaces.
-    pub(crate) fn schedule_dead_vms(tdev: &ARef<TyrDrmDevice>) {
-        let _ = cleanup::enqueue::<ARef<TyrDrmDevice>, { work_id::DEAD_VMS }>(tdev.clone());
+    pub(crate) fn schedule_dead_mappings(tdev: &ARef<TyrDrmDevice>) {
+        let _ = cleanup::enqueue::<ARef<TyrDrmDevice>, { work_id::DEAD_MAPPINGS }>(tdev.clone());
     }
 
-    /// Retries the deferred VM teardowns inline at unbind, after their address
+    /// Retries the dead mapping unmaps inline at unbind, after their address
     /// spaces are released, so no queued retry holds a device reference past
     /// unbind.
-    pub(crate) fn unbind_dead_vms(&self) {
-        let _ = self.dead_vm_work.cancel_sync();
-        self.retry_dead_vms();
+    pub(crate) fn unbind_dead_mappings(&self) {
+        let _ = self.dead_mapping_work.cancel_sync();
+        self.retry_dead_mappings();
     }
 
-    /// Retries the unmap of each deferred VM teardown, dropping the VMs whose
-    /// unmap succeeds.
-    fn retry_dead_vms(&self) {
-        self.dead_vms
-            .lock()
-            .retain(|exec| exec.unmap_all().is_err());
+    /// Retries the unmap of each dead mapping, keeping those that need another
+    /// retry.
+    fn retry_dead_mappings(&self) {
+        self.dead_mappings.lock().retain(|mapping| match mapping {
+            DeadMapping::Vm(exec) => exec.unmap_all().is_err(),
+            DeadMapping::KernelBo(cleanup) => cleanup.retry_unmap(),
+        });
     }
 
     /// Waits for unbind to halt the firmware and evict the resident groups if
@@ -605,7 +618,7 @@ impl_has_delayed_work! {
 }
 
 kernel::impl_has_work! {
-    impl HasWork<TyrDrmDevice, { work_id::DEAD_VMS }> for TyrDrmDeviceData { self.dead_vm_work }
+    impl HasWork<TyrDrmDevice, { work_id::DEAD_MAPPINGS }> for TyrDrmDeviceData { self.dead_mapping_work }
 }
 
 impl_has_delayed_work! {
@@ -732,11 +745,11 @@ impl WorkItem<{ work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData {
     }
 }
 
-impl WorkItem<{ work_id::DEAD_VMS }> for TyrDrmDeviceData {
+impl WorkItem<{ work_id::DEAD_MAPPINGS }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
-        this.retry_dead_vms();
+        this.retry_dead_mappings();
     }
 }
 
@@ -948,8 +961,8 @@ impl platform::Driver for TyrPlatformDriver {
                     syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                     work_gate_closed <- new_spinlock!(false),
                     unbind_halted <- Completion::new(),
-                    dead_vms <- new_mutex!(KVec::new()),
-                    dead_vm_work <- kernel::new_work!("TyrDrmDeviceData::dead_vm_work"),
+                    dead_mappings <- new_mutex!(KVec::new()),
+                    dead_mapping_work <- kernel::new_work!("TyrDrmDeviceData::dead_mapping_work"),
                     devfreq_data,
                     pm: SetOnce::new(),
                     pm_powered_down: Atomic::new(false),
