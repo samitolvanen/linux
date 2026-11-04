@@ -158,7 +158,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{
     c_str,
-    dma_buf::dma_fence::{
+    dma_buf::legacy_fence::{
         CallbackError,
         DmaFenceContext,
         DmaFenceDelayedWork,

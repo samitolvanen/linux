@@ -7,7 +7,7 @@ use core::ops::{
 
 use kernel::{
     alloc::KVec,
-    dma_buf::dma_fence::{
+    dma_buf::legacy_fence::{
         DmaFenceSignallingAnnotation,
         DmaFenceWorkqueue,
         DriverDmaFence,

@@ -4,7 +4,7 @@
 //!
 //! Rust abstractions for the kernel's DMA buffer subsystem (drivers/dma-buf/).
 
-pub mod dma_fence;
+pub mod legacy_fence;
 
 use crate::bindings;
 

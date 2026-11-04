@@ -9,7 +9,7 @@
 use core::mem::offset_of;
 
 use kernel::{
-    dma_buf::dma_fence::{
+    dma_buf::legacy_fence::{
         FenceChain,
         PublicDmaFence, //
     },

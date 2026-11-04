@@ -16,7 +16,7 @@ use kernel::{
         Device as DmaDevice,
         DmaMask, //
     },
-    dma_buf::dma_fence::{
+    dma_buf::legacy_fence::{
         impl_has_dma_fence_work,
         new_dma_fence_work,
         DmaFenceWork,

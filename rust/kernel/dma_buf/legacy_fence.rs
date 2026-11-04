@@ -1032,12 +1032,12 @@ macro_rules! impl_has_dma_fence_work {
         }
 
         impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
-            type Pointer = <Self as $crate::dma_buf::dma_fence::DmaFenceWorkItem<$($id)?>>::Pointer;
+            type Pointer = <Self as $crate::dma_buf::legacy_fence::DmaFenceWorkItem<$($id)?>>::Pointer;
 
             fn run(this: Self::Pointer) {
-                let _annotation = $crate::dma_buf::dma_fence::DmaFenceSignallingAnnotation::new();
+                let _annotation = $crate::dma_buf::legacy_fence::DmaFenceSignallingAnnotation::new();
 
-                <Self as $crate::dma_buf::dma_fence::DmaFenceWorkItem<$($id)?>>::run(this)
+                <Self as $crate::dma_buf::legacy_fence::DmaFenceWorkItem<$($id)?>>::run(this)
             }
         }
     )*};
@@ -1048,7 +1048,7 @@ pub use impl_has_dma_fence_work;
 #[macro_export]
 macro_rules! new_dma_fence_work {
     ($($name:literal)?) => {
-        $crate::dma_buf::dma_fence::DmaFenceWork::new(
+        $crate::dma_buf::legacy_fence::DmaFenceWork::new(
             $crate::optional_name!($($name)?),
             $crate::static_lock_class!(),
         )
@@ -1148,11 +1148,11 @@ macro_rules! impl_has_dma_fence_delayed_work {
 
         impl$(<$($generics)+>)? $crate::workqueue::WorkItem<$($id)?> for $self {
             type Pointer =
-                <Self as $crate::dma_buf::dma_fence::DmaFenceDelayedWorkItem<$($id)?>>::Pointer;
+                <Self as $crate::dma_buf::legacy_fence::DmaFenceDelayedWorkItem<$($id)?>>::Pointer;
 
             fn run(this: Self::Pointer) {
-                let _annotation = $crate::dma_buf::dma_fence::DmaFenceSignallingAnnotation::new();
-                <Self as $crate::dma_buf::dma_fence::DmaFenceDelayedWorkItem<$($id)?>>::run(this)
+                let _annotation = $crate::dma_buf::legacy_fence::DmaFenceSignallingAnnotation::new();
+                <Self as $crate::dma_buf::legacy_fence::DmaFenceDelayedWorkItem<$($id)?>>::run(this)
             }
         }
     )*};
@@ -1164,7 +1164,7 @@ pub use impl_has_dma_fence_delayed_work;
 #[macro_export]
 macro_rules! new_dma_fence_delayed_work {
     () => {
-        $crate::dma_buf::dma_fence::DmaFenceDelayedWork::new(
+        $crate::dma_buf::legacy_fence::DmaFenceDelayedWork::new(
             $crate::optional_name!(),
             $crate::static_lock_class!(),
             $crate::c_str!(::core::concat!(
@@ -1177,7 +1177,7 @@ macro_rules! new_dma_fence_delayed_work {
         )
     };
     ($name:literal) => {
-        $crate::dma_buf::dma_fence::DmaFenceDelayedWork::new(
+        $crate::dma_buf::legacy_fence::DmaFenceDelayedWork::new(
             $crate::c_str!($name),
             $crate::static_lock_class!(),
             $crate::c_str!(::core::concat!($name, "_timer")),

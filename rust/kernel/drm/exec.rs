@@ -14,7 +14,7 @@
 use crate::{
     bindings,
     dma_buf::{
-        dma_fence::PublicDmaFence,
+        legacy_fence::PublicDmaFence,
         DmaResvUsage, //
     },
     drm::gem::IntoGEMObject,

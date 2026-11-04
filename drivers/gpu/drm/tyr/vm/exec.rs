@@ -4,7 +4,7 @@
 
 use kernel::{
     bindings::drm_gpuvm_exec,
-    dma_buf::dma_fence::PublicDmaFence,
+    dma_buf::legacy_fence::PublicDmaFence,
     drm::{
         exec::ExecFlag,
         gpuvm::{

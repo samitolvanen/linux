@@ -24,7 +24,7 @@ use kernel::{
         Device, //
     },
     dma::DmaAddress,
-    dma_buf::dma_fence::{
+    dma_buf::legacy_fence::{
         DmaFenceWorkqueue,
         DriverDmaFence,
         DriverDmaFenceOps,
