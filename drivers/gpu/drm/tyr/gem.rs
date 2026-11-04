@@ -45,10 +45,13 @@ use kernel::{
 use crate::{
     cleanup,
     driver::{
+        DeadMapping,
         TyrDrmDevice,
+        TyrDrmDeviceData,
         TyrDrmDriver, //
     },
     file::TyrDrmFile,
+    mmu,
     vm::{
         range,
         Vm,
@@ -490,7 +493,7 @@ pub(crate) struct KernelBo {
     /// The underlying GEM buffer object.
     ///
     /// Wrapped in `ManuallyDrop` so `Drop` can move the single owning
-    /// reference into `kernel_bo_unmap`. The GEM object's final drop
+    /// reference into `KernelBoCleanup`. The GEM object's final drop
     /// runs `Object::free_callback`, whose cached sg-table teardown
     /// takes `dma_resv_lock`, so it must not run on the dma-fence
     /// signalling path that may be dropping this `KernelBo`.
@@ -498,13 +501,14 @@ pub(crate) struct KernelBo {
     /// The GPU VM this buffer is mapped into.
     ///
     /// `ManuallyDrop` so `Drop` can move the reference into
-    /// `kernel_bo_unmap`.
+    /// `KernelBoCleanup`.
     vm: ManuallyDrop<Arc<Vm>>,
     /// The GPU VA range occupied by this buffer.
     va_range: Range<u64>,
     /// Kernel-VA pool reservation backing `va_range`. Dropped from the
     /// deferred cleanup once `Vm::unmap_exact` has torn the mapping
-    /// down, or leaked if the unmap fails and a live mapping still
+    /// down. Kept while a blocked unmap waits for its retry. Leaked if
+    /// the unmap fails and is not retried, since a live mapping still
     /// covers the address. `None` when the VA is managed externally,
     /// as on the firmware load path.
     kernel_node: Option<range::LiveRange>,
@@ -606,14 +610,57 @@ impl KernelBo {
     }
 }
 
-/// The captures that `KernelBo::drop` passes to `kernel_bo_unmap`.
-struct KernelBoCleanup {
-    vm: Arc<Vm>,
+/// The captures that `KernelBo::drop` passes to the unmap.
+pub(crate) struct KernelBoCleanup {
     bo: ARef<Bo>,
+    /// Declared after `bo`, since the VM may hold the last device reference.
+    vm: Arc<Vm>,
     va_range: Range<u64>,
     /// Kernel-VA pool reservation, held until the deferred unmap has
     /// torn down the GPU PTEs.
     kernel_node: Option<range::LiveRange>,
+}
+
+impl KernelBoCleanup {
+    /// Tears down the mapping, then releases the VA reservation.
+    fn unmap(&mut self) -> Result {
+        self.vm
+            .unmap_exact(self.va_range.start, va_range_size(&self.va_range))?;
+        self.kernel_node = None;
+        Ok(())
+    }
+
+    /// Retries an unmap that failed on a blocked address space, returning
+    /// whether it is still blocked.
+    pub(crate) fn retry_unmap(&mut self) -> bool {
+        match self.unmap() {
+            Ok(()) => false,
+            Err(e) if mmu::update_blocked(e) => true,
+            Err(e) => {
+                self.log_failure(e);
+                false
+            }
+        }
+    }
+
+    fn log_failure(&self, e: Error) {
+        dev_err!(
+            self.vm.dev(),
+            "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
+            self.va_range.start,
+            self.va_range.end,
+            e
+        );
+    }
+}
+
+impl Drop for KernelBoCleanup {
+    fn drop(&mut self) {
+        // The unmap failed, and the live mapping still covers the address.
+        if let Some(node) = self.kernel_node.take() {
+            node.leak();
+        }
+    }
 }
 
 impl Drop for KernelBo {
@@ -644,54 +691,40 @@ impl Drop for KernelBo {
     }
 }
 
-/// Runs `kernel_bo_unmap` from the hand-off, resuming the device first if the
-/// VM kept its AS slot across a runtime suspend.
-fn kernel_bo_unmap_deferred(captures: KernelBoCleanup) {
-    let tdev = captures.bo.dev();
+/// Unmaps a `KernelBo` from the hand-off, resuming the device first if the
+/// VM kept its AS slot across a runtime suspend. An unmap that fails on a
+/// blocked address space is retried once the address space is released.
+fn kernel_bo_unmap_deferred(mut captures: KernelBoCleanup) {
+    let tdev = ARef::from(captures.bo.dev());
     let _awake = tdev.registration_guard().and_then(|guard| {
         guard.registration_data_with(|reg_data| {
             tdev.resume_for_vm_update(reg_data, &captures.vm.as_data)
                 .ok()
         })
     });
-    kernel_bo_unmap(captures);
-}
-
-/// Tears down a `KernelBo` mapping and then releases the VA
-/// reservation. Runs on the cleanup workqueue, or inline for a firmware
-/// section.
-fn kernel_bo_unmap(captures: KernelBoCleanup) {
-    let KernelBoCleanup {
-        vm,
-        bo,
-        va_range,
-        kernel_node,
-    } = captures;
-    let unmapped = vm
-        .unmap_exact(va_range.start, va_range_size(&va_range))
-        .inspect_err(|e| {
-            dev_err!(
-                vm.dev(),
-                "Failed to unmap KernelBo range {:#x}..{:#x}: {:?}\n",
-                va_range.start,
-                va_range.end,
+    match captures.unmap() {
+        Ok(()) => {}
+        Err(e) if mmu::update_blocked(e) => {
+            dev_warn!(
+                captures.vm.dev(),
+                "Failed to unmap KernelBo range {:#x}..{:#x}, retrying later: {:?}\n",
+                captures.va_range.start,
+                captures.va_range.end,
                 e
             );
-        })
-        .is_ok();
-    drop(bo);
-    release_kernel_va(kernel_node, unmapped);
+            TyrDrmDeviceData::defer_unmap(&tdev, DeadMapping::KernelBo(captures));
+        }
+        Err(e) => captures.log_failure(e),
+    }
+}
+
+/// Unmaps a firmware section's `KernelBo` inline.
+fn kernel_bo_unmap(mut captures: KernelBoCleanup) {
+    if let Err(e) = captures.unmap() {
+        captures.log_failure(e);
+    }
 }
 
 fn va_range_size(va_range: &Range<u64>) -> u64 {
     va_range.end.saturating_sub(va_range.start)
-}
-
-/// Frees the kernel-VA reservation, or keeps it out of the pool when the
-/// unmap failed and a live mapping still covers the address.
-fn release_kernel_va(node: Option<range::LiveRange>, unmapped: bool) {
-    match node {
-        Some(node) if !unmapped => node.leak(),
-        node => drop(node),
-    }
 }
