@@ -153,6 +153,10 @@ impl<'a, T: Send + Sync + FenceContextOps> FenceContext<T> {
     ///
     /// This is needed because many times, creation of a [`DriverFence`] must not
     /// fail, and allocating might deadlock in some situations.
+    ///
+    /// If `data` needs to be dropped, dropping the [`DriverFence`] waits for an
+    /// RCU grace period before dropping `data`, so it must happen in a context
+    /// that can sleep.
     pub fn new_fence_allocation(
         &self,
         data: T::FenceDataType,
@@ -741,7 +745,8 @@ struct DriverFenceData<'a, T: Send + Sync + FenceContextOps> {
     inner: Fence,
     /// Reference to access the FenceContext.
     fctx: &'a FenceContext<T>,
-    /// The API user's data.
+    /// The API user's data, dropped by [`DriverFence`]'s [`Drop`] after an RCU
+    /// grace period.
     #[pin]
     data: T::FenceDataType,
 }
@@ -1131,10 +1136,17 @@ impl<'a, T: Send + Sync + FenceContextOps> Drop for DriverFence<'a, T> {
         // then remove synchronize_rcu().
         synchronize_rcu();
 
-        // SAFETY: Valid because `self` is valid.
-        unsafe { drop_in_place(&raw mut self.data) };
+        // `as_raw()` references the whole `DriverFenceData`, so take the
+        // pointer before the payload is dropped.
+        let fence = self.as_raw();
 
-        // SAFETY: The `synchronize_rcu()` above ensures all accessors are gone.
-        unsafe { bindings::dma_fence_put(self.as_raw()) };
+        // SAFETY: `self.data` points to a valid `DriverFenceData` because
+        // `self` is valid. The `synchronize_rcu()` above ensures that no one
+        // accesses the payload any more, and nothing drops it after this.
+        unsafe { drop_in_place(&raw mut (*self.data.as_ptr()).data) };
+
+        // SAFETY: `fence` is valid until this reference is put. The
+        // `synchronize_rcu()` above ensures all accessors are gone.
+        unsafe { bindings::dma_fence_put(fence) };
     }
 }
