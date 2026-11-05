@@ -154,6 +154,11 @@ impl Controller {
     }
 
     #[inline]
+    fn is_idle(&self) -> bool {
+        self.state.load(Relaxed) == ResetState::Idle
+    }
+
+    #[inline]
     fn is_in_progress(&self) -> bool {
         self.state.load(Relaxed) == ResetState::InProgress
     }
@@ -423,6 +428,14 @@ impl ResetHandle {
     pub(crate) fn set_ready(&self) {
         if self.inner.controller.set_ready() {
             let _ = self.inner.wq.enqueue(self.inner.controller.clone());
+        }
+    }
+
+    /// Asks for a GPU reset only from the idle state, for paths that repeat the
+    /// request. Unlike `schedule`, it queues no worker for a pending request.
+    pub(crate) fn schedule_if_idle(&self) {
+        if self.inner.controller.is_idle() {
+            self.schedule();
         }
     }
 

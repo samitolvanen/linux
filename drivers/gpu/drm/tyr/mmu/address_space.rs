@@ -479,6 +479,8 @@ impl AddressSpaceManager {
         let slot = self.validate_as_slot(as_nr)?;
 
         if self.stuck[slot.get()] {
+            // A reset in progress absorbs the timeout's request, so ask again once idle.
+            self.reset.schedule_if_idle();
             return Err(ETIMEDOUT);
         }
 
