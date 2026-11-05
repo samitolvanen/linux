@@ -335,6 +335,10 @@ pub(crate) struct AddressSpaceManager {
     /// timeout sets it, and a completed reset or a resume clears it.
     stuck: [bool; MAX_AS],
 
+    /// Whether a cache flush timed out and may still be active. A completed
+    /// reset, a resume or the flush's late completion clears it.
+    flush_stuck: bool,
+
     /// Set from runtime suspend until resume. A binding kept by a failed
     /// eviction leaves its VM resident, so AS commands fail before touching
     /// the registers while this is set.
@@ -404,6 +408,7 @@ impl AddressSpaceManager {
             lock_pending: [false; MAX_AS],
             faulty: [false; MAX_AS],
             stuck: [false; MAX_AS],
+            flush_stuck: false,
             suspended: false,
             reset,
         })
@@ -443,6 +448,24 @@ impl AddressSpaceManager {
         if self.suspended {
             return Err(EBUSY);
         }
+        Ok(())
+    }
+
+    /// Fails while a timed-out cache flush may still be active, since a flush
+    /// command issued during an active flush is undefined.
+    fn check_flush_done(&mut self) -> Result {
+        if !self.flush_stuck {
+            return Ok(());
+        }
+
+        let io = self.iomem.access(self.dev())?;
+        if !io.read(GPU_IRQ_RAWSTAT).clean_caches_completed() {
+            // A reset in progress absorbs the timeout's request, so ask again.
+            self.reset.schedule();
+            return Err(ETIMEDOUT);
+        }
+
+        self.flush_stuck = false;
         Ok(())
     }
 
@@ -710,16 +733,17 @@ impl AddressSpaceManager {
 
     /// Issues the GPU-side `flush_caches` command and waits for completion.
     ///
-    /// The completion bit is cleared before and after polling so each call
-    /// observes only its own completion event. This affects all GPU caches
-    /// globally. It does not touch MMU AS lock state.
+    /// The completion bit is cleared before the command and after its completion
+    /// so each call observes only its own completion event. This affects all GPU
+    /// caches globally. It does not touch MMU AS lock state.
     pub(super) fn gpu_flush_caches(
-        &self,
+        &mut self,
         l2: FlushMode,
         lsc: FlushMode,
         other: FlushMode,
     ) -> Result {
         self.check_powered()?;
+        self.check_flush_done()?;
 
         let dev = self.dev();
         let io = self.iomem.access(dev)?;
@@ -738,21 +762,21 @@ impl AddressSpaceManager {
         let res =
             poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
 
-        // Always clear the bit, even on timeout, to leave the next caller
-        // in a known state.
+        if let Err(e) = res {
+            // The GPU stopped acknowledging cache maintenance. Only a
+            // reset unblocks the situation.
+            dev_err!(dev, "Flush caches timeout\n");
+            self.reset.schedule();
+            self.flush_stuck = true;
+            return Err(e);
+        }
+
         io.write(
             GPU_IRQ_CLEAR,
             GPU_IRQ_CLEAR::zeroed().with_clean_caches_completed(true),
         );
 
-        if res.is_err() {
-            // The GPU stopped acknowledging cache maintenance. Only a
-            // reset unblocks the situation.
-            dev_err!(dev, "Flush caches timeout\n");
-            self.reset.schedule();
-        }
-
-        res.map(|_| ())
+        Ok(())
     }
 }
 
@@ -900,6 +924,7 @@ impl AsSlotManager {
     /// the hardware. The caller guarantees no slot is programmed.
     pub(super) fn release_vms(&mut self) {
         self.stuck = [false; MAX_AS];
+        self.flush_stuck = false;
         for slot_idx in 0..self.slot_count() {
             // Clone the VM here because slot_data borrows self and release_vm
             // takes &mut self.
@@ -974,6 +999,7 @@ impl AsSlotManager {
     pub(super) fn resume(&mut self, release: bool) {
         self.suspended = false;
         self.stuck = [false; MAX_AS];
+        self.flush_stuck = false;
         if release {
             self.release_vms();
         }
