@@ -257,12 +257,13 @@ pub(crate) struct AddressSpaceManager {
     /// Live page-fault IRQ mask, shared with the MMU IRQ handler.
     fault_mask: Arc<PageFaultMask>,
 
-    /// Whether hardware AS slot N currently holds a region lock.
+    /// The region locked on hardware AS slot N, if any, before the hardware
+    /// rounds it up. A completed Unlock or programming the slot clears it.
     ///
     /// The lock is tracked per slot. Every Lock and Unlock on a slot goes
     /// through `as_start_update`, `as_end_update`, and `as_disable` under the
-    /// `as_manager` mutex, so the flag follows whichever VM occupies the slot.
-    lock_pending: [bool; MAX_AS],
+    /// `as_manager` mutex, so the region follows whichever VM occupies the slot.
+    locked_region: [Option<Range<u64>>; MAX_AS],
 
     /// Whether hardware AS slot N was unprogrammed for a faulted or
     /// unusable VM while its slot binding was kept. Cleared when the slot
@@ -312,7 +313,7 @@ impl AddressSpaceManager {
             iomem,
             as_present,
             fault_mask,
-            lock_pending: [false; MAX_AS],
+            locked_region: [const { None }; MAX_AS],
             faulty: [false; MAX_AS],
             stuck: [false; MAX_AS],
             flush_stuck: false,
@@ -478,7 +479,7 @@ impl AddressSpaceManager {
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
         self.faulty[slot.get()] = false;
-        self.lock_pending[slot.get()] = false;
+        self.locked_region[slot.get()] = None;
 
         Ok(())
     }
@@ -498,7 +499,7 @@ impl AddressSpaceManager {
 
         // Reclaiming a slot mid-update leaves the region lock from
         // `as_start_update` unbalanced. Release it before the slot is reused.
-        if self.lock_pending[slot.get()] {
+        if self.locked_region[slot.get()].is_some() {
             self.as_end_update(as_nr)?;
         }
 
@@ -564,6 +565,13 @@ impl AddressSpaceManager {
         if region.is_empty() {
             return Ok(());
         }
+
+        // A LOCK clears the slot's earlier lock, whose flush may not have
+        // completed, so the new lock also covers the earlier region.
+        let region = match &self.locked_region[slot.get()] {
+            Some(held) => held.start.min(region.start)..held.end.max(region.end),
+            None => region.clone(),
+        };
 
         // The lock operates on full 64-byte cache lines of translation table entries.
         // Since each translation table entry (TTE) is 8 bytes, a cache line has 8 TTEs.
@@ -631,7 +639,7 @@ impl AddressSpaceManager {
         }
 
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Lock)?;
-        self.lock_pending[slot.get()] = true;
+        self.locked_region[slot.get()] = Some(region);
         Ok(())
     }
 
@@ -647,7 +655,7 @@ impl AddressSpaceManager {
             FlushMode::None,
         )?;
         self.as_send_cmd_and_wait(as_nr, MmuCommand::Unlock)?;
-        self.lock_pending[slot.get()] = false;
+        self.locked_region[slot.get()] = None;
         Ok(())
     }
 
