@@ -927,6 +927,7 @@ impl WorkItem for VmExec {
 struct GpuVmRelease {
     gpuvm: ARef<GpuVm<GpuVmData>>,
     unique: Option<UniqueRefGpuVm<GpuVmData>>,
+    mmu: Arc<Mmu>,
 }
 
 /// Flushes the deferred `vm_bo` list, then drops the gpuvm references
@@ -935,8 +936,8 @@ struct GpuVmRelease {
 /// The flush takes the gpuvm reservation lock, so `VmExec::drop` defers
 /// it to the cleanup workqueue, except for the firmware VM.
 fn release_gpuvm(release: GpuVmRelease) {
-    let GpuVmRelease { gpuvm, unique } = release;
-    gpuvm.deferred_cleanup();
+    let GpuVmRelease { gpuvm, unique, mmu } = release;
+    mmu.cleanup_gpuvm(&gpuvm);
     drop(unique);
     drop(gpuvm);
 }
@@ -962,6 +963,7 @@ impl PinnedDrop for VmExec {
         let release = GpuVmRelease {
             gpuvm,
             unique: gpuvm_unique,
+            mmu: this.mmu.clone(),
         };
         // The firmware VM is dropped only by probe, unbind and the cleanup
         // workqueue, outside any signalling section.
@@ -1605,7 +1607,11 @@ impl VmExec {
     }
 
     pub(crate) fn flush_deferred_cleanup(&self) {
-        self.gpuvm.deferred_cleanup();
+        // A VM operation holds this lock until its flush ends, then calls this again. A cleanup
+        // that loses the lock to another holder waits for the next VM operation or VM drop.
+        if self.gpuvm_unique.try_lock().is_some() {
+            self.mmu.cleanup_gpuvm(&self.gpuvm);
+        }
     }
 
     #[expect(clippy::too_many_arguments)]

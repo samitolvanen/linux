@@ -15,12 +15,17 @@ use core::ops::Range;
 
 use kernel::{
     device::Bound,
+    drm::gpuvm::GpuVm,
     io::mem::DevresIoMem,
     new_mutex,
     platform,
     prelude::*,
     sizes::SZ_2M,
     sync::{
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         Mutex, //
@@ -29,6 +34,7 @@ use kernel::{
 
 use crate::{
     driver::{
+        DeadMapping,
         IoMem,
         TyrDrmRegistrationData, //
     },
@@ -56,7 +62,8 @@ use crate::{
         },
         ResetHandle, //
     },
-    slot::SlotManager, //
+    slot::SlotManager,
+    vm::GpuVmData, //
 };
 
 pub(crate) mod address_space;
@@ -85,6 +92,13 @@ pub(crate) struct Mmu {
     /// Slot Manager instance used to allocate hardware slots and write to MMU registers.
     #[pin]
     pub(crate) as_manager: Mutex<AsSlotManager>,
+
+    /// Whether the flush of an update failed, so the pages it unmapped can still
+    /// be written. Only stopping the GPU clears it.
+    pub(crate) flush_owed: Atomic<bool>,
+
+    /// Dead mappings of the device, including GPUVMs that wait for `flush_owed` to clear.
+    pub(crate) dead_mappings: Arc<Mutex<KVec<DeadMapping>>>,
 }
 
 impl Mmu {
@@ -124,6 +138,8 @@ impl Mmu {
             hw_gate,
             fault_mask,
             as_manager <- new_mutex!(as_slot_manager),
+            flush_owed: Atomic::new(false),
+            dead_mappings: Arc::pin_init(new_mutex!(KVec::new()), GFP_KERNEL)?,
         });
         Arc::pin_init(mmu_init, GFP_KERNEL)
     }
@@ -260,7 +276,25 @@ impl Mmu {
     /// range go through, in case any of them were blocked.
     /// If the region is empty or the VM is not resident, this is a NOP.
     pub(crate) fn end_vm_update(&self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
-        self.as_manager.lock().end_vm_update(vm_as_data, region)
+        let mut as_manager = self.as_manager.lock();
+        let result = as_manager.end_vm_update(vm_as_data, region);
+        if matches!(result, Err(e) if update_blocked(e)) {
+            self.flush_owed.store(true, Relaxed);
+        }
+        result
+    }
+
+    /// Runs the deferred cleanup of `gpuvm`, or parks it on `dead_mappings` while a flush is
+    /// owed. A failed allocation leaves the vm_bos, which pin `gpuvm`.
+    pub(crate) fn cleanup_gpuvm(self: &Arc<Self>, gpuvm: &GpuVm<GpuVmData>) {
+        let mut list = self.dead_mappings.lock();
+        let parked = |m: &DeadMapping| matches!(m, DeadMapping::Gpuvm(vm, _) if **vm == *gpuvm);
+        if !self.flush_owed.load(Relaxed) {
+            drop(list);
+            gpuvm.deferred_cleanup();
+        } else if !list.iter().any(parked) {
+            let _ = list.push(DeadMapping::Gpuvm(gpuvm.into(), self.clone()), GFP_KERNEL);
+        }
     }
 }
 
@@ -301,6 +335,7 @@ pub(crate) fn post_reset(
         let mut as_manager = reg_data.mmu.as_manager.lock();
         as_manager.release_vms();
         reg_data.mmu.fault_mask.mask_all(io);
+        reg_data.mmu.flush_owed.store(false, Relaxed);
     }
 
     unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
@@ -325,6 +360,9 @@ pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>, rele
         let mut as_manager = reg_data.mmu.as_manager.lock();
         as_manager.resume(release);
         as_manager.release_vm(reg_data.fw.vm_as_data());
+        if release {
+            reg_data.mmu.flush_owed.store(false, Relaxed);
+        }
     }
     unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
 }
@@ -333,4 +371,5 @@ pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>, rele
 /// halted.
 pub(crate) fn unbind(mmu: &Mmu) {
     mmu.as_manager.lock().release_vms();
+    mmu.flush_owed.store(false, Relaxed);
 }
