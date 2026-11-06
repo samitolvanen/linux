@@ -38,6 +38,7 @@ use kernel::{
         gpuvm::{
             DriverGpuVm,
             GpuVaAlloc,
+            GpuVaRemoved,
             GpuVm,
             GpuVmBo,
             OpMap,
@@ -626,6 +627,9 @@ pub(crate) struct PtUpdateContext<'ctx> {
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
 
+    /// Mappings this update removed, which keep their BOs until the flush on drop ends.
+    removed: RemovedVas,
+
     /// Held for the whole update, so the reset worker drains it before
     /// wiping the hardware that the flush on drop polls.
     _hw: HwReadGuard<'ctx>,
@@ -667,6 +671,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
             region,
             op_type,
             resources,
+            removed: RemovedVas::default(),
             _hw,
             _op_lock,
         })
@@ -694,6 +699,13 @@ impl<'ctx> PtUpdateContext<'ctx> {
         }
     }
 
+    fn remove_va<'op>(&mut self, op: OpUnmap<'op, GpuVmData>) -> OpUnmapped<'op, GpuVmData> {
+        let vm_bo = ARef::from(op.va().vm_bo());
+        let (op_unmapped, va_removed) = op.remove();
+        self.removed.push(va_removed, vm_bo);
+        op_unmapped
+    }
+
     /// Widens the AS lock to also cover `region`.
     ///
     /// A remap can rebuild fragments beyond the originally locked request,
@@ -712,7 +724,10 @@ impl<'ctx> PtUpdateContext<'ctx> {
 
 impl Drop for PtUpdateContext<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.mmu.end_vm_update(self.as_data, &self.region) {
+        if let Err(e) = self
+            .mmu
+            .end_vm_update(self.as_data, &self.region, &mut self.removed)
+        {
             dev_err!(self.dev, "Failed to end VM update {:?}", e);
         }
 
@@ -792,6 +807,65 @@ impl GpuVmData {
 pub(crate) struct GpuVaData {
     /// Memory protection flags of this mapping, as passed to `pt_map`.
     prot: u32,
+    /// Holds the BO while the mapping is on a `RemovedVas`.
+    removed_vm_bo: Option<ARef<GpuVmBo<GpuVmData>>>,
+    /// The next mapping on a `RemovedVas`.
+    next_removed: RemovedVas,
+}
+
+impl GpuVaData {
+    fn new(prot: u32) -> Self {
+        Self {
+            prot,
+            removed_vm_bo: None,
+            next_removed: RemovedVas::default(),
+        }
+    }
+}
+
+/// Mappings that left the VA tree, each with a reference to its `GpuVmBo`. They link through their
+/// `GpuVaData`, so the list grows without allocating in a signalling section.
+#[derive(Default)]
+pub(crate) struct RemovedVas(Option<GpuVaRemoved<GpuVmData>>);
+
+impl RemovedVas {
+    fn push(&mut self, mut va: GpuVaRemoved<GpuVmData>, vm_bo: ARef<GpuVmBo<GpuVmData>>) {
+        va.removed_vm_bo = Some(vm_bo);
+        va.next_removed.0 = self.0.take();
+        self.0 = Some(va);
+    }
+
+    fn pop(&mut self) -> Option<ARef<GpuVmBo<GpuVmData>>> {
+        let mut va = self.0.take()?;
+        self.0 = va.next_removed.0.take();
+        va.removed_vm_bo.take()
+    }
+
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        while let Some(mut va) = other.0.take() {
+            other.0 = va.next_removed.0.take();
+            va.next_removed.0 = self.0.take();
+            self.0 = Some(va);
+        }
+    }
+
+    /// Drops the references and cleans up each `GpuVmBo` that lost its last one, which can free
+    /// the BO. Takes reservation locks, so it must not run in a dma-fence signalling section.
+    pub(crate) fn release(mut self) {
+        while let Some(vm_bo) = self.pop() {
+            let gpuvm = ARef::from(vm_bo.gpuvm());
+            drop(vm_bo);
+            gpuvm.deferred_cleanup();
+        }
+    }
+}
+
+impl Drop for RemovedVas {
+    /// Leaves the `GpuVmBo`s on the deferred list of their VM.
+    fn drop(&mut self) {
+        // Dropping the head alone would recurse through the links.
+        while self.pop().is_some() {}
+    }
 }
 
 fn max_va_range(gpu_info: &GpuInfo) -> u64 {
@@ -1802,7 +1876,7 @@ impl DriverGpuVm for GpuVmData {
         }
 
         let gpuva = context.preallocated_gpuva()?;
-        let op = op.insert(gpuva, GpuVaData { prot });
+        let op = op.insert(gpuva, GpuVaData::new(prot));
 
         Ok(op)
     }
@@ -1832,9 +1906,7 @@ impl DriverGpuVm for GpuVmData {
             result?;
         }
 
-        let (op_unmapped, _va_removed) = op.remove();
-
-        Ok(op_unmapped)
+        Ok(context.remove_va(op))
     }
 
     /// Split up an existing mapping.
@@ -1933,8 +2005,11 @@ impl DriverGpuVm for GpuVmData {
             .inspect_err(|_| self.mark_failed(context, &(region_start..region_end)))?;
         }
 
-        let (op_remapped, remap_ret) =
-            op.remap([prev_va, next_va], GpuVaData { prot }, GpuVaData { prot });
+        let (op_remapped, remap_ret) = op.remap(
+            [prev_va, next_va],
+            GpuVaData::new(prot),
+            GpuVaData::new(prot),
+        );
 
         if let Some(unused_va) = remap_ret.unused_va {
             context.return_preallocated_gpuva(unused_va);

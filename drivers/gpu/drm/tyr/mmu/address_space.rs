@@ -71,9 +71,12 @@ use crate::{
         Seat,
         SlotOperations, //
     },
-    vm::pt_alloc::{
-        DevresPageTable,
-        PtAllocator, //
+    vm::{
+        pt_alloc::{
+            DevresPageTable,
+            PtAllocator, //
+        },
+        RemovedVas, //
     }, //
 };
 
@@ -278,6 +281,9 @@ pub(crate) struct AddressSpaceManager {
     /// reset, a resume or the flush's late completion clears it.
     flush_stuck: bool,
 
+    /// Mappings of the updates that ended while `Mmu::flush_owed` was set.
+    pub(super) removed: RemovedVas,
+
     /// Set from runtime suspend until resume. A binding kept by a failed
     /// eviction leaves its VM resident, so AS commands fail before touching
     /// the registers while this is set.
@@ -317,6 +323,7 @@ impl AddressSpaceManager {
             faulty: [false; MAX_AS],
             stuck: [false; MAX_AS],
             flush_stuck: false,
+            removed: RemovedVas::default(),
             suspended: false,
             reset,
         })

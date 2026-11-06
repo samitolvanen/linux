@@ -21,6 +21,10 @@ use kernel::{
     prelude::*,
     sizes::SZ_2M,
     sync::{
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         ArcBorrow,
         Mutex, //
@@ -56,7 +60,8 @@ use crate::{
         },
         ResetHandle, //
     },
-    slot::SlotManager, //
+    slot::SlotManager,
+    vm::RemovedVas, //
 };
 
 pub(crate) mod address_space;
@@ -85,6 +90,10 @@ pub(crate) struct Mmu {
     /// Slot Manager instance used to allocate hardware slots and write to MMU registers.
     #[pin]
     pub(crate) as_manager: Mutex<AsSlotManager>,
+
+    /// Whether the flush of an update failed, so the pages it unmapped can still
+    /// be written. Only stopping the GPU clears it.
+    pub(crate) flush_owed: Atomic<bool>,
 }
 
 impl Mmu {
@@ -124,6 +133,7 @@ impl Mmu {
             hw_gate,
             fault_mask,
             as_manager <- new_mutex!(as_slot_manager),
+            flush_owed: Atomic::new(false),
         });
         Arc::pin_init(mmu_init, GFP_KERNEL)
     }
@@ -259,8 +269,35 @@ impl Mmu {
     /// If the VM is resident, this will let GPU accesses on the updated
     /// range go through, in case any of them were blocked.
     /// If the region is empty or the VM is not resident, this is a NOP.
-    pub(crate) fn end_vm_update(&self, vm_as_data: &VmAsData, region: &Range<u64>) -> Result {
-        self.as_manager.lock().end_vm_update(vm_as_data, region)
+    ///
+    /// The AS manager takes over the mappings in `removed` if a flush is owed.
+    pub(crate) fn end_vm_update(
+        &self,
+        vm_as_data: &VmAsData,
+        region: &Range<u64>,
+        removed: &mut RemovedVas,
+    ) -> Result {
+        let mut as_manager = self.as_manager.lock();
+        let result = as_manager.end_vm_update(vm_as_data, region);
+        if matches!(result, Err(e) if update_blocked(e)) {
+            self.flush_owed.store(true, Relaxed);
+        }
+        if self.flush_owed.load(Relaxed) {
+            as_manager.removed.append(removed);
+        }
+        result
+    }
+
+    /// Releases the mappings kept for a failed flush, unless one is still owed.
+    pub(crate) fn release_removed(&self) {
+        let removed = {
+            let mut as_manager = self.as_manager.lock();
+            if self.flush_owed.load(Relaxed) {
+                return;
+            }
+            core::mem::take(&mut as_manager.removed)
+        };
+        removed.release();
     }
 }
 
@@ -301,6 +338,7 @@ pub(crate) fn post_reset(
         let mut as_manager = reg_data.mmu.as_manager.lock();
         as_manager.release_vms();
         reg_data.mmu.fault_mask.mask_all(io);
+        reg_data.mmu.flush_owed.store(false, Relaxed);
     }
 
     unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
@@ -325,12 +363,17 @@ pub(crate) fn resume(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>, rele
         let mut as_manager = reg_data.mmu.as_manager.lock();
         as_manager.resume(release);
         as_manager.release_vm(reg_data.fw.vm_as_data());
+        if release {
+            reg_data.mmu.flush_owed.store(false, Relaxed);
+        }
     }
     unquiesce(&reg_data.mmu_irq, io, |io| reg_data.mmu.enable_irq(io));
 }
 
-/// Releases the AS slot bindings kept by failed evictions, once the GPU is
-/// halted.
+/// Releases the AS slot bindings kept by failed evictions and the mappings kept
+/// for a failed flush, once the GPU is halted.
 pub(crate) fn unbind(mmu: &Mmu) {
     mmu.as_manager.lock().release_vms();
+    mmu.flush_owed.store(false, Relaxed);
+    mmu.release_removed();
 }

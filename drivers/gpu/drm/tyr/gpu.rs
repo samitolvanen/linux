@@ -318,9 +318,9 @@ pub(crate) fn reset(dev: &Device, io: &IoMem<'_>) -> Result {
 }
 
 /// Stops the GPU IRQ and powers the L2 block off for runtime suspend.
-pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) {
+pub(crate) fn suspend(reg_data: &TyrDrmRegistrationData<'_>, io: &IoMem<'_>) -> Result {
     quiesce(&reg_data.gpu_irq, io, irq::gpu_irq_disable);
-    let _ = l2_power_off(reg_data.pdev.as_ref(), io);
+    l2_power_off(reg_data.pdev.as_ref(), io)
 }
 
 /// Powers the L2 block on and re-enables the GPU IRQ for runtime resume.
