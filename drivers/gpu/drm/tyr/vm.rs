@@ -1944,6 +1944,12 @@ impl VmExec {
         self.gpuvm.deferred_cleanup();
     }
 
+    /// Fails with `EBUSY` while an update of this VM can still be flushing. A mapping added after
+    /// an eviction and then unmapped leaves a fully evicted `GpuVmBo` while its flush runs.
+    pub(crate) fn check_no_update(&self) -> Result {
+        self.gpuvm_unique.try_lock().map(drop).ok_or(EBUSY)
+    }
+
     /// Returns whether the VM has no jobs in flight, waiting up to `timeout`
     /// for them to finish.
     ///
