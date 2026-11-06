@@ -541,15 +541,16 @@ fn soft_reset(dev: &Device, iomem: &Devres<IoMem>) -> Result {
 }
 
 /// Masks the interrupts and powers the L2 block off for runtime suspend.
-pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) {
+pub(crate) fn suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriverData>) -> Result {
     let bound = dev.as_ref();
     let tdev = &data.device;
     tdev.gpu_irq
         .quiesce(bound, &tdev.iomem, irq::gpu_irq_disable);
-    let _ = tdev.hw_ops.l2_power_off(bound, &tdev.iomem);
+    let result = tdev.hw_ops.l2_power_off(bound, &tdev.iomem);
     if let Some(pwr_irq) = &tdev.pwr_irq {
         pwr_irq.quiesce(bound, &tdev.iomem, pwr::pwr_irq_disable);
     }
+    result
 }
 
 /// Powers the L2 block on and unmasks the interrupts for runtime resume.
