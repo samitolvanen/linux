@@ -567,8 +567,9 @@ impl TyrDrmDeviceData {
         Self::schedule_dead_mappings(tdev);
     }
 
-    /// Retries the dead mapping unmaps on the cleanup workqueue, after a
-    /// reset or resume that may have released their address spaces.
+    /// Retries the dead mappings on the cleanup workqueue and releases the mappings kept for a
+    /// failed flush, after a reset, resume or L2 power-off that may have released their address
+    /// spaces or cleared `Mmu::flush_owed`.
     pub(crate) fn schedule_dead_mappings(tdev: &ARef<TyrDrmDevice>) {
         let _ = cleanup::enqueue::<ARef<TyrDrmDevice>, { work_id::DEAD_MAPPINGS }>(tdev.clone());
     }
@@ -749,6 +750,9 @@ impl WorkItem<{ work_id::DEAD_MAPPINGS }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
+        if let Some(guard) = this.registration_guard() {
+            guard.registration_data_with(|reg_data| reg_data.mmu.release_removed());
+        }
         this.retry_dead_mappings();
     }
 }
