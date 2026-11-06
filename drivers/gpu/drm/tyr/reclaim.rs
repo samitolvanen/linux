@@ -367,6 +367,8 @@ fn mapping_vm(resv: &ResvGuard<'_, Bo>) -> Result<Arc<VmReclaim>> {
 /// Fails with `EAGAIN` if the BO is now harder to reclaim than its state says, or than `max`.
 /// The caller holds the reservation lock of `held`.
 fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState, held: Option<&VmReclaim>) -> Result {
+    check_flushed(resv.obj())?;
+
     {
         let gpuva = GemGpuvaGuard::try_lock(resv.obj()).ok_or(EBUSY)?;
         let (old, new) = update_state(resv, Some(&gpuva));
@@ -375,12 +377,14 @@ fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState, held: Option<&VmReclai
         }
 
         for vm_bo in gpuva.vm_bos() {
+            let vm = vm_bo.data().vm().ok_or(EBUSY)?;
+            let exec = vm.exec().ok_or(EBUSY)?;
+
             if is_fully_evicted(vm_bo, resv, &gpuva) {
+                exec.check_no_update()?;
                 continue;
             }
 
-            let vm = vm_bo.data().vm().ok_or(EBUSY)?;
-            let exec = vm.exec().ok_or(EBUSY)?;
             let locked = held.is_some_and(|held| ptr::eq(held, &**vm));
             let _vm_resv = if locked || vm.shares_resv(resv.obj()) {
                 None
@@ -392,10 +396,21 @@ fn evict(resv: &mut ResvGuard<'_, Bo>, max: ReclaimState, held: Option<&VmReclai
         }
     }
 
-    // SAFETY: Every GPU mapping of the BO is evicted. A new mapping pins the BO, which takes the
-    // reservation lock that `resv` holds.
+    // The flush of the eviction above can fail.
+    check_flushed(resv.obj())?;
+
+    // SAFETY: Every GPU mapping of the BO is evicted and no flush can still write to its pages.
+    // A new mapping pins the BO, which takes the reservation lock that `resv` holds.
     unsafe { resv.evict() }?;
     resv.obj().count_eviction();
+    Ok(())
+}
+
+/// Fails with `EBUSY` while a failed flush can still write to any BO.
+fn check_flushed(bo: &Bo) -> Result {
+    if bo.dev().mmu.flush_owed.load(Relaxed) {
+        return Err(EBUSY);
+    }
     Ok(())
 }
 
