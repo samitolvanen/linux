@@ -70,7 +70,7 @@ pub(crate) struct TyrPmPayload {
 /// Powers the hardware components down for runtime suspend, the reverse
 /// of `resume_hw_components`. Shared by runtime suspend and the
 /// resume-failure unwind. The caller gates the clocks afterward.
-fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
+fn suspend_hw_components(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationData<'_>) {
     let Ok(io) = reg_data.iomem.access(reg_data.pdev.as_ref()) else {
         dev_err!(
             reg_data.pdev,
@@ -85,7 +85,9 @@ fn suspend_hw_components(reg_data: &TyrDrmRegistrationData<'_>) {
     // user slots while still clocked so teardown hits no gated MMIO.
     mmu::suspend(reg_data, io);
 
-    gpu::suspend(reg_data, io);
+    if gpu::suspend(reg_data, io).is_ok() && reg_data.mmu.flush_owed.xchg(false, Relaxed) {
+        TyrDrmDeviceData::schedule_dead_mappings(tdev);
+    }
 }
 
 /// Brings the hardware components up for runtime resume, the reverse of
@@ -138,8 +140,9 @@ fn fail_resume(
     e: Error,
 ) -> Error {
     let e = latch_resume_failure(tdev, reg_data, e);
-    suspend_hw_components(reg_data);
+    suspend_hw_components(tdev, reg_data);
     reg_data.clks.lock().gate();
+    TyrDrmDeviceData::schedule_dead_mappings(tdev);
     e
 }
 
@@ -158,7 +161,7 @@ fn quiesce_and_suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationD
     sched::tick::suspend(tdev, reg_data);
     // Drain any worker that raced the gate before halting the hardware.
     tdev.drain_sched_work();
-    suspend_hw_components(reg_data);
+    suspend_hw_components(tdev, reg_data);
 }
 
 /// Powers the GPU down for runtime suspend.
