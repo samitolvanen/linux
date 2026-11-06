@@ -22,9 +22,9 @@ __rust_helper void rust_helper_dma_fence_end_signalling(bool cookie)
 	dma_fence_end_signalling(cookie);
 }
 
-__rust_helper bool rust_helper_dma_fence_is_signaled(struct dma_fence *f)
+__rust_helper bool rust_helper_dma_fence_is_signaled_locked(struct dma_fence *f)
 {
-	return dma_fence_is_signaled(f);
+	return dma_fence_is_signaled_locked(f);
 }
 
 __rust_helper bool rust_helper_dma_fence_test_signaled_flag(struct dma_fence *f)

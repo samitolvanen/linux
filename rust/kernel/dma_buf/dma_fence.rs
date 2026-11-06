@@ -504,40 +504,49 @@ unsafe impl Send for Fence {}
 // SAFETY: Fences are literally designed to be shared between threads.
 unsafe impl Sync for Fence {}
 
+/// Fence-Status queried through [`Fence::status()`].
+#[derive(Debug)]
+pub enum FenceStatus {
+    /// The fence is not yet signaled.
+    Unsignaled,
+    /// The fence is signaled. Might have been signaled with an error.
+    Signaled(Result),
+}
+
 impl Fence {
-    /// Check whether the fence was signaled at the moment of the function call.
+    /// Query a fence's error code and turn it into a [`Result`].
     ///
-    /// Note that this can return `true` for a [`Fence`] whose [`DriverFence`]
-    /// has not yet been dropped. The reason is that the fence ops callbacks can
-    /// cause the fence to get signaled by the C backend.
-    #[inline]
-    pub fn is_signaled(&self) -> bool {
-        // We should not use `dma_fence_is_signaled_locked()` here, because
-        // according to the C backend's recommendations, that function is
-        // problematic and we should avoid calling that function with a lock
-        // held.
+    /// # Safety
+    ///
+    /// The caller must only call this on fences that are already signaled.
+    unsafe fn __status(&self) -> Result {
+        // SAFETY: Safe by the function's safety requirements.
+        let res = unsafe { (*self.as_raw()).error };
 
-        // SAFETY: Inner `fence` is valid because `self` is valid.
-        let ret = unsafe { bindings::dma_fence_is_signaled(self.as_raw()) };
+        to_result(res)
+    }
 
-        // To be as robust as possible for the future we guarantee that an API
-        // caller can 100% rely on the signaling being completed (i.e., all
-        // fence callbacks ran), so we have to take the lock.
-        //
-        // The reason is that the C dma_fence backend currently does not
-        // carefully synchronize the `dma_fence_is_signaled()` function with the
-        // proper spinlock. This can lead to the function returning `true` while
-        // fence callbacks are still being executed. This can be mitigated by
-        // guarding the entire function with the spinlock.
-        //
-        // The fundamental reason is that the C backend currently does guard
-        // setting of the fence's signaled-bit with the fence's spinlock, but
-        // reading is done locklessly.
-        //
-        // See commit c8a5d5ea3ba6a.
-        let _ = self.lock();
+    /// Query a fence's status at the moment of the function call.
+    ///
+    /// If it is signaled, return the fence's result, i.e., determine if it was
+    /// signaled with an error.
+    pub fn status(&self) -> FenceStatus {
+        // The C backend provides `dma_fence_is_signaled()`. However, this is
+        // currently racy and could lead to misordering with our reading of the
+        // fence error code. Take the lock to prevent that.
+        let fence = self.lock();
+        // SAFETY: `fence` is valid because `self` is valid. The lock was
+        // taken above.
+        let signaled = unsafe { bindings::dma_fence_is_signaled_locked(fence.as_raw()) };
 
-        ret
+        if signaled {
+            // SAFETY: The fence is signaled.
+            let status = unsafe { fence.__status() };
+
+            return FenceStatus::Signaled(status);
+        }
+
+        FenceStatus::Unsignaled
     }
 
     /// Lock the fence. A helper only to be used internally in this module.
@@ -661,6 +670,7 @@ struct DriverFenceData<'a, T: Send + Sync + FenceContextOps> {
 ///         FenceContextOps,
 ///         FenceCallback,
 ///         FenceCallbackRegistration,
+///         FenceStatus, //
 ///     },
 ///     str::CString,
 ///     sync::aref::ARef, //
@@ -712,9 +722,15 @@ struct DriverFenceData<'a, T: Send + Sync + FenceContextOps> {
 /// let cb_reg = KBox::pin_init(cb_reg, GFP_KERNEL)?;
 ///
 /// // TODO signalling guards
-/// assert_eq!(waiting_fence.is_signaled(), false);
+///
+/// // TODO: add support for `assert_matches!()`.
+/// if let FenceStatus::Signaled(_) = waiting_fence.status() {
+///      return Err(ENOMSG);
+/// }
 /// fence.signal(Ok(()));
-/// assert_eq!(waiting_fence.is_signaled(), true);
+/// if let FenceStatus::Unsignaled = waiting_fence.status() {
+///     return Err(ENOENT);
+/// }
 ///
 /// Ok::<(), Error>(())
 /// ```
