@@ -135,6 +135,12 @@ impl<'a, T: Send + Sync + FenceContextOps> FenceContext<T> {
         })
     }
 
+    /// Obtain the FenceContext's ID number.
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.nr
+    }
+
     fn next_seqno(&self) -> u64 {
         self.seqno.fetch_add(1, Relaxed)
     }
