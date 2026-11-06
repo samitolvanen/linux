@@ -149,7 +149,10 @@ use crate::{
         MAX_CSGS, //
     },
     slot::SlotManager,
-    vm::VmExec,
+    vm::{
+        GpuVmData,
+        VmExec, //
+    },
 };
 
 #[cfg(CONFIG_DEBUG_FS)]
@@ -203,16 +206,26 @@ pub(crate) mod work_id {
     pub(crate) const FW_PING: u64 = 5;
     /// Syncwait poll of evicted groups.
     pub(crate) const SYNCWAIT_POLL: u64 = 6;
-    /// Retry of the dead mapping unmaps.
+    /// Retry of the dead mappings.
     pub(crate) const DEAD_MAPPINGS: u64 = 7;
 }
 
-/// A mapping whose unmap failed, retried after a reset, resume or unbind.
+/// Work left by an unmap, retried after a reset, resume or unbind.
 pub(crate) enum DeadMapping {
     /// The whole VA range of a killed VM.
     Vm(Arc<VmExec>),
     /// The VA range of a dropped kernel BO.
     KernelBo(KernelBoCleanup),
+    /// The deferred cleanup of a GPUVM, which waits for `Mmu::flush_owed` to clear.
+    Gpuvm(ARef<drm::gpuvm::GpuVm<GpuVmData>>),
+}
+
+/// Adds `mapping` to `list`. A failed allocation drops `mapping` after the unlock, since its drop
+/// can take the lock.
+fn push_dead_mapping(list: &Mutex<KVec<DeadMapping>>, mapping: DeadMapping) -> Result {
+    let mut list = list.lock();
+    list.reserve(1, GFP_KERNEL)?;
+    Ok(list.push(mapping, GFP_KERNEL)?)
 }
 
 pub(crate) struct TyrPlatformDriverData {
@@ -446,14 +459,7 @@ pub(crate) struct TyrDrmDeviceData {
     #[pin]
     unbind_halted: Completion,
 
-    /// Mappings whose unmap failed, retried by `dead_mapping_work` and at
-    /// unbind. Lock order `dead_mappings > {gpuvm, VM op_lock, hw_gate, AS slot
-    /// manager, kernel VA, dma_resv}`, because the retried unmaps run under the
-    /// lock.
-    #[pin]
-    dead_mappings: Mutex<KVec<DeadMapping>>,
-
-    /// Retries the unmap of `dead_mappings` on the cleanup workqueue.
+    /// Retries `Mmu::dead_mappings` on the cleanup workqueue.
     #[pin]
     dead_mapping_work: Work<TyrDrmDevice, { work_id::DEAD_MAPPINGS }>,
 
@@ -762,34 +768,43 @@ impl TyrDrmDeviceData {
 
     /// Defers a failed unmap to a later retry.
     pub(crate) fn defer_unmap(tdev: &ARef<TyrDrmDevice>, mapping: DeadMapping) {
-        if tdev.dead_mappings.lock().push(mapping, GFP_KERNEL).is_err() {
+        if push_dead_mapping(&tdev.mmu.dead_mappings, mapping).is_err() {
             return;
         }
         // A reset may have released the address space since the unmap failed.
         Self::schedule_dead_mappings(tdev);
     }
 
-    /// Retries the dead mapping unmaps on the cleanup workqueue, after a
-    /// reset or resume that may have released their address spaces.
+    /// Retries the dead mappings on the cleanup workqueue, after a reset, resume or L2 power-off
+    /// that may have released their address spaces or cleared `Mmu::flush_owed`.
     pub(crate) fn schedule_dead_mappings(tdev: &ARef<TyrDrmDevice>) {
         let _ = cleanup::enqueue::<ARef<TyrDrmDevice>, { work_id::DEAD_MAPPINGS }>(tdev.clone());
     }
 
-    /// Retries the dead mapping unmaps inline at unbind, after their address
-    /// spaces are released. A queued retry would hold a device reference and
-    /// delay the release of the clocks the device data owns.
+    /// Retries the dead mappings inline at unbind, after their address spaces are released and
+    /// `Mmu::flush_owed` is cleared. A queued retry would hold a device reference and delay the
+    /// release of the clocks the device data owns.
     pub(crate) fn unbind_dead_mappings(&self) {
         let _ = self.dead_mapping_work.cancel_sync();
         self.retry_dead_mappings();
     }
 
-    /// Retries the unmap of each dead mapping, keeping those that need another
-    /// retry.
+    /// Retries each dead mapping, keeping those that need another retry. A retry or its drop
+    /// can take the lock, so the retries run on a private batch.
     fn retry_dead_mappings(&self) {
-        self.dead_mappings.lock().retain(|mapping| match mapping {
+        let mut batch = core::mem::take(&mut *self.mmu.dead_mappings.lock());
+        batch.retain(|mapping| match mapping {
             DeadMapping::Vm(exec) => exec.unmap_all().is_err(),
             DeadMapping::KernelBo(cleanup) => cleanup.retry_unmap(),
+            DeadMapping::Gpuvm(gpuvm) => {
+                self.mmu.cleanup_gpuvm(gpuvm);
+                false
+            }
         });
+        let raced = core::mem::replace(&mut *self.mmu.dead_mappings.lock(), batch);
+        for mapping in raced {
+            let _ = push_dead_mapping(&self.mmu.dead_mappings, mapping);
+        }
     }
 
     /// Waits for unbind to halt the firmware and evict the resident groups if
@@ -1150,7 +1165,6 @@ impl TyrPlatformDriverData {
                 syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                 system_work_closed <- new_spinlock!(false),
                 unbind_halted <- Completion::new(),
-                dead_mappings <- new_mutex!(KVec::new()),
                 dead_mapping_work <- kernel::new_work!("TyrDrmDeviceData::dead_mapping_work"),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
@@ -1188,6 +1202,7 @@ impl TyrPlatformDriverData {
             tdev.mmu.suspend();
             let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
             mmu::unbind(&tdev);
+            tdev.unbind_dead_mappings();
             tdev.unbind_halted.complete_all();
         });
 

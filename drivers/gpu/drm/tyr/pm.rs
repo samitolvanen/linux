@@ -68,7 +68,9 @@ fn suspend_hw_components(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDr
     // user slots while still clocked so teardown hits no gated MMIO.
     mmu::suspend(dev, data);
 
-    gpu::suspend(dev, data);
+    if gpu::suspend(dev, data).is_ok() && tdev.mmu.flush_owed.xchg(false, ordering::Relaxed) {
+        TyrDrmDeviceData::schedule_dead_mappings(tdev);
+    }
 }
 
 /// Brings the hardware components up for runtime resume, the reverse of
@@ -109,6 +111,7 @@ fn fail_resume(
 
     suspend_hw_components(dev, data);
     tdev.clks.lock().gate();
+    TyrDrmDeviceData::schedule_dead_mappings(tdev);
 
     let _ = tdev.with_locked_scheduler(|sched| {
         sched.fail_all_groups();
