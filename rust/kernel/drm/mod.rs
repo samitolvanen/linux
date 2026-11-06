@@ -10,6 +10,7 @@ pub mod file;
 pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
+pub mod job_queue;
 pub mod legacy_job_queue;
 pub mod syncobj;
 
@@ -24,6 +25,9 @@ pub use self::driver::Driver;
 pub use self::driver::DriverInfo;
 pub use self::driver::Registration;
 pub use self::file::File;
+pub use self::job_queue::JobQueue;
+pub use self::job_queue::JobQueueOps;
+pub use self::job_queue::JobRunnable;
 
 pub(crate) mod private {
     pub trait Sealed {}
