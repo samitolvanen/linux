@@ -474,6 +474,14 @@ impl TyrDrmDeviceData {
         self.tick_work.inner.flush();
     }
 
+    /// Waits for the tick and firmware-events workers to finish. Both run in a
+    /// dma-fence signalling section, so a fence's completion path can wait for
+    /// them. Not callable under the scheduler or CSG slot-manager mutexes.
+    pub(crate) fn flush_tick_and_fw_events(&self) {
+        self.tick_work.inner.flush();
+        self.fw_events_work.inner.flush();
+    }
+
     /// Waits for the tick, firmware-events and sync-update workers to
     /// finish.
     ///
@@ -487,8 +495,7 @@ impl TyrDrmDeviceData {
     /// to the firmware. A failed heap growth can still queue a fresh
     /// tick after this returns, so callers gate the tick first.
     pub(crate) fn drain_sched_work(&self) {
-        self.tick_work.inner.flush();
-        self.fw_events_work.inner.flush();
+        self.flush_tick_and_fw_events();
         self.sync_upd_work.flush();
     }
 
