@@ -349,8 +349,8 @@ pub(crate) struct Group {
     /// device's `heap_alloc_wq`.
     #[pin]
     tiler_oom_work: Work<Group, { work_id::TILER_OOM }>,
-    /// Worker that fails a job that has run for longer than
-    /// `JOB_TIMEOUT_MS`, and completes jobs whose sync-update IRQ was
+    /// Worker that terminates the group of a job that has run for longer
+    /// than `JOB_TIMEOUT_MS`, and completes jobs whose sync-update IRQ was
     /// missed.
     ///
     /// Armed by `arm_timeout` on a push, when the group's slot goes Active, on
@@ -741,10 +741,14 @@ impl Group {
         TyrDrmDeviceData::schedule_sync_upd(&self.tdev);
     }
 
-    /// Arms `timeout_work` for the group's earliest job deadline, unless
-    /// every queue with a job is suspended. Suspended queues count, since a
-    /// later arm cannot move a pending timer earlier.
+    /// Arms `timeout_work` for the group's earliest job deadline, unless the
+    /// group has timed out or every queue with a job is suspended. Suspended
+    /// queues count, since a later arm cannot move a pending timer earlier.
     pub(super) fn arm_timeout(self: &Arc<Self>) {
+        if self.with_locked_inner(|inner| inner.timedout) {
+            return;
+        }
+
         let Some((delay, true)) = self
             .queues
             .iter()
@@ -767,12 +771,16 @@ impl Group {
         };
     }
 
-    /// Fails the oldest job of a queue once it has run for longer than
-    /// `JOB_TIMEOUT_MS`, not counting time its queue spent suspended off a
-    /// CSG slot, and terminates the group. Completes the jobs the syncobjs
-    /// show complete first, as a backstop for a missed sync-update IRQ.
+    /// Terminates the group once the oldest job of a queue has run for
+    /// longer than `JOB_TIMEOUT_MS`, not counting time its queue spent
+    /// suspended off a CSG slot. Completes the jobs the syncobjs show
+    /// complete first, as a backstop for a missed sync-update IRQ.
     /// Re-arms `timeout_work` for the next deadline.
     fn check_timeouts(self: &Arc<Self>) {
+        if self.with_locked_inner(|inner| inner.timedout) {
+            return;
+        }
+
         for (queue_idx, queue) in self.indexed_queues() {
             let Some((done_seqno, _)) = queue.oldest_job_deadline() else {
                 continue;
@@ -789,7 +797,6 @@ impl Group {
             dev_warn!(self.tdev.as_ref(), "Queue job {} timed out\n", done_seqno);
             self.with_locked_inner(|inner| inner.mark_timedout());
             self.detach_and_terminate();
-            queue.fail_submit_fence(done_seqno, ETIMEDOUT);
         }
 
         self.arm_timeout();
