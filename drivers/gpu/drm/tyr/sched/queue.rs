@@ -834,9 +834,15 @@ impl QueueData {
             // A concurrent eviction requeues by live ring state, so the
             // bytes committed above are still kicked.
             let tick = match group.tdev.with_locked_scheduler(|sched| {
-                group.with_locked_inner(|inner| {
+                let blocked = group.with_locked_inner(|inner| {
                     inner.set_queue_idle(queue_index, false);
+                    inner.blocked_queues() & queue_index.bit() != 0
                 });
+                // The bind after the wait resolves kicks this queue.
+                if blocked {
+                    TyrDrmDeviceData::schedule_sync_upd(&group.tdev);
+                    return Ok(SubmitTick::None);
+                }
                 sched.mark_group_runnable(group);
                 Ok(sched.submit_tick(group.priority))
             }) {
