@@ -1240,9 +1240,6 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
                 .group
                 .with_locked_inner(|inner| inner.mark_timedout());
             ctx.job.group.detach_and_terminate();
-            if let Some(done_seqno) = ctx.job.done_seqno() {
-                self.data.signal_submit_fence(done_seqno, Err(ETIMEDOUT));
-            }
             return StageAdvance::TimedOut(ETIMEDOUT);
         }
 
