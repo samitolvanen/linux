@@ -650,6 +650,7 @@ impl SchedulingDecision {
 
     /// Evaluates the priority rules to decide which groups to keep and
     /// which to take.
+    #[inline(never)]
     pub(crate) fn evaluate_rules(
         &mut self,
         tdev: &TyrDrmDeviceData,
@@ -751,6 +752,7 @@ impl SchedulingDecision {
     /// When the rotating group is skipped, the others on its VM are
     /// skipped too. Their slots are reserved while that VM can still get
     /// an address space. Returns the number of reserved slots.
+    #[inline(never)]
     fn keep_bound(
         &mut self,
         csg_slot_manager: &CsgSlotManager,
@@ -931,6 +933,7 @@ impl<'a> Tick<'a> {
 
     /// Evaluates groups and applies the scheduling decisions to the
     /// hardware.
+    #[inline(never)]
     fn tick(&mut self, tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result<()> {
         self.sched
             .sync_group_states(tdev, fw)
@@ -940,6 +943,23 @@ impl<'a> Tick<'a> {
         let full_tick = now.wrapping_sub(self.sched.last_full_tick_jiffies)
             >= msecs_to_jiffies(TICK_PERIOD_MS) as u64;
 
+        self.evaluate_and_apply(tdev, fw, full_tick)?;
+
+        if full_tick {
+            self.sched.last_full_tick_jiffies = now;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluates the scheduling rules and applies the resulting decision.
+    #[inline(never)]
+    fn evaluate_and_apply(
+        &mut self,
+        tdev: &ARef<TyrDrmDevice>,
+        fw: &Firmware<'_>,
+        full_tick: bool,
+    ) -> Result<()> {
         let rules = build_scheduling_rules! {
             // Idle groups are processed identically in both normal and
             // full ticks. Prefer keeping them bound unless a hardware
@@ -986,10 +1006,6 @@ impl<'a> Tick<'a> {
             return Err(e);
         }
 
-        if full_tick {
-            self.sched.last_full_tick_jiffies = now;
-        }
-
         Ok(())
     }
 
@@ -1030,6 +1046,7 @@ impl<'a> Tick<'a> {
 
     /// Tears down the binding of every slot in `evicted`, after the firmware
     /// acked (or timed out on) the staged state transitions.
+    #[inline(never)]
     fn unbind_evicted_groups(
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
@@ -1117,6 +1134,7 @@ impl<'a> Tick<'a> {
     }
 
     /// Suspends and unbinds groups not marked to be kept.
+    #[inline(never)]
     fn halt_and_unbind_evicted_groups(
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
@@ -1223,9 +1241,128 @@ impl<'a> Tick<'a> {
         self.sched.requeue_group(pending.list_arc, is_idle);
     }
 
+    /// Activates slots for pending groups and stages priority and bind requests.
+    #[inline(never)]
+    fn stage_priorities_and_bind(
+        &mut self,
+        tdev: &ARef<TyrDrmDevice>,
+        fw: &Firmware<'_>,
+        decision: &mut SchedulingDecision,
+        context: &mut CsgUpdateContext,
+    ) {
+        let mut next_fw_prio = MAX_CSG_PRIO;
+        let mut bind_timed_out = false;
+
+        let mut csg_slot_manager = tdev.csg_slot_manager.lock();
+
+        for selection in
+            SelectedGroup::iter_prioritized(&decision.selections, decision.rotated_slots)
+        {
+            let fw_prio = next_fw_prio;
+            next_fw_prio = next_fw_prio.saturating_sub(1);
+
+            match selection {
+                SelectedGroup::Kept(slot_idx, _sw_prio, _is_idle, cur_fw_prio) => {
+                    if cur_fw_prio == fw_prio {
+                        continue;
+                    }
+
+                    if let Err(e) = self.sched.update_csg_slot_priority(
+                        tdev,
+                        fw,
+                        &csg_slot_manager,
+                        slot_idx,
+                        fw_prio,
+                        context,
+                    ) {
+                        dev_err!(
+                            tdev.as_ref(),
+                            "update_csg_slot_priority {} failed: {}\n",
+                            slot_idx,
+                            e.to_errno()
+                        );
+                    }
+                }
+                SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
+                    let Some(pending) = decision.pending_groups.get_mut(idx).and_then(Option::take)
+                    else {
+                        continue;
+                    };
+
+                    // An earlier bind in this pass timed out on its
+                    // address space. Requeue the rest rather than
+                    // repeat the wait for each remaining group.
+                    if bind_timed_out {
+                        self.requeue_pending_bind(pending);
+                        continue;
+                    }
+
+                    let group: Arc<Group> = pending.list_arc.clone_arc();
+                    let slot_idx = match csg_slot_manager.activate(CsgSlotData {
+                        group: group.clone(),
+                        started: false,
+                        fw_priority: fw_prio,
+                    }) {
+                        Ok(slot_idx) => slot_idx,
+                        Err(e) => {
+                            dev_err!(
+                                tdev.as_ref(),
+                                "activate (pending) failed: {}\n",
+                                e.to_errno()
+                            );
+                            // ETIMEDOUT reaches here from the AS-ready
+                            // and cache-flush polls under vm.activate().
+                            if e == ETIMEDOUT {
+                                bind_timed_out = true;
+                            }
+                            self.requeue_pending_bind(pending);
+                            if !group.can_run() {
+                                Scheduler::request_tick(tdev);
+                            }
+                            continue;
+                        }
+                    };
+
+                    // The slot manager has recorded the binding, so
+                    // any failure from here to the staged request
+                    // has to release it again.
+                    if let Err(e) =
+                        Scheduler::program_csg_activate(fw, &group, slot_idx, fw_prio, context)
+                    {
+                        dev_err!(
+                            tdev.as_ref(),
+                            "program_csg_activate failed: {}\n",
+                            e.to_errno()
+                        );
+                        if let Err(err) = csg_slot_manager.evict(&group.csg_seat) {
+                            dev_err!(
+                                tdev.as_ref(),
+                                "bind rollback: evict failed: {}\n",
+                                err.to_errno()
+                            );
+                            // A failed hardware eviction keeps the
+                            // seat bound, so the group would look
+                            // resident with no firmware programming
+                            // behind it.
+                            group.with_locked_inner(|inner| {
+                                inner.state = State::Unknown;
+                                inner.fatal = true;
+                            });
+                        }
+                        self.requeue_pending_bind(pending);
+                        continue;
+                    }
+
+                    drop(pending.list_arc);
+                }
+            }
+        }
+    }
+
     /// Updates priorities for retained groups and binds new pending
     /// groups into available hardware slots in a single prioritized
     /// pass.
+    #[inline(never)]
     fn apply_priorities_and_bind(
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
@@ -1233,122 +1370,7 @@ impl<'a> Tick<'a> {
         decision: &mut SchedulingDecision,
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
-        let mut next_fw_prio = MAX_CSG_PRIO;
-        let mut bind_timed_out = false;
-
-        // Build the priority/bind request set under the slot-manager
-        // lock, then drop the lock before issuing the firmware update.
-        {
-            let mut csg_slot_manager = tdev.csg_slot_manager.lock();
-
-            for selection in
-                SelectedGroup::iter_prioritized(&decision.selections, decision.rotated_slots)
-            {
-                let fw_prio = next_fw_prio;
-                next_fw_prio = next_fw_prio.saturating_sub(1);
-
-                match selection {
-                    SelectedGroup::Kept(slot_idx, _sw_prio, _is_idle, cur_fw_prio) => {
-                        if cur_fw_prio == fw_prio {
-                            continue;
-                        }
-
-                        if let Err(e) = self.sched.update_csg_slot_priority(
-                            tdev,
-                            fw,
-                            &csg_slot_manager,
-                            slot_idx,
-                            fw_prio,
-                            &mut context,
-                        ) {
-                            dev_err!(
-                                tdev.as_ref(),
-                                "update_csg_slot_priority {} failed: {}\n",
-                                slot_idx,
-                                e.to_errno()
-                            );
-                        }
-                    }
-                    SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
-                        let Some(pending) =
-                            decision.pending_groups.get_mut(idx).and_then(Option::take)
-                        else {
-                            continue;
-                        };
-
-                        // An earlier bind in this pass timed out on its
-                        // address space. Requeue the rest rather than
-                        // repeat the wait for each remaining group.
-                        if bind_timed_out {
-                            self.requeue_pending_bind(pending);
-                            continue;
-                        }
-
-                        let group: Arc<Group> = pending.list_arc.clone_arc();
-                        let slot_idx = match csg_slot_manager.activate(CsgSlotData {
-                            group: group.clone(),
-                            started: false,
-                            fw_priority: fw_prio,
-                        }) {
-                            Ok(slot_idx) => slot_idx,
-                            Err(e) => {
-                                dev_err!(
-                                    tdev.as_ref(),
-                                    "activate (pending) failed: {}\n",
-                                    e.to_errno()
-                                );
-                                // ETIMEDOUT reaches here from the AS-ready
-                                // and cache-flush polls under vm.activate().
-                                if e == ETIMEDOUT {
-                                    bind_timed_out = true;
-                                }
-                                self.requeue_pending_bind(pending);
-                                if !group.can_run() {
-                                    Scheduler::request_tick(tdev);
-                                }
-                                continue;
-                            }
-                        };
-
-                        // The slot manager has recorded the binding, so
-                        // any failure from here to the staged request
-                        // has to release it again.
-                        if let Err(e) = Scheduler::program_csg_activate(
-                            fw,
-                            &group,
-                            slot_idx,
-                            fw_prio,
-                            &mut context,
-                        ) {
-                            dev_err!(
-                                tdev.as_ref(),
-                                "program_csg_activate failed: {}\n",
-                                e.to_errno()
-                            );
-                            if let Err(err) = csg_slot_manager.evict(&group.csg_seat) {
-                                dev_err!(
-                                    tdev.as_ref(),
-                                    "bind rollback: evict failed: {}\n",
-                                    err.to_errno()
-                                );
-                                // A failed hardware eviction keeps the
-                                // seat bound, so the group would look
-                                // resident with no firmware programming
-                                // behind it.
-                                group.with_locked_inner(|inner| {
-                                    inner.state = State::Unknown;
-                                    inner.fatal = true;
-                                });
-                            }
-                            self.requeue_pending_bind(pending);
-                            continue;
-                        }
-
-                        drop(pending.list_arc);
-                    }
-                }
-            }
-        }
+        self.stage_priorities_and_bind(tdev, fw, decision, &mut context);
 
         let res = self.sched.apply_csg_updates(tdev, fw, &mut context);
         if res.is_err() {
