@@ -12,6 +12,7 @@
 use core::cmp::Reverse;
 
 use kernel::{
+    dma_buf::dma_fence::DmaFenceSignallingAnnotation,
     list::{
         List,
         ListArc, //
@@ -324,9 +325,9 @@ impl ParkedGroups {
 
 /// Stops scheduling for a GPU reset.
 ///
-/// The scheduler workers bail out while the reset worker is executing a
-/// claimed reset. Flush the in-flight ones, then evict every resident
-/// group through the same machinery as runtime suspend, including
+/// The tick and firmware-events workers bail out while the reset worker is
+/// executing a claimed reset. Flush the in-flight ones, then evict every
+/// resident group through the same machinery as runtime suspend, including
 /// escalating to termination on ack timeout.
 ///
 /// The eviction leaves every group that can still run on a scheduler
@@ -335,8 +336,10 @@ impl ParkedGroups {
 /// `Group::cancel_queues`.
 pub(crate) fn pre_reset(tdev: &ARef<TyrDrmDevice>) -> ParkedGroups {
     let data: &TyrDrmDeviceData = tdev;
-    data.drain_sched_work();
+    let annotation = DmaFenceSignallingAnnotation::new();
+    data.flush_tick_and_fw_events();
     suspend(tdev);
+    drop(annotation);
 
     let groups = tdev
         .with_locked_scheduler(|sched| Ok(sched.collect_listed_groups()))

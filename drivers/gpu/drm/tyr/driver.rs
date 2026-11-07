@@ -681,6 +681,15 @@ impl TyrDrmDeviceData {
         let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
     }
 
+    /// Waits for the tick and firmware-events workers to finish. Both run in a
+    /// dma-fence signalling section, so a fence's completion path can wait for
+    /// them. Not callable under the scheduler or CSG slot-manager mutexes.
+    pub(crate) fn flush_tick_and_fw_events(&self) {
+        let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
+        let _ =
+            workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::FW_EVENTS }>(self);
+    }
+
     /// Waits for the tick, firmware-events and sync-update workers to
     /// finish.
     ///
@@ -693,9 +702,7 @@ impl TyrDrmDeviceData {
     /// to the firmware. A failed heap growth can still queue a fresh
     /// tick after this returns, so callers gate the tick first.
     pub(crate) fn drain_sched_work(&self) {
-        let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
-        let _ =
-            workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::FW_EVENTS }>(self);
+        self.flush_tick_and_fw_events();
         let _ =
             workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::SYNC_UPD }>(self);
     }
