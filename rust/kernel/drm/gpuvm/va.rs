@@ -142,6 +142,15 @@ impl<T: DriverGpuVm> GpuVaAlloc<T> {
 /// The `drm_gpuva` is not resident in the [`GpuVm`].
 pub struct GpuVaRemoved<T: DriverGpuVm>(KBox<GpuVa<T>>);
 
+// SAFETY: It is safe to send a `GpuVaRemoved<T>` to another thread because it owns a `drm_gpuva`
+// that left its GPUVM, and all it can access or drop is `T::VaData`, which is `Send` by the
+// `DriverGpuVm` bounds.
+unsafe impl<T: DriverGpuVm> Send for GpuVaRemoved<T> {}
+
+// SAFETY: It is safe to share a `&GpuVaRemoved<T>` between threads when `T::VaData` is `Sync`
+// because shared access only reaches `&T::VaData`.
+unsafe impl<T: DriverGpuVm> Sync for GpuVaRemoved<T> where T::VaData: Sync {}
+
 impl<T: DriverGpuVm> GpuVaRemoved<T> {
     /// Convert a raw pointer into a [`GpuVaRemoved`].
     ///
