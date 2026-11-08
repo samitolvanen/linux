@@ -98,6 +98,7 @@ impl CsIrqEvents<'_> {
     /// Records the fatal, fault, tiler OOM and extract events of CS `cs_id`,
     /// and acknowledges the fatal and fault events. Returns `true` if a fault
     /// was acknowledged.
+    #[inline(never)]
     fn process_cs_irq(
         &mut self,
         csg: &mut CsgInterface,
