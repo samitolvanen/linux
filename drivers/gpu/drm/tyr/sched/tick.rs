@@ -368,11 +368,11 @@ pub(crate) enum SelectedGroup {
     /// A hardware slot index that was chosen to be kept, its software
     /// priority, whether the rule that selected it matched idle
     /// groups, and its current firmware priority.
-    Kept(usize, Priority, bool, u32),
+    Kept(u8, Priority, bool, u8),
     /// An index into the `pending_groups` array for a newly chosen
     /// group, its software priority, and whether the rule that
     /// selected it matched idle groups.
-    Pending(usize, Priority, bool),
+    Pending(u8, Priority, bool),
 }
 
 /// Coarse class used as the primary key when sorting selections within
@@ -438,12 +438,12 @@ fn sort_key(
         }
 
         SelectedGroup::Kept(slot_idx, _, is_idle, fw_prio) => {
-            let class = match (*is_idle, rotated == Some(*slot_idx)) {
+            let class = match (*is_idle, rotated == Some(usize::from(*slot_idx))) {
                 (false, false) => SortClass::KeptActive,
                 (false, true) => SortClass::RotatedActive,
                 (true, _) => SortClass::KeptIdle,
             };
-            (class, u32::MAX - *fw_prio, original_idx)
+            (class, u32::MAX - u32::from(*fw_prio), original_idx)
         }
     }
 }
@@ -767,13 +767,15 @@ impl SchedulingDecision {
                 continue;
             }
             let selection = self.selections.get_mut(self.num_selected).ok_or(EINVAL)?;
+            let slot_idx = u8::try_from(i)?;
+            let fw_prio = u8::try_from(fw_priority)?;
             if !as_budget.take(&slot_data.group.vm) {
                 continue;
             }
 
             self.keep_mask |= 1u32 << i;
 
-            *selection = Some(SelectedGroup::Kept(i, priority, is_idle, fw_priority));
+            *selection = Some(SelectedGroup::Kept(slot_idx, priority, is_idle, fw_prio));
 
             self.num_selected += 1;
 
@@ -839,7 +841,7 @@ impl SchedulingDecision {
             }
             for (i, selection) in selections.iter_mut().take(count).enumerate() {
                 *selection = Some(SelectedGroup::Pending(
-                    self.num_pending + i,
+                    u8::try_from(self.num_pending + i)?,
                     priority,
                     is_idle,
                 ));
@@ -1179,14 +1181,14 @@ impl<'a> Tick<'a> {
 
             match selection {
                 SelectedGroup::Kept(slot_idx, _sw_prio, _is_idle, cur_fw_prio) => {
-                    if cur_fw_prio == fw_prio {
+                    if u32::from(cur_fw_prio) == fw_prio {
                         continue;
                     }
 
                     if let Err(e) = self.sched.update_csg_slot_priority(
                         data,
                         &csg_slot_manager,
-                        slot_idx,
+                        usize::from(slot_idx),
                         fw_prio,
                         context,
                     ) {
@@ -1198,7 +1200,10 @@ impl<'a> Tick<'a> {
                     }
                 }
                 SelectedGroup::Pending(idx, _sw_prio, _is_idle) => {
-                    let Some(pending) = decision.pending_groups.get_mut(idx).and_then(Option::take)
+                    let Some(pending) = decision
+                        .pending_groups
+                        .get_mut(usize::from(idx))
+                        .and_then(Option::take)
                     else {
                         continue;
                     };
