@@ -729,6 +729,7 @@ impl Scheduler {
     ///
     /// The post-ack sync pass takes the `csg_slot_manager` mutex.
     /// Callers must not pre-hold it.
+    #[inline(never)]
     pub(crate) fn apply_csg_updates(
         &mut self,
         data: &TyrDrmDevice,
@@ -842,6 +843,7 @@ impl Scheduler {
     }
 
     /// Stages a firmware-priority update for CSG slot `csg_idx`.
+    #[inline(never)]
     pub(crate) fn update_csg_slot_priority(
         &mut self,
         data: &TyrDrmDevice,
@@ -902,6 +904,7 @@ impl Scheduler {
     ///
     /// A transition into `Suspend` also opens the off-slot deadline
     /// credit, except for the queues in `Group::blocked_idle_queues`.
+    #[inline(never)]
     fn sync_csg_slot_state(
         &mut self,
         data: &TyrDrmDevice,
@@ -1013,6 +1016,7 @@ impl Scheduler {
     ///
     /// `skipped_sync_updates` is the `TyrDrmDeviceData::skipped_sync_updates`
     /// count `apply_csg_updates` read before writing its CSG requests.
+    #[inline(never)]
     fn sync_csg_slot_queues_state(
         &mut self,
         data: &TyrDrmDevice,
@@ -1577,6 +1581,7 @@ impl Scheduler {
     /// Stages `CSG_REQ.STATUS_UPDATE` on every resident CSG slot and
     /// applies the batch. The post-ack sync pass refreshes per-queue
     /// firmware-status state.
+    #[inline(never)]
     pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
         let mut context = CsgUpdateContext::new();
         let mut faulted_mask: u32 = 0;
