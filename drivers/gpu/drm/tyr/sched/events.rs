@@ -78,18 +78,17 @@ enum GrowOutcome {
 }
 
 /// CS events collected from one CSG interrupt.
-#[derive(Default)]
-struct CsIrqEvents {
+struct CsIrqEvents<'a> {
     tiler_oom_mask: u32,
     cs_fatal_mask: u32,
     /// Streams whose `EXTRACT_EVENT` request is acked (REQ == ACK).
     extract_acked_mask: u32,
     cs_unrecoverable: bool,
     /// `EXTRACT` of each faulted queue, read before the fault is acknowledged.
-    cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP],
+    cs_fault_extract: &'a mut [Option<u64>; MAX_CS_PER_GROUP],
 }
 
-impl CsIrqEvents {
+impl CsIrqEvents<'_> {
     /// Collects the events of CS `cs_id` and acknowledges its fatal and
     /// fault events. Returns `true` if a fault was acknowledged.
     fn process_cs_irq(
@@ -377,13 +376,13 @@ impl Scheduler {
         doorbells: &mut CsgSlotMask,
     ) -> [Option<Arc<Group>>; MAX_CSGS] {
         let mut groups = [const { None }; MAX_CSGS];
-        let slot_manager = tdev.csg_slot_manager.lock();
+        let mut slot_manager = tdev.csg_slot_manager.lock();
 
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            match Self::process_csg_irq(tdev, fw, &slot_manager, csg_id, tick, doorbells) {
+            match Self::process_csg_irq(tdev, fw, &mut slot_manager, csg_id, tick, doorbells) {
                 Ok(group) => {
                     if let Some(slot) = groups.get_mut(csg_id) {
                         *slot = group;
@@ -417,7 +416,7 @@ impl Scheduler {
     pub(super) fn process_csg_irq(
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
-        slot_manager: &CsgSlotManager,
+        slot_manager: &mut CsgSlotManager,
         csg_id: usize,
         tick: &mut bool,
         doorbells: &mut CsgSlotMask,
@@ -505,7 +504,13 @@ impl Scheduler {
             }
         }
 
-        let mut events = CsIrqEvents::default();
+        let mut events = CsIrqEvents {
+            tiler_oom_mask: 0,
+            cs_fatal_mask: 0,
+            extract_acked_mask: 0,
+            cs_unrecoverable: false,
+            cs_fault_extract: slot_manager.cs_fault_extract(),
+        };
         let ring_cs_db_mask = fw.with_csg_mut(csg_id, |csg| {
             let mut cs_irqs = pending_cs_irqs;
             let mut ring_cs_db_mask = 0u32;
@@ -570,7 +575,7 @@ impl Scheduler {
                 });
             }
 
-            for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
+            for (queue, &extract) in group.queues.iter().zip(cs_fault_extract.iter()) {
                 if let Some(extract) = extract {
                     queue.fail_job_at_extract(extract, EINVAL);
                 }
