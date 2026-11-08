@@ -874,8 +874,8 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// MMU manager backing every VM on this device.
     pub(crate) mmu: Arc<Mmu>,
 
-    /// Firmware sections.
-    pub(crate) fw: Firmware<'drm>,
+    /// Firmware sections, boxed to keep the probe frame small.
+    pub(crate) fw: KBox<Firmware<'drm>>,
 
     /// Job IRQ registration. Freed after `fw`, so the handler is still armed while the MCU
     /// stops.
@@ -907,8 +907,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Device-managed handle to the GPU MMIO register mapping.
     pub(crate) iomem: Arc<DevresIoMem<SZ_2M>>,
 
-    /// GPU information read from hardware during probe.
-    pub(crate) gpu_info: GpuInfo,
+    /// GPU information read from hardware during probe, boxed to keep the
+    /// probe frame small.
+    pub(crate) gpu_info: KBox<GpuInfo>,
 
     /// Command stream interface information reported to userspace.
     pub(crate) csif_info: gpu::CsifInfo,
@@ -1037,7 +1038,7 @@ impl platform::Driver for TyrPlatformDriver {
                 }
             });
 
-            let gpu_info = GpuInfo::new(pdev.as_ref(), io, coherency)?;
+            let gpu_info = KBox::new(GpuInfo::new(pdev.as_ref(), io, coherency)?, GFP_KERNEL)?;
             gpu_info.log(pdev.as_ref());
             gpu_info.check_l2_line_size(pdev.as_ref())?;
 
@@ -1118,13 +1119,16 @@ impl platform::Driver for TyrPlatformDriver {
             let reset_dev = ARef::from(&*unreg_dev);
             let reset_guard = ScopeGuard::new(move || reset_dev.reset.clear_device());
 
-            let firmware = Firmware::new(
-                pdev,
-                iomem.clone(),
-                &unreg_dev,
-                mmu.as_arc_borrow(),
-                &gpu_info,
-                coherent,
+            let firmware = KBox::new(
+                Firmware::new(
+                    pdev,
+                    iomem.clone(),
+                    &unreg_dev,
+                    mmu.as_arc_borrow(),
+                    &gpu_info,
+                    coherent,
+                )?,
+                GFP_KERNEL,
             )?;
 
             // Declared after the firmware, so a failed probe halts the GPU
