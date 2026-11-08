@@ -259,7 +259,25 @@ impl CsgUpdateContext {
 /// `evict` releases that binding. The CSG_INPUT programming, the
 /// firmware-visible `CSG_REQ` write, the doorbell ring and the ack
 /// wait are driven by the scheduler.
-pub(crate) struct CsgSlotOps;
+pub(crate) struct CsgSlotOps {
+    /// Per-CS fault `EXTRACT` values collected by `Scheduler::process_csg_irq`,
+    /// boxed to keep `CsgSlotOps` small while probe moves it by value.
+    cs_fault_extract: KBox<[Option<u64>; group::MAX_CS_PER_GROUP]>,
+}
+
+impl CsgSlotOps {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            cs_fault_extract: KBox::init(pin_init::init_array_from_fn(|_| None), GFP_KERNEL)?,
+        })
+    }
+
+    /// Clears and returns the fault `EXTRACT` values.
+    fn cs_fault_extract(&mut self) -> &mut [Option<u64>; group::MAX_CS_PER_GROUP] {
+        self.cs_fault_extract.fill_with(|| None);
+        &mut self.cs_fault_extract
+    }
+}
 
 impl SlotOperations<MAX_CSGS> for CsgSlotOps {
     type SlotData = CsgSlotData;
@@ -1601,7 +1619,7 @@ impl Scheduler {
             }
         }
 
-        let csg_slot_manager = tdev.csg_slot_manager.lock();
+        let mut csg_slot_manager = tdev.csg_slot_manager.lock();
         let mut tick = false;
         let mut doorbells = CsgSlotMask::empty();
         for csg_idx in CsgSlotIdx::iter_mask(faulted_mask).map(CsgSlotIdx::get) {
@@ -1612,7 +1630,7 @@ impl Scheduler {
             if let Err(e) = Self::process_csg_irq(
                 tdev,
                 fw,
-                &csg_slot_manager,
+                &mut csg_slot_manager,
                 csg_idx,
                 &mut tick,
                 &mut doorbells,
