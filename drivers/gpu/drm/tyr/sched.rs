@@ -864,7 +864,7 @@ impl Scheduler {
         };
 
         let slot_data = csg_slot_manager.slot_data(csg_idx).ok_or(EINVAL)?;
-        let group = slot_data.group.clone();
+        let group = &slot_data.group;
 
         data.fw.with_csg_mut(csg_idx, |csg| {
             let ep_req = CSG_EP_REQ::zeroed()
@@ -912,7 +912,7 @@ impl Scheduler {
         let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
             return Ok(());
         };
-        let group = slot_data.group.clone();
+        let group = &slot_data.group;
 
         let old_state = group.state();
 
@@ -1023,7 +1023,7 @@ impl Scheduler {
         let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
             return Ok(());
         };
-        let group = slot_data.group.clone();
+        let group = &slot_data.group;
         let priority = group.priority as usize;
 
         // Snapshot the per-CS firmware state under one
@@ -1032,7 +1032,7 @@ impl Scheduler {
         // in `GroupInner`) so this stays allocation-free.
         let mut blocked_reasons: [Option<CsBlockedReason>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
-        let mut scoreboards: [u32; group::MAX_CS_PER_GROUP] = [0; group::MAX_CS_PER_GROUP];
+        let mut scoreboards_zero: u32 = 0;
         let mut sync_waits: [Option<CsStatusWait>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
 
@@ -1043,7 +1043,9 @@ impl Scheduler {
                 };
                 let reason = cs.read_status_blocked_reason()?;
                 blocked_reasons[cs_id.get()] = Some(reason);
-                scoreboards[cs_id.get()] = cs.read_status_scoreboards()?;
+                if cs.read_status_scoreboards()? == 0 {
+                    scoreboards_zero |= cs_id.bit();
+                }
 
                 if reason == CsBlockedReason::SyncWait {
                     sync_waits[cs_id.get()] = Some(cs.read_status_wait_sync()?);
@@ -1068,13 +1070,13 @@ impl Scheduler {
             for (cs_id, queue) in group.indexed_queues() {
                 let mut idle = false;
                 let mut blocked = false;
+                let sb_zero = (scoreboards_zero & cs_id.bit()) != 0;
 
                 match blocked_reasons[cs_id.get()] {
                     // `is_ringbuf_empty` reads firmware-shared memory directly, not
                     // through the firmware lock, so probing it here under `inner` is safe.
                     Some(CsBlockedReason::Unblocked)
-                        if scoreboards[cs_id.get()] == 0
-                            && queue.is_ringbuf_empty().unwrap_or(false) =>
+                        if sb_zero && queue.is_ringbuf_empty().unwrap_or(false) =>
                     {
                         idle = true;
                     }
@@ -1083,7 +1085,7 @@ impl Scheduler {
                         has_sync_wait = true;
                         // Only blocked if there is no deferred work
                         // still resolving on the scoreboards.
-                        if scoreboards[cs_id.get()] == 0 {
+                        if sb_zero {
                             blocked = true;
                         }
                     }
@@ -1109,7 +1111,7 @@ impl Scheduler {
         // wait-list link single-owner so a list walker can iterate
         // without racing concurrent inserts.
         if has_sync_wait {
-            if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group) {
+            if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group.clone()) {
                 self.waiting_groups[priority].push_back(wait_arc);
                 data.waiting_groups.store(true, Relaxed);
                 // A SYNC_UPDATE skipped since the status request may have
@@ -1577,20 +1579,16 @@ impl Scheduler {
     /// firmware-status state.
     pub(crate) fn sync_group_states(&mut self, data: ARef<TyrDrmDevice>) -> Result {
         let mut context = CsgUpdateContext::new();
-        let mut faulted_groups: [Option<(usize, Arc<Group>)>; MAX_CSGS] =
-            [const { None }; MAX_CSGS];
+        let mut faulted_mask: u32 = 0;
 
         {
             let csg_slot_manager = data.csg_slot_manager.lock();
-            for (csg_idx, slot) in CsgSlotIdx::all()
-                .zip(faulted_groups.iter_mut())
-                .take(csg_slot_manager.slot_count())
-            {
+            for csg_idx in CsgSlotIdx::all().take(csg_slot_manager.slot_count()) {
                 let Some(slot_data) = csg_slot_manager.slot_data(csg_idx.get()) else {
                     continue;
                 };
                 if slot_data.group.vm.as_data.unhandled_fault.load(Relaxed) {
-                    *slot = Some((csg_idx.get(), slot_data.group.clone()));
+                    faulted_mask |= csg_idx.bit();
                 }
                 context.toggle_reqs(csg_idx, CsgReqToggle::StatusUpdate);
             }
@@ -1599,17 +1597,14 @@ impl Scheduler {
         let csg_slot_manager = data.csg_slot_manager.lock();
         let mut tick = false;
         let mut doorbells = CsgSlotMask::empty();
-        for slot in faulted_groups.iter() {
-            let Some((csg_idx, group)) = slot else {
+        for csg_idx in CsgSlotIdx::iter_mask(faulted_mask).map(CsgSlotIdx::get) {
+            let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
                 continue;
             };
-            if let Err(e) = Self::process_csg_irq(
-                &data,
-                &csg_slot_manager,
-                *csg_idx,
-                &mut tick,
-                &mut doorbells,
-            ) {
+            let group = slot_data.group.clone();
+            if let Err(e) =
+                Self::process_csg_irq(&data, &csg_slot_manager, csg_idx, &mut tick, &mut doorbells)
+            {
                 pr_err!("process_csg_irq {} failed: {}\n", csg_idx, e.to_errno());
             }
             let queue_count = group.queue_count();

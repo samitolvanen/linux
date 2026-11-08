@@ -60,8 +60,6 @@ use crate::{
     vm::Vm, //
 };
 
-const TEARDOWN_ARRAY_SIZE: usize = MAX_CSGS;
-
 /// Period between two consecutive scheduler ticks, in milliseconds.
 ///
 /// The tick is short because every period also acts as the deadline
@@ -180,11 +178,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         Scheduler::process_fw_events(tdev);
     }
 
-    // Stack-allocated array for groups evicted during this tick that
-    // need terminal cleanup (`!can_run()`). Sized to handle every
-    // possible CSG slot eviction.
-    let mut teardown_groups: [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE] =
-        [const { None }; TEARDOWN_ARRAY_SIZE];
+    let mut teardown_mask: u32 = 0;
     let mut evicted_groups: [Option<Arc<Group>>; MAX_CSGS] = [const { None }; MAX_CSGS];
 
     let mut dead_groups = List::<Group, 0>::new();
@@ -200,7 +194,7 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
             return Ok(());
         }
         sched.detach_unrunnable_groups(&mut dead_groups, &mut dead_waiting);
-        Tick::new(sched, &mut teardown_groups, &mut evicted_groups)
+        Tick::new(sched, &mut teardown_mask, &mut evicted_groups)
             .tick(tdev)
             .inspect_err(|_| Scheduler::request_tick(tdev))
     }) else {
@@ -211,15 +205,14 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         tdev.reset.schedule();
     }
 
-    Scheduler::drain_queue_completions(&teardown_groups);
+    Scheduler::drain_queue_completions(&evicted_groups);
 
     // schedule_term does not take the scheduler mutex, so terminate the
     // groups after releasing it.
-    for slot in teardown_groups.iter_mut() {
-        let Some(group) = slot.take() else {
-            break;
-        };
-        group.schedule_term();
+    for csg_idx in CsgSlotIdx::iter_mask(teardown_mask) {
+        if let Some(group) = evicted_groups.get_mut(csg_idx.get()).and_then(Option::take) {
+            group.schedule_term();
+        }
     }
 
     while let Some(list_arc) = dead_groups.pop_front() {
@@ -232,8 +225,6 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         group.schedule_term();
     }
 
-    Scheduler::drain_queue_completions(&evicted_groups);
-
     result
 }
 
@@ -244,30 +235,26 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
 ///
 /// Must not be called with the scheduler mutex held.
 pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>) {
-    let mut teardown_groups: [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE] =
-        [const { None }; TEARDOWN_ARRAY_SIZE];
+    let mut teardown_mask: u32 = 0;
     let mut evicted_groups: [Option<Arc<Group>>; MAX_CSGS] = [const { None }; MAX_CSGS];
 
     let result = tdev.with_locked_scheduler(|sched| {
         // Record the suspend under the scheduler mutex so tick paths that
         // re-check it there observe it once the eviction below begins.
         tdev.sched_suspended.store(true, ordering::Relaxed);
-        Tick::new(sched, &mut teardown_groups, &mut evicted_groups).suspend(tdev)
+        Tick::new(sched, &mut teardown_mask, &mut evicted_groups).suspend(tdev)
     });
     if let Err(e) = result {
         pr_err!("scheduler suspend failed: {}\n", e.to_errno());
     }
 
-    Scheduler::drain_queue_completions(&teardown_groups);
-
-    for slot in teardown_groups.iter_mut() {
-        let Some(group) = slot.take() else {
-            break;
-        };
-        group.schedule_term();
-    }
-
     Scheduler::drain_queue_completions(&evicted_groups);
+
+    for csg_idx in CsgSlotIdx::iter_mask(teardown_mask) {
+        if let Some(group) = evicted_groups.get_mut(csg_idx.get()).and_then(Option::take) {
+            group.schedule_term();
+        }
+    }
 }
 
 /// Resumes the scheduler after a runtime resume. Reissues the sync-update
@@ -872,26 +859,23 @@ impl SchedulingDecision {
 /// State for a single execution of the scheduler tick.
 pub(crate) struct Tick<'a> {
     sched: &'a mut Scheduler,
-    /// Groups evicted during this tick that need subsequent cleanup. The
-    /// caller drains their queue completions before canceling them.
-    teardown_groups: &'a mut [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE],
-    num_teardown: usize,
-    /// Groups evicted during this tick that can still run, by slot. The
-    /// caller drains their queue completions after releasing the scheduler
-    /// mutex.
+    /// Bitmask of `evicted_groups` slots that need terminal cleanup (`!can_run()`).
+    teardown_mask: &'a mut u32,
+    /// Groups evicted during this tick, indexed by slot. The caller drains their
+    /// queue completions after releasing the scheduler mutex, and before
+    /// canceling those in `teardown_mask`.
     evicted_groups: &'a mut [Option<Arc<Group>>; MAX_CSGS],
 }
 
 impl<'a> Tick<'a> {
     fn new(
         sched: &'a mut Scheduler,
-        teardown_groups: &'a mut [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE],
+        teardown_mask: &'a mut u32,
         evicted_groups: &'a mut [Option<Arc<Group>>; MAX_CSGS],
     ) -> Self {
         Self {
             sched,
-            teardown_groups,
-            num_teardown: 0,
+            teardown_mask,
             evicted_groups,
         }
     }
@@ -1061,13 +1045,12 @@ impl<'a> Tick<'a> {
                     self.sched.requeue_group(list_arc, is_idle);
                 }
                 poll |= group.blocked_idle_queues() != 0;
-                self.evicted_groups[csg_idx.get()] = Some(group.clone());
-            } else if self.num_teardown < self.teardown_groups.len() {
+            } else {
                 // Canceled / faulted: queue for terminal cleanup.
                 self.sched.remove_group_from_wait_list(&group);
-                self.teardown_groups[self.num_teardown] = Some(group.clone());
-                self.num_teardown += 1;
+                *self.teardown_mask |= csg_idx.bit();
             }
+            self.evicted_groups[csg_idx.get()] = Some(group);
         }
 
         if poll {
