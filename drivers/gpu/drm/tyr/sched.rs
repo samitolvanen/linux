@@ -688,6 +688,7 @@ impl Scheduler {
     /// The caller must hold the slot-manager mutex. The manager has
     /// already recorded the binding by this point, so a caller that
     /// sees an error must evict the seat.
+    #[inline(never)]
     pub(in crate::sched) fn program_csg_activate(
         fw: &Firmware<'_>,
         group: &Group,
@@ -978,85 +979,84 @@ impl Scheduler {
         }
 
         if !context.timedout_mask.is_empty() {
-            // `sync_csg_slot_queues_state` is unreachable when STATUS_UPDATE
-            // times out, so snapshot the per-CS status registers directly
-            // here. Firmware that stops acking one slot may have stopped
-            // acking all of them, so dump every slot and every CS
-            // interface on it, bound or not.
-            if let Ok(io) = fw.iomem() {
-                gpu::trace_shader_power_state(io);
-            }
-            for csg_id in CsgSlotIdx::all() {
-                if let Ok((ack, state, ep_cur, ep_req, rdep)) =
-                    fw.with_csg_mut(csg_id.get(), |csg| csg.read_output_dump_raw())
-                {
-                    trace::fw_csg_dump_output(
-                        csg_id.get() as u32,
-                        ack,
-                        state,
-                        ep_cur,
-                        ep_req,
-                        rdep,
-                    );
-                }
-
-                let (vm, group_uid) = csg_slot_manager
-                    .slot_data(csg_id.get())
-                    .map(|s| (Some(s.group.vm.clone()), s.group.uid()))
-                    .unwrap_or((None, 0));
-                let _ = fw.with_csg_mut(csg_id.get(), |csg| {
-                    for cs_id in 0..group::MAX_CS_PER_GROUP {
-                        let Some(cs) = csg.cs_mut(cs_id) else {
-                            continue;
-                        };
-                        let req = cs.read_input_req_raw()?;
-                        let ack = cs.read_output_ack_raw()?;
-                        let status_wait = cs.read_status_wait_raw()?;
-                        let reason = cs.read_status_blocked_reason()? as u32;
-                        let scoreboards = cs.read_status_scoreboards()?;
-                        let sync_ptr = cs.read_status_wait_sync_pointer_raw()?;
-                        let req_resource = cs.read_status_req_resource_raw()?;
-                        let heap = cs.read_heap_output_state()?;
-                        let (cur_val, cur_val_valid) = match &vm {
-                            Some(vm) if trace::cs_status_snapshot_enabled() => {
-                                let sync64 = status_wait & (1 << 30) != 0;
-                                events::read_syncwait_cur_val(vm, sync_ptr, sync64)
-                            }
-                            _ => (0, false),
-                        };
-                        trace::cs_status_snapshot(
-                            csg_id.get() as u32,
-                            group_uid,
-                            cs_id as u32,
-                            req,
-                            ack,
-                            status_wait,
-                            reason,
-                            scoreboards,
-                            sync_ptr,
-                            cur_val,
-                            cur_val_valid,
-                        );
-                        trace::wedge_cs_state(
-                            csg_id.get() as u32,
-                            group_uid,
-                            cs_id as u32,
-                            status_wait,
-                            reason,
-                            req_resource,
-                            heap.heap_address,
-                            heap.vt_start,
-                            heap.vt_end,
-                            heap.frag_end,
-                        );
-                    }
-                    Ok::<_, Error>(())
-                });
-            }
+            Self::dump_wedged_csgs(fw, &csg_slot_manager);
             return Err(ETIMEDOUT);
         }
 
         Ok(())
+    }
+
+    /// Snapshots every CSG slot and CS interface after a CSG ack timeout.
+    #[inline(never)]
+    fn dump_wedged_csgs(fw: &Firmware<'_>, csg_slot_manager: &CsgSlotManager) {
+        // `sync_csg_slot_queues_state` is unreachable when STATUS_UPDATE
+        // times out, so snapshot the per-CS status registers directly
+        // here. Firmware that stops acking one slot may have stopped
+        // acking all of them, so dump every slot and every CS
+        // interface on it, bound or not.
+        if let Ok(io) = fw.iomem() {
+            gpu::trace_shader_power_state(io);
+        }
+        for csg_id in CsgSlotIdx::all() {
+            if let Ok((ack, state, ep_cur, ep_req, rdep)) =
+                fw.with_csg_mut(csg_id.get(), |csg| csg.read_output_dump_raw())
+            {
+                trace::fw_csg_dump_output(csg_id.get() as u32, ack, state, ep_cur, ep_req, rdep);
+            }
+
+            let (vm, group_uid) = csg_slot_manager
+                .slot_data(csg_id.get())
+                .map(|s| (Some(s.group.vm.clone()), s.group.uid()))
+                .unwrap_or((None, 0));
+            let _ = fw.with_csg_mut(csg_id.get(), |csg| {
+                for cs_id in 0..group::MAX_CS_PER_GROUP {
+                    let Some(cs) = csg.cs_mut(cs_id) else {
+                        continue;
+                    };
+                    let req = cs.read_input_req_raw()?;
+                    let ack = cs.read_output_ack_raw()?;
+                    let status_wait = cs.read_status_wait_raw()?;
+                    let reason = cs.read_status_blocked_reason()? as u32;
+                    let scoreboards = cs.read_status_scoreboards()?;
+                    let sync_ptr = cs.read_status_wait_sync_pointer_raw()?;
+                    let req_resource = cs.read_status_req_resource_raw()?;
+                    let heap = cs.read_heap_output_state()?;
+                    let (cur_val, cur_val_valid) = match &vm {
+                        Some(vm) if trace::cs_status_snapshot_enabled() => {
+                            let sync64 = status_wait & (1 << 30) != 0;
+                            events::read_syncwait_cur_val(vm, sync_ptr, sync64)
+                        }
+                        _ => (0, false),
+                    };
+                    trace::cs_status_snapshot(
+                        csg_id.get() as u32,
+                        group_uid,
+                        cs_id as u32,
+                        req,
+                        ack,
+                        status_wait,
+                        reason,
+                        scoreboards,
+                        sync_ptr,
+                        cur_val,
+                        cur_val_valid,
+                    );
+                    trace::wedge_cs_state(
+                        csg_id.get() as u32,
+                        group_uid,
+                        cs_id as u32,
+                        status_wait,
+                        reason,
+                        req_resource,
+                        heap.heap_address,
+                        heap.vt_start,
+                        heap.vt_end,
+                        heap.frag_end,
+                    );
+                }
+                Ok::<_, Error>(())
+            });
+        }
     }
 
     /// Diagnostic probe for a CSG slot whose ack timed out.
@@ -1075,6 +1075,7 @@ impl Scheduler {
     /// Downstream-only debug aid; not for upstream. Distinguishes a
     /// transient CPU->MCU visibility race (re-kick recovers) from
     /// firmware state corruption (re-kick does not).
+    #[inline(never)]
     fn probe_csg_ack_timeout(
         &mut self,
         tdev: &TyrDrmDevice,
@@ -1217,6 +1218,7 @@ impl Scheduler {
     }
 
     /// Stages a firmware-priority update for CSG slot `csg_idx`.
+    #[inline(never)]
     pub(crate) fn update_csg_slot_priority(
         &mut self,
         tdev: &TyrDrmDevice,
