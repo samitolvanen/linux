@@ -625,7 +625,7 @@ impl SchedulingDecision {
         if full_tick {
             self.rotated_slots = find_rotated_slots(&csg_slot_manager, slot_count);
         }
-        sched.as_budget.reset();
+        sched.scratch.as_budget.reset();
 
         let mut reserved = 0;
         for rule in rules {
@@ -633,7 +633,7 @@ impl SchedulingDecision {
                 Action::Keep | Action::KeepExceptRotated => {
                     reserved = self.keep_bound(
                         &csg_slot_manager,
-                        &mut sched.as_budget,
+                        &mut sched.scratch.as_budget,
                         slot_count,
                         rule.priority,
                         rule.is_idle,
@@ -831,7 +831,7 @@ impl SchedulingDecision {
         };
 
         // Collect available groups.
-        let count = Self::collect_groups(queue, prior_state, target, &mut sched.as_budget)?;
+        let count = Self::collect_groups(queue, prior_state, target, &mut sched.scratch.as_budget)?;
         if count > 0 {
             if !is_idle {
                 self.all_idle = false;
@@ -1281,7 +1281,7 @@ impl<'a> Tick<'a> {
             && decision.idle_group_count == 0;
 
         if decision.needs_resched()
-            || ((all_slots_busy || self.sched.as_budget.refused)
+            || ((all_slots_busy || self.sched.scratch.as_budget.refused)
                 && self.sched.has_runnable_groups())
         {
             let period = Delta::from_millis(i64::from(TICK_PERIOD_MS));
