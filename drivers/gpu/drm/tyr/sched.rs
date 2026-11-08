@@ -355,9 +355,9 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) waiting_groups: [List<Group, 1>; GROUP_PRIORITY_COUNT],
     /// Number of CSG slots the firmware exposes, capped to `MAX_CSG_PRIO + 1`.
     pub(in crate::sched) csg_slot_count: u32,
-    /// Per-tick address-space budget, boxed to keep `Scheduler` small
-    /// while probe moves it by value.
-    pub(in crate::sched) as_budget: KBox<tick::AsBudget>,
+    /// Scratch state, boxed to keep `Scheduler` small while probe moves it
+    /// by value.
+    pub(in crate::sched) scratch: KBox<Scratch>,
     /// Number of CSG slots used by the most recent tick.
     pub(in crate::sched) used_csg_slot_count: u32,
     /// When the next tick should occur, if any.
@@ -375,6 +375,22 @@ pub(crate) struct Scheduler {
     /// While set, the tick releases the usage reference before asking the
     /// PM core again, since the failed attempt's reference arms nothing.
     pub(in crate::sched) resume_failed: bool,
+}
+
+/// Working state of the scheduler passes. Each pass resets the part it uses.
+pub(in crate::sched) struct Scratch {
+    /// Address spaces taken by the groups selected in one tick.
+    as_budget: tick::AsBudget,
+    /// Per-CS sync waits read by `Scheduler::sync_csg_slot_queues_state`.
+    sync_waits: [Option<CsStatusWait>; group::MAX_CS_PER_GROUP],
+}
+
+impl Scratch {
+    /// Clears and returns the sync waits.
+    fn sync_waits(&mut self) -> &mut [Option<CsStatusWait>; group::MAX_CS_PER_GROUP] {
+        self.sync_waits.fill_with(|| None);
+        &mut self.sync_waits
+    }
 }
 
 /// The tick to schedule after marking a group runnable.
@@ -417,7 +433,13 @@ impl Scheduler {
             return Err(EINVAL);
         }
 
-        let as_budget = KBox::new(tick::AsBudget::new(user_as_slot_count), GFP_KERNEL)?;
+        let scratch = KBox::init(
+            init!(Scratch {
+                as_budget: tick::AsBudget::new(user_as_slot_count),
+                sync_waits <- pin_init::init_array_from_fn(|_| None),
+            }),
+            GFP_KERNEL,
+        )?;
 
         // A distinct CSG priority per slot avoids a FW scheduler deadlock,
         // capping the usable slots to the priority count.
@@ -442,7 +464,7 @@ impl Scheduler {
                 idle_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
                 waiting_groups: [const { List::new() }; GROUP_PRIORITY_COUNT],
                 csg_slot_count,
-                as_budget,
+                scratch,
                 used_csg_slot_count: 0,
                 resched_target: None,
                 last_tick: Instant::<Monotonic>::now(),
@@ -1037,15 +1059,12 @@ impl Scheduler {
         let group = &slot_data.group;
         let priority = group.priority as usize;
 
-        // Snapshot the per-CS firmware state under one
-        // `with_csg_mut`. The arrays are sized to
-        // `MAX_CS_PER_GROUP` (the width of the per-queue bitmasks
-        // in `GroupInner`) so this stays allocation-free.
+        // Snapshot the per-CS firmware state under one `with_csg_mut`. The
+        // buffers hold `MAX_CS_PER_GROUP` entries, so this stays allocation-free.
         let mut blocked_reasons: [Option<CsBlockedReason>; group::MAX_CS_PER_GROUP] =
             [const { None }; group::MAX_CS_PER_GROUP];
         let mut scoreboards_zero: u32 = 0;
-        let mut sync_waits: [Option<CsStatusWait>; group::MAX_CS_PER_GROUP] =
-            [const { None }; group::MAX_CS_PER_GROUP];
+        let sync_waits = self.scratch.sync_waits();
 
         fw.with_csg_mut(csg_idx, |csg| {
             for (cs_id, _) in group.indexed_queues() {
