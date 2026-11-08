@@ -296,11 +296,23 @@ impl CsgUpdateContext {
 /// callback itself just tears the binding down.
 pub(crate) struct CsgSlotOps {
     fw: Arc<fw::Firmware>,
+    /// Per-CS fault `EXTRACT` values collected by `Scheduler::process_csg_irq`,
+    /// boxed to keep `CsgSlotOps` small while probe moves it by value.
+    cs_fault_extract: KBox<[Option<u64>; group::MAX_CS_PER_GROUP]>,
 }
 
 impl CsgSlotOps {
-    pub(crate) fn new(fw: Arc<fw::Firmware>) -> Self {
-        Self { fw }
+    pub(crate) fn new(fw: Arc<fw::Firmware>) -> Result<Self> {
+        Ok(Self {
+            fw,
+            cs_fault_extract: KBox::init(pin_init::init_array_from_fn(|_| None), GFP_KERNEL)?,
+        })
+    }
+
+    /// Clears and returns the fault `EXTRACT` values.
+    fn cs_fault_extract(&mut self) -> &mut [Option<u64>; group::MAX_CS_PER_GROUP] {
+        self.cs_fault_extract.fill_with(|| None);
+        &mut self.cs_fault_extract
     }
 }
 
@@ -1599,7 +1611,7 @@ impl Scheduler {
             }
         }
 
-        let csg_slot_manager = data.csg_slot_manager.lock();
+        let mut csg_slot_manager = data.csg_slot_manager.lock();
         let mut tick = false;
         let mut doorbells = CsgSlotMask::empty();
         for csg_idx in CsgSlotIdx::iter_mask(faulted_mask).map(CsgSlotIdx::get) {
@@ -1607,9 +1619,13 @@ impl Scheduler {
                 continue;
             };
             let group = slot_data.group.clone();
-            if let Err(e) =
-                Self::process_csg_irq(&data, &csg_slot_manager, csg_idx, &mut tick, &mut doorbells)
-            {
+            if let Err(e) = Self::process_csg_irq(
+                &data,
+                &mut csg_slot_manager,
+                csg_idx,
+                &mut tick,
+                &mut doorbells,
+            ) {
                 pr_err!("process_csg_irq {} failed: {}\n", csg_idx, e.to_errno());
             }
             let queue_count = group.queue_count();

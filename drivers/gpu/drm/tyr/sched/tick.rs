@@ -1011,7 +1011,7 @@ impl<'a> Tick<'a> {
             }
             if let Err(e) = Scheduler::process_csg_irq(
                 data,
-                &csg_slot_manager,
+                &mut csg_slot_manager,
                 csg_idx.get(),
                 &mut tick,
                 &mut doorbells,

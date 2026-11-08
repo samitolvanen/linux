@@ -1096,7 +1096,7 @@ impl TyrPlatformDriverData {
 
         let heap_alloc_wq = Queue::new_unbound().build(c"tyr-heap-alloc")?;
 
-        let csg_slot_ops = CsgSlotOps::new(firmware.clone());
+        let csg_slot_ops = CsgSlotOps::new(firmware.clone())?;
         let csg_slot_manager = SlotManager::<CsgSlotOps, MAX_CSGS>::new(csg_slot_ops, MAX_CSGS)?;
 
         let devfreq_data = Arc::pin_init(TyrDevfreqData::new(), GFP_KERNEL)?;
