@@ -104,6 +104,7 @@ struct CsIrqEvents<'a> {
 impl CsIrqEvents<'_> {
     /// Collects the events of CS `cs_id` and acknowledges its fatal and
     /// fault events. Returns `true` if a fault was acknowledged.
+    #[inline(never)]
     fn process_cs_irq(
         &mut self,
         tdev: &TyrDrmDevice,
