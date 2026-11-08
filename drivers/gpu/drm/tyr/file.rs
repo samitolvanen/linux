@@ -57,7 +57,10 @@ use crate::{
         TyrDrmRegistrationData, //
     },
     gem,
-    gpu::CsifInfo,
+    gpu::{
+        CsifInfo,
+        GpuInfo, //
+    },
     heap,
     mmap,
     mmu::MmuInfo, //
@@ -323,7 +326,7 @@ impl TyrDrmFileData {
         if devquery.pointer == 0 {
             match devquery.type_ {
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_GPU_INFO => {
-                    devquery.size = core::mem::size_of_val(&reg_data.gpu_info) as u32;
+                    devquery.size = core::mem::size_of::<GpuInfo>() as u32;
                     Ok(0)
                 }
                 uapi::drm_panthor_dev_query_type_DRM_PANTHOR_DEV_QUERY_CSIF_INFO => {
@@ -354,7 +357,7 @@ impl TyrDrmFileData {
                         devquery.pointer,
                         devquery.size,
                         min_size,
-                        &reg_data.gpu_info,
+                        &*reg_data.gpu_info,
                     )?;
 
                     Ok(0)
