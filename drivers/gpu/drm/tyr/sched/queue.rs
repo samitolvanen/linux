@@ -611,21 +611,6 @@ impl QueueData {
         ))
     }
 
-    /// Completes the jobs the syncobj of `group`'s queue `queue_index` shows
-    /// complete, as a backstop for a missed sync-update IRQ. A failed read
-    /// fails the job that completes at `done_seqno`.
-    pub(super) fn complete_from_syncobj(
-        &self,
-        group: &Group,
-        queue_index: QueueIdx,
-        done_seqno: u64,
-    ) {
-        match group.read_syncobj(queue_index.get()) {
-            Ok(syncobj_seqno) => self.complete_submit_fences(syncobj_seqno),
-            Err(err) => self.fail_submit_fence(done_seqno, err),
-        }
-    }
-
     /// Marks the queue as suspended off its CSG slot.
     ///
     /// Records the current monotonic instant so a later
@@ -658,7 +643,7 @@ pub(super) struct TyrQueueOps {
     data: Arc<QueueData>,
 }
 
-impl TyrQueueOps {
+impl QueueData {
     /// Cancels a job of a group that can no longer run.
     fn cancel_job(
         &self,
@@ -666,7 +651,7 @@ impl TyrQueueOps {
         fence: SubmitFence<TyrQueueOps>,
     ) -> SubmitResult<TyrQueueOps> {
         TyrDrmDeviceData::schedule_tick(&job.group.tdev);
-        match self.data.signal_unpushed_fence(fence, ECANCELED) {
+        match self.signal_unpushed_fence(fence, ECANCELED) {
             Ok(()) => SubmitResult::Submitted,
             Err(fence) => SubmitResult::NoResources(fence),
         }
@@ -695,6 +680,175 @@ impl TyrQueueOps {
         }
         self.cancel_job(job, fence)
     }
+
+    /// Copies the wrapper of `job` into the ring and rings the doorbell.
+    /// `fence` goes on the pending list, or back to the job queue for a
+    /// retry when the ring or the list has no room.
+    fn submit_job(
+        &self,
+        job: &QueueJob,
+        fence: SubmitFence<TyrQueueOps>,
+    ) -> SubmitResult<TyrQueueOps> {
+        if !job.group.can_run() {
+            return self.cancel_job(job, fence);
+        }
+
+        // Fold any in-flight suspend interval into the baseline so it
+        // matches the shape the timeout stage uses on the consumer
+        // side. Subtraction is exact only when both sides fold.
+        let (accumulated, in_flight_since) = self.suspend_snapshot();
+        let baseline = match in_flight_since {
+            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
+            None => accumulated,
+        };
+
+        if job.stream.is_empty() {
+            let Some(done_seqno) = job.done_seqno() else {
+                fence.signal(Ok(()));
+                return SubmitResult::Submitted;
+            };
+            return match self.push_submit_fence(done_seqno, 0..0, fence, baseline) {
+                Ok(()) => {
+                    job.group.arm_timeout();
+                    SubmitResult::Submitted
+                }
+                Err(fence) => SubmitResult::NoResources(fence),
+            };
+        }
+
+        if let Err(err) = self.can_append(job.stream.len()) {
+            if matches!(err, RingBufferError::Full) {
+                return SubmitResult::NoResources(fence);
+            }
+            return self.fail_queue(job, fence, err);
+        }
+
+        let ringbuf_range = match self.claim_ringbuf_range(&job.stream) {
+            Ok(range) => range,
+            Err(err) => return self.fail_queue(job, fence, err),
+        };
+
+        let Some(done_seqno) = job.done_seqno() else {
+            pr_warn_once!("queue job has no done seqno\n");
+            if let Err(fence) = self.signal_unpushed_fence(fence, EINVAL) {
+                return SubmitResult::NoResources(fence);
+            }
+            return SubmitResult::Submitted;
+        };
+
+        if let Err(fence) =
+            self.push_submit_fence(done_seqno, ringbuf_range.clone(), fence, baseline)
+        {
+            return SubmitResult::NoResources(fence);
+        }
+        job.group.arm_timeout();
+
+        if let Err(err) = self.commit_ringbuf_range(ringbuf_range.end) {
+            pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
+            self.fail_submit_fence(done_seqno, err);
+            return SubmitResult::Submitted;
+        }
+
+        // `Scheduler::program_csg_activate` and `CsgSlotOps::evict` update
+        // `csg_id` and the per-queue `doorbell_id` together under this lock,
+        // so a bound group observed here keeps its doorbell for the whole
+        // kick. Ringing outside the lock would race an eviction and fail the
+        // kick for committed ringbuf bytes.
+        //
+        // Ring only while the device is runtime-active. When it is not, a
+        // suspend is evicting the group and the rebind re-rings the
+        // committed bytes.
+        let group = &job.group;
+        let awake = group.tdev.pm_get_if_active();
+        let device_active = awake.is_some();
+        let queue_index = job.queue_index;
+        let resident = group.tdev.with_locked_scheduler(|sched| {
+            let (active, kick_err, blocked, resume_tick) = group.with_locked_inner(|inner| {
+                if inner.csg_id.is_none() || inner.state != State::Active {
+                    return (false, Ok(()), false, false);
+                }
+                let group_idle = inner.is_idle();
+                let blocked = inner.blocked_queues() & queue_index.bit() != 0;
+                let queue_idle = inner.set_queue_idle(queue_index, false);
+                let resume_tick = group_idle && queue_idle && !blocked;
+                if awake.is_none() {
+                    return (true, Ok(()), blocked, resume_tick);
+                }
+                let kick_res = self.kick();
+                (true, kick_res, blocked, resume_tick)
+            });
+            if !active {
+                return Ok(None);
+            }
+            kick_err?;
+            if device_active {
+                self.resume_timeout();
+            }
+            if !blocked {
+                // This path does not always schedule a tick, so record the busy
+                // edge here.
+                group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
+                if sched.pm_ref.is_none() {
+                    sched.pm_ref = group.tdev.sched_pm_get();
+                }
+            }
+            let tick = if resume_tick {
+                sched.resident_submit_tick()
+            } else {
+                SubmitTick::None
+            };
+            Ok(Some(tick))
+        });
+        drop(awake);
+
+        let resident = match resident {
+            Ok(resident) => resident,
+            Err(err) => {
+                pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
+                self.fail_submit_fence(done_seqno, err);
+                return SubmitResult::Submitted;
+            }
+        };
+
+        if let Some(tick) = resident {
+            tick.dispatch(&group.tdev);
+        } else {
+            // A concurrent eviction requeues by live ring state, so the
+            // bytes committed above are still kicked.
+            let tick = match group.tdev.with_locked_scheduler(|sched| {
+                group.with_locked_inner(|inner| {
+                    inner.set_queue_idle(queue_index, false);
+                });
+                sched.mark_group_runnable(group);
+                Ok(sched.submit_tick(group.priority))
+            }) {
+                Ok(tick) => tick,
+                Err(err) => {
+                    pr_warn_once!("queue group scheduling failed: {}\n", err.to_errno());
+                    self.fail_submit_fence(done_seqno, err);
+                    return SubmitResult::Submitted;
+                }
+            };
+            tick.dispatch(&group.tdev);
+        }
+
+        SubmitResult::Submitted
+    }
+
+    /// Completes the jobs the syncobj of `group`'s queue `queue_index` shows
+    /// complete, as a backstop for a missed sync-update IRQ. A failed read
+    /// fails the job that completes at `done_seqno`.
+    pub(super) fn complete_from_syncobj(
+        &self,
+        group: &Group,
+        queue_index: QueueIdx,
+        done_seqno: u64,
+    ) {
+        match group.read_syncobj(queue_index.get()) {
+            Ok(syncobj_seqno) => self.complete_submit_fences(syncobj_seqno),
+            Err(err) => self.fail_submit_fence(done_seqno, err),
+        }
+    }
 }
 
 impl QueueOps for TyrQueueOps {
@@ -721,154 +875,7 @@ impl QueueOps for TyrQueueOps {
         fence: SubmitFence<Self>,
         _wq: &DmaFenceWorkqueue,
     ) -> Result<SubmitResult<Self>> {
-        if !job.job.group.can_run() {
-            return Ok(self.cancel_job(job.job, fence));
-        }
-
-        // Fold any in-flight suspend interval into the baseline so it
-        // matches the shape the timeout stage uses on the consumer
-        // side. Subtraction is exact only when both sides fold.
-        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
-        let baseline = match in_flight_since {
-            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
-            None => accumulated,
-        };
-
-        if job.job.stream.is_empty() {
-            let Some(done_seqno) = job.job.done_seqno() else {
-                fence.signal(Ok(()));
-                return Ok(SubmitResult::Submitted);
-            };
-            return match self
-                .data
-                .push_submit_fence(done_seqno, 0..0, fence, baseline)
-            {
-                Ok(()) => {
-                    job.job.group.arm_timeout();
-                    Ok(SubmitResult::Submitted)
-                }
-                Err(fence) => Ok(SubmitResult::NoResources(fence)),
-            };
-        }
-
-        if let Err(err) = self.data.can_append(job.job.stream.len()) {
-            if matches!(err, RingBufferError::Full) {
-                return Ok(SubmitResult::NoResources(fence));
-            }
-            return Ok(self.fail_queue(job.job, fence, err));
-        }
-
-        let ringbuf_range = match self.data.claim_ringbuf_range(&job.job.stream) {
-            Ok(range) => range,
-            Err(err) => return Ok(self.fail_queue(job.job, fence, err)),
-        };
-
-        let Some(done_seqno) = job.job.done_seqno() else {
-            pr_warn_once!("queue job has no done seqno\n");
-            if let Err(fence) = self.data.signal_unpushed_fence(fence, EINVAL) {
-                return Ok(SubmitResult::NoResources(fence));
-            }
-            return Ok(SubmitResult::Submitted);
-        };
-
-        if let Err(fence) =
-            self.data
-                .push_submit_fence(done_seqno, ringbuf_range.clone(), fence, baseline)
-        {
-            return Ok(SubmitResult::NoResources(fence));
-        }
-        job.job.group.arm_timeout();
-
-        if let Err(err) = self.data.commit_ringbuf_range(ringbuf_range.end) {
-            pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
-            self.data.fail_submit_fence(done_seqno, err);
-            return Ok(SubmitResult::Submitted);
-        }
-
-        // `Scheduler::program_csg_activate` and `CsgSlotOps::evict` update
-        // `csg_id` and the per-queue `doorbell_id` together under this lock,
-        // so a bound group observed here keeps its doorbell for the whole
-        // kick. Ringing outside the lock would race an eviction and fail the
-        // kick for committed ringbuf bytes.
-        //
-        // Ring only while the device is runtime-active. When it is not, a
-        // suspend is evicting the group and the rebind re-rings the
-        // committed bytes.
-        let group = &job.job.group;
-        let awake = group.tdev.pm_get_if_active();
-        let device_active = awake.is_some();
-        let queue_index = job.job.queue_index;
-        let resident = group.tdev.with_locked_scheduler(|sched| {
-            let (active, kick_err, blocked, resume_tick) = group.with_locked_inner(|inner| {
-                if inner.csg_id.is_none() || inner.state != State::Active {
-                    return (false, Ok(()), false, false);
-                }
-                let group_idle = inner.is_idle();
-                let blocked = inner.blocked_queues() & queue_index.bit() != 0;
-                let queue_idle = inner.set_queue_idle(queue_index, false);
-                let resume_tick = group_idle && queue_idle && !blocked;
-                if awake.is_none() {
-                    return (true, Ok(()), blocked, resume_tick);
-                }
-                let kick_res = self.data.kick();
-                (true, kick_res, blocked, resume_tick)
-            });
-            if !active {
-                return Ok(None);
-            }
-            kick_err?;
-            if device_active {
-                self.data.resume_timeout();
-            }
-            if !blocked {
-                // This path does not always schedule a tick, so record the busy
-                // edge here.
-                group.tdev.devfreq_data.devfreq_state.lock().mark_busy();
-                if sched.pm_ref.is_none() {
-                    sched.pm_ref = group.tdev.sched_pm_get();
-                }
-            }
-            let tick = if resume_tick {
-                sched.resident_submit_tick()
-            } else {
-                SubmitTick::None
-            };
-            Ok(Some(tick))
-        });
-        drop(awake);
-
-        let resident = match resident {
-            Ok(resident) => resident,
-            Err(err) => {
-                pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
-                self.data.fail_submit_fence(done_seqno, err);
-                return Ok(SubmitResult::Submitted);
-            }
-        };
-
-        if let Some(tick) = resident {
-            tick.dispatch(&group.tdev);
-        } else {
-            // A concurrent eviction requeues by live ring state, so the
-            // bytes committed above are still kicked.
-            let tick = match group.tdev.with_locked_scheduler(|sched| {
-                group.with_locked_inner(|inner| {
-                    inner.set_queue_idle(queue_index, false);
-                });
-                sched.mark_group_runnable(group);
-                Ok(sched.submit_tick(group.priority))
-            }) {
-                Ok(tick) => tick,
-                Err(err) => {
-                    pr_warn_once!("queue group scheduling failed: {}\n", err.to_errno());
-                    self.data.fail_submit_fence(done_seqno, err);
-                    return Ok(SubmitResult::Submitted);
-                }
-            };
-            tick.dispatch(&group.tdev);
-        }
-
-        Ok(SubmitResult::Submitted)
+        Ok(self.data.submit_job(job.job, fence))
     }
 }
 
