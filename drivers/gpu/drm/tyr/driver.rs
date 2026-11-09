@@ -335,9 +335,9 @@ pub(crate) struct TyrDrmDeviceData {
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
     /// Dedicated DMA-fence-constrained workqueue for the scheduler
-    /// bottom half. Created `WQ_HIGHPRI` (`MEM_RECLAIM` is added by
-    /// `DmaFenceWorkqueue::new_highpri`) so the scheduler can keep up
-    /// with firmware acks under memory pressure.
+    /// bottom half. `DmaFenceWorkqueue::new_unbound` builds it as an
+    /// unbound, mem-reclaim queue so the scheduler can ack firmware
+    /// events under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
     /// Dedicated unbound workqueue for the per-group `term_work`. Flushed
@@ -403,8 +403,7 @@ pub(crate) struct TyrDrmDeviceData {
     ///
     /// Typed as `DmaFenceWork` so it can ride on `sched_wq` (a
     /// `DmaFenceWorkqueue`), not because the body signals dma-fences:
-    /// it only ACKs CSG events. Sharing the queue with the tick worker
-    /// keeps it on `WQ_HIGHPRI` without a second workqueue.
+    /// it only ACKs CSG events.
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
@@ -1115,7 +1114,7 @@ impl TyrPlatformDriverData {
             GFP_KERNEL,
         )?;
 
-        let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
+        let sched_wq = Arc::new(DmaFenceWorkqueue::new_unbound(c"tyr-sched")?, GFP_KERNEL)?;
 
         let term_wq = DmaFenceWorkqueue::new_unbound(c"tyr-group-term")?;
 
