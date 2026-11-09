@@ -48,7 +48,8 @@ use super::{
     },
     CsgSlotIdx,
     CsgSlotManager,
-    Scheduler, //
+    Scheduler,
+    MAX_CSGS, //
 };
 
 struct PendingOom {
@@ -255,7 +256,7 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
 
 impl Scheduler {
     /// Processes the CSG events latched in `fw_events`, then drains the
-    /// resident queues after a `SYNC_UPDATE`.
+    /// submit fences of the groups that reported a `SYNC_UPDATE`.
     ///
     /// Sleeps, takes the slot-manager mutex and drains fences in a dma-fence
     /// signalling section, so it must not be called under the scheduler or
@@ -283,19 +284,20 @@ impl Scheduler {
         }
 
         let _annotation = DmaFenceSignallingAnnotation::new();
-        let sync_update = guard
+        let groups = guard
             .registration_data_with(|reg_data| Self::process_csg_irqs(tdev, &reg_data.fw, events));
-        if sync_update {
-            Self::drain_resident_queue_completions(tdev);
-        }
+        Self::drain_queue_completions(tdev, &groups);
     }
 
-    /// Processes the events of the CSG slots in `events`. Returns whether
-    /// any of them reported a `SYNC_UPDATE`. A `true` return carries the
-    /// duty documented on `process_csg_irq`.
+    /// Processes the events of the CSG slots in `events`. Returns the groups
+    /// `process_csg_irq` returned, which carry the duty documented there.
     #[must_use]
-    fn process_csg_irqs(tdev: &TyrDrmDevice, fw: &Firmware<'_>, mut events: u32) -> bool {
-        let mut sync_update = false;
+    fn process_csg_irqs(
+        tdev: &TyrDrmDevice,
+        fw: &Firmware<'_>,
+        mut events: u32,
+    ) -> [Option<Arc<Group>>; MAX_CSGS] {
+        let mut groups = [const { None }; MAX_CSGS];
         let slot_manager = tdev.csg_slot_manager.lock();
 
         while events != 0 {
@@ -303,7 +305,11 @@ impl Scheduler {
             let mask = 1u32 << csg_id;
 
             match Self::process_csg_irq(tdev, fw, &slot_manager, csg_id) {
-                Ok(updated) => sync_update |= updated,
+                Ok(group) => {
+                    if let Some(slot) = groups.get_mut(csg_id) {
+                        *slot = group;
+                    }
+                }
                 Err(e) => dev_err!(
                     tdev.as_ref(),
                     "Failed to process the CSG slot {} IRQ: {:?}\n",
@@ -314,27 +320,27 @@ impl Scheduler {
             events &= !mask;
         }
 
-        sync_update
+        groups
     }
 
-    /// Processes the events of CSG slot `csg_id`. Returns whether the slot
-    /// reported a `SYNC_UPDATE`.
+    /// Processes the events of CSG slot `csg_id`. Returns the slot's group
+    /// if the slot reported a `SYNC_UPDATE`.
     ///
     /// Every bind and evict holds the slot-manager mutex. Holding it across
     /// the call keeps the slot's group fixed while its events are
     /// acknowledged and handled.
     ///
-    /// On `Ok(true)` the caller must drain the fences of the slot's group
-    /// after releasing the slot-manager mutex, and before canceling them.
+    /// The caller must drain the fences of a returned group after releasing
+    /// the slot-manager mutex, and before canceling them.
     pub(super) fn process_csg_irq(
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         slot_manager: &CsgSlotManager,
         csg_id: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<Arc<Group>>> {
         // The IRQ event mask is wider than the scheduler's slot count.
         if csg_id >= slot_manager.slot_count() {
-            return Ok(false);
+            return Ok(None);
         }
         let csg_slot = CsgSlotIdx::new(csg_id).ok_or(EINVAL)?;
 
@@ -365,7 +371,7 @@ impl Scheduler {
         })?;
 
         if pending == 0 && pending_cs_irqs == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
@@ -494,7 +500,7 @@ impl Scheduler {
             fw.ring_csg_doorbells(mask)?;
         }
 
-        Ok(sync_update)
+        Ok(group.filter(|_| sync_update))
     }
 
     /// Takes one pending tiler OOM of `group` on a CS in `todo` and reads
