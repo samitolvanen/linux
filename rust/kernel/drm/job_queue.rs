@@ -29,14 +29,15 @@
 //! dependency fences have all been signaled are run. If the front job's
 //! dependency is not yet fulfilled, the JobQueue pauses until that's the case.
 //!
-//! If a dependency fence gets signaled with an error, what happens next depends
-//! on the timing:
+//! If a dependency fence gets signaled with an error, the job still runs, as in
+//! drm_sched. What else happens depends on the timing:
 //!
-//! a) If it signals with an error, or was already signaled with one, when one
-//!    tries to set a dependency through [`Job::add_dependency()`], the error is
-//!    returned to that function's caller, who can then decide how to proceed.
+//! a) If it was already signaled when one sets the dependency through
+//!    [`Job::add_dependency()`], nothing else happens. A driver that wants to
+//!    know can check [`Fence::status()`] itself.
 //! b) If it signals afterwards, JobQueue will invoke [`JobQueueOps::kill()`],
-//!    requesting from the driver that it tears down the JobQueue.
+//!    requesting from the driver that it tears down the JobQueue. A driver
+//!    that keeps the JobQueue goes on with it.
 //!
 //! JobQueue implements a credit count system, where the queue itself gets
 //! assigned a capacity by the user, and jobs get assigned individual cost. Jobs
@@ -81,7 +82,6 @@ use kernel::{
         FenceCallbackRegistration,
         FenceContext,
         FenceContextOps,
-        FenceStatus,
     },
     list::{
         impl_list_arc_safe,
@@ -160,9 +160,12 @@ struct DependencyWaker<'b, 'nr_of_deps, T: JobQueueOps + Send + Sync> {
 
 impl<'b, T: JobQueueOps + Send + Sync> FenceCallback for DependencyWaker<'b, '_, T> {
     fn on_signal(&mut self, res: Result) {
+        // A failed dependency still counts as signaled, as in drm_sched: the
+        // job runs, and the driver, told through kill(), decides what the
+        // error means for it. Not counting it would block this job, and every
+        // later job of the queue, forever.
         if let Err(err) = res {
             T::kill(self.jq.fctx.deref(), self.jq.id(), err);
-            return;
         }
 
         // Last dependency kicks the worker.
@@ -185,13 +188,10 @@ pub struct Job<'a, T: JobQueueOps + Send + Sync> {
 impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     /// Add a dependency for the job.
     ///
-    /// A JobQueue will only run a job once `fence` has been signaled with `Ok(())`.
+    /// A JobQueue will only run a job once `fence` has been signaled, with or
+    /// without an error.
     ///
-    /// This action can race with the fence being signaled. The returned Result
-    /// indicates success, obviously. Should an error be returned, this means
-    /// that the dependency fence signaled with an error, meaning the associated
-    /// action will not be completed. It is then up to the caller to decide
-    /// whether it can continue operating on this [`JobQueue`].
+    /// Fails only if the memory for the dependency cannot be allocated.
     pub fn add_dependency(&mut self, fence: &Fence) -> Result {
         self.inner.as_mut().with_project(|job| {
             // If the registration below gets registered successfully, a signaling
@@ -216,11 +216,9 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
                 Err(e) => {
                     let _ = job.nr_of_deps.fetch_sub(1, Relaxed);
                     if e == ENOENT {
-                        // Was already signaled. Return the fence's state.
-                        match fence.status() {
-                            FenceStatus::Signaled(res) => return res,
-                            FenceStatus::Unsignaled => return Err(ENOENT), // Can never happen.
-                        }
+                        // Already signaled, so there is nothing to wait for,
+                        // even if it failed.
+                        return Ok(());
                     }
                     return Err(e);
                 }
@@ -660,7 +658,8 @@ pub trait JobQueueOps {
     /// Tells the driver to tear this JobQueue down.
     ///
     /// The JobQueue backend invokes this in case a job's dependency got
-    /// signaled with an error. This means that the dependency's associated
+    /// signaled with an error after it was added through
+    /// [`Job::add_dependency()`]. This means that the dependency's associated
     /// action on a GPU ring has failed and will not be recovered.
     ///
     /// Thus, it is necessary to tear this JobQueue down, too. Upon receiving
@@ -670,8 +669,8 @@ pub trait JobQueueOps {
     /// [`JobQueue::submit()`], but these jobs will never run and will
     /// ultimately be canceled with ECANCELED once tho JobQueue drops.
     ///
-    /// The JobQueue might continue calling [`JobQueueOps::run_job()`] for jobs
-    /// with fulfilled dependencies, even after `kill()` was called.
+    /// The JobQueue continues calling [`JobQueueOps::run_job()`] after `kill()`
+    /// was called, including for the job whose dependency failed.
     ///
     /// This ops is invoked in atomic context. Hence, you should schedule a
     /// JobQueue teardown through an asynchronous path.
