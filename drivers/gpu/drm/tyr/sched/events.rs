@@ -7,6 +7,7 @@
 //! is allowed to sleep.
 
 use kernel::{
+    dma_buf::dma_fence::DmaFenceSignallingAnnotation,
     prelude::*,
     sync::{
         aref::ARef,
@@ -253,15 +254,47 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
 }
 
 impl Scheduler {
+    /// Processes the CSG events latched in `fw_events`, then drains the
+    /// resident queues after a `SYNC_UPDATE`.
+    ///
+    /// Sleeps, takes the slot-manager mutex and drains fences in a dma-fence
+    /// signalling section, so it must not be called under the scheduler or
+    /// slot-manager mutex.
+    pub(crate) fn process_fw_events(tdev: &TyrDrmDevice) {
+        // Processing rings CSG doorbells, so leave the events latched while
+        // the device is suspended. The tick queued on resume processes them.
+        let Some(_active) = tdev.pm_get_if_active() else {
+            return;
+        };
+
+        // Skip while a reset owns the firmware interface. The reset worker
+        // reissues the tick when the reset completes.
+        if tdev.reset.in_progress() {
+            return;
+        }
+
+        let Some(guard) = tdev.registration_guard() else {
+            return;
+        };
+
+        let events = tdev.fw_events_take();
+        if events == 0 {
+            return;
+        }
+
+        let _annotation = DmaFenceSignallingAnnotation::new();
+        let sync_update = guard
+            .registration_data_with(|reg_data| Self::process_csg_irqs(tdev, &reg_data.fw, events));
+        if sync_update {
+            Self::drain_resident_queue_completions(tdev);
+        }
+    }
+
     /// Processes the events of the CSG slots in `events`. Returns whether
     /// any of them reported a `SYNC_UPDATE`. A `true` return carries the
     /// duty documented on `process_csg_irq`.
     #[must_use]
-    pub(crate) fn process_csg_irqs(
-        tdev: &TyrDrmDevice,
-        fw: &Firmware<'_>,
-        mut events: u32,
-    ) -> bool {
+    fn process_csg_irqs(tdev: &TyrDrmDevice, fw: &Firmware<'_>, mut events: u32) -> bool {
         let mut sync_update = false;
         let slot_manager = tdev.csg_slot_manager.lock();
 
@@ -471,7 +504,8 @@ impl Scheduler {
     /// Must be called *outside* `TyrDrmDeviceData::with_locked_scheduler`.
     /// This takes the scheduler mutex itself, so a tick cannot be partway
     /// through a firmware sequence on the group's slot. It reads the counters
-    /// under the slot-manager mutex, which also excludes CSG event processing.
+    /// under the slot-manager mutex, which also excludes CSG event processing
+    /// in the job IRQ thread.
     fn take_pending_tiler_oom(
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
