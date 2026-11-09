@@ -180,7 +180,7 @@ pub(crate) struct QueueData {
     next_seqno: Atomic<u64>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     #[pin]
-    pending_submit_fences: Mutex<PendingFences>,
+    pending_submit_fences: SpinLock<PendingFences>,
     /// Submit fence of the most recently committed job of any kind.
     #[pin]
     last_job_fence: Mutex<Option<ARef<PublicDmaFence>>>,
@@ -371,9 +371,7 @@ impl QueueData {
     /// Pushes `fence` into the pending list. Returns it as the error when
     /// every entry holds a job that has not drained yet.
     ///
-    /// It must not allocate, since an allocation under this lock closes the
-    /// lockdep cycle `JobQueue::state` -> `dma_fence_map` -> `mmu_notifier`
-    /// -> `fs_reclaim` -> `pending_submit_fences`.
+    /// It must not sleep or allocate under the pending-submit-fences spinlock.
     fn push_submit_fence(
         &self,
         done_seqno: u64,
@@ -1067,7 +1065,7 @@ struct PendingSubmitFence {
     fence: Option<DriverDmaFence<QueueFenceData, Published>>,
 }
 
-/// State protected by the pending-submit-fences mutex.
+/// State protected by the pending-submit-fences spinlock.
 ///
 /// `vec` carries the live ordered list of in-flight per-job fences.
 ///
@@ -1126,7 +1124,7 @@ impl Queue {
                 doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
                 next_seqno: Atomic::new(0),
                 iomem: reg_data.iomem.clone(),
-                pending_submit_fences <- new_mutex!(PendingFences {
+                pending_submit_fences <- new_spinlock!(PendingFences {
                     vec: pending_fence_vec,
                     head: 0,
                     fault: None,
