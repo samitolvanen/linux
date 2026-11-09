@@ -255,12 +255,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// This keeps scheduler-mutex work off the threaded IRQ handler.
     fw_events: Atomic<u32>,
 
-    /// Worker that drains `fw_events` under the
-    /// scheduler mutex. Enqueued on `sched_wq`.
-    ///
-    /// Typed as `DmaFenceWork` so it can ride on `sched_wq` (a
-    /// `DmaFenceWorkqueue`), not because the body signals dma-fences.
-    /// It only ACKs CSG events.
+    /// Worker that drains `fw_events` under the scheduler mutex, then
+    /// signals the completed submit fences of the resident groups after a
+    /// `SYNC_UPDATE`. Enqueued on `sched_wq`.
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
@@ -664,12 +661,16 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             return;
         };
 
-        guard.registration_data_with(|reg_data| {
-            let _ = tdev.with_locked_scheduler(|sched| {
-                sched.process_csg_irqs(tdev, &reg_data.fw, events);
-                Ok(())
-            });
+        let sync_update = guard.registration_data_with(|reg_data| {
+            tdev.with_locked_scheduler(|sched| {
+                Ok(sched.process_csg_irqs(tdev, &reg_data.fw, events))
+            })
+            .unwrap_or(false)
         });
+
+        if sync_update {
+            Scheduler::drain_resident_queue_completions(tdev);
+        }
     }
 }
 
@@ -713,9 +714,19 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
         };
 
         guard.registration_data_with(|reg_data| {
-            let snapshot = this
-                .with_locked_scheduler(|sched| Ok(sched.collect_syncwait_candidates(&this)))
+            let (snapshot, waiting) = this
+                .with_locked_scheduler(|sched| {
+                    Ok((
+                        sched.collect_syncwait_candidates(&this),
+                        sched.has_waiting_groups(),
+                    ))
+                })
                 .unwrap_or_default();
+            // Test the list, not the snapshot, so a failed allocation still
+            // reaches the poll re-arm below.
+            if !waiting {
+                return;
+            }
 
             let dev = reg_data.pdev.as_ref();
             let results = Scheduler::evaluate_syncwait_candidates(dev, &reg_data.fw, snapshot);
