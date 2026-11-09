@@ -13,7 +13,15 @@ use kernel::{
         dma_fence_chain::FenceChain,
         Fence, //
     },
-    drm::syncobj::SyncObj,
+    drm::{
+        job_queue::{
+            DependencyAllocation,
+            Job,
+            JobQueue,
+            JobQueueOps, //
+        },
+        syncobj::SyncObj, //
+    },
     prelude::*,
     sync::{
         aref::ARef,
@@ -244,6 +252,53 @@ pub(crate) fn append_syncops(
     Ok(())
 }
 
+/// A job whose allocations are done, so that adding its intra-batch
+/// dependencies and submitting it cannot fail.
+pub(crate) struct PreparedJob<'a, T: JobQueueOps + Send + Sync> {
+    job: Job<'a, T>,
+    /// Memory for the dependencies `Self::add_dep` adds.
+    dep_allocations: KVec<DependencyAllocation<'a, T>>,
+}
+
+impl<'a, T: JobQueueOps + Send + Sync> PreparedJob<'a, T> {
+    /// Creates the job for `data` on `queue` behind `deps`, and allocates
+    /// the memory for `extra_dep_capacity` more dependencies.
+    pub(crate) fn new(
+        queue: &'a JobQueue<T>,
+        data: T::JobDataType,
+        deps: &[ARef<Fence>],
+        extra_dep_capacity: usize,
+    ) -> Result<Self> {
+        let mut job = queue.new_job(1, data)?;
+        for fence in deps {
+            job.add_dependency(fence)?;
+        }
+
+        let mut dep_allocations = KVec::with_capacity(extra_dep_capacity, GFP_KERNEL)?;
+        for _ in 0..extra_dep_capacity {
+            dep_allocations.push(job.new_dependency_allocation()?, GFP_KERNEL)?;
+        }
+
+        Ok(Self {
+            job,
+            dep_allocations,
+        })
+    }
+
+    /// Adds `fence` to the job's dependencies, in memory allocated by
+    /// `Self::new`.
+    pub(crate) fn add_dep(&mut self, fence: &Fence) -> Result {
+        let allocation = self.dep_allocations.pop().ok_or(EINVAL)?;
+        self.job.add_dependency_with(fence, allocation);
+        Ok(())
+    }
+
+    /// Submits the job and returns its fence.
+    pub(crate) fn submit(self) -> ARef<Fence> {
+        self.job.submit()
+    }
+}
+
 /// How one job of a batch reaches its queue.
 ///
 /// A group submit and an async VM bind track dependencies the same way
@@ -251,18 +306,16 @@ pub(crate) fn append_syncops(
 /// this and shares `Context`.
 ///
 /// `Context` prepares each job at most once. The caller drives prepare
-/// and then commit in ascending job index, and a caller that shares a
-/// queue with another batch serializes the whole window from the first
-/// prepare to the last commit. The queue fixes the order it runs jobs
-/// in at prepare time and their fence sequence numbers at commit time.
+/// and then commit in ascending job index. The queue fixes the order it
+/// runs jobs in, and their fence sequence numbers, at commit time.
 pub(crate) trait BatchOps {
     /// Job description the context holds until it is prepared.
     type Job;
     /// Handle to a prepared job, consumed by `Self::commit`.
     type Prepared;
 
-    /// Queues `job` behind `deps` and reserves `extra_dep_capacity`
-    /// dependency slots for `Self::add_dep` to fill.
+    /// Creates the queue job for `job` behind `deps` and allocates the
+    /// memory for `extra_dep_capacity` dependencies for `Self::add_dep`.
     fn prepare(
         &self,
         job: Self::Job,
@@ -336,7 +389,7 @@ struct JobContext<T: BatchOps> {
 /// SIGNALs. `Self::prepare` resolves each WAIT against that registry
 /// first and falls back to `drm_syncobj_find_fence`, stashing the
 /// intra-batch hits. `Self::commit` resolves those and appends them to
-/// the prepared job within the capacity reserved at prepare time, so it
+/// the prepared job in memory allocated at prepare time, so it
 /// allocates nothing. `Self::push_fences` publishes the producer fences
 /// only once every commit has succeeded.
 pub(crate) struct Context<'a, T: BatchOps> {
@@ -431,15 +484,11 @@ impl<'a, T: BatchOps> Context<'a, T> {
     ///
     /// The path is allocation-free, so it may run in a dma-fence
     /// signalling section. Intra-batch fences are appended via
-    /// `BatchOps::add_dep` within the capacity reserved at prepare time,
-    /// and `Self::update_job_syncs` only writes into a pre-allocated
-    /// slot. Neither caller opens an annotation of its own. Both hold a
+    /// `BatchOps::add_dep` in memory allocated at prepare time, and
+    /// `Self::update_job_syncs` only writes into a pre-allocated slot.
+    /// Neither caller opens an annotation of its own. Both hold a
     /// reservation lock, and every fence they have already installed
     /// there is in a signalling section from that point on.
-    ///
-    /// A batch commits in prepare order, and the caller holds the lock
-    /// that serializes the whole prepare-to-commit window, so a queue
-    /// claims its seqnos in the order its pipeline runs the jobs.
     pub(crate) fn commit(&mut self, job_idx: usize) -> Result<ARef<Fence>> {
         let state = self.jobs.get_mut(job_idx).ok_or(EINVAL)?.state.take();
         let (mut prepared, intra_batch_deps) = match state {

@@ -652,7 +652,7 @@ impl Scheduler {
         })?;
 
         // Publish the per-queue doorbell ids and the bound CSG slot
-        // index in one `inner` critical section. `TyrQueueOps::submit`
+        // index in one `inner` critical section. `TyrQueueOps::run_job`
         // reads `csg_id` and rings the matching `doorbell_id` under the
         // same lock, so it can never see a bound `csg_id` next to an
         // `UNASSIGNED` doorbell. `CsgSlotOps::evict` clears both the

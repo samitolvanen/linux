@@ -13,17 +13,10 @@ use kernel::{
         Fence,
         SignallingSection, //
     },
-    drm::{
-        legacy_job_queue::{
-            JobQueue,
-            JobQueueLockClasses,
-            JobRef,
-            PipelineBuilder,
-            PreparedJob,
-            QueueOps,
-            SubmitFence,
-            SubmitResult, //
-        }, //
+    drm::job_queue::{
+        JobQueue,
+        JobQueueOps,
+        JobRunnable, //
     },
     io::{
         mem::DevresIoMem,
@@ -39,6 +32,7 @@ use kernel::{
         SZ_4K,
         SZ_64K, //
     },
+    str::CString,
     sync::{
         aref::ARef,
         atomic::{
@@ -50,7 +44,6 @@ use kernel::{
             Write, //
         },
         Arc,
-        LockClassKey,
         Mutex, //
     },
     time::{
@@ -60,7 +53,8 @@ use kernel::{
         Monotonic, //
     },
     transmute::FromBytes,
-    uapi, //
+    uapi,
+    workqueue, //
 };
 
 use crate::{
@@ -83,6 +77,7 @@ use crate::{
 };
 
 use super::{
+    deps::PreparedJob,
     group::{
         Group,
         QueueIdx,
@@ -98,11 +93,22 @@ pub(super) const JOB_TIMEOUT_MS: u32 = 5000;
 ///
 /// `sched::job::build_wrapped_stream` emits 11 8-byte instructions and
 /// pads them up to a 64-byte boundary, so the minimum is
-/// `next_multiple_of(88, 64) == 128`. Used to size the pre-allocated
-/// pending-fence vec to an upper bound on the number of jobs a
-/// `ringbuf_size`-byte ring can hold. Sync-only jobs take no ring space but
-/// still take a vec entry.
+/// `next_multiple_of(88, 64) == 128`. Used to size the queue's credits and
+/// the pre-allocated pending-fence vec. Sync-only jobs take no ring space but
+/// still take a credit and a vec entry.
 const WRAPPER_RINGBUF_BYTES: usize = 128;
+
+/// Wrappers the queue's credits keep free for the lag of `EXTRACT`.
+///
+/// The `EXTRACT` the firmware publishes trails the jobs that have completed:
+/// on a G610 it was seen up to three wrappers behind the queue's syncobj
+/// with back-to-back small jobs. The firmware checks `INSERT` against that
+/// value and raises `CS_CONFIG_FAULT` past it, so the credits leave twice
+/// the lag free.
+const EXTRACT_LAG_WRAPPERS: usize = 6;
+static_assert!(
+    (MIN_RINGBUF_SIZE - RINGBUF_RESERVED_BYTES) / WRAPPER_RINGBUF_BYTES > 1 + EXTRACT_LAG_WRAPPERS
+);
 
 /// The hardware considers a CSF ring buffer full one 64-byte cache
 /// line short of its allocated size.
@@ -110,20 +116,6 @@ pub(super) const RINGBUF_RESERVED_BYTES: usize = 64;
 
 /// Smallest ring buffer size a queue can be created with.
 pub(super) const MIN_RINGBUF_SIZE: usize = SZ_4K;
-
-// SAFETY: The key is in static memory, is pinned with `Pin::static_ref()` before use, and a
-// static is never dropped.
-static TYR_QUEUE_INBOX_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static TYR_QUEUE_STATE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static TYR_QUEUE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static TYR_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static TYR_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 #[repr(transparent)]
 pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
@@ -163,6 +155,10 @@ impl QueueCreate {
 
 #[pin_data]
 pub(crate) struct QueueData {
+    /// Runs the queue's jobs. Declared first, so no job runs while the
+    /// other fields drop.
+    #[pin]
+    job_queue: JobQueue<TyrQueueOps>,
     priority: u8,
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
@@ -324,8 +320,9 @@ impl QueueData {
             let taken = entry.take_fence(result);
             pending.head = head + 1;
 
-            if let Some((fence, result)) = taken {
-                fence.signal(result);
+            if let Some((fence_seqno, result)) = taken {
+                self.job_queue
+                    .complete_jobs_up_to_seqno(fence_seqno, result);
             }
         }
     }
@@ -358,60 +355,83 @@ impl QueueData {
         pending.head = 0;
     }
 
-    /// Pushes `fence` into the pending list. Returns it as the error when
-    /// every entry holds a job that has not drained yet.
+    /// Pushes the job with fence sequence number `fence_seqno` into the
+    /// pending list.
     ///
-    /// It must not allocate, since an allocation under this lock closes the
-    /// lockdep cycle `JobQueue::state` -> `dma_fence_map` -> `mmu_notifier`
-    /// -> `fs_reclaim` -> `pending_submit_fences`.
+    /// Every entry is a job that holds one of the queue's credits, and the
+    /// vec has room for as many entries as the queue has credits, so the
+    /// push does not fail. It must not allocate, since the lock is taken in
+    /// the dma-fence signalling path.
     fn push_submit_fence(
         &self,
         done_seqno: u64,
         ringbuf_range: Range<u64>,
-        fence: SubmitFence<TyrQueueOps>,
+        fence_seqno: u64,
+        error: Option<Error>,
         baseline_suspend: Delta,
-    ) -> Result<(), SubmitFence<TyrQueueOps>> {
-        // The fence goes in after the push, so a failed push can return it.
+    ) {
+        let mut pending = self.pending_submit_fences.lock();
+        Self::push_locked(
+            &mut pending,
+            done_seqno,
+            ringbuf_range,
+            fence_seqno,
+            error,
+            baseline_suspend,
+        );
+    }
+
+    fn push_locked(
+        pending: &mut PendingFences,
+        done_seqno: u64,
+        ringbuf_range: Range<u64>,
+        fence_seqno: u64,
+        error: Option<Error>,
+        baseline_suspend: Delta,
+    ) {
+        Self::maybe_truncate_pending(pending);
+        // A sync-only job pushed after a CS fault failed the job it completes
+        // with takes the same error.
+        let fault = pending
+            .fault
+            .filter(|(seqno, _)| *seqno == done_seqno)
+            .map(|(_, err)| err);
         let pending_fence = PendingSubmitFence {
             done_seqno,
             ringbuf_range,
-            fence: None,
-            error: None,
+            fence: Some(fence_seqno),
+            error: error.or(fault),
+            unpushed: error.is_some(),
             started: Instant::<Monotonic>::now(),
             baseline_suspend,
         };
 
-        let mut pending = self.pending_submit_fences.lock();
-        Self::maybe_truncate_pending(&mut pending);
-        let fault = pending.fault.filter(|(seqno, _)| *seqno == done_seqno);
         if pending.vec.push_within_capacity(pending_fence).is_err() {
-            return Err(fence);
+            pr_warn_once!("queue pending-fence vec is full\n");
         }
-        let Some(entry) = pending.vec.last_mut() else {
-            return Err(fence);
-        };
-        entry.fence = Some(fence);
-        if let Some((_, err)) = fault {
-            entry.error = Some(err);
-        }
-        Ok(())
     }
 
-    /// Signals `fence`, which was never pushed, with `err`. Hands it back
-    /// instead while an older pending fence is live.
-    fn signal_unpushed_fence(
-        &self,
-        fence: SubmitFence<TyrQueueOps>,
-        err: Error,
-    ) -> Result<(), SubmitFence<TyrQueueOps>> {
+    /// Signals the job with fence sequence number `fence_seqno`, which was
+    /// never pushed, with `err`. While an older pending fence is live, it
+    /// is queued behind that one with `err` instead, so the queue signals
+    /// its fences in order.
+    fn signal_unpushed_fence(&self, fence_seqno: u64, err: Error) {
         let _section = SignallingSection::begin();
-        let pending = self.pending_submit_fences.lock();
+        let mut pending = self.pending_submit_fences.lock();
         let head = pending.head;
         if pending.vec.iter().skip(head).any(|e| e.fence.is_some()) {
-            return Err(fence);
+            Self::push_locked(
+                &mut pending,
+                self.next_seqno(),
+                0..0,
+                fence_seqno,
+                Some(err),
+                Delta::ZERO,
+            );
+            return;
         }
-        fence.signal(Err(err));
-        Ok(())
+        self.job_queue
+            .complete_jobs_up_to_seqno(fence_seqno, Err(err));
     }
 
     /// Fails the pending fence for `done_seqno` with `err`. While an older
@@ -421,18 +441,25 @@ impl QueueData {
         let mut pending = self.pending_submit_fences.lock();
         let head = pending.head;
         let mut older_live = false;
-        for entry in pending.vec.iter_mut().skip(head) {
-            if entry.done_seqno == done_seqno {
+        let mut signaled = None;
+        for (idx, entry) in pending.vec.iter_mut().enumerate().skip(head) {
+            if entry.done_seqno == done_seqno && entry.fence.is_some() {
                 if older_live {
-                    if entry.fence.is_some() {
-                        entry.error = Some(err);
-                    }
-                } else if let Some(fence) = entry.fence.take() {
-                    fence.signal(Err(err));
+                    entry.error = Some(err);
+                } else if let Some(fence_seqno) = entry.fence.take() {
+                    self.job_queue
+                        .complete_jobs_up_to_seqno(fence_seqno, Err(err));
+                    signaled = Some(idx);
                 }
-                return;
+                break;
             }
             older_live |= entry.fence.is_some();
+        }
+        // No entry before a signaled one is live, so drain them all. An
+        // entry left behind would hold a slot after the job's credit has
+        // come back.
+        if let Some(idx) = signaled {
+            pending.head = idx + 1;
         }
     }
 
@@ -445,8 +472,8 @@ impl QueueData {
     /// `WAIT(all scoreboards)`, so every async sub-job the job
     /// dispatched has landed. `EXTRACT` would race them.
     ///
-    /// The group's timeout work also calls this as a backstop for a missed
-    /// sync-update IRQ.
+    /// `TyrQueueOps::run_job` and the group's timeout work also call this
+    /// as a backstop for a missed sync-update IRQ.
     pub(in crate::sched) fn complete_submit_fences(&self, syncobj_seqno: u64) {
         self.signal_submit_fences_up_to(syncobj_seqno, Ok(()));
     }
@@ -473,7 +500,7 @@ impl QueueData {
         };
         pending.fault = Some((done_seqno, err));
         for entry in pending.vec.iter_mut().skip(head) {
-            if entry.done_seqno == done_seqno && entry.fence.is_some() {
+            if entry.done_seqno == done_seqno && entry.fence.is_some() && !entry.unpushed {
                 entry.error = Some(err);
             }
         }
@@ -592,7 +619,11 @@ impl QueueData {
         let (done_seqno, started, baseline_suspend) = {
             let pending = self.pending_submit_fences.lock();
             let head = pending.head;
-            let entry = pending.vec.iter().skip(head).find(|e| e.fence.is_some())?;
+            let entry = pending
+                .vec
+                .iter()
+                .skip(head)
+                .find(|e| e.fence.is_some() && !e.unpushed)?;
             (entry.done_seqno, entry.started, entry.baseline_suspend)
         };
 
@@ -640,30 +671,18 @@ impl QueueData {
 }
 
 pub(super) struct TyrQueueOps {
-    data: Arc<QueueData>,
+    wq: Arc<DmaFenceWorkqueue>,
 }
 
 impl QueueData {
     /// Cancels a job of a group that can no longer run.
-    fn cancel_job(
-        &self,
-        job: &QueueJob,
-        fence: SubmitFence<TyrQueueOps>,
-    ) -> SubmitResult<TyrQueueOps> {
+    fn cancel_job(&self, job: &QueueJob, fence_seqno: u64) {
         TyrDrmDeviceData::schedule_tick(&job.group.tdev);
-        match self.signal_unpushed_fence(fence, ECANCELED) {
-            Ok(()) => SubmitResult::Submitted,
-            Err(fence) => SubmitResult::NoResources(fence),
-        }
+        self.signal_unpushed_fence(fence_seqno, ECANCELED);
     }
 
     /// Fails the queue of `job` after a ring claim error.
-    fn fail_queue(
-        &self,
-        job: &QueueJob,
-        fence: SubmitFence<TyrQueueOps>,
-        err: RingBufferError,
-    ) -> SubmitResult<TyrQueueOps> {
+    fn fail_queue(&self, job: &QueueJob, fence_seqno: u64, err: RingBufferError) {
         let group = &job.group;
         group.with_locked_inner(|inner| inner.set_queue_fatal(job.queue_index));
         group.detach_and_terminate();
@@ -678,19 +697,16 @@ impl QueueData {
                 pr_warn!("queue {} ring claim failed\n", job.queue_index.get())
             }
         }
-        self.cancel_job(job, fence)
+        self.cancel_job(job, fence_seqno)
     }
 
-    /// Copies the wrapper of `job` into the ring and rings the doorbell.
-    /// `fence` goes on the pending list, or back to the job queue for a
-    /// retry when the ring or the list has no room.
-    fn submit_job(
-        &self,
-        job: &QueueJob,
-        fence: SubmitFence<TyrQueueOps>,
-    ) -> SubmitResult<TyrQueueOps> {
+    /// Copies the wrapper of `job`, whose fence has sequence number
+    /// `fence_seqno`, into the ring and rings the doorbell. Returns the
+    /// `done_seqno` the job completes at when it is pushed.
+    fn submit_job(&self, job: &QueueJob, fence_seqno: u64) -> Option<u64> {
         if !job.group.can_run() {
-            return self.cancel_job(job, fence);
+            self.cancel_job(job, fence_seqno);
+            return None;
         }
 
         // Fold any in-flight suspend interval into the baseline so it
@@ -703,50 +719,50 @@ impl QueueData {
         };
 
         if job.stream.is_empty() {
-            let Some(done_seqno) = job.done_seqno() else {
-                fence.signal(Ok(()));
-                return SubmitResult::Submitted;
-            };
-            return match self.push_submit_fence(done_seqno, 0..0, fence, baseline) {
-                Ok(()) => {
-                    job.group.arm_timeout();
-                    SubmitResult::Submitted
-                }
-                Err(fence) => SubmitResult::NoResources(fence),
-            };
+            // A sync-only job completes with the command-stream job before
+            // it, or at once when there is none.
+            let done_seqno = self.next_seqno();
+            if done_seqno == 0 {
+                self.job_queue
+                    .complete_jobs_up_to_seqno(fence_seqno, Ok(()));
+                return None;
+            }
+            self.push_submit_fence(done_seqno, 0..0, fence_seqno, None, baseline);
+            job.group.arm_timeout();
+            return Some(done_seqno);
         }
 
+        // The credits keep the ring from filling up, so `Full` is as
+        // unexpected here as the other errors.
         if let Err(err) = self.can_append(job.stream.len()) {
-            if matches!(err, RingBufferError::Full) {
-                return SubmitResult::NoResources(fence);
-            }
-            return self.fail_queue(job, fence, err);
+            self.fail_queue(job, fence_seqno, err);
+            return None;
         }
 
         let ringbuf_range = match self.claim_ringbuf_range(&job.stream) {
             Ok(range) => range,
-            Err(err) => return self.fail_queue(job, fence, err),
-        };
-
-        let Some(done_seqno) = job.done_seqno() else {
-            pr_warn_once!("queue job has no done seqno\n");
-            if let Err(fence) = self.signal_unpushed_fence(fence, EINVAL) {
-                return SubmitResult::NoResources(fence);
+            Err(err) => {
+                self.fail_queue(job, fence_seqno, err);
+                return None;
             }
-            return SubmitResult::Submitted;
         };
 
-        if let Err(fence) =
-            self.push_submit_fence(done_seqno, ringbuf_range.clone(), fence, baseline)
-        {
-            return SubmitResult::NoResources(fence);
-        }
+        // Jobs run one at a time in submit order, so the seqnos follow the
+        // ring.
+        let done_seqno = self.claim_seqno();
+        self.push_submit_fence(
+            done_seqno,
+            ringbuf_range.clone(),
+            fence_seqno,
+            None,
+            baseline,
+        );
         job.group.arm_timeout();
 
         if let Err(err) = self.commit_ringbuf_range(ringbuf_range.end) {
             pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
             self.fail_submit_fence(done_seqno, err);
-            return SubmitResult::Submitted;
+            return Some(done_seqno);
         }
 
         // `Scheduler::program_csg_activate` and `CsgSlotOps::evict` update
@@ -806,7 +822,7 @@ impl QueueData {
             Err(err) => {
                 pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
                 self.fail_submit_fence(done_seqno, err);
-                return SubmitResult::Submitted;
+                return Some(done_seqno);
             }
         };
 
@@ -826,13 +842,13 @@ impl QueueData {
                 Err(err) => {
                     pr_warn_once!("queue group scheduling failed: {}\n", err.to_errno());
                     self.fail_submit_fence(done_seqno, err);
-                    return SubmitResult::Submitted;
+                    return Some(done_seqno);
                 }
             };
             tick.dispatch(&group.tdev);
         }
 
-        SubmitResult::Submitted
+        Some(done_seqno)
     }
 
     /// Completes the jobs the syncobj of `group`'s queue `queue_index` shows
@@ -851,51 +867,43 @@ impl QueueData {
     }
 }
 
-impl QueueOps for TyrQueueOps {
-    type Job = QueueJob;
-    type FenceData = QueueFenceData;
+impl JobQueueOps for TyrQueueOps {
+    type JobDataType = QueueJob;
 
-    const DRIVER_NAME: &'static CStr = c"tyr";
-    const TIMELINE_NAME: &'static CStr = c"tyr_queue";
+    fn run_job<'a>(&self, job: JobRunnable<'a, QueueJob>) {
+        let _section = SignallingSection::begin();
+        let JobRunnable { seqno, data: job } = job;
+        let Some(queue) = job.group.queues.get(job.queue_index.get()) else {
+            pr_warn_once!("queue job has no queue\n");
+            return;
+        };
 
-    fn lock_classes() -> JobQueueLockClasses {
-        JobQueueLockClasses {
-            inbox: &TYR_QUEUE_INBOX_LOCK_CLASS,
-            state: &TYR_QUEUE_STATE_LOCK_CLASS,
-            work: &TYR_QUEUE_WORK_LOCK_CLASS,
-            cleanup_work: &TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS,
-            stage_work: &TYR_QUEUE_STAGE_WORK_LOCK_CLASS,
-            stage_timer: &TYR_QUEUE_STAGE_TIMER_LOCK_CLASS,
+        if let Some(done_seqno) = queue.submit_job(job, seqno) {
+            queue.complete_from_syncobj(&job.group, job.queue_index, done_seqno);
         }
     }
 
-    fn submit(
-        &self,
-        job: &JobRef<'_, Self::Job>,
-        fence: SubmitFence<Self>,
-        _wq: &DmaFenceWorkqueue,
-    ) -> Result<SubmitResult<Self>> {
-        Ok(self.data.submit_job(job.job, fence))
+    fn workqueue(&self) -> &workqueue::Queue {
+        self.wq.queue()
+    }
+
+    fn kill(&self, _jq_id: u64, _err: Error) {
+        // A dependency of one of this queue's jobs failed. Tyr goes on, as
+        // panthor does under drm_sched: the job still runs, and if it faults
+        // on the GPU, that fails it like any other job.
     }
 }
 
-pub(super) type PreparedQueueJob = PreparedJob<TyrQueueOps>;
-
-#[derive(Default)]
-pub(super) struct QueueFenceData;
+pub(super) type PreparedQueueJob<'a> = PreparedJob<'a, TyrQueueOps>;
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    /// Per-queue syncobj seqno at which this job is complete, set at commit
-    /// time. A sync-only job takes the seqno of the last command-stream job
-    /// on its queue, or zero if there is none.
-    done_seqno: Atomic<u64>,
     /// Back-reference to the owning group; used by
-    /// `TyrQueueOps::submit` to reach the scheduler workqueue when
-    /// no CSG doorbell has been assigned to the queue yet.
+    /// `TyrQueueOps::run_job` to reach the queue, and the scheduler
+    /// workqueue when no CSG doorbell has been assigned to the queue yet.
     pub(super) group: Arc<Group>,
     /// Index of the owning queue inside `Group::queues`. Captured
-    /// at prepare time.
+    /// at prepare time so `TyrQueueOps::run_job` finds the queue.
     queue_index: QueueIdx,
 }
 
@@ -903,21 +911,9 @@ impl QueueJob {
     pub(super) fn new(stream: KVec<u8>, group: Arc<Group>, queue_index: QueueIdx) -> Self {
         Self {
             stream,
-            done_seqno: Atomic::new(0),
             group,
             queue_index,
         }
-    }
-
-    fn done_seqno(&self) -> Option<u64> {
-        match self.done_seqno.load(Relaxed) {
-            0 => None,
-            v => Some(v),
-        }
-    }
-
-    pub(super) fn set_done_seqno(&self, done_seqno: u64) {
-        self.done_seqno.store(done_seqno, Relaxed);
     }
 }
 
@@ -991,10 +987,15 @@ struct PendingSubmitFence {
     /// Ring buffer offsets of the job's wrapped stream. Empty for a
     /// sync-only job.
     ringbuf_range: Range<u64>,
-    fence: Option<SubmitFence<TyrQueueOps>>,
+    /// The job's fence sequence number in `QueueData::job_queue`, taken
+    /// once the fence is signaled.
+    fence: Option<u64>,
     /// Error staged by `QueueData::fail_submit_fence` or
     /// `QueueData::fail_job_at_extract` for the in-order drain.
     error: Option<Error>,
+    /// Set for a job `QueueData::signal_unpushed_fence` queued behind an
+    /// older live one. It signals with its own error.
+    unpushed: bool,
     /// When the job was pushed, for the job timeout.
     started: Instant<Monotonic>,
     /// `QueueData::suspend_snapshot` when the job was pushed, folded with
@@ -1005,9 +1006,11 @@ struct PendingSubmitFence {
 
 impl PendingSubmitFence {
     /// Takes the fence, with the result to signal it with: `result`, or the
-    /// staged error when `result` is `Ok`.
-    fn take_fence(&mut self, result: Result) -> Option<(SubmitFence<TyrQueueOps>, Result)> {
+    /// staged error when `result` is `Ok`. An unpushed job keeps its own
+    /// error.
+    fn take_fence(&mut self, result: Result) -> Option<(u64, Result)> {
         let fence = self.fence.take()?;
+        let result = if self.unpushed { Ok(()) } else { result };
         Some((fence, result.and(self.error.map_or(Ok(()), Err))))
     }
 }
@@ -1019,9 +1022,7 @@ impl PendingSubmitFence {
 /// `head` is the cursor into `vec` past which entries are live. The
 /// prefix `vec[..head]` is drained but not yet truncated and every
 /// such entry has `fence == None`. The suffix `vec[head..]` is the
-/// live ordered list. An entry inside it may still have `fence ==
-/// None` if `QueueData::fail_submit_fence` signaled it as the oldest
-/// live entry. Such a hole is skipped on drain.
+/// live ordered list.
 /// `Queue::maybe_truncate_pending` compacts the prefix away once
 /// `head` reaches `max(len / 2, 16)`, or once `head` is non-zero in a
 /// full vec.
@@ -1036,7 +1037,6 @@ struct PendingFences {
 /// A minimal hardware queue object owned by a scheduling group.
 pub(crate) struct Queue {
     data: Arc<QueueData>,
-    job_queue: JobQueue<TyrQueueOps>,
 }
 
 impl Queue {
@@ -1059,11 +1059,24 @@ impl Queue {
         let iface_mem = reg_data.fw.alloc_queue_mem(tdev, GFP_KERNEL_ACCOUNT)?;
         let interfaces = Interfaces::new(iface_mem)?;
 
-        let max_jobs = queue_args.ringbuf_size() as usize / WRAPPER_RINGBUF_BYTES;
+        // One credit per wrapper the ring holds, less one for the job being
+        // claimed and `EXTRACT_LAG_WRAPPERS` for the lag of `EXTRACT`.
+        let max_jobs = (queue_args.ringbuf_size() as usize - RINGBUF_RESERVED_BYTES)
+            / WRAPPER_RINGBUF_BYTES
+            - 1
+            - EXTRACT_LAG_WRAPPERS;
         let pending_fence_vec = KVec::with_capacity(max_jobs, GFP_KERNEL)?;
 
         let data = Arc::pin_init(
-            pin_init!(QueueData {
+            try_pin_init!(QueueData {
+                job_queue <- JobQueue::new(
+                    CString::try_from_fmt(fmt!("tyr"))?,
+                    CString::try_from_fmt(fmt!("tyr_queue"))?,
+                    max_jobs as u64,
+                    TyrQueueOps {
+                        wq: reg_data.wq.clone(),
+                    },
+                ),
                 priority: queue_args.priority(),
                 ringbuf,
                 interfaces,
@@ -1082,18 +1095,11 @@ impl Queue {
                     accumulated: Delta::ZERO,
                 }),
                 parked: Atomic::new(false),
-            }),
+            }? Error),
             GFP_KERNEL,
         )?;
 
-        let job_queue = JobQueue::new(
-            TyrQueueOps { data: data.clone() },
-            reg_data.wq.clone(),
-            reg_data.wq.clone(),
-            PipelineBuilder::new(),
-        )?;
-
-        Ok(Self { data, job_queue })
+        Ok(Self { data })
     }
 
     pub(super) fn prepare_job(
@@ -1101,54 +1107,53 @@ impl Queue {
         job: QueueJob,
         deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
-    ) -> Result<PreparedQueueJob> {
-        self.job_queue
-            .prepare(job, deps, extra_dep_capacity, QueueFenceData)
+    ) -> Result<PreparedQueueJob<'_>> {
+        PreparedJob::new(&self.data.job_queue, job, deps, extra_dep_capacity)
     }
 
-    pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<Fence> {
-        let fence = self.job_queue.commit(prepared);
+    pub(super) fn commit_job(&self, prepared: PreparedQueueJob<'_>) -> ARef<Fence> {
+        let fence = prepared.submit();
         *self.data.last_job_fence.lock() = Some(fence.clone());
         fence
     }
 
-    /// Stops the pipeline from handing any further job to the firmware,
+    /// Stops the queue from handing any further job to the firmware,
     /// and the group's timeout work from failing one. Jobs keep resolving
-    /// their dependencies and pile up in front of the exec stage.
+    /// their dependencies and pile up in the queue. Returns once no job is
+    /// being handed over.
     pub(crate) fn park(&self) {
         self.data.parked.store(true, Relaxed);
-        self.job_queue.park();
+        self.data.job_queue.park();
     }
 
-    /// Releases a park and rechecks the pipeline, so jobs that piled
-    /// up behind it are submitted without waiting for another event.
-    /// The caller re-arms the group's timeout work.
+    /// Releases a park, so jobs that piled up behind it are submitted
+    /// without waiting for another event. The caller re-arms the group's
+    /// timeout work.
     pub(crate) fn unpark(&self) {
-        self.job_queue.unpark();
+        self.data.job_queue.unpark();
         self.data.parked.store(false, Relaxed);
     }
 
     /// Signals every pending submit fence with `err`.
     ///
     /// The caller must have made the group unrunnable first, so the jobs
-    /// left in the pipeline fail at submit.
+    /// left in the queue fail at submit.
     pub(crate) fn cancel(&self, err: Error) {
-        self.job_queue.park();
+        self.data.job_queue.park();
         self.data.signal_submit_fences_up_to(u64::MAX, Err(err));
-        self.job_queue.unpark();
+        self.data.job_queue.unpark();
     }
 
-    /// Retires every job left in the pipeline and refuses later commits.
+    /// Waits for the last committed job to complete.
     ///
-    /// Waits for the last committed job first, so a job committed before the
-    /// drain is not canceled before its dependencies signal. Waits on
-    /// fences, so it must not be called from a dma-fence signalling section.
+    /// The group no longer takes commits, so no job is left in the queue
+    /// afterwards. Waits on fences, so it must not be called from a
+    /// dma-fence signalling section.
     pub(crate) fn drain(&self) {
         let last = self.data.last_job_fence.lock().clone();
         if let Some(fence) = last {
             wait_for_fence(&fence);
         }
-        self.job_queue.cancel_all();
     }
 }
 

@@ -279,8 +279,10 @@ pub(crate) struct Group {
     #[pin]
     inner: Mutex<GroupInner>,
     /// Serializes a submit's prepare-to-commit window on this group, so
-    /// every queue claims its pipeline slots and fence seqnos in the
-    /// same order.
+    /// that a queue's fences reach the VM reservation in sequence number
+    /// order and each replaces the one before it, and so that
+    /// `Group::drain_queues` waits out a submit in progress and finds its
+    /// last job.
     ///
     /// Lock order `submit_lock > {inner, drm_exec, job queue}`, with nothing
     /// else held when it is taken. The window allocates and holds the VM
@@ -698,8 +700,8 @@ impl Group {
 
     /// Parks every queue in the group.
     ///
-    /// Must not be called with the scheduler mutex held. Submit takes
-    /// the per-queue pipeline lock before that mutex.
+    /// Must not be called with the scheduler mutex held. Parking waits for
+    /// a job being handed to the firmware, which takes that mutex.
     pub(crate) fn park_queues(&self) {
         for queue in self.queues.iter() {
             queue.park();
@@ -977,7 +979,7 @@ impl Group {
 
         let jobs = Job::from_queue_submits(queue_submits)?;
         let job_count = jobs.len();
-        let mut ctx = deps::Context::new(file, SubmitOps::new(self.clone(), *csif));
+        let mut ctx = deps::Context::new(file, SubmitOps::new(self, *csif));
 
         for (job, syncs) in jobs.into_iter() {
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
@@ -1015,30 +1017,29 @@ impl Group {
     }
 }
 
-/// A submit job that has claimed its slot on a queue.
-struct PreparedSubmit {
+/// A submit job whose allocations on its queue are done.
+struct PreparedSubmit<'a> {
     queue_index: usize,
-    queue_job: PreparedQueueJob,
-    has_stream: bool,
+    queue_job: PreparedQueueJob<'a>,
 }
 
 /// Runs the jobs of a group submit through `deps::Context`.
-struct SubmitOps {
-    group: Arc<Group>,
+struct SubmitOps<'a> {
+    group: &'a Arc<Group>,
     /// CSIF information snapshotted at submit time and used to size the
     /// wrapper's working registers.
     csif: CsifInfo,
 }
 
-impl SubmitOps {
-    fn new(group: Arc<Group>, csif: CsifInfo) -> Self {
+impl<'a> SubmitOps<'a> {
+    fn new(group: &'a Arc<Group>, csif: CsifInfo) -> Self {
         Self { group, csif }
     }
 }
 
-impl deps::BatchOps for SubmitOps {
+impl<'a> deps::BatchOps for SubmitOps<'a> {
     type Job = Job;
-    type Prepared = PreparedSubmit;
+    type Prepared = PreparedSubmit<'a>;
 
     /// Allocates the wrapped command stream and hands the job to its queue.
     fn prepare(
@@ -1046,20 +1047,20 @@ impl deps::BatchOps for SubmitOps {
         job: Job,
         deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
-    ) -> Result<PreparedSubmit> {
+    ) -> Result<PreparedSubmit<'a>> {
+        let group = self.group;
         let queue_index = QueueIdx::new(job.queue_index()).ok_or(EINVAL)?;
-        let queue = self.group.queues.get(queue_index.get()).ok_or(EINVAL)?;
-        let has_stream = job.has_stream();
+        let queue = group.queues.get(queue_index.get()).ok_or(EINVAL)?;
 
-        let wrapped = if has_stream {
-            let sync_va = self.group.syncobj_va(queue_index.get())?;
+        let wrapped = if job.has_stream() {
+            let sync_va = group.syncobj_va(queue_index.get())?;
             job.build_wrapped_stream(&self.csif, sync_va)?
         } else {
             KVec::new()
         };
 
         let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, self.group.clone(), queue_index),
+            QueueJob::new(wrapped, group.clone(), queue_index),
             deps,
             extra_dep_capacity,
         )?;
@@ -1067,32 +1068,16 @@ impl deps::BatchOps for SubmitOps {
         Ok(PreparedSubmit {
             queue_index: queue_index.get(),
             queue_job: prepared,
-            has_stream,
         })
     }
 
-    fn add_dep(&self, prepared: &mut PreparedSubmit, fence: ARef<Fence>) -> Result {
-        prepared.queue_job.add_dep(fence)
+    fn add_dep(&self, prepared: &mut PreparedSubmit<'a>, fence: ARef<Fence>) -> Result {
+        prepared.queue_job.add_dep(&fence)
     }
 
-    fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<Fence>> {
-        let PreparedSubmit {
-            queue_index,
-            queue_job,
-            has_stream,
-        } = prepared;
-
-        let queue = self.group.queues.get(queue_index).ok_or(EINVAL)?;
-        let job = queue_job.job().ok_or(EINVAL)?;
-
-        let done_seqno = if has_stream {
-            queue.claim_seqno()
-        } else {
-            queue.next_seqno()
-        };
-        job.set_done_seqno(done_seqno);
-
-        Ok(queue.commit_job(queue_job))
+    fn commit(&self, prepared: PreparedSubmit<'a>) -> Result<ARef<Fence>> {
+        let queue = self.group.queues.get(prepared.queue_index).ok_or(EINVAL)?;
+        Ok(queue.commit_job(prepared.queue_job))
     }
 }
 
