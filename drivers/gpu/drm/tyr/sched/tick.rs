@@ -1053,15 +1053,16 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         // Drain any pending CSG IRQs on each evicted slot so the
         // group's per-queue / per-CSG bookkeeping reflects the latest
-        // firmware state before we tear the binding down. Runs
-        // *before* taking the slot-manager lock below because
-        // `process_csg_irq` re-takes the slot-manager lock itself to
-        // look the group up.
+        // firmware state before we tear the binding down.
+        let mut csg_slot_manager = tdev.csg_slot_manager.lock();
         for csg_idx in CsgSlotIdx::all() {
             if !evicted.contains(csg_idx) {
                 continue;
             }
-            if let Err(e) = self.sched.process_csg_irq(tdev, fw, csg_idx.get()) {
+            if let Err(e) = self
+                .sched
+                .process_csg_irq(tdev, fw, &csg_slot_manager, csg_idx.get())
+            {
                 dev_err!(
                     tdev.as_ref(),
                     "process_csg_irq {} failed: {}\n",
@@ -1071,7 +1072,6 @@ impl<'a> Tick<'a> {
             }
         }
 
-        let mut csg_slot_manager = tdev.csg_slot_manager.lock();
         // Evict every slot even when one fails, so no group is left bound when
         // the caller halts the MCU.
         let mut ret = Ok(());
