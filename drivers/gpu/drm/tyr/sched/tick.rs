@@ -440,21 +440,17 @@ enum SortClass {
     PendingActive,
     RotatedActive,
     KeptIdle,
-    RotatedIdle,
     PendingIdle,
 }
 
 /// Finds the slot holding the group that rotates in each software
-/// priority band.
+/// priority band on a full tick.
 ///
-/// The resident holding the highest firmware priority in a band
-/// rotates. Ties resolve to the lowest slot index. A normal tick
-/// only considers idle or non-runnable residents, so an active,
-/// runnable resident can only rotate on a full tick.
+/// The active, runnable resident holding the highest firmware priority
+/// in a band rotates. Ties resolve to the lowest slot index.
 fn find_rotated_slots(
     csg_slot_manager: &CsgSlotManager,
     slot_count: usize,
-    full_tick: bool,
 ) -> [Option<usize>; Priority::num_priorities()] {
     let mut rotated = [const { None }; Priority::num_priorities()];
     let mut highest = [0u32; Priority::num_priorities()];
@@ -465,7 +461,7 @@ fn find_rotated_slots(
         };
 
         let status = slot_data.group.status();
-        if !full_tick && !status.is_idle && status.can_run {
+        if status.is_idle || !status.can_run {
             continue;
         }
 
@@ -501,8 +497,7 @@ fn sort_key(
             let class = match (*is_idle, rotated == Some(*slot_idx)) {
                 (false, false) => SortClass::KeptActive,
                 (false, true) => SortClass::RotatedActive,
-                (true, false) => SortClass::KeptIdle,
-                (true, true) => SortClass::RotatedIdle,
+                (true, _) => SortClass::KeptIdle,
             };
             (class, u32::MAX - *fw_prio, original_idx)
         }
@@ -521,11 +516,9 @@ impl SelectedGroup {
     ///
     /// Within a band, active groups come before idle ones. In each
     /// half, retained groups sort by descending previous fw_prio
-    /// ahead of the newly bound ones. At most one group rotates. An
-    /// active one drops below the newly bound active groups, yielding
-    /// priority to work that has not run yet. An idle one drops
-    /// behind the other retained idle groups but stays ahead of the
-    /// newly bound idle groups.
+    /// ahead of the newly bound ones. At most one active group
+    /// rotates. It drops below the newly bound active groups, yielding
+    /// priority to work that has not run yet.
     pub(crate) fn iter_prioritized(
         selections: &[Option<SelectedGroup>; MAX_CSGS],
         rotated_slots: [Option<usize>; Priority::num_priorities()],
@@ -621,7 +614,8 @@ impl AsBudget {
 /// Represents the outcome of evaluating scheduling rules.
 pub(crate) struct SchedulingDecision {
     /// Slot holding the group that rotates in each software priority
-    /// band, as returned by `find_rotated_slots`.
+    /// band on a full tick, as returned by `find_rotated_slots`. All
+    /// `None` on a normal tick.
     pub(crate) rotated_slots: [Option<usize>; Priority::num_priorities()],
     /// Bitmask of hardware CSG slots that will retain their currently
     /// bound group.
@@ -684,7 +678,9 @@ impl SchedulingDecision {
         let csg_slot_manager = tdev.csg_slot_manager.lock();
         let slot_count = csg_slot_manager.slot_count();
 
-        self.rotated_slots = find_rotated_slots(&csg_slot_manager, slot_count, full_tick);
+        if full_tick {
+            self.rotated_slots = find_rotated_slots(&csg_slot_manager, slot_count);
+        }
         sched.as_budget.reset();
 
         let mut reserved = 0;
