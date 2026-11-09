@@ -169,7 +169,7 @@ pub(crate) struct QueueData {
     next_seqno: Atomic<u64>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     #[pin]
-    pending_submit_fences: Mutex<PendingFences>,
+    pending_submit_fences: SpinLock<PendingFences>,
     /// Submit fence of the most recently committed job of any kind.
     #[pin]
     last_job_fence: Mutex<Option<ARef<Fence>>>,
@@ -367,8 +367,8 @@ impl QueueData {
     ///
     /// Every entry is a job that holds one of the queue's credits, and the
     /// vec has room for as many entries as the queue has credits, so the
-    /// push does not fail. It must not allocate, since the lock is taken in
-    /// the dma-fence signalling path.
+    /// push does not fail. It must not sleep or allocate under the
+    /// pending-submit-fences spinlock.
     fn push_submit_fence(
         &self,
         done_seqno: u64,
@@ -1055,7 +1055,7 @@ impl PendingSubmitFence {
     }
 }
 
-/// State protected by the pending-submit-fences mutex.
+/// State protected by the pending-submit-fences spinlock.
 ///
 /// `vec` carries the live ordered list of in-flight per-job fences.
 ///
@@ -1124,7 +1124,7 @@ impl Queue {
                 doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
                 next_seqno: Atomic::new(0),
                 iomem: reg_data.iomem.clone(),
-                pending_submit_fences <- new_mutex!(PendingFences {
+                pending_submit_fences <- new_spinlock!(PendingFences {
                     vec: pending_fence_vec,
                     head: 0,
                     fault: None,
