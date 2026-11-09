@@ -260,8 +260,7 @@ pub(crate) struct TyrDrmDeviceData {
     ///
     /// Typed as `DmaFenceWork` so it can ride on `sched_wq` (a
     /// `DmaFenceWorkqueue`), not because the body signals dma-fences.
-    /// It only ACKs CSG events. Sharing the queue with the tick worker
-    /// keeps it on `WQ_HIGHPRI` without a second workqueue.
+    /// It only ACKs CSG events.
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
@@ -846,8 +845,8 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     pub(crate) wq: Arc<DmaFenceWorkqueue>,
 
     /// Dedicated DMA-fence-constrained workqueue for the scheduler bottom half.
-    /// `DmaFenceWorkqueue::new_highpri` builds it as a per-cpu, high-priority, mem-reclaim
-    /// queue so the scheduler can keep up with firmware acks under memory pressure.
+    /// `DmaFenceWorkqueue::new_unbound` builds it as an unbound, mem-reclaim queue so the
+    /// scheduler can ack firmware events under memory pressure.
     pub(crate) sched_wq: Arc<DmaFenceWorkqueue>,
 
     #[pin]
@@ -1075,7 +1074,7 @@ impl platform::Driver for TyrPlatformDriver {
                 GFP_KERNEL,
             )?;
 
-            let sched_wq = Arc::new(DmaFenceWorkqueue::new_highpri(c"tyr-sched")?, GFP_KERNEL)?;
+            let sched_wq = Arc::new(DmaFenceWorkqueue::new_unbound(c"tyr-sched")?, GFP_KERNEL)?;
 
             if cfg!(CONFIG_TRANSPARENT_HUGEPAGE) {
                 match unreg_dev.create_huge_mnt(c"within_size") {
