@@ -328,10 +328,10 @@ impl QueueData {
                 Self::maybe_truncate_pending(&mut pending);
                 break;
             }
-            let fence = entry.fence.take();
+            let taken = entry.take_fence(result);
             pending.head = head + 1;
 
-            if let Some(fence) = fence {
+            if let Some((fence, result)) = taken {
                 fence.signal(result);
             }
         }
@@ -382,6 +382,7 @@ impl QueueData {
             done_seqno,
             ringbuf_range,
             fence: None,
+            error: None,
         };
 
         let mut pending = self.pending_submit_fences.lock();
@@ -393,9 +394,9 @@ impl QueueData {
         let Some(entry) = pending.vec.last_mut() else {
             return Err(fence);
         };
-        let fence = entry.fence.insert(fence);
+        entry.fence = Some(fence);
         if let Some((_, err)) = fault {
-            fence.set_error(err);
+            entry.error = Some(err);
         }
         Ok(())
     }
@@ -411,9 +412,10 @@ impl QueueData {
                 break;
             }
         }
-        let fence = position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.fence.take()));
+        let taken =
+            position.and_then(|idx| pending.vec.get_mut(idx).and_then(|e| e.take_fence(result)));
 
-        let Some(fence) = fence else {
+        let Some((fence, result)) = taken else {
             return false;
         };
 
@@ -448,8 +450,8 @@ impl QueueData {
         for entry in pending.vec.iter_mut().skip(head) {
             if entry.done_seqno == done_seqno {
                 if older_live {
-                    if let Some(fence) = entry.fence.as_mut() {
-                        fence.set_error(err);
+                    if entry.fence.is_some() {
+                        entry.error = Some(err);
                     }
                 } else if let Some(fence) = entry.fence.take() {
                     fence.signal(Err(err));
@@ -497,10 +499,8 @@ impl QueueData {
         };
         pending.fault = Some((done_seqno, err));
         for entry in pending.vec.iter_mut().skip(head) {
-            if entry.done_seqno == done_seqno {
-                if let Some(fence) = entry.fence.as_mut() {
-                    fence.set_error(err);
-                }
+            if entry.done_seqno == done_seqno && entry.fence.is_some() {
+                entry.error = Some(err);
             }
         }
     }
@@ -1057,6 +1057,21 @@ struct PendingSubmitFence {
     /// sync-only job.
     ringbuf_range: Range<u64>,
     fence: Option<DriverDmaFence<QueueFenceData, Published>>,
+    /// Error staged by `QueueData::fail_submit_fence` or
+    /// `QueueData::fail_job_at_extract` for the in-order drain.
+    error: Option<Error>,
+}
+
+impl PendingSubmitFence {
+    /// Takes the fence, with the result to signal it with: `result`, or the
+    /// staged error when `result` is `Ok`.
+    fn take_fence(
+        &mut self,
+        result: Result,
+    ) -> Option<(DriverDmaFence<QueueFenceData, Published>, Result)> {
+        let fence = self.fence.take()?;
+        Some((fence, result.and(self.error.map_or(Ok(()), Err))))
+    }
 }
 
 /// State protected by the pending-submit-fences mutex.
