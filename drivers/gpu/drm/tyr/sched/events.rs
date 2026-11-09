@@ -277,8 +277,7 @@ impl Scheduler {
         fw: &Firmware<'_>,
         csg_id: usize,
     ) -> Result {
-        // Callers walk the whole slot array, which can be wider than the
-        // slot count the firmware reports.
+        // The IRQ event mask is wider than the scheduler's slot count.
         if csg_id >= self.csg_slot_count as usize {
             return Ok(());
         }
