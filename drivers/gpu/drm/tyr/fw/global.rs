@@ -379,8 +379,8 @@ impl<'drm> GlobalInterface<'drm> {
             csg.clone_req_ack_io()?
         };
 
-        // Caller is the sole writer of CSG_REQ for this slot, so req is
-        // stable across the wait.
+        // Caller is the sole writer of the `mask` bits of CSG_REQ for this
+        // slot, so req is stable across the wait.
         let req = csg_input.read(CSG_REQ) & mask;
 
         let _ = self.event_wait.wait_timeout(timeout_ms, || {

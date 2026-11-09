@@ -840,7 +840,7 @@ impl QueueOps for TyrQueueOps {
                     return Ok(SubmitTick::None);
                 }
                 sched.mark_group_runnable(group);
-                Ok(sched.submit_tick(group.priority))
+                Ok(sched.submit_tick(&group.tdev, group.priority))
             }) {
                 Ok(tick) => tick,
                 Err(err) => {
