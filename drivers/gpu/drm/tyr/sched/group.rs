@@ -18,7 +18,7 @@ use kernel::{
             DmaFenceWork,
             DmaFenceWorkItem, //
         },
-        legacy_fence::PublicDmaFence,
+        Fence,
     },
     drm::gem::BaseObject,
     io::IoBase,
@@ -966,7 +966,7 @@ impl deps::BatchOps for SubmitOps {
     fn prepare(
         &self,
         job: Job,
-        deps: &[ARef<PublicDmaFence>],
+        deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedSubmit> {
         let queue_index = QueueIdx::new(job.queue_index()).ok_or(EINVAL)?;
@@ -993,11 +993,11 @@ impl deps::BatchOps for SubmitOps {
         })
     }
 
-    fn add_dep(&self, prepared: &mut PreparedSubmit, fence: ARef<PublicDmaFence>) -> Result {
+    fn add_dep(&self, prepared: &mut PreparedSubmit, fence: ARef<Fence>) -> Result {
         prepared.queue_job.add_dep(fence)
     }
 
-    fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<PublicDmaFence>> {
+    fn commit(&self, prepared: PreparedSubmit) -> Result<ARef<Fence>> {
         let PreparedSubmit {
             queue_index,
             queue_job,

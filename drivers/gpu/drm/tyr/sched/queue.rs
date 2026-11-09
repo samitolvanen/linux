@@ -8,14 +8,12 @@ use core::ops::{
 use kernel::{
     alloc::KVec,
     dma_buf::{
-        fence_work::DmaFenceWorkqueue,
-        legacy_fence::{
-            DriverDmaFence,
-            DriverDmaFenceOps,
-            FenceWaitResult,
-            PublicDmaFence,
-            Published, //
+        dma_fence::{
+            FenceStatus,
+            FenceWaitResult, //
         },
+        fence_work::DmaFenceWorkqueue,
+        Fence,
         SignallingSection, //
     },
     drm::{
@@ -29,6 +27,7 @@ use kernel::{
             StageAdvance,
             StageContext,
             StageOps,
+            SubmitFence,
             SubmitResult, //
         }, //
     },
@@ -132,8 +131,6 @@ static TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::
 static TYR_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 // SAFETY: See above.
 static TYR_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 #[repr(transparent)]
 pub(crate) struct QueueCreate(uapi::drm_panthor_queue_create);
@@ -183,7 +180,7 @@ pub(crate) struct QueueData {
     pending_submit_fences: Mutex<PendingFences>,
     /// Submit fence of the most recently committed job of any kind.
     #[pin]
-    last_job_fence: Mutex<Option<ARef<PublicDmaFence>>>,
+    last_job_fence: Mutex<Option<ARef<Fence>>>,
     /// Active GPU sync-wait captured for this queue.
     #[pin]
     syncwait: Mutex<SyncWait>,
@@ -375,8 +372,8 @@ impl QueueData {
         &self,
         done_seqno: u64,
         ringbuf_range: Range<u64>,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> Result<(), DriverDmaFence<QueueFenceData, Published>> {
+        fence: SubmitFence<TyrQueueOps>,
+    ) -> Result<(), SubmitFence<TyrQueueOps>> {
         // The fence goes in after the push, so a failed push can return it.
         let pending_fence = PendingSubmitFence {
             done_seqno,
@@ -427,9 +424,9 @@ impl QueueData {
     /// instead while an older pending fence is live.
     fn signal_unpushed_fence(
         &self,
-        fence: DriverDmaFence<QueueFenceData, Published>,
+        fence: SubmitFence<TyrQueueOps>,
         err: Error,
-    ) -> Result<(), DriverDmaFence<QueueFenceData, Published>> {
+    ) -> Result<(), SubmitFence<TyrQueueOps>> {
         let _section = SignallingSection::begin();
         let pending = self.pending_submit_fences.lock();
         let head = pending.head;
@@ -642,8 +639,8 @@ impl TyrQueueOps {
     fn cancel_job(
         &self,
         job: &QueueJob,
-        fence: DriverDmaFence<QueueFenceData, Published>,
-    ) -> SubmitResult<QueueFenceData> {
+        fence: SubmitFence<TyrQueueOps>,
+    ) -> SubmitResult<TyrQueueOps> {
         TyrDrmDeviceData::schedule_tick(&job.group.tdev);
         match self.data.signal_unpushed_fence(fence, ECANCELED) {
             Ok(()) => SubmitResult::Submitted,
@@ -655,9 +652,9 @@ impl TyrQueueOps {
     fn fail_queue(
         &self,
         job: &QueueJob,
-        fence: DriverDmaFence<QueueFenceData, Published>,
+        fence: SubmitFence<TyrQueueOps>,
         err: RingBufferError,
-    ) -> SubmitResult<QueueFenceData> {
+    ) -> SubmitResult<TyrQueueOps> {
         let group = &job.group;
         group.with_locked_inner(|inner| inner.set_queue_fatal(job.queue_index));
         group.detach_and_terminate();
@@ -680,6 +677,9 @@ impl QueueOps for TyrQueueOps {
     type Job = QueueJob;
     type FenceData = QueueFenceData;
 
+    const DRIVER_NAME: &'static CStr = c"tyr";
+    const TIMELINE_NAME: &'static CStr = c"tyr_queue";
+
     fn lock_classes() -> JobQueueLockClasses {
         JobQueueLockClasses {
             inbox: &TYR_QUEUE_INBOX_LOCK_CLASS,
@@ -688,16 +688,15 @@ impl QueueOps for TyrQueueOps {
             cleanup_work: &TYR_QUEUE_CLEANUP_WORK_LOCK_CLASS,
             stage_work: &TYR_QUEUE_STAGE_WORK_LOCK_CLASS,
             stage_timer: &TYR_QUEUE_STAGE_TIMER_LOCK_CLASS,
-            driver_fence: &TYR_QUEUE_DRIVER_FENCE_LOCK_CLASS,
         }
     }
 
     fn submit(
         &self,
         job: &JobRef<'_, Self::Job>,
-        fence: DriverDmaFence<Self::FenceData, Published>,
+        fence: SubmitFence<Self>,
         _wq: &DmaFenceWorkqueue,
-    ) -> Result<SubmitResult<Self::FenceData>> {
+    ) -> Result<SubmitResult<Self>> {
         if !job.job.group.can_run() {
             return Ok(self.cancel_job(job.job, fence));
         }
@@ -853,7 +852,7 @@ struct QueueCompletionStage {
 
 impl StageOps<TyrQueueOps> for QueueCompletionStage {
     fn process(&self, ctx: &StageContext<'_, TyrQueueOps>) -> StageAdvance {
-        if ctx.submit_fence.is_signaled() {
+        if matches!(ctx.submit_fence.status(), FenceStatus::Signaled(_)) {
             return StageAdvance::Advance;
         }
 
@@ -867,7 +866,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             }
         }
 
-        if ctx.submit_fence.is_signaled() {
+        if matches!(ctx.submit_fence.status(), FenceStatus::Signaled(_)) {
             return StageAdvance::Advance;
         }
 
@@ -920,17 +919,6 @@ pub(super) type PreparedQueueJob = PreparedJob<TyrQueueOps>;
 
 #[derive(Default)]
 pub(super) struct QueueFenceData;
-
-#[vtable]
-impl DriverDmaFenceOps for QueueFenceData {
-    fn driver_name(&self) -> &'static CStr {
-        c"tyr"
-    }
-
-    fn timeline_name(&self) -> &'static CStr {
-        c"tyr_queue"
-    }
-}
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
@@ -1056,7 +1044,7 @@ struct PendingSubmitFence {
     /// Ring buffer offsets of the job's wrapped stream. Empty for a
     /// sync-only job.
     ringbuf_range: Range<u64>,
-    fence: Option<DriverDmaFence<QueueFenceData, Published>>,
+    fence: Option<SubmitFence<TyrQueueOps>>,
     /// Error staged by `QueueData::fail_submit_fence` or
     /// `QueueData::fail_job_at_extract` for the in-order drain.
     error: Option<Error>,
@@ -1065,10 +1053,7 @@ struct PendingSubmitFence {
 impl PendingSubmitFence {
     /// Takes the fence, with the result to signal it with: `result`, or the
     /// staged error when `result` is `Ok`.
-    fn take_fence(
-        &mut self,
-        result: Result,
-    ) -> Option<(DriverDmaFence<QueueFenceData, Published>, Result)> {
+    fn take_fence(&mut self, result: Result) -> Option<(SubmitFence<TyrQueueOps>, Result)> {
         let fence = self.fence.take()?;
         Some((fence, result.and(self.error.map_or(Ok(()), Err))))
     }
@@ -1165,14 +1150,14 @@ impl Queue {
     pub(super) fn prepare_job(
         &self,
         job: QueueJob,
-        deps: &[ARef<PublicDmaFence>],
+        deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedQueueJob> {
         self.job_queue
             .prepare(job, deps, extra_dep_capacity, QueueFenceData)
     }
 
-    pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<PublicDmaFence> {
+    pub(super) fn commit_job(&self, prepared: PreparedQueueJob) -> ARef<Fence> {
         let fence = self.job_queue.commit(prepared);
         *self.data.last_job_fence.lock() = Some(fence.clone());
         fence
@@ -1218,7 +1203,7 @@ impl Queue {
 
 /// Waits for `fence` to signal, in `JOB_TIMEOUT_MS` steps so the wait does
 /// not trip the hung-task detector.
-pub(crate) fn wait_for_fence(fence: &PublicDmaFence) {
+pub(crate) fn wait_for_fence(fence: &Fence) {
     let step = msecs_to_jiffies(JOB_TIMEOUT_MS);
     while let Ok(FenceWaitResult::TimedOut) = fence.wait_timeout(step) {
         pr_warn_once!("still waiting for job dependencies during teardown\n");

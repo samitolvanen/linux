@@ -11,7 +11,7 @@ use core::mem::offset_of;
 use kernel::{
     dma_buf::{
         dma_fence_chain::FenceChain,
-        legacy_fence::PublicDmaFence, //
+        Fence, //
     },
     drm::syncobj::SyncObj,
     prelude::*,
@@ -82,7 +82,7 @@ enum PendingSignal {
         syncobj: SyncObj<TyrDrmDriver>,
         handle: u32,
         job_idx: usize,
-        fence: Option<ARef<PublicDmaFence>>,
+        fence: Option<ARef<Fence>>,
     },
     Timeline {
         syncobj: SyncObj<TyrDrmDriver>,
@@ -90,7 +90,7 @@ enum PendingSignal {
         point: u64,
         job_idx: usize,
         chain: FenceChain,
-        fence: Option<ARef<PublicDmaFence>>,
+        fence: Option<ARef<Fence>>,
     },
 }
 
@@ -109,13 +109,13 @@ impl PendingSignal {
         }
     }
 
-    fn fence(&self) -> Option<&ARef<PublicDmaFence>> {
+    fn fence(&self) -> Option<&ARef<Fence>> {
         match self {
             Self::Binary { fence, .. } | Self::Timeline { fence, .. } => fence.as_ref(),
         }
     }
 
-    fn set_fence(&mut self, new_fence: ARef<PublicDmaFence>) {
+    fn set_fence(&mut self, new_fence: ARef<Fence>) {
         match self {
             Self::Binary { fence, .. } | Self::Timeline { fence, .. } => *fence = Some(new_fence),
         }
@@ -266,7 +266,7 @@ pub(crate) trait BatchOps {
     fn prepare(
         &self,
         job: Self::Job,
-        deps: &[ARef<PublicDmaFence>],
+        deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
     ) -> Result<Self::Prepared>;
 
@@ -274,19 +274,19 @@ pub(crate) trait BatchOps {
     /// allocate. Later calls in a batch run with earlier fences already
     /// installed in a reservation, so they run inside a dma-fence
     /// signalling section.
-    fn add_dep(&self, prepared: &mut Self::Prepared, fence: ARef<PublicDmaFence>) -> Result;
+    fn add_dep(&self, prepared: &mut Self::Prepared, fence: ARef<Fence>) -> Result;
 
     /// Submits a prepared job and returns the fence that gates its
     /// completion. Must not allocate, for the same reason as
     /// `Self::add_dep`.
-    fn commit(&self, prepared: Self::Prepared) -> Result<ARef<PublicDmaFence>>;
+    fn commit(&self, prepared: Self::Prepared) -> Result<ARef<Fence>>;
 }
 
 /// Dependencies collected for one job's WAIT syncops.
 struct CollectedDeps {
     /// Fences that already exist when the job is prepared, passed to
     /// `BatchOps::prepare`.
-    external: KVVec<ARef<PublicDmaFence>>,
+    external: KVVec<ARef<Fence>>,
     /// (handle, point) keys of WAITs met by a producer earlier in the
     /// batch.
     intra_batch: KVVec<(u32, u64)>,
@@ -440,7 +440,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
     /// A batch commits in prepare order, and the caller holds the lock
     /// that serializes the whole prepare-to-commit window, so a queue
     /// claims its seqnos in the order its pipeline runs the jobs.
-    pub(crate) fn commit(&mut self, job_idx: usize) -> Result<ARef<PublicDmaFence>> {
+    pub(crate) fn commit(&mut self, job_idx: usize) -> Result<ARef<Fence>> {
         let state = self.jobs.get_mut(job_idx).ok_or(EINVAL)?.state.take();
         let (mut prepared, intra_batch_deps) = match state {
             Some(JobState::Prepared {
@@ -553,7 +553,7 @@ impl<'a, T: BatchOps> Context<'a, T> {
         })
     }
 
-    fn update_job_syncs(&mut self, job_idx: usize, done_fence: ARef<PublicDmaFence>) -> Result {
+    fn update_job_syncs(&mut self, job_idx: usize, done_fence: ARef<Fence>) -> Result {
         let syncops = self.jobs.get(job_idx).ok_or(EINVAL)?.syncops.clone();
 
         for syncop in syncops.iter() {

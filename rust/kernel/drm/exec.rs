@@ -14,8 +14,8 @@
 use crate::{
     bindings,
     dma_buf::{
-        legacy_fence::PublicDmaFence,
-        DmaResvUsage, //
+        DmaResvUsage,
+        Fence, //
     },
     drm::gem::IntoGEMObject,
     error::to_result,
@@ -161,12 +161,7 @@ impl Exec {
     /// `dma_resv_add_fence()` may replace an entry instead of taking a slot.
     /// Overrunning the reservation hits a `BUG_ON()` in
     /// `dma_resv_add_fence()`.
-    pub fn resv_add_fence(
-        &mut self,
-        prepared: Prepared,
-        fence: &PublicDmaFence,
-        usage: DmaResvUsage,
-    ) {
+    pub fn resv_add_fence(&mut self, prepared: Prepared, fence: &Fence, usage: DmaResvUsage) {
         if prepared.exec_id != self.id || self.resvs.get(prepared.index) != Some(&prepared.resv) {
             pr_warn_once!("drm_exec: dropping a fence for an unprepared reservation\n");
             return;
@@ -174,7 +169,7 @@ impl Exec {
 
         // SAFETY: By the type invariant the reservation is locked for as long
         // as `self` lives, and `fence` is live for the call.
-        unsafe { bindings::dma_resv_add_fence(prepared.resv, fence.raw(), usage as u32) };
+        unsafe { bindings::dma_resv_add_fence(prepared.resv, fence.as_raw(), usage as u32) };
     }
 
     /// The raw context, for `rust/kernel` wrappers of C functions taking a

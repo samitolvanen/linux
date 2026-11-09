@@ -154,11 +154,20 @@
 //! the [`QueueOps`] handler, any `Arc`s inside it) stay alive until drop
 //! completes normally.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{
+    marker::PhantomData,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use crate::{
     c_str,
     dma_buf::{
+        dma_fence::{
+            CallbackError,
+            DriverFenceAllocation,
+            FenceStatus,
+            FenceWaitResult, //
+        },
         fence_work::{
             DmaFenceDelayedWork,
             DmaFenceDelayedWorkItem,
@@ -166,18 +175,12 @@ use crate::{
             DmaFenceWorkItem,
             DmaFenceWorkqueue, //
         },
-        legacy_fence::{
-            CallbackError,
-            DmaFenceContext,
-            DriverDmaFence,
-            DriverDmaFenceOps,
-            FenceCallback,
-            FenceCallbackRegistration,
-            FenceWaitResult,
-            PublicDmaFence,
-            Published,
-            UninitDmaFence, //
-        },
+        DriverFence,
+        Fence,
+        FenceCallback,
+        FenceCallbackRegistration,
+        FenceContext,
+        FenceContextOps,
         SignallingSection, //
     },
     error::Result,
@@ -214,8 +217,6 @@ pub struct JobQueueLockClasses {
     pub stage_work: &'static LockClassKey,
     /// Lock class for the stage progress timer.
     pub stage_timer: &'static LockClassKey,
-    /// Lock class for per-job driver submit fences.
-    pub driver_fence: &'static LockClassKey,
 }
 
 /// The result returned by a stage's [`StageOps::process`] call.
@@ -246,7 +247,7 @@ pub enum StageAdvance {
     ///
     /// The pipeline registers a callback on `fence` and re-invokes
     /// [`StageOps::process`] when it fires.
-    WaitOn(ARef<PublicDmaFence>),
+    WaitOn(ARef<Fence>),
     /// Re-check after `delay` jiffies.
     ///
     /// Useful for polling intervals or deadline timers. The pipeline schedules
@@ -294,7 +295,7 @@ pub struct StageContext<'a, T: QueueOps> {
     /// Monotonic job counter.
     pub counter: u64,
     /// The public submit fence for this job.
-    pub submit_fence: &'a ARef<PublicDmaFence>,
+    pub submit_fence: &'a ARef<Fence>,
     entered_at: Instant<Monotonic>,
     pipeline_entered_at: Instant<Monotonic>,
 }
@@ -475,16 +476,32 @@ enum StageKind<T: QueueOps> {
     Driver(Arc<dyn StageOps<T>>),
 }
 
+/// The [`FenceContextOps`] of the submit fences of a [`JobQueue`] with
+/// operations `T`.
+pub struct SubmitFenceOps<T: QueueOps>(PhantomData<fn() -> T>);
+
+impl<T: QueueOps> FenceContextOps for SubmitFenceOps<T> {
+    type FenceDataType = T::FenceData;
+}
+
+/// The driver side of the submit fence of a job in a [`JobQueue`] with
+/// operations `T`.
+///
+/// The fence borrows the fence context of its queue. [`JobQueue::prepare`]
+/// extends the borrow to `'static`, and [`QueueOps::submit`] says how long a
+/// driver may keep the fence.
+pub type SubmitFence<T> = DriverFence<'static, SubmitFenceOps<T>>;
+
 /// The result of a driver's submit call.
-pub enum SubmitResult<FD: DriverDmaFenceOps> {
+pub enum SubmitResult<T: QueueOps> {
     /// The driver accepted the job and took ownership of the submit fence.
-    /// The driver must eventually call [`DriverDmaFence::signal`] when the
+    /// The driver must eventually call [`DriverFence::signal`] when the
     /// job completes or fails (directly or via a registered callback).
     Submitted,
     /// The driver has no resources available (e.g. ring buffer full).
     /// The fence is returned so the pipeline can retry on the next progress
     /// check, which is triggered by job completions or new submissions.
-    NoResources(DriverDmaFence<FD, Published>),
+    NoResources(SubmitFence<T>),
 }
 
 /// A read-only reference to a submitted job, provided to the driver's submit
@@ -493,20 +510,27 @@ pub struct JobRef<'a, J: Send + Sync + 'static> {
     /// The driver's job data.
     pub job: &'a J,
     /// The public fence that will be signaled when this job completes.
-    pub submit_fence: &'a ARef<PublicDmaFence>,
+    pub submit_fence: &'a ARef<Fence>,
     /// Monotonic job counter, useful for debug/logging.
     pub counter: u64,
 }
 
 /// Driver callbacks for [`JobQueue`] -- all calls happen in process context.
-pub trait QueueOps: Send + Sync + 'static {
+pub trait QueueOps: Send + Sync + Sized + 'static {
     /// The type of job this handler processes.
     type Job: Send + Sync + 'static;
 
     /// The driver data type embedded in submit fences.
     ///
-    /// Use a zero-sized type to avoid per-job allocation overhead.
-    type FenceData: DriverDmaFenceOps + Send + 'static;
+    /// Use a zero-sized type to avoid per-job allocation overhead. Its
+    /// [`Drop`] implementation must only do what is allowed in atomic context.
+    type FenceData: Send + Sync + 'static;
+
+    /// The driver name the submit fences report.
+    const DRIVER_NAME: &'static CStr;
+
+    /// The timeline name the submit fences report.
+    const TIMELINE_NAME: &'static CStr;
 
     /// Returns the lock classes used by this queue's internal primitives.
     fn lock_classes() -> JobQueueLockClasses;
@@ -514,17 +538,23 @@ pub trait QueueOps: Send + Sync + 'static {
     /// Submit a job to the hardware. Called from process context.
     ///
     /// `fence` is owned by the call. On [`SubmitResult::Submitted`] the driver
-    /// takes ownership and must eventually call [`DriverDmaFence::signal`]
+    /// takes ownership and must eventually call [`DriverFence::signal`]
     /// (directly or via a callback) when the job completes or fails. On
     /// [`SubmitResult::NoResources`] the fence is returned to the queue for
     /// the next retry. On `Err(..)` the driver must signal `fence` with the
     /// error before returning.
+    ///
+    /// `fence` borrows the fence context of this queue, so the driver must
+    /// signal or drop it before the context is dropped. The context is
+    /// dropped with the internal state of the queue, after the handler and
+    /// the stages, so a fence kept in data that only they hold at that point
+    /// meets this.
     fn submit(
         &self,
         job: &JobRef<'_, Self::Job>,
-        fence: DriverDmaFence<Self::FenceData, Published>,
+        fence: SubmitFence<Self>,
         wq: &DmaFenceWorkqueue,
-    ) -> Result<SubmitResult<Self::FenceData>>;
+    ) -> Result<SubmitResult<Self>>;
 }
 
 /// A wrapping range over `u32` indices.
@@ -573,7 +603,7 @@ impl WrapRange {
 #[allow(dead_code)]
 struct JobDependencies<T: QueueOps> {
     /// All dependency fences, set at submit time.
-    fences: KVVec<ARef<PublicDmaFence>>,
+    fences: KVVec<ARef<Fence>>,
     /// Which dependency we're currently waiting on.
     current_idx: usize,
     /// The currently active dependency callback (at most one at a time).
@@ -596,13 +626,13 @@ struct JobEntry<T: QueueOps> {
 
     /// The public fence returned to the caller of `submit()`. Shared with
     /// dependency waiters and other observers.
-    submit_fence: ARef<PublicDmaFence>,
+    submit_fence: ARef<Fence>,
 
     /// The driver-side submit fence handle. Present from job creation until
     /// the job is passed to [`QueueOps::submit`]; `None` thereafter (the
     /// driver owns it and will signal it when done, or on drop signals
     /// `ECANCELED`).
-    submit_fence_drv: Option<DriverDmaFence<T::FenceData, Published>>,
+    submit_fence_drv: Option<SubmitFence<T>>,
 
     /// Monotonic job counter for debugging.
     counter: u64,
@@ -660,7 +690,7 @@ enum XaEntry<T: QueueOps> {
     /// Job reserved by [`prepare()`] but not yet committed.
     Reserved {
         job: Arc<T::Job>,
-        deps: KVVec<ARef<PublicDmaFence>>,
+        deps: KVVec<ARef<Fence>>,
         /// Pre-allocated callback storage stashed alongside `deps` until
         /// [`commit()`] moves it into the `Live` entry.
         prealloc_cbs:
@@ -697,9 +727,9 @@ impl<T: QueueOps> XaEntry<T> {
     /// allocating. Returns `submit_fence_drv` if the entry is not `Reserved`.
     fn make_live(
         &mut self,
-        submit_fence: &ARef<PublicDmaFence>,
-        submit_fence_drv: DriverDmaFence<T::FenceData, Published>,
-    ) -> Result<(), DriverDmaFence<T::FenceData, Published>> {
+        submit_fence: &ARef<Fence>,
+        submit_fence_drv: SubmitFence<T>,
+    ) -> Result<(), SubmitFence<T>> {
         let XaEntry::Reserved {
             job,
             deps,
@@ -831,9 +861,6 @@ struct JobQueueInner<T: QueueOps> {
     /// Internal workqueue for cleanup work.
     aux_wq: Arc<DmaFenceWorkqueue>,
 
-    /// DMA fence context and sequence number counter for submit fences.
-    fence_ctx: DmaFenceContext,
-
     /// Monotonic job counter.
     job_counter: AtomicU64,
 
@@ -860,6 +887,14 @@ struct JobQueueInner<T: QueueOps> {
     /// Delayed work for stage-timer wakeups.
     #[pin]
     stage_timer: DmaFenceDelayedWork<JobQueueInner<T>, 4>,
+
+    /// Fence context of the submit fences.
+    ///
+    /// The fences borrow it with the lifetime extended to `'static`, see
+    /// [`JobQueue::prepare`]. It is the last field, so the fences kept in
+    /// `fifo`, `handler` and `stages` are dropped before it.
+    #[pin]
+    fence_ctx: FenceContext<SubmitFenceOps<T>>,
 }
 
 // SAFETY: `JobQueueInner` only contains thread-safe kernel synchronization
@@ -875,7 +910,7 @@ struct DepCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for DepCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+    fn on_signal(&mut self, _status: Result) {
         self.inner.maybe_check_progress();
     }
 }
@@ -886,7 +921,7 @@ struct ProgressCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for ProgressCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+    fn on_signal(&mut self, _status: Result) {
         self.inner.maybe_check_progress();
     }
 }
@@ -897,7 +932,7 @@ struct StageWakeCallback<T: QueueOps> {
 }
 
 impl<T: QueueOps> FenceCallback for StageWakeCallback<T> {
-    fn signaled(self, _fence: &ARef<PublicDmaFence>) {
+    fn on_signal(&mut self, _status: Result) {
         self.inner.maybe_check_progress();
     }
 }
@@ -1130,12 +1165,18 @@ impl<T: QueueOps> JobQueueInner<T> {
                             .and_then(|e| e.as_live_mut())
                             .and_then(|e| e.prealloc_stage_cb.take())
                     };
-                    let cb = FenceCallbackRegistration::new(
-                        &fence,
-                        StageWakeCallback {
-                            inner: self.clone(),
-                        },
-                    );
+                    // SAFETY: The registration goes into the entry or is dropped at
+                    // once. The pipeline and `cancel_all()`, which `JobQueue::drop()`
+                    // calls, drop the entries, so neither the registration nor the
+                    // reference cycle through its `Arc` is forgotten.
+                    let cb = unsafe {
+                        FenceCallbackRegistration::new(
+                            &fence,
+                            StageWakeCallback {
+                                inner: self.clone(),
+                            },
+                        )
+                    };
                     // The first WaitOn uses the prealloc slot. A re-registration
                     // falls back to GFP_NOWAIT, never GFP_KERNEL under the state mutex.
                     let result = match uninit_box {
@@ -1211,7 +1252,7 @@ impl<T: QueueOps> JobQueueInner<T> {
 
             // Advance past an already-signaled dep, releasing any callback left
             // over from the previous one, without consuming a prealloc slot.
-            if dep_fence.is_signaled() {
+            if matches!(dep_fence.status(), FenceStatus::Signaled(_)) {
                 let mut guard = self.fifo.lock();
                 if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                     entry.deps.active_cb = None;
@@ -1247,7 +1288,11 @@ impl<T: QueueOps> JobQueueInner<T> {
                     .and_then(|e| e.as_live_mut())
                     .and_then(|e| e.deps.prealloc_cbs.pop())
             };
-            let cb_init = FenceCallbackRegistration::new(&dep_fence, callback);
+            // SAFETY: The registration goes into the entry or is dropped at
+            // once. The pipeline and `cancel_all()`, which `JobQueue::drop()`
+            // calls, drop the entries, so neither the registration nor the
+            // reference cycle through its `Arc` is forgotten.
+            let cb_init = unsafe { FenceCallbackRegistration::new(&dep_fence, callback) };
             let result = match uninit_box {
                 Some(uninit_box) => uninit_box.write_pin_init(cb_init),
                 None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
@@ -1335,12 +1380,18 @@ impl<T: QueueOps> JobQueueInner<T> {
                         .and_then(|e| e.as_live_mut())
                         .and_then(|e| e.prealloc_progress_cb.take())
                 };
-                let cb_init = FenceCallbackRegistration::new(
-                    &submit_fence,
-                    ProgressCallback {
-                        inner: self.clone(),
-                    },
-                );
+                // SAFETY: The registration goes into the entry or is dropped at
+                // once. The pipeline and `cancel_all()`, which `JobQueue::drop()`
+                // calls, drop the entries, so neither the registration nor the
+                // reference cycle through its `Arc` is forgotten.
+                let cb_init = unsafe {
+                    FenceCallbackRegistration::new(
+                        &submit_fence,
+                        ProgressCallback {
+                            inner: self.clone(),
+                        },
+                    )
+                };
                 let cb_result = match uninit_box {
                     Some(uninit_box) => uninit_box.write_pin_init(cb_init),
                     None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
@@ -1394,7 +1445,7 @@ impl<T: QueueOps> JobQueueInner<T> {
         {
             let guard = self.fifo.lock();
             if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
-                if entry.submit_fence.is_signaled() {
+                if matches!(entry.submit_fence.status(), FenceStatus::Signaled(_)) {
                     return StageAdvance::Advance;
                 }
             }
@@ -1550,8 +1601,10 @@ impl<T: QueueOps> Drop for CoalesceGuard<T> {
 /// one, so code holding a [`PreparedJob`] must not wait on a job committed
 /// after it.
 pub struct PreparedJob<T: QueueOps> {
+    /// Declared first so that it drops before `slot`, which may hold the last
+    /// reference to the fence context it borrows.
+    uninit_fence: DriverFenceAllocation<'static, SubmitFenceOps<T>>,
     slot: ReservedSlot<T>,
-    uninit_fence: UninitDmaFence<T::FenceData>,
 }
 
 /// The XArray index reserved for a [`PreparedJob`].
@@ -1572,7 +1625,7 @@ impl<T: QueueOps> PreparedJob<T> {
     /// is safe inside a dma-fence signalling section. Returns `ENOSPC` if the
     /// caller asked for too few extra slots, and `EINVAL` if the reserved
     /// entry is no longer `Reserved`.
-    pub fn add_dep(&mut self, fence: ARef<PublicDmaFence>) -> Result {
+    pub fn add_dep(&mut self, fence: ARef<Fence>) -> Result {
         let mut guard = self.slot.inner.fifo.lock();
         let Some(XaEntry::Reserved { deps, .. }) = guard.get_mut(self.slot.index.index()) else {
             return Err(EINVAL);
@@ -1596,7 +1649,7 @@ impl<T: QueueOps> PreparedJob<T> {
     }
 
     /// Commits the job to the queue that prepared it. See [`JobQueue::commit`].
-    fn commit(self) -> ARef<PublicDmaFence> {
+    fn commit(self) -> ARef<Fence> {
         let Self {
             mut slot,
             uninit_fence,
@@ -1604,9 +1657,8 @@ impl<T: QueueOps> PreparedJob<T> {
         let inner = &slot.inner;
         let index = slot.index.index();
 
-        let (ctx, seqno) = inner.fence_ctx.next_seqno();
-
-        let (submit_fence_drv, submit_fence) = uninit_fence.init(ctx, seqno);
+        let submit_fence_drv = uninit_fence.new_fence();
+        let submit_fence = ARef::from(submit_fence_drv.as_fence());
 
         let refused = {
             let mut guard = inner.fifo.lock();
@@ -1706,7 +1758,6 @@ impl<T: QueueOps> JobQueue<T> {
                 ),
                 wq,
                 aux_wq,
-                fence_ctx: DmaFenceContext::new(0),
                 job_counter: AtomicU64::new(0),
                 coalesce: AtomicBool::new(false),
                 cancelled: Atomic::new(false),
@@ -1718,6 +1769,12 @@ impl<T: QueueOps> JobQueue<T> {
                     ::core::pin::Pin::static_ref(lock_classes.stage_work),
                     c_str!("JobQueue::stage_timer_timer"),
                     ::core::pin::Pin::static_ref(lock_classes.stage_timer),
+                ),
+                fence_ctx <- FenceContext::new(
+                    1,
+                    T::DRIVER_NAME,
+                    T::TIMELINE_NAME,
+                    SubmitFenceOps(PhantomData),
                 ),
             }),
             GFP_KERNEL,
@@ -1741,15 +1798,22 @@ impl<T: QueueOps> JobQueue<T> {
     pub fn prepare(
         &self,
         job: T::Job,
-        deps: &[ARef<PublicDmaFence>],
+        deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
         fence_data: T::FenceData,
     ) -> Result<PreparedJob<T>> {
-        let lock_classes = T::lock_classes();
-        let uninit_fence = UninitDmaFence::new(
-            fence_data,
-            ::core::pin::Pin::static_ref(lock_classes.driver_fence),
-        )?;
+        let uninit_fence = self.inner.fence_ctx.new_fence_allocation(fence_data)?;
+        // SAFETY: Only the lifetime of the borrow of `fence_ctx` changes. The
+        // allocation, and later the fence made from it, live in the returned
+        // `PreparedJob`, which holds a reference to `self.inner` and drops the
+        // allocation first, in an entry of `fifo`, which drops before
+        // `fence_ctx`, or with the driver, under the rule on `QueueOps::submit`.
+        let uninit_fence = unsafe {
+            core::mem::transmute::<
+                DriverFenceAllocation<'_, SubmitFenceOps<T>>,
+                DriverFenceAllocation<'static, SubmitFenceOps<T>>,
+            >(uninit_fence)
+        };
         let counter = self.inner.job_counter.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(job, GFP_KERNEL)?;
         let dep_capacity = deps
@@ -1825,12 +1889,12 @@ impl<T: QueueOps> JobQueue<T> {
         }
 
         Ok(PreparedJob {
+            uninit_fence,
             slot: ReservedSlot {
                 inner: self.inner.clone(),
                 index: xa_index,
                 armed: true,
             },
-            uninit_fence,
         })
     }
 
@@ -1854,7 +1918,7 @@ impl<T: QueueOps> JobQueue<T> {
     /// signals it before `cancel_all` returns. This is safe only while the
     /// fences carry `BOOKKEEP` usage, which implicit sync never reads. A
     /// caller must not wait on its own reservation object at `BOOKKEEP`.
-    pub fn commit(&self, prepared: PreparedJob<T>) -> ARef<PublicDmaFence> {
+    pub fn commit(&self, prepared: PreparedJob<T>) -> ARef<Fence> {
         prepared.commit()
     }
 
@@ -2011,7 +2075,7 @@ impl<T: QueueOps> JobQueue<T> {
 
     /// Waits for one in-flight hardware fence, bounded by the cancel timeout
     /// when one is set.
-    fn wait_for_hw_fence(&self, fence: &PublicDmaFence) {
+    fn wait_for_hw_fence(&self, fence: &Fence) {
         match self.inner.cancel_timeout {
             None => {
                 let _ = fence.wait();

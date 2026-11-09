@@ -4,11 +4,11 @@
 //!
 //! C header: [`include/drm/drm_syncobj.h`](../../../../include/drm/drm_syncobj.h)
 
-use core::marker::PhantomData;
+use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
     bindings,
-    dma_buf::{dma_fence_chain::FenceChain, legacy_fence::PublicDmaFence},
+    dma_buf::{dma_fence_chain::FenceChain, Fence},
     drm,
     error::Result,
     prelude::*,
@@ -44,16 +44,14 @@ impl<T: drm::Driver> SyncObj<T> {
     }
 
     /// Returns the DMA fence associated with this sync object, if any.
-    pub fn fence_get(&self) -> Option<ARef<PublicDmaFence>> {
+    pub fn fence_get(&self) -> Option<ARef<Fence>> {
         // SAFETY: `self.ptr` is valid per the type invariant.
-        let fence = unsafe { bindings::drm_syncobj_fence_get(self.ptr) };
-        if fence.is_null() {
-            None
-        } else {
-            // SAFETY: The pointer is non-NULL and `drm_syncobj_fence_get` acquired
-            // an additional reference.
-            Some(unsafe { PublicDmaFence::from_raw(fence) })
-        }
+        let fence = NonNull::new(unsafe { bindings::drm_syncobj_fence_get(self.ptr) })?;
+
+        // SAFETY: `drm_syncobj_fence_get` acquired an additional reference, which
+        // the `ARef` takes over. `Fence` is a transparent wrapper of a
+        // `struct dma_fence`.
+        Some(unsafe { ARef::from_raw(fence.cast()) })
     }
 
     /// Finds the fence at a specific timeline point for this sync object.
@@ -62,7 +60,7 @@ impl<T: drm::Driver> SyncObj<T> {
         handle: u32,
         point: u64,
         flags: u64,
-    ) -> Result<Option<ARef<PublicDmaFence>>> {
+    ) -> Result<Option<ARef<Fence>>> {
         let mut fence = core::ptr::null_mut();
 
         // SAFETY: The arguments are valid per the type invariants.
@@ -71,32 +69,37 @@ impl<T: drm::Driver> SyncObj<T> {
         };
 
         if ret != 0 {
-            Err(Error::from_errno(ret))
-        } else if fence.is_null() {
-            Ok(None)
-        } else {
-            // SAFETY: The pointer is non-NULL and `drm_syncobj_find_fence`
-            // acquired an additional reference.
-            Ok(Some(unsafe { PublicDmaFence::from_raw(fence) }))
+            return Err(Error::from_errno(ret));
         }
+
+        let Some(fence) = NonNull::new(fence) else {
+            return Ok(None);
+        };
+
+        // SAFETY: `drm_syncobj_find_fence` acquired an additional reference,
+        // which the `ARef` takes over. `Fence` is a transparent wrapper of a
+        // `struct dma_fence`.
+        Ok(Some(unsafe { ARef::from_raw(fence.cast()) }))
     }
 
     /// Replaces the DMA fence with a new one, or removes it if `fence` is `None`.
-    pub fn replace_fence(&self, fence: Option<&PublicDmaFence>) {
+    pub fn replace_fence(&self, fence: Option<&Fence>) {
         // SAFETY: The arguments are valid per the respective type invariants.
         unsafe {
             bindings::drm_syncobj_replace_fence(
                 self.ptr,
-                fence.map_or(core::ptr::null_mut(), |fence| fence.raw()),
+                fence.map_or(core::ptr::null_mut(), |fence| fence.as_raw()),
             )
         };
     }
 
     /// Adds a new timeline point to the sync object.
-    pub fn add_point(&self, chain: FenceChain, fence: &PublicDmaFence, point: u64) {
+    pub fn add_point(&self, chain: FenceChain, fence: &Fence, point: u64) {
         // SAFETY: The arguments are valid per the respective type invariants, and
         // this transfers ownership of `chain` to the DRM core.
-        unsafe { bindings::drm_syncobj_add_point(self.ptr, chain.into_raw(), fence.raw(), point) };
+        unsafe {
+            bindings::drm_syncobj_add_point(self.ptr, chain.into_raw(), fence.as_raw(), point)
+        };
     }
 }
 

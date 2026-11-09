@@ -4,7 +4,7 @@
 
 use kernel::{
     bindings::drm_gpuvm_exec,
-    dma_buf::legacy_fence::PublicDmaFence,
+    dma_buf::Fence,
     drm::{
         exec::ExecFlag,
         gpuvm::{
@@ -49,18 +49,13 @@ impl<'a, T: DriverGpuVm> ExecToken<'a, T> {
         })
     }
 
-    pub(crate) fn resv_add_fence(
-        &mut self,
-        fence: &PublicDmaFence,
-        private_usage: u32,
-        extobj_usage: u32,
-    ) {
+    pub(crate) fn resv_add_fence(&mut self, fence: &Fence, private_usage: u32, extobj_usage: u32) {
         // SAFETY: `vm_exec` stays locked for the lifetime of the token and `fence` is live.
         unsafe {
             kernel::bindings::drm_gpuvm_resv_add_fence(
                 self.vm_exec.vm,
                 core::ptr::from_ref(&self.vm_exec.exec).cast_mut(),
-                fence.raw(),
+                fence.as_raw(),
                 private_usage,
                 extobj_usage,
             )

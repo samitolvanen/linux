@@ -26,12 +26,7 @@ use kernel::{
     dma::DmaAddress,
     dma_buf::{
         fence_work::DmaFenceWorkqueue,
-        legacy_fence::{
-            DriverDmaFence,
-            DriverDmaFenceOps,
-            PublicDmaFence,
-            Published, //
-        },
+        Fence, //
     },
     drm::{
         exec::{
@@ -60,6 +55,7 @@ use kernel::{
             PipelineBuilder,
             PreparedJob,
             QueueOps,
+            SubmitFence,
             SubmitResult, //
         }, //
     },
@@ -140,8 +136,6 @@ static VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassK
 static VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 // SAFETY: See above.
 static VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
-// SAFETY: See above.
-static VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS: LockClassKey = unsafe { LockClassKey::new_static() };
 
 /// Maximum number of live VMs per file.
 const MAX_VMS_PER_POOL: u32 = 32;
@@ -322,17 +316,6 @@ impl fmt::Display for VmMapFlags {
 #[derive(Default)]
 pub(crate) struct VmBindFenceData;
 
-#[vtable]
-impl DriverDmaFenceOps for VmBindFenceData {
-    fn driver_name(&self) -> &'static CStr {
-        c"tyr"
-    }
-
-    fn timeline_name(&self) -> &'static CStr {
-        c"tyr_vm_bind"
-    }
-}
-
 pub(crate) enum VmBindJobOp {
     Map {
         bo_offset: u64,
@@ -427,6 +410,9 @@ impl QueueOps for VmBindQueueOps {
     type Job = VmBindJob;
     type FenceData = VmBindFenceData;
 
+    const DRIVER_NAME: &'static CStr = c"tyr";
+    const TIMELINE_NAME: &'static CStr = c"tyr_vm_bind";
+
     fn lock_classes() -> JobQueueLockClasses {
         JobQueueLockClasses {
             inbox: &VM_BIND_QUEUE_INBOX_LOCK_CLASS,
@@ -435,16 +421,15 @@ impl QueueOps for VmBindQueueOps {
             cleanup_work: &VM_BIND_QUEUE_CLEANUP_WORK_LOCK_CLASS,
             stage_work: &VM_BIND_QUEUE_STAGE_WORK_LOCK_CLASS,
             stage_timer: &VM_BIND_QUEUE_STAGE_TIMER_LOCK_CLASS,
-            driver_fence: &VM_BIND_QUEUE_DRIVER_FENCE_LOCK_CLASS,
         }
     }
 
     fn submit(
         &self,
         job: &JobRef<'_, Self::Job>,
-        fence: DriverDmaFence<Self::FenceData, Published>,
+        fence: SubmitFence<Self>,
         _wq: &DmaFenceWorkqueue,
-    ) -> Result<SubmitResult<Self::FenceData>> {
+    ) -> Result<SubmitResult<Self>> {
         let Some(guard) = self.ddev.registration_guard() else {
             fence.signal(Err(ENODEV));
             return Ok(SubmitResult::Submitted);
@@ -519,17 +504,17 @@ impl deps::BatchOps for BindOps {
     fn prepare(
         &self,
         job: VmBindJob,
-        deps: &[ARef<PublicDmaFence>],
+        deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedVmBindJob> {
         self.vm.prepare_bind_job(job, deps, extra_dep_capacity)
     }
 
-    fn add_dep(&self, prepared: &mut PreparedVmBindJob, fence: ARef<PublicDmaFence>) -> Result {
+    fn add_dep(&self, prepared: &mut PreparedVmBindJob, fence: ARef<Fence>) -> Result {
         prepared.add_dep(fence)
     }
 
-    fn commit(&self, prepared: PreparedVmBindJob) -> Result<ARef<PublicDmaFence>> {
+    fn commit(&self, prepared: PreparedVmBindJob) -> Result<ARef<Fence>> {
         self.vm.commit_bind_job(prepared)
     }
 }
@@ -992,7 +977,7 @@ pub(crate) struct Vm {
     bind_lock: Mutex<()>,
     /// Submit fence of the most recently committed async bind.
     #[pin]
-    last_bind_fence: Mutex<Option<ARef<PublicDmaFence>>>,
+    last_bind_fence: Mutex<Option<ARef<Fence>>>,
     /// Exclusive upper bound on what user space may bind.
     user_va_limit: u64,
     /// Kernel VA allocator for auto-placement of kernel buffer objects.
@@ -1304,7 +1289,7 @@ impl Vm {
     pub(crate) fn prepare_bind_job(
         &self,
         job: VmBindJob,
-        deps: &[ARef<PublicDmaFence>],
+        deps: &[ARef<Fence>],
         extra_dep_capacity: usize,
     ) -> Result<PreparedVmBindJob> {
         self.flush_deferred_cleanup();
@@ -1313,10 +1298,7 @@ impl Vm {
             .prepare(job, deps, extra_dep_capacity, VmBindFenceData)
     }
 
-    pub(crate) fn commit_bind_job(
-        &self,
-        prepared: PreparedVmBindJob,
-    ) -> Result<ARef<PublicDmaFence>> {
+    pub(crate) fn commit_bind_job(&self, prepared: PreparedVmBindJob) -> Result<ARef<Fence>> {
         let fence = self.bind_queue()?.commit(prepared);
         *self.last_bind_fence.lock() = Some(fence.clone());
         Ok(fence)
@@ -1326,7 +1308,7 @@ impl Vm {
 /// The bind queue and fence that `Vm::drop` passes to `release_bind_queue`.
 struct BindQueueRelease {
     queue: JobQueue<VmBindQueueOps>,
-    last_fence: Option<ARef<PublicDmaFence>>,
+    last_fence: Option<ARef<Fence>>,
 }
 
 /// Drops the bind queue once its last committed bind has signaled, so no
@@ -1367,12 +1349,7 @@ pub(crate) struct PreparedVm<'a> {
 }
 
 impl PreparedVm<'_> {
-    pub(crate) fn resv_add_fence(
-        &mut self,
-        fence: &PublicDmaFence,
-        private_usage: u32,
-        extobj_usage: u32,
-    ) {
+    pub(crate) fn resv_add_fence(&mut self, fence: &Fence, private_usage: u32, extobj_usage: u32) {
         self.exec_token
             .resv_add_fence(fence, private_usage, extobj_usage);
     }
