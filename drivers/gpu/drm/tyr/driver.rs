@@ -398,12 +398,9 @@ pub(crate) struct TyrDrmDeviceData {
     /// This keeps scheduler-mutex work off the threaded IRQ handler.
     fw_events: Atomic<u32>,
 
-    /// Worker that drains `fw_events` under the
-    /// scheduler mutex. Enqueued on `sched_wq`.
-    ///
-    /// Typed as `DmaFenceWork` so it can ride on `sched_wq` (a
-    /// `DmaFenceWorkqueue`), not because the body signals dma-fences:
-    /// it only ACKs CSG events.
+    /// Worker that drains `fw_events` under the scheduler mutex, then
+    /// signals the completed submit fences of the resident groups after a
+    /// `SYNC_UPDATE`. Enqueued on `sched_wq`.
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
@@ -872,10 +869,13 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             return;
         }
 
-        let _ = tdev.with_locked_scheduler(|sched| {
-            sched.process_csg_irqs(events, tdev);
-            Ok(())
-        });
+        let sync_update = tdev
+            .with_locked_scheduler(|sched| Ok(sched.process_csg_irqs(events, tdev)))
+            .unwrap_or(false);
+
+        if sync_update {
+            Scheduler::drain_resident_queue_completions(tdev);
+        }
     }
 }
 
@@ -907,9 +907,19 @@ impl WorkItem<{ work_id::SYNC_UPD }> for TyrDrmDeviceData {
 
         Scheduler::drain_resident_queue_completions(tdev);
 
-        let snapshot = tdev
-            .with_locked_scheduler(|sched| Ok(sched.collect_syncwait_candidates()))
+        let (snapshot, waiting) = tdev
+            .with_locked_scheduler(|sched| {
+                Ok((
+                    sched.collect_syncwait_candidates(),
+                    sched.has_waiting_groups(),
+                ))
+            })
             .unwrap_or_default();
+        // Test the list, not the snapshot, so a failed allocation still
+        // reaches the poll re-arm below.
+        if !waiting {
+            return;
+        }
 
         // SAFETY: `stop_system_work` cancels this worker and shuts its gate
         // before the device unbinds, both at unbind and on a failed probe.

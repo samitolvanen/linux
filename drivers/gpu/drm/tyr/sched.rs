@@ -571,6 +571,11 @@ impl Scheduler {
         self.runnable_groups.iter().any(|list| !list.is_empty())
     }
 
+    /// Returns whether any group is on the wait list.
+    pub(crate) fn has_waiting_groups(&self) -> bool {
+        self.waiting_groups.iter().any(|list| !list.is_empty())
+    }
+
     /// Removes `group` from the list named by `list_state`.
     pub(crate) fn remove_group_from_list(
         &mut self,
