@@ -358,7 +358,12 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
                 // Drop here directly if possible. Otherwise, let the DropWorker
                 // take care of it.
                 if core::mem::needs_drop::<T::JobDataType>() {
+                    // complete_jobs_up_to_seqno() woke the DropWorker before
+                    // this job reached the list, so wake it again: otherwise
+                    // the job waits until the next completion.
+                    let queue = job.jq;
                     jq.drop_list.push_back(job);
+                    queue.check_start_drop_worker();
                 }
             } else {
                 jq.running_jobs.push_back(job);
