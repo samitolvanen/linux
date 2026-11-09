@@ -922,6 +922,33 @@ impl<'a, T: Send + Sync + FenceContextOps> DriverFenceAllocation<'a, T> {
 }
 
 impl<'a, T: Send + Sync + FenceContextOps> DriverFence<'a, T> {
+    /// Drops the fence without waiting for an RCU grace period.
+    ///
+    /// [`Drop`] waits for one grace period per fence before it drops the
+    /// fence's data. A caller that drops many fences can instead wait once,
+    /// with [`synchronize_rcu()`], after all of them were signaled, and then
+    /// drop each with this function.
+    ///
+    /// # Safety
+    ///
+    /// The fence is signaled, and a full RCU grace period has elapsed since.
+    pub unsafe fn drop_after_grace_period(self) {
+        let this = ManuallyDrop::new(self);
+
+        // `as_raw()` references the whole `DriverFenceData`, so take the
+        // pointer before the payload is dropped.
+        let fence = this.as_raw();
+
+        // SAFETY: `this.data` points to a valid `DriverFenceData`. The fence
+        // is signaled and a grace period has elapsed since, so no
+        // dma_fence_ops caller can reach the payload any more.
+        unsafe { drop_in_place(&raw mut (*this.data.as_ptr()).data) };
+
+        // SAFETY: `this` owns one reference to `fence`, which it gives up
+        // here.
+        unsafe { bindings::dma_fence_put(fence) };
+    }
+
     fn as_raw(&self) -> *mut bindings::dma_fence {
         // SAFETY: Valid because `self` is valid.
         let fence_data = unsafe { &*self.data.as_ptr() };
