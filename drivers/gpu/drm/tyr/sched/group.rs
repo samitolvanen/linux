@@ -13,10 +13,15 @@ use kernel::{
     },
     dma_buf::{
         fence_work::{
+            impl_has_dma_fence_delayed_work,
             impl_has_dma_fence_work,
+            new_dma_fence_delayed_work,
             new_dma_fence_work,
+            DmaFenceDelayedWork,
+            DmaFenceDelayedWorkItem,
             DmaFenceWork,
-            DmaFenceWorkItem, //
+            DmaFenceWorkItem,
+            DmaFenceWorkqueue, //
         },
         Fence,
     },
@@ -37,6 +42,10 @@ use kernel::{
         Arc,
         LockedBy,
         Mutex, //
+    },
+    time::{
+        msecs_to_jiffies,
+        Delta, //
     },
     uaccess::UserSlice,
     uapi,
@@ -88,7 +97,8 @@ use super::{
         PreparedQueueJob,
         Queue,
         QueueCreate,
-        QueueJob, //
+        QueueJob,
+        JOB_TIMEOUT_MS, //
     },
     syncs, //
 };
@@ -103,6 +113,8 @@ pub(crate) mod work_id {
     pub(crate) const RELEASE: u64 = 2;
     /// Tiler heap out-of-memory growth worker.
     pub(crate) const TILER_OOM: u64 = 3;
+    /// Job timeout worker.
+    pub(crate) const TIMEOUT: u64 = 4;
 }
 
 /// Upper bound on queues per group, set by the width of the per-queue
@@ -335,6 +347,16 @@ pub(crate) struct Group {
     /// device's `heap_alloc_wq`.
     #[pin]
     tiler_oom_work: Work<Group, { work_id::TILER_OOM }>,
+    /// Worker that fails a job that has run for longer than
+    /// `JOB_TIMEOUT_MS`, and completes jobs whose sync-update IRQ was
+    /// missed.
+    ///
+    /// Armed when a queue pushes a job, and canceled by `release_work`.
+    /// Runs on `wq`.
+    #[pin]
+    timeout_work: DmaFenceDelayedWork<Group, { work_id::TIMEOUT }>,
+    /// The workqueue the group's queues run their jobs on.
+    wq: Arc<DmaFenceWorkqueue>,
     #[pin]
     pub(crate) links: ListLinks,
     #[pin]
@@ -508,6 +530,8 @@ impl Group {
                 term_work <- new_dma_fence_work!("tyr-group-term"),
                 release_work <- new_work!("tyr-group-release"),
                 tiler_oom_work <- new_work!("tyr-group-tiler-oom"),
+                timeout_work <- new_dma_fence_delayed_work!("tyr-group-timeout"),
+                wq: reg_data.wq.clone(),
                 links <- ListLinks::new(),
                 tracker <- AtomicTracker::new(),
                 wait_links <- ListLinks::new(),
@@ -682,11 +706,13 @@ impl Group {
         }
     }
 
-    /// Releases the park taken by `park_queues`. Same locking rule.
-    pub(crate) fn unpark_queues(&self) {
+    /// Releases the park taken by `park_queues`, and re-arms
+    /// `timeout_work` for the jobs on the queues. Same locking rule.
+    pub(crate) fn unpark_queues(self: &Arc<Self>) {
         for queue in self.queues.iter() {
             queue.unpark();
         }
+        self.arm_timeout();
     }
 
     /// Cancels every queue in the group.
@@ -720,6 +746,58 @@ impl Group {
         }
 
         TyrDrmDeviceData::schedule_sync_upd(&self.tdev);
+    }
+
+    /// Arms `timeout_work` for the earliest deadline of the jobs on the
+    /// group's queues. A pending one keeps its deadline, which is never
+    /// later.
+    pub(super) fn arm_timeout(self: &Arc<Self>) {
+        let Some(delay) = self
+            .queues
+            .iter()
+            .filter_map(|queue| queue.oldest_job_deadline())
+            .map(|(_, remaining)| remaining)
+            .min()
+        else {
+            return;
+        };
+        let delay = msecs_to_jiffies(delay.as_millis().clamp(1, JOB_TIMEOUT_MS.into()) as u32);
+
+        // SAFETY: The group holds a reference to `self.wq` and the work
+        // item holds a reference to the group, so the workqueue lives until
+        // the item has run or been canceled.
+        let _ = unsafe {
+            self.wq
+                .enqueue_delayed::<Arc<Self>, { work_id::TIMEOUT }>(self.clone(), delay)
+        };
+    }
+
+    /// Fails the oldest job of a queue once it has run for longer than
+    /// `JOB_TIMEOUT_MS`, not counting time its queue spent suspended off a
+    /// CSG slot, and terminates the group. Completes the jobs the syncobjs
+    /// show complete first, as a backstop for a missed sync-update IRQ.
+    /// Re-arms `timeout_work` for the next deadline.
+    fn check_timeouts(self: &Arc<Self>) {
+        for (queue_idx, queue) in self.indexed_queues() {
+            let Some((done_seqno, _)) = queue.oldest_job_deadline() else {
+                continue;
+            };
+            queue.complete_from_syncobj(self, queue_idx, done_seqno);
+
+            let Some((done_seqno, remaining)) = queue.oldest_job_deadline() else {
+                continue;
+            };
+            if remaining > Delta::ZERO {
+                continue;
+            }
+
+            dev_warn!(self.tdev.as_ref(), "Queue job {} timed out\n", done_seqno);
+            self.with_locked_inner(|inner| inner.mark_timedout());
+            self.detach_and_terminate();
+            queue.fail_submit_fence(done_seqno, ETIMEDOUT);
+        }
+
+        self.arm_timeout();
     }
 
     /// Drains every queue. Same context rule as `Queue::drain`.
@@ -1034,6 +1112,20 @@ impl_has_dma_fence_work! {
     }
 }
 
+impl_has_dma_fence_delayed_work! {
+    impl HasDmaFenceDelayedWork<Group, { work_id::TIMEOUT }> for Group {
+        self.timeout_work
+    }
+}
+
+impl DmaFenceDelayedWorkItem<{ work_id::TIMEOUT }> for Group {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Self::Pointer) {
+        this.check_timeouts();
+    }
+}
+
 impl_has_work! {
     impl HasWork<Group, { work_id::RELEASE }> for Group {
         self.release_work
@@ -1062,6 +1154,8 @@ impl WorkItem<{ work_id::RELEASE }> for Group {
 
     fn run(this: Self::Pointer) {
         this.drain_queues();
+        // The queues have no job left, so nothing arms it again.
+        drop(this.timeout_work.cancel_sync());
         drop(this);
     }
 }
