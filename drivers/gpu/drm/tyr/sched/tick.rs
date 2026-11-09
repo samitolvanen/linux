@@ -219,8 +219,10 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>, fw: &Firmware<'_>) -> Result 
         tdev.reset.schedule();
     }
 
-    // schedule_term needs no scheduler state, so drain after the mutex
-    // is released, keeping the tick's critical section short.
+    Scheduler::drain_queue_completions(tdev, &teardown_groups);
+
+    // schedule_term needs no scheduler state, so terminate the groups
+    // after the mutex is released, keeping the tick's critical section short.
     for slot in teardown_groups.iter_mut() {
         let Some(group) = slot.take() else {
             break;
@@ -267,6 +269,8 @@ pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationDa
             e.to_errno()
         );
     }
+
+    Scheduler::drain_queue_completions(tdev, &teardown_groups);
 
     for slot in teardown_groups.iter_mut() {
         let Some(group) = slot.take() else {
@@ -919,7 +923,8 @@ impl SchedulingDecision {
 /// State for a single execution of the scheduler tick.
 pub(crate) struct Tick<'a> {
     sched: &'a mut Scheduler,
-    /// Groups evicted during this tick that need subsequent cleanup.
+    /// Groups evicted during this tick that need subsequent cleanup. The
+    /// caller drains their queue completions before canceling them.
     teardown_groups: &'a mut [Option<Arc<Group>>; TEARDOWN_ARRAY_SIZE],
     num_teardown: usize,
     /// Groups evicted during this tick that can still run, by slot. The
