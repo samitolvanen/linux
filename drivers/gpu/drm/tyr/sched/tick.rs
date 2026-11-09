@@ -41,6 +41,7 @@ use crate::{
     fw::{
         global::csg::Priority,
         CsgExecutionState,
+        CsgSlotMask,
         Firmware, //
     },
     regs::MAX_AS,
@@ -1012,13 +1013,16 @@ impl<'a> Tick<'a> {
     }
 
     /// Stages a `Suspend` (or `Terminate` for unhealthy groups) state
-    /// transition for every bound slot not covered by `keep_mask`.
+    /// transition for every bound slot not covered by `keep_mask`, and
+    /// returns those slots.
     fn stage_evictions(
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
         keep_mask: u32,
         context: &mut CsgUpdateContext,
-    ) {
+    ) -> CsgSlotMask {
+        let mut evicted = CsgSlotMask::empty();
+
         // Build the halt request set under the slot-manager lock,
         // then drop the lock before issuing the firmware update.
         // `apply_csg_updates` re-acquires it itself across its wait
@@ -1032,21 +1036,24 @@ impl<'a> Tick<'a> {
                 continue;
             };
 
+            evicted.insert(csg_idx);
             if slot_data.group.can_run() {
                 context.set_state(csg_idx, CsgExecutionState::Suspend);
             } else {
                 context.set_state(csg_idx, CsgExecutionState::Terminate);
             }
         }
+
+        evicted
     }
 
-    /// Tears down the binding of every slot not covered by `keep_mask`, after
-    /// the firmware acked (or timed out on) the staged state transitions.
+    /// Tears down the binding of every slot in `evicted`, after the firmware
+    /// acked (or timed out on) the staged state transitions.
     fn unbind_evicted_groups(
         &mut self,
         tdev: &ARef<TyrDrmDevice>,
         fw: &Firmware<'_>,
-        keep_mask: u32,
+        evicted: CsgSlotMask,
     ) -> Result<()> {
         // Drain any pending CSG IRQs on each evicted slot so the
         // group's per-queue / per-CSG bookkeeping reflects the latest
@@ -1055,7 +1062,7 @@ impl<'a> Tick<'a> {
         // `process_csg_irq` re-takes the slot-manager lock itself to
         // look the group up.
         for csg_idx in CsgSlotIdx::all() {
-            if (keep_mask & csg_idx.bit()) != 0 {
+            if !evicted.contains(csg_idx) {
                 continue;
             }
             if let Err(e) = self.sched.process_csg_irq(tdev, fw, csg_idx.get()) {
@@ -1074,7 +1081,7 @@ impl<'a> Tick<'a> {
         let mut ret = Ok(());
         let mut poll = false;
         for csg_idx in CsgSlotIdx::all() {
-            if (keep_mask & csg_idx.bit()) != 0 {
+            if !evicted.contains(csg_idx) {
                 continue;
             }
 
@@ -1128,13 +1135,16 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        self.stage_evictions(tdev, decision.keep_mask, &mut context);
+        let evicted = self.stage_evictions(tdev, decision.keep_mask, &mut context);
+        if evicted.is_empty() {
+            return Ok(());
+        }
 
         self.sched
             .apply_csg_updates(tdev, fw, &mut context)
             .inspect_err(|_| dev_err!(tdev.as_ref(), "apply_csg_updates (halt) failed\n"))?;
 
-        self.unbind_evicted_groups(tdev, fw, decision.keep_mask)
+        self.unbind_evicted_groups(tdev, fw, evicted)
     }
 
     /// Evicts every resident group for runtime suspend.
@@ -1149,7 +1159,7 @@ impl<'a> Tick<'a> {
     ) -> Result<()> {
         let mut context = CsgUpdateContext::new();
 
-        self.stage_evictions(tdev, 0, &mut context);
+        let evicted = self.stage_evictions(tdev, 0, &mut context);
 
         if self
             .sched
@@ -1202,7 +1212,7 @@ impl<'a> Tick<'a> {
             }
         }
 
-        let res = self.unbind_evicted_groups(tdev, &reg_data.fw, 0);
+        let res = self.unbind_evicted_groups(tdev, &reg_data.fw, evicted);
 
         if self.sched.has_runnable_groups() {
             TyrDrmDeviceData::schedule_tick(tdev);
