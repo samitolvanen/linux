@@ -253,37 +253,51 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
 }
 
 impl Scheduler {
+    /// Processes the events of the CSG slots in `events`. Returns whether
+    /// any of them reported a `SYNC_UPDATE`. A `true` return carries the
+    /// duty documented on `process_csg_irq`.
+    #[must_use]
     pub(crate) fn process_csg_irqs(
         &mut self,
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         mut events: u32,
-    ) {
+    ) -> bool {
+        let mut sync_update = false;
+
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            if let Err(e) = self.process_csg_irq(tdev, fw, csg_id) {
-                dev_err!(
+            match self.process_csg_irq(tdev, fw, csg_id) {
+                Ok(updated) => sync_update |= updated,
+                Err(e) => dev_err!(
                     tdev.as_ref(),
                     "Failed to process the CSG slot {} IRQ: {:?}\n",
                     csg_id,
                     e
-                );
+                ),
             }
             events &= !mask;
         }
+
+        sync_update
     }
 
+    /// Processes the events of CSG slot `csg_id`. Returns whether the slot
+    /// reported a `SYNC_UPDATE`.
+    ///
+    /// On `Ok(true)` the caller must drain the fences of the slot's group
+    /// after releasing the scheduler mutex, and before canceling them.
     pub(super) fn process_csg_irq(
         &mut self,
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
         csg_id: usize,
-    ) -> Result {
+    ) -> Result<bool> {
         // The IRQ event mask is wider than the scheduler's slot count.
         if csg_id >= self.csg_slot_count as usize {
-            return Ok(());
+            return Ok(false);
         }
         let csg_slot = CsgSlotIdx::new(csg_id).ok_or(EINVAL)?;
 
@@ -314,7 +328,7 @@ impl Scheduler {
         })?;
 
         if pending == 0 && pending_cs_irqs == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
@@ -340,7 +354,8 @@ impl Scheduler {
             }
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
-        if pending & CSG_REQ::SYNC_UPDATE_MASK != 0 {
+        let sync_update = pending & CSG_REQ::SYNC_UPDATE_MASK != 0;
+        if sync_update && self.has_waiting_groups() {
             TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
         }
 
@@ -441,7 +456,7 @@ impl Scheduler {
             fw.ring_csg_doorbells(mask)?;
         }
 
-        Ok(())
+        Ok(sync_update)
     }
 
     /// Takes one pending tiler OOM of `group` on a CS in `todo` and reads
