@@ -106,7 +106,7 @@ use kernel::{
         atomic::AtomicFlag,
         Srcu, //
     },
-    sync::{Arc, UniqueArc},
+    sync::{rcu::synchronize_rcu, Arc, UniqueArc},
     workqueue::{
         self,
         new_scoped_work,
@@ -131,6 +131,10 @@ impl<T: ListItem> Default for UniqueList<T> {
 impl<T: ListItem> UniqueList<T> {
     fn new() -> Self {
         Self(List::new())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     fn push_front(&mut self, item: Pin<UniqueArc<T>>) {
@@ -387,11 +391,27 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for DropWorker<'_, '_, T> {
         }
 
         let mut jq_locked = work.inner.lock();
+        let mut batch = core::mem::take(&mut jq_locked.drop_list);
+        drop(jq_locked);
 
-        while let Some(job) = jq_locked.drop_list.pop_front() {
-            drop(jq_locked);
-            drop(job);
-            jq_locked = work.inner.lock();
+        if batch.is_empty() {
+            return;
+        }
+
+        // An RCU grace period ends once every reader that started before it
+        // has finished. Every job on the drop list signaled its fence before
+        // it got there, so a reader that may still use a fence's data started
+        // before this point. One grace period from here covers every fence in
+        // the batch, where dropping the jobs one by one would wait once each.
+        synchronize_rcu();
+
+        while let Some(mut job) = batch.pop_front() {
+            if let Some(fence) = job.as_mut().project().fence.take() {
+                // SAFETY: The fence was signaled before the job went on the
+                // drop list, and `synchronize_rcu()` has waited for a grace
+                // period since.
+                unsafe { fence.drop_after_grace_period() };
+            }
         }
     }
 }
