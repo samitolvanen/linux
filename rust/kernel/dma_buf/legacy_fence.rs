@@ -171,8 +171,12 @@ impl PublicDmaFence {
 
     /// Check if the fence has been signaled.
     pub fn is_signaled(&self) -> bool {
+        // dma_fence_get_status() returns 0 while the fence is unsignaled, and
+        // 1, or a negative error code, once it is signaled. Like
+        // dma_fence_is_signaled(), it asks the fence's ops whether the fence
+        // has signaled; it takes the fence lock to do so.
         // SAFETY: The pointer is valid per the type invariant.
-        unsafe { bindings::dma_fence_is_signaled(self.inner.get()) }
+        unsafe { bindings::dma_fence_get_status(self.inner.get()) != 0 }
     }
 
     /// Get the error from the fence, if any.
@@ -623,7 +627,7 @@ impl<T: DriverDmaFenceOps, V: DriverDmaFenceVisibility> Drop for DriverDmaFence<
             // signaled, signal it with ECANCELED so waiters don't hang.
             // SAFETY: `raw_fence` remains valid while this handle still owns the
             // final driver reference.
-            if !unsafe { bindings::dma_fence_is_signaled(raw_fence) } {
+            if unsafe { bindings::dma_fence_get_status(raw_fence) } == 0 {
                 // SAFETY: The fence is still valid and we are setting the terminal
                 // error immediately before signaling it.
                 unsafe { bindings::dma_fence_set_error(raw_fence, -(bindings::ECANCELED as i32)) };
