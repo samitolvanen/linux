@@ -171,10 +171,10 @@ impl WorkItem<{ work_id::TILER_OOM }> for Group {
 
             // Service only the OOMs pending now, so a re-raised OOM cannot starve
             // the others. The IRQ handler records an OOM and requeues the work
-            // under the scheduler mutex, so an OOM recorded later gets a new run.
-            let Ok(mut todo) = tdev.with_locked_scheduler(|_| Ok(this.tiler_oom.load(Relaxed)))
-            else {
-                return;
+            // under the slot-manager mutex, so an OOM recorded later gets a new run.
+            let mut todo = {
+                let _slots = tdev.csg_slot_manager.lock();
+                this.tiler_oom.load(Relaxed)
             };
 
             loop {
@@ -264,12 +264,13 @@ impl Scheduler {
         mut events: u32,
     ) -> bool {
         let mut sync_update = false;
+        let slot_manager = tdev.csg_slot_manager.lock();
 
         while events != 0 {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            match self.process_csg_irq(tdev, fw, csg_id) {
+            match self.process_csg_irq(tdev, fw, &slot_manager, csg_id) {
                 Ok(updated) => sync_update |= updated,
                 Err(e) => dev_err!(
                     tdev.as_ref(),
@@ -287,12 +288,17 @@ impl Scheduler {
     /// Processes the events of CSG slot `csg_id`. Returns whether the slot
     /// reported a `SYNC_UPDATE`.
     ///
+    /// Every bind and evict holds the slot-manager mutex. Holding it across
+    /// the call keeps the slot's group fixed while its events are
+    /// acknowledged and handled.
+    ///
     /// On `Ok(true)` the caller must drain the fences of the slot's group
     /// after releasing the scheduler mutex, and before canceling them.
     pub(super) fn process_csg_irq(
         &mut self,
         tdev: &TyrDrmDevice,
         fw: &Firmware<'_>,
+        slot_manager: &CsgSlotManager,
         csg_id: usize,
     ) -> Result<bool> {
         // The IRQ event mask is wider than the scheduler's slot count.
@@ -333,12 +339,9 @@ impl Scheduler {
 
         let tdev_aref: ARef<TyrDrmDevice> = tdev.into();
 
-        let group = {
-            let slot_manager = tdev.csg_slot_manager.lock();
-            slot_manager
-                .slot_data(csg_id)
-                .map(|data| data.group.clone())
-        };
+        let group = slot_manager
+            .slot_data(csg_id)
+            .map(|data| data.group.clone());
 
         if pending & CSG_REQ::IDLE_MASK != 0 {
             // At least one resident group may now be idle.
