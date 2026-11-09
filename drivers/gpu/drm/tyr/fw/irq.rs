@@ -45,6 +45,7 @@ use crate::{
         JOB_IRQ_RAWSTAT,
         JOB_IRQ_STATUS, //
     },
+    sched::Scheduler,
     wait::{
         Wait,
         WaitResult, //
@@ -179,6 +180,8 @@ impl TyrIrqTrait for JobIrq<'_> {
 
     fn clear_status(&self, io: &IoMem<'_>, status: u32) {
         io.write_reg(JOB_IRQ_CLEAR::from_raw(status));
+        // Complete the posted clear before the handler reads the firmware interfaces.
+        io.read(JOB_IRQ_RAWSTAT);
     }
 
     fn mask(&self) -> u32 {
@@ -205,11 +208,10 @@ impl TyrIrqTrait for JobIrq<'_> {
             }
         }
 
-        // Defer to sleepable context via fw_events_work.
         let csg_events = *JOB_IRQ_RAWSTAT::from_raw(status).csg();
         if csg_events != 0 {
             tdev.fw_events_or(csg_events);
-            TyrDrmDeviceData::schedule_fw_events(&ARef::from(tdev));
+            Scheduler::process_fw_events(tdev);
         }
     }
 }

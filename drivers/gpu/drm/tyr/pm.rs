@@ -159,7 +159,9 @@ fn quiesce_and_suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationD
     tdev.reset.flush();
     tdev.cancel_fw_ping();
     sched::tick::suspend(tdev, reg_data);
-    // Drain any worker that raced the gate before halting the hardware.
+    // Drain any job IRQ run and worker that raced the powered-down flag
+    // before halting the hardware.
+    reg_data.job_irq.synchronize();
     tdev.drain_sched_work();
     suspend_hw_components(tdev, reg_data);
 }
