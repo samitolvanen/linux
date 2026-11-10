@@ -264,7 +264,7 @@ impl Scheduler {
     /// reported a `SYNC_UPDATE`.
     ///
     /// On `Ok(true)` the caller must drain the fences of the slot's group
-    /// after releasing the scheduler mutex, or cancel them.
+    /// after releasing the scheduler mutex, and before canceling them.
     pub(super) fn process_csg_irq(&mut self, tdev: &TyrDrmDevice, csg_id: usize) -> Result<bool> {
         // The IRQ event mask is wider than the scheduler's slot count.
         if csg_id >= self.csg_slot_count as usize {
