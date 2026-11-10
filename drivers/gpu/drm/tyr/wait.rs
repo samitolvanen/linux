@@ -3,6 +3,7 @@
 //! Code to wait on GPU events.
 
 use kernel::{
+    io::poll::read_poll_timeout,
     new_condvar,
     prelude::*,
     sync::{
@@ -14,7 +15,10 @@ use kernel::{
         CondVar,
         Mutex, //
     },
-    time::msecs_to_jiffies, //
+    time::{
+        msecs_to_jiffies,
+        Delta, //
+    }, //
 };
 
 /// Creates a new [`Wait`] instance with a call-site-specific lockdep class key.
@@ -98,6 +102,25 @@ impl Wait {
                     WaitResult::Retry => remaining_time = jiffies,
                 },
             }
+        }
+    }
+
+    /// Like `wait_timeout`, but first busy-polls `on_woken` for up to `spin`
+    /// without the wait lock. `on_woken` must also be safe to call without it.
+    pub(crate) fn spin_then_wait_timeout<F>(
+        &self,
+        spin: Delta,
+        timeout_ms: u32,
+        mut on_woken: F,
+    ) -> Result
+    where
+        F: FnMut() -> Result<WaitResult>,
+    {
+        let done = |res: &WaitResult| matches!(res, WaitResult::Done);
+        match read_poll_timeout(&mut on_woken, done, Delta::ZERO, spin) {
+            Ok(_) => Ok(()),
+            Err(e) if e == ETIMEDOUT => self.wait_timeout(timeout_ms, on_woken),
+            Err(e) => Err(e),
         }
     }
 
