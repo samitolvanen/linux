@@ -243,8 +243,8 @@ impl WorkItem<2> for Group {
 
 impl Scheduler {
     /// Processes the CSG events latched in `fw_events`, drains the submit
-    /// fences of the groups that reported a `SYNC_UPDATE`, then queues any
-    /// tick the events asked for.
+    /// fences of the groups that reported a `SYNC_UPDATE`, then rings the
+    /// CSG doorbells and queues any tick the events asked for.
     ///
     /// Sleeps, takes the slot-manager mutex and drains fences in a dma-fence
     /// signalling section, so it must not be called under the scheduler or
@@ -269,8 +269,10 @@ impl Scheduler {
 
         let _annotation = DmaFenceSignallingAnnotation::new();
         let mut tick = false;
-        let groups = Self::process_csg_irqs(events, tdev, &mut tick);
+        let mut doorbells = CsgSlotMask::empty();
+        let groups = Self::process_csg_irqs(events, tdev, &mut tick, &mut doorbells);
         Self::drain_queue_completions(&groups);
+        Self::ring_csg_irq_doorbells(tdev, doorbells);
 
         if tick {
             TyrDrmDeviceData::schedule_tick(&tdev.into());
@@ -278,13 +280,14 @@ impl Scheduler {
     }
 
     /// Processes the events of the CSG slots in `events`, collecting the
-    /// groups `process_csg_irq` returns and the `tick` it sets. Both carry
-    /// the duties documented there.
+    /// groups `process_csg_irq` returns and the `tick` and `doorbells` it
+    /// sets. Each carries a duty documented there.
     #[must_use]
     fn process_csg_irqs(
         mut events: u32,
         tdev: &TyrDrmDevice,
         tick: &mut bool,
+        doorbells: &mut CsgSlotMask,
     ) -> [Option<Arc<Group>>; MAX_CSGS] {
         let mut groups = [const { None }; MAX_CSGS];
         let slot_manager = tdev.csg_slot_manager.lock();
@@ -293,7 +296,7 @@ impl Scheduler {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            match Self::process_csg_irq(tdev, &slot_manager, csg_id, tick) {
+            match Self::process_csg_irq(tdev, &slot_manager, csg_id, tick, doorbells) {
                 Ok(group) => {
                     if let Some(slot) = groups.get_mut(csg_id) {
                         *slot = group;
@@ -308,21 +311,23 @@ impl Scheduler {
     }
 
     /// Processes the events of CSG slot `csg_id`. Returns the slot's group
-    /// if the slot reported a `SYNC_UPDATE`, and sets `tick` if an event asks
-    /// for a scheduler tick.
+    /// if the slot reported a `SYNC_UPDATE`, sets `tick` if an event asks
+    /// for a scheduler tick, and adds the slot to `doorbells` if its
+    /// acknowledgment still needs a CSG doorbell.
     ///
     /// Every bind and evict holds the slot-manager mutex. Holding it across
     /// the call keeps the slot's group fixed while its events are
     /// acknowledged and handled.
     ///
     /// The caller must drain the fences of a returned group after releasing
-    /// the slot-manager mutex, and before canceling them. It must queue a
-    /// tick if `tick` is set, even on error.
+    /// the slot-manager mutex, and before canceling them. It must ring
+    /// `doorbells`, and queue a tick if `tick` is set, even on error.
     pub(super) fn process_csg_irq(
         tdev: &TyrDrmDevice,
         slot_manager: &CsgSlotManager,
         csg_id: usize,
         tick: &mut bool,
+        doorbells: &mut CsgSlotMask,
     ) -> Result<Option<Arc<Group>>> {
         // The IRQ event mask is wider than the scheduler's slot count.
         if csg_id >= slot_manager.slot_count() {
@@ -477,12 +482,21 @@ impl Scheduler {
                 Ok(())
             })?;
         } else {
-            let mut mask = CsgSlotMask::empty();
-            mask.insert(csg_slot);
-            tdev.fw.ring_csg_doorbells(mask)?;
+            doorbells.insert(csg_slot);
         }
 
         Ok(group.filter(|_| sync_update))
+    }
+
+    /// Rings the CSG doorbells that `process_csg_irq` left to its caller.
+    pub(super) fn ring_csg_irq_doorbells(tdev: &TyrDrmDevice, doorbells: CsgSlotMask) {
+        if let Err(e) = tdev.fw.ring_csg_doorbells(doorbells) {
+            pr_err!(
+                "Failed to ring the CSG doorbells {:#x}: {:?}\n",
+                doorbells.into_raw(),
+                e
+            );
+        }
     }
 
     /// Takes one pending tiler OOM of `group` on a CS in `todo` and reads
