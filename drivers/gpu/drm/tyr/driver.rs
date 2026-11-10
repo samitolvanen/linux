@@ -411,9 +411,8 @@ pub(crate) struct TyrDrmDeviceData {
     /// context; the consumer reads-and-clears with `fw_events_take`.
     fw_events: Atomic<u32>,
 
-    /// Worker that drains `fw_events`, then signals the completed submit
-    /// fences of the resident groups after a `SYNC_UPDATE`. Enqueued on
-    /// `sched_wq`.
+    /// Worker that processes the `fw_events` the job IRQ thread left
+    /// latched. Enqueued on `sched_wq`.
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
@@ -865,31 +864,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
     type Pointer = ARef<TyrDrmDevice>;
 
     fn run(this: Self::Pointer) {
-        let tdev = &*this;
-
-        // Processing events ACKs them through CSG doorbells. If the
-        // device is runtime suspended, leave the events latched in
-        // `fw_events`. The resume path reschedules this worker.
-        let Some(_active) = tdev.pm_get_if_active() else {
-            return;
-        };
-
-        // Skip while a reset owns the firmware interface. The reset worker
-        // reissues this work when the reset completes.
-        if tdev.reset.in_progress() {
-            return;
-        }
-
-        let events = tdev.fw_events_take();
-        if events == 0 {
-            return;
-        }
-
-        let sync_update = Scheduler::process_csg_irqs(events, tdev);
-
-        if sync_update {
-            Scheduler::drain_resident_queue_completions(tdev);
-        }
+        Scheduler::process_fw_events(&this);
     }
 }
 

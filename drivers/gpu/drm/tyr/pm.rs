@@ -138,7 +138,9 @@ fn quiesce_and_suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriv
     tdev.reset.flush();
     tdev.cancel_fw_ping();
     sched::tick::suspend(tdev);
-    // Drain any worker that raced the gate before halting the hardware.
+    // Drain any job IRQ run and worker that raced the powered-down flag
+    // before halting the hardware.
+    tdev.job_irq.synchronize();
     tdev.drain_sched_work();
     suspend_hw_components(dev, data);
 }
