@@ -1008,13 +1008,18 @@ impl<'a> Tick<'a> {
         // firmware state before we tear the binding down.
         let mut csg_slot_manager = data.csg_slot_manager.lock();
         let mut tick = false;
+        let mut doorbells = CsgSlotMask::empty();
         for csg_idx in CsgSlotIdx::all() {
             if !evicted.contains(csg_idx) {
                 continue;
             }
-            if let Err(e) =
-                Scheduler::process_csg_irq(data, &csg_slot_manager, csg_idx.get(), &mut tick)
-            {
+            if let Err(e) = Scheduler::process_csg_irq(
+                data,
+                &csg_slot_manager,
+                csg_idx.get(),
+                &mut tick,
+                &mut doorbells,
+            ) {
                 pr_err!(
                     "process_csg_irq {} failed: {}\n",
                     csg_idx.get(),
@@ -1022,6 +1027,7 @@ impl<'a> Tick<'a> {
                 );
             }
         }
+        Scheduler::ring_csg_irq_doorbells(data, doorbells);
         if tick {
             TyrDrmDeviceData::schedule_tick(data);
         }
