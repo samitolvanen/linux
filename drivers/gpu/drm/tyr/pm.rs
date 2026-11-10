@@ -114,7 +114,7 @@ fn fail_resume(
     TyrDrmDeviceData::schedule_dead_mappings(tdev);
 
     let _ = tdev.with_locked_scheduler(|sched| {
-        sched.fail_all_groups();
+        sched.fail_all_groups(tdev);
         Ok(())
     });
 
