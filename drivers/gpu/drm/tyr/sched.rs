@@ -1590,11 +1590,20 @@ impl Scheduler {
         }
 
         let csg_slot_manager = tdev.csg_slot_manager.lock();
+        let mut tick = false;
+        let mut doorbells = CsgSlotMask::empty();
         for slot in faulted_groups.iter() {
             let Some((csg_idx, group)) = slot else {
                 continue;
             };
-            if let Err(e) = Self::process_csg_irq(tdev, fw, &csg_slot_manager, *csg_idx) {
+            if let Err(e) = Self::process_csg_irq(
+                tdev,
+                fw,
+                &csg_slot_manager,
+                *csg_idx,
+                &mut tick,
+                &mut doorbells,
+            ) {
                 dev_err!(
                     tdev.as_ref(),
                     "process_csg_irq {} failed: {}\n",
@@ -1612,7 +1621,11 @@ impl Scheduler {
                 }
             });
         }
+        Self::ring_csg_irq_doorbells(tdev, fw, doorbells);
         drop(csg_slot_manager);
+        if tick {
+            TyrDrmDeviceData::schedule_tick(&tdev.into());
+        }
 
         self.apply_csg_updates(tdev, fw, &mut context)
     }
