@@ -193,8 +193,6 @@ const SYNCWAIT_POLL_MS: u32 = 10;
 pub(crate) mod work_id {
     /// Scheduler tick worker.
     pub(crate) const TICK: u64 = 1;
-    /// Firmware-event drain worker.
-    pub(crate) const FW_EVENTS: u64 = 2;
     /// Group sync-update worker.
     pub(crate) const SYNC_UPD: u64 = 3;
     /// Periodic re-arming of the scheduler tick.
@@ -411,11 +409,6 @@ pub(crate) struct TyrDrmDeviceData {
     /// context; the consumer reads-and-clears with `fw_events_take`.
     fw_events: Atomic<u32>,
 
-    /// Worker that processes the `fw_events` the job IRQ thread left
-    /// latched. Enqueued on `sched_wq`.
-    #[pin]
-    fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
-
     /// Scheduler tick worker. Enqueued on `sched_wq`.
     #[pin]
     tick_work: DmaFenceWork<TyrDrmDevice, { work_id::TICK }>,
@@ -453,8 +446,8 @@ pub(crate) struct TyrDrmDeviceData {
     syncwait_poll_work: DelayedWork<TyrDrmDevice, { work_id::SYNCWAIT_POLL }>,
 
     /// Shut by unbind or a failed probe to stop the scheduler tick, the
-    /// firmware-event drain, the sync-update sweep and its poll, the periodic
-    /// tick re-arm and the firmware ping.
+    /// sync-update sweep and its poll, the periodic tick re-arm and the
+    /// firmware ping.
     #[pin]
     system_work_closed: SpinLock<bool>,
 
@@ -624,23 +617,11 @@ impl TyrDrmDeviceData {
         self.fw_events.xchg(0, Acquire)
     }
 
-    /// Returns whether any firmware-events bits are pending, a hint for
-    /// rescheduling the drain worker. The drain itself synchronizes through
+    /// Returns whether any firmware-events bits are pending, a hint for the
+    /// tick to process them. The processing itself synchronizes through
     /// `fw_events_take`.
     pub(crate) fn fw_events_pending(&self) -> bool {
         self.fw_events.load(Relaxed) != 0
-    }
-
-    /// Schedules the fw-events worker on the scheduler workqueue.
-    ///
-    /// Safe to call from the threaded IRQ handler. Repeated calls coalesce
-    /// in the workqueue.
-    pub(crate) fn schedule_fw_events(tdev: &ARef<TyrDrmDevice>) {
-        tdev.enqueue_system_work(|| {
-            let _ = tdev
-                .sched_wq
-                .enqueue::<ARef<TyrDrmDevice>, { work_id::FW_EVENTS }>(tdev.clone());
-        });
     }
 
     /// Runs `f` unless unbind has stopped the work items it gates.
@@ -683,27 +664,20 @@ impl TyrDrmDeviceData {
         });
     }
 
-    /// Waits for any in-flight scheduler tick to finish.
+    /// Waits for any in-flight scheduler tick to finish. The tick runs in a
+    /// dma-fence signalling section, so a fence's completion path can wait
+    /// for it.
     ///
-    /// Must not be called while holding the scheduler mutex: the tick
-    /// worker takes it, so flushing under the lock would deadlock.
+    /// Must not be called while holding the scheduler or CSG slot-manager
+    /// mutex. The tick worker takes both, so flushing under either would
+    /// deadlock.
     pub(crate) fn flush_tick(&self) {
         let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
     }
 
-    /// Waits for the tick and firmware-events workers to finish. Both run in a
-    /// dma-fence signalling section, so a fence's completion path can wait for
-    /// them. Not callable under the scheduler or CSG slot-manager mutexes.
-    pub(crate) fn flush_tick_and_fw_events(&self) {
-        let _ = workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::TICK }>(self);
-        let _ =
-            workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::FW_EVENTS }>(self);
-    }
-
-    /// Waits for the tick, firmware-events and sync-update workers to
-    /// finish.
+    /// Waits for the tick and sync-update workers to finish.
     ///
-    /// All block bounded. Not callable under the scheduler, CSG
+    /// Both block bounded. Not callable under the scheduler, CSG
     /// slot-manager or per-VM gpuvm mutexes, nor with a BO reservation
     /// lock held, nor from a reclaim worker, nor in a dma-fence
     /// signalling section. The per-group tiler OOM workers are not
@@ -712,7 +686,7 @@ impl TyrDrmDeviceData {
     /// to the firmware. A failed heap growth can still queue a fresh
     /// tick after this returns, so callers gate the tick first.
     pub(crate) fn drain_sched_work(&self) {
-        self.flush_tick_and_fw_events();
+        self.flush_tick();
         let _ =
             workqueue::flush_work::<TyrDrmDevice, TyrDrmDeviceData, { work_id::SYNC_UPD }>(self);
     }
@@ -776,7 +750,6 @@ impl TyrDrmDeviceData {
     pub(crate) fn stop_system_work(&self) {
         *self.system_work_closed.lock() = true;
         let _ = self.tick_work.cancel_sync();
-        let _ = self.fw_events_work.cancel_sync();
         let _ = self.sync_upd_work.cancel_sync();
         let _ = self.periodic_tick_work.cancel_sync();
         let _ = self.syncwait_poll_work.cancel_sync();
@@ -833,10 +806,6 @@ impl TyrDrmDeviceData {
 }
 
 impl_has_dma_fence_work! {
-    impl HasDmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }> for TyrDrmDeviceData { self.fw_events_work }
-}
-
-impl_has_dma_fence_work! {
     impl HasDmaFenceWork<TyrDrmDevice, { work_id::TICK }> for TyrDrmDeviceData { self.tick_work }
 }
 
@@ -858,14 +827,6 @@ impl_has_delayed_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<TyrDrmDevice, { work_id::SYNCWAIT_POLL }> for TyrDrmDeviceData { self.syncwait_poll_work }
-}
-
-impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
-    type Pointer = ARef<TyrDrmDevice>;
-
-    fn run(this: Self::Pointer) {
-        Scheduler::process_fw_events(&this);
-    }
 }
 
 impl DmaFenceWorkItem<{ work_id::TICK }> for TyrDrmDeviceData {
@@ -1161,7 +1122,6 @@ impl TyrPlatformDriverData {
                 skipped_sync_updates: Atomic::new(0),
                 csg_slot_manager <- new_mutex!(csg_slot_manager),
                 fw_events: Atomic::new(0),
-                fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
                 tick_work <- new_dma_fence_work!("TyrDrmDeviceData::tick_work"),
                 sync_upd_work <- kernel::new_work!("TyrDrmDeviceData::sync_upd_work"),
                 sync_upd_pending: AtomicFlag::new(false),

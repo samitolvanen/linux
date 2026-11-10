@@ -250,13 +250,13 @@ impl Scheduler {
     /// slot-manager mutex.
     pub(crate) fn process_fw_events(tdev: &TyrDrmDevice) {
         // Processing rings CSG doorbells, so leave the events latched while
-        // the device is suspended. The resume path reissues the worker.
+        // the device is suspended. The tick queued on resume processes them.
         let Some(_active) = tdev.pm_get_if_active() else {
             return;
         };
 
         // Skip while a reset owns the firmware interface. The reset worker
-        // reissues the firmware-events worker when the reset completes.
+        // reissues the tick when the reset completes.
         if tdev.reset.in_progress() {
             return;
         }

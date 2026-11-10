@@ -173,11 +173,11 @@ pub(crate) fn tick_step(tdev: &ARef<TyrDrmDevice>) -> Result {
         return Ok(());
     }
 
-    // The fw-events drain defers the same way this tick does, but
-    // nothing re-kicks it once its IRQ has fired. Pick up events
-    // latched while the device was down or a transition was in flight.
+    // The job IRQ thread leaves CSG events latched while the device is down
+    // or a reset owns the firmware, and nothing re-raises that IRQ. Process
+    // them here.
     if tdev.fw_events_pending() {
-        TyrDrmDeviceData::schedule_fw_events(tdev);
+        Scheduler::process_fw_events(tdev);
     }
 
     // Stack-allocated array for groups evicted during this tick that
@@ -270,10 +270,10 @@ pub(crate) fn suspend(tdev: &ARef<TyrDrmDevice>) {
     Scheduler::drain_queue_completions(&evicted_groups);
 }
 
-/// Resumes the scheduler after a runtime resume. Reissues the
-/// firmware-event drain for events latched across the suspend, the
-/// sync-update sweep for syncwaits satisfied while no group was
-/// resident, and the tick so evicted-but-runnable groups rebind.
+/// Resumes the scheduler after a runtime resume. Reissues the sync-update
+/// sweep for syncwaits satisfied while no group was resident, and the tick,
+/// which processes the firmware events latched across the suspend and
+/// rebinds the evicted-but-runnable groups.
 pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
     // Clear the suspend under the scheduler mutex, the counterpart to the
     // store in `suspend`, before reissuing work.
@@ -281,7 +281,6 @@ pub(crate) fn resume(tdev: &ARef<TyrDrmDevice>) {
         tdev.sched_suspended.store(false, ordering::Relaxed);
         Ok(())
     });
-    TyrDrmDeviceData::schedule_fw_events(tdev);
     TyrDrmDeviceData::schedule_sync_upd(tdev);
     TyrDrmDeviceData::schedule_tick(tdev);
     Scheduler::request_tick(tdev);
@@ -330,12 +329,12 @@ impl ParkedGroups {
 
 /// Stops scheduling for a GPU reset.
 ///
-/// The tick and firmware-events workers bail out while the reset worker is
-/// executing a claimed reset. Flush the in-flight ones, then evict every
-/// resident group through the same machinery as runtime suspend, including
-/// escalating to termination on ack timeout. The job IRQ thread bails out
-/// too, and `Firmware::pre_reset` waits for a run in flight before the
-/// hardware reset.
+/// The tick bails out while the reset worker is executing a claimed reset.
+/// Flush an in-flight one, then evict every resident group through the
+/// same machinery as runtime suspend, including escalating to termination
+/// on ack timeout. The job IRQ thread bails out too, and
+/// `Firmware::pre_reset` waits for a run in flight before the hardware
+/// reset.
 ///
 /// The eviction leaves every group that can still run on a scheduler
 /// list, so parking the listed groups covers all of them. Groups it
@@ -344,7 +343,7 @@ impl ParkedGroups {
 pub(crate) fn pre_reset(tdev: &ARef<TyrDrmDevice>) -> ParkedGroups {
     let data: &TyrDrmDeviceData = tdev;
     let annotation = DmaFenceSignallingAnnotation::new();
-    data.flush_tick_and_fw_events();
+    data.flush_tick();
     suspend(tdev);
     drop(annotation);
 
