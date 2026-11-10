@@ -184,6 +184,14 @@ impl<T: TyrIrqTrait + Send> IrqSlot<T> {
         }
     }
 
+    /// Waits for in-flight handlers of the slot IRQ. Does nothing before
+    /// probe publishes the registration or after devres revokes it.
+    pub(crate) fn synchronize(&self) {
+        if let Some(reg) = self.resolve() {
+            let _ = reg.try_synchronize();
+        }
+    }
+
     /// Clears the suspended flag and unmasks the slot IRQ.
     ///
     /// Used by probe once the handler is registered, and after a GPU reset.

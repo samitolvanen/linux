@@ -41,6 +41,7 @@ use crate::{
         JOB_IRQ_RAWSTAT,
         JOB_IRQ_STATUS, //
     },
+    sched::Scheduler,
     wait::{Wait, WaitResult},
 };
 
@@ -175,6 +176,8 @@ impl TyrIrqTrait for JobIrq {
     }
 
     fn handle(&self, tdev: &TyrDrmDevice, status: u32) {
+        self.state.handle(status);
+
         if JOB_IRQ_RAWSTAT::from_raw(status).glb() {
             match tdev.fw.process_global_irq() {
                 Ok(pending_idle) => {
@@ -188,13 +191,10 @@ impl TyrIrqTrait for JobIrq {
             }
         }
 
-        // Defer to sleepable context via fw_events_work.
         let csg_events = *JOB_IRQ_RAWSTAT::from_raw(status).csg();
         if csg_events != 0 {
             tdev.fw_events_or(csg_events);
-            TyrDrmDeviceData::schedule_fw_events(&ARef::from(tdev));
+            Scheduler::process_fw_events(tdev);
         }
-
-        self.state.handle(status);
     }
 }

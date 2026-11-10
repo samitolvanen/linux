@@ -333,7 +333,9 @@ impl ParkedGroups {
 /// The tick and firmware-events workers bail out while the reset worker is
 /// executing a claimed reset. Flush the in-flight ones, then evict every
 /// resident group through the same machinery as runtime suspend, including
-/// escalating to termination on ack timeout.
+/// escalating to termination on ack timeout. The job IRQ thread bails out
+/// too, and `Firmware::pre_reset` waits for a run in flight before the
+/// hardware reset.
 ///
 /// The eviction leaves every group that can still run on a scheduler
 /// list, so parking the listed groups covers all of them. Groups it
