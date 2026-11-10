@@ -192,7 +192,13 @@ use crate::{
         Mutex, //
     },
     time::{msecs_to_jiffies, Delta, Instant, Jiffies, Monotonic},
-    xarray::{AllocKind, ReservedIndex, XArray, XaLimit},
+    xarray::{
+        AllocKind,
+        Guard,
+        ReservedIndex,
+        XArray,
+        XaLimit, //
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -730,16 +736,8 @@ impl<T: QueueOps> XaEntry<T> {
     }
 }
 
-/// What [`step_stage`](JobQueueInner::step_stage) found at the front of
-/// a stage. Read under the XArray lock, acted on after it is dropped.
-enum FrontEntry {
-    /// A live job. `timed_out` mirrors `JobEntry::timed_out`.
-    Live { timed_out: bool },
-    /// A reservation that [`JobQueue::commit`] has not consumed yet.
-    Reserved,
-    /// No entry, because the reservation was dropped before commit.
-    Gone,
-}
+/// The `fifo` lock guard.
+type FifoGuard<'a, T> = Guard<'a, KBox<XaEntry<T>>>;
 
 // State managed by `submit()`. This is separate from `PipelineState` to avoid
 // lock ordering issues between `submit()` and `check_progress()`. In other
@@ -1028,59 +1026,45 @@ impl<T: QueueOps> JobQueueInner<T> {
         }
         let entry_idx = state.stage_ranges[stage_i].start;
 
-        let front = {
+        let mut reset_stage_clock = false;
+        let advance = {
             let guard = self.fifo.lock();
             match guard.get(entry_idx as usize) {
-                Some(XaEntry::Live(entry)) => FrontEntry::Live {
-                    timed_out: entry.timed_out,
-                },
-                Some(XaEntry::Reserved { .. }) => FrontEntry::Reserved,
-                None => FrontEntry::Gone,
-            }
-        };
-        let mut advancing = false;
-        let advance = match front {
-            // A reservation dropped before commit leaves no entry behind.
-            // Retire the index so it cannot hold up the stage.
-            FrontEntry::Gone => StageAdvance::Advance,
-            // drain_inbox() never pulls a reserved index in, so this arm
-            // is unreachable and purely defensive. If that ever changes,
-            // waiting keeps the pipeline from retiring an entry a
-            // PreparedJob still owns.
-            FrontEntry::Reserved => {
-                pr_err_once!(
-                    "JobQueue: step_stage() BUG: xa_idx={} still reserved\n",
-                    entry_idx
-                );
-                StageAdvance::Wait
-            }
-            // Fast-path for an entry that is already timed out. Skip the
-            // stage handler and advance it to the next stage immediately.
-            // For driver stages, teardown() is called to release any
-            // per-stage resources.
-            FrontEntry::Live { timed_out: true } => {
-                if let StageKind::Driver(stage) = &self.stages[stage_i] {
-                    let job = {
-                        let guard = self.fifo.lock();
-                        guard
-                            .get(entry_idx as usize)
-                            .and_then(|e| e.as_live())
-                            .map(|e| (e.job.clone(), e.counter))
-                    };
-                    if let Some((job, counter)) = job {
+                // A reservation dropped before commit leaves no entry behind.
+                // Retire the index so it cannot hold up the stage.
+                None => StageAdvance::Advance,
+                // drain_inbox() never pulls a reserved index in, so this arm
+                // is unreachable and purely defensive. If that ever changes,
+                // waiting keeps the pipeline from retiring an entry a
+                // PreparedJob still owns.
+                Some(XaEntry::Reserved { .. }) => {
+                    pr_err_once!(
+                        "JobQueue: step_stage() BUG: xa_idx={} still reserved\n",
+                        entry_idx
+                    );
+                    StageAdvance::Wait
+                }
+                // Fast-path for an entry that is already timed out. Skip the
+                // stage handler and advance it to the next stage immediately.
+                // For driver stages, teardown() is called to release any
+                // per-stage resources.
+                Some(XaEntry::Live(entry)) if entry.timed_out => {
+                    if let StageKind::Driver(stage) = &self.stages[stage_i] {
+                        let (job, counter) = (entry.job.clone(), entry.counter);
+                        drop(guard);
                         stage.teardown(&job, counter);
                     }
+                    StageAdvance::Advance
                 }
-                StageAdvance::Advance
-            }
-            FrontEntry::Live { timed_out: false } => {
-                advancing = true;
-                match &self.stages[stage_i] {
-                    StageKind::WaitingForDeps => self.process_deps(entry_idx),
-                    StageKind::WaitingForExec => self.process_exec(entry_idx),
-                    StageKind::Executing => self.process_default_hw_wait(entry_idx),
-                    StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
-                }
+                Some(XaEntry::Live(_)) => match &self.stages[stage_i] {
+                    StageKind::WaitingForDeps => self.process_deps(guard, entry_idx),
+                    StageKind::WaitingForExec => self.process_exec(guard, entry_idx),
+                    StageKind::Executing => self.process_default_hw_wait(guard, entry_idx),
+                    StageKind::Driver(stage) => {
+                        reset_stage_clock = true;
+                        self.process_driver_stage(guard, &**stage, entry_idx)
+                    }
+                },
             }
         };
 
@@ -1089,10 +1073,9 @@ impl<T: QueueOps> JobQueueInner<T> {
                 state.stage_ranges[stage_i].pop_front();
                 if stage_i + 1 < self.stages.len() {
                     state.stage_ranges[stage_i + 1].push_back();
-                    // Reset the elapsed timer when entering a new stage
-                    // (only for legitimately advancing jobs, not timed-out
-                    // entries draining through).
-                    if advancing {
+                    // Reset the stage clock for the next stage. The deps and
+                    // exec helpers already did it under their own lock.
+                    if reset_stage_clock {
                         let mut guard = self.fifo.lock();
                         if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                             entry.stage_entered_at = Instant::now();
@@ -1179,113 +1162,112 @@ impl<T: QueueOps> JobQueueInner<T> {
     ///
     /// Fast-forwards through already-signaled fences, registers a callback on
     /// the next unsignaled one, and returns `Wait`. Returns `Advance` once all
-    /// dependencies are met.
-    fn process_deps(self: &Arc<Self>, entry_idx: u32) -> StageAdvance {
+    /// dependencies are met. Drops `guard` before registering a callback.
+    fn process_deps<'a>(
+        self: &'a Arc<Self>,
+        mut guard: FifoGuard<'a, T>,
+        entry_idx: u32,
+    ) -> StageAdvance {
         loop {
-            let current_dependency = {
-                let guard = self.fifo.lock();
-                let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
-                    pr_err!(
-                        "JobQueue: process_deps() BUG: xa_idx={} missing\n",
-                        entry_idx
-                    );
-                    return StageAdvance::Advance;
-                };
-                if entry.deps.current_idx >= entry.deps.fences.len() {
-                    None // All deps satisfied.
-                } else {
-                    Some(entry.deps.fences[entry.deps.current_idx].clone())
-                }
+            let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) else {
+                pr_err!(
+                    "JobQueue: process_deps() BUG: xa_idx={} missing\n",
+                    entry_idx
+                );
+                return StageAdvance::Advance;
+            };
+            let current_dependency = if entry.deps.current_idx >= entry.deps.fences.len() {
+                None // All deps satisfied.
+            } else {
+                Some(entry.deps.fences[entry.deps.current_idx].clone())
             };
 
             let Some(dep_fence) = current_dependency else {
                 // All deps met — free the allocation and advance.
-                let fences = self
-                    .fifo
-                    .lock()
-                    .get_mut(entry_idx as usize)
-                    .and_then(|e| e.as_live_mut())
-                    .map(|e| core::mem::take(&mut e.deps.fences));
+                let fences = core::mem::take(&mut entry.deps.fences);
+                entry.stage_entered_at = Instant::now();
+                drop(guard);
                 drop(fences);
                 return StageAdvance::Advance;
             };
+            let is_waiting = entry.deps.active_cb.is_some();
+            drop(guard);
 
-            // If the fence is already signaled, drop the previous active_cb
-            // (if any), advance, and try the next dep without consuming a
-            // prealloc slot.
-            if dep_fence.is_signaled() {
-                let mut guard = self.fifo.lock();
-                if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                    entry.deps.active_cb = None;
-                    entry.deps.current_idx += 1;
-                }
-                continue;
+            if let Some(advance) = self.watch_dep(entry_idx, dep_fence, is_waiting) {
+                return advance;
             }
 
-            // If a callback is already registered for this dep (re-entrant
-            // tick on the same unsignaled fence), wait for it to fire rather
-            // than popping another prealloc slot.
-            let is_waiting = {
-                let guard = self.fifo.lock();
-                guard
-                    .get(entry_idx as usize)
-                    .and_then(|e| e.as_live())
-                    .is_some_and(|e| e.deps.active_cb.is_some())
-            };
-            if is_waiting {
-                return self.pipeline_wait_or_timeout(entry_idx);
+            guard = self.fifo.lock();
+            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                entry.deps.active_cb = None;
+                entry.deps.current_idx += 1;
             }
+        }
+    }
 
-            let callback = DepCallback {
-                inner: self.clone(),
-            };
-            // One prealloc slot per dep callback registration. prepare()
-            // sized prealloc_cbs to dep_capacity so this is the steady-state
-            // path; GFP_NOWAIT is a safety net for any accounting drift and
-            // stays out of direct reclaim.
-            let uninit_box = {
-                let mut guard = self.fifo.lock();
-                guard
-                    .get_mut(entry_idx as usize)
-                    .and_then(|e| e.as_live_mut())
-                    .and_then(|e| e.deps.prealloc_cbs.pop())
-            };
-            let cb_init = FenceCallbackRegistration::new(&dep_fence, callback);
-            let result = match uninit_box {
-                Some(uninit_box) => uninit_box.write_pin_init(cb_init),
-                None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
-            };
-            match result {
-                Ok(registration) => {
-                    {
-                        let mut guard = self.fifo.lock();
-                        if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                            entry.deps.active_cb = Some(registration);
-                        }
-                    }
-                    return self.pipeline_wait_or_timeout(entry_idx);
-                }
-                Err(CallbackError::AlreadySignaled(_)) => {
+    /// Wait on `dep_fence`, the current dependency of the job at `entry_idx`.
+    ///
+    /// Returns `None` if the caller should move on to the next dependency,
+    /// i.e. the fence has signaled.
+    fn watch_dep(
+        self: &Arc<Self>,
+        entry_idx: u32,
+        dep_fence: ARef<PublicDmaFence>,
+        is_waiting: bool,
+    ) -> Option<StageAdvance> {
+        // Skip an already-signaled dep without consuming a prealloc slot.
+        if dep_fence.is_signaled() {
+            return None;
+        }
+
+        // If a callback is already registered for this dep (re-entrant
+        // tick on the same unsignaled fence), wait for it to fire rather
+        // than popping another prealloc slot.
+        if is_waiting {
+            return Some(self.pipeline_wait_or_timeout(entry_idx));
+        }
+
+        let callback = DepCallback {
+            inner: self.clone(),
+        };
+        // One prealloc slot per dep callback registration. prepare() sized
+        // prealloc_cbs to dep_capacity, so GFP_NOWAIT is only a fallback
+        // and stays out of direct reclaim.
+        let uninit_box = {
+            let mut guard = self.fifo.lock();
+            guard
+                .get_mut(entry_idx as usize)
+                .and_then(|e| e.as_live_mut())
+                .and_then(|e| e.deps.prealloc_cbs.pop())
+        };
+        let cb_init = FenceCallbackRegistration::new(&dep_fence, callback);
+        let result = match uninit_box {
+            Some(uninit_box) => uninit_box.write_pin_init(cb_init),
+            None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
+        };
+        match result {
+            Ok(registration) => {
+                {
                     let mut guard = self.fifo.lock();
                     if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                        entry.deps.active_cb = None;
-                        entry.deps.current_idx += 1;
+                        entry.deps.active_cb = Some(registration);
                     }
-                    // Continue loop: try the next dependency.
                 }
-                Err(CallbackError::Other(e)) => {
-                    pr_err_once!(
-                        "JobQueue: cannot wait on a dependency of entry {}: {:?}, polling\n",
-                        entry_idx,
-                        e
-                    );
-                    let poll = msecs_to_jiffies(DEP_POLL_INTERVAL_MS);
-                    return match self.pipeline_wait_or_timeout(entry_idx) {
-                        StageAdvance::Wait => StageAdvance::WaitFor(poll),
-                        StageAdvance::WaitFor(delay) => StageAdvance::WaitFor(delay.min(poll)),
-                        other => other,
-                    };
-                }
+                Some(self.pipeline_wait_or_timeout(entry_idx))
+            }
+            Err(CallbackError::AlreadySignaled(_)) => None,
+            Err(CallbackError::Other(e)) => {
+                pr_err_once!(
+                    "JobQueue: cannot wait on a dependency of entry {}: {:?}, polling\n",
+                    entry_idx,
+                    e
+                );
+                let poll = msecs_to_jiffies(DEP_POLL_INTERVAL_MS);
+                Some(match self.pipeline_wait_or_timeout(entry_idx) {
+                    StageAdvance::Wait => StageAdvance::WaitFor(poll),
+                    StageAdvance::WaitFor(delay) => StageAdvance::WaitFor(delay.min(poll)),
+                    other => other,
+                })
             }
         }
     }
@@ -1293,33 +1275,28 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// Exec-stage helper: call the driver's submit handler.
     ///
     /// Returns `Advance` on `Submitted`, `Wait` on `NoResources`, and
-    /// `TimedOut(e)` on a driver error.
-    fn process_exec(self: &Arc<Self>, entry_idx: u32) -> StageAdvance {
-        let (job, submit_fence, counter) = {
-            let guard = self.fifo.lock();
-            let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
-                pr_err!(
-                    "JobQueue: process_exec() BUG: xa_idx={} missing\n",
-                    entry_idx
-                );
-                return StageAdvance::Advance;
-            };
-            (entry.job.clone(), entry.submit_fence.clone(), entry.counter)
+    /// `TimedOut(e)` on a driver error. Drops `guard` before calling the
+    /// driver.
+    fn process_exec(self: &Arc<Self>, mut guard: FifoGuard<'_, T>, entry_idx: u32) -> StageAdvance {
+        let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) else {
+            pr_err!(
+                "JobQueue: process_exec() BUG: xa_idx={} missing\n",
+                entry_idx
+            );
+            return StageAdvance::Advance;
         };
 
         // Take the fence *before* calling the driver so ownership transfers
         // cleanly on `Submitted`.
-        let fence = {
-            let mut guard = self.fifo.lock();
-            guard
-                .get_mut(entry_idx as usize)
-                .and_then(|e| e.as_live_mut())
-                .and_then(|e| e.submit_fence_drv.take())
-        };
-        let Some(fence) = fence else {
+        let Some(fence) = entry.submit_fence_drv.take() else {
             // Already submitted — shouldn't happen in normal operation.
+            entry.stage_entered_at = Instant::now();
             return StageAdvance::Advance;
         };
+        let (job, submit_fence, counter) =
+            (entry.job.clone(), entry.submit_fence.clone(), entry.counter);
+        let uninit_box = entry.prealloc_progress_cb.take();
+        drop(guard);
 
         let job_ref = JobRef {
             job: &*job,
@@ -1331,13 +1308,6 @@ impl<T: QueueOps> JobQueueInner<T> {
             Ok(SubmitResult::Submitted) => {
                 // Register a callback on the public submit fence so that the
                 // HW-wait stage wakes up promptly when the driver signals it.
-                let uninit_box = {
-                    let mut guard = self.fifo.lock();
-                    guard
-                        .get_mut(entry_idx as usize)
-                        .and_then(|e| e.as_live_mut())
-                        .and_then(|e| e.prealloc_progress_cb.take())
-                };
                 let cb_init = FenceCallbackRegistration::new(
                     &submit_fence,
                     ProgressCallback {
@@ -1348,15 +1318,11 @@ impl<T: QueueOps> JobQueueInner<T> {
                     Some(uninit_box) => uninit_box.write_pin_init(cb_init),
                     None => KBox::try_pin_init(cb_init, GFP_NOWAIT),
                 };
-                match cb_result {
-                    Ok(registration) => {
-                        let mut guard = self.fifo.lock();
-                        if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                            entry.progress_cb = Some(registration);
-                        }
-                    }
+                let registration = match cb_result {
+                    Ok(registration) => Some(registration),
                     Err(CallbackError::AlreadySignaled(cb)) => {
                         cb.inner.maybe_check_progress();
+                        None
                     }
                     Err(CallbackError::Other(e)) => {
                         pr_err!(
@@ -1364,7 +1330,13 @@ impl<T: QueueOps> JobQueueInner<T> {
                             e,
                             counter
                         );
+                        None
                     }
+                };
+                let mut guard = self.fifo.lock();
+                if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                    entry.progress_cb = registration;
+                    entry.stage_entered_at = Instant::now();
                 }
                 StageAdvance::Advance
             }
@@ -1374,6 +1346,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                     let mut guard = self.fifo.lock();
                     if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
                         entry.submit_fence_drv = Some(fence);
+                        entry.prealloc_progress_cb = uninit_box;
                     }
                 }
                 self.pipeline_wait_or_timeout(entry_idx)
@@ -1393,15 +1366,13 @@ impl<T: QueueOps> JobQueueInner<T> {
     }
 
     /// Default HW-wait helper: advance once the submit fence signals.
-    fn process_default_hw_wait(&self, entry_idx: u32) -> StageAdvance {
-        {
-            let guard = self.fifo.lock();
-            if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
-                if entry.submit_fence.is_signaled() {
-                    return StageAdvance::Advance;
-                }
+    fn process_default_hw_wait(&self, guard: FifoGuard<'_, T>, entry_idx: u32) -> StageAdvance {
+        if let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) {
+            if entry.submit_fence.is_signaled() {
+                return StageAdvance::Advance;
             }
         }
+        drop(guard);
         self.pipeline_wait_or_timeout(entry_idx)
     }
 
@@ -1432,26 +1403,25 @@ impl<T: QueueOps> JobQueueInner<T> {
     }
 
     /// Driver-stage helper: build a [`StageContext`] and delegate to the
-    /// driver's [`StageOps::process`].
-    fn process_driver_stage(&self, stage: Arc<dyn StageOps<T>>, entry_idx: u32) -> StageAdvance {
-        // Clear any stale wake callback before re-evaluating; the callback
-        // may have already fired and triggered this check.
-        {
-            let mut guard = self.fifo.lock();
-            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                entry.stage_wake_cb = None;
-            }
-        }
-
+    /// driver's [`StageOps::process`]. Drops `guard` before calling the
+    /// driver.
+    fn process_driver_stage(
+        &self,
+        mut guard: FifoGuard<'_, T>,
+        stage: &dyn StageOps<T>,
+        entry_idx: u32,
+    ) -> StageAdvance {
         let (job, submit_fence, counter, stage_entered_at, pipeline_entered_at) = {
-            let guard = self.fifo.lock();
-            let Some(XaEntry::Live(entry)) = guard.get(entry_idx as usize) else {
+            let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) else {
                 pr_err!(
                     "JobQueue: process_driver_stage() BUG: xa_idx={} missing\n",
                     entry_idx
                 );
                 return StageAdvance::Advance;
             };
+            // Clear any stale wake callback before re-evaluating. The callback
+            // may have already fired and triggered this check.
+            entry.stage_wake_cb = None;
             (
                 entry.job.clone(),
                 entry.submit_fence.clone(),
@@ -1460,6 +1430,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 entry.pipeline_entered_at,
             )
         };
+        drop(guard);
 
         let ctx = StageContext {
             job: &*job,
