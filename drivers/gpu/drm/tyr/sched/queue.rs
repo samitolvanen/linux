@@ -561,7 +561,8 @@ impl QueueData {
     /// so concurrent drains signal in seqno order.
     ///
     /// For each completed job, the per-job profiling samples are read
-    /// back from the slot BO and accumulated into `group`'s fdinfo.
+    /// back from the slot BO and accumulated into `group`'s fdinfo after
+    /// the job's fence signals.
     ///
     /// Obeys the dma-fence signalling-section constraints, because the
     /// readback only reads a kernel-mapped BO (normal memory) and takes the
@@ -582,21 +583,17 @@ impl QueueData {
                 Self::maybe_truncate_pending(&mut pending);
                 break;
             }
-            let profiling_mask = entry.profiling_mask;
-            // Read the sample before the head advance lets its slot be
-            // reassigned.
-            let sample =
-                (profiling_mask != 0).then(|| self.read_profiling_sample(entry.profiling_slot));
             let fence = entry.fence.take();
-            pending.head = head + 1;
-
-            if let Some(sample) = sample {
-                Self::accumulate_profiling_sample(group, sample, profiling_mask);
-            }
-
             if let Some(fence) = fence {
                 fence.signal(Ok(()));
             }
+            if entry.profiling_mask != 0 {
+                // Read the sample before the head advance lets its slot be
+                // reassigned.
+                let sample = self.read_profiling_sample(entry.profiling_slot);
+                Self::accumulate_profiling_sample(group, sample, entry.profiling_mask);
+            }
+            pending.head = head + 1;
         }
     }
 
