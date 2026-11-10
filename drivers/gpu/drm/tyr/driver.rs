@@ -1415,7 +1415,7 @@ impl drm::Driver for TyrDrmDriver {
         drm_printf!(
             printer,
             "drm-curfreq-panthor:\t{} Hz\n",
-            device.devfreq_data.current_frequency.load(Relaxed)
+            devfreq::cur_freq(device)
         );
 
         let mem = inner.gather_mem_info();

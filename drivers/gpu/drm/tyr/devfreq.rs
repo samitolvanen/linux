@@ -315,3 +315,12 @@ pub(crate) fn suspend(slot: Option<&DevfreqSlot>) -> Result {
 pub(crate) fn resume(slot: Option<&DevfreqSlot>) -> Result {
     with_devfreq(slot, |devfreq| devfreq.resume_device())
 }
+
+/// Returns the core clock rate in Hz, or zero without devfreq or after unbind.
+pub(crate) fn cur_freq(tdev: &TyrDrmDevice) -> c_ulong {
+    if tdev.devfreq_data.opp_table.lock().is_none() {
+        return 0;
+    }
+
+    tdev.with_locked_core_clk(|core| core.rate().as_hz())
+}
