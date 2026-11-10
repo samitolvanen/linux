@@ -627,7 +627,7 @@ struct JobEntry<T: QueueOps> {
         Option<KBox<core::mem::MaybeUninit<FenceCallbackRegistration<ProgressCallback<T>>>>>,
 
     /// Pre-allocated uninitialized storage for the stage-wake callback
-    /// registered in [`process_stage`](JobQueueInner::process_stage) on
+    /// registered in [`step_stage`](JobQueueInner::step_stage) on
     /// [`StageAdvance::WaitOn`]. Consumed once. Later `WaitOn`
     /// registrations for the same entry fall back to `GFP_NOWAIT`.
     prealloc_stage_cb:
@@ -638,7 +638,7 @@ struct JobEntry<T: QueueOps> {
     /// Instead of jumping directly to `done_range` (which would corrupt the
     /// contiguous [`WrapRange`] invariant), the entry carries this flag and
     /// drains naturally through each subsequent stage. At the top of
-    /// [`process_stage`](JobQueueInner::process_stage) the flag is checked;
+    /// [`step_stage`](JobQueueInner::step_stage) the flag is checked;
     /// if set, the stage's [`StageOps::teardown`] is called (for driver stages)
     /// and [`StageAdvance::Advance`] is returned immediately, skipping
     /// [`StageOps::process`].
@@ -730,7 +730,7 @@ impl<T: QueueOps> XaEntry<T> {
     }
 }
 
-/// What [`process_stage`](JobQueueInner::process_stage) found at the front of
+/// What [`step_stage`](JobQueueInner::step_stage) found at the front of
 /// a stage. Read under the XArray lock, acted on after it is dropped.
 enum FrontEntry {
     /// A live job. `timed_out` mirrors `JobEntry::timed_out`.
@@ -967,7 +967,7 @@ impl<T: QueueOps> JobQueueInner<T> {
     ///
     /// For each stage, loops over the jobs queued there (front first) calling
     /// the appropriate per-stage helper until the stage returns anything other
-    /// than `Advance`. Stage transitions are managed in [`process_stage`](Self::process_stage);
+    /// than `Advance`. Stage transitions are managed in [`step_stage`](Self::step_stage);
     /// helpers only return a [`StageAdvance`] without touching `PipelineState`
     /// themselves.
     fn check_progress(self: &Arc<Self>) {
@@ -1014,159 +1014,160 @@ impl<T: QueueOps> JobQueueInner<T> {
     /// Process the front job at `stage_i` in a loop until the stage empties
     /// or the job blocks.
     fn process_stage(self: &Arc<Self>, state: &mut PipelineState, stage_i: usize) {
-        loop {
-            if state.stage_ranges[stage_i].is_empty() {
-                return;
+        while self.step_stage(state, stage_i) {}
+    }
+
+    /// Process the front job at `stage_i`. Returns whether it left the stage.
+    fn step_stage(self: &Arc<Self>, state: &mut PipelineState, stage_i: usize) -> bool {
+        if state.stage_ranges[stage_i].is_empty() {
+            return false;
+        }
+        let entry_idx = state.stage_ranges[stage_i].start;
+
+        let front = {
+            let guard = self.fifo.lock();
+            match guard.get(entry_idx as usize) {
+                Some(XaEntry::Live(entry)) => FrontEntry::Live {
+                    timed_out: entry.timed_out,
+                },
+                Some(XaEntry::Reserved { .. }) => FrontEntry::Reserved,
+                None => FrontEntry::Gone,
             }
-            let entry_idx = state.stage_ranges[stage_i].start;
+        };
+        let mut advancing = false;
+        let advance = match front {
+            // A reservation dropped before commit leaves no entry behind.
+            // Retire the index so it cannot hold up the stage.
+            FrontEntry::Gone => StageAdvance::Advance,
+            // drain_inbox() never pulls a reserved index in, so this arm
+            // is unreachable and purely defensive. If that ever changes,
+            // waiting keeps the pipeline from retiring an entry a
+            // PreparedJob still owns.
+            FrontEntry::Reserved => {
+                pr_err_once!(
+                    "JobQueue: step_stage() BUG: xa_idx={} still reserved\n",
+                    entry_idx
+                );
+                StageAdvance::Wait
+            }
+            // Fast-path for an entry that is already timed out. Skip the
+            // stage handler and advance it to the next stage immediately.
+            // For driver stages, teardown() is called to release any
+            // per-stage resources.
+            FrontEntry::Live { timed_out: true } => {
+                if let StageKind::Driver(stage) = &self.stages[stage_i] {
+                    let job = {
+                        let guard = self.fifo.lock();
+                        guard
+                            .get(entry_idx as usize)
+                            .and_then(|e| e.as_live())
+                            .map(|e| (e.job.clone(), e.counter))
+                    };
+                    if let Some((job, counter)) = job {
+                        stage.teardown(&job, counter);
+                    }
+                }
+                StageAdvance::Advance
+            }
+            FrontEntry::Live { timed_out: false } => {
+                advancing = true;
+                match &self.stages[stage_i] {
+                    StageKind::WaitingForDeps => self.process_deps(entry_idx),
+                    StageKind::WaitingForExec => self.process_exec(entry_idx),
+                    StageKind::Executing => self.process_default_hw_wait(entry_idx),
+                    StageKind::Driver(stage) => self.process_driver_stage(stage.clone(), entry_idx),
+                }
+            }
+        };
 
-            let front = {
-                let guard = self.fifo.lock();
-                match guard.get(entry_idx as usize) {
-                    Some(XaEntry::Live(entry)) => FrontEntry::Live {
-                        timed_out: entry.timed_out,
-                    },
-                    Some(XaEntry::Reserved { .. }) => FrontEntry::Reserved,
-                    None => FrontEntry::Gone,
-                }
-            };
-            let mut advancing = false;
-            let advance = match front {
-                // A reservation dropped before commit leaves no entry behind.
-                // Retire the index so it cannot hold up the stage.
-                FrontEntry::Gone => StageAdvance::Advance,
-                // drain_inbox() never pulls a reserved index in, so this arm
-                // is unreachable and purely defensive. If that ever changes,
-                // waiting keeps the pipeline from retiring an entry a
-                // PreparedJob still owns.
-                FrontEntry::Reserved => {
-                    pr_err_once!(
-                        "JobQueue: process_stage() BUG: xa_idx={} still reserved\n",
-                        entry_idx
-                    );
-                    StageAdvance::Wait
-                }
-                // Fast-path for an entry that is already timed out. Skip the
-                // stage handler and advance it to the next stage immediately.
-                // For driver stages, teardown() is called to release any
-                // per-stage resources.
-                FrontEntry::Live { timed_out: true } => {
-                    if let StageKind::Driver(stage) = &self.stages[stage_i] {
-                        let job = {
-                            let guard = self.fifo.lock();
-                            guard
-                                .get(entry_idx as usize)
-                                .and_then(|e| e.as_live())
-                                .map(|e| (e.job.clone(), e.counter))
-                        };
-                        if let Some((job, counter)) = job {
-                            stage.teardown(&job, counter);
-                        }
-                    }
-                    StageAdvance::Advance
-                }
-                FrontEntry::Live { timed_out: false } => {
-                    advancing = true;
-                    match &self.stages[stage_i] {
-                        StageKind::WaitingForDeps => self.process_deps(entry_idx),
-                        StageKind::WaitingForExec => self.process_exec(entry_idx),
-                        StageKind::Executing => self.process_default_hw_wait(entry_idx),
-                        StageKind::Driver(stage) => {
-                            self.process_driver_stage(stage.clone(), entry_idx)
-                        }
-                    }
-                }
-            };
-
-            match advance {
-                StageAdvance::Advance => {
-                    state.stage_ranges[stage_i].pop_front();
-                    if stage_i + 1 < self.stages.len() {
-                        state.stage_ranges[stage_i + 1].push_back();
-                        // Reset the elapsed timer when entering a new stage
-                        // (only for legitimately advancing jobs, not timed-out
-                        // entries draining through).
-                        if advancing {
-                            let mut guard = self.fifo.lock();
-                            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                                entry.stage_entered_at = Instant::now();
-                            }
-                        }
-                    } else {
-                        state.done_range.push_back();
-                    }
-                    // Continue loop: process the new front of this stage.
-                }
-                StageAdvance::TimedOut(_) => {
-                    // Set the timed_out flag and advance to the next stage
-                    // normally. This preserves the contiguous WrapRange
-                    // invariant: every cursor move is a front-of-stage pop,
-                    // so done_range.end always equals stage_ranges[N-1].start.
-                    // The timed-out entry drains silently through subsequent
-                    // stages via the timed-out fast-path above.
-                    {
+        match advance {
+            StageAdvance::Advance => {
+                state.stage_ranges[stage_i].pop_front();
+                if stage_i + 1 < self.stages.len() {
+                    state.stage_ranges[stage_i + 1].push_back();
+                    // Reset the elapsed timer when entering a new stage
+                    // (only for legitimately advancing jobs, not timed-out
+                    // entries draining through).
+                    if advancing {
                         let mut guard = self.fifo.lock();
                         if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                            entry.timed_out = true;
+                            entry.stage_entered_at = Instant::now();
                         }
                     }
-                    state.stage_ranges[stage_i].pop_front();
-                    if stage_i + 1 < self.stages.len() {
-                        state.stage_ranges[stage_i + 1].push_back();
-                    } else {
-                        state.done_range.push_back();
-                    }
-                    // Continue loop: process the new front of this stage.
+                } else {
+                    state.done_range.push_back();
                 }
-                StageAdvance::WaitOn(fence) => {
-                    let uninit_box = {
-                        let mut guard = self.fifo.lock();
-                        guard
-                            .get_mut(entry_idx as usize)
-                            .and_then(|e| e.as_live_mut())
-                            .and_then(|e| e.prealloc_stage_cb.take())
-                    };
-                    let cb = FenceCallbackRegistration::new(
-                        &fence,
-                        StageWakeCallback {
-                            inner: self.clone(),
-                        },
-                    );
-                    // The first WaitOn uses the prealloc slot. A re-registration
-                    // falls back to GFP_NOWAIT, never GFP_KERNEL under the state mutex.
-                    let result = match uninit_box {
-                        Some(uninit_box) => uninit_box.write_pin_init(cb),
-                        None => KBox::try_pin_init(cb, GFP_NOWAIT),
-                    };
-                    match result {
-                        Ok(registration) => {
-                            let mut guard = self.fifo.lock();
-                            if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
-                                entry.stage_wake_cb = Some(registration);
-                            }
-                        }
-                        Err(CallbackError::AlreadySignaled(cb)) => {
-                            cb.inner.maybe_check_progress();
-                        }
-                        Err(CallbackError::Other(e)) => {
-                            pr_err!(
-                                "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
-                                e,
-                                entry_idx
-                            );
-                        }
-                    }
-                    return;
-                }
-                StageAdvance::WaitFor(delay) => {
-                    // SAFETY: The pending work item is an `Arc<Self>` and `self.wq` is an owning
-                    // `Arc<DmaFenceWorkqueue>` field of `Self`, so the workqueue stays alive while
-                    // the item is pending.
-                    let _ = unsafe { self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay) };
-                    return;
-                }
-                StageAdvance::Wait => return,
+                true
             }
+            StageAdvance::TimedOut(_) => {
+                // Set the timed_out flag and advance to the next stage
+                // normally. This preserves the contiguous WrapRange
+                // invariant: every cursor move is a front-of-stage pop,
+                // so done_range.end always equals stage_ranges[N-1].start.
+                // The timed-out entry drains silently through subsequent
+                // stages via the timed-out fast-path above.
+                {
+                    let mut guard = self.fifo.lock();
+                    if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                        entry.timed_out = true;
+                    }
+                }
+                state.stage_ranges[stage_i].pop_front();
+                if stage_i + 1 < self.stages.len() {
+                    state.stage_ranges[stage_i + 1].push_back();
+                } else {
+                    state.done_range.push_back();
+                }
+                true
+            }
+            StageAdvance::WaitOn(fence) => {
+                let uninit_box = {
+                    let mut guard = self.fifo.lock();
+                    guard
+                        .get_mut(entry_idx as usize)
+                        .and_then(|e| e.as_live_mut())
+                        .and_then(|e| e.prealloc_stage_cb.take())
+                };
+                let cb = FenceCallbackRegistration::new(
+                    &fence,
+                    StageWakeCallback {
+                        inner: self.clone(),
+                    },
+                );
+                // The first WaitOn uses the prealloc slot. A re-registration
+                // falls back to GFP_NOWAIT, never GFP_KERNEL under the state mutex.
+                let result = match uninit_box {
+                    Some(uninit_box) => uninit_box.write_pin_init(cb),
+                    None => KBox::try_pin_init(cb, GFP_NOWAIT),
+                };
+                match result {
+                    Ok(registration) => {
+                        let mut guard = self.fifo.lock();
+                        if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
+                            entry.stage_wake_cb = Some(registration);
+                        }
+                    }
+                    Err(CallbackError::AlreadySignaled(cb)) => {
+                        cb.inner.maybe_check_progress();
+                    }
+                    Err(CallbackError::Other(e)) => {
+                        pr_err!(
+                            "JobQueue: stage WaitOn cb alloc failed: {:?}, entry {}\n",
+                            e,
+                            entry_idx
+                        );
+                    }
+                }
+                false
+            }
+            StageAdvance::WaitFor(delay) => {
+                // SAFETY: The pending work item is an `Arc<Self>` and `self.wq` is an owning
+                // `Arc<DmaFenceWorkqueue>` field of `Self`, so the workqueue stays alive while
+                // the item is pending.
+                let _ = unsafe { self.wq.enqueue_delayed::<Arc<Self>, 4>(self.clone(), delay) };
+                false
+            }
+            StageAdvance::Wait => false,
         }
     }
 
