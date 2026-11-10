@@ -1056,11 +1056,20 @@ impl<'a> Tick<'a> {
         // group's per-queue / per-CSG bookkeeping reflects the latest
         // firmware state before we tear the binding down.
         let mut csg_slot_manager = tdev.csg_slot_manager.lock();
+        let mut tick = false;
+        let mut doorbells = CsgSlotMask::empty();
         for csg_idx in CsgSlotIdx::all() {
             if !evicted.contains(csg_idx) {
                 continue;
             }
-            if let Err(e) = Scheduler::process_csg_irq(tdev, fw, &csg_slot_manager, csg_idx.get()) {
+            if let Err(e) = Scheduler::process_csg_irq(
+                tdev,
+                fw,
+                &csg_slot_manager,
+                csg_idx.get(),
+                &mut tick,
+                &mut doorbells,
+            ) {
                 dev_err!(
                     tdev.as_ref(),
                     "process_csg_irq {} failed: {}\n",
@@ -1068,6 +1077,10 @@ impl<'a> Tick<'a> {
                     e.to_errno()
                 );
             }
+        }
+        Scheduler::ring_csg_irq_doorbells(tdev, fw, doorbells);
+        if tick {
+            TyrDrmDeviceData::schedule_tick(tdev);
         }
 
         // Evict every slot even when one fails, so no group is left bound when
