@@ -370,6 +370,20 @@ pub(crate) struct TyrDrmDeviceData {
     /// tick.
     pub(crate) sched_suspended: Atomic<bool>,
 
+    /// Set when a resident group may have become idle. The submit path then
+    /// ticks immediately to re-evaluate residency. Recomputed from each
+    /// tick's idle-group count.
+    pub(crate) might_have_idle_groups: Atomic<bool>,
+
+    /// Whether a group is on the scheduler wait list. Set under the
+    /// slot-manager mutex when a status update adds a group, and refreshed
+    /// on each scheduler unlock.
+    pub(crate) waiting_groups: Atomic<bool>,
+
+    /// Number of `SYNC_UPDATE` events handled while `waiting_groups` was
+    /// clear. Incremented under the slot-manager mutex.
+    pub(crate) skipped_sync_updates: Atomic<u32>,
+
     /// Slot manager for the firmware-visible CSG slots.
     ///
     /// Pinned at probe time with `MAX_CSGS` as an upper bound so the
@@ -395,12 +409,11 @@ pub(crate) struct TyrDrmDeviceData {
     ///
     /// Producers OR new status bits in via `fw_events_or` from any
     /// context; the consumer reads-and-clears with `fw_events_take`.
-    /// This keeps scheduler-mutex work off the threaded IRQ handler.
     fw_events: Atomic<u32>,
 
-    /// Worker that drains `fw_events` under the scheduler mutex, then
-    /// signals the completed submit fences of the resident groups after a
-    /// `SYNC_UPDATE`. Enqueued on `sched_wq`.
+    /// Worker that drains `fw_events`, then signals the completed submit
+    /// fences of the resident groups after a `SYNC_UPDATE`. Enqueued on
+    /// `sched_wq`.
     #[pin]
     fw_events_work: DmaFenceWork<TyrDrmDevice, { work_id::FW_EVENTS }>,
 
@@ -533,8 +546,7 @@ impl TyrDrmDeviceData {
     where
         F: FnOnce(&mut Scheduler) -> Result<R>,
     {
-        let mut sched = self.sched.lock();
-        f(sched.enabled_mut()?)
+        self.with_enabled_scheduler(f).unwrap_or(Err(EINVAL))
     }
 
     /// Runs `f` under the scheduler mutex, or returns `None` before probe
@@ -543,8 +555,12 @@ impl TyrDrmDeviceData {
     where
         F: FnOnce(&mut Scheduler) -> R,
     {
-        let mut sched = self.sched.lock();
-        sched.enabled_mut().ok().map(f)
+        let mut guard = self.sched.lock();
+        let sched = guard.enabled_mut().ok()?;
+        let ret = f(sched);
+        self.waiting_groups
+            .store(sched.has_waiting_groups(), Relaxed);
+        Some(ret)
     }
 
     /// Returns whether a failed reset or resume has left the device unusable.
@@ -869,9 +885,7 @@ impl DmaFenceWorkItem<{ work_id::FW_EVENTS }> for TyrDrmDeviceData {
             return;
         }
 
-        let sync_update = tdev
-            .with_locked_scheduler(|sched| Ok(sched.process_csg_irqs(events, tdev)))
-            .unwrap_or(false);
+        let sync_update = Scheduler::process_csg_irqs(events, tdev);
 
         if sync_update {
             Scheduler::drain_resident_queue_completions(tdev);
@@ -1167,6 +1181,9 @@ impl TyrPlatformDriverData {
                 csif_info <- new_mutex!(gpu::CsifInfo::default()),
                 sched <- new_mutex!(SchedulerState::Disabled),
                 sched_suspended: Atomic::new(false),
+                might_have_idle_groups: Atomic::new(false),
+                waiting_groups: Atomic::new(false),
+                skipped_sync_updates: Atomic::new(0),
                 csg_slot_manager <- new_mutex!(csg_slot_manager),
                 fw_events: Atomic::new(0),
                 fw_events_work <- new_dma_fence_work!("TyrDrmDeviceData::fw_events_work"),
@@ -1349,7 +1366,7 @@ impl platform::Driver for TyrPlatformDriverData {
         Self::suspend_at_unbind(pdev, this);
         this.device.unbind_halted.complete_all();
         let _ = this.device.with_locked_scheduler(|sched| {
-            sched.fail_all_groups();
+            sched.fail_all_groups(&this.device);
             Ok(())
         });
         // The workers that enqueue tiler OOM works are drained and their

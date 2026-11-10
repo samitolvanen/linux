@@ -244,7 +244,7 @@ impl Scheduler {
     /// any of them reported a `SYNC_UPDATE`. A `true` return carries the
     /// duty documented on `process_csg_irq`.
     #[must_use]
-    pub(crate) fn process_csg_irqs(&mut self, mut events: u32, tdev: &TyrDrmDevice) -> bool {
+    pub(crate) fn process_csg_irqs(mut events: u32, tdev: &TyrDrmDevice) -> bool {
         let mut sync_update = false;
         let slot_manager = tdev.csg_slot_manager.lock();
 
@@ -252,7 +252,7 @@ impl Scheduler {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            match self.process_csg_irq(tdev, &slot_manager, csg_id) {
+            match Self::process_csg_irq(tdev, &slot_manager, csg_id) {
                 Ok(updated) => sync_update |= updated,
                 Err(e) => pr_err!("Failed to process the CSG slot {} IRQ: {:?}\n", csg_id, e),
             }
@@ -270,15 +270,14 @@ impl Scheduler {
     /// acknowledged and handled.
     ///
     /// On `Ok(true)` the caller must drain the fences of the slot's group
-    /// after releasing the scheduler mutex, and before canceling them.
+    /// after releasing the slot-manager mutex, and before canceling them.
     pub(super) fn process_csg_irq(
-        &mut self,
         tdev: &TyrDrmDevice,
         slot_manager: &CsgSlotManager,
         csg_id: usize,
     ) -> Result<bool> {
         // The IRQ event mask is wider than the scheduler's slot count.
-        if csg_id >= self.csg_slot_count as usize {
+        if csg_id >= slot_manager.slot_count() {
             return Ok(false);
         }
         let csg_slot = CsgSlotIdx::new(csg_id).ok_or(EINVAL)?;
@@ -316,7 +315,7 @@ impl Scheduler {
 
         if pending & CSG_REQ::IDLE_MASK != 0 {
             // At least one resident group may now be idle.
-            self.might_have_idle_groups = true;
+            tdev.might_have_idle_groups.store(true, Relaxed);
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
         if pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0 {
@@ -334,8 +333,12 @@ impl Scheduler {
             TyrDrmDeviceData::schedule_tick(&tdev_aref);
         }
         let sync_update = pending & CSG_REQ::SYNC_UPDATE_MASK != 0;
-        if sync_update && self.has_waiting_groups() {
-            TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
+        if sync_update {
+            if tdev.waiting_groups.load(Relaxed) {
+                TyrDrmDeviceData::schedule_sync_upd(&tdev_aref);
+            } else {
+                tdev.skipped_sync_updates.add(1, Relaxed);
+            }
         }
 
         let mut events = CsIrqEvents::default();
@@ -439,9 +442,10 @@ impl Scheduler {
     /// or the group holds no slot.
     ///
     /// Must be called *outside* `TyrDrmDeviceData::with_locked_scheduler`:
-    /// this takes the scheduler mutex itself and holds it across the mask
-    /// update and the counter reads, so a tick cannot be partway through a
-    /// firmware sequence on the group's slot.
+    /// this takes the scheduler mutex itself, so a tick cannot be partway
+    /// through a firmware sequence on the group's slot. It reads the counters
+    /// under the slot-manager mutex, which also excludes CSG event processing
+    /// in the job IRQ thread.
     fn take_pending_tiler_oom(
         tdev: &TyrDrmDevice,
         group: &Group,

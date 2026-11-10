@@ -366,7 +366,7 @@ pub(crate) fn pre_reset(tdev: &ARef<TyrDrmDevice>) -> ParkedGroups {
 pub(crate) fn post_reset(tdev: &ARef<TyrDrmDevice>, parked: ParkedGroups, reset_failed: bool) {
     if reset_failed {
         let _ = tdev.with_locked_scheduler(|sched| {
-            sched.fail_all_groups();
+            sched.fail_all_groups(tdev);
             Ok(())
         });
     }
@@ -1010,10 +1010,7 @@ impl<'a> Tick<'a> {
             if !evicted.contains(csg_idx) {
                 continue;
             }
-            if let Err(e) = self
-                .sched
-                .process_csg_irq(data, &csg_slot_manager, csg_idx.get())
-            {
+            if let Err(e) = Scheduler::process_csg_irq(data, &csg_slot_manager, csg_idx.get()) {
                 pr_err!(
                     "process_csg_irq {} failed: {}\n",
                     csg_idx.get(),
@@ -1255,7 +1252,8 @@ impl<'a> Tick<'a> {
         self.sched.resched_target = None;
         self.sched.last_tick = Instant::<Monotonic>::now();
         self.sched.used_csg_slot_count = decision.num_selected as u32;
-        self.sched.might_have_idle_groups = decision.idle_group_count > 0;
+        data.might_have_idle_groups
+            .store(decision.idle_group_count > 0, ordering::Relaxed);
 
         let all_slots_busy = decision.num_selected == self.sched.csg_slot_count as usize
             && decision.idle_group_count == 0;

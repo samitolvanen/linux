@@ -16,7 +16,10 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
-        atomic::Relaxed,
+        atomic::{
+            Acquire,
+            Relaxed, //
+        },
         Arc, //
     },
     time::{
@@ -474,10 +477,6 @@ pub(crate) struct Scheduler {
     pub(in crate::sched) as_budget: KBox<tick::AsBudget>,
     /// Number of CSG slots used by the most recent tick.
     pub(in crate::sched) used_csg_slot_count: u32,
-    /// Set when a resident group may have become idle. The submit path
-    /// then ticks immediately to re-evaluate residency. Recomputed from
-    /// each tick's idle-group count.
-    pub(in crate::sched) might_have_idle_groups: bool,
     /// When the next tick should occur, if any.
     pub(in crate::sched) resched_target: Option<Instant<Monotonic>>,
     /// When the last tick occurred.
@@ -558,7 +557,6 @@ impl Scheduler {
             csg_slot_count,
             as_budget,
             used_csg_slot_count: 0,
-            might_have_idle_groups: false,
             resched_target: None,
             last_tick: Instant::<Monotonic>::now(),
             last_full_tick_jiffies: jiffies64(),
@@ -736,6 +734,10 @@ impl Scheduler {
 
         const CSG_REQ_ACK_TIMEOUT_MS: u32 = 100;
 
+        // Sampled before the requests are written, since another doorbell
+        // ring can make the firmware act on them before ours.
+        let skipped_sync_updates = data.skipped_sync_updates.load(Acquire);
+
         for csg_id in CsgSlotIdx::all() {
             if !context.update_mask.contains(csg_id) {
                 continue;
@@ -809,10 +811,20 @@ impl Scheduler {
                 self.sync_csg_slot_priority(data, &mut csg_slot_manager, csg_id.get())?;
             }
             if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
-                self.sync_csg_slot_state(data, &csg_slot_manager, csg_id.get())?;
+                self.sync_csg_slot_state(
+                    data,
+                    &csg_slot_manager,
+                    csg_id.get(),
+                    skipped_sync_updates,
+                )?;
             }
             if !(acked_reqs & CSG_REQ_STATUS_UPDATE).is_empty() {
-                self.sync_csg_slot_queues_state(data, &csg_slot_manager, csg_id.get())?;
+                self.sync_csg_slot_queues_state(
+                    data,
+                    &csg_slot_manager,
+                    csg_id.get(),
+                    skipped_sync_updates,
+                )?;
             }
         }
 
@@ -886,9 +898,10 @@ impl Scheduler {
     /// credit, except for the queues in `Group::blocked_idle_queues`.
     fn sync_csg_slot_state(
         &mut self,
-        data: &TyrDrmDeviceData,
+        data: &TyrDrmDevice,
         csg_slot_manager: &CsgSlotManager,
         csg_idx: usize,
+        skipped_sync_updates: u32,
     ) -> Result {
         let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
             return Ok(());
@@ -917,7 +930,7 @@ impl Scheduler {
             data.reset.schedule();
         }
         if new_state == group::State::Suspended {
-            self.sync_csg_slot_queues_state(data, csg_slot_manager, csg_idx)?;
+            self.sync_csg_slot_queues_state(data, csg_slot_manager, csg_idx, skipped_sync_updates)?;
 
             let blocked_idle = group.blocked_idle_queues();
             for (queue_idx, queue) in group.indexed_queues() {
@@ -987,11 +1000,15 @@ impl Scheduler {
     ///   `Scheduler::waiting_groups`.
     /// * Other reasons are not blocking and leave the queue in its
     ///   current classification.
+    ///
+    /// `skipped_sync_updates` is the `TyrDrmDeviceData::skipped_sync_updates`
+    /// count `apply_csg_updates` read before writing its CSG requests.
     fn sync_csg_slot_queues_state(
         &mut self,
-        data: &TyrDrmDeviceData,
+        data: &TyrDrmDevice,
         csg_slot_manager: &CsgSlotManager,
         csg_idx: usize,
+        skipped_sync_updates: u32,
     ) -> Result {
         let Some(slot_data) = csg_slot_manager.slot_data(csg_idx) else {
             return Ok(());
@@ -1084,6 +1101,12 @@ impl Scheduler {
         if has_sync_wait {
             if let Ok(wait_arc) = ListArc::<Group, 1>::try_from_arc(group) {
                 self.waiting_groups[priority].push_back(wait_arc);
+                data.waiting_groups.store(true, Relaxed);
+                // A SYNC_UPDATE skipped since the status request may have
+                // satisfied this wait, so re-evaluate it.
+                if data.skipped_sync_updates.load(Relaxed) != skipped_sync_updates {
+                    TyrDrmDeviceData::schedule_sync_upd(&ARef::from(data));
+                }
             }
         }
 
@@ -1143,7 +1166,7 @@ impl Scheduler {
     /// the hardware is unusable. Every group is terminated and its fences
     /// canceled. Nothing is bound, since the pre-reset or suspend pass
     /// evicted every CSG slot.
-    pub(crate) fn fail_all_groups(&mut self) {
+    pub(crate) fn fail_all_groups(&mut self, tdev: &TyrDrmDevice) {
         for prio in 0..GROUP_PRIORITY_COUNT {
             Self::terminate_list(&mut self.runnable_groups[prio]);
             Self::terminate_list(&mut self.idle_groups[prio]);
@@ -1170,7 +1193,7 @@ impl Scheduler {
         // its own tick, and no other tick source survives a dead device.
         self.resched_target = None;
         self.used_csg_slot_count = 0;
-        self.might_have_idle_groups = false;
+        tdev.might_have_idle_groups.store(false, Relaxed);
     }
 
     /// Requeues a group onto the idle or runnable list.
@@ -1239,12 +1262,12 @@ impl Scheduler {
     /// Decides which tick a submit should schedule after marking its group
     /// runnable. A real-time group, a possibly-idle resident group, or a free
     /// slot ticks now. With every slot busy the submit rides the periodic tick.
-    pub(crate) fn submit_tick(&mut self, priority: Priority) -> SubmitTick {
+    pub(crate) fn submit_tick(&mut self, tdev: &TyrDrmDevice, priority: Priority) -> SubmitTick {
         if priority == Priority::RealTime {
             return SubmitTick::Immediate;
         }
 
-        if self.might_have_idle_groups {
+        if tdev.might_have_idle_groups.load(Relaxed) {
             return SubmitTick::Immediate;
         }
 
@@ -1568,7 +1591,7 @@ impl Scheduler {
             let Some((csg_idx, group)) = slot else {
                 continue;
             };
-            if let Err(e) = self.process_csg_irq(&data, &csg_slot_manager, *csg_idx) {
+            if let Err(e) = Self::process_csg_irq(&data, &csg_slot_manager, *csg_idx) {
                 pr_err!("process_csg_irq {} failed: {}\n", csg_idx, e.to_errno());
             }
             let queue_count = group.queue_count();
