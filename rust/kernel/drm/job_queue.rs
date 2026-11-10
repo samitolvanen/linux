@@ -38,7 +38,8 @@
 //!
 //! - **WaitingForExec** — calls the driver's [`QueueOps::submit`]. On
 //!   `Submitted` the job advances; on `NoResources` it stays and is retried
-//!   on the next tick; on `Err` it is retired to Done.
+//!   once a later stage advances a job, or on a later tick; on `Err` it is
+//!   retired to Done.
 //!   A callback on the public submit fence ensures a tick fires when the
 //!   driver eventually signals it.
 //!
@@ -61,12 +62,11 @@
 //!
 //! ## Stage iteration order
 //!
-//! `check_progress()` walks the pipeline in two passes per tick:
-//!
-//! 1. Backward — later stages first, so completed jobs free resources
-//!    (e.g. ring-buffer slots) before earlier stages try to consume them.
-//! 2. Forward — picks up jobs that became eligible during the backward
-//!    pass and advances them in the same tick.
+//! `check_progress()` processes the exec stage first, moving jobs into it
+//! from the deps stage one at a time, so a job reaches the driver as soon as
+//! its dependencies are met. Later stages run next. A blocked submit is
+//! retried once a later stage advances a job, which may free resources
+//! (e.g. ring-buffer slots) it needs.
 //!
 //! ## Lock topology
 //!
@@ -448,13 +448,6 @@ impl<T: QueueOps> PipelineBuilder<T> {
     }
 }
 
-/// Iteration direction for [`JobQueueInner::check_stages`].
-#[allow(dead_code)]
-enum Direction {
-    Backward,
-    Forward,
-}
-
 /// Internal representation of a pipeline stage stored in
 /// [`JobQueueInner::stages`]. Built-in stages carry no data; driver stages
 /// wrap an [`Arc`]-ed [`StageOps`] implementation.
@@ -470,6 +463,12 @@ enum StageKind<T: QueueOps> {
     /// A driver-provided stage (replaces [`Executing`] when present).
     Driver(Arc<dyn StageOps<T>>),
 }
+
+/// Index of [`StageKind::WaitingForDeps`] in [`JobQueueInner::stages`].
+const DEPS_STAGE_IDX: usize = 0;
+
+/// Index of [`StageKind::WaitingForExec`] in [`JobQueueInner::stages`].
+const EXEC_STAGE_IDX: usize = 1;
 
 /// The result of a driver's submit call.
 pub enum SubmitResult<FD: DriverDmaFenceOps> {
@@ -958,26 +957,17 @@ impl<T: QueueOps> JobQueueInner<T> {
 
     /// The main pipeline tick. Runs in process context.
     ///
-    /// Drains the inbox, then walks the pipeline in two passes:
-    ///
-    /// 1. Backward — later stages first, so completed jobs free resources
-    ///    (e.g. ring-buffer slots) before earlier stages try to consume them.
-    /// 2. Forward — picks up jobs that became eligible during the backward
-    ///    pass and advances them immediately, avoiding an extra tick of latency.
-    ///
-    /// For each stage, loops over the jobs queued there (front first) calling
-    /// the appropriate per-stage helper until the stage returns anything other
-    /// than `Advance`. Stage transitions are managed in [`step_stage`](Self::step_stage);
-    /// helpers only return a [`StageAdvance`] without touching `PipelineState`
-    /// themselves.
+    /// Drains the inbox, then walks the pipeline with
+    /// [`check_stages`](Self::check_stages). Stage transitions are managed in
+    /// [`step_stage`](Self::step_stage); helpers only return a [`StageAdvance`]
+    /// without touching `PipelineState` themselves.
     fn check_progress(self: &Arc<Self>) {
         let mut state = self.state.lock();
 
         // Drain newly submitted jobs into stage_ranges[0] (DepsStage).
         self.drain_inbox(&mut state);
 
-        self.check_stages(&mut state, Direction::Backward);
-        self.check_stages(&mut state, Direction::Forward);
+        self.check_stages(&mut state);
 
         let needs_cleanup = !state.done_range.is_empty();
         drop(state);
@@ -986,35 +976,48 @@ impl<T: QueueOps> JobQueueInner<T> {
         }
     }
 
-    /// Walk every stage in the given [`Direction`], processing the front job at
-    /// each stage until it blocks or the stage empties.
-    fn check_stages(self: &Arc<Self>, state: &mut PipelineState, direction: Direction) {
+    /// Process every stage below `parked_at`.
+    ///
+    /// The exec stage runs first and takes jobs from the deps stage one at a
+    /// time while it is empty. The later stages run next. If one of them
+    /// advanced a job, retry the exec stage, because the job may have freed
+    /// resources the exec stage needs. The rest of the deps stage runs last.
+    /// A dependency satisfied by a later stage is seen on the next tick.
+    fn check_stages(self: &Arc<Self>, state: &mut PipelineState) {
         let park = state.parked_at.unwrap_or(usize::MAX);
-
-        match direction {
-            Direction::Forward => {
-                for stage_i in 0..self.stages.len() {
-                    if stage_i >= park {
-                        continue;
+        // Set once the deps stage is empty or its front job is blocked.
+        let mut deps_blocked = false;
+        loop {
+            if EXEC_STAGE_IDX < park {
+                loop {
+                    self.process_stage(state, EXEC_STAGE_IDX);
+                    if deps_blocked || !state.stage_ranges[EXEC_STAGE_IDX].is_empty() {
+                        break;
                     }
-                    self.process_stage(state, stage_i);
+                    deps_blocked = !self.step_stage(state, DEPS_STAGE_IDX);
                 }
             }
-            Direction::Backward => {
-                for stage_i in (0..self.stages.len()).rev() {
-                    if stage_i >= park {
-                        continue;
-                    }
-                    self.process_stage(state, stage_i);
-                }
+            let mut advanced = false;
+            for stage_i in (EXEC_STAGE_IDX + 1)..self.stages.len().min(park) {
+                advanced |= self.process_stage(state, stage_i);
             }
+            if !advanced || state.stage_ranges[EXEC_STAGE_IDX].is_empty() {
+                break;
+            }
+        }
+        if !deps_blocked && DEPS_STAGE_IDX < park {
+            self.process_stage(state, DEPS_STAGE_IDX);
         }
     }
 
     /// Process the front job at `stage_i` in a loop until the stage empties
-    /// or the job blocks.
-    fn process_stage(self: &Arc<Self>, state: &mut PipelineState, stage_i: usize) {
-        while self.step_stage(state, stage_i) {}
+    /// or the job blocks. Returns whether any job left the stage.
+    fn process_stage(self: &Arc<Self>, state: &mut PipelineState, stage_i: usize) -> bool {
+        let mut advanced = false;
+        while self.step_stage(state, stage_i) {
+            advanced = true;
+        }
+        advanced
     }
 
     /// Process the front job at `stage_i`. Returns whether it left the stage.
@@ -1363,7 +1366,7 @@ impl<T: QueueOps> JobQueueInner<T> {
                 StageAdvance::Advance
             }
             Ok(SubmitResult::NoResources(fence)) => {
-                // Return the fence and retry on the next tick.
+                // Return the fence for the next attempt.
                 {
                     let mut guard = self.fifo.lock();
                     if let Some(XaEntry::Live(entry)) = guard.get_mut(entry_idx as usize) {
@@ -1935,10 +1938,6 @@ impl<T: QueueOps> JobQueue<T> {
     /// [`PipelineBuilder::set_cancel_timeout`] bounds the wait but does not
     /// make it safe there.
     pub fn cancel_all(&self) {
-        // WaitingForExec is always at index 1; stages beyond it have been
-        // handed to hardware and need their fences waited on before cancel.
-        const EXEC_STAGE_IDX: usize = 1;
-
         self.inner.latch_cancelled();
 
         let stage_count = self.inner.state.lock().stage_ranges.len();
