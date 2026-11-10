@@ -1340,6 +1340,27 @@ pub(crate) fn user_stream_head_enabled() -> bool {
     false
 }
 
+/// Returns whether `cs_ringbuf_dump` is enabled, so a ring commit reads the
+/// published words only while the tracepoint is on.
+#[cfg(CONFIG_TRACEPOINTS)]
+pub(crate) fn cs_ringbuf_dump_enabled() -> bool {
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_cs_ringbuf_dump,
+            kernel::bindings::tracepoint,
+            key
+        )
+    }
+}
+
+/// Without `CONFIG_TRACEPOINTS` the `__tracepoint_*` symbols do not
+/// exist, so the read can never produce trace output.
+#[cfg(not(CONFIG_TRACEPOINTS))]
+pub(crate) fn cs_ringbuf_dump_enabled() -> bool {
+    false
+}
+
 /// Direction tag for `vm_bind_syncop`. Keep in sync with
 /// `TYR_VM_BIND_SYNCOP_KINDS` in `include/trace/events/tyr.h`.
 #[repr(u32)]
