@@ -62,7 +62,10 @@ use kernel::{
     platform,
     prelude::*,
     sync::{aref::ARef, Arc, Mutex},
-    time::arch_timer_get_rate,
+    time::{
+        arch_timer_get_rate,
+        Delta, //
+    },
 };
 
 pub(crate) use self::cs::{
@@ -72,6 +75,10 @@ pub(crate) use self::cs::{
 pub(crate) use self::csg::{CsgActivateInputs, CsgInterface};
 
 use crate::wait::WaitResult;
+
+/// How long to busy-poll for a firmware ack before sleeping. It covers the
+/// usual ack latency, and a sleep and wakeup take longer.
+const ACK_SPIN_TIME: Delta = Delta::from_micros(20);
 
 /// Encodes a GLB timer timeout and selects the backing time source.
 pub(super) fn conv_timeout(core_clk_rate: u64, timeout_us: u32) -> Result<(u32, TimestampSource)> {
@@ -123,7 +130,7 @@ impl<'a> GlobalInterfaceRequests<'a> {
     fn wait_acks(&self, reqs_mask: GLB_REQ, event_wait: &Wait, timeout_ms: u32) -> Result {
         let mask = reqs_mask.into_raw();
 
-        event_wait.wait_timeout(timeout_ms, || {
+        event_wait.spin_then_wait_timeout(ACK_SPIN_TIME, timeout_ms, || {
             let req = self.input.read(GLB_REQ).into_raw() & mask;
             let ack = self.output.read(GLB_ACK).into_raw() & mask;
             if req == ack {
@@ -326,13 +333,9 @@ impl GlobalInterface {
     /// distinguish a stuck slot from a successful transition and see
     /// exactly which sub-requests were honored.
     ///
-    /// The wait predicate runs under the event-wait lock and must not
-    /// re-acquire `inner`. `process_global_irq` already holds `inner`
-    /// across the GLB-side wait_acks (which takes the event-wait lock
-    /// internally), so a predicate that took `inner` from inside the
-    /// event-wait lock would invert that order and deadlock. The MMIO
-    /// snapshot taken before entering the wait keeps the predicate
-    /// `inner`-free.
+    /// The wait predicate reads only the `CSG_ACK` view cloned out of `inner`,
+    /// so it takes no lock. It runs without the event-wait lock while the wait
+    /// spins, and under it once the wait sleeps.
     pub(crate) fn wait_csg_acks(
         &self,
         csg_idx: usize,
@@ -351,14 +354,16 @@ impl GlobalInterface {
         // slot, so req is stable across the wait.
         let req = csg_input.read(CSG_REQ) & mask;
 
-        let _ = self.event_wait.wait_timeout(timeout_ms, || {
-            let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
-            if ack == req {
-                Ok(WaitResult::Done)
-            } else {
-                Ok(WaitResult::Retry)
-            }
-        });
+        let _ = self
+            .event_wait
+            .spin_then_wait_timeout(ACK_SPIN_TIME, timeout_ms, || {
+                let ack = CSG_REQ::from_raw(csg_output.read(CSG_ACK).into_raw()) & mask;
+                if ack == req {
+                    Ok(WaitResult::Done)
+                } else {
+                    Ok(WaitResult::Retry)
+                }
+            });
 
         // Re-read ACK so the returned mask reflects what the firmware
         // acked even on timeout.
