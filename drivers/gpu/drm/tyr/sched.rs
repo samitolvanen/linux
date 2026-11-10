@@ -1587,11 +1587,12 @@ impl Scheduler {
         }
 
         let csg_slot_manager = data.csg_slot_manager.lock();
+        let mut tick = false;
         for slot in faulted_groups.iter() {
             let Some((csg_idx, group)) = slot else {
                 continue;
             };
-            if let Err(e) = Self::process_csg_irq(&data, &csg_slot_manager, *csg_idx) {
+            if let Err(e) = Self::process_csg_irq(&data, &csg_slot_manager, *csg_idx, &mut tick) {
                 pr_err!("process_csg_irq {} failed: {}\n", csg_idx, e.to_errno());
             }
             let queue_count = group.queue_count();
@@ -1605,6 +1606,9 @@ impl Scheduler {
             });
         }
         drop(csg_slot_manager);
+        if tick {
+            TyrDrmDeviceData::schedule_tick(&data);
+        }
 
         self.apply_csg_updates(&data, &mut context)
     }

@@ -242,8 +242,9 @@ impl WorkItem<2> for Group {
 }
 
 impl Scheduler {
-    /// Processes the CSG events latched in `fw_events`, then drains the
-    /// submit fences of the groups that reported a `SYNC_UPDATE`.
+    /// Processes the CSG events latched in `fw_events`, drains the submit
+    /// fences of the groups that reported a `SYNC_UPDATE`, then queues any
+    /// tick the events asked for.
     ///
     /// Sleeps, takes the slot-manager mutex and drains fences in a dma-fence
     /// signalling section, so it must not be called under the scheduler or
@@ -267,14 +268,24 @@ impl Scheduler {
         }
 
         let _annotation = DmaFenceSignallingAnnotation::new();
-        let groups = Self::process_csg_irqs(events, tdev);
+        let mut tick = false;
+        let groups = Self::process_csg_irqs(events, tdev, &mut tick);
         Self::drain_queue_completions(&groups);
+
+        if tick {
+            TyrDrmDeviceData::schedule_tick(&tdev.into());
+        }
     }
 
-    /// Processes the events of the CSG slots in `events`. Returns the groups
-    /// `process_csg_irq` returned, which carry the duty documented there.
+    /// Processes the events of the CSG slots in `events`, collecting the
+    /// groups `process_csg_irq` returns and the `tick` it sets. Both carry
+    /// the duties documented there.
     #[must_use]
-    fn process_csg_irqs(mut events: u32, tdev: &TyrDrmDevice) -> [Option<Arc<Group>>; MAX_CSGS] {
+    fn process_csg_irqs(
+        mut events: u32,
+        tdev: &TyrDrmDevice,
+        tick: &mut bool,
+    ) -> [Option<Arc<Group>>; MAX_CSGS] {
         let mut groups = [const { None }; MAX_CSGS];
         let slot_manager = tdev.csg_slot_manager.lock();
 
@@ -282,7 +293,7 @@ impl Scheduler {
             let csg_id = events.trailing_zeros() as usize;
             let mask = 1u32 << csg_id;
 
-            match Self::process_csg_irq(tdev, &slot_manager, csg_id) {
+            match Self::process_csg_irq(tdev, &slot_manager, csg_id, tick) {
                 Ok(group) => {
                     if let Some(slot) = groups.get_mut(csg_id) {
                         *slot = group;
@@ -297,18 +308,21 @@ impl Scheduler {
     }
 
     /// Processes the events of CSG slot `csg_id`. Returns the slot's group
-    /// if the slot reported a `SYNC_UPDATE`.
+    /// if the slot reported a `SYNC_UPDATE`, and sets `tick` if an event asks
+    /// for a scheduler tick.
     ///
     /// Every bind and evict holds the slot-manager mutex. Holding it across
     /// the call keeps the slot's group fixed while its events are
     /// acknowledged and handled.
     ///
     /// The caller must drain the fences of a returned group after releasing
-    /// the slot-manager mutex, and before canceling them.
+    /// the slot-manager mutex, and before canceling them. It must queue a
+    /// tick if `tick` is set, even on error.
     pub(super) fn process_csg_irq(
         tdev: &TyrDrmDevice,
         slot_manager: &CsgSlotManager,
         csg_id: usize,
+        tick: &mut bool,
     ) -> Result<Option<Arc<Group>>> {
         // The IRQ event mask is wider than the scheduler's slot count.
         if csg_id >= slot_manager.slot_count() {
@@ -350,7 +364,7 @@ impl Scheduler {
         if pending & CSG_REQ::IDLE_MASK != 0 {
             // At least one resident group may now be idle.
             tdev.might_have_idle_groups.store(true, Relaxed);
-            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+            *tick = true;
         }
         if pending & CSG_REQ::PROGRESS_TIMER_EVENT_MASK != 0 {
             // Progress-timer expiry: the firmware-imposed forward-progress
@@ -364,7 +378,7 @@ impl Scheduler {
                 );
                 group.with_locked_inner(|inner| inner.mark_timedout());
             }
-            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+            *tick = true;
         }
         let sync_update = pending & CSG_REQ::SYNC_UPDATE_MASK != 0;
         if sync_update {
@@ -448,7 +462,7 @@ impl Scheduler {
         }
 
         if cs_fatal_mask != 0 {
-            TyrDrmDeviceData::schedule_tick(&tdev_aref);
+            *tick = true;
         }
 
         if ring_cs_db_mask != 0 {
