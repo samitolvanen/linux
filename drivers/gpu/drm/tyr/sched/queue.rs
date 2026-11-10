@@ -553,7 +553,11 @@ impl QueueData {
     /// written before the leading `wmb()`, so they land before `insert`. The
     /// trailing `wmb()` orders `insert` before the doorbell ring.
     pub(super) fn commit_ringbuf_range(&self, completion_point: u64) -> Result {
-        let prev_insert = self.interfaces.read_input()?.insert;
+        let prev_insert = if trace::cs_ringbuf_dump_enabled() {
+            Some(self.interfaces.read_input()?.insert)
+        } else {
+            None
+        };
         let ringbuf_output = self.interfaces.read_output()?;
         self.interfaces.write_extract_init(ringbuf_output.extract)?;
 
@@ -570,7 +574,9 @@ impl QueueData {
         // Mali prologue can be inspected from trace alone. Wraparound
         // is handled by masking each 8-byte offset into the ringbuf.
         let ringbuf_sz = self.ringbuf.size() as u64;
-        if ringbuf_sz != 0 && completion_point > prev_insert {
+        if let Some(prev_insert) =
+            prev_insert.filter(|&prev| ringbuf_sz != 0 && completion_point > prev)
+        {
             let ringbuf = self.ringbuf.vmap();
             let size = ringbuf.owner().size();
             // SAFETY: `ringbuf` owns a readable CPU mapping for the
