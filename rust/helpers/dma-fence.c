@@ -25,6 +25,12 @@ void rust_helper_dma_fence_chain_free(struct dma_fence_chain *chain)
 	dma_fence_chain_free(chain);
 }
 
+__rust_helper struct dma_fence *
+rust_helper_dma_fence_chain_contained(struct dma_fence *fence)
+{
+	return dma_fence_chain_contained(fence);
+}
+
 void rust_helper_dma_fence_set_error(struct dma_fence *fence, int error)
 {
 	dma_fence_set_error(fence, error);
