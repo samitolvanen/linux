@@ -72,6 +72,8 @@ enum GrowOutcome {
 struct CsIrqEvents {
     tiler_oom_mask: u32,
     cs_fatal_mask: u32,
+    /// Streams whose `EXTRACT_EVENT` request is acked (REQ == ACK).
+    extract_acked_mask: u32,
     /// Whether a fatal event was unrecoverable.
     cs_unrecoverable: bool,
     /// `EXTRACT` of each faulted queue, read before the fault is acknowledged.
@@ -79,8 +81,8 @@ struct CsIrqEvents {
 }
 
 impl CsIrqEvents {
-    /// Records the fatal, fault and tiler OOM events of CS `cs_id`, and
-    /// acknowledges the fatal and fault events. Returns `true` if a fault
+    /// Records the fatal, fault, tiler OOM and extract events of CS `cs_id`,
+    /// and acknowledges the fatal and fault events. Returns `true` if a fault
     /// was acknowledged.
     fn process_cs_irq(
         &mut self,
@@ -97,6 +99,10 @@ impl CsIrqEvents {
 
         if input_req.tiler_oom() != output_ack.tiler_oom() {
             self.tiler_oom_mask |= 1u32 << cs_id;
+        }
+
+        if input_req.extract_event() == output_ack.extract_event() {
+            self.extract_acked_mask |= 1u32 << cs_id;
         }
 
         let fatal_event = input_req.fatal() != output_ack.fatal();
@@ -420,6 +426,7 @@ impl Scheduler {
         let CsIrqEvents {
             mut tiler_oom_mask,
             mut cs_fatal_mask,
+            extract_acked_mask,
             cs_unrecoverable,
             cs_fault_extract,
         } = events;
@@ -458,6 +465,12 @@ impl Scheduler {
             for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
                 if let Some(extract) = extract {
                     queue.fail_job_at_extract(extract, EINVAL);
+                }
+            }
+
+            for (cs_id, queue) in group.indexed_queues() {
+                if extract_acked_mask & cs_id.bit() != 0 {
+                    queue.wake_ring_full();
                 }
             }
         }
