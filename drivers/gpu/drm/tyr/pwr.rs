@@ -50,6 +50,14 @@ use crate::{
 /// Timeout for a power domain transition to complete.
 const TRANSITION_TIMEOUT: Delta = Delta::from_secs(2);
 
+/// How long to busy-poll a domain transition before sleeping. It covers a
+/// transition of a few tens of microseconds without a sleep and wakeup.
+const TRANSITION_SPIN_TIME: Delta = Delta::from_micros(50);
+
+/// Sleep between domain transition polls once the spin ends. A short interval
+/// notices a transition that outlasts the spin soon after it completes.
+const TRANSITION_POLL_INTERVAL: Delta = Delta::from_micros(20);
+
 /// Timeout for a pending retract operation to clear.
 const RETRACT_TIMEOUT: Delta = Delta::from_millis(2);
 
@@ -386,19 +394,36 @@ pub(crate) fn reset_soft(dev: &Device, iomem: &Devres<IoMem>) -> Result {
     reset(dev, iomem, PwrCommand::ResetSoft)
 }
 
+/// Like `poll::read_poll_timeout`, but busy-polls for `TRANSITION_SPIN_TIME`
+/// before sleeping. `timeout` covers both phases.
+fn poll_transition<T>(
+    mut op: impl FnMut() -> Result<T>,
+    mut cond: impl FnMut(&T) -> bool,
+    timeout: Delta,
+) -> Result<T> {
+    match poll::read_poll_timeout(&mut op, &mut cond, Delta::ZERO, TRANSITION_SPIN_TIME) {
+        Err(e) if e == ETIMEDOUT => poll::read_poll_timeout(
+            op,
+            cond,
+            TRANSITION_POLL_INTERVAL,
+            timeout - TRANSITION_SPIN_TIME,
+        ),
+        res => res,
+    }
+}
+
 fn wait_domain_transition(
     dev: &Device,
     iomem: &Devres<IoMem>,
     domain: PwrDomain,
     timeout: Delta,
 ) -> Result {
-    poll::read_poll_timeout(
+    poll_transition(
         || {
             let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(domain_pwrtrans(&io, domain))
         },
         |val| *val == 0,
-        Delta::from_micros(100),
         timeout,
     )
     .inspect_err(|_| dev_err!(dev, "{} domain power in transition\n", domain_name(domain)))?;
@@ -443,13 +468,12 @@ fn domain_transition(
         write_command(&io, pwr_cmd, mask);
     }
 
-    poll::read_poll_timeout(
+    poll_transition(
         || {
             let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(domain_ready(&io, domain))
         },
         |val| *val & mask == expected,
-        Delta::from_micros(100),
         timeout,
     )
     .inspect_err(|_| {
@@ -479,13 +503,12 @@ fn retract_domain(dev: &Device, iomem: &Devres<IoMem>, domain: PwrDomain) -> Res
         pwr_status(&io)
     };
 
-    poll::read_poll_timeout(
+    poll_transition(
         || {
             let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(pwr_status(&io))
         },
         |status| !status.retract_pending(),
-        Delta::from_micros(0),
         RETRACT_TIMEOUT,
     )
     .inspect_err(|_| dev_err!(dev, "{} domain retract pending\n", domain_name(domain)))?;
@@ -506,13 +529,12 @@ fn retract_domain(dev: &Device, iomem: &Devres<IoMem>, domain: PwrDomain) -> Res
         );
     }
 
-    poll::read_poll_timeout(
+    poll_transition(
         || {
             let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(pwr_status(&io))
         },
         |status| domain_allowed(*status, domain) && !domain_delegated(*status, domain),
-        Delta::from_micros(10),
         TRANSITION_TIMEOUT,
     )
     .inspect_err(|_| dev_err!(dev, "Retracting {} domain timeout\n", domain_name(domain)))?;
@@ -559,13 +581,12 @@ fn delegate_domain(dev: &Device, iomem: &Devres<IoMem>, domain: PwrDomain) -> Re
         );
     }
 
-    poll::read_poll_timeout(
+    poll_transition(
         || {
             let io = iomem.try_access().ok_or(ENODEV)?;
             Ok(pwr_status(&io))
         },
         |status| domain_delegated(*status, domain) && !domain_allowed(*status, domain),
-        Delta::from_micros(10),
         TRANSITION_TIMEOUT,
     )
     .inspect_err(|_| dev_err!(dev, "Delegating {} domain timeout\n", domain_name(domain)))?;
