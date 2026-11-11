@@ -563,7 +563,7 @@ impl<'drm> Firmware<'drm> {
         if let Err(e) = Self::wait_for_mcu_status(
             io,
             McuStatus::Disabled,
-            time::Delta::from_micros(10),
+            time::Delta::from_micros(20),
             time::Delta::from_millis(100),
         ) {
             if let McuWaitError::Timeout(status) = e {
@@ -590,7 +590,7 @@ impl<'drm> Firmware<'drm> {
         Self::wait_for_mcu_status(
             io,
             McuStatus::Halt,
-            time::Delta::from_micros(10),
+            time::Delta::from_micros(20),
             time::Delta::from_millis(1000),
         )
     }
