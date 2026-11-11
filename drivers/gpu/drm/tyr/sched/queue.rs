@@ -37,6 +37,7 @@ use kernel::{
         IoBase, //
     },
     new_mutex,
+    new_spinlock,
     pr_warn_once,
     prelude::*,
     sizes::{
@@ -56,7 +57,8 @@ use kernel::{
         },
         Arc,
         LockClassKey,
-        Mutex, //
+        Mutex,
+        SpinLock, //
     },
     time::{
         msecs_to_jiffies,
@@ -189,6 +191,9 @@ pub(crate) struct QueueData {
     /// the job deadline.
     #[pin]
     suspend_state: Mutex<SuspendState>,
+    /// Timeout start of the completion-stage head.
+    #[pin]
+    head_clock: SpinLock<Option<HeadClock>>,
 }
 
 impl QueueData {
@@ -603,6 +608,20 @@ impl QueueData {
         (state.accumulated, state.since)
     }
 
+    /// Returns the timeout start of the head with job counter `counter`. A
+    /// new head starts its timeout at `now`, with `suspended` as its baseline.
+    fn head_start(&self, counter: u64, now: Instant<Monotonic>, suspended: Delta) -> HeadClock {
+        let mut head = self.head_clock.lock();
+        match *head {
+            Some(clock) if clock.counter == counter => clock,
+            _ => *head.insert(HeadClock {
+                counter,
+                since: now,
+                suspended,
+            }),
+        }
+    }
+
     /// Marks the queue as suspended off its CSG slot.
     ///
     /// Records the current monotonic instant so a later
@@ -699,16 +718,6 @@ impl QueueOps for TyrQueueOps {
         if !job.job.group.can_run() {
             return Ok(self.cancel_job(job.job, fence));
         }
-
-        // Fold any in-flight suspend interval into the baseline so it
-        // matches the shape the timeout stage uses on the consumer
-        // side. Subtraction is exact only when both sides fold.
-        let (accumulated, in_flight_since) = self.data.suspend_snapshot();
-        let baseline = match in_flight_since {
-            Some(start) => accumulated + (Instant::<Monotonic>::now() - start),
-            None => accumulated,
-        };
-        job.job.set_baseline_suspend(baseline);
 
         if job.job.stream.is_empty() {
             let Some(done_seqno) = job.job.done_seqno() else {
@@ -847,9 +856,10 @@ impl QueueOps for TyrQueueOps {
     }
 }
 
-/// Bounds an in-flight job by `JOB_TIMEOUT_MS`, not counting time its
-/// queue spent suspended off a CSG slot. A queue blocked on a sync wait
-/// gets no such credit when no queue in its group is active.
+/// Bounds an in-flight job by `JOB_TIMEOUT_MS` from when it becomes the
+/// stage head, not counting time its queue spent suspended off a CSG slot.
+/// A queue blocked on a sync wait gets no such credit when no queue in its
+/// group is active.
 struct QueueCompletionStage {
     data: Arc<QueueData>,
     timeout: Jiffies,
@@ -878,14 +888,16 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
         // Compute the suspend allowance under one lock acquire so the
         // in-flight interval and the accumulator are read atomically.
         let (accumulated, in_flight_since) = self.data.suspend_snapshot();
+        let now = Instant::<Monotonic>::now();
         let mut suspended = accumulated;
         if let Some(start) = in_flight_since {
-            suspended += Instant::<Monotonic>::now() - start;
+            suspended += now - start;
         }
-        let allowance = suspended - ctx.job.baseline_suspend();
+        let head = self.data.head_start(ctx.counter, now, suspended);
+        let allowance = suspended - head.suspended;
         let allowance_jiffies = msecs_to_jiffies(allowance.as_millis().max(0) as u32);
 
-        let elapsed = msecs_to_jiffies(ctx.stage_elapsed().as_millis().max(0) as u32);
+        let elapsed = msecs_to_jiffies((now - head.since).as_millis().max(0) as u32);
         let adjusted_elapsed = elapsed.saturating_sub(allowance_jiffies);
 
         if adjusted_elapsed >= self.timeout {
@@ -939,12 +951,6 @@ pub(super) struct QueueJob {
     /// time. A sync-only job takes the seqno of the last command-stream job
     /// on its queue, or zero if there is none.
     done_seqno: Atomic<u64>,
-    /// Snapshot of `QueueData::suspend_snapshot` taken at submit
-    /// time, folded with any in-flight suspend interval; subtracted
-    /// from the queue's current accumulator by the timeout stage so a
-    /// job is not faulted for time the queue spent suspended off its
-    /// CSG slot before this job was submitted.
-    baseline_suspend_nanos: Atomic<i64>,
     /// Back-reference to the owning group; used by
     /// `TyrQueueOps::submit` to reach the scheduler workqueue when
     /// no CSG doorbell has been assigned to the queue yet.
@@ -960,7 +966,6 @@ impl QueueJob {
         Self {
             stream,
             done_seqno: Atomic::new(0),
-            baseline_suspend_nanos: Atomic::new(0),
             group,
             queue_index,
         }
@@ -975,15 +980,6 @@ impl QueueJob {
 
     pub(super) fn set_done_seqno(&self, done_seqno: u64) {
         self.done_seqno.store(done_seqno, Relaxed);
-    }
-
-    pub(super) fn baseline_suspend(&self) -> Delta {
-        Delta::from_nanos(self.baseline_suspend_nanos.load(Relaxed))
-    }
-
-    fn set_baseline_suspend(&self, baseline: Delta) {
-        self.baseline_suspend_nanos
-            .store(baseline.as_nanos(), Relaxed);
     }
 }
 
@@ -1004,6 +1000,17 @@ impl Default for SuspendState {
             accumulated: Delta::ZERO,
         }
     }
+}
+
+/// Timeout start of the job at the head of the completion stage.
+#[derive(Clone, Copy)]
+struct HeadClock {
+    /// Job counter of the head.
+    counter: u64,
+    /// When the job became the head.
+    since: Instant<Monotonic>,
+    /// Queue suspend time at `since`.
+    suspended: Delta,
 }
 
 /// Per-queue snapshot of the active GPU sync-wait. Populated when the
@@ -1130,6 +1137,7 @@ impl Queue {
                     since: Some(Instant::<Monotonic>::now()),
                     accumulated: Delta::ZERO,
                 }),
+                head_clock <- new_spinlock!(None),
             }),
             GFP_KERNEL,
         )?;
