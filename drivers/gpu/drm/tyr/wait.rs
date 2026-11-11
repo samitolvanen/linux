@@ -134,6 +134,30 @@ impl Wait {
     }
 }
 
+/// Like `read_poll_timeout`, but busy-polls for the first `spin` of
+/// `timeout` before sleeping `interval` between polls.
+///
+/// `interval` must exceed 10 us, as `fsleep()` busy-waits for 10 us or less.
+#[track_caller]
+pub(crate) fn spin_then_poll_timeout<Op, Cond, T>(
+    mut op: Op,
+    mut cond: Cond,
+    spin: Delta,
+    interval: Delta,
+    timeout: Delta,
+) -> Result<T>
+where
+    Op: FnMut() -> Result<T>,
+    Cond: FnMut(&T) -> bool,
+{
+    match read_poll_timeout(&mut op, &mut cond, Delta::ZERO, spin) {
+        Err(e) if e == ETIMEDOUT => {
+            read_poll_timeout(op, cond, interval, (timeout - spin).max(Delta::ZERO))
+        }
+        res => res,
+    }
+}
+
 /// The result of a wait operation.
 pub(crate) enum WaitResult {
     /// The condition was met.
