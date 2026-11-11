@@ -224,6 +224,14 @@ impl PublicDmaFence {
         // SAFETY: The pointer is valid per the type invariant.
         unsafe { (*self.inner.get()).seqno }
     }
+
+    /// Returns the context the fence belongs to.
+    #[inline]
+    pub fn context(&self) -> u64 {
+        // SAFETY: The pointer is valid per the type invariant, and
+        // `dma_fence_init()` sets `context` before the fence is shared.
+        unsafe { (*self.inner.get()).context }
+    }
 }
 
 /// A DMA fence context plus a monotonically increasing sequence number.
