@@ -340,6 +340,10 @@ impl Job {
     /// syncobj at `sync_va` by one. It is padded to a 64-byte boundary so
     /// the firmware prefetcher sees cacheline-aligned trailing storage.
     ///
+    /// The `WAIT` on every scoreboard before the `SYNC_ADD64` retires the
+    /// work of the job before its fence signals and before the next job on
+    /// the ring starts. The serial execution of the queue relies on it.
+    ///
     /// When `profiling_mask` enables sampling, `STORE_STATE` pairs
     /// record the GPU cycle counter and/or timestamp into the sample
     /// slot at `profiling_va`, before and after the `CALL`. Also returns
