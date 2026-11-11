@@ -79,7 +79,9 @@ use crate::{
     },
     fw::{
         global::CsActivateInputs,
-        CsWaitCondition, //
+        CsDbMask,
+        CsWaitCondition,
+        Firmware, //
     },
     gem,
     regs::doorbell_block,
@@ -177,6 +179,9 @@ pub(crate) struct QueueData {
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
     doorbell_id: Atomic<usize>,
+    /// Set while a submit waits for ring space. Changed under the
+    /// slot-manager mutex.
+    ring_full: Atomic<bool>,
     next_seqno: Atomic<u64>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     #[pin]
@@ -689,6 +694,50 @@ impl TyrQueueOps {
         }
         self.cancel_job(job, fence)
     }
+
+    /// Rechecks the ring space for `job` under the slot-manager mutex, so no
+    /// `Queue::wake_ring_full` call is missed. On a full ring, requests an
+    /// `EXTRACT_EVENT` while the group is active.
+    fn request_ring_space(&self, job: &QueueJob) -> Result<(), RingBufferError> {
+        let tdev = &job.group.tdev;
+        let awake = tdev.pm_get_if_active();
+        let guard = tdev.registration_guard();
+        let _slots = tdev.csg_slot_manager.lock();
+
+        let space = self.data.can_append(job.stream.len());
+        let full = matches!(space, Err(RingBufferError::Full));
+        self.data.ring_full.store(full, Relaxed);
+        if !full {
+            return space;
+        }
+
+        let csg_id = job
+            .group
+            .with_locked_inner(|inner| inner.csg_id.filter(|_| inner.state == State::Active));
+        let (Some(_), Some(guard), Some(csg_id)) = (&awake, &guard, csg_id) else {
+            return space;
+        };
+        guard.registration_data_with(|reg_data| {
+            arm_extract_event(&reg_data.fw, csg_id, job.queue_index)
+        })?;
+        space
+    }
+}
+
+/// Requests an `EXTRACT_EVENT` from CS `cs_id` of CSG slot `csg_id`, unless
+/// one is pending.
+fn arm_extract_event(fw: &Firmware<'_>, csg_id: usize, cs_id: QueueIdx) -> Result {
+    let requested = fw.with_csg_mut(csg_id, |csg| {
+        csg.cs_mut(cs_id.get())
+            .ok_or(EINVAL)?
+            .request_extract_event()
+    })?;
+    if requested {
+        fw.with_csg_mut_ring_doorbell(csg_id, |csg| {
+            csg.toggle_input_db_req(CsDbMask::from_raw(cs_id.bit()))
+        })?;
+    }
+    Ok(())
 }
 
 impl QueueOps for TyrQueueOps {
@@ -728,7 +777,11 @@ impl QueueOps for TyrQueueOps {
             };
         }
 
-        if let Err(err) = self.data.can_append(job.job.stream.len()) {
+        let mut space = self.data.can_append(job.job.stream.len());
+        if matches!(space, Err(RingBufferError::Full)) {
+            space = self.request_ring_space(job.job);
+        }
+        if let Err(err) = space {
             if matches!(err, RingBufferError::Full) {
                 return Ok(SubmitResult::NoResources(fence));
             }
@@ -1122,6 +1175,7 @@ impl Queue {
                 ringbuf,
                 interfaces,
                 doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
+                ring_full: Atomic::new(false),
                 next_seqno: Atomic::new(0),
                 iomem: reg_data.iomem.clone(),
                 pending_submit_fences <- new_spinlock!(PendingFences {
@@ -1182,6 +1236,14 @@ impl Queue {
     /// up behind it are submitted without waiting for another event.
     pub(crate) fn unpark(&self) {
         self.job_queue.unpark();
+    }
+
+    /// Schedules a retry of a submit that found the ring full. The caller
+    /// must hold the slot-manager mutex.
+    pub(crate) fn wake_ring_full(&self) {
+        if self.data.ring_full.xchg(false, Relaxed) {
+            self.job_queue.wake();
+        }
     }
 
     /// Signals every pending submit fence with `err`.
