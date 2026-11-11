@@ -1194,10 +1194,12 @@ impl Queue {
             GFP_KERNEL,
         )?;
 
-        let pipeline = PipelineBuilder::new().add_stage(QueueCompletionStage {
-            data: data.clone(),
-            timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
-        })?;
+        let pipeline = PipelineBuilder::new()
+            .add_stage(QueueCompletionStage {
+                data: data.clone(),
+                timeout: msecs_to_jiffies(JOB_TIMEOUT_MS),
+            })?
+            .set_serial_execution();
         let job_queue = JobQueue::new(
             TyrQueueOps { data: data.clone() },
             reg_data.wq.clone(),
