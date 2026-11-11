@@ -262,6 +262,8 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
 
         TyrDrmDeviceData::schedule_dead_mappings(tdev);
 
+        tdev.user_mmio.lock().set_powered(tdev, true);
+
         // The work reissued below tests this flag, so clear it first. A failed
         // resume returns before this point, and the flag stays set until a
         // later resume succeeds.
@@ -275,8 +277,6 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
 
         Ok(())
     })?;
-
-    tdev.user_mmio.lock().set_powered(tdev, true);
 
     Ok(())
 }
