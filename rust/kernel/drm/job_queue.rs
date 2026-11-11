@@ -35,6 +35,9 @@
 //! - **WaitingForDeps** — waits for all dependency fences. Walks them one
 //!   at a time: registers a callback on the next unsignaled fence, fires
 //!   `check_progress()` when it signals, and advances when all are met.
+//!   A queue with [`PipelineBuilder::set_serial_execution`] does not wait on
+//!   its own fences, found directly or within a short chain passed to
+//!   [`JobQueue::prepare`].
 //!
 //! - **WaitingForExec** — calls the driver's [`QueueOps::submit`]. On
 //!   `Submitted` the job advances; on `NoResources` it stays and is retried
@@ -400,6 +403,7 @@ pub struct PipelineBuilder<T: QueueOps> {
     stages: KVec<Arc<dyn StageOps<T>>>,
     pipeline_timeout: Option<Jiffies>,
     cancel_timeout: Option<Jiffies>,
+    serial_execution: bool,
 }
 
 impl<T: QueueOps> Default for PipelineBuilder<T> {
@@ -415,6 +419,7 @@ impl<T: QueueOps> PipelineBuilder<T> {
             stages: KVec::new(),
             pipeline_timeout: None,
             cancel_timeout: None,
+            serial_execution: false,
         }
     }
 
@@ -449,6 +454,24 @@ impl<T: QueueOps> PipelineBuilder<T> {
         self.cancel_timeout = Some(timeout);
         self
     }
+
+    /// Declare that the driver runs the jobs of the queue one at a time, in
+    /// submission order.
+    ///
+    /// The driver must not start a job accepted by [`QueueOps::submit`] before
+    /// every job it accepted earlier on the queue has completed and its writes
+    /// are visible. A dependency on a fence of the queue is then met by
+    /// submission order, so the queue drops it, including when it is one of
+    /// the links of a short `dma_fence_chain` passed to [`JobQueue::prepare`].
+    ///
+    /// [`JobQueue::new`] rejects it together with
+    /// [`Self::set_pipeline_timeout`]. A job that the timeout retires before
+    /// submission is canceled only at cleanup, so a later job that no longer
+    /// waits on it could signal first.
+    pub fn set_serial_execution(mut self) -> Self {
+        self.serial_execution = true;
+        self
+    }
 }
 
 /// Internal representation of a pipeline stage stored in
@@ -472,6 +495,11 @@ const DEPS_STAGE_IDX: usize = 0;
 
 /// Index of [`StageKind::WaitingForExec`] in [`JobQueueInner::stages`].
 const EXEC_STAGE_IDX: usize = 1;
+
+/// The most `dma_fence_chain` links that [`JobQueue::prepare`] walks for the
+/// dependencies of one job under serial execution, to bound the cost of the
+/// walk.
+const MAX_DEP_WALK: usize = 512;
 
 /// The result of a driver's submit call.
 pub enum SubmitResult<FD: DriverDmaFenceOps> {
@@ -851,6 +879,9 @@ struct JobQueueInner<T: QueueOps> {
     pipeline_timeout: Option<Jiffies>,
 
     cancel_timeout: Option<Jiffies>,
+
+    /// Set by [`PipelineBuilder::set_serial_execution`].
+    serial_execution: bool,
 
     /// Delayed work for stage-timer wakeups.
     #[pin]
@@ -1495,6 +1526,54 @@ impl<T: QueueOps> JobQueueInner<T> {
             }
         }
     }
+
+    /// Returns whether submission order meets a dependency on `fence`.
+    ///
+    /// A fence of the queue exists once its job commits. Jobs commit in prepare
+    /// order, so the job that owns the fence precedes every job that has not
+    /// committed yet.
+    fn in_queue_order(&self, fence: &PublicDmaFence) -> bool {
+        self.serial_execution && fence.context() == self.fence_ctx.ctx()
+    }
+
+    /// Appends to `dep_vec` the fences that a job prepared with `deps` waits
+    /// on.
+    ///
+    /// With serial execution, the fences of the queue are dropped, and a
+    /// `dma_fence_chain` is replaced by its other unsignaled fences. Other
+    /// dependencies that reach past `MAX_DEP_WALK` links are kept as they are.
+    fn push_deps(
+        &self,
+        dep_vec: &mut KVVec<ARef<PublicDmaFence>>,
+        deps: &[ARef<PublicDmaFence>],
+    ) -> Result {
+        if !self.serial_execution {
+            dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
+            return Ok(());
+        }
+        let mut budget = MAX_DEP_WALK;
+        for dep in deps {
+            if self.in_queue_order(dep) {
+                continue;
+            }
+            let start = dep_vec.len();
+            let walk = dep.for_each_unsignaled(budget, |fence| {
+                if !self.in_queue_order(fence) {
+                    dep_vec.push(ARef::from(fence), GFP_KERNEL | __GFP_NOWARN)?;
+                }
+                Ok(())
+            })?;
+            match walk {
+                Some(visited) => budget = budget.saturating_sub(visited),
+                None => {
+                    dep_vec.truncate(start);
+                    dep_vec.push(dep.clone(), GFP_KERNEL | __GFP_NOWARN)?;
+                    budget = 0;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A process-context job queue that manages job dependencies, driver
@@ -1572,13 +1651,24 @@ impl<T: QueueOps> PreparedJob<T> {
     /// push is allocation-free so that it is safe to call inside a
     /// dma-fence signalling section. Returns `ENOSPC` if the caller asked
     /// for too few extra slots, and `EINVAL` if the reserved entry is no
-    /// longer `Reserved`.
+    /// longer `Reserved`. With serial execution, a fence of the queue is
+    /// dropped, and the call returns `Ok` before either check.
     pub fn add_dep(&mut self, fence: ARef<PublicDmaFence>) -> Result {
+        if self.slot.inner.in_queue_order(&fence) {
+            return Ok(());
+        }
         let mut guard = self.slot.inner.fifo.lock();
-        let Some(XaEntry::Reserved { deps, .. }) = guard.get_mut(self.slot.index.index()) else {
+        let Some(XaEntry::Reserved {
+            deps, prealloc_cbs, ..
+        }) = guard.get_mut(self.slot.index.index())
+        else {
             return Err(EINVAL);
         };
 
+        // Bound by the callback slots, since `deps` may have spare capacity.
+        if deps.len() >= prealloc_cbs.len() {
+            return Err(ENOSPC);
+        }
         deps.push_within_capacity(fence).map_err(|_| ENOSPC)
     }
 
@@ -1673,6 +1763,10 @@ impl<T: QueueOps> JobQueue<T> {
         all_stages.push(StageKind::WaitingForExec, GFP_KERNEL)?;
         let pipeline_timeout = pipeline.pipeline_timeout;
         let cancel_timeout = pipeline.cancel_timeout;
+        let serial_execution = pipeline.serial_execution;
+        if serial_execution && pipeline_timeout.is_some() {
+            return Err(EINVAL);
+        }
         if pipeline.stages.is_empty() {
             all_stages.push(StageKind::Executing, GFP_KERNEL)?;
         } else {
@@ -1714,6 +1808,7 @@ impl<T: QueueOps> JobQueue<T> {
                 stages: all_stages,
                 pipeline_timeout,
                 cancel_timeout,
+                serial_execution,
                 stage_timer <- DmaFenceDelayedWork::new(
                     c_str!("JobQueue::stage_timer"),
                     ::core::pin::Pin::static_ref(lock_classes.stage_work),
@@ -1753,12 +1848,17 @@ impl<T: QueueOps> JobQueue<T> {
         )?;
         let counter = self.inner.job_counter.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(job, GFP_KERNEL)?;
-        let dep_capacity = deps
+        let initial_capacity = deps
             .len()
             .checked_add(extra_dep_capacity)
             .ok_or(EOVERFLOW)?;
-        let mut dep_vec = KVVec::with_capacity(dep_capacity, GFP_KERNEL | __GFP_NOWARN)?;
-        dep_vec.extend_from_slice(deps, GFP_KERNEL)?;
+        let mut dep_vec = KVVec::with_capacity(initial_capacity, GFP_KERNEL | __GFP_NOWARN)?;
+        self.inner.push_deps(&mut dep_vec, deps)?;
+        let dep_capacity = dep_vec
+            .len()
+            .checked_add(extra_dep_capacity)
+            .ok_or(EOVERFLOW)?;
+        dep_vec.reserve(extra_dep_capacity, GFP_KERNEL | __GFP_NOWARN)?;
 
         // One uninitialised callback slot per dep slot, so that
         // process_deps() can register a callback without allocating under
