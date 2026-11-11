@@ -6,7 +6,11 @@
 //! firmware global interface. It keeps the CSG-to-CS discovery and suspend-size
 //! queries out of the older monolithic interfaces file.
 
-use kernel::{io::Io, prelude::*};
+use kernel::{
+    io::Io,
+    prelude::*,
+    sync::barrier::dma_mb, //
+};
 
 use super::{cs::CsInterface, SharedSectionInfo};
 use crate::fw::{
@@ -476,8 +480,8 @@ impl CsgInterface {
     /// global doorbell write.
     ///
     /// The flip is taken against `CSG_DB_ACK` (not the live
-    /// `CSG_DB_REQ` input) so the firmware always sees `req != ack`
-    /// for the toggled bits and is guaranteed to consume the event.
+    /// `CSG_DB_REQ` input) so each toggled bit raises a new request
+    /// or leaves an unacked one pending.
     ///
     /// Returns `EINVAL` if the interface is not enabled.
     pub(crate) fn toggle_input_db_req(&self, mask: CsDbMask) -> Result {
@@ -485,6 +489,10 @@ impl CsgInterface {
             CsgInterfaceState::Enabled(enabled) => enabled,
             CsgInterfaceState::Disabled => return Err(EINVAL),
         };
+
+        // The firmware acks CSG_DB_REQ before it samples CS_REQ, so order
+        // the caller's CS_REQ writes before the CSG_DB_ACK read.
+        dma_mb();
 
         let mask = mask.into_raw();
         let cur_req = enabled.csg_input.read(CSG_DB_REQ).into_raw();
