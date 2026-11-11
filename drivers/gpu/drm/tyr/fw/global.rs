@@ -61,7 +61,12 @@ use kernel::{
     num::Bounded,
     platform,
     prelude::*,
-    sync::{aref::ARef, Arc, Mutex},
+    sync::{
+        aref::ARef,
+        barrier::dma_mb,
+        Arc,
+        Mutex, //
+    },
     time::{
         arch_timer_get_rate,
         Delta, //
@@ -380,9 +385,8 @@ impl GlobalInterface {
     /// Toggles the `GLB_DB_REQ` bits that differ from `GLB_DB_ACK` for
     /// each slot in `csg_mask`, then writes the global doorbell so the
     /// firmware re-evaluates the global input block. Toggling against
-    /// the live ack guarantees the request transitions to a value the
-    /// firmware has not already acknowledged, so the event is observed
-    /// as a fresh edge rather than collapsed.
+    /// the live ack makes each toggled bit raise a new request or leave
+    /// an unacked one pending.
     pub(super) fn ring_csg_doorbells(&self, csg_mask: CsgSlotMask) -> Result {
         if csg_mask.is_empty() {
             return Ok(());
@@ -778,9 +782,13 @@ impl InnerGlobalInterface {
             }
         };
 
+        // The firmware acks GLB_DB_REQ before it samples CSG_REQ and
+        // CSG_DB_REQ, so order the caller's writes before the GLB_DB_ACK read.
+        dma_mb();
+
         // Toggle the requested doorbell bits relative to the firmware-
-        // owned ack so each one becomes a fresh "event pending" edge.
-        // Other bits in the GLB_DB_REQ word are preserved.
+        // owned ack so each one raises a new request or leaves an unacked
+        // one pending. Other bits in the GLB_DB_REQ word are preserved.
         let csg_mask = csg_mask.into_raw();
         let cur_req = enabled.glb_input.read(GLB_DB_REQ).into_raw();
         let cur_ack = enabled.glb_output.read(GLB_DB_ACK).into_raw();
