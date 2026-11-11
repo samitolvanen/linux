@@ -574,7 +574,7 @@ impl Firmware {
             &self.iomem,
             McuStatus::Halt,
             || self.global_iface.halt_acked(),
-            time::Delta::from_micros(10),
+            time::Delta::from_micros(20),
             time::Delta::from_millis(1000),
         )
     }
@@ -591,7 +591,7 @@ impl Firmware {
             &self.iomem,
             McuStatus::Disabled,
             || true,
-            time::Delta::from_micros(10),
+            time::Delta::from_micros(20),
             time::Delta::from_millis(100),
         )
         .is_err()
