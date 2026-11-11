@@ -231,6 +231,51 @@ impl PublicDmaFence {
         // `dma_fence_init()` sets `context` before the fence is shared.
         unsafe { (*self.inner.get()).context }
     }
+
+    /// Calls `f` on each unsignaled fence that `self` waits for, newest first.
+    ///
+    /// A `dma_fence_chain` waits for the fence in each of its links. Any other
+    /// fence, a `dma_fence_array` included, is visited as one fence. The walk
+    /// stops at the first error `f` returns. `f` may sleep.
+    ///
+    /// Returns the number of links visited, or `None` if links remain after
+    /// the first `max`. `f` has then already run on the unsignaled fences of
+    /// those links.
+    pub fn for_each_unsignaled(
+        &self,
+        max: usize,
+        mut f: impl FnMut(&PublicDmaFence) -> Result,
+    ) -> Result<Option<usize>> {
+        let mut link = ARef::from(self);
+        for visited in 1..=max {
+            let fence = link.chain_contained();
+            if !fence.is_signaled() {
+                f(fence)?;
+            }
+            let raw = ARef::into_raw(link).as_ptr().cast();
+            // SAFETY: `dma_fence_chain_walk()` takes over the reference that
+            // `link` gave up, and returns the next unsignaled link with a
+            // reference of its own, or NULL past the last link.
+            let next = unsafe { bindings::dma_fence_chain_walk(raw) };
+            if next.is_null() {
+                return Ok(Some(visited));
+            }
+            // SAFETY: `next` is non-NULL and carries a reference for the caller.
+            link = unsafe { Self::from_raw(next) };
+        }
+        Ok(None)
+    }
+
+    /// Returns the fence in a `dma_fence_chain` link, or `self` for any other
+    /// fence.
+    #[inline]
+    fn chain_contained(&self) -> &PublicDmaFence {
+        // SAFETY: `self` is valid per the type invariant. The result is `self`,
+        // or the fence a chain node holds a reference to and never replaces,
+        // so it lives as long as `self`. `PublicDmaFence` is
+        // `repr(transparent)` over the `dma_fence`.
+        unsafe { &*bindings::dma_fence_chain_contained(self.raw()).cast() }
+    }
 }
 
 /// A DMA fence context plus a monotonically increasing sequence number.
