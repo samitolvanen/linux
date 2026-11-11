@@ -38,8 +38,8 @@
 //!
 //! - **WaitingForExec** — calls the driver's [`QueueOps::submit`]. On
 //!   `Submitted` the job advances; on `NoResources` it stays and is retried
-//!   once a later stage advances a job, or on a later tick; on `Err` it is
-//!   retired to Done.
+//!   once a later stage advances a job, on a later tick, or on
+//!   [`JobQueue::wake`]; on `Err` it is retired to Done.
 //!   A callback on the public submit fence ensures a tick fires when the
 //!   driver eventually signals it.
 //!
@@ -481,7 +481,8 @@ pub enum SubmitResult<FD: DriverDmaFenceOps> {
     Submitted,
     /// The driver has no resources available (e.g. ring buffer full).
     /// The fence is returned so the pipeline can retry on the next progress
-    /// check, which is triggered by job completions or new submissions.
+    /// check, which is triggered by job completions, new submissions, or
+    /// [`JobQueue::wake`].
     NoResources(DriverDmaFence<FD, Published>),
 }
 
@@ -1924,6 +1925,18 @@ impl<T: QueueOps> JobQueue<T> {
     /// in the exec stage while the queue was parked are drained without delay.
     pub fn unpark(&self) {
         self.inner.state.lock().parked_at = None;
+        self.inner.maybe_check_progress();
+    }
+
+    /// Schedules a progress check to retry a submit that returned
+    /// [`SubmitResult::NoResources`].
+    ///
+    /// Drivers call this when a resource the submit waits for frees up
+    /// without a later stage advancing a job. It leaves a park in place, so a
+    /// parked queue retries nothing until [`unpark`](Self::unpark). Under an
+    /// active [`CoalesceGuard`], the check runs when the guard drops. Safe to
+    /// call from any context.
+    pub fn wake(&self) {
         self.inner.maybe_check_progress();
     }
 
