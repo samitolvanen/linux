@@ -25,6 +25,7 @@ use kernel::{
         IoBase, //
     },
     new_mutex,
+    new_spinlock,
     pr_warn_once,
     prelude::*,
     sizes::{
@@ -44,7 +45,8 @@ use kernel::{
             Write, //
         },
         Arc,
-        Mutex, //
+        Mutex,
+        SpinLock, //
     },
     time::{
         msecs_to_jiffies,
@@ -175,9 +177,9 @@ pub(crate) struct QueueData {
     #[pin]
     syncwait: Mutex<SyncWait>,
     /// Per-queue accounting of off-slot suspend time, credited against
-    /// the job deadline.
+    /// the job deadline. Nests inside `pending_submit_fences`.
     #[pin]
-    suspend_state: Mutex<SuspendState>,
+    suspend_state: SpinLock<SuspendState>,
     /// Set while `Queue::park` holds the queue, so that no deadline of its
     /// jobs is evaluated until the unpark.
     parked: Atomic<bool>,
@@ -318,8 +320,12 @@ impl QueueData {
                 Self::maybe_truncate_pending(&mut pending);
                 break;
             }
+            let timed = entry.is_timed();
             let taken = entry.take_fence(result);
             pending.head = head + 1;
+            if timed {
+                self.start_head_timeout(&mut pending);
+            }
 
             if let Some((fence_seqno, result)) = taken {
                 self.job_queue
@@ -450,7 +456,7 @@ impl QueueData {
                 } else if let Some(fence_seqno) = entry.fence.take() {
                     self.job_queue
                         .complete_jobs_up_to_seqno(fence_seqno, Err(err));
-                    signaled = Some(idx);
+                    signaled = Some((idx, !entry.unpushed));
                 }
                 break;
             }
@@ -459,9 +465,28 @@ impl QueueData {
         // No entry before a signaled one is live, so drain them all. An
         // entry left behind would hold a slot after the job's credit has
         // come back.
-        if let Some(idx) = signaled {
+        if let Some((idx, timed)) = signaled {
             pending.head = idx + 1;
+            if timed {
+                self.start_head_timeout(&mut pending);
+            }
         }
+    }
+
+    /// Starts the job timeout of the oldest timed entry of `pending`, after
+    /// the caller drained the one ahead of it.
+    fn start_head_timeout(&self, pending: &mut PendingFences) {
+        let head = pending.head;
+        let Some(entry) = pending.vec.iter_mut().skip(head).find(|e| e.is_timed()) else {
+            return;
+        };
+        let (accumulated, in_flight_since) = self.suspend_snapshot();
+        let now = Instant::<Monotonic>::now();
+        entry.started = now;
+        entry.baseline_suspend = match in_flight_since {
+            Some(start) => accumulated + (now - start),
+            None => accumulated,
+        };
     }
 
     /// Signals every leading pending submit fence whose stored
@@ -609,8 +634,8 @@ impl QueueData {
 
     /// Returns the `done_seqno` of the oldest live job and how long it has
     /// left before `JOB_TIMEOUT_MS`, not counting the time the queue spent
-    /// suspended off its CSG slot since the job was handed over. A queue
-    /// blocked on a sync wait gets no such credit when no queue in its
+    /// suspended off its CSG slot since the job reached the queue head. A
+    /// queue blocked on a sync wait gets no such credit when no queue in its
     /// group is active.
     pub(super) fn oldest_job_deadline(&self) -> Option<(u64, Delta)> {
         if self.parked.load(Relaxed) {
@@ -620,11 +645,7 @@ impl QueueData {
         let (done_seqno, started, baseline_suspend) = {
             let pending = self.pending_submit_fences.lock();
             let head = pending.head;
-            let entry = pending
-                .vec
-                .iter()
-                .skip(head)
-                .find(|e| e.fence.is_some() && !e.unpushed)?;
+            let entry = pending.vec.iter().skip(head).find(|e| e.is_timed())?;
             (entry.done_seqno, entry.started, entry.baseline_suspend)
         };
 
@@ -1008,15 +1029,22 @@ struct PendingSubmitFence {
     /// Set for a job `QueueData::signal_unpushed_fence` queued behind an
     /// older live one. It signals with its own error.
     unpushed: bool,
-    /// When the job was pushed, for the job timeout.
+    /// When the job was pushed, or reached the queue head if that was later,
+    /// for the job timeout.
     started: Instant<Monotonic>,
-    /// `QueueData::suspend_snapshot` when the job was pushed, folded with
-    /// any in-flight suspend interval, so the job is not faulted for time
-    /// the queue spent suspended off its CSG slot before it was pushed.
+    /// `QueueData::suspend_snapshot` at `started`, folded with any in-flight
+    /// suspend interval, so the job is not faulted for time the queue spent
+    /// suspended off its CSG slot before then.
     baseline_suspend: Delta,
 }
 
 impl PendingSubmitFence {
+    /// Returns true for a live job the queue ran, which the job timeout
+    /// covers.
+    fn is_timed(&self) -> bool {
+        self.fence.is_some() && !self.unpushed
+    }
+
     /// Takes the fence, with the result to signal it with: `result`, or the
     /// staged error when `result` is `Ok`. An unpushed job keeps its own
     /// error.
@@ -1103,7 +1131,7 @@ impl Queue {
                 }),
                 last_job_fence <- new_mutex!(None),
                 syncwait <- new_mutex!(SyncWait::default()),
-                suspend_state <- new_mutex!(SuspendState {
+                suspend_state <- new_spinlock!(SuspendState {
                     since: Some(Instant::<Monotonic>::now()),
                     accumulated: Delta::ZERO,
                 }),
