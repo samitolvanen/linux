@@ -27,6 +27,7 @@ use kernel::{
     io::register::Array,
     io::Io,
     new_mutex,
+    new_spinlock,
     pr_err_once,
     pr_warn_once,
     prelude::*,
@@ -41,7 +42,8 @@ use kernel::{
         barrier::dma_rmb,
         Arc,
         LockClassKey,
-        Mutex, //
+        Mutex,
+        SpinLock, //
     },
     time::{
         msecs_to_jiffies,
@@ -188,7 +190,7 @@ struct PendingSubmitFence {
     fence: Option<DriverDmaFence<QueueFenceData, Published>>,
 }
 
-/// State protected by the pending-submit-fences mutex.
+/// State protected by the pending-submit-fences spinlock.
 ///
 /// `vec` carries the live ordered list of in-flight per-job fences.
 ///
@@ -357,7 +359,7 @@ pub(crate) struct QueueData {
     profiling_slot_count: u32,
     iomem: Arc<kernel::devres::Devres<IoMem>>,
     #[pin]
-    pending_submit_fences: Mutex<PendingFences>,
+    pending_submit_fences: SpinLock<PendingFences>,
     /// Submit fence of the most recently committed job of any kind.
     #[pin]
     last_job_fence: Mutex<Option<ARef<PublicDmaFence>>>,
@@ -562,7 +564,8 @@ impl QueueData {
     ///
     /// For each completed job, the per-job profiling samples are read
     /// back from the slot BO and accumulated into `group`'s fdinfo after
-    /// the job's fence signals.
+    /// the job's fence signals. The readback runs under the
+    /// pending-submit-fences spinlock, so it must not sleep.
     ///
     /// Obeys the dma-fence signalling-section constraints, because the
     /// readback only reads a kernel-mapped BO (normal memory) and takes the
@@ -664,9 +667,7 @@ impl QueueData {
     /// Returns the profiling sample slot assigned to `job`, if it is
     /// profiled.
     ///
-    /// It must not allocate, since an allocation under this lock closes the
-    /// lockdep cycle `JobQueue::state` -> `dma_fence_map` -> `mmu_notifier`
-    /// -> `fs_reclaim` -> `pending_submit_fences`.
+    /// It must not sleep or allocate under the pending-submit-fences spinlock.
     fn push_submit_fence(
         &self,
         job: &QueueJob,
@@ -1303,7 +1304,7 @@ impl Queue {
                 profiling_slots,
                 profiling_slot_count,
                 iomem: tdev.iomem.clone(),
-                pending_submit_fences <- new_mutex!(PendingFences {
+                pending_submit_fences <- new_spinlock!(PendingFences {
                     vec: pending_fence_vec,
                     head: 0,
                     next_profiling_slot: 0,
