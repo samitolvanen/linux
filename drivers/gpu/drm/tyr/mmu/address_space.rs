@@ -16,7 +16,6 @@ use kernel::{
     error::Result,
     io::{
         mem::DevresIoMem,
-        poll,
         register::Array,
         Io, //
     },
@@ -77,8 +76,15 @@ use crate::{
             PtAllocator, //
         },
         RemovedVas, //
-    }, //
+    },
+    wait::spin_then_poll_timeout, //
 };
+
+/// How long to busy-poll an AS command or cache flush before sleeping.
+const CMD_SPIN_TIME: Delta = Delta::from_micros(50);
+
+/// Sleep between AS command and cache flush polls once the spin ends.
+const CMD_POLL_INTERVAL: Delta = Delta::from_micros(20);
 
 /// An AS slot index checked by `AddressSpaceManager::validate_as_slot`.
 ///
@@ -407,8 +413,13 @@ impl AddressSpaceManager {
             Ok(io.read(status_reg))
         };
         let cond = |status: &STATUS| -> bool { !status.active_ext() };
-        let res =
-            poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
+        let res = spin_then_poll_timeout(
+            op,
+            cond,
+            CMD_SPIN_TIME,
+            CMD_POLL_INTERVAL,
+            Delta::from_millis(100),
+        );
         if matches!(res, Err(e) if e == ETIMEDOUT) {
             // A stuck AS_ACTIVE bit only clears with a GPU reset.
             dev_err!(&self.pdev, "AS_ACTIVE bit stuck\n");
@@ -700,8 +711,13 @@ impl AddressSpaceManager {
             Ok(io.read(GPU_IRQ_RAWSTAT))
         };
         let cond = |status: &GPU_IRQ_RAWSTAT| -> bool { status.clean_caches_completed() };
-        let res =
-            poll::read_poll_timeout(op, cond, Delta::from_micros(10), Delta::from_millis(100));
+        let res = spin_then_poll_timeout(
+            op,
+            cond,
+            CMD_SPIN_TIME,
+            CMD_POLL_INTERVAL,
+            Delta::from_millis(100),
+        );
 
         if matches!(res, Err(e) if e == ETIMEDOUT) {
             // The GPU stopped acknowledging cache maintenance. Only a
