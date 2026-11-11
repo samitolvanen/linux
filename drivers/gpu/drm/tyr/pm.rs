@@ -222,6 +222,8 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
 
     TyrDrmDeviceData::schedule_dead_mappings(tdev);
 
+    tdev.user_mmio.lock().set_powered(tdev, true);
+
     // The work reissued below tests this flag, so clear it first. A failed
     // resume leaves the flag set, since the device then stays unusable until
     // unbind.
@@ -232,8 +234,6 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     if let Err(e) = devfreq::resume(slot) {
         dev_warn!(bound, "Failed to resume devfreq: {:?}\n", e);
     }
-
-    tdev.user_mmio.lock().set_powered(tdev, true);
 
     Ok(())
 }
