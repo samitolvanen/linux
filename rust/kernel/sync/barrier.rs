@@ -81,3 +81,14 @@ pub fn dma_rmb() {
     // validity requirements on the caller.
     unsafe { bindings::dma_rmb() };
 }
+
+/// A full memory barrier for coherent memory shared with devices.
+///
+/// Orders all prior reads and writes before all later ones. Does not order
+/// accesses with respect to other CPUs.
+#[inline(always)]
+pub fn dma_mb() {
+    // SAFETY: `dma_mb()` is a barrier with no memory operands, so it has no
+    // validity requirements on the caller.
+    unsafe { bindings::dma_mb() };
+}
