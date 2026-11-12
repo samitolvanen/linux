@@ -1248,6 +1248,12 @@ impl Queue {
         }
     }
 
+    /// Returns whether a submit waits for ring space. The caller must hold
+    /// the slot-manager mutex.
+    pub(crate) fn ring_full(&self) -> bool {
+        self.data.ring_full.load(Relaxed)
+    }
+
     /// Signals every pending submit fence with `err`.
     ///
     /// The caller must have made the group unrunnable first, so the jobs
