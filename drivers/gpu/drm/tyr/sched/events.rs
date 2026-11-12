@@ -11,6 +11,10 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::Relaxed,
+        barrier::{
+            dma_mb,
+            Full, //
+        },
         Arc, //
     },
     workqueue::WorkItem, //
@@ -296,6 +300,11 @@ impl Scheduler {
 
             if pending != 0 {
                 csg.update_input_req(CSG_REQ::from_raw(ack & pending), CSG_REQ::from_raw(pending))?;
+            }
+            // The firmware writes a sync object before it samples CSG_REQ, so
+            // order the SYNC_UPDATE ack before the sync object reads.
+            if pending & CSG_REQ::SYNC_UPDATE_MASK != 0 {
+                dma_mb(Full);
             }
             if pending_cs_irqs != 0 {
                 csg.write_input_irq_ack(irq_ack.with_mask(irq_req));
