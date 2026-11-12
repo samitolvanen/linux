@@ -292,6 +292,9 @@ pub(crate) struct Group {
     submit_lock: Mutex<()>,
     /// Pending TILER_OOM events, one bit per command stream.
     pub(crate) tiler_oom: Atomic<u32>,
+    /// TILER_OOM events recorded and not yet answered, one bit per command
+    /// stream. Updated under the firmware interface lock.
+    pub(crate) tiler_oom_seen: Atomic<u32>,
     /// Tyr DRM device that owns this group.
     ///
     /// # Invariants
@@ -525,6 +528,7 @@ impl Group {
                 }),
                 submit_lock <- new_mutex!(()),
                 tiler_oom: Atomic::new(0),
+                tiler_oom_seen: Atomic::new(0),
                 tdev: ddev.into(),
                 csg_seat: LockedBy::new(&ddev.csg_slot_manager, Seat::default()),
                 queues,

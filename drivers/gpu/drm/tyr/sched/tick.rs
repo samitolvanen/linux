@@ -1304,6 +1304,7 @@ impl<'a> Tick<'a> {
                         let group: Arc<Group> = pending.list_arc.clone_arc();
                         let slot_idx = match csg_slot_manager.activate(CsgSlotData {
                             group: group.clone(),
+                            started: false,
                             fw_priority: fw_prio,
                         }) {
                             Ok(slot_idx) => slot_idx,
