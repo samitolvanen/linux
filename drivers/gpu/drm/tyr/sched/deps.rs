@@ -257,7 +257,7 @@ pub(crate) fn append_syncops(
 pub(crate) struct PreparedJob<'a, T: JobQueueOps + Send + Sync> {
     job: Job<'a, T>,
     /// Memory for the dependencies `Self::add_dep` adds.
-    dep_allocations: KVec<DependencyAllocation<'a, T>>,
+    dep_allocations: KVVec<DependencyAllocation<'a, T>>,
 }
 
 impl<'a, T: JobQueueOps + Send + Sync> PreparedJob<'a, T> {
@@ -274,7 +274,8 @@ impl<'a, T: JobQueueOps + Send + Sync> PreparedJob<'a, T> {
             job.add_dependency(fence)?;
         }
 
-        let mut dep_allocations = KVec::with_capacity(extra_dep_capacity, GFP_KERNEL)?;
+        let mut dep_allocations =
+            KVVec::with_capacity(extra_dep_capacity, GFP_KERNEL | __GFP_NOWARN)?;
         for _ in 0..extra_dep_capacity {
             dep_allocations.push(job.new_dependency_allocation()?, GFP_KERNEL)?;
         }
