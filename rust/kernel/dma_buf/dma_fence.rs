@@ -535,6 +535,17 @@ pub enum FenceWaitResult {
     TimedOut,
 }
 
+/// The result of [`Fence::for_each_unsignaled`].
+#[must_use]
+pub enum FenceWalk {
+    /// The walk visited every unsignaled link. Holds the number of links
+    /// visited.
+    Complete(usize),
+    /// The walk stopped after `max` links. Holds the first link not visited.
+    /// It signals once the fences of every link not visited have signaled.
+    Truncated(ARef<Fence>),
+}
+
 impl Fence {
     /// Query a fence's error code and turn it into a [`Result`].
     ///
@@ -601,6 +612,57 @@ impl Fence {
         // SAFETY: Valid because `self` is valid. `dma_fence_init()` sets
         // `context` before the fence is shared.
         unsafe { (*self.as_raw()).context }
+    }
+
+    /// Calls `f` on each unsignaled fence that `self` waits for, newest first.
+    ///
+    /// A `dma_fence_chain` waits for the fence in each of its links. Any other
+    /// fence is visited as one fence. Unlike its C counterpart
+    /// `dma_fence_unwrap_for_each()`, the walk does not unwrap a
+    /// `dma_fence_array`. The walk stops at the first error `f` returns. `f`
+    /// may sleep.
+    ///
+    /// The walk visits at most `max` links, see [`FenceWalk`].
+    ///
+    /// To skip signaled links, the walk calls `dma_fence_is_signaled()`, which
+    /// can signal a fence and run its callbacks. The caller must not hold a
+    /// lock that a fence callback takes.
+    pub fn for_each_unsignaled(
+        &self,
+        max: usize,
+        mut f: impl FnMut(&Fence) -> Result,
+    ) -> Result<FenceWalk> {
+        let mut link = ARef::from(self);
+        for visited in 1..=max {
+            let fence = link.chain_contained();
+            // SAFETY: `fence.as_raw()` is a valid fence.
+            if !unsafe { bindings::dma_fence_test_signaled_flag(fence.as_raw()) } {
+                f(fence)?;
+            }
+            let raw = ARef::into_raw(link).as_ptr().cast();
+            // SAFETY: `raw` is a valid fence, and `dma_fence_chain_walk()`
+            // takes over the reference that `link` gave up.
+            let next = unsafe { bindings::dma_fence_chain_walk(raw) };
+            let Some(next) = NonNull::new(next) else {
+                return Ok(FenceWalk::Complete(visited));
+            };
+            // SAFETY: `dma_fence_chain_walk()` returns the next link with a
+            // reference for the caller, which the `ARef` takes over. `Fence`
+            // is a transparent wrapper of a `struct dma_fence`.
+            link = unsafe { ARef::from_raw(next.cast()) };
+        }
+        Ok(FenceWalk::Truncated(link))
+    }
+
+    /// Returns the fence in a `dma_fence_chain` link, or `self` for any other
+    /// fence.
+    #[inline]
+    fn chain_contained(&self) -> &Fence {
+        // SAFETY: `self.as_raw()` is a valid fence. The result is `self` or the
+        // fence a chain link holds a reference to and never replaces, so it
+        // lives as long as `self`. `Fence` is a transparent wrapper of a
+        // `struct dma_fence`.
+        unsafe { Fence::from_raw(bindings::dma_fence_chain_contained(self.as_raw())) }
     }
 
     /// Wait until the fence is signaled.
