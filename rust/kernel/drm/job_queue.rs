@@ -43,7 +43,8 @@
 //! assigned a capacity by the user, and jobs get assigned individual cost. Jobs
 //! are only run if there is enough capacity; if not, running stops until that
 //! is the case. These credits must accurately represent the capacity on the GPU
-//! ring the queue was created for.
+//! ring the queue was created for. A driver whose hardware frees a resource
+//! after the job completes can defer a job, see [`RunResult::NoResources`].
 //!
 //! The driver tells the JobQueue which jobs are finished through
 //! [`JobQueue::complete_jobs_up_to_seqno()`]. This function is typically
@@ -411,8 +412,14 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
             };
 
             drop(jq); // Release lock.
-            T::run_job(work.fctx, runnable_job);
+            let result = T::run_job(work.fctx, runnable_job);
             jq = work.inner.lock(); // Retake lock.
+
+            if result == RunResult::NoResources {
+                *jq.as_mut().project().capacity += u64::from(job.cost);
+                jq.waiting_jobs.push_front(job);
+                break;
+            }
 
             // run_job() above needs to be called without lock protection. Thus,
             // it is possible that the driver instructed completion right before
@@ -549,6 +556,7 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
 ///         JobQueue,
 ///         JobQueueOps,
 ///         JobRunnable,
+///         RunResult,
 ///     },
 ///     workqueue::{
 ///         OwnedQueue,
@@ -598,8 +606,9 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
 /// impl JobQueueOps for JqData {
 ///     type JobDataType = Payload;
 ///
-///     fn run_job<'a>(&self, job: JobRunnable<'a, Payload>) {
+///     fn run_job<'a>(&self, job: JobRunnable<'a, Payload>) -> RunResult {
 ///         pr_info!("Job Nr. {} gets run now.\n", job.seqno);
+///         RunResult::Ran
 ///     }
 ///
 ///     fn kill(&self, jq_nr: u64, err: Error) {
@@ -704,6 +713,24 @@ pub struct JobRunnable<'a, T> {
     pub data: &'a T,
 }
 
+/// What [`JobQueueOps::run_job`] did with a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum RunResult {
+    /// The job runs on the hardware, or the driver has completed it.
+    Ran,
+    /// The driver lacks a resource to run the job and did not start it.
+    ///
+    /// JobQueue gives the job's credits back and calls
+    /// [`JobQueueOps::run_job`] for it again before any later job. The driver
+    /// must call [`JobQueue::wake`] once the resource frees up, and the
+    /// resource must free up in bounded time without userspace action.
+    /// JobQueue may also retry earlier.
+    ///
+    /// The driver must not return this for a job it has already completed.
+    NoResources,
+}
+
 /// Ops for the JobQueue.
 pub trait JobQueueOps {
     /// The type of the data passed over in [`JobQueue::new_job`].
@@ -714,12 +741,12 @@ pub trait JobQueueOps {
     /// JobQueue calls this callback from process context without any locks
     /// held, thus, the driver is permitted to sleep in its implementation.
     ///
-    /// The driver must be aware that JobQueue trusts on its credit count system
-    /// for this operation to be infallible.
+    /// The driver returns [`RunResult::NoResources`] to defer a job it lacks a
+    /// resource for.
     ///
     /// This callback might be called while the driver is in the process of
     /// dropping the JobQueue, but will never be called afterwards.
-    fn run_job<'a>(&self, job: JobRunnable<'a, Self::JobDataType>);
+    fn run_job<'a>(&self, job: JobRunnable<'a, Self::JobDataType>) -> RunResult;
 
     /// Tells the driver to tear this JobQueue down.
     ///
@@ -978,6 +1005,19 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
         self.with_inner(|inner| {
             *inner.lock().as_mut().project().parked = false;
         });
+        self.check_start_submit_worker();
+    }
+
+    /// Retry a job that [`JobQueueOps::run_job`] deferred.
+    ///
+    /// A call while `run_job()` runs, before it returns
+    /// [`RunResult::NoResources`], still causes a retry. It does not unpark
+    /// the queue.
+    ///
+    /// This function can be called from any context.
+    #[inline]
+    pub fn wake(&self) {
+        // A running SubmitWorker is no longer pending, so this queues it again.
         self.check_start_submit_worker();
     }
 
