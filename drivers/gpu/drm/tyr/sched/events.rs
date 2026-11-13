@@ -12,7 +12,10 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::Relaxed,
-        barrier::dma_mb,
+        barrier::{
+            dma_mb,
+            dma_rmb, //
+        },
         Arc, //
     },
     workqueue::WorkItem,
@@ -27,6 +30,7 @@ use crate::{
         global::CsgInterface,
         CsDbMask,
         CsFatalExceptionType,
+        CsgExecutionState,
         CsgSlotMask,
         CSG_REQ, //
     },
@@ -99,7 +103,14 @@ impl CsIrqEvents {
         let output_ack = cs.read_output_ack()?;
 
         if input_req.tiler_oom() != output_ack.tiler_oom() {
-            self.tiler_oom_mask |= 1u32 << cs_id;
+            if let Some(group) = group {
+                let bit = 1u32 << cs_id;
+                let seen = group.tiler_oom_seen.load(Relaxed);
+                if seen & bit == 0 {
+                    group.tiler_oom_seen.store(seen | bit, Relaxed);
+                    self.tiler_oom_mask |= bit;
+                }
+            }
         }
 
         if input_req.extract_event() == output_ack.extract_event() {
@@ -108,6 +119,12 @@ impl CsIrqEvents {
 
         let fatal_event = input_req.fatal() != output_ack.fatal();
         let fault_event = input_req.fault() != output_ack.fault();
+
+        // The firmware stores the event's output words before `CS_ACK`, so
+        // order their loads after the `CS_ACK` load.
+        if fatal_event || fault_event {
+            dma_rmb();
+        }
 
         if fatal_event {
             if let Some(group) = group {
@@ -149,6 +166,35 @@ impl CsIrqEvents {
 
         Ok(fault_event)
     }
+}
+
+/// Returns the streams of `group` outside `flagged` with an unhandled
+/// event. The firmware can raise one without toggling `CSG_IRQ_REQ`.
+fn unflagged_cs_events(csg: &mut CsgInterface, group: &Group, flagged: u32) -> u32 {
+    let oom_seen = group.tiler_oom_seen.load(Relaxed);
+    let mut events = 0;
+
+    for (cs_id, queue) in group.indexed_queues() {
+        let bit = cs_id.bit();
+        if flagged & bit != 0 {
+            continue;
+        }
+        let Some(cs) = csg.cs_mut(cs_id.get()) else {
+            continue;
+        };
+        let (Ok(req), Ok(ack)) = (cs.read_input_req(), cs.read_output_ack()) else {
+            continue;
+        };
+        if req.fatal() != ack.fatal()
+            || req.fault() != ack.fault()
+            || (req.tiler_oom() != ack.tiler_oom() && oom_seen & bit == 0)
+            || (req.extract_event() == ack.extract_event() && queue.ring_full())
+        {
+            events |= bit;
+        }
+    }
+
+    events
 }
 
 fn slot_holds(slot_manager: &CsgSlotManager, csg_id: usize, group: &Arc<Group>) -> bool {
@@ -347,7 +393,8 @@ impl Scheduler {
 
         let (pending, pending_cs_irqs) = tdev.fw.with_csg_mut(csg_id, |csg| {
             let req = csg.read_input_req()?.into_raw();
-            let ack = csg.read_output_ack()?.into_raw();
+            let ack_reg = csg.read_output_ack()?;
+            let ack = ack_reg.into_raw();
             let irq_req = csg.read_output_irq_req()?.mask();
             let irq_ack = csg.read_input_irq_ack()?;
             let pending = (req ^ ack) & pending_mask;
@@ -364,8 +411,19 @@ impl Scheduler {
             if pending_cs_irqs != 0 {
                 csg.write_input_irq_ack(irq_ack.with_mask(irq_req));
             }
+            // Skip a staged binding until Start or Resume runs on the slot.
+            let running = matches!(
+                ack_reg.state(),
+                Ok(CsgExecutionState::Start | CsgExecutionState::Resume)
+            );
+            let unflagged = slot_manager
+                .slot_data(csg_id)
+                .filter(|data| data.started || running)
+                .map_or(0, |data| {
+                    unflagged_cs_events(csg, &data.group, pending_cs_irqs)
+                });
 
-            Ok((pending, pending_cs_irqs))
+            Ok((pending, pending_cs_irqs | unflagged))
         })?;
 
         if pending == 0 && pending_cs_irqs == 0 {
@@ -560,8 +618,13 @@ impl Scheduler {
             let counters = tdev.fw.with_csg_mut(csg_id, |csg| {
                 let cs = csg.cs_mut(cs_id.get()).ok_or(EINVAL)?;
                 if cs.read_input_req()?.tiler_oom() == cs.read_output_ack()?.tiler_oom() {
+                    let seen = group.tiler_oom_seen.load(Relaxed);
+                    group.tiler_oom_seen.store(seen & !cs_id.bit(), Relaxed);
                     return Ok(None);
                 }
+                // The firmware stores the heap words before `CS_ACK`, so order their
+                // loads after the `CS_ACK` load.
+                dma_rmb();
                 let heap = cs.read_heap_output_state()?;
 
                 Ok(Some((
@@ -626,6 +689,8 @@ impl Scheduler {
 
                 let ack = cs.read_output_ack()?.tiler_oom();
                 let req = cs.read_input_req()?.with_tiler_oom(ack);
+                let seen = group.tiler_oom_seen.load(Relaxed);
+                group.tiler_oom_seen.store(seen & !oom.cs_id.bit(), Relaxed);
                 cs.write_input_req(req);
             }
 

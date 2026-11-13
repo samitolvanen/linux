@@ -1225,6 +1225,7 @@ impl<'a> Tick<'a> {
                             &group.csg_seat,
                             CsgSlotData {
                                 group: group.clone(),
+                                started: false,
                                 fw_priority: fw_prio,
                             },
                             &mut context,
