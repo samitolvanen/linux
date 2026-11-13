@@ -82,7 +82,8 @@ use kernel::{
         FenceCallback,
         FenceCallbackRegistration,
         FenceContext,
-        FenceContextOps, //
+        FenceContextOps,
+        SignallingSection, //
     },
     list::{
         impl_list_arc_safe,
@@ -452,28 +453,40 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for DropWorker<'_, '_, T> {
         }
 
         let mut jq_locked = work.inner.lock();
-        let mut batch = core::mem::take(&mut jq_locked.drop_list);
+        let batch = core::mem::take(&mut jq_locked.drop_list);
         drop(jq_locked);
         // `JobQueue::park()` can wait for this read section from a dma-fence
         // signalling section, so the payloads must drop after it.
         drop(srcu_guard);
 
+        // SAFETY: Every job on the drop list signaled its fence before it got
+        // there.
+        unsafe { Self::drop_batch(batch) };
+    }
+}
+
+impl<'fctx, T: JobQueueOps + Send + Sync> DropWorker<'_, 'fctx, T> {
+    /// Drops the jobs in `batch` after one RCU grace period.
+    ///
+    /// # Safety
+    ///
+    /// Every fence of the jobs in `batch` is signaled.
+    unsafe fn drop_batch(mut batch: UniqueList<JobInternal<'fctx, T>>) {
         if batch.is_empty() {
             return;
         }
 
         // An RCU grace period ends once every reader that started before it
-        // has finished. Every job on the drop list signaled its fence before
-        // it got there, so a reader that may still use a fence's data started
+        // has finished. Every job in the batch signaled its fence before this
+        // call, so a reader that may still use a fence's data started
         // before this point. One grace period from here covers every fence in
         // the batch, where dropping the jobs one by one would wait once each.
         synchronize_rcu();
 
         while let Some(mut job) = batch.pop_front() {
             if let Some(fence) = job.as_mut().project().fence.take() {
-                // SAFETY: The fence was signaled before the job went on the
-                // drop list, and `synchronize_rcu()` has waited for a grace
-                // period since.
+                // SAFETY: The fence was signaled before this call, and
+                // `synchronize_rcu()` has waited for a grace period since.
                 unsafe { fence.drop_after_grace_period() };
             }
         }
@@ -984,26 +997,36 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
 #[pinned_drop]
 impl<T: JobQueueOps + Send + Sync> PinnedDrop for JobQueue<T> {
     fn drop(self: Pin<&mut Self>) {
+        let section = SignallingSection::begin();
         // Revoke to prevent still existing DependencyWakers from kicking the
         // SubmitWorker again before we could deregister them.
         self.revoked.store(true, Relaxed);
         self.srcu.synchronize();
         self.with_inner(|inner| {
             let mut inner = inner.lock();
-            let drop_list = core::mem::take(&mut inner.drop_list);
-            let waiting_jobs = core::mem::take(&mut inner.waiting_jobs);
+            let mut drop_list = core::mem::take(&mut inner.drop_list);
+            let mut waiting_jobs = core::mem::take(&mut inner.waiting_jobs);
             let mut running_jobs = core::mem::take(&mut inner.running_jobs);
+            drop(inner);
 
+            // Signal every fence, in sequence number order, before any job
+            // drops.
             while let Some(job) = running_jobs.pop_front() {
                 if let Some(fence) = job.fence() {
                     fence.signal(Err(self.err));
                 }
+                drop_list.push_back(job);
             }
+            while let Some(job) = waiting_jobs.pop_front() {
+                if let Some(fence) = job.fence() {
+                    fence.signal(Err(ECANCELED));
+                }
+                drop_list.push_back(job);
+            }
+            drop(section);
 
-            drop(inner);
-            drop(drop_list);
-            drop(waiting_jobs);
-            drop(running_jobs);
+            // SAFETY: Every job on the drop list has signaled its fence.
+            unsafe { DropWorker::drop_batch(drop_list) };
         })
     }
 }
