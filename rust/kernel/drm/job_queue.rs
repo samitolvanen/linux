@@ -28,6 +28,9 @@
 //! process context through a work item in FIFO order. Only jobs whose
 //! dependency fences have all been signaled are run. If the front job's
 //! dependency is not yet fulfilled, the JobQueue pauses until that's the case.
+//! A driver whose hardware also runs the jobs one at a time in that order can
+//! set [`JobQueueOps::SERIAL_EXECUTION`], so that jobs do not wait for the
+//! fences of their own queue.
 //!
 //! If a dependency fence gets signaled with an error, the job still runs, as in
 //! drm_sched. What else happens depends on the timing:
@@ -84,6 +87,7 @@ use kernel::{
         FenceCallbackRegistration,
         FenceContext,
         FenceContextOps,
+        FenceWalk,
         SignallingSection, //
     },
     list::{
@@ -188,7 +192,14 @@ impl<'b, T: JobQueueOps + Send + Sync> FenceCallback for DependencyWaker<'b, '_,
 pub struct Job<'a, T: JobQueueOps + Send + Sync> {
     inner: Pin<UniqueArc<JobInternal<'a, T>>>,
     fence_allocation: DriverFenceAllocation<'a, DriverDataWrapper<T>>,
+    /// The number of fences that [`Job::add_dependency`] may still walk, chain
+    /// links included.
+    dep_walk_budget: usize,
 }
+
+/// The most fences that [`Job::add_dependency`] walks for one job, chain links
+/// included, to bound the cost of the walk.
+const MAX_DEP_WALK: usize = 512;
 
 /// The memory for one dependency of a [`Job`], allocated in advance.
 ///
@@ -220,8 +231,31 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     /// A JobQueue will only run a job once `fence` has been signaled, with or
     /// without an error.
     ///
+    /// With [`JobQueueOps::SERIAL_EXECUTION`], a fence of the queue is dropped,
+    /// and a `dma_fence_chain` is replaced by its unsignaled fences of other
+    /// contexts. Past a limit of fences per job, chain links included, the job
+    /// waits for the rest of the chain as one fence.
+    ///
     /// Fails only if the memory for the dependency cannot be allocated.
     pub fn add_dependency(&mut self, fence: &Fence) -> Result {
+        if T::SERIAL_EXECUTION {
+            if self.is_own_fence(fence) {
+                return Ok(());
+            }
+            let walk = fence.for_each_unsignaled(self.dep_walk_budget, |link| {
+                self.add_dependency_unless_own(link)
+            })?;
+            match walk {
+                FenceWalk::Complete(visited) => {
+                    self.dep_walk_budget = self.dep_walk_budget.saturating_sub(visited);
+                }
+                FenceWalk::Truncated(rest) => {
+                    self.dep_walk_budget = 0;
+                    self.add_dependency_unless_own(&rest)?;
+                }
+            }
+            return Ok(());
+        }
         let allocation = self.new_dependency_allocation()?;
         self.add_dependency_in(fence, allocation)
     }
@@ -229,8 +263,31 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     /// Add a dependency for the job in `allocation`.
     ///
     /// Like [`Job::add_dependency`], but does not allocate and cannot fail.
+    /// With [`JobQueueOps::SERIAL_EXECUTION`], a fence of the queue is dropped,
+    /// but the job waits for a `dma_fence_chain` as one fence.
     pub fn add_dependency_with(&mut self, fence: &Fence, allocation: DependencyAllocation<'a, T>) {
+        if self.is_own_fence(fence) {
+            return;
+        }
         let _ = self.add_dependency_in(fence, allocation);
+    }
+
+    /// Returns whether `fence` belongs to the queue and the queue has serial
+    /// execution.
+    ///
+    /// The job need not wait for such a fence. Its job was submitted earlier,
+    /// so the hardware completes that job before this one.
+    fn is_own_fence(&self, fence: &Fence) -> bool {
+        T::SERIAL_EXECUTION && fence.context_id() == self.inner.jq.id()
+    }
+
+    /// Adds a dependency on `fence` unless `is_own_fence()` returns true.
+    fn add_dependency_unless_own(&mut self, fence: &Fence) -> Result {
+        if self.is_own_fence(fence) {
+            return Ok(());
+        }
+        let allocation = self.new_dependency_allocation()?;
+        self.add_dependency_in(fence, allocation)
     }
 
     /// Add a dependency in `allocation`.
@@ -736,6 +793,24 @@ pub trait JobQueueOps {
     /// The type of the data passed over in [`JobQueue::new_job`].
     type JobDataType: Send + Sync;
 
+    /// Whether the hardware runs the jobs of a queue one at a time, in
+    /// submission order.
+    ///
+    /// The hardware must not begin a job until every earlier job for which
+    /// [`JobQueueOps::run_job`] returned [`RunResult::Ran`] has completed and
+    /// its writes are visible. `run_job()` may queue a job before that.
+    ///
+    /// [`Job::add_dependency`] then drops a dependency on a fence of the queue,
+    /// including one in a link of a `dma_fence_chain`, up to a limit of fences
+    /// per job, chain links included. drm_sched always ignores a dependency on
+    /// a fence of the job's own entity. JobQueue does so only with this set.
+    ///
+    /// A failure of a dropped fence of the queue does not call
+    /// [`JobQueueOps::kill`]. Within the limit, a failure of a fence of
+    /// another context in a chain still does, even though the chain itself
+    /// does not carry the error.
+    const SERIAL_EXECUTION: bool = false;
+
     /// Instructs the driver to run this job.
     ///
     /// JobQueue calls this callback from process context without any locks
@@ -900,6 +975,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
         Ok(Job {
             inner,
             fence_allocation,
+            dep_walk_budget: MAX_DEP_WALK,
         })
     }
 
