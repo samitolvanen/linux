@@ -92,6 +92,7 @@ use kernel::{
         ListLinks, //
     },
     new_srcu,
+    pr_warn_once,
     prelude::*,
     str::CString,
     sync::{
@@ -147,10 +148,12 @@ impl<T: ListItem> UniqueList<T> {
     }
 
     fn pop_front(&mut self) -> Option<Pin<UniqueArc<T>>> {
-        Some(
-            Arc::into_unique_or_drop(self.0.pop_front()?.into_arc())
-                .expect("UniqueList should only contain UniqueArc"),
-        )
+        loop {
+            if let Some(item) = Arc::into_unique_or_drop(self.0.pop_front()?.into_arc()) {
+                return Some(item);
+            }
+            pr_warn_once!("JobQueue: skipping a list entry that is not unique\n");
+        }
     }
 }
 
@@ -349,6 +352,18 @@ impl_list_item! {
         using ListLinks { self.links }; }
 }
 
+impl<'b, T: JobQueueOps + Send + Sync> JobInternal<'b, T> {
+    /// Returns the fence that [`Job::submit`] set, warning if there is none.
+    ///
+    /// The caller must drop a job without a fence.
+    fn fence(&self) -> Option<&DriverFence<'b, DriverDataWrapper<T>>> {
+        if self.fence.is_none() {
+            pr_warn_once!("JobQueue: dropping a job without a fence\n");
+        }
+        self.fence.as_ref()
+    }
+}
+
 struct SubmitWorker<'a, 'fctx, T: JobQueueOps + Send + Sync> {
     srcu: &'a Srcu,
     revoked: &'a AtomicFlag,
@@ -379,6 +394,9 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
                 jq.waiting_jobs.push_front(job);
                 break;
             }
+            let Some(fence) = job.fence() else {
+                continue;
+            };
             let new_capacity = jq.capacity as i64 - i64::from(job.cost);
             if new_capacity < 0 {
                 jq.waiting_jobs.push_front(job);
@@ -386,7 +404,6 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
             }
             *jq.as_mut().project().capacity = new_capacity as u64;
 
-            let fence = job.fence.as_ref().expect("fence not present");
             let seqno = fence.as_fence().seqno();
             let runnable_job = JobRunnable {
                 seqno,
@@ -898,25 +915,18 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
                 return;
             }
 
-            while let Some(mut job) = jq.running_jobs.pop_front() {
-                if job
-                    .as_mut()
-                    .project()
-                    .fence
-                    .as_mut()
-                    .expect("fence not present")
-                    .as_fence()
-                    .seqno()
-                    > seqno
-                {
+            while let Some(job) = jq.running_jobs.pop_front() {
+                let fence = job.fence();
+                if fence.is_some_and(|fence| fence.as_fence().seqno() > seqno) {
                     jq.running_jobs.push_front(job);
                     break;
                 }
 
                 *jq.capacity += u64::from(job.cost);
 
-                let fence = job.fence.as_ref().expect("fence not present");
-                fence.signal(result);
+                if let Some(fence) = fence {
+                    fence.signal(result);
+                }
 
                 if needs_drop {
                     jq.drop_list.push_back(job);
@@ -995,8 +1005,9 @@ impl<T: JobQueueOps + Send + Sync> PinnedDrop for JobQueue<T> {
             let mut running_jobs = core::mem::take(&mut inner.running_jobs);
 
             while let Some(job) = running_jobs.pop_front() {
-                let fence = job.fence.as_ref().expect("fence not present");
-                fence.signal(Err(self.err));
+                if let Some(fence) = job.fence() {
+                    fence.signal(Err(self.err));
+                }
             }
 
             drop(inner);
