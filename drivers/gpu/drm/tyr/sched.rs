@@ -149,6 +149,8 @@ impl SchedulerState {
 pub(crate) struct CsgSlotData {
     /// The group that currently owns the slot.
     pub(in crate::sched) group: Arc<Group>,
+    /// Set once the firmware acknowledges `Start` or `Resume` for this binding.
+    pub(in crate::sched) started: bool,
     /// CSG firmware priority programmed into `CSG_EP_REQ.priority`.
     pub(in crate::sched) fw_priority: u32,
 }
@@ -370,6 +372,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         let mut db_mask = CsDbMask::empty();
         self.fw.with_csg_mut(slot_idx, |csg| {
             csg.program_activate_inputs(&inputs)?;
+            group.tiler_oom_seen.store(0, Relaxed);
             for (cs_idx, queue) in group.indexed_queues() {
                 let cs = csg.cs_mut(cs_idx.get()).ok_or(EINVAL)?;
                 cs.program_activate_inputs(&queue.cs_activate_inputs(cs_doorbell)?)?;
@@ -816,7 +819,7 @@ impl Scheduler {
             if !(acked_reqs & CSG_REQ_STATE_MASK).is_empty() {
                 self.sync_csg_slot_state(
                     data,
-                    &csg_slot_manager,
+                    &mut csg_slot_manager,
                     csg_id.get(),
                     skipped_sync_updates,
                 )?;
@@ -902,7 +905,7 @@ impl Scheduler {
     fn sync_csg_slot_state(
         &mut self,
         data: &TyrDrmDevice,
-        csg_slot_manager: &CsgSlotManager,
+        csg_slot_manager: &mut CsgSlotManager,
         csg_idx: usize,
         skipped_sync_updates: u32,
     ) -> Result {
@@ -982,6 +985,9 @@ impl Scheduler {
                         e.to_errno()
                     );
                 }
+            }
+            if let Some(slot_data) = csg_slot_manager.slot_data_mut(csg_idx) {
+                slot_data.started = true;
             }
         }
 
