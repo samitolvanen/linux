@@ -69,7 +69,9 @@ use crate::{
     },
     fw::{
         global::CsActivateInputs,
-        CsWaitCondition, //
+        CsDbMask,
+        CsWaitCondition,
+        Firmware, //
     },
     gem,
     regs::doorbell_block,
@@ -107,8 +109,8 @@ const WRAPPER_RINGBUF_BYTES: usize = 128;
 /// The `EXTRACT` the firmware publishes trails the jobs that have completed:
 /// on a G610 it was seen up to three wrappers behind the queue's syncobj
 /// with back-to-back small jobs. The firmware checks `INSERT` against that
-/// value and raises `CS_CONFIG_FAULT` past it, so the credits leave twice
-/// the lag free.
+/// value, so a job that finds the ring full waits for it to advance. The
+/// credits leave twice the lag free to keep that wait rare.
 const EXTRACT_LAG_WRAPPERS: usize = 6;
 static_assert!(
     (MIN_RINGBUF_SIZE - RINGBUF_RESERVED_BYTES) / WRAPPER_RINGBUF_BYTES > 1 + EXTRACT_LAG_WRAPPERS
@@ -167,6 +169,9 @@ pub(crate) struct QueueData {
     ringbuf: Arc<gem::MappedBo>,
     interfaces: Interfaces,
     doorbell_id: Atomic<usize>,
+    /// Set while a submit waits for ring space. Changed under the
+    /// slot-manager mutex.
+    ring_full: Atomic<bool>,
     next_seqno: Atomic<u64>,
     iomem: Arc<DevresIoMem<SZ_2M>>,
     #[pin]
@@ -724,13 +729,42 @@ impl QueueData {
         self.cancel_job(job, fence_seqno)
     }
 
+    /// Rechecks the ring space for `job` under the slot-manager mutex, so no
+    /// `Queue::wake_ring_full` call is missed. On a full ring, requests an
+    /// `EXTRACT_EVENT` while the group is active.
+    fn request_ring_space(&self, job: &QueueJob) -> Result<(), RingBufferError> {
+        let tdev = &job.group.tdev;
+        let awake = tdev.pm_get_if_active();
+        let guard = tdev.registration_guard();
+        let _slots = tdev.csg_slot_manager.lock();
+
+        let space = self.can_append(job.stream.len());
+        let full = matches!(space, Err(RingBufferError::Full));
+        self.ring_full.store(full, Relaxed);
+        if !full {
+            return space;
+        }
+
+        let csg_id = job
+            .group
+            .with_locked_inner(|inner| inner.csg_id.filter(|_| inner.state == State::Active));
+        let (Some(_), Some(guard), Some(csg_id)) = (&awake, &guard, csg_id) else {
+            return space;
+        };
+        guard.registration_data_with(|reg_data| {
+            arm_extract_event(&reg_data.fw, csg_id, job.queue_index)
+        })?;
+        space
+    }
+
     /// Copies the wrapper of `job`, whose fence has sequence number
     /// `fence_seqno`, into the ring and rings the doorbell. Returns the
-    /// `done_seqno` the job completes at when it is pushed.
-    fn submit_job(&self, job: &QueueJob, fence_seqno: u64) -> Option<u64> {
+    /// `done_seqno` the job completes at when it is pushed, or `RingFull`,
+    /// leaving the job unclaimed, while the ring has no room for the wrapper.
+    fn submit_job(&self, job: &QueueJob, fence_seqno: u64) -> Result<Option<u64>, RingFull> {
         if !job.group.can_run() {
             self.cancel_job(job, fence_seqno);
-            return None;
+            return Ok(None);
         }
 
         // Fold any in-flight suspend interval into the baseline so it
@@ -749,25 +783,30 @@ impl QueueData {
             if done_seqno == 0 {
                 self.job_queue
                     .complete_jobs_up_to_seqno(fence_seqno, Ok(()));
-                return None;
+                return Ok(None);
             }
             self.push_submit_fence(done_seqno, 0..0, fence_seqno, None, baseline);
             job.group.arm_timeout();
-            return Some(done_seqno);
+            return Ok(Some(done_seqno));
         }
 
-        // The credits keep the ring from filling up, so `Full` is as
-        // unexpected here as the other errors.
-        if let Err(err) = self.can_append(job.stream.len()) {
+        let mut space = self.can_append(job.stream.len());
+        if matches!(space, Err(RingBufferError::Full)) {
+            space = self.request_ring_space(job);
+        }
+        if let Err(err) = space {
+            if matches!(err, RingBufferError::Full) {
+                return Err(RingFull);
+            }
             self.fail_queue(job, fence_seqno, err);
-            return None;
+            return Ok(None);
         }
 
         let ringbuf_range = match self.claim_ringbuf_range(&job.stream) {
             Ok(range) => range,
             Err(err) => {
                 self.fail_queue(job, fence_seqno, err);
-                return None;
+                return Ok(None);
             }
         };
 
@@ -786,7 +825,7 @@ impl QueueData {
         if let Err(err) = self.commit_ringbuf_range(ringbuf_range.end) {
             pr_warn_once!("queue ring commit failed: {}\n", err.to_errno());
             self.fail_submit_fence(done_seqno, err);
-            return Some(done_seqno);
+            return Ok(Some(done_seqno));
         }
 
         // `Scheduler::program_csg_activate` and `CsgSlotOps::evict` update
@@ -846,7 +885,7 @@ impl QueueData {
             Err(err) => {
                 pr_warn_once!("queue doorbell kick failed: {}\n", err.to_errno());
                 self.fail_submit_fence(done_seqno, err);
-                return Some(done_seqno);
+                return Ok(Some(done_seqno));
             }
         };
 
@@ -872,13 +911,13 @@ impl QueueData {
                 Err(err) => {
                     pr_warn_once!("queue group scheduling failed: {}\n", err.to_errno());
                     self.fail_submit_fence(done_seqno, err);
-                    return Some(done_seqno);
+                    return Ok(Some(done_seqno));
                 }
             };
             tick.dispatch(&group.tdev);
         }
 
-        Some(done_seqno)
+        Ok(Some(done_seqno))
     }
 
     /// Completes the jobs the syncobj of `group`'s queue `queue_index` shows
@@ -897,6 +936,22 @@ impl QueueData {
     }
 }
 
+/// Requests an `EXTRACT_EVENT` from CS `cs_id` of CSG slot `csg_id`, unless
+/// one is pending.
+fn arm_extract_event(fw: &Firmware<'_>, csg_id: usize, cs_id: QueueIdx) -> Result {
+    let requested = fw.with_csg_mut(csg_id, |csg| {
+        csg.cs_mut(cs_id.get())
+            .ok_or(EINVAL)?
+            .request_extract_event()
+    })?;
+    if requested {
+        fw.with_csg_mut_ring_doorbell(csg_id, |csg| {
+            csg.toggle_input_db_req(CsDbMask::from_raw(cs_id.bit()))
+        })?;
+    }
+    Ok(())
+}
+
 impl JobQueueOps for TyrQueueOps {
     type JobDataType = QueueJob;
 
@@ -905,8 +960,12 @@ impl JobQueueOps for TyrQueueOps {
         let JobRunnable { seqno, data: job } = job;
         let queue = &job.queue;
 
-        if let Some(done_seqno) = queue.submit_job(job, seqno) {
-            queue.complete_from_syncobj(&job.group, job.queue_index, done_seqno);
+        match queue.submit_job(job, seqno) {
+            Ok(Some(done_seqno)) => {
+                queue.complete_from_syncobj(&job.group, job.queue_index, done_seqno)
+            }
+            Ok(None) => {}
+            Err(RingFull) => return RunResult::NoResources,
         }
         RunResult::Ran
     }
@@ -1124,6 +1183,7 @@ impl Queue {
                 ringbuf,
                 interfaces,
                 doorbell_id: Atomic::new(UNASSIGNED_DOORBELL_ID),
+                ring_full: Atomic::new(false),
                 next_seqno: Atomic::new(0),
                 iomem: reg_data.iomem.clone(),
                 pending_submit_fences <- new_spinlock!(PendingFences {
@@ -1175,6 +1235,20 @@ impl Queue {
     pub(crate) fn unpark(&self) {
         self.data.job_queue.unpark();
         self.data.parked.store(false, Relaxed);
+    }
+
+    /// Schedules a retry of a submit that found the ring full. The caller
+    /// must hold the slot-manager mutex.
+    pub(crate) fn wake_ring_full(&self) {
+        if self.data.ring_full.xchg(false, Relaxed) {
+            self.data.job_queue.wake();
+        }
+    }
+
+    /// Returns whether a submit waits for ring space. The caller must hold
+    /// the slot-manager mutex.
+    pub(crate) fn ring_full(&self) -> bool {
+        self.data.ring_full.load(Relaxed)
     }
 
     /// Signals every pending submit fence with `err`.
@@ -1255,6 +1329,9 @@ impl From<Error> for RingBufferError {
         Self::Other
     }
 }
+
+/// The ring has no room for a job yet.
+struct RingFull;
 
 /// The firmware-owned input and output blocks of a single queue.
 pub(crate) struct Interfaces {

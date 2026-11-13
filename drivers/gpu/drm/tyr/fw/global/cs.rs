@@ -278,7 +278,9 @@ impl CsInterface {
     /// `CS_REQ.state` is set to `Start` with the `idle_sync_wait` and
     /// `idle_empty` IDLE-event sources enabled, so the firmware raises
     /// the CSG_IRQ idle event on a sync-wait stall or a drained
-    /// ringbuf. The IRQ-driven scheduler relies on both.
+    /// ringbuf. The IRQ-driven scheduler relies on both. An `extract_event`
+    /// request of an earlier binding is canceled, so
+    /// `Self::request_extract_event` can make a new one.
     ///
     /// Returns `EINVAL` if the interface is not enabled, or
     /// `EOVERFLOW` if `priority` exceeds `CS_CONFIG.priority`'s
@@ -313,10 +315,13 @@ impl CsInterface {
             .cs_input
             .write(CS_ACK_IRQ_MASK, CS_ACK_IRQ_MASK::from_raw(!0u32));
 
-        const ACTIVATE_MASK: u32 =
-            CS_REQ::STATE_MASK | CS_REQ::IDLE_SYNC_WAIT_MASK | CS_REQ::IDLE_EMPTY_MASK;
+        const ACTIVATE_MASK: u32 = CS_REQ::STATE_MASK
+            | CS_REQ::EXTRACT_EVENT_MASK
+            | CS_REQ::IDLE_SYNC_WAIT_MASK
+            | CS_REQ::IDLE_EMPTY_MASK;
         let activate_val = CS_REQ::zeroed()
             .with_state(CsState::Start)
+            .with_extract_event(enabled.cs_output.read(CS_ACK).extract_event())
             .with_idle_sync_wait(true)
             .with_idle_empty(true)
             .into_raw();
@@ -326,6 +331,23 @@ impl CsInterface {
             CS_REQ::from_raw((cur & !ACTIVATE_MASK) | activate_val),
         );
         Ok(())
+    }
+
+    /// Toggles `CS_REQ.extract_event` unless a request is pending. Returns
+    /// whether it toggled, or `EINVAL` if the interface is not enabled.
+    pub(crate) fn request_extract_event(&self) -> Result<bool> {
+        let enabled = match &self.state {
+            CsInterfaceState::Enabled(e) => e,
+            CsInterfaceState::Disabled => return Err(EINVAL),
+        };
+
+        let req = enabled.cs_input.read(CS_REQ);
+        let ack = enabled.cs_output.read(CS_ACK).extract_event();
+        if req.extract_event() != ack {
+            return Ok(false);
+        }
+        enabled.cs_input.write(CS_REQ, req.with_extract_event(!ack));
+        Ok(true)
     }
 
     pub(in super::super) fn write_tiler_heap(

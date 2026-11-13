@@ -82,6 +82,8 @@ enum GrowOutcome {
 struct CsIrqEvents {
     tiler_oom_mask: u32,
     cs_fatal_mask: u32,
+    /// Streams whose `EXTRACT_EVENT` request is acked (REQ == ACK).
+    extract_acked_mask: u32,
     cs_unrecoverable: bool,
     /// `EXTRACT` of each faulted queue, read before the fault is acknowledged.
     cs_fault_extract: [Option<u64>; MAX_CS_PER_GROUP],
@@ -113,6 +115,10 @@ impl CsIrqEvents {
                     self.tiler_oom_mask |= bit;
                 }
             }
+        }
+
+        if input_req.extract_event() == output_ack.extract_event() {
+            self.extract_acked_mask |= 1u32 << cs_id;
         }
 
         let fatal_event = input_req.fatal() != output_ack.fatal();
@@ -158,7 +164,7 @@ fn unflagged_cs_events(csg: &mut CsgInterface, group: &Group, flagged: u32) -> u
     let oom_seen = group.tiler_oom_seen.load(Relaxed);
     let mut events = 0;
 
-    for (cs_id, _) in group.indexed_queues() {
+    for (cs_id, queue) in group.indexed_queues() {
         let bit = cs_id.bit();
         if flagged & bit != 0 {
             continue;
@@ -172,6 +178,7 @@ fn unflagged_cs_events(csg: &mut CsgInterface, group: &Group, flagged: u32) -> u
         if req.fatal() != ack.fatal()
             || req.fault() != ack.fault()
             || (req.tiler_oom() != ack.tiler_oom() && oom_seen & bit == 0)
+            || (req.extract_event() == ack.extract_event() && queue.ring_full())
         {
             events |= bit;
         }
@@ -503,6 +510,7 @@ impl Scheduler {
         let CsIrqEvents {
             mut tiler_oom_mask,
             mut cs_fatal_mask,
+            extract_acked_mask,
             cs_unrecoverable,
             cs_fault_extract,
         } = events;
@@ -543,6 +551,12 @@ impl Scheduler {
             for (queue, extract) in group.queues.iter().zip(cs_fault_extract) {
                 if let Some(extract) = extract {
                     queue.fail_job_at_extract(extract, EINVAL);
+                }
+            }
+
+            for (cs_id, queue) in group.indexed_queues() {
+                if extract_acked_mask & cs_id.bit() != 0 {
+                    queue.wake_ring_full();
                 }
             }
         }

@@ -288,6 +288,9 @@ impl SlotOperations<MAX_CSGS> for CsgSlotOps {
             inner.csg_id = None;
         });
         slot_data.group.tiler_oom.store(0, Relaxed);
+        for queue in slot_data.group.queues.iter() {
+            queue.wake_ring_full();
+        }
 
         slot_data.group.vm.idle()?;
         Ok(())
@@ -959,6 +962,7 @@ impl Scheduler {
         if new_state == group::State::Active {
             for queue in slot_data.group.queues.iter() {
                 queue.resume_timeout();
+                queue.wake_ring_full();
                 if queue.is_ringbuf_empty().unwrap_or(true) {
                     continue;
                 }

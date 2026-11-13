@@ -704,8 +704,9 @@ impl Group {
 
     /// Parks every queue in the group.
     ///
-    /// Must not be called with the scheduler mutex held. Parking waits for
-    /// a job being handed to the firmware, which takes that mutex.
+    /// Must not be called with the scheduler, slot-manager or firmware
+    /// interface mutex held. Parking waits for a job being handed to the
+    /// firmware, which takes all three.
     pub(crate) fn park_queues(&self) {
         for queue in self.queues.iter() {
             queue.park();
