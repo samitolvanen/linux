@@ -446,7 +446,7 @@ struct DropWorker<'a, 'fctx, T: JobQueueOps + Send + Sync> {
 impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for DropWorker<'_, '_, T> {
     fn run(work: &ScopedWorkRef<Self>) {
         // Synchronize against revocation in `JobQueue::drop`.
-        let _lock_guard = work.srcu.read_lock();
+        let srcu_guard = work.srcu.read_lock();
         if work.revoked.load(Relaxed) {
             return;
         }
@@ -454,6 +454,9 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for DropWorker<'_, '_, T> {
         let mut jq_locked = work.inner.lock();
         let mut batch = core::mem::take(&mut jq_locked.drop_list);
         drop(jq_locked);
+        // `JobQueue::park()` can wait for this read section from a dma-fence
+        // signalling section, so the payloads must drop after it.
+        drop(srcu_guard);
 
         if batch.is_empty() {
             return;
