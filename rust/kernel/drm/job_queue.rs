@@ -7,12 +7,12 @@
 //! DRM's job dependency manager and load balancer for GPUs with firmware
 //! scheduling, i.e., GPUs that can spawn one ring exclusive per user context.
 //!
-//! JobQueue abstracts the entire handling of [`dma_buf::FenceContext`] and its
-//! associated [`dma_buf::DriverFence`]s for the user.
+//! JobQueue abstracts the entire handling of [`FenceContext`] and its
+//! associated [`DriverFence`]s for the user.
 //!
-//! In this design, a JobQueue is always the owner of a [`dma_buf::FenceContext`]
+//! In this design, a JobQueue is always the owner of a [`FenceContext`]
 //! which represents the timeline on the associated GPU ring. Jobs created on
-//! this JobQueue always contain a [`dma_buf::DriverFence`] from this JobQueue,
+//! this JobQueue always contain a [`DriverFence`] from this JobQueue,
 //! where the fence sequence number corresponds with the job sequence number,
 //! and the fence's generic payload data is also the job's payload data. This
 //! allows for the dma_fence backend_ops callbacks interacting with the driver
@@ -24,7 +24,7 @@
 //! [`Job::submit()`] sets up the fence and performs no fallible operations.
 //!
 //! Before jobs are submitted to a queue, dependencies in the form of
-//! [`dma_buf::Fence`] can be set on them. Jobs are run by the JobQueue in
+//! [`Fence`] can be set on them. Jobs are run by the JobQueue in
 //! process context through a work item in FIFO order. Only jobs whose
 //! dependency fences have all been signaled are run. If the front job's
 //! dependency is not yet fulfilled, the JobQueue pauses until that's the case.
@@ -50,8 +50,8 @@
 //! invoked through the driver's GPU interrupt handler.
 //!
 //! Since jobs might contain data that must not drop in atomic context, and
-//! since jobs' [`dma_buf::DriverFence`]s perform a call to
-//! [`rcu::synchronize_rcu()`], they are dropped through a work item if [`Drop`]
+//! since jobs' [`DriverFence`]s perform a call to
+//! [`synchronize_rcu()`], they are dropped through a work item if [`Drop`]
 //! is implemented for the job's payload data.
 //!
 //! From JobQueue's perspective, it is not necessary to call any of its API
@@ -82,7 +82,7 @@ use kernel::{
         FenceCallback,
         FenceCallbackRegistration,
         FenceContext,
-        FenceContextOps,
+        FenceContextOps, //
     },
     list::{
         impl_list_arc_safe,
@@ -277,14 +277,14 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
 
     /// Submit the job.
     ///
-    /// Returns a [`dma_buf::Fence`] on which the user can register callbacks.
+    /// Returns a [`Fence`] on which the user can register callbacks.
     /// The fence will be signaled once the job is completed through
     /// [`JobQueue::complete_jobs_up_to_seqno`], which can happen immediately
     /// after the job has been submitted.
     ///
     /// This function does all fence initialization under the JobQueue lock in
     /// one go, including setting of the fence sequence number. Thus, it is
-    /// typically unnecessary (and advaised against) to call this function with
+    /// typically unnecessary (and advised against) to call this function with
     /// a driver lock held.
     pub fn submit(self) -> ARef<Fence> {
         let jq = self.inner.jq;
@@ -497,7 +497,7 @@ struct JobQueueInner<'a, T: JobQueueOps + Send + Sync> {
     #[pin]
     /// Jobs that have finished executing and whose payload data `T` implements
     /// `Drop`. These jobs are dropped in process context, which also allows for
-    /// their [`dma_buf::DriverFence`]s to implement the necessary RCU grace
+    /// their [`DriverFence`]s to implement the necessary RCU grace
     /// period delay.
     ///
     /// If `Drop` is not implemented, this list is unused and the elements drop
@@ -660,8 +660,8 @@ pub struct JobQueue<T: JobQueueOps + Send + Sync> {
     /// The workqueue from [`JobQueueOps::workqueue`], asked for once.
     wq: &'fctx Queue,
     #[pin]
-    /// The [`dma_buf::FenceContext`] on which the queue creates
-    /// [`dma_buf::DriverFence`]s for the jobs.
+    /// The [`FenceContext`] on which the queue creates
+    /// [`DriverFence`]s for the jobs.
     fctx: FenceContext<DriverDataWrapper<T>>,
     /// A mechanism for preventing rescheduling of work items when the queue
     /// drops.
@@ -716,8 +716,8 @@ pub trait JobQueueOps {
     /// this ops, the driver should schedule a work_item in which it passes
     /// through `err` with [`JobQueue::set_error()`] and then drops the
     /// JobQueue. The JobQueue is robust against the driver continuing to call
-    /// [`JobQueue::submit()`], but these jobs will never run and will
-    /// ultimately be canceled with ECANCELED once tho JobQueue drops.
+    /// [`Job::submit()`], but these jobs will never run and will
+    /// ultimately be canceled with ECANCELED once the JobQueue drops.
     ///
     /// The JobQueue continues calling [`JobQueueOps::run_job()`] after `kill()`
     /// was called, including for the job whose dependency failed.
@@ -772,7 +772,7 @@ impl<T: JobQueueOps + Send + Sync> Deref for JobQueue<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.fctx.deref()
+        self.fctx.deref()
     }
 }
 impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
@@ -823,8 +823,9 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
 
     /// Give the unique identifier for this JobQueue.
     ///
-    /// This corresponds to the JobQueue's underlying [`dma_buf::FenceContext`].
+    /// This corresponds to the JobQueue's underlying [`FenceContext`].
     /// It is unique for all JobQueues in the entire system.
+    #[inline]
     pub fn id(&self) -> u64 {
         self.fctx.id()
     }
