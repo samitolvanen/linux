@@ -302,6 +302,10 @@ impl Job {
     /// `SYNC_ADD64` / `ERROR_BARRIER` epilogue that bumps the per-queue
     /// syncobj at `sync_va` by one. It is padded to a 64-byte boundary so
     /// the firmware prefetcher sees cacheline-aligned trailing storage.
+    ///
+    /// The `WAIT` on every scoreboard before the `SYNC_ADD64` retires the
+    /// work of the job before its fence signals and before the next job on
+    /// the ring starts. The serial execution of the queue relies on it.
     pub(crate) fn build_wrapped_stream(&self, csif: &CsifInfo, sync_va: u64) -> Result<KVec<u8>> {
         const INSTR_BYTES: usize = 8;
         const INSTRS_PER_WRAPPER: usize = 11;

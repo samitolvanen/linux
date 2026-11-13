@@ -955,6 +955,8 @@ fn arm_extract_event(fw: &Firmware<'_>, csg_id: usize, cs_id: QueueIdx) -> Resul
 impl JobQueueOps for TyrQueueOps {
     type JobDataType = QueueJob;
 
+    const SERIAL_EXECUTION: bool = true;
+
     fn run_job<'a>(&self, job: JobRunnable<'a, QueueJob>) -> RunResult {
         let _section = SignallingSection::begin();
         let JobRunnable { seqno, data: job } = job;
