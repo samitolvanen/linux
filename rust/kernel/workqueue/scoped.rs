@@ -359,7 +359,7 @@ where
     where
         F: FnOnce(*mut bindings::work_struct) -> bool,
     {
-        unreachable!()
+        build_error!("NonNull<ScopedWorkRef<T>> cannot be enqueued")
     }
 }
 
