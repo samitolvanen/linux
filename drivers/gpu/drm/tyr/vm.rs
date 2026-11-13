@@ -53,7 +53,8 @@ use kernel::{
         job_queue::{
             JobQueue,
             JobQueueOps,
-            JobRunnable, //
+            JobRunnable,
+            RunResult, //
         }, //
     },
     fmt,
@@ -405,16 +406,16 @@ impl JobQueueOps for VmBindQueueOps {
     type JobDataType = BindQueueJob;
 
     /// Performs the bind ops of the job and completes it.
-    fn run_job<'a>(&self, job: JobRunnable<'a, BindQueueJob>) {
+    fn run_job<'a>(&self, job: JobRunnable<'a, BindQueueJob>) -> RunResult {
         let _section = SignallingSection::begin();
         let JobRunnable { seqno, data } = job;
         let Ok(queue) = data.vm.bind_queue() else {
-            return;
+            return RunResult::Ran;
         };
 
         let Some(guard) = self.ddev.registration_guard() else {
             queue.complete_jobs_up_to_seqno(seqno, Err(ENODEV));
-            return;
+            return RunResult::Ran;
         };
 
         let result = guard.registration_data_with(|reg_data| {
@@ -458,6 +459,7 @@ impl JobQueueOps for VmBindQueueOps {
 
         // A pending flush also covers the vm_bos this job deferred.
         let _ = cleanup::enqueue(self.exec.clone());
+        RunResult::Ran
     }
 
     fn workqueue(&self) -> &workqueue::Queue {

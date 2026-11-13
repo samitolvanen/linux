@@ -16,7 +16,8 @@ use kernel::{
     drm::job_queue::{
         JobQueue,
         JobQueueOps,
-        JobRunnable, //
+        JobRunnable,
+        RunResult, //
     },
     io::{
         mem::DevresIoMem,
@@ -899,7 +900,7 @@ impl QueueData {
 impl JobQueueOps for TyrQueueOps {
     type JobDataType = QueueJob;
 
-    fn run_job<'a>(&self, job: JobRunnable<'a, QueueJob>) {
+    fn run_job<'a>(&self, job: JobRunnable<'a, QueueJob>) -> RunResult {
         let _section = SignallingSection::begin();
         let JobRunnable { seqno, data: job } = job;
         let queue = &job.queue;
@@ -907,6 +908,7 @@ impl JobQueueOps for TyrQueueOps {
         if let Some(done_seqno) = queue.submit_job(job, seqno) {
             queue.complete_from_syncobj(&job.group, job.queue_index, done_seqno);
         }
+        RunResult::Ran
     }
 
     fn workqueue(&self) -> &workqueue::Queue {
