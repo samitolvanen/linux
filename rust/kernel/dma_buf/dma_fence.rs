@@ -593,6 +593,16 @@ impl Fence {
         unsafe { (*self.as_raw()).seqno }
     }
 
+    /// Get the id of the context the fence belongs to.
+    ///
+    /// The fences of a [`FenceContext`] carry its [`FenceContext::id`].
+    #[inline]
+    pub fn context_id(&self) -> u64 {
+        // SAFETY: Valid because `self` is valid. `dma_fence_init()` sets
+        // `context` before the fence is shared.
+        unsafe { (*self.as_raw()).context }
+    }
+
     /// Wait until the fence is signaled.
     ///
     /// The wait is not interruptible. It returns `Ok(())` once the fence is
