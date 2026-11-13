@@ -680,7 +680,7 @@ impl QueueData {
     /// Cancels a job of a group that can no longer run.
     fn cancel_job(&self, job: &QueueJob, fence_seqno: u64) {
         TyrDrmDeviceData::schedule_tick(&job.group.tdev);
-        self.signal_unpushed_fence(fence_seqno, job.group.queue_error(job.queue_index));
+        self.signal_unpushed_fence(fence_seqno, ECANCELED);
     }
 
     /// Fails the queue of `job` after a ring claim error.
