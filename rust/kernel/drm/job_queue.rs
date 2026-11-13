@@ -1045,9 +1045,12 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             // in 'running_jobs', in case of a race against the lock.
             *jq.last_completed = seqno;
             *jq.last_result = result;
+            let waiting = !jq.waiting_jobs.is_empty();
             drop(jq_locked);
 
-            self.check_start_submit_worker();
+            if waiting {
+                self.check_start_submit_worker();
+            }
             if needs_drop {
                 self.check_start_drop_worker();
             }
