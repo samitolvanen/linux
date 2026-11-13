@@ -114,8 +114,7 @@ use kernel::{
         Queue,
         ScopedWork,
         ScopedWorkItem,
-        ScopedWorkRef,
-        ScopedQueue, //
+        ScopedWorkRef, //
     }, //
 };
 
@@ -647,17 +646,9 @@ pub struct JobQueue<T: JobQueueOps + Send + Sync> {
     /// The queue's maximum available capacity.
     max_capacity: u64,
     #[pin]
-    #[uses('_: invariant)]
-    /// The work queue on which the JobQueue drops the user's payload data.
-    drop_queue: ScopedQueue<'inner>,
-    #[pin]
     #[uses('_: invariant, 'revoked: invariant, 'srcu: invariant)]
     /// A worker for dropping the queue's jobs.
     drop_worker: ScopedWork<DropWorker<'inner, 'fctx, T>>,
-    #[pin]
-    #[uses('_: invariant)]
-    /// The work queue on which the JobQueue runs jobs ([`JobQueueOps::run_job`]).
-    submit_queue: ScopedQueue<'submit_worker>,
     #[pin]
     #[uses('_: invariant)]
     /// The worker submitting the queue's ready jobs.
@@ -816,17 +807,12 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
                 running_jobs: UniqueList::new(),
                 drop_list: UniqueList::new(),
             })),
-            // TODO: We need to set the WQ_MEM_RECLAIM bit!
-            // SAFETY: The queue is not leaked; its lifetime is tied to JobQueue.
-            submit_queue <- unsafe { ScopedQueue::new(c"JobQueueSubmitQueue") },
             submit_worker <- new_scoped_work!("JobQueueSubmitWorker", Ok(SubmitWorker {
                 srcu: Pin::get_ref(srcu),
                 revoked,
                 inner: Pin::get_ref(inner),
                 fctx: Pin::get_ref(fctx)
             })),
-            // SAFETY: The queue is not leaked; its lifetime is tied to JobQueue.
-            drop_queue <- unsafe { ScopedQueue::new(c"JobQueueDropQueue") },
             drop_worker <- new_scoped_work!("JobQueueDropWorker", Ok(DropWorker {
                 srcu: Pin::get_ref(srcu),
                 revoked,
