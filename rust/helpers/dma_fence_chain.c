@@ -4,11 +4,12 @@
 
 #ifdef CONFIG_DMA_SHARED_BUFFER
 
-struct dma_fence_chain *rust_helper_dma_fence_chain_alloc(void)
+__rust_helper struct dma_fence_chain *rust_helper_dma_fence_chain_alloc(void)
 {
 	return dma_fence_chain_alloc();
 }
 
+__rust_helper
 void rust_helper_dma_fence_chain_free(struct dma_fence_chain *chain)
 {
 	dma_fence_chain_free(chain);
