@@ -1065,7 +1065,7 @@ impl<'a> deps::BatchOps for SubmitOps<'a> {
         };
 
         let prepared = queue.prepare_job(
-            QueueJob::new(wrapped, group.clone(), queue_index),
+            QueueJob::new(wrapped, queue, group.clone(), queue_index),
             deps,
             extra_dep_capacity,
         )?;

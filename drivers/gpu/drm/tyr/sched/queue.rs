@@ -875,10 +875,7 @@ impl JobQueueOps for TyrQueueOps {
     fn run_job<'a>(&self, job: JobRunnable<'a, QueueJob>) {
         let _section = SignallingSection::begin();
         let JobRunnable { seqno, data: job } = job;
-        let Some(queue) = job.group.queues.get(job.queue_index.get()) else {
-            pr_warn_once!("queue job has no queue\n");
-            return;
-        };
+        let queue = &job.queue;
 
         if let Some(done_seqno) = queue.submit_job(job, seqno) {
             queue.complete_from_syncobj(&job.group, job.queue_index, done_seqno);
@@ -900,19 +897,26 @@ pub(super) type PreparedQueueJob<'a> = PreparedJob<'a, TyrQueueOps>;
 
 pub(super) struct QueueJob {
     stream: KVec<u8>,
-    /// Back-reference to the owning group; used by
-    /// `TyrQueueOps::run_job` to reach the queue, and the scheduler
-    /// workqueue when no CSG doorbell has been assigned to the queue yet.
+    /// The queue that runs the job. Drops before `group`, which owns the
+    /// queue, so a queue never drops from its own JobQueue's DropWorker.
+    queue: Arc<QueueData>,
+    /// The owning group, which `TyrQueueOps::run_job` uses to submit, cancel
+    /// or complete the job.
     pub(super) group: Arc<Group>,
-    /// Index of the owning queue inside `Group::queues`. Captured
-    /// at prepare time so `TyrQueueOps::run_job` finds the queue.
+    /// Index of the owning queue inside `Group::queues`.
     queue_index: QueueIdx,
 }
 
 impl QueueJob {
-    pub(super) fn new(stream: KVec<u8>, group: Arc<Group>, queue_index: QueueIdx) -> Self {
+    pub(super) fn new(
+        stream: KVec<u8>,
+        queue: &Queue,
+        group: Arc<Group>,
+        queue_index: QueueIdx,
+    ) -> Self {
         Self {
             stream,
+            queue: queue.data.clone(),
             group,
             queue_index,
         }
