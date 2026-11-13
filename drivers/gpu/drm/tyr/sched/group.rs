@@ -792,8 +792,8 @@ impl Group {
         self.arm_timeout();
     }
 
-    /// Returns the error the jobs of queue `queue_idx` fail with once the
-    /// group can no longer run.
+    /// Returns the error the pushed jobs of queue `queue_idx` fail with once
+    /// the group can no longer run.
     pub(super) fn queue_error(&self, queue_idx: QueueIdx) -> Error {
         let (fatal_queues, timedout) =
             self.with_locked_inner(|inner| (inner.fatal_queues(), inner.timedout));
