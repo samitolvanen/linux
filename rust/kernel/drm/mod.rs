@@ -27,6 +27,7 @@ pub use self::file::File;
 pub use self::job_queue::JobQueue;
 pub use self::job_queue::JobQueueOps;
 pub use self::job_queue::JobRunnable;
+pub use self::job_queue::RunResult;
 
 pub(crate) mod private {
     pub trait Sealed {}
