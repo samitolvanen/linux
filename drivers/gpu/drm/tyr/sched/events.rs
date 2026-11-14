@@ -582,7 +582,16 @@ impl Scheduler {
                 .slot_data(csg_id)
                 .filter(|data| data.started || running)
                 .map_or(0, |data| {
-                    unflagged_cs_events(csg, &data.group, pending_cs_irqs)
+                    let unflagged = unflagged_cs_events(csg, &data.group, pending_cs_irqs);
+                    if unflagged != 0 {
+                        trace::cs_event_rescan(
+                            csg_id as u32,
+                            data.group.handle(),
+                            pending_cs_irqs,
+                            unflagged,
+                        );
+                    }
+                    unflagged
                 });
 
             Ok((pending, pending_cs_irqs | unflagged))
@@ -722,7 +731,8 @@ impl Scheduler {
 
             for (cs_id, queue) in group.indexed_queues() {
                 if extract_acked_mask & cs_id.bit() != 0 {
-                    queue.wake_ring_full();
+                    let woke = queue.wake_ring_full();
+                    trace::extract_event_ack(csg_id as u32, cs_id.get() as u32, group_id, woke);
                 }
             }
         }

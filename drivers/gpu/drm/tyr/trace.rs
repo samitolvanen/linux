@@ -250,12 +250,16 @@ kernel::declare_trace! {
     /// # Safety
     ///
     /// Always safe to call.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn tyr_job_submit(
         completion_point: u64,
         group_id: u64,
         group_uid: u64,
         cs_id: u32,
         user_stream_size: u32,
+        fence_seqno: u64,
+        jobs_on_ring: u32,
+        ring_used: u64,
     );
 
     /// # Safety
@@ -1112,6 +1116,44 @@ kernel::declare_trace! {
         offset: u64,
         result: u32,
     );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_queue_jq(group_id: u64, cs_id: u32, jq_id: u64);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_vm_bind_jq(vm_id: u64, jq_id: u64);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_ring_full(
+        group_id: u64,
+        cs_id: u32,
+        fence_seqno: u64,
+        needed: u32,
+        used: u32,
+        armed: bool,
+        active: bool,
+    );
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_extract_event_req(csg_id: u32, cs_id: u32, requested: bool);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_extract_event_ack(csg_id: u32, cs_id: u32, group_id: u64, woke: bool);
+
+    /// # Safety
+    ///
+    /// Always safe to call.
+    unsafe fn tyr_cs_event_rescan(csg_id: u32, group_id: u64, flagged: u32, unflagged: u32);
 }
 
 /// Returns whether the tiler-heap-state dump should run, i.e. whether
@@ -1402,6 +1444,27 @@ pub(crate) fn job_dep_added_enabled() -> bool {
 /// exist, so the lookup can never produce trace output.
 #[cfg(not(CONFIG_TRACEPOINTS))]
 pub(crate) fn job_dep_added_enabled() -> bool {
+    false
+}
+
+/// Returns whether `job_submit` is enabled, so a submit reads `EXTRACT`
+/// for the ring occupancy only while it is on.
+#[cfg(CONFIG_TRACEPOINTS)]
+pub(crate) fn job_submit_enabled() -> bool {
+    // SAFETY: It's always okay to query the static key for a tracepoint.
+    unsafe {
+        kernel::jump_label::static_branch_unlikely!(
+            kernel::bindings::__tracepoint_tyr_job_submit,
+            kernel::bindings::tracepoint,
+            key
+        )
+    }
+}
+
+/// Without `CONFIG_TRACEPOINTS` the `__tracepoint_*` symbols do not
+/// exist, so the read can never produce trace output.
+#[cfg(not(CONFIG_TRACEPOINTS))]
+pub(crate) fn job_submit_enabled() -> bool {
     false
 }
 
@@ -1868,12 +1931,16 @@ pub(crate) fn csg_ack_timeout_state(
 }
 
 /// One Job committed to a queue ringbuffer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn job_submit(
     completion_point: u64,
     group_id: u64,
     group_uid: u64,
     cs_id: u32,
     user_stream_size: u32,
+    fence_seqno: u64,
+    jobs_on_ring: u32,
+    ring_used: u64,
 ) {
     // SAFETY: Always safe to call.
     unsafe {
@@ -1883,6 +1950,9 @@ pub(crate) fn job_submit(
             group_uid,
             cs_id,
             user_stream_size,
+            fence_seqno,
+            jobs_on_ring,
+            ring_used,
         )
     }
 }
@@ -3616,4 +3686,49 @@ pub(crate) fn tiler_heap_readback(
             read_end,
         )
     }
+}
+
+/// The JobQueue that runs the jobs of queue `cs_id` of group `group_id`.
+/// `jq_id` is the key of the `rust_jq_debug` events.
+pub(crate) fn queue_jq(group_id: u64, cs_id: u32, jq_id: u64) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_queue_jq(group_id, cs_id, jq_id) }
+}
+
+/// The JobQueue that runs the async binds of VM `vm_id`.
+pub(crate) fn vm_bind_jq(vm_id: u64, jq_id: u64) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_vm_bind_jq(vm_id, jq_id) }
+}
+
+/// A job that found its ring full and was deferred to a later run.
+pub(crate) fn ring_full(
+    group_id: u64,
+    cs_id: u32,
+    fence_seqno: u64,
+    needed: u32,
+    used: u32,
+    armed: bool,
+    active: bool,
+) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_ring_full(group_id, cs_id, fence_seqno, needed, used, armed, active) }
+}
+
+/// An `EXTRACT_EVENT` request for a full ring.
+pub(crate) fn extract_event_req(csg_id: u32, cs_id: u32, requested: bool) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_extract_event_req(csg_id, cs_id, requested) }
+}
+
+/// An acked `EXTRACT_EVENT`, and whether it woke a deferred job.
+pub(crate) fn extract_event_ack(csg_id: u32, cs_id: u32, group_id: u64, woke: bool) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_extract_event_ack(csg_id, cs_id, group_id, woke) }
+}
+
+/// CS events a CSG interrupt found outside its `CSG_IRQ_REQ` mask.
+pub(crate) fn cs_event_rescan(csg_id: u32, group_id: u64, flagged: u32, unflagged: u32) {
+    // SAFETY: Always safe to call.
+    unsafe { tyr_cs_event_rescan(csg_id, group_id, flagged, unflagged) }
 }

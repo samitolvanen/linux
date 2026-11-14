@@ -1480,6 +1480,9 @@ impl Vm {
     fn set_handle(&self, handle: u64) {
         self.exec.handle.store(handle, Relaxed);
         self.exec.as_data.set_vm_id(handle);
+        if let Some(queue) = self.bind_queue.as_deref() {
+            trace::vm_bind_jq(handle, queue.id());
+        }
     }
 
     /// Creates the firmware MCU VM with an explicit kernel auto-VA window.

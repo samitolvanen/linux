@@ -686,16 +686,27 @@ TRACE_EVENT(tyr_cs_activate_ringbuf_state,
 		  __entry->extract, __entry->extract_init)
 );
 
+/*
+ * `completion_point` is the job's done seqno and `fence_seqno` the seqno
+ * of its JobQueue fence. `jobs_on_ring` counts the queue's live jobs,
+ * this one included. `ring_used` is the number of ring bytes between
+ * `EXTRACT` and the job's end.
+ */
 TRACE_EVENT(tyr_job_submit,
 	TP_PROTO(u64 completion_point, u64 group_id, u64 group_uid, u32 cs_id,
-		 u32 user_stream_size),
-	TP_ARGS(completion_point, group_id, group_uid, cs_id, user_stream_size),
+		 u32 user_stream_size, u64 fence_seqno, u32 jobs_on_ring,
+		 u64 ring_used),
+	TP_ARGS(completion_point, group_id, group_uid, cs_id, user_stream_size,
+		fence_seqno, jobs_on_ring, ring_used),
 	TP_STRUCT__entry(
 		__field(u64, completion_point)
 		__field(u64, group_id)
 		__field(u64, group_uid)
 		__field(u32, cs_id)
 		__field(u32, user_stream_size)
+		__field(u64, fence_seqno)
+		__field(u32, jobs_on_ring)
+		__field(u64, ring_used)
 	),
 	TP_fast_assign(
 		__entry->completion_point = completion_point;
@@ -703,11 +714,15 @@ TRACE_EVENT(tyr_job_submit,
 		__entry->group_uid = group_uid;
 		__entry->cs_id = cs_id;
 		__entry->user_stream_size = user_stream_size;
+		__entry->fence_seqno = fence_seqno;
+		__entry->jobs_on_ring = jobs_on_ring;
+		__entry->ring_used = ring_used;
 	),
-	TP_printk("completion_point=%llu group=%llu group_uid=%llu cs=%u user_stream=%u",
+	TP_printk("completion_point=%llu group=%llu group_uid=%llu cs=%u user_stream=%u fence_seqno=%llu jobs_on_ring=%u ring_used=%llu",
 		  __entry->completion_point, __entry->group_id,
 		  __entry->group_uid, __entry->cs_id,
-		  __entry->user_stream_size)
+		  __entry->user_stream_size, __entry->fence_seqno,
+		  __entry->jobs_on_ring, __entry->ring_used)
 );
 
 TRACE_EVENT(tyr_submit_fence_signal,
@@ -3377,6 +3392,148 @@ TRACE_EVENT(tyr_tiler_heap_readback,
 		  __entry->group_uid, __entry->csg_id, __entry->cs_id,
 		  __print_symbolic(__entry->phase, TYR_HEAP_READBACK_PHASES),
 		  __entry->written, __entry->read_start, __entry->read_end)
+);
+
+/*
+ * Maps the JobQueue context `jq_id` of the rust_jq_debug events to queue
+ * `cs_id` of group `group_id`.
+ */
+TRACE_EVENT(tyr_queue_jq,
+	TP_PROTO(u64 group_id, u32 cs_id, u64 jq_id),
+	TP_ARGS(group_id, cs_id, jq_id),
+	TP_STRUCT__entry(
+		__field(u64, group_id)
+		__field(u32, cs_id)
+		__field(u64, jq_id)
+	),
+	TP_fast_assign(
+		__entry->group_id = group_id;
+		__entry->cs_id = cs_id;
+		__entry->jq_id = jq_id;
+	),
+	TP_printk("group=%llu cs=%u jq_id=%llu",
+		  __entry->group_id, __entry->cs_id, __entry->jq_id)
+);
+
+/*
+ * Maps the JobQueue context `jq_id` of the rust_jq_debug events to the
+ * bind queue of VM `vm_id`.
+ */
+TRACE_EVENT(tyr_vm_bind_jq,
+	TP_PROTO(u64 vm_id, u64 jq_id),
+	TP_ARGS(vm_id, jq_id),
+	TP_STRUCT__entry(
+		__field(u64, vm_id)
+		__field(u64, jq_id)
+	),
+	TP_fast_assign(
+		__entry->vm_id = vm_id;
+		__entry->jq_id = jq_id;
+	),
+	TP_printk("vm=%llu jq_id=%llu", __entry->vm_id, __entry->jq_id)
+);
+
+/*
+ * A job whose wrapper of `needed` bytes did not fit next to the `used`
+ * bytes of its ring, so run_job() returned NoResources. `armed` is set
+ * when an EXTRACT_EVENT request is pending for the CS, and `active` when
+ * the group runs on a CSG slot.
+ */
+TRACE_EVENT(tyr_ring_full,
+	TP_PROTO(u64 group_id, u32 cs_id, u64 fence_seqno, u32 needed,
+		 u32 used, bool armed, bool active),
+	TP_ARGS(group_id, cs_id, fence_seqno, needed, used, armed, active),
+	TP_STRUCT__entry(
+		__field(u64, group_id)
+		__field(u32, cs_id)
+		__field(u64, fence_seqno)
+		__field(u32, needed)
+		__field(u32, used)
+		__field(bool, armed)
+		__field(bool, active)
+	),
+	TP_fast_assign(
+		__entry->group_id = group_id;
+		__entry->cs_id = cs_id;
+		__entry->fence_seqno = fence_seqno;
+		__entry->needed = needed;
+		__entry->used = used;
+		__entry->armed = armed;
+		__entry->active = active;
+	),
+	TP_printk("group=%llu cs=%u fence_seqno=%llu needed=%u used=%u armed=%d active=%d",
+		  __entry->group_id, __entry->cs_id, __entry->fence_seqno,
+		  __entry->needed, __entry->used, __entry->armed,
+		  __entry->active)
+);
+
+/*
+ * An EXTRACT_EVENT request for CS `cs_id` of CSG slot `csg_id`.
+ * `requested` is clear when a request was already pending.
+ */
+TRACE_EVENT(tyr_extract_event_req,
+	TP_PROTO(u32 csg_id, u32 cs_id, bool requested),
+	TP_ARGS(csg_id, cs_id, requested),
+	TP_STRUCT__entry(
+		__field(u32, csg_id)
+		__field(u32, cs_id)
+		__field(bool, requested)
+	),
+	TP_fast_assign(
+		__entry->csg_id = csg_id;
+		__entry->cs_id = cs_id;
+		__entry->requested = requested;
+	),
+	TP_printk("csg=%u cs=%u requested=%d",
+		  __entry->csg_id, __entry->cs_id, __entry->requested)
+);
+
+/*
+ * A CSG interrupt that found the EXTRACT_EVENT of CS `cs_id` acked.
+ * `woke` is set when a job deferred on the full ring was woken.
+ */
+TRACE_EVENT(tyr_extract_event_ack,
+	TP_PROTO(u32 csg_id, u32 cs_id, u64 group_id, bool woke),
+	TP_ARGS(csg_id, cs_id, group_id, woke),
+	TP_STRUCT__entry(
+		__field(u32, csg_id)
+		__field(u32, cs_id)
+		__field(u64, group_id)
+		__field(bool, woke)
+	),
+	TP_fast_assign(
+		__entry->csg_id = csg_id;
+		__entry->cs_id = cs_id;
+		__entry->group_id = group_id;
+		__entry->woke = woke;
+	),
+	TP_printk("csg=%u cs=%u group=%llu woke=%d",
+		  __entry->csg_id, __entry->cs_id, __entry->group_id,
+		  __entry->woke)
+);
+
+/*
+ * A CSG interrupt that found CS events in `unflagged` outside the
+ * `flagged` streams of its CSG_IRQ_REQ mask.
+ */
+TRACE_EVENT(tyr_cs_event_rescan,
+	TP_PROTO(u32 csg_id, u64 group_id, u32 flagged, u32 unflagged),
+	TP_ARGS(csg_id, group_id, flagged, unflagged),
+	TP_STRUCT__entry(
+		__field(u32, csg_id)
+		__field(u64, group_id)
+		__field(u32, flagged)
+		__field(u32, unflagged)
+	),
+	TP_fast_assign(
+		__entry->csg_id = csg_id;
+		__entry->group_id = group_id;
+		__entry->flagged = flagged;
+		__entry->unflagged = unflagged;
+	),
+	TP_printk("csg=%u group=%llu flagged=0x%x unflagged=0x%x",
+		  __entry->csg_id, __entry->group_id, __entry->flagged,
+		  __entry->unflagged)
 );
 
 #endif /* _TYR_TRACE_H */
