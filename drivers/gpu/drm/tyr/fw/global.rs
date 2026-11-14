@@ -36,6 +36,7 @@ use kernel::{
             dma_mb,
             mb,
             Full,
+            Read,
             Write, //
         },
         Arc,
@@ -400,6 +401,9 @@ impl<'drm> GlobalInterface<'drm> {
         if (acked & state_mask) != (mask & state_mask) {
             acked &= !state_mask;
         }
+
+        // Order the output word reads after the `CSG_ACK` read.
+        dma_mb(Read);
 
         Ok(acked)
     }
