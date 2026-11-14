@@ -124,6 +124,8 @@ use kernel::{
     }, //
 };
 
+use super::job_queue_trace as trace;
+
 /// A linked list where all elements are owned.
 ///
 /// This is a thin wrapper of `List` with all elements are `UniqueArc`.
@@ -165,6 +167,9 @@ impl<T: ListItem> UniqueList<T> {
 struct DependencyWaker<'b, 'nr_of_deps, T: JobQueueOps + Send + Sync> {
     nr_of_deps: &'nr_of_deps Atomic<u32>,
     jq: &'b JobQueue<T>,
+    job: usize,
+    dep_ctx: u64,
+    dep_seqno: u64,
 }
 
 impl<'b, T: JobQueueOps + Send + Sync> FenceCallback for DependencyWaker<'b, '_, T> {
@@ -174,14 +179,24 @@ impl<'b, T: JobQueueOps + Send + Sync> FenceCallback for DependencyWaker<'b, '_,
         // error means for it. Not counting it would block this job, and every
         // later job of the queue, forever.
         if let Err(err) = res {
+            trace::kill(self.jq.id(), err);
             T::kill(self.jq.fctx.deref(), self.jq.id(), err);
         }
 
+        let pending = self.nr_of_deps.fetch_sub(1, Relaxed);
+        trace::dep_signal(
+            self.jq.id(),
+            self.job,
+            self.dep_ctx,
+            self.dep_seqno,
+            res,
+            pending.wrapping_sub(1),
+        );
         // Last dependency kicks the worker.
-        if self.nr_of_deps.fetch_sub(1, Relaxed) == 1 {
+        if pending == 1 {
             // The drop-order of JobQueue ensures that all DependencyWakers are
             // cancelled before the JobQueue itself is dropped.
-            self.jq.check_start_submit_worker();
+            self.jq.check_start_submit_worker(trace::KickSource::Dep);
         }
     }
 }
@@ -240,6 +255,7 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     pub fn add_dependency(&mut self, fence: &Fence) -> Result {
         if T::SERIAL_EXECUTION {
             if self.is_own_fence(fence) {
+                self.trace_dep(fence, trace::DepAction::OwnDropped);
                 return Ok(());
             }
             let walk = fence.for_each_unsignaled(self.dep_walk_budget, |link| {
@@ -248,15 +264,20 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
             match walk {
                 FenceWalk::Complete(visited) => {
                     self.dep_walk_budget = self.dep_walk_budget.saturating_sub(visited);
+                    self.trace_dep_walk(fence, visited, None);
                 }
                 FenceWalk::Truncated(rest) => {
+                    let visited = self.dep_walk_budget;
                     self.dep_walk_budget = 0;
+                    self.trace_dep_walk(fence, visited, Some(&rest));
                     self.add_dependency_unless_own(&rest)?;
                 }
             }
             return Ok(());
         }
-        let allocation = self.new_dependency_allocation()?;
+        let allocation = self
+            .new_dependency_allocation()
+            .inspect_err(|_| self.trace_dep(fence, trace::DepAction::AllocFail))?;
         self.add_dependency_in(fence, allocation)
     }
 
@@ -266,7 +287,9 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     /// With [`JobQueueOps::SERIAL_EXECUTION`], a fence of the queue is dropped,
     /// but the job waits for a `dma_fence_chain` as one fence.
     pub fn add_dependency_with(&mut self, fence: &Fence, allocation: DependencyAllocation<'a, T>) {
+        self.trace_dep(fence, trace::DepAction::With);
         if self.is_own_fence(fence) {
+            self.trace_dep(fence, trace::DepAction::OwnDropped);
             return;
         }
         let _ = self.add_dependency_in(fence, allocation);
@@ -284,10 +307,28 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
     /// Adds a dependency on `fence` unless `is_own_fence()` returns true.
     fn add_dependency_unless_own(&mut self, fence: &Fence) -> Result {
         if self.is_own_fence(fence) {
+            self.trace_dep(fence, trace::DepAction::OwnDropped);
             return Ok(());
         }
-        let allocation = self.new_dependency_allocation()?;
+        let allocation = self
+            .new_dependency_allocation()
+            .inspect_err(|_| self.trace_dep(fence, trace::DepAction::AllocFail))?;
         self.add_dependency_in(fence, allocation)
+    }
+
+    fn trace_dep(&self, fence: &Fence, action: trace::DepAction) {
+        trace::dep(self.inner.jq.id(), self.inner.trace_key(), fence, action);
+    }
+
+    fn trace_dep_walk(&self, fence: &Fence, visited: usize, rest: Option<&Fence>) {
+        trace::dep_walk(
+            self.inner.jq.id(),
+            self.inner.trace_key(),
+            fence,
+            visited,
+            rest,
+            self.dep_walk_budget,
+        );
     }
 
     /// Add a dependency in `allocation`.
@@ -296,6 +337,8 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
         fence: &Fence,
         allocation: DependencyAllocation<'a, T>,
     ) -> Result {
+        let jq_id = self.inner.jq.id();
+        let job_key = self.inner.trace_key();
         self.inner.as_mut().with_project(|job| {
             // If the registration below gets registered successfully, a signaling
             // fence will decrement the atomic. That could race. Thus, increment in
@@ -311,6 +354,9 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
                         DependencyWaker {
                             nr_of_deps: job.nr_of_deps,
                             jq: job.jq,
+                            job: job_key,
+                            dep_ctx: fence.context_id(),
+                            dep_seqno: fence.seqno(),
                         },
                     )
                 }
@@ -321,12 +367,14 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
                     if e == ENOENT {
                         // Already signaled, so there is nothing to wait for,
                         // even if it failed.
+                        trace::dep(jq_id, job_key, fence, trace::DepAction::Signaled);
                         return Ok(());
                     }
                     return Err(e);
                 }
                 Ok(dep) => {
                     job.dependencies.push_back(dep);
+                    trace::dep(jq_id, job_key, fence, trace::DepAction::Added);
                 }
             }
 
@@ -362,12 +410,20 @@ impl<'a, T: JobQueueOps + Send + Sync> Job<'a, T> {
             let mut inner = inner.lock();
             let fence = job.fence_allocation.new_fence();
             let ret_fence = ARef::from(fence.as_fence());
+            trace::submit(
+                jq.id(),
+                ret_fence.seqno(),
+                job.inner.trace_key(),
+                job.inner.cost,
+                job.inner.nr_of_deps.load(Relaxed),
+                inner.capacity,
+            );
 
             *job.inner.as_mut().project().fence = Some(fence);
 
             inner.waiting_jobs.push_back(job.inner);
             drop(inner);
-            jq.check_start_submit_worker();
+            jq.check_start_submit_worker(trace::KickSource::Submit);
 
             ret_fence
         })
@@ -420,6 +476,19 @@ impl<'b, T: JobQueueOps + Send + Sync> JobInternal<'b, T> {
         }
         self.fence.as_ref()
     }
+
+    fn trace_key(&self) -> usize {
+        core::ptr::from_ref(self).addr()
+    }
+
+    fn trace_worker_end(&self, reason: trace::EndReason, ran: u32, capacity: u64) {
+        let seqno = self
+            .fence
+            .as_ref()
+            .map_or(0, |fence| fence.as_fence().seqno());
+        let deps = self.nr_of_deps.load(Relaxed);
+        trace::worker_end(self.jq.id(), reason, ran, seqno, deps, self.cost, capacity);
+    }
 }
 
 struct SubmitWorker<'a, 'fctx, T: JobQueueOps + Send + Sync> {
@@ -431,17 +500,32 @@ struct SubmitWorker<'a, 'fctx, T: JobQueueOps + Send + Sync> {
 
 impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
     fn run(work: &ScopedWorkRef<Self>) {
+        let jq_id = work.fctx.id();
         // Synchronize against revocation in `JobQueue::drop`.
         let _lock_guard = work.srcu.read_lock();
         if work.revoked.load(Relaxed) {
+            trace::worker_end(jq_id, trace::EndReason::Revoked, 0, 0, 0, 0, 0);
             return;
         }
 
         let mut jq = work.inner.lock();
+        trace::worker_begin(
+            jq_id,
+            jq.capacity,
+            jq.last_completed,
+            jq.parked,
+            jq.waiting_jobs.is_empty(),
+        );
+        let mut ran = 0u32;
 
-        while let Some(job) = jq.waiting_jobs.pop_front() {
+        loop {
+            let Some(job) = jq.waiting_jobs.pop_front() else {
+                trace::worker_end(jq_id, trace::EndReason::Empty, ran, 0, 0, 0, jq.capacity);
+                break;
+            };
             // A parked queue runs no job until `JobQueue::unpark()`.
             if jq.parked {
+                job.trace_worker_end(trace::EndReason::Parked, ran, jq.capacity);
                 jq.waiting_jobs.push_front(job);
                 break;
             }
@@ -449,6 +533,7 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
             // that a new job entered the waiting list which has an unfulfilled
             // dependency.
             if job.nr_of_deps.load(Relaxed) > 0 {
+                job.trace_worker_end(trace::EndReason::Deps, ran, jq.capacity);
                 jq.waiting_jobs.push_front(job);
                 break;
             }
@@ -457,6 +542,7 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
             };
             let new_capacity = jq.capacity as i64 - i64::from(job.cost);
             if new_capacity < 0 {
+                job.trace_worker_end(trace::EndReason::Capacity, ran, jq.capacity);
                 jq.waiting_jobs.push_front(job);
                 break;
             }
@@ -469,14 +555,24 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
             };
 
             drop(jq); // Release lock.
+            trace::run_job(jq_id, seqno, job.cost, new_capacity as u64);
             let result = T::run_job(work.fctx, runnable_job);
             jq = work.inner.lock(); // Retake lock.
+            trace::run_job_done(
+                jq_id,
+                seqno,
+                result,
+                jq.last_completed >= seqno,
+                jq.capacity,
+            );
 
             if result == RunResult::NoResources {
                 *jq.as_mut().project().capacity += u64::from(job.cost);
+                job.trace_worker_end(trace::EndReason::NoResources, ran, jq.capacity);
                 jq.waiting_jobs.push_front(job);
                 break;
             }
+            ran = ran.saturating_add(1);
 
             // run_job() above needs to be called without lock protection. Thus,
             // it is possible that the driver instructed completion right before
@@ -493,7 +589,7 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for SubmitWorker<'_, '_, T> {
                     // the job waits until the next completion.
                     let queue = job.jq;
                     jq.drop_list.push_back(job);
-                    queue.check_start_drop_worker();
+                    queue.check_start_drop_worker(trace::KickSource::RunRace);
                 }
             } else {
                 jq.running_jobs.push_back(job);
@@ -506,6 +602,7 @@ struct DropWorker<'a, 'fctx, T: JobQueueOps + Send + Sync> {
     srcu: &'a Srcu,
     revoked: &'a AtomicFlag,
     inner: &'a SpinLockIrq<JobQueueInner<'fctx, T>>,
+    jq_id: u64,
 }
 
 impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for DropWorker<'_, '_, T> {
@@ -519,13 +616,14 @@ impl<T: JobQueueOps + Send + Sync> ScopedWorkItem for DropWorker<'_, '_, T> {
         let mut jq_locked = work.inner.lock();
         let batch = core::mem::take(&mut jq_locked.drop_list);
         drop(jq_locked);
+        let jq_id = work.jq_id;
         // `JobQueue::park()` can wait for this read section from a dma-fence
         // signalling section, so the payloads must drop after it.
         drop(srcu_guard);
 
         // SAFETY: Every job on the drop list signaled its fence before it got
         // there.
-        unsafe { Self::drop_batch(batch) };
+        unsafe { Self::drop_batch(batch, jq_id) };
     }
 }
 
@@ -535,10 +633,11 @@ impl<'fctx, T: JobQueueOps + Send + Sync> DropWorker<'_, 'fctx, T> {
     /// # Safety
     ///
     /// Every fence of the jobs in `batch` is signaled.
-    unsafe fn drop_batch(mut batch: UniqueList<JobInternal<'fctx, T>>) {
+    unsafe fn drop_batch(mut batch: UniqueList<JobInternal<'fctx, T>>, jq_id: u64) {
         if batch.is_empty() {
             return;
         }
+        trace::drop_batch(jq_id, 0, trace::DropPhase::Begin);
 
         // An RCU grace period ends once every reader that started before it
         // has finished. Every job in the batch signaled its fence before this
@@ -547,13 +646,16 @@ impl<'fctx, T: JobQueueOps + Send + Sync> DropWorker<'_, 'fctx, T> {
         // the batch, where dropping the jobs one by one would wait once each.
         synchronize_rcu();
 
+        let mut count = 0u32;
         while let Some(mut job) = batch.pop_front() {
             if let Some(fence) = job.as_mut().project().fence.take() {
                 // SAFETY: The fence was signaled before this call, and
                 // `synchronize_rcu()` has waited for a grace period since.
                 unsafe { fence.drop_after_grace_period() };
             }
+            count = count.saturating_add(1);
         }
+        trace::drop_batch(jq_id, count, trace::DropPhase::End);
     }
 }
 
@@ -934,7 +1036,8 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             drop_worker <- new_scoped_work!("JobQueueDropWorker", Ok(DropWorker {
                 srcu: Pin::get_ref(srcu),
                 revoked,
-                inner: Pin::get_ref(inner)
+                inner: Pin::get_ref(inner),
+                jq_id: Pin::get_ref(fctx).id()
             })),
         })
     }
@@ -971,6 +1074,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
         });
 
         let inner = UniqueArc::pin_init(job, GFP_KERNEL)?;
+        trace::job_new(self.id(), inner.trace_key(), cost, self.max_capacity);
 
         Ok(Job {
             inner,
@@ -979,22 +1083,24 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
         })
     }
 
-    fn check_start_submit_worker(&self) {
+    fn check_start_submit_worker(&self, source: trace::KickSource) {
         let wq = self.wq();
-        self.with_submit_worker(|submit_worker| {
+        let queued = self.with_submit_worker(|submit_worker| {
             // SAFETY: The worker is carried by the JobQueue and, thus, cannot be
             // forgotten. It is only ever queued on `wq`.
-            let _ = unsafe { wq.enqueue_scoped(submit_worker) };
-        })
+            unsafe { wq.enqueue_scoped(submit_worker) }
+        });
+        trace::kick(self.id(), trace::Worker::Submit, source, queued);
     }
 
-    fn check_start_drop_worker(&self) {
+    fn check_start_drop_worker(&self, source: trace::KickSource) {
         let wq = self.wq();
-        self.with_drop_worker(|drop_worker| {
+        let queued = self.with_drop_worker(|drop_worker| {
             // SAFETY: The worker is carried by the JobQueue and, thus, cannot be
             // forgotten. It is only ever queued on `wq`.
-            let _ = unsafe { wq.enqueue_scoped(drop_worker) };
-        })
+            unsafe { wq.enqueue_scoped(drop_worker) }
+        });
+        trace::kick(self.id(), trace::Worker::Drop, source, queued);
     }
 
     /// Complete all the jobs in the queue's running_list, up to `seqno`.
@@ -1018,9 +1124,12 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             // second call for the same `seqno` has nothing left to complete.
             // It must not replace `last_result` either.
             if seqno <= *jq.last_completed {
+                let waiting = !jq.waiting_jobs.is_empty();
+                trace::complete(self.id(), seqno, 0, result, *jq.capacity, waiting, true);
                 return;
             }
 
+            let mut count = 0u32;
             while let Some(job) = jq.running_jobs.pop_front() {
                 let fence = job.fence();
                 if fence.is_some_and(|fence| fence.as_fence().seqno() > seqno) {
@@ -1033,6 +1142,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
                 if let Some(fence) = fence {
                     fence.signal(result);
                 }
+                count = count.saturating_add(1);
 
                 if needs_drop {
                     jq.drop_list.push_back(job);
@@ -1046,13 +1156,22 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
             *jq.last_completed = seqno;
             *jq.last_result = result;
             let waiting = !jq.waiting_jobs.is_empty();
+            trace::complete(
+                self.id(),
+                seqno,
+                count,
+                result,
+                *jq.capacity,
+                waiting,
+                false,
+            );
             drop(jq_locked);
 
             if waiting {
-                self.check_start_submit_worker();
+                self.check_start_submit_worker(trace::KickSource::Completion);
             }
             if needs_drop {
-                self.check_start_drop_worker();
+                self.check_start_drop_worker(trace::KickSource::Completion);
             }
         })
     }
@@ -1073,6 +1192,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
         self.with_inner(|inner| {
             *inner.lock().as_mut().project().parked = true;
         });
+        trace::park(self.id(), true);
 
         // A SubmitWorker holds the SRCU read lock across `run_job()`, and stops
         // at its next job once it sees `parked`.
@@ -1084,7 +1204,8 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
         self.with_inner(|inner| {
             *inner.lock().as_mut().project().parked = false;
         });
-        self.check_start_submit_worker();
+        trace::park(self.id(), false);
+        self.check_start_submit_worker(trace::KickSource::Unpark);
     }
 
     /// Retry a job that [`JobQueueOps::run_job`] deferred.
@@ -1097,7 +1218,7 @@ impl<T: JobQueueOps + Send + Sync> JobQueue<T> {
     #[inline]
     pub fn wake(&self) {
         // A running SubmitWorker is no longer pending, so this queues it again.
-        self.check_start_submit_worker();
+        self.check_start_submit_worker(trace::KickSource::Wake);
     }
 
     /// Set the error with which this JobQueue will signal all running jobs'
@@ -1130,22 +1251,27 @@ impl<T: JobQueueOps + Send + Sync> PinnedDrop for JobQueue<T> {
 
             // Signal every fence, in sequence number order, before any job
             // drops.
+            let mut running = 0u32;
             while let Some(job) = running_jobs.pop_front() {
                 if let Some(fence) = job.fence() {
                     fence.signal(Err(self.err));
                 }
                 drop_list.push_back(job);
+                running = running.saturating_add(1);
             }
+            let mut waiting = 0u32;
             while let Some(job) = waiting_jobs.pop_front() {
                 if let Some(fence) = job.fence() {
                     fence.signal(Err(ECANCELED));
                 }
                 drop_list.push_back(job);
+                waiting = waiting.saturating_add(1);
             }
             drop(section);
+            trace::teardown(self.id(), running, waiting, self.err);
 
             // SAFETY: Every job on the drop list has signaled its fence.
-            unsafe { DropWorker::drop_batch(drop_list) };
+            unsafe { DropWorker::drop_batch(drop_list, self.id()) };
         })
     }
 }
