@@ -23,7 +23,6 @@ use kernel::{
         Bound,
         Device, //
     },
-    dma::DmaAddress,
     dma_buf::dma_fence::{
         DmaFenceWorkqueue,
         DriverDmaFence,
@@ -368,6 +367,7 @@ impl VmBindJob {
         va: u64,
         flags: VmMapFlags,
     ) -> Result {
+        let map_sgt = prefetch_map_sgt(&bo, dev, bo_offset, size, GFP_KERNEL_ACCOUNT)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -375,7 +375,7 @@ impl VmBindJob {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: Some(vm.exec.gpuvm.obtain(&bo, ())?),
-            map_sgt: Some(prefetch_map_sgt(&bo, dev)?),
+            map_sgt: Some(map_sgt),
             pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
@@ -585,11 +585,11 @@ pub(crate) struct VmOpResources {
     /// registration does not run on the path to `dma_fence_signal()`.
     /// `None` for Unmap.
     vm_bo: Option<ARef<GpuVmBo<GpuVmData>>>,
-    /// SG-table segments of the BO being mapped, prefetched outside the
-    /// VM_BIND dma-fence signalling section. Each entry is a
-    /// `(dma_address, dma_len)` pair, in the order yielded by the BO's
-    /// scatter-gather table. `None` for Unmap.
-    map_sgt: Option<KVVec<(DmaAddress, u64)>>,
+    /// SG-table segments backing the BO range being mapped, trimmed to the
+    /// range and prefetched outside the VM_BIND dma-fence signalling section.
+    /// Each entry is a `(dma_address, len)` pair, in the order yielded by the
+    /// BO's scatter-gather table. `None` for Unmap.
+    map_sgt: Option<KVVec<(u64, u64)>>,
     /// Page tables the operation can need, reserved outside the VM_BIND
     /// dma-fence signalling section because that section must not make
     /// allocations that can wait for reclaim.
@@ -1703,7 +1703,7 @@ impl VmExec {
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
             ],
             vm_bo: Some(self.gpuvm.obtain(bo, ())?),
-            map_sgt: Some(prefetch_map_sgt(bo, dev)?),
+            map_sgt: Some(prefetch_map_sgt(bo, dev, bo_offset, map_size, pt_gfp)?),
             pt_reserve: pt_alloc::PtReserve::for_map(va, map_size, pt_gfp)?,
         };
 
@@ -1816,7 +1816,6 @@ impl DriverGpuVm for GpuVmData {
         let start_iova = op.addr();
         let mut iova = start_iova;
         let mut bytes_left_to_map = op.length();
-        let mut gem_offset = op.gem_offset();
 
         // Make sure that the end of the requested GEM range doesn't run past the
         // end of the GEM buffer itself.
@@ -1841,25 +1840,9 @@ impl DriverGpuVm for GpuVmData {
 
         let map_sgt = context.resources.map_sgt.as_ref().ok_or(EINVAL)?;
 
-        for &(paddr, mut sgt_entry_length) in map_sgt.iter() {
-            // Expressly convert to u64 to work with arm 32-bit builds.
-            #[allow(clippy::useless_conversion)]
-            let mut paddr = u64::from(paddr);
-
+        for &(paddr, sgt_entry_length) in map_sgt.iter() {
             if bytes_left_to_map == 0 {
                 break;
-            }
-
-            if gem_offset > 0 {
-                // Skip the entire SGT entry if the gem_offset exceeds its length.
-                let skip = u64::min(sgt_entry_length, gem_offset);
-                paddr += skip;
-                sgt_entry_length -= skip;
-                gem_offset -= skip;
-            }
-
-            if sgt_entry_length == 0 {
-                continue;
             }
 
             let len = u64::min(sgt_entry_length, bytes_left_to_map);
@@ -2112,22 +2095,50 @@ fn get_pgsize(addr: u64, size: u64) -> (u64, u64) {
 }
 
 /// Collects the BO's scatter-gather segments outside the VM_BIND
-/// signalling section.
+/// signalling section. The segments are trimmed to the `size` bytes at
+/// `bo_offset`.
 ///
 /// The first call for a buffer populates the cached SG table under
 /// `dma_resv_lock`, which must not be taken on the path to
 /// `dma_fence_signal()`. Later calls are lock-free. The segments are
 /// consumed lock-free inside the signalling section.
-fn prefetch_map_sgt(bo: &Bo, dev: &Device<Bound>) -> Result<KVVec<(DmaAddress, u64)>> {
+fn prefetch_map_sgt(
+    bo: &Bo,
+    dev: &Device<Bound>,
+    bo_offset: u64,
+    size: u64,
+    gfp: Flags,
+) -> Result<KVVec<(u64, u64)>> {
     let sgt = bo.sg_table(dev).inspect_err(|e| {
         dev_err!(dev, "Failed to get sg_table: {:?}", e);
     })?;
+    let range = bo_offset..bo_offset.saturating_add(size);
 
-    let mut segments = KVVec::new();
-    for sgt_entry in sgt.iter() {
-        let len = u64::from(sgt_entry.dma_len());
+    let segments_in_range = || {
+        sgt.iter()
+            .scan(0u64, |offset, sgt_entry| {
+                let start = *offset;
+                *offset = start.saturating_add(u64::from(sgt_entry.dma_len()));
+                (start < range.end).then_some((sgt_entry, start..*offset))
+            })
+            .filter_map(|(sgt_entry, entry_range)| {
+                let start = entry_range.start.max(range.start);
+                let end = entry_range.end.min(range.end);
+                if start >= end {
+                    return None;
+                }
 
-        segments.push((sgt_entry.dma_address(), len), GFP_KERNEL)?;
+                // Expressly convert to u64 to work with arm 32-bit builds.
+                #[allow(clippy::useless_conversion)]
+                let paddr = u64::from(sgt_entry.dma_address());
+
+                Some((paddr + (start - entry_range.start), end - start))
+            })
+    };
+
+    let mut segments = KVVec::with_capacity(segments_in_range().count(), gfp)?;
+    for segment in segments_in_range() {
+        segments.push(segment, gfp)?;
     }
 
     Ok(segments)
