@@ -15,7 +15,8 @@ use kernel::{
         barrier::{
             dma_mb,
             Full,
-            Read, //
+            Read,
+            Write, //
         },
         Arc, //
     },
@@ -720,6 +721,8 @@ impl Scheduler {
             {
                 let cs = csg.cs_mut(oom.cs_id.get()).ok_or(EINVAL)?;
                 cs.write_tiler_heap_raw(new_chunk_va, new_chunk_va);
+                // The firmware loads the heap words when it sees the ack in `CS_REQ`.
+                dma_mb(Write);
 
                 let ack = cs.read_output_ack()?.tiler_oom();
                 let req = cs.read_input_req()?.with_tiler_oom(ack);
