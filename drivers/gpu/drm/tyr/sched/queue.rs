@@ -203,7 +203,7 @@ pub(crate) struct QueueData {
 
 impl QueueData {
     fn ringbuf_capacity(&self) -> usize {
-        self.ringbuf.size() - RINGBUF_RESERVED_BYTES
+        self.ringbuf.size().saturating_sub(RINGBUF_RESERVED_BYTES)
     }
 
     /// The distance from `EXTRACT` to `INSERT` uses only the low 32 bits, so a
@@ -247,7 +247,7 @@ impl QueueData {
 
     /// Claims the next seqno and returns it.
     pub(super) fn claim_seqno(&self) -> u64 {
-        self.next_seqno.fetch_add(1, Relaxed) + 1
+        self.next_seqno.fetch_add(1, Relaxed).wrapping_add(1)
     }
 
     /// Returns the highest seqno claimed so far on this queue.
@@ -268,7 +268,7 @@ impl QueueData {
 
         let cs_insert = (ringbuf_start & (size as u64 - 1)) as usize;
 
-        let first_chunk = core::cmp::min(size - cs_insert, instrs.len());
+        let first_chunk = core::cmp::min(size.saturating_sub(cs_insert), instrs.len());
         let dst = ringbuf.as_view().as_ptr().cast::<u8>();
         // SAFETY: `dst` is the writable CPU mapping of the ring buffer, valid
         // for `size` bytes, and `instrs` is a separate allocation. The mask
@@ -1371,10 +1371,11 @@ impl Interfaces {
     }
 
     pub(super) fn write_extract_init(&self, extract_init: u64) -> Result {
-        self.mem.vmap().try_write64(
-            extract_init,
-            self.input_offset + RingBufferInput::EXTRACT_INIT,
-        )
+        let offset = self
+            .input_offset
+            .checked_add(RingBufferInput::EXTRACT_INIT)
+            .ok_or(EINVAL)?;
+        self.mem.vmap().try_write64(extract_init, offset)
     }
 
     pub(super) fn read_extract(&self) -> Result<u64> {
