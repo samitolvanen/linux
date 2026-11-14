@@ -36,6 +36,7 @@ use kernel::{
             dma_mb,
             mb,
             Full,
+            Read,
             Write, //
         },
         Arc,
@@ -405,6 +406,9 @@ impl<'drm> GlobalInterface<'drm> {
         if (acked & state_mask) != (mask & state_mask) {
             acked &= !state_mask;
         }
+
+        // The callers read output words that the firmware stores before `CSG_ACK`.
+        dma_mb(Read);
 
         Ok(acked)
     }
