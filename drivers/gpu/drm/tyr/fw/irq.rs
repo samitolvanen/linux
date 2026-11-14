@@ -165,6 +165,8 @@ impl TyrIrqTrait for JobIrq {
     fn clear_status(&self, dev: &Device<Bound>, status: u32) {
         if let Ok(io) = self.iomem.access(dev) {
             io.write_reg(JOB_IRQ_CLEAR::from_raw(status));
+            // Complete the posted clear before the handler reads the firmware interfaces.
+            io.read(JOB_IRQ_RAWSTAT);
         }
     }
 
