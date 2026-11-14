@@ -9,7 +9,10 @@
 use kernel::{
     io::Io,
     prelude::*,
-    sync::barrier::dma_mb, //
+    sync::barrier::{
+        dma_mb,
+        dma_wmb, //
+    }, //
 };
 
 use super::{cs::CsInterface, SharedSectionInfo};
@@ -410,6 +413,8 @@ impl CsgInterface {
         let new = (cur_req & !set_mask & !toggle_mask)
             | (value & set_mask)
             | ((cur_ack ^ toggle_mask) & toggle_mask);
+        // Order the slot inputs before the request that uses them.
+        dma_wmb();
         enabled.csg_input.write(CSG_REQ, new);
         Ok(new)
     }
