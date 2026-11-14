@@ -951,7 +951,9 @@ impl Group {
             return Err(EINVAL);
         }
 
-        Ok(queue_index * core::mem::size_of::<syncs::SyncObj64b>())
+        queue_index
+            .checked_mul(core::mem::size_of::<syncs::SyncObj64b>())
+            .ok_or(EINVAL)
     }
 
     /// GPU virtual address of the per-queue syncobj for `queue_index`.
