@@ -15,7 +15,8 @@ use kernel::{
     prelude::*,
     sync::barrier::{
         dma_mb,
-        Full, //
+        Full,
+        Write, //
     }, //
 };
 
@@ -469,6 +470,8 @@ impl CsgInterface {
         let new = (cur_req & !set_mask & !toggle_mask)
             | (value & set_mask)
             | ((cur_ack ^ toggle_mask) & toggle_mask);
+        // Order the slot inputs before the request that uses them.
+        dma_mb(Write);
         enabled.csg_input.write(CSG_REQ, new);
         Ok(new)
     }
