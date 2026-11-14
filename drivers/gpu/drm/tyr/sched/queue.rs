@@ -25,6 +25,7 @@ use kernel::{
         IoBase, //
     },
     new_mutex,
+    num::casts::FromSafeCast,
     pr_warn_once,
     prelude::*,
     sizes::{
@@ -443,7 +444,10 @@ impl QueueData {
         let head = pending.head;
         let mut older_live = false;
         let mut signaled = None;
-        for (idx, entry) in pending.vec.iter_mut().enumerate().skip(head) {
+        for idx in head..pending.vec.len() {
+            let Some(entry) = pending.vec.get_mut(idx) else {
+                break;
+            };
             if entry.done_seqno == done_seqno && entry.fence.is_some() {
                 if older_live {
                     entry.error = Some(err);
@@ -1067,10 +1071,11 @@ impl Queue {
 
         // One credit per wrapper the ring holds, less one for the job being
         // claimed and `EXTRACT_LAG_WRAPPERS` for the lag of `EXTRACT`.
-        let max_jobs = (queue_args.ringbuf_size() as usize - RINGBUF_RESERVED_BYTES)
-            / WRAPPER_RINGBUF_BYTES
-            - 1
-            - EXTRACT_LAG_WRAPPERS;
+        let max_jobs = usize::from_safe_cast(queue_args.ringbuf_size())
+            .checked_sub(RINGBUF_RESERVED_BYTES)
+            .map(|bytes| bytes / WRAPPER_RINGBUF_BYTES)
+            .and_then(|wrappers| wrappers.checked_sub(1 + EXTRACT_LAG_WRAPPERS))
+            .ok_or(EINVAL)?;
         let pending_fence_vec = KVec::with_capacity(max_jobs, GFP_KERNEL)?;
 
         let data = Arc::pin_init(
