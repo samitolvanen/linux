@@ -63,7 +63,10 @@ use kernel::{
     prelude::*,
     sync::{
         aref::ARef,
-        barrier::dma_mb,
+        barrier::{
+            dma_mb,
+            dma_rmb, //
+        },
         Arc,
         Mutex, //
     },
@@ -377,6 +380,9 @@ impl GlobalInterface {
         if (acked & state_mask) != (mask & state_mask) {
             acked &= !state_mask;
         }
+
+        // Order the output word reads after the `CSG_ACK` read.
+        dma_rmb();
 
         Ok(acked)
     }
