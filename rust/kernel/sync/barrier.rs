@@ -92,3 +92,14 @@ pub fn dma_mb() {
     // validity requirements on the caller.
     unsafe { bindings::dma_mb() };
 }
+
+/// A write-write memory barrier for coherent memory read by devices.
+///
+/// Orders the writes of data before the write of the word that publishes it
+/// to the device. Does not order writes with respect to other CPUs.
+#[inline(always)]
+pub fn dma_wmb() {
+    // SAFETY: `dma_wmb()` is a barrier with no memory operands, so it has no
+    // validity requirements on the caller.
+    unsafe { bindings::dma_wmb() };
+}
