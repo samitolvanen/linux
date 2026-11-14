@@ -13,12 +13,16 @@
 //!
 //! A queued item may drop the last reference to a device, and destroying a
 //! workqueue from one of its own workers deadlocks, so no device owns the
-//! queue. The module destroys it after the driver unregisters, which drains
-//! the drops deferred after unbind.
+//! queue. The module destroys it after the driver unregisters and the last
+//! JobQueue drops, which drains the drops deferred after unbind.
 
 use kernel::{
     prelude::*,
-    sync::global_lock,
+    sync::{
+        global_lock,
+        Arc,
+        Completion, //
+    },
     workqueue::{
         self,
         impl_has_work,
@@ -33,12 +37,46 @@ global_lock! {
     unsafe(uninit) static CLEANUP_WQ: SpinLock<Option<workqueue::OwnedQueue>> = None;
 }
 
+global_lock! {
+    // SAFETY: Initialized by `Registration::new` before any other use.
+    unsafe(uninit) static JOB_QUEUES: SpinLock<Option<Arc<JobQueuesGone>>> = None;
+}
+
+/// Ends the wait in `Registration::drop` when the last reference drops.
+struct JobQueuesGone(Arc<Completion>);
+
+impl Drop for JobQueuesGone {
+    fn drop(&mut self) {
+        self.0.complete_all();
+    }
+}
+
+/// Keeps the module from destroying the cleanup workqueue.
+///
+/// Every JobQueue holds one. The owner of a JobQueue can drop on one of its
+/// workers, and an inline drop by `Handoff::spawn` there would wait for that
+/// worker.
+pub(crate) struct JobQueueHold {
+    _gone: Option<Arc<JobQueuesGone>>,
+}
+
+impl JobQueueHold {
+    /// Must not be called before the module has created the `Registration`.
+    pub(crate) fn new() -> Self {
+        Self {
+            _gone: JOB_QUEUES.lock().clone(),
+        }
+    }
+}
+
 /// Registration of the module-wide cleanup workqueue.
 ///
 /// Creating it builds the queue and publishes it to `enqueue` and
-/// `Handoff::spawn`. Dropping it destroys the queue, which drains every item
-/// still queued.
-pub(crate) struct Registration(());
+/// `Handoff::spawn`. Dropping it waits for every `JobQueueHold` to drop, then
+/// destroys the queue, which drains every item still queued.
+pub(crate) struct Registration {
+    job_queues_gone: Arc<Completion>,
+}
 
 impl Registration {
     /// Creates the cleanup workqueue.
@@ -50,14 +88,23 @@ impl Registration {
     pub(crate) unsafe fn new() -> Result<Self> {
         // SAFETY: The caller calls this at most once, before any other use.
         unsafe { CLEANUP_WQ.init() };
+        // SAFETY: The caller calls this at most once, before any other use.
+        unsafe { JOB_QUEUES.init() };
+        let job_queues_gone = Arc::pin_init(Completion::new(), GFP_KERNEL)?;
+        let holds = Arc::new(JobQueuesGone(job_queues_gone.clone()), GFP_KERNEL)?;
         let wq = workqueue::Queue::new_unbound().build(c"tyr-cleanup")?;
+        *JOB_QUEUES.lock() = Some(holds);
         *CLEANUP_WQ.lock() = Some(wq);
-        Ok(Self(()))
+        Ok(Self { job_queues_gone })
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        let holds = JOB_QUEUES.lock().take();
+        drop(holds);
+        self.job_queues_gone.wait_for_completion();
+
         // Destroying the queue sleeps and runs items that may enqueue again,
         // so take it out of the static first.
         let wq = CLEANUP_WQ.lock().take();

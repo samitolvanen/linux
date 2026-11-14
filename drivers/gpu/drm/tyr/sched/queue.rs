@@ -58,6 +58,7 @@ use kernel::{
 };
 
 use crate::{
+    cleanup,
     driver::{
         TyrDrmDevice,
         TyrDrmDeviceData,
@@ -672,6 +673,7 @@ impl QueueData {
 
 pub(super) struct TyrQueueOps {
     wq: Arc<DmaFenceWorkqueue>,
+    _hold: cleanup::JobQueueHold,
 }
 
 impl QueueData {
@@ -1075,6 +1077,7 @@ impl Queue {
                     max_jobs as u64,
                     TyrQueueOps {
                         wq: reg_data.wq.clone(),
+                        _hold: cleanup::JobQueueHold::new(),
                     },
                 ),
                 priority: queue_args.priority(),

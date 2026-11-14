@@ -388,6 +388,7 @@ pub(crate) struct VmBindQueueOps {
     ddev: ARef<TyrDrmDevice>,
     exec: Arc<VmExec>,
     wq: Arc<DmaFenceWorkqueue>,
+    _hold: cleanup::JobQueueHold,
 }
 
 /// A job on a VM's bind queue.
@@ -1074,6 +1075,7 @@ impl Vm {
                         ddev: ddev.into(),
                         exec: exec.clone(),
                         wq,
+                        _hold: cleanup::JobQueueHold::new(),
                     },
                 ),
                 GFP_KERNEL,
