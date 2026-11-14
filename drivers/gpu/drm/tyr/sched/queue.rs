@@ -276,6 +276,7 @@ impl QueueData {
     pub(crate) fn set_group_id(&self, group_id: u64, group_uid: u64) {
         self.group_id.store(group_id, Relaxed);
         self.group_uid.store(group_uid, Relaxed);
+        trace::queue_jq(group_id, self.cs_id, self.job_queue.id());
     }
 
     fn group_id(&self) -> u64 {
@@ -576,7 +577,7 @@ impl QueueData {
     /// pending-submit-fences spinlock.
     ///
     /// Returns the profiling sample slot assigned to the job, if
-    /// `profiling_mask` enables sampling.
+    /// `profiling_mask` enables sampling, and the number of live entries.
     fn push_submit_fence(
         &self,
         done_seqno: u64,
@@ -585,9 +586,9 @@ impl QueueData {
         error: Option<Error>,
         baseline_suspend: Delta,
         profiling_mask: u32,
-    ) -> Option<u32> {
+    ) -> (Option<u32>, u32) {
         let mut pending = self.pending_submit_fences.lock();
-        Self::push_locked(
+        let profiling_slot = Self::push_locked(
             &mut pending,
             done_seqno,
             ringbuf_range,
@@ -595,7 +596,9 @@ impl QueueData {
             error,
             baseline_suspend,
             profiling_mask,
-        )
+        );
+        let live = pending.vec.len().saturating_sub(pending.head);
+        (profiling_slot, live as u32)
     }
 
     fn push_locked(
@@ -1226,7 +1229,7 @@ impl QueueData {
     /// Rechecks the ring space for `job` under the slot-manager mutex, so no
     /// `Queue::wake_ring_full` call is missed. On a full ring, requests an
     /// `EXTRACT_EVENT` while the group is active.
-    fn request_ring_space(&self, job: &QueueJob) -> Result<(), RingBufferError> {
+    fn request_ring_space(&self, job: &QueueJob, fence_seqno: u64) -> Result<(), RingBufferError> {
         let tdev = &job.group.tdev;
         let awake = tdev.pm_get_if_active();
         let guard = tdev.registration_guard();
@@ -1243,12 +1246,34 @@ impl QueueData {
             .group
             .with_locked_inner(|inner| inner.csg_id.filter(|_| inner.state == State::Active));
         let (Some(_), Some(guard), Some(csg_id)) = (&awake, &guard, csg_id) else {
+            self.trace_ring_full(job, fence_seqno, false, csg_id.is_some());
             return space;
         };
         guard.registration_data_with(|reg_data| {
             arm_extract_event(&reg_data.fw, csg_id, job.queue_index)
         })?;
+        self.trace_ring_full(job, fence_seqno, true, true);
         space
+    }
+
+    /// Emits `ring_full` for `job`, whose wrapper does not fit in the ring.
+    fn trace_ring_full(&self, job: &QueueJob, fence_seqno: u64, armed: bool, active: bool) {
+        let used = match (
+            self.interfaces.read_insert(),
+            self.interfaces.read_extract(),
+        ) {
+            (Ok(insert), Ok(extract)) => (insert as u32).wrapping_sub(extract as u32),
+            _ => 0,
+        };
+        trace::ring_full(
+            self.group_id(),
+            self.cs_id,
+            fence_seqno,
+            job.stream.len() as u32,
+            used,
+            armed,
+            active,
+        );
     }
 
     /// Copies the wrapper of `job`, whose fence has sequence number
@@ -1294,7 +1319,7 @@ impl QueueData {
 
         let mut space = self.can_append(job.stream.len());
         if matches!(space, Err(RingBufferError::Full)) {
-            space = self.request_ring_space(job);
+            space = self.request_ring_space(job, fence_seqno);
         }
         if let Err(err) = space {
             if matches!(err, RingBufferError::Full) {
@@ -1315,7 +1340,7 @@ impl QueueData {
         // Jobs run one at a time in submit order, so the seqnos follow the
         // ring.
         let done_seqno = self.claim_seqno();
-        let profiling_slot = self.push_submit_fence(
+        let (profiling_slot, jobs_on_ring) = self.push_submit_fence(
             done_seqno,
             ringbuf_range.clone(),
             fence_seqno,
@@ -1334,12 +1359,21 @@ impl QueueData {
             return Ok(Some(done_seqno));
         }
 
+        let ring_used = if trace::job_submit_enabled() {
+            self.read_extract()
+                .map_or(0, |extract| ringbuf_range.end.wrapping_sub(extract))
+        } else {
+            0
+        };
         trace::job_submit(
             done_seqno,
             self.group_id(),
             self.group_uid(),
             self.cs_id,
             job.stream.len() as u32,
+            fence_seqno,
+            jobs_on_ring,
+            ring_used,
         );
 
         // `Scheduler::program_csg_activate` and `CsgSlotOps::evict` update
@@ -1462,6 +1496,7 @@ fn arm_extract_event(fw: &Firmware<'_>, csg_id: usize, cs_id: QueueIdx) -> Resul
             .ok_or(EINVAL)?
             .request_extract_event()
     })?;
+    trace::extract_event_req(csg_id as u32, cs_id.get() as u32, requested);
     if requested {
         fw.with_csg_mut_ring_doorbell(csg_id, |csg| {
             csg.toggle_input_db_req(CsDbMask::from_raw(cs_id.bit()))
@@ -1821,12 +1856,15 @@ impl Queue {
         self.data.parked.store(false, Relaxed);
     }
 
-    /// Schedules a retry of a submit that found the ring full. The caller
-    /// must hold the slot-manager mutex.
-    pub(crate) fn wake_ring_full(&self) {
-        if self.data.ring_full.xchg(false, Relaxed) {
+    /// Schedules a retry of a submit that found the ring full, and returns
+    /// whether a submit was waiting. The caller must hold the slot-manager
+    /// mutex.
+    pub(crate) fn wake_ring_full(&self) -> bool {
+        let woke = self.data.ring_full.xchg(false, Relaxed);
+        if woke {
             self.data.job_queue.wake();
         }
+        woke
     }
 
     /// Returns whether a submit waits for ring space. The caller must hold
