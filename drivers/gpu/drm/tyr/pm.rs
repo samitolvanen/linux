@@ -153,6 +153,7 @@ fn quiesce_and_suspend(tdev: &ARef<TyrDrmDevice>, reg_data: &TyrDrmRegistrationD
     if tdev.pm_powered_down() {
         return;
     }
+    tdev.reset.clear_resumed();
     tdev.pm_powered_down.store(true, Relaxed);
 
     tdev.user_mmio.lock().set_powered(tdev, false);
@@ -179,6 +180,8 @@ fn suspend(data: Option<&TyrPmPayload>) -> Result {
     let Some(guard) = tdev.registration_guard() else {
         return Err(EAGAIN);
     };
+
+    tdev.reset.clear_resumed();
 
     if let Err(e) = devfreq::suspend(Some(&data.devfreq)) {
         dev_warn!(tdev.as_ref(), "Failed to suspend devfreq: {:?}\n", e);
@@ -274,6 +277,8 @@ fn resume(data: Option<&TyrPmPayload>) -> Result {
         if let Err(e) = devfreq::resume(Some(&data.devfreq)) {
             dev_warn!(reg_data.pdev, "Failed to resume devfreq: {:?}\n", e);
         }
+
+        tdev.reset.set_resumed();
 
         Ok(())
     })?;
