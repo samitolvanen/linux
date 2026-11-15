@@ -132,6 +132,7 @@ fn quiesce_and_suspend(dev: &platform::Device<Bound>, data: Pin<&TyrPlatformDriv
     if tdev.pm_powered_down() {
         return;
     }
+    tdev.reset.clear_resumed();
     tdev.pm_powered_down.store(true, ordering::Release);
 
     tdev.user_mmio.lock().set_powered(tdev, false);
@@ -154,6 +155,8 @@ fn suspend(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result 
         return Err(EAGAIN);
     };
     let tdev = &data.device;
+
+    tdev.reset.clear_resumed();
 
     if let Err(e) = devfreq::suspend(slot) {
         dev_warn!(bound, "Failed to suspend devfreq: {:?}\n", e);
@@ -234,6 +237,8 @@ fn resume(dev: &platform::Device<Bound>, slot: Option<&DevfreqSlot>) -> Result {
     if let Err(e) = devfreq::resume(slot) {
         dev_warn!(bound, "Failed to resume devfreq: {:?}\n", e);
     }
+
+    tdev.reset.set_resumed();
 
     Ok(())
 }

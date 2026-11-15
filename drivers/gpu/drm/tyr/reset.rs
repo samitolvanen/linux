@@ -110,6 +110,10 @@ struct Controller {
     /// recorded before that are held back until it is set.
     #[pin]
     ready: Mutex<bool>,
+    /// Set from the end of a runtime resume until the next suspend or
+    /// unbind. The GPU is powered while it is set.
+    #[pin]
+    resumed: Mutex<bool>,
     /// Gate closed around the reset so VM updates and address-space
     /// operations drain before the hardware is wiped.
     gate: Arc<HwGate>,
@@ -141,6 +145,7 @@ impl Controller {
                 ddev <- new_mutex!(None),
                 state: Atomic::new(ResetState::Idle),
                 ready <- new_mutex!(false),
+                resumed <- new_mutex!(false),
                 gate,
                 work <- kernel::new_work!("tyr::reset"),
             }),
@@ -185,9 +190,30 @@ impl Controller {
         self.state.load(Relaxed) == ResetState::Pending
     }
 
+    /// Marks the device resumed and returns whether a request is waiting.
+    ///
+    /// `schedule` records its request before it reads the mark under the
+    /// same lock. Either this call sees the request, or `schedule` sees the
+    /// mark and queues a worker itself.
+    fn set_resumed(&self) -> bool {
+        let mut resumed = self.resumed.lock();
+        *resumed = true;
+        self.state.load(Relaxed) == ResetState::Pending
+    }
+
+    fn is_resumed(&self) -> bool {
+        *self.resumed.lock()
+    }
+
     #[inline]
     fn claim_pending(&self) -> bool {
         self.try_change_state(ResetState::Pending, ResetState::InProgress)
+    }
+
+    /// Claims a pending request for a worker that holds no PM reference.
+    fn claim_resumed(&self) -> bool {
+        let resumed = self.resumed.lock();
+        *resumed && self.claim_pending()
     }
 
     #[inline]
@@ -238,12 +264,15 @@ impl Controller {
 
         // The token blocks a suspend when runtime PM can hold a reference. A
         // reset must not run against a powered-off GPU, so a denied token
-        // leaves the request pending across the suspend cycle.
-        let Some(_active) = tdev.pm_get_if_active() else {
-            return;
+        // leaves the request pending across the suspend cycle. A device marked
+        // resumed is still powered, so the worker claims without a token.
+        let active = tdev.pm_get_if_active();
+        let claimed = if active.is_some() {
+            self.claim_pending()
+        } else {
+            self.claim_resumed()
         };
-
-        if !self.claim_pending() {
+        if !claimed {
             return;
         }
 
@@ -413,6 +442,23 @@ impl ResetHandle {
         self.inner.controller.finish_reset()
     }
 
+    /// Marks the end of a runtime resume.
+    ///
+    /// A request recorded after the resume's last claim has no worker, so
+    /// this queues one. Until `Self::clear_resumed`, the worker may reset
+    /// without a PM reference.
+    pub(crate) fn set_resumed(&self) {
+        if self.inner.controller.set_resumed() {
+            let _ = self.inner.wq.enqueue(self.inner.controller.clone());
+        }
+    }
+
+    /// Stops the worker from resetting without a PM reference. A suspend or
+    /// unbind calls this before it flushes the worker.
+    pub(crate) fn clear_resumed(&self) {
+        *self.inner.controller.resumed.lock() = false;
+    }
+
     /// Publishes the DRM device reference the reset worker resolves.
     ///
     /// Called once probe has created the device. Devres revokes the
@@ -457,8 +503,11 @@ impl ResetHandle {
         }
 
         let Some(_active) = tdev.pm_get_if_active() else {
-            // The GPU is (or is about to be) powered off, so any later
-            // resume claims the recorded request.
+            // While the device is marked resumed, queue the worker to claim the
+            // request. Otherwise the resume in flight or the next one runs it.
+            if self.inner.controller.is_resumed() {
+                let _ = self.inner.wq.enqueue(self.inner.controller.clone());
+            }
             return;
         };
 
