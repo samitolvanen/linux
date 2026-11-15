@@ -431,7 +431,7 @@ impl QueueData {
 
     /// Claims the next seqno and returns it.
     pub(super) fn claim_seqno(&self) -> u64 {
-        self.next_seqno.fetch_add(1, Relaxed) + 1
+        self.next_seqno.fetch_add(1, Relaxed).wrapping_add(1)
     }
 
     /// Returns the highest seqno claimed so far on this queue.
@@ -1553,7 +1553,8 @@ impl Interfaces {
 
     pub(super) fn write_insert(&self, insert: u64) -> Result {
         let vmap = self.mem.vmap();
-        let input = (vmap.addr() + self.input_offset) as *mut RingBufferInput;
+        let input =
+            vmap.addr().checked_add(self.input_offset).ok_or(EINVAL)? as *mut RingBufferInput;
 
         // SAFETY: `input` points at the queue input structure inside the
         // writable CPU mapping owned by `mem`. `addr_of_mut!` projects to the
@@ -1565,7 +1566,8 @@ impl Interfaces {
 
     pub(super) fn write_extract_init(&self, extract_init: u64) -> Result {
         let vmap = self.mem.vmap();
-        let input = (vmap.addr() + self.input_offset) as *mut RingBufferInput;
+        let input =
+            vmap.addr().checked_add(self.input_offset).ok_or(EINVAL)? as *mut RingBufferInput;
 
         // SAFETY: `input` points at the queue input structure inside the
         // writable CPU mapping owned by `mem`. `addr_of_mut!` projects to the
