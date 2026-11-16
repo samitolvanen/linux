@@ -450,6 +450,7 @@ impl<'drm> Firmware<'drm> {
                 coherent,
                 KernelBoOwner::Firmware,
                 GFP_KERNEL,
+                c"FW section",
             )?;
 
             let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
@@ -902,7 +903,16 @@ impl<'drm> Firmware<'drm> {
         let dev = self.dev.as_ref();
         let flags = VmMapFlags::from(VmFlag::Noexec) | VmMapFlags::from(VmFlag::Uncached);
 
-        let mem = gem::new_kernel_object(dev, ddev, &self.vm, SZ_8K, flags, ddev.coherent, pt_gfp)?;
+        let mem = gem::new_kernel_object(
+            dev,
+            ddev,
+            &self.vm,
+            SZ_8K,
+            flags,
+            ddev.coherent,
+            pt_gfp,
+            c"Queue FW interface",
+        )?;
 
         let vmap = mem.vmap();
         let size = vmap.owner().size();
@@ -930,6 +940,7 @@ impl<'drm> Firmware<'drm> {
             flags,
             ddev.coherent,
             pt_gfp,
+            c"FW suspend buffer",
         )
     }
 }

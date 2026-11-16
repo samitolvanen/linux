@@ -1340,6 +1340,7 @@ impl Queue {
             flags,
             tdev.coherent,
             GFP_KERNEL_ACCOUNT,
+            c"CS ring buffer",
         )?;
         let iface_mem = reg_data.fw.alloc_queue_mem(tdev, GFP_KERNEL_ACCOUNT)?;
         let interfaces = Interfaces::new(iface_mem)?;
@@ -1364,6 +1365,7 @@ impl Queue {
             flags,
             tdev.coherent,
             GFP_KERNEL_ACCOUNT,
+            c"Group job stats",
         )?;
 
         let data = Arc::pin_init(

@@ -532,6 +532,7 @@ impl Group {
             flags,
             ddev.coherent,
             GFP_KERNEL_ACCOUNT,
+            c"Group sync objects",
         )?;
 
         let vmap = syncobjs.vmap();

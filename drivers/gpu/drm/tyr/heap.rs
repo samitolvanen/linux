@@ -124,6 +124,7 @@ fn alloc_chunk_bo(
         flags,
         ddev.coherent,
         pt_gfp,
+        c"Tiler heap chunk",
     )?;
 
     ChunkHeader::zero(&chunk_bo)?;
@@ -242,6 +243,7 @@ impl Pool {
             flags,
             ddev.coherent,
             GFP_KERNEL_ACCOUNT,
+            c"Heap pool",
         )?;
         let xa = KBox::pin_init(XArray::new(xarray::AllocKind::Alloc), GFP_KERNEL)?;
 

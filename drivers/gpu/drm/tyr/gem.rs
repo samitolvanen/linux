@@ -468,6 +468,7 @@ pub(crate) fn sync(
 ///
 /// The BO's `dma_resv` is aliased to the VM root GEM, so a fence on one
 /// VM BO blocks operations on the others.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn new_kernel_object(
     dev: &Device<Bound>,
     ddev: &TyrDrmDevice,
@@ -476,9 +477,10 @@ pub(crate) fn new_kernel_object(
     flags: VmMapFlags,
     coherent: bool,
     pt_gfp: Flags,
+    label: &CStr,
 ) -> Result<Arc<MappedBo>> {
     MappedBo::new(new_kernel_object_no_vmap(
-        dev, ddev, vm, size, flags, coherent, pt_gfp,
+        dev, ddev, vm, size, flags, coherent, pt_gfp, label,
     )?)
 }
 
@@ -495,6 +497,7 @@ pub(crate) fn new_kernel_object(
 ///
 /// The object and the mapping are both rounded to the host page size,
 /// so `Bo::size()` matches the mapping.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn new_kernel_object_no_vmap(
     dev: &Device<Bound>,
     ddev: &TyrDrmDevice,
@@ -503,6 +506,7 @@ pub(crate) fn new_kernel_object_no_vmap(
     flags: VmMapFlags,
     coherent: bool,
     pt_gfp: Flags,
+    label: &CStr,
 ) -> Result<KernelBo> {
     let aligned_size = size.checked_next_multiple_of(PAGE_SIZE).ok_or(EINVAL)?;
     let node = vm.alloc_kernel_range(aligned_size)?;
@@ -518,6 +522,7 @@ pub(crate) fn new_kernel_object_no_vmap(
         coherent,
         KernelBoOwner::User,
         pt_gfp,
+        label,
     )?
     .with_va_reservation(node))
 }
@@ -580,7 +585,7 @@ impl KernelBo {
     /// cleaned up when the [`KernelBo`] is dropped.
     ///
     /// The object is rounded up to the host page size while the mapping
-    /// keeps `size`.
+    /// keeps `size`. `label` names the BO in the `gems` debugfs file.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &Device<Bound>,
@@ -592,6 +597,7 @@ impl KernelBo {
         coherent: bool,
         owner: KernelBoOwner,
         pt_gfp: Flags,
+        label: &CStr,
     ) -> Result<Self> {
         if size == 0 {
             dev_err!(dev, "Cannot create KernelBo with size 0");
@@ -629,6 +635,11 @@ impl KernelBo {
         )?;
 
         vm.map_bo_range(dev, &bo, 0, size, va, flags, pt_gfp)?;
+
+        match CString::try_from(label) {
+            Ok(label) => bo.set_label(Some(label)),
+            Err(_) => dev_warn!(dev, "Not enough memory to allocate BO label\n"),
+        }
 
         let usage = GEM_USAGE_KERNEL | if vm.is_fw() { GEM_USAGE_FW_MAPPED } else { 0 };
         bo.gem_link.register(&bo, usage);
