@@ -50,6 +50,13 @@ impl<T: DriverFile> File<T> {
         unsafe { (*self.as_raw()).driver_priv }.cast()
     }
 
+    /// Returns the client ID that the DRM core assigned to this file.
+    pub fn client_id(&self) -> u64 {
+        // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid. The DRM core
+        // sets `client_id` when it allocates the file and never changes it.
+        unsafe { (*self.as_raw()).client_id }
+    }
+
     /// Return a pinned reference to the driver file structure.
     pub fn inner(&self) -> Pin<&T> {
         // SAFETY: By the type invariant the pointer `self.as_raw()` points to a valid and opened
