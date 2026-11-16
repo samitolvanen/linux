@@ -169,7 +169,8 @@ use crate::{
 #[cfg(CONFIG_DEBUG_FS)]
 use crate::debugfs::{
     GemsShow,
-    GpuvasShow, //
+    GpuvasShow,
+    SchedGroupsShow, //
 };
 #[cfg(CONFIG_DEBUG_FS)]
 use kernel::debugfs::ScopeRef;
@@ -938,8 +939,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Command stream interface information reported to userspace.
     pub(crate) csif_info: gpu::CsifInfo,
 
-    /// The DRM device, whose `unbinding` flag the drop reads.
-    tdev: ARef<TyrDrmDevice>,
+    /// The DRM device. The drop reads its `unbinding` flag, and the
+    /// `sched_groups` debugfs file lists its open files.
+    pub(crate) tdev: ARef<TyrDrmDevice>,
 
     /// Device-wide registry of live VMs, dumped by the `gpuvas` debugfs file.
     pub(crate) vm_registry: Arc<VmRegistry>,
@@ -1486,6 +1488,7 @@ impl drm::Driver for TyrDrmDriver {
     fn debugfs_init(dir: &ScopeRef<'_, TyrDrmRegistrationData<'_>, Self::OwnerModule>) {
         dir.seq_file::<GemsShow>(c"gems");
         dir.seq_file::<GpuvasShow>(c"gpuvas");
+        dir.seq_file::<SchedGroupsShow>(c"sched_groups");
     }
 }
 
