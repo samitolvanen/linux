@@ -1295,6 +1295,13 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
             return StageAdvance::TimedOut(ETIMEDOUT);
         }
 
+        // The remaining budget stays the same while the queue is off its CSG
+        // slot, and `Scheduler::sync_csg_slot_state` wakes the pipeline once it
+        // is back.
+        if in_flight_since.is_some() {
+            return StageAdvance::Wait;
+        }
+
         // Wake at the remaining deadline. The submit fence's
         // progress callback (registered by the framework's
         // `process_exec`) will wake the pipeline earlier when
@@ -1420,6 +1427,12 @@ impl Queue {
     /// up behind it are submitted without waiting for another event.
     pub(crate) fn unpark(&self) {
         self.job_queue.unpark();
+    }
+
+    /// Rechecks the pipeline, so the completion stage arms its timer again
+    /// after `QueueData::resume_timeout`.
+    pub(crate) fn wake(&self) {
+        self.job_queue.wake();
     }
 
     /// Schedules a retry of a submit that found the ring full. The caller

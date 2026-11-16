@@ -974,6 +974,7 @@ impl Scheduler {
         if new_state == group::State::Active {
             for queue in slot_data.group.queues.iter() {
                 queue.resume_timeout();
+                queue.wake();
                 queue.wake_ring_full();
                 if queue.is_ringbuf_empty().unwrap_or(true) {
                     continue;
