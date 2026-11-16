@@ -942,6 +942,7 @@ impl Scheduler {
                     );
                 }
             }
+            group.arm_timeout();
         }
 
         Ok(())

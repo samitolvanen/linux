@@ -611,6 +611,13 @@ impl QueueData {
         (state.accumulated, state.since)
     }
 
+    /// Returns true from queue creation until the group's slot first goes
+    /// Active, and between `Self::suspend_timeout` and `Self::resume_timeout`.
+    /// The remaining budget of the queue's jobs stays the same in both cases.
+    pub(super) fn timeout_suspended(&self) -> bool {
+        self.suspend_state.lock().since.is_some()
+    }
+
     /// Returns the `done_seqno` of the oldest live job and how long it has
     /// left before `JOB_TIMEOUT_MS`, not counting the time the queue spent
     /// suspended off its CSG slot since the job was handed over. A queue

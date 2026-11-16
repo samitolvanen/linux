@@ -353,7 +353,8 @@ pub(crate) struct Group {
     /// `JOB_TIMEOUT_MS`, and completes jobs whose sync-update IRQ was
     /// missed.
     ///
-    /// Armed when a queue pushes a job, and canceled by `release_work`.
+    /// Armed by `arm_timeout` on a push, when the group's slot goes Active, on
+    /// unpark and after each run. Canceled by `release_work`.
     /// Runs on `wq`.
     #[pin]
     timeout_work: DmaFenceDelayedWork<Group, { work_id::TIMEOUT }>,
@@ -740,16 +741,18 @@ impl Group {
         TyrDrmDeviceData::schedule_sync_upd(&self.tdev);
     }
 
-    /// Arms `timeout_work` for the earliest deadline of the jobs on the
-    /// group's queues. A pending one keeps its deadline, which is never
-    /// later.
+    /// Arms `timeout_work` for the group's earliest job deadline, unless
+    /// every queue with a job is suspended. Suspended queues count, since a
+    /// later arm cannot move a pending timer earlier.
     pub(super) fn arm_timeout(self: &Arc<Self>) {
-        let Some(delay) = self
+        let Some((delay, true)) = self
             .queues
             .iter()
-            .filter_map(|queue| queue.oldest_job_deadline())
-            .map(|(_, remaining)| remaining)
-            .min()
+            .filter_map(|queue| {
+                let (_, remaining) = queue.oldest_job_deadline()?;
+                Some((remaining, !queue.timeout_suspended()))
+            })
+            .reduce(|(a, a_running), (b, b_running)| (a.min(b), a_running || b_running))
         else {
             return;
         };
