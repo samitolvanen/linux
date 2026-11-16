@@ -1355,6 +1355,12 @@ impl Pool {
         self.0.get(index)
     }
 
+    /// Calls `f` with the handle and the group of each group in the pool.
+    #[cfg(CONFIG_DEBUG_FS)]
+    pub(crate) fn for_each(&self, f: impl FnMut(usize, Arc<Group>) -> Result) -> Result {
+        self.0.for_each(f)
+    }
+
     /// Drains every group's profiling samples into `stats`.
     pub(crate) fn gather_stats(&self, stats: &mut Stats) {
         let _ = self.0.for_each(|_, group| {

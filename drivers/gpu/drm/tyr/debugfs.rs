@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
-//! Device-wide object registries and their debugfs files.
+//! Device-wide object registries and their debugfs files, and the
+//! `sched_groups` file.
 //!
 //! Each registry tracks live objects without referencing them, so a debugfs
 //! file can dump them without walking per-file state. Without
@@ -18,6 +19,7 @@ pub(crate) use self::enabled::{
     GemRegistry,
     GemsShow,
     GpuvasShow,
+    SchedGroupsShow,
     VmRegistry, //
 };
 
@@ -64,6 +66,7 @@ mod enabled {
 
     use crate::{
         driver::TyrDrmRegistrationData,
+        fw::global::csg::Priority,
         gem::Bo,
         vm::Vm, //
     };
@@ -388,6 +391,41 @@ mod enabled {
     impl SeqShow<TyrDrmRegistrationData<'_>> for GpuvasShow {
         fn show(reg_data: &TyrDrmRegistrationData<'_>, m: &SeqFile) -> Result {
             reg_data.vm_registry.print_gpuvas(m)
+        }
+    }
+
+    fn priority_name(priority: Priority) -> &'static str {
+        match priority {
+            Priority::Low => "LOW",
+            Priority::Medium => "MEDIUM",
+            Priority::High => "HIGH",
+            Priority::RealTime => "REAL-TIME",
+        }
+    }
+
+    /// The `sched_groups` debugfs file, which lists the groups of every open
+    /// file.
+    pub(crate) struct SchedGroupsShow;
+
+    impl SeqShow<TyrDrmRegistrationData<'_>> for SchedGroupsShow {
+        fn show(reg_data: &TyrDrmRegistrationData<'_>, m: &SeqFile) -> Result {
+            reg_data.tdev.for_each_file(|file| {
+                let client_id = file.client_id();
+
+                file.inner().group_pool().for_each(|handle, group| {
+                    seq_print!(
+                        m,
+                        "client_id {:8} pid {:8} command {}: group {:2} priority {} queue count {}\n",
+                        client_id,
+                        group.task_pid(),
+                        group.task_comm(),
+                        handle,
+                        priority_name(group.priority),
+                        group.queue_count()
+                    );
+                    Ok(())
+                })
+            })
         }
     }
 }
