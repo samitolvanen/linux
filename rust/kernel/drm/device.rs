@@ -22,6 +22,7 @@ use crate::{
         from_err_ptr,
         to_result, //
     },
+    interop::list::clist_create,
     prelude::*,
     sync::{
         aref::{
@@ -31,7 +32,8 @@ use crate::{
         atomic::{
             Acquire,
             Atomic, //
-        }, //
+        },
+        Mutex, //
     },
     types::{
         NotThreadSafe,
@@ -444,6 +446,36 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
                 1,
             )
         };
+    }
+
+    /// Calls `f` on each open file of this device, stopping at the first error.
+    ///
+    /// The file list lock of the device is held while `f` runs, so `f` must not call
+    /// `for_each_file()` or open or close a file of this device.
+    pub fn for_each_file(&self, f: impl FnMut(&drm::File<T::File>) -> Result) -> Result {
+        let raw = self.as_raw();
+
+        // SAFETY: `filelist_mutex` is initialized by `drm_dev_init()` and remains valid for the
+        // lifetime of the `struct drm_device`.
+        let filelist_mutex = unsafe { Mutex::from_raw(&raw mut (*raw).filelist_mutex) };
+        let _guard = filelist_mutex.lock();
+
+        // SAFETY:
+        // - `filelist` is initialized and protected by the held mutex.
+        // - Its entries are `drm_file`s linked through `lhead`, and `File` is
+        //   `#[repr(transparent)]` over `struct drm_file`.
+        // - The DRM core adds a file to the list after `T::File::open()` succeeds and removes it
+        //   under the mutex before `postclose()`, so each listed file is open.
+        let filelist = unsafe {
+            clist_create!(
+                &raw mut (*raw).filelist,
+                drm::File<T::File>,
+                bindings::drm_file,
+                lhead
+            )
+        };
+
+        filelist.iter().try_for_each(f)
     }
 
     extern "C" fn release(ptr: *mut bindings::drm_device) {
