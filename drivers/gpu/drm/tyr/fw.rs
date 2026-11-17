@@ -898,7 +898,15 @@ impl Firmware {
 pub(crate) struct ModInfoBuilder<const N: usize>(firmware::ModInfoBuilder<N>);
 
 impl<const N: usize> ModInfoBuilder<N> {
-    const FILES: &'static [&'static str] = &["arm/mali/arch10.8/mali_csffw.bin"];
+    const FILES: &'static [&'static str] = &[
+        "arm/mali/arch10.8/mali_csffw.bin",
+        "arm/mali/arch10.10/mali_csffw.bin",
+        "arm/mali/arch10.12/mali_csffw.bin",
+        "arm/mali/arch11.8/mali_csffw.bin",
+        "arm/mali/arch12.8/mali_csffw.bin",
+        "arm/mali/arch13.8/mali_csffw.bin",
+        "arm/mali/arch14.8/mali_csffw.bin",
+    ];
 
     pub(crate) const fn create(
         module_name: &'static kernel::str::CStr,
