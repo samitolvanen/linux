@@ -59,6 +59,13 @@ use kernel::{
     impl_flags,
     io::PhysAddr,
     iommu::pgtable::prot,
+    list::{
+        impl_list_arc_safe,
+        impl_list_item,
+        AtomicTracker,
+        ListLinks,
+        TryNewListArc, //
+    },
     new_mutex,
     platform,
     prelude::*,
@@ -955,10 +962,27 @@ pub(crate) struct VmExec {
     /// Flushes the deferred `vm_bo` list on the cleanup workqueue.
     #[pin]
     cleanup_work: Work<VmExec>,
+    /// Links the VM into the device list of failed unmaps.
+    #[pin]
+    dead_links: ListLinks,
+    #[pin]
+    dead_tracker: AtomicTracker<0>,
 }
 
 impl_has_work! {
     impl HasWork<Self> for VmExec { self.cleanup_work }
+}
+
+impl_list_arc_safe! {
+    impl ListArcSafe<0> for VmExec {
+        tracked_by dead_tracker: AtomicTracker<0>;
+    }
+}
+
+impl_list_item! {
+    impl ListItem<0> for VmExec {
+        using ListLinks { self.dead_links };
+    }
 }
 
 impl WorkItem for VmExec {
@@ -1134,6 +1158,8 @@ impl Vm {
                 va_range: total_range,
                 handoff,
                 cleanup_work <- new_work!("tyr-vm-cleanup"),
+                dead_links <- ListLinks::new(),
+                dead_tracker <- AtomicTracker::new(),
             }),
             GFP_KERNEL,
         )?;
