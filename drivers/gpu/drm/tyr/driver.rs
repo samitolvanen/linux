@@ -995,6 +995,14 @@ impl DeviceAttribute for ProfilingAttr {
 
 kernel::device_attribute_groups!(TYR_GROUPS, [ProfilingAttr]);
 
+/// Halts the GPU after a failed probe, before the device data drops.
+fn halt_failed_probe(dev: &device::Device<Bound>, tdev: &TyrDrmDeviceData) {
+    tdev.fw.stop_mcu();
+    tdev.mmu.suspend();
+    let _ = tdev.hw_ops.l2_power_off(dev, &tdev.iomem);
+    mmu::unbind(tdev);
+}
+
 impl TyrPlatformDriverData {
     fn new(pdev: &platform::Device<Core>, info: Option<&SocData>) -> Result<Self> {
         let core_clk = Clk::get(pdev.as_ref(), None)?;
@@ -1090,6 +1098,8 @@ impl TyrPlatformDriverData {
             gate.finish(ProbeState::Failed);
         });
 
+        let user_mmio = mmap::UserMmio::new()?;
+
         // The clocks move into the data below.
         power_guard.dismiss();
 
@@ -1140,7 +1150,7 @@ impl TyrPlatformDriverData {
                 unbinding: Atomic::new(false),
                 unusable: Atomic::new(false),
                 probe_gate,
-                user_mmio <- new_mutex!(mmap::UserMmio::new()?),
+                user_mmio <- new_mutex!(user_mmio),
                 #[cfg(CONFIG_DEBUG_FS)]
                 gem_registry <- GemRegistry::new(),
                 #[cfg(CONFIG_DEBUG_FS)]
@@ -1155,6 +1165,13 @@ impl TyrPlatformDriverData {
             }
         }
 
+        let ddev = ARef::from(&*uninit_ddev);
+        let reg_guard = ScopeGuard::new(|| {
+            if let Some(data) = ddev.data() {
+                halt_failed_probe(pdev.as_ref(), data);
+            }
+        });
+
         // SAFETY: `unbind` drops the registration, and a failed probe drops it
         // when this function returns. Both happen before `pdev` releases its
         // devres resources.
@@ -1164,13 +1181,11 @@ impl TyrPlatformDriverData {
 
         let hw_guard = ScopeGuard::new(|| {
             tdev.stop_system_work();
-            tdev.fw.stop_mcu();
-            tdev.mmu.suspend();
-            let _ = tdev.hw_ops.l2_power_off(pdev.as_ref(), &tdev.iomem);
-            mmu::unbind(&tdev);
+            halt_failed_probe(pdev.as_ref(), &tdev);
             tdev.unbind_dead_mappings();
             tdev.unbind_halted.complete_all();
         });
+        reg_guard.dismiss();
 
         // Devres drops this reference after the entries below that hold the device.
         devres::register(pdev.as_ref(), tdev.clone(), GFP_KERNEL)?;
