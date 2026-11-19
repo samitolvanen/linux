@@ -36,6 +36,10 @@ use kernel::{
         UnregisteredDevice, //
     },
     error::to_result,
+    list::{
+        List,
+        ListArc, //
+    },
     math64::div_u64_rem,
     new_condvar,
     new_mutex,
@@ -213,12 +217,32 @@ pub(crate) enum DeadMapping {
     KernelBo(KernelBoCleanup),
 }
 
-/// Adds `mapping` to `list`. A failed allocation drops `mapping` after the unlock, since its drop
+/// Work left by unmaps.
+#[derive(Default)]
+struct DeadMappings {
+    /// Killed VMs, linked through their own list links.
+    vms: List<VmExec>,
+    /// Dropped kernel BOs.
+    kernel_bos: KVec<KernelBoCleanup>,
+}
+
+/// Only a kernel BO allocates. A failed allocation drops the BO after the unlock, since its drop
 /// can take the lock.
-fn push_dead_mapping(list: &Mutex<KVec<DeadMapping>>, mapping: DeadMapping) -> Result {
-    let mut list = list.lock();
-    list.reserve(1, GFP_KERNEL)?;
-    Ok(list.push(mapping, GFP_KERNEL)?)
+fn push_dead_mapping(list: &Mutex<DeadMappings>, mapping: DeadMapping) -> Result {
+    match mapping {
+        DeadMapping::Vm(exec) => {
+            // An `Err` means the VM is listed or under retry.
+            if let Ok(exec) = ListArc::try_from_arc(exec) {
+                list.lock().vms.push_back(exec);
+            }
+        }
+        DeadMapping::KernelBo(cleanup) => {
+            let mut list = list.lock();
+            list.kernel_bos.reserve(1, GFP_KERNEL)?;
+            list.kernel_bos.push(cleanup, GFP_KERNEL)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct TyrPlatformDriverData {
@@ -457,7 +481,7 @@ pub(crate) struct TyrDrmDeviceData {
 
     /// Work left by unmaps, retried by `dead_mapping_work` and at unbind.
     #[pin]
-    dead_mappings: Mutex<KVec<DeadMapping>>,
+    dead_mappings: Mutex<DeadMappings>,
 
     /// Retries `dead_mappings` on the cleanup workqueue.
     #[pin]
@@ -784,13 +808,18 @@ impl TyrDrmDeviceData {
     /// can take the lock, so the retries run on a private batch.
     fn retry_dead_mappings(&self) {
         let mut batch = core::mem::take(&mut *self.dead_mappings.lock());
-        batch.retain(|mapping| match mapping {
-            DeadMapping::Vm(exec) => exec.unmap_all().is_err(),
-            DeadMapping::KernelBo(cleanup) => cleanup.retry_unmap(),
-        });
-        let raced = core::mem::replace(&mut *self.dead_mappings.lock(), batch);
-        for mapping in raced {
-            let _ = push_dead_mapping(&self.dead_mappings, mapping);
+        batch.kernel_bos.retain(|cleanup| cleanup.retry_unmap());
+        let mut blocked = List::new();
+        while let Some(exec) = batch.vms.pop_front() {
+            if exec.unmap_all().is_err() {
+                blocked.push_back(exec);
+            }
+        }
+        batch.vms = blocked;
+        let mut raced = core::mem::replace(&mut *self.dead_mappings.lock(), batch);
+        self.dead_mappings.lock().vms.push_all_back(&mut raced.vms);
+        for cleanup in raced.kernel_bos {
+            let _ = push_dead_mapping(&self.dead_mappings, DeadMapping::KernelBo(cleanup));
         }
     }
 
@@ -1140,7 +1169,7 @@ impl TyrPlatformDriverData {
                 syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                 system_work_closed <- new_spinlock!(false),
                 unbind_halted <- Completion::new(),
-                dead_mappings <- new_mutex!(KVec::new()),
+                dead_mappings <- new_mutex!(DeadMappings::default()),
                 dead_mapping_work <- kernel::new_work!("TyrDrmDeviceData::dead_mapping_work"),
                 profile_mask: Atomic::new(0),
                 max_freq: Atomic::new(0),
