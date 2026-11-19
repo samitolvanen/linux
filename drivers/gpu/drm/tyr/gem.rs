@@ -522,7 +522,7 @@ pub(crate) fn sync(
         return Ok(());
     }
 
-    let mut resv = bo.lock_resv();
+    let mut resv = bo.lock_resv_interruptible()?;
     if !resv.is_resident() {
         return Ok(());
     }
