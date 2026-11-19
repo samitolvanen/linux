@@ -27,6 +27,10 @@ use kernel::{
     drm::ioctl,
     io::mem::DevresIoMem,
     irq::ThreadedRegistration,
+    list::{
+        List,
+        ListArc, //
+    },
     mm::virt::VmaNew,
     new_mutex,
     new_spinlock,
@@ -187,6 +191,31 @@ pub(crate) enum DeadMapping {
     KernelBo(KernelBoCleanup),
 }
 
+/// The mappings whose unmap failed.
+#[derive(Default)]
+struct DeadMappings {
+    /// Killed VMs, linked through their own list links.
+    vms: List<VmExec>,
+    /// Dropped kernel BOs.
+    kernel_bos: KVec<KernelBoCleanup>,
+}
+
+impl DeadMappings {
+    /// Adds `mapping`. Only a kernel BO allocates, so only it can fail.
+    fn push(&mut self, mapping: DeadMapping) -> Result {
+        match mapping {
+            DeadMapping::Vm(exec) => {
+                // An `Err` means the VM is listed already.
+                if let Ok(exec) = ListArc::try_from_arc(exec) {
+                    self.vms.push_back(exec);
+                }
+            }
+            DeadMapping::KernelBo(cleanup) => self.kernel_bos.push(cleanup, GFP_KERNEL)?,
+        }
+        Ok(())
+    }
+}
+
 /// Data owned by the DRM device.
 ///
 /// Driver callbacks that cannot take a registration guard, such as the mmap hook, reach the
@@ -316,7 +345,7 @@ pub(crate) struct TyrDrmDeviceData {
     /// manager, kernel VA, dma_resv}`, because the retried unmaps run under the
     /// lock.
     #[pin]
-    dead_mappings: Mutex<KVec<DeadMapping>>,
+    dead_mappings: Mutex<DeadMappings>,
 
     /// Retries the unmap of `dead_mappings` on the cleanup workqueue.
     #[pin]
@@ -546,7 +575,7 @@ impl TyrDrmDeviceData {
 
     /// Defers a failed unmap to a later retry.
     pub(crate) fn defer_unmap(tdev: &ARef<TyrDrmDevice>, mapping: DeadMapping) {
-        if tdev.dead_mappings.lock().push(mapping, GFP_KERNEL).is_err() {
+        if tdev.dead_mappings.lock().push(mapping).is_err() {
             return;
         }
         // A reset may have released the address space since the unmap failed.
@@ -571,10 +600,15 @@ impl TyrDrmDeviceData {
     /// Retries the unmap of each dead mapping, keeping those that need another
     /// retry.
     fn retry_dead_mappings(&self) {
-        self.dead_mappings.lock().retain(|mapping| match mapping {
-            DeadMapping::Vm(exec) => exec.unmap_all().is_err(),
-            DeadMapping::KernelBo(cleanup) => cleanup.retry_unmap(),
-        });
+        let mut dead = self.dead_mappings.lock();
+        dead.kernel_bos.retain(|cleanup| cleanup.retry_unmap());
+        let mut blocked = List::new();
+        while let Some(exec) = dead.vms.pop_front() {
+            if exec.unmap_all().is_err() {
+                blocked.push_back(exec);
+            }
+        }
+        dead.vms = blocked;
     }
 
     /// Waits for unbind to halt the firmware and evict the resident groups if
@@ -926,7 +960,7 @@ impl platform::Driver for TyrPlatformDriver {
                     syncwait_poll_work <- kernel::new_delayed_work!("TyrDrmDeviceData::syncwait_poll_work"),
                     work_gate_closed <- new_spinlock!(false),
                     unbind_halted <- Completion::new(),
-                    dead_mappings <- new_mutex!(KVec::new()),
+                    dead_mappings <- new_mutex!(DeadMappings::default()),
                     dead_mapping_work <- kernel::new_work!("TyrDrmDeviceData::dead_mapping_work"),
                     devfreq_data,
                     pm: SetOnce::new(),
