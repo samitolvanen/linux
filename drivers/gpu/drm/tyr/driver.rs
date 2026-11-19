@@ -767,7 +767,7 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
 ///
 /// This data can have references tied to the parent platform device binding scope
 /// and is accessible only while the DRM device is registered with userspace.
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Parent platform device.
     pub(crate) pdev: &'drm platform::Device<Bound>,
@@ -812,6 +812,9 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
 
     /// Command stream interface information reported to userspace.
     pub(crate) csif_info: gpu::CsifInfo,
+
+    /// The DRM device, whose `unbinding` flag the drop reads.
+    tdev: ARef<TyrDrmDevice>,
 }
 
 kernel::of_device_table!(
@@ -952,12 +955,8 @@ impl platform::Driver for TyrPlatformDriver {
 
             // Declared after the firmware, so a failed probe halts the GPU
             // before the firmware and the MMU drop.
-            let hw_guard = ScopeGuard::new(|| {
-                firmware.stop_mcu();
-                mmu.suspend();
-                let _ = gpu::l2_power_off(pdev.as_ref(), io);
-                mmu::unbind(&mmu);
-            });
+            let hw_guard =
+                ScopeGuard::new(|| halt_failed_probe(pdev.as_ref(), io, &firmware, &mmu));
             power_guard.dismiss();
 
             // SAFETY: The registration is owned by `gpu_irq` and then by
@@ -1061,8 +1060,11 @@ impl platform::Driver for TyrPlatformDriver {
                 return Err(EBUSY);
             }
 
-            // The clocks and the regulator move into the data below.
+            // The data below owns the clocks and the regulator, and halts the
+            // GPU if the registration fails.
             hw_guard.dismiss();
+
+            let tdev = ARef::from(&*unreg_dev);
 
             Ok(try_pin_init!(TyrPlatformDriverData {
                 devfreq_registration,
@@ -1088,6 +1090,7 @@ impl platform::Driver for TyrPlatformDriver {
                         iomem,
                         gpu_info,
                         csif_info,
+                        tdev,
                     }),
                 )},
                 _: {
@@ -1119,6 +1122,28 @@ impl PinnedDrop for TyrPlatformDriverData<'_> {
         // gates reject later runs, so the queue stays empty from here.
         self.reg.device().heap_alloc_wq.flush();
     }
+}
+
+#[pinned_drop]
+impl PinnedDrop for TyrDrmRegistrationData<'_> {
+    fn drop(self: Pin<&mut Self>) {
+        // Unbind halts the GPU before the registration drops. Otherwise probe
+        // failed to register the device and the GPU is still running.
+        if self.tdev.unbinding() {
+            return;
+        }
+        if let Ok(io) = self.iomem.access(self.pdev.as_ref()) {
+            halt_failed_probe(self.pdev.as_ref(), io, &self.fw, &self.mmu);
+        }
+    }
+}
+
+/// Halts the GPU after a failed probe, before the firmware and the MMU drop.
+fn halt_failed_probe(dev: &device::Device, io: &IoMem<'_>, fw: &Firmware<'_>, mmu: &Mmu) {
+    fw.stop_mcu();
+    mmu.suspend();
+    let _ = gpu::l2_power_off(dev, io);
+    mmu::unbind(mmu);
 }
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with
