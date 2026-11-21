@@ -230,13 +230,14 @@ impl GlobalInterface {
         pdev: &platform::Device,
         iomem: Arc<Devres<IoMem>>,
         shared_section: &Section,
-        gpu_info: GpuInfo,
+        gpu_info: &GpuInfo,
         irq_state: &JobIrqState,
     ) -> Result<impl PinInit<Self, Error>> {
         let inner = InnerGlobalInterface::new();
         let pdev: ARef<platform::Device> = pdev.into();
         let shared_section = SharedSectionInfo::new(shared_section)?;
         let event_wait = irq_state.event_wait_arc();
+        let gpu_info = *gpu_info;
 
         Ok(try_pin_init!(Self {
             pdev,
@@ -252,7 +253,7 @@ impl GlobalInterface {
         let enabled = InnerGlobalInterface::build_enabled(
             self.iomem.as_ref(),
             &self.shared_section,
-            self.gpu_info,
+            &self.gpu_info,
             core_clk_rate,
             self.event_wait.as_ref(),
         )?;
@@ -513,7 +514,7 @@ impl InnerGlobalInterface {
     fn build_enabled(
         iomem: &Devres<IoMem>,
         shared_section: &SharedSectionInfo,
-        gpu_info: GpuInfo,
+        gpu_info: &GpuInfo,
         core_clk_rate: u64,
         event_wait: &Wait,
     ) -> Result<EnabledGlobalInterface> {
@@ -549,7 +550,7 @@ impl InnerGlobalInterface {
             output_va.value().get().into(),
         )?;
 
-        Self::configure_glb_input(&glb_input, &gpu_info, core_clk_rate)?;
+        Self::configure_glb_input(&glb_input, gpu_info, core_clk_rate)?;
         let ack_mask =
             Self::configure_glb_requests(&glb_input, &glb_output, has_glb_state(version))?;
 
