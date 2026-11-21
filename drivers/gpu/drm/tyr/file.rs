@@ -1142,7 +1142,7 @@ impl VmBindOp {
                 }
 
                 if self.0.size != 0 {
-                    job.push_unmap(self.0.va, self.0.size)?;
+                    job.push_unmap(vm, self.0.va, self.0.size)?;
                 }
             }
             uapi::drm_panthor_vm_bind_op_flags_DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY => {
