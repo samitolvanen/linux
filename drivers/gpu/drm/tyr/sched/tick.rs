@@ -595,7 +595,7 @@ pub(crate) struct SchedulingDecision {
     /// Total number of groups (kept + pending) selected for execution.
     pub(crate) num_selected: usize,
     /// Number of non-idle groups selected per software priority.
-    nonidle_group_counts: [usize; Priority::num_priorities()],
+    nonidle_group_counts: [u8; Priority::num_priorities()],
     /// Records the exact order in which groups were selected.
     pub(crate) selections: [Option<SelectedGroup>; MAX_CSGS],
 }
@@ -790,7 +790,8 @@ impl SchedulingDecision {
 
             if !is_idle {
                 self.all_idle = false;
-                self.nonidle_group_counts[priority as usize] += 1;
+                let nonidle = &mut self.nonidle_group_counts[priority as usize];
+                *nonidle = nonidle.saturating_add(1);
             } else {
                 self.idle_group_count += 1;
             }
@@ -844,7 +845,8 @@ impl SchedulingDecision {
         if count > 0 {
             if !is_idle {
                 self.all_idle = false;
-                self.nonidle_group_counts[priority as usize] += count;
+                let nonidle = &mut self.nonidle_group_counts[priority as usize];
+                *nonidle = nonidle.saturating_add(u8::try_from(count)?);
             } else {
                 self.idle_group_count += count;
             }
