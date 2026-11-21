@@ -1234,6 +1234,11 @@ impl Queue {
         fence
     }
 
+    /// Returns the fence of the last committed job.
+    pub(super) fn last_job_fence(&self) -> Option<ARef<Fence>> {
+        self.data.last_job_fence.lock().clone()
+    }
+
     /// Stops the queue from handing any further job to the firmware,
     /// and the group's timeout work from failing one. Jobs keep resolving
     /// their dependencies and pile up in the queue. Returns once no job is

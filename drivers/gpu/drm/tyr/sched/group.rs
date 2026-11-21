@@ -1003,7 +1003,9 @@ impl Group {
         let job_count = jobs.len();
         let mut ctx = deps::Context::new(file, SubmitOps::new(self, *csif));
 
+        let mut batch_queues = 0;
         for (job, syncs) in jobs.into_iter() {
+            batch_queues |= QueueIdx::new(job.queue_index()).ok_or(EINVAL)?.bit();
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
         }
 
@@ -1020,17 +1022,21 @@ impl Group {
         }
 
         self.vm
-            .with_prepared_vm(job_count as u32, |mut prepared_vm| {
-                for idx in 0..job_count {
-                    let signal_fence = ctx.commit(idx)?;
+            .with_prepared_vm(batch_queues.count_ones(), |mut prepared_vm| {
+                let res = (0..job_count).try_for_each(|idx| ctx.commit(idx).map(|_| ()));
+
+                let queues = self
+                    .indexed_queues()
+                    .filter(|(idx, _)| batch_queues & idx.bit() != 0);
+                for fence in queues.filter_map(|(_, queue)| queue.last_job_fence()) {
                     prepared_vm.resv_add_fence(
-                        &signal_fence,
+                        &fence,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                         kernel::bindings::dma_resv_usage_DMA_RESV_USAGE_BOOKKEEP,
                     );
                 }
 
-                Ok(())
+                res
             })?;
 
         ctx.push_fences();
