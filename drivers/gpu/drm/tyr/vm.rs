@@ -419,6 +419,8 @@ impl VmBindJob {
         let dev = unsafe { vm.exec.pdev.as_ref().as_bound() };
         let handoff = cleanup::Handoff::new(bo.dev().into())?;
         let (pin, map_sgt) = prefetch_map_sgt(&bo, dev, bo_offset, size, GFP_KERNEL_ACCOUNT)?;
+        let pt_reserve =
+            pt_alloc::PtReserve::for_map(&vm.as_data.pt_allocator, va, size, GFP_KERNEL_ACCOUNT)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -428,7 +430,7 @@ impl VmBindJob {
             vm_bo: Some(vm.exec.obtain(&bo)?),
             map_sgt: Some(map_sgt),
             _map_pin: Some(MapPin::Deferred(Some((pin, handoff)))),
-            pt_reserve: pt_alloc::PtReserve::for_map(va, size, GFP_KERNEL_ACCOUNT)?,
+            pt_reserve,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -445,7 +447,9 @@ impl VmBindJob {
             .map_err(Error::from)
     }
 
-    pub(crate) fn push_unmap(&mut self, va: u64, size: u64) -> Result {
+    pub(crate) fn push_unmap(&mut self, vm: &Vm, va: u64, size: u64) -> Result {
+        let pt_reserve =
+            pt_alloc::PtReserve::for_unmap(&vm.as_data.pt_allocator, va, size, GFP_KERNEL_ACCOUNT)?;
         let resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -455,7 +459,7 @@ impl VmBindJob {
             vm_bo: None,
             map_sgt: None,
             _map_pin: None,
-            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, GFP_KERNEL_ACCOUNT)?,
+            pt_reserve,
         };
         let resources = KBox::pin_init(new_mutex!(Some(resources)), GFP_KERNEL)?;
         self.ops
@@ -855,9 +859,8 @@ impl Drop for PtUpdateContext<'_> {
             pr_err!("Failed to end VM update {:?}\n", e);
         }
 
-        // The leftovers go back to the resources. They are freed with
-        // everything else the operation reserved, once this context has
-        // released the op lock.
+        // The cache keeps the leftovers it has room for. The rest go back to
+        // the resources and are freed after this context releases the op lock.
         self.resources.pt_reserve = self.vm.as_data.pt_allocator.take_reserve();
     }
 }
@@ -1985,8 +1988,12 @@ impl VmExec {
 
         while let Some(va) = self.first_evicted_va(vm_bo)? {
             let size = va.range.end - va.range.start;
-            let pt_reserve =
-                pt_alloc::PtReserve::for_map(va.range.start, size, GFP_KERNEL_ACCOUNT)?;
+            let pt_reserve = pt_alloc::PtReserve::for_map(
+                &self.as_data.pt_allocator,
+                va.range.start,
+                size,
+                GFP_KERNEL_ACCOUNT,
+            )?;
 
             self.map_evicted_va(vm_bo, &va, &segments, pt_reserve)?;
         }
@@ -2084,6 +2091,8 @@ impl VmExec {
         // cleanup workqueue instead.
         let _flush = ScopeGuard::new(|| self.flush_deferred_cleanup());
         let (pin, map_sgt) = prefetch_map_sgt(bo, dev, bo_offset, size, pt_gfp)?;
+        let pt_reserve =
+            pt_alloc::PtReserve::for_map(&self.as_data.pt_allocator, va, size, pt_gfp)?;
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
                 Some(GpuVaAlloc::<GpuVmData>::new(GFP_KERNEL)?),
@@ -2093,7 +2102,7 @@ impl VmExec {
             vm_bo: Some(self.obtain(bo)?),
             map_sgt: Some(map_sgt),
             _map_pin: Some(MapPin::Inline { _pin: pin }),
-            pt_reserve: pt_alloc::PtReserve::for_map(va, size, pt_gfp)?,
+            pt_reserve,
         };
 
         self.map_bo_range_inner(bo_offset, size, va, flags, &mut resources)
@@ -2129,6 +2138,8 @@ impl VmExec {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         let full_vm = va == self.va_range.start && end == self.va_range.end;
 
+        let pt_reserve =
+            pt_alloc::PtReserve::for_unmap(&self.as_data.pt_allocator, va, size, pt_gfp)?;
         let mut resources = VmOpResources {
             preallocated_gpuvas: if full_vm {
                 // Unmapping the entire VM cannot split an existing mapping,
@@ -2144,7 +2155,7 @@ impl VmExec {
             vm_bo: None,
             map_sgt: None,
             _map_pin: None,
-            pt_reserve: pt_alloc::PtReserve::for_unmap(va, size, pt_gfp)?,
+            pt_reserve,
         };
         let result = self.unmap_range_inner(va, size, &mut resources);
 
