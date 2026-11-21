@@ -192,6 +192,7 @@ impl TyrIrqTrait for MmuIrq {
         }
 
         let _ = decode_faults(fault_bits, &self.iomem);
+        let mut mcu_vm_fault = false;
 
         // Flag the faulting AS slots and tear their MMU programming
         // down before the scheduler tick runs, so any further GPU
@@ -207,12 +208,17 @@ impl TyrIrqTrait for MmuIrq {
             let Some(vm_as_data) = as_manager.slot_data(as_idx).cloned() else {
                 continue;
             };
+            mcu_vm_fault |= core::ptr::eq(&*vm_as_data, tdev.fw.vm_as_data());
             vm_as_data.unhandled_fault.store(true, Relaxed);
             if let Err(e) = as_manager.disable_vm(&vm_as_data) {
                 pr_err!("mmu_irq: disable_vm({}) failed: {:?}\n", as_idx, e);
             }
         }
         drop(as_manager);
+
+        if mcu_vm_fault {
+            tdev.reset.schedule();
+        }
 
         TyrDrmDeviceData::schedule_tick(&ARef::from(tdev));
     }
