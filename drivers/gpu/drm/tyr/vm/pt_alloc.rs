@@ -153,7 +153,7 @@ impl Drop for PtPage {
     }
 }
 
-/// An unzeroed `PT_SIZE` page table held by a `PtReserve`.
+/// An unzeroed `PT_SIZE` page table held by a `PtReserve` or a `PtPool`.
 ///
 /// # Invariants
 ///
@@ -181,6 +181,19 @@ impl ReservedPt {
     }
 }
 
+impl TryFrom<PtPage> for ReservedPt {
+    type Error = PtPage;
+
+    fn try_from(page: PtPage) -> Result<Self, PtPage> {
+        if page.size != PT_SIZE {
+            return Err(page);
+        }
+
+        // INVARIANT: The pointer comes from `PtPage::into_raw` for `PT_SIZE`.
+        Ok(Self(page.into_raw()))
+    }
+}
+
 impl Drop for ReservedPt {
     fn drop(&mut self) {
         // SAFETY: By the type invariant, the pointer came from
@@ -201,7 +214,12 @@ pub(crate) struct PtReserve {
 
 impl PtReserve {
     /// Reserves the page tables that mapping `size` bytes at `va` can need.
-    pub(crate) fn for_map(va: u64, size: u64, flags: Flags) -> Result<Self> {
+    pub(crate) fn for_map(
+        allocator: &PtAllocator,
+        va: u64,
+        size: u64,
+        flags: Flags,
+    ) -> Result<Self> {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         if size == 0 {
             return Ok(Self::default());
@@ -221,11 +239,16 @@ impl PtReserve {
             .map(|&shift| regions_spanned(va, end, shift))
             .sum();
 
-        Self::with_count(count, flags)
+        Self::with_count(allocator, count, flags)
     }
 
     /// Reserves the page tables that unmapping `size` bytes at `va` can need.
-    pub(crate) fn for_unmap(va: u64, size: u64, flags: Flags) -> Result<Self> {
+    pub(crate) fn for_unmap(
+        allocator: &PtAllocator,
+        va: u64,
+        size: u64,
+        flags: Flags,
+    ) -> Result<Self> {
         let end = va.checked_add(size).ok_or(EINVAL)?;
         if size == 0 {
             return Ok(Self::default());
@@ -248,18 +271,24 @@ impl PtReserve {
             count += 1;
         }
 
-        Self::with_count(count, flags)
+        Self::with_count(allocator, count, flags)
     }
 
-    /// Allocates `count` page tables with `flags`.
-    fn with_count(count: u64, flags: Flags) -> Result<Self> {
+    /// Reserves `count` page tables, taking the ones `allocator` caches before
+    /// allocating with `flags`.
+    fn with_count(allocator: &PtAllocator, count: u64, flags: Flags) -> Result<Self> {
         let count = usize::try_from(count)
             .ok()
             .filter(|&count| count <= PT_RESERVE_MAX)
             .ok_or(ENOMEM)?;
-        let mut pages = KVec::with_capacity(count, flags)?;
+        if count == 0 {
+            return Ok(Self::default());
+        }
 
-        for _ in 0..count {
+        let mut pages = KVec::with_capacity(count, flags)?;
+        allocator.take_cached(&mut pages);
+
+        while pages.len() < count {
             let page = ReservedPt::new(flags).ok_or(ENOMEM)?;
             pages.push(page, flags)?;
         }
@@ -275,10 +304,16 @@ pub(crate) struct PtAllocator {
     pool: SpinLock<PtPool>,
 }
 
+/// Largest number of page tables a `PtPool` caches, enough for the reserve of
+/// a map within one `PT_MIN_BLOCK_SIZE` block.
+const PT_POOL_CACHE_CAP: usize = PT_LEVEL_SHIFTS.len();
+
 /// The state `PtAllocator` hands page tables out from.
 struct PtPool {
     /// Page tables reserved for the update in progress, `None` outside one.
     reserve: Option<PtReserve>,
+    /// Page tables freed or left unused by an update, kept for later reserves.
+    cache: [Option<ReservedPt>; PT_POOL_CACHE_CAP],
     /// Whether a reserve has already failed to serve a request, so that only
     /// the first failure warns.
     warned: bool,
@@ -290,6 +325,7 @@ impl PtAllocator {
         pin_init!(Self {
             pool <- new_spinlock!(PtPool {
                 reserve: None,
+                cache: [const { None }; PT_POOL_CACHE_CAP],
                 warned: false,
             }),
         })
@@ -300,17 +336,51 @@ impl PtAllocator {
         self.pool.lock().reserve = Some(reserve);
     }
 
-    /// Takes back what is left of the reserve of a finished update.
+    /// Takes back the reserve of a finished update after moving its spare
+    /// page tables into the cache.
+    #[inline(never)]
     pub(crate) fn take_reserve(&self) -> PtReserve {
-        self.pool.lock().reserve.take().unwrap_or_default()
+        let mut pool = self.pool.lock();
+        let mut reserve = pool.reserve.take().unwrap_or_default();
+
+        for slot in pool.cache.iter_mut().filter(|slot| slot.is_none()) {
+            *slot = reserve.pages.pop();
+        }
+
+        reserve
+    }
+
+    /// Moves cached page tables into `pages`, up to its capacity.
+    fn take_cached(&self, pages: &mut KVec<ReservedPt>) {
+        let mut pool = self.pool.lock();
+
+        for slot in pool.cache.iter_mut() {
+            let Some(page) = slot.take() else {
+                continue;
+            };
+
+            if let Err(err) = pages.push_within_capacity(page) {
+                *slot = Some(err.0);
+                break;
+            }
+        }
+    }
+
+    /// Caches `page` if the cache has room, and frees it otherwise.
+    fn cache_or_free(&self, page: ReservedPt) {
+        let mut pool = self.pool.lock();
+
+        if let Some(slot) = pool.cache.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(page);
+        }
     }
 }
 
 // SAFETY: Every page table is physically contiguous memory from the slab
 // allocator, in a layout whose size and alignment are both at least the
 // requested size, and is zeroed when it is handed out. Handing a page table
-// out removes it from the reserve, so no page table is handed out twice. A
-// page table is only freed once it comes back through `free`.
+// out removes it from the reserve, and only `free` caches or frees it, so it
+// is never handed out again or freed while io-pgtable owns it.
 unsafe impl PageTableAlloc for PtAllocator {
     fn alloc(&self, size: usize, flags: Flags) -> Option<NonNull<u8>> {
         let first_failure = {
@@ -342,9 +412,15 @@ unsafe impl PageTableAlloc for PtAllocator {
         Some(PtPage::new(size, flags | __GFP_ZERO)?.into_raw())
     }
 
+    #[inline]
     unsafe fn free(&self, pages: NonNull<u8>, size: usize) {
         // SAFETY: The caller guarantees that `pages` came from `alloc` for
         // `size` and has not been freed since.
-        drop(unsafe { PtPage::from_raw(pages, size) });
+        let page = unsafe { PtPage::from_raw(pages, size) };
+
+        match ReservedPt::try_from(page) {
+            Ok(page) => self.cache_or_free(page),
+            Err(page) => drop(page),
+        }
     }
 }
