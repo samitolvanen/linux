@@ -393,11 +393,116 @@ impl<'drm> Firmware<'drm> {
         kernel::firmware::Firmware::request(&path, ddev.as_ref().as_ref())
     }
 
+    #[inline(never)]
     fn load(dev: &Device, ddev: &TyrDrmDevice, gpu_info: &GpuInfo) -> Result<KVec<ParsedSection>> {
         let fw = Self::request(ddev, gpu_info)?;
         let mut parser = FwParser::new(dev, fw.data());
 
         parser.parse()
+    }
+
+    /// Allocates the parsed sections and maps them into the MCU VM.
+    #[inline(never)]
+    fn load_sections(
+        dev: &Device<Bound>,
+        ddev: &TyrDrmDevice,
+        vm: &Arc<Vm>,
+        coherent: bool,
+        parsed_sections: KVec<ParsedSection>,
+    ) -> Result<KVec<Section>> {
+        let mut sections = KVec::new();
+        for parsed in parsed_sections {
+            let ParsedSection {
+                data,
+                va,
+                vm_map_flags,
+                section_flags,
+            } = parsed;
+            let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
+
+            let va = u64::from(va.start);
+            let end = va + size;
+
+            if vm.overlaps_mapping(va, size) {
+                dev_err!(
+                    dev,
+                    "Firmware corrupted, section {:#x}..{:#x} overlaps another section\n",
+                    va,
+                    end
+                );
+                return Err(EINVAL);
+            }
+
+            let mem = KernelBo::new(
+                dev,
+                ddev,
+                vm.clone(),
+                size,
+                KernelBoVaAlloc::Explicit(va),
+                vm_map_flags,
+                coherent,
+                KernelBoOwner::Firmware,
+                GFP_KERNEL,
+            )?;
+
+            let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
+            let auto_va_end = auto_va_start + u64::from(CSF_MCU_SHARED_REGION_SIZE);
+            if end > auto_va_start && va < auto_va_end {
+                vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
+            }
+
+            let vmap = mem.bo().owned_vmap::<0>()?;
+            Self::init_section_mem(dev, &vmap, &data, section_flags, size)?;
+            Self::sync_section(dev, mem.bo())?;
+
+            sections.push(
+                Section {
+                    data,
+                    section_flags,
+                    vmap,
+                    mem,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
+        Ok(sections)
+    }
+
+    /// Activates the MCU VM and sets up the global interface.
+    #[inline(never)]
+    fn build_firmware(
+        pdev: &'drm platform::Device<Bound>,
+        iomem: Arc<DevresIoMem<SZ_2M>>,
+        vm: &Arc<Vm>,
+        gpu_info: &GpuInfo,
+        sections: KVec<Section>,
+    ) -> Result<Firmware<'drm>> {
+        vm.activate()?;
+
+        let irq_state = irq::JobIrqState::new()?;
+        let shared_section = Self::find_shared_section(pdev.as_ref(), &sections)?;
+        let global_iface = Arc::pin_init(
+            GlobalInterface::new(
+                pdev.as_ref(),
+                iomem.clone(),
+                shared_section,
+                gpu_info,
+                &irq_state,
+            )?,
+            GFP_KERNEL,
+        )?;
+
+        Ok(Firmware {
+            dev: pdev,
+            iomem,
+            vm: vm.clone(),
+            sections,
+            irq_state,
+            unclean_stop: Atomic::new(false),
+            mcu_running: Atomic::new(false),
+            global_iface,
+        })
     }
 
     /// Load firmware and map sections into MCU VM.
@@ -420,90 +525,9 @@ impl<'drm> Firmware<'drm> {
             coherent,
         )?;
 
-        let result = (|| {
-            let parsed_sections = Self::load(dev, ddev, gpu_info)?;
-            let mut sections = KVec::new();
-            for parsed in parsed_sections {
-                let ParsedSection {
-                    data,
-                    va,
-                    vm_map_flags,
-                    section_flags,
-                } = parsed;
-                let size = u64::from(va.end.checked_sub(va.start).ok_or(EINVAL)?);
-
-                let va = u64::from(va.start);
-                let end = va + size;
-
-                if vm.overlaps_mapping(va, size) {
-                    dev_err!(
-                        dev,
-                        "Firmware corrupted, section {:#x}..{:#x} overlaps another section\n",
-                        va,
-                        end
-                    );
-                    return Err(EINVAL);
-                }
-
-                let mem = KernelBo::new(
-                    dev,
-                    ddev,
-                    vm.clone(),
-                    size,
-                    KernelBoVaAlloc::Explicit(va),
-                    vm_map_flags,
-                    coherent,
-                    KernelBoOwner::Firmware,
-                    GFP_KERNEL,
-                )?;
-
-                let auto_va_start = u64::from(CSF_MCU_SHARED_REGION_START);
-                let auto_va_end = auto_va_start + u64::from(CSF_MCU_SHARED_REGION_SIZE);
-                if end > auto_va_start && va < auto_va_end {
-                    vm.reserve_kernel_range(va.max(auto_va_start), end.min(auto_va_end))?;
-                }
-
-                let vmap = mem.bo().owned_vmap::<0>()?;
-                Self::init_section_mem(dev, &vmap, &data, section_flags, size)?;
-                Self::sync_section(dev, mem.bo())?;
-
-                sections.push(
-                    Section {
-                        data,
-                        section_flags,
-                        vmap,
-                        mem,
-                    },
-                    GFP_KERNEL,
-                )?;
-            }
-
-            vm.activate()?;
-
-            let irq_state = irq::JobIrqState::new()?;
-            let shared_section = Self::find_shared_section(dev, &sections)?;
-            let global_iface = Arc::pin_init(
-                GlobalInterface::new(
-                    pdev.as_ref(),
-                    iomem.clone(),
-                    shared_section,
-                    *gpu_info,
-                    &irq_state,
-                )?,
-                GFP_KERNEL,
-            )?;
-
-            Ok(Firmware {
-                dev: pdev,
-                iomem,
-                vm: vm.clone(),
-                sections,
-                irq_state,
-                unclean_stop: Atomic::new(false),
-                mcu_running: Atomic::new(false),
-                global_iface,
-            })
-        })();
+        let result = Self::load(dev, ddev, gpu_info)
+            .and_then(|parsed| Self::load_sections(dev, ddev, &vm, coherent, parsed))
+            .and_then(|sections| Self::build_firmware(pdev, iomem, &vm, gpu_info, sections));
 
         if result.is_err() {
             vm.kill();
