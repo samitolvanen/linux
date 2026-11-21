@@ -999,7 +999,9 @@ impl Group {
         let mut ctx =
             deps::Context::new(file, SubmitOps::new(self.clone(), self.tdev.profile_mask()));
 
+        let mut batch_queues = 0;
         for (job, syncs) in jobs.into_iter() {
+            batch_queues |= QueueIdx::new(job.queue_index()).ok_or(EINVAL)?.bit();
             ctx.add_job(job, Arc::new(syncs, GFP_KERNEL)?)?;
         }
 
@@ -1015,18 +1017,19 @@ impl Group {
             ctx.prepare(idx)?;
         }
 
-        self.vm.with_prepared_vm(job_count as u32, |vm_exec| {
-            for idx in 0..job_count {
-                let signal_fence = ctx.commit(idx)?;
-                vm_exec.resv_add_fence(
-                    &signal_fence,
-                    DmaResvUsage::Bookkeep,
-                    DmaResvUsage::Bookkeep,
-                );
-            }
+        self.vm
+            .with_prepared_vm(batch_queues.count_ones(), |vm_exec| {
+                let res = (0..job_count).try_for_each(|idx| ctx.commit(idx).map(|_| ()));
 
-            Ok(())
-        })?;
+                let queues = self
+                    .indexed_queues()
+                    .filter(|(idx, _)| batch_queues & idx.bit() != 0);
+                for fence in queues.filter_map(|(_, queue)| queue.last_job_fence()) {
+                    vm_exec.resv_add_fence(&fence, DmaResvUsage::Bookkeep, DmaResvUsage::Bookkeep);
+                }
+
+                res
+            })?;
 
         ctx.push_fences();
 

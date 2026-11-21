@@ -1415,6 +1415,11 @@ impl Queue {
         fence
     }
 
+    /// Returns the fence of the last committed job.
+    pub(super) fn last_job_fence(&self) -> Option<ARef<PublicDmaFence>> {
+        self.data.last_job_fence.lock().clone()
+    }
+
     /// Stops the pipeline from handing any further job to the
     /// firmware and from failing one. Jobs keep resolving their
     /// dependencies and pile up in front of the exec stage, and the

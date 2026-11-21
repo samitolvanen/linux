@@ -268,9 +268,9 @@ pub(crate) trait BatchOps {
     ) -> Result<Self::Prepared>;
 
     /// Appends `fence` to the dependencies of a prepared job. Must not
-    /// allocate. Later calls in a batch run with earlier fences already
-    /// installed in a reservation, so they run inside a dma-fence
-    /// signalling section.
+    /// allocate. Later calls in a batch can run with earlier fences already
+    /// installed in a reservation, i.e. inside a dma-fence signalling
+    /// section.
     fn add_dep(&self, prepared: &mut Self::Prepared, fence: ARef<PublicDmaFence>) -> Result;
 
     /// Submits a prepared job and returns the fence that gates its
