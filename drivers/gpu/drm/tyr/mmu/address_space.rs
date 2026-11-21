@@ -334,7 +334,9 @@ pub(crate) struct AddressSpaceManager {
     /// The lock is tracked per slot. Every Lock and Unlock on a slot goes
     /// through `as_start_update`, `as_end_update`, and `as_disable` under the
     /// `as_manager` mutex, so the region follows whichever VM occupies the slot.
-    locked_region: [Option<Range<u64>>; MAX_AS],
+    ///
+    /// Boxed to keep `AddressSpaceManager` small while probe moves it by value.
+    locked_region: KBox<[Option<Range<u64>>; MAX_AS]>,
 
     /// Whether hardware AS slot N was unprogrammed for a faulted or
     /// unusable VM while its slot binding was kept. Cleared when the slot
@@ -413,12 +415,14 @@ impl AddressSpaceManager {
             return Err(EINVAL);
         }
 
+        let locked_region = KBox::init(pin_init::init_array_from_fn(|_| None), GFP_KERNEL)?;
+
         Ok(Self {
             pdev: pdev.into(),
             iomem: iomem.into(),
             as_present,
             fault_mask,
-            locked_region: [const { None }; MAX_AS],
+            locked_region,
             faulty: [false; MAX_AS],
             stuck: [false; MAX_AS],
             flush_stuck: false,
