@@ -648,15 +648,6 @@ pub(crate) struct PtUpdateContext<'ctx> {
     /// VM being updated.
     vm: &'ctx VmExec,
 
-    /// Page table.
-    page_table: &'ctx Devres<pt_alloc::PageTable>,
-
-    /// MMU manager.
-    mmu: &'ctx Mmu,
-
-    /// Reference to the address space data to pass to the MMU functions.
-    as_data: &'ctx VmAsData,
-
     /// Region of the virtual address space covered by this request.
     region: Range<u64>,
 
@@ -687,25 +678,19 @@ impl<'ctx> PtUpdateContext<'ctx> {
     /// complete the update when dropped.
     fn new(
         vm: &'ctx VmExec,
-        page_table: &'ctx Devres<pt_alloc::PageTable>,
-        mmu: &'ctx Mmu,
-        as_data: &'ctx VmAsData,
         region: Range<u64>,
         op_type: PtOpType,
         resources: &'ctx mut VmOpResources,
     ) -> Result<PtUpdateContext<'ctx>> {
-        let _op_lock = as_data.lock_ops();
-        let _hw = mmu.begin_hw_access();
-        mmu.start_vm_update(as_data, &region)?;
-        as_data
+        let _op_lock = vm.as_data.lock_ops();
+        let _hw = vm.mmu.begin_hw_access();
+        vm.mmu.start_vm_update(&vm.as_data, &region)?;
+        vm.as_data
             .pt_allocator
             .set_reserve(core::mem::take(&mut resources.pt_reserve));
 
         Ok(Self {
             vm,
-            page_table,
-            mmu,
-            as_data,
             region,
             op_type,
             resources,
@@ -713,6 +698,11 @@ impl<'ctx> PtUpdateContext<'ctx> {
             _hw,
             _op_lock,
         })
+    }
+
+    /// Returns the page table.
+    fn pt(&self) -> &'ctx Devres<pt_alloc::PageTable> {
+        &self.vm.as_data.page_table
     }
 
     /// Finds one of our pre-allocated VAs.
@@ -753,7 +743,7 @@ impl<'ctx> PtUpdateContext<'ctx> {
     fn extend_lock(&mut self, region: Range<u64>) -> Result {
         let union = self.region.start.min(region.start)..self.region.end.max(region.end);
         if union.start < self.region.start || union.end > self.region.end {
-            self.mmu.extend_vm_update(self.as_data, &union)?;
+            self.vm.mmu.extend_vm_update(&self.vm.as_data, &union)?;
             self.region = union;
         }
         Ok(())
@@ -763,8 +753,9 @@ impl<'ctx> PtUpdateContext<'ctx> {
 impl Drop for PtUpdateContext<'_> {
     fn drop(&mut self) {
         if let Err(e) = self
+            .vm
             .mmu
-            .end_vm_update(self.as_data, &self.region, &mut self.removed)
+            .end_vm_update(&self.vm.as_data, &self.region, &mut self.removed)
         {
             pr_err!("Failed to end VM update {:?}\n", e);
         }
@@ -772,7 +763,7 @@ impl Drop for PtUpdateContext<'_> {
         // The leftovers go back to the resources. They are freed with
         // everything else the operation reserved, once this context has
         // released the op lock.
-        self.resources.pt_reserve = self.as_data.pt_allocator.take_reserve();
+        self.resources.pt_reserve = self.vm.as_data.pt_allocator.take_reserve();
     }
 }
 
@@ -821,19 +812,19 @@ impl GpuVmData {
         }
 
         self.unmap_in_sync(context, region.start..probed.start)
-            .and_then(|()| pt_unmap_mapped(context.page_table, probed.clone()))
+            .and_then(|()| pt_unmap_mapped(context.pt(), probed.clone()))
             .and_then(|()| self.unmap_in_sync(context, probed.end..region.end))
             .inspect_err(|_| self.mark_failed(context, &region))
     }
 
     /// Unmaps `region`, which lies outside `pt_out_of_sync` and so is fully mapped.
     fn unmap_in_sync(&mut self, context: &PtUpdateContext<'_>, region: Range<u64>) -> Result {
-        if pt_unmap(context.page_table, region.clone()).is_ok() {
+        if pt_unmap(context.pt(), region.clone()).is_ok() {
             return Ok(());
         }
 
         self.mark_failed(context, &region);
-        pt_unmap_mapped(context.page_table, region)
+        pt_unmap_mapped(context.pt(), region)
     }
 }
 
@@ -1630,53 +1621,32 @@ impl VmExec {
     fn exec_op(
         &self,
         gpuvm_unique: &mut UniqueRefGpuVm<GpuVmData>,
-        req: VmOpRequest,
+        req: &VmOpRequest,
         resources: &mut VmOpResources,
     ) -> Result {
-        let page_table = &self.as_data.page_table;
+        let op_type = match &req.op_type {
+            VmOpType::Map(args) => PtOpType::Map(PtMapArgs {
+                prot: args.flags.to_prot(),
+            }),
+            VmOpType::Unmap => PtOpType::Unmap,
+        };
+        let mut pt_upd = PtUpdateContext::new(self, req.region.clone(), op_type, resources)?;
 
-        match req.op_type {
-            VmOpType::Map(args) => {
-                let mut pt_upd = PtUpdateContext::new(
-                    self,
-                    page_table,
-                    &self.mmu,
-                    &self.as_data,
-                    req.region,
-                    PtOpType::Map(PtMapArgs {
-                        prot: args.flags.to_prot(),
-                    }),
-                    resources,
-                )?;
-
-                gpuvm_unique.sm_map(OpMapRequest {
-                    addr: pt_upd.region.start,
-                    range: pt_upd.region.end - pt_upd.region.start,
-                    gem_offset: args.bo_offset,
-                    vm_bo: &args.vm_bo,
-                    context: &mut pt_upd,
-                })
-                //PtUpdateContext drops here flushing the page table
-            }
-            VmOpType::Unmap => {
-                let mut pt_upd = PtUpdateContext::new(
-                    self,
-                    page_table,
-                    &self.mmu,
-                    &self.as_data,
-                    req.region,
-                    PtOpType::Unmap,
-                    resources,
-                )?;
-
-                gpuvm_unique.sm_unmap(
-                    pt_upd.region.start,
-                    pt_upd.region.end - pt_upd.region.start,
-                    &mut pt_upd,
-                )
-                //PtUpdateContext drops here flushing the page table
-            }
+        match &req.op_type {
+            VmOpType::Map(args) => gpuvm_unique.sm_map(OpMapRequest {
+                addr: pt_upd.region.start,
+                range: pt_upd.region.end - pt_upd.region.start,
+                gem_offset: args.bo_offset,
+                vm_bo: &args.vm_bo,
+                context: &mut pt_upd,
+            }),
+            VmOpType::Unmap => gpuvm_unique.sm_unmap(
+                pt_upd.region.start,
+                pt_upd.region.end - pt_upd.region.start,
+                &mut pt_upd,
+            ),
         }
+        // PtUpdateContext drops here flushing the page table
     }
 
     /// Maps a GEM buffer object range into the VM at the specified virtual address.
@@ -1711,7 +1681,7 @@ impl VmExec {
             return Err(EINVAL);
         }
 
-        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)?;
+        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, &req, resources)?;
 
         Ok(())
     }
@@ -1760,7 +1730,7 @@ impl VmExec {
         };
         let mut gpuvm_unique = self.gpuvm_unique.lock();
 
-        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, req, resources)?;
+        self.exec_op((*gpuvm_unique).as_mut().ok_or(EINVAL)?, &req, resources)?;
 
         Ok(())
     }
@@ -1851,13 +1821,13 @@ impl DriverGpuVm for GpuVmData {
 
             let len = sgt_entry_length.min(bytes_left_to_map);
 
-            let segment_mapped = match pt_map(context.page_table, iova, paddr, len, prot) {
+            let segment_mapped = match pt_map(context.pt(), iova, paddr, len, prot) {
                 Ok(segment_mapped) => segment_mapped,
                 Err(e) => {
                     // clean up any successful mappings from previous SGT entries.
                     let total_mapped = iova - start_iova;
                     if total_mapped > 0 {
-                        pt_unmap(context.page_table, start_iova..(start_iova + total_mapped)).ok();
+                        pt_unmap(context.pt(), start_iova..(start_iova + total_mapped)).ok();
                     }
                     self.mark_failed(context, &(start_iova..start_iova + op.length()));
                     return Err(e);
@@ -1872,7 +1842,7 @@ impl DriverGpuVm for GpuVmData {
         if bytes_left_to_map != 0 {
             let total_mapped = iova - start_iova;
 
-            if total_mapped > 0 && pt_unmap(context.page_table, start_iova..iova).is_err() {
+            if total_mapped > 0 && pt_unmap(context.pt(), start_iova..iova).is_err() {
                 self.mark_failed(context, &(start_iova..iova));
             }
 
@@ -1951,13 +1921,13 @@ impl DriverGpuVm for GpuVmData {
         // never expanded, so its sub-range unmap stays correct.
         let head_paddr = match op.prev() {
             Some(prev) if aligned_start < unmap_start && prev.addr() <= aligned_start => {
-                contiguous_phys(context.page_table, aligned_start..unmap_start)
+                contiguous_phys(context.pt(), aligned_start..unmap_start)
             }
             _ => None,
         };
         let tail_paddr = match op.next() {
             Some(next) if aligned_end > unmap_end && next.addr() + next.length() >= aligned_end => {
-                contiguous_phys(context.page_table, unmap_end..aligned_end)
+                contiguous_phys(context.pt(), unmap_end..aligned_end)
             }
             _ => None,
         };
@@ -1991,7 +1961,7 @@ impl DriverGpuVm for GpuVmData {
 
         if let Some(head_paddr) = head_paddr {
             pt_map(
-                context.page_table,
+                context.pt(),
                 aligned_start,
                 head_paddr,
                 unmap_start - aligned_start,
@@ -2001,7 +1971,7 @@ impl DriverGpuVm for GpuVmData {
         }
         if let Some(tail_paddr) = tail_paddr {
             pt_map(
-                context.page_table,
+                context.pt(),
                 unmap_end,
                 tail_paddr,
                 aligned_end - unmap_end,
