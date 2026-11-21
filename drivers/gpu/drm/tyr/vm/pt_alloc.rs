@@ -107,9 +107,9 @@ struct PtPage {
 unsafe impl Send for PtPage {}
 
 impl PtPage {
-    /// Allocates a zeroed page table of `size` bytes.
+    /// Allocates a page table of `size` bytes with `flags`.
     fn new(size: usize, flags: Flags) -> Option<Self> {
-        let ptr = Kmalloc::alloc(pt_layout(size)?, flags | __GFP_ZERO, NumaNode::NO_NODE).ok()?;
+        let ptr = Kmalloc::alloc(pt_layout(size)?, flags, NumaNode::NO_NODE).ok()?;
 
         Some(Self {
             ptr: ptr.cast(),
@@ -149,7 +149,7 @@ impl Drop for PtPage {
     }
 }
 
-/// A zeroed `PT_SIZE` page table held by a `PtReserve`.
+/// An unzeroed `PT_SIZE` page table held by a `PtReserve`.
 ///
 /// # Invariants
 ///
@@ -162,14 +162,17 @@ struct ReservedPt(NonNull<u8>);
 unsafe impl Send for ReservedPt {}
 
 impl ReservedPt {
-    /// Allocates a zeroed `PT_SIZE` page table.
+    /// Allocates a `PT_SIZE` page table.
     fn new(flags: Flags) -> Option<Self> {
         // INVARIANT: The pointer comes from `PtPage::into_raw` for `PT_SIZE`.
         Some(Self(PtPage::new(PT_SIZE, flags)?.into_raw()))
     }
 
-    /// Gives up ownership of the page table.
-    fn into_raw(self) -> NonNull<u8> {
+    /// Zeroes the page table and gives up ownership of it.
+    fn into_zeroed_raw(self) -> NonNull<u8> {
+        // SAFETY: By the type invariant, `self` owns a `PT_SIZE` page table, so
+        // it is valid for writes of `PT_SIZE` bytes.
+        unsafe { self.0.as_ptr().write_bytes(0, PT_SIZE) };
         ManuallyDrop::new(self).0
     }
 }
@@ -299,11 +302,11 @@ impl PtAllocator {
     }
 }
 
-// SAFETY: `PtPage::new` allocates zeroed, physically contiguous memory from
-// the slab allocator, in a layout whose size and alignment are both at least
-// the requested size. Handing a page table out removes it from the reserve,
-// so no page table is handed out twice. A page table is only freed once it
-// comes back through `free`.
+// SAFETY: Every page table is physically contiguous memory from the slab
+// allocator, in a layout whose size and alignment are both at least the
+// requested size, and is zeroed when it is handed out. Handing a page table
+// out removes it from the reserve, so no page table is handed out twice. A
+// page table is only freed once it comes back through `free`.
 unsafe impl PageTableAlloc for PtAllocator {
     fn alloc(&self, size: usize, flags: Flags) -> Option<NonNull<u8>> {
         let first_failure = {
@@ -314,7 +317,8 @@ unsafe impl PageTableAlloc for PtAllocator {
                 Some(reserve) => {
                     if size == PT_SIZE {
                         if let Some(page) = reserve.pages.pop() {
-                            return Some(page.into_raw());
+                            drop(pool);
+                            return Some(page.into_zeroed_raw());
                         }
                     }
 
@@ -331,13 +335,10 @@ unsafe impl PageTableAlloc for PtAllocator {
 
         // Reached for the top-level table, which is allocated before any
         // update starts, and for a request the reserve could not serve.
-        Some(PtPage::new(size, flags)?.into_raw())
+        Some(PtPage::new(size, flags | __GFP_ZERO)?.into_raw())
     }
 
     unsafe fn free(&self, pages: NonNull<u8>, size: usize) {
-        // A freed page table goes back to the slab allocator and never to a
-        // reserve, so every page table a reserve hands out is still zeroed.
-        //
         // SAFETY: The caller guarantees that `pages` came from `alloc` for
         // `size` and has not been freed since.
         drop(unsafe { PtPage::from_raw(pages, size) });
