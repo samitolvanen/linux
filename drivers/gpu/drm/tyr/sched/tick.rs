@@ -63,9 +63,6 @@ use crate::{
 };
 
 /// Period between two consecutive scheduler ticks, in milliseconds.
-///
-/// The tick is short because every period also acts as the deadline
-/// for firmware ack waits issued from the apply step.
 pub(crate) const TICK_PERIOD_MS: u32 = 10;
 
 /// Delay between retries of a failed runtime resume. A failed attempt waits
@@ -91,8 +88,7 @@ enum Action {
 /// for hardware slots.
 #[derive(Copy, Clone)]
 pub(crate) struct Rule {
-    /// The action (`Keep` or `Take`) to perform for groups matching
-    /// this rule.
+    /// The action to perform for groups matching this rule.
     action: Action,
     /// The software scheduling priority this rule applies to.
     priority: Priority,
@@ -970,7 +966,7 @@ impl<'a> Tick<'a> {
             // slot is needed, walking priorities high to low. This
             // includes idle-because-syncwait groups. While on-slot, the
             // firmware keeps polling the wait and the job deadline keeps
-            // running. The runnable rules above run first and fill every
+            // running. The runnable rules below run first and fill every
             // slot under genuine overcommit, so these idle keeps become
             // no-ops and the blocked group is evicted to make room.
             shared_idle: [
@@ -1026,8 +1022,7 @@ impl<'a> Tick<'a> {
 
         // Build the halt request set under the slot-manager lock,
         // then drop the lock before issuing the firmware update.
-        // `apply_csg_updates` re-acquires it itself across its wait
-        // phase.
+        // `apply_csg_updates` takes the lock itself.
         let csg_slot_manager = tdev.csg_slot_manager.lock();
         for csg_idx in CsgSlotIdx::all() {
             if (keep_mask & csg_idx.bit()) != 0 {

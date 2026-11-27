@@ -987,7 +987,7 @@ mod csg {
                 31:31 progress_timer_event => bool;
             }
 
-            /// Global acknowledge IRQ mask.
+            /// CSG acknowledge IRQ mask.
             ///
             /// Controls which flags in CSG_ACK trigger a host IRQ when updated.
             pub CSG_ACK_IRQ_MASK(u32) @ 0x04 {

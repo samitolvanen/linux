@@ -99,10 +99,7 @@ pub(crate) struct HeapOutputState {
 /// Inputs for `CsInterface::program_activate_inputs`.
 ///
 /// Bundles the static CS_INPUT state programmed once per CS-slot
-/// activation: ringbuffer base / size, kernel-visible input / output
-/// page VAs, the user-mode input / output VAs, the `CS_CONFIG`
-/// priority and per-CS doorbell id, and the matching
-/// `CS_ACK_IRQ_MASK`.
+/// activation.
 pub(crate) struct CsActivateInputs {
     /// GPU VA of the start of the queue's ringbuffer.
     pub(crate) ringbuf_base: u64,
