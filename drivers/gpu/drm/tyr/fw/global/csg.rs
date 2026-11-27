@@ -119,8 +119,8 @@ pub(crate) struct CsgInterface {
 
 /// Inputs for `CsgInterface::program_activate_inputs`.
 ///
-/// All fields are written once per residency at `CSG_REQ.state = Start`
-/// and are not updated during the slot's lifetime.
+/// All fields are written at slot activation, for both `Start` and `Resume`.
+/// Only `ep_req` changes later, through `CsgInterface::write_input_ep_req`.
 pub(crate) struct CsgActivateInputs {
     pub(crate) allow_compute: u64,
     pub(crate) allow_fragment: u64,
@@ -334,8 +334,9 @@ impl CsgInterface {
     /// Read-modify-write `CSG_REQ`: sets the bits in `mask` to `value`,
     /// preserving all other bits.
     ///
-    /// Each call site owns a disjoint subset of the word and must not
-    /// race with the IRQ-side bits the firmware can flip concurrently.
+    /// `CSG_REQ` is host-owned. The host IRQ path copies event bits from
+    /// `CSG_ACK` into it. Each writer owns a disjoint subset of the word and
+    /// must not overwrite bits owned by the others.
     ///
     /// Returns `EINVAL` if the interface is not enabled.
     pub(crate) fn update_input_req(&self, value: CSG_REQ, mask: CSG_REQ) -> Result {
@@ -420,7 +421,7 @@ impl CsgInterface {
     }
 
     /// Programs the CSG-level static input registers before requesting
-    /// `CSG_REQ.state = Start`.
+    /// `CSG_REQ.state = Start` or `Resume`.
     ///
     /// Per-CS queue programming and CSG_REQ staging are the caller's
     /// responsibility.

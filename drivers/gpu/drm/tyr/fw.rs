@@ -258,7 +258,7 @@ pub(crate) struct Section {
 /// Loaded firmware with sections mapped into MCU VM.
 #[pin_data(PinnedDrop)]
 pub(crate) struct Firmware {
-    /// Platform device reference (needed to access the MCU JOB_IRQ registers).
+    /// Platform device the firmware sections are mapped for.
     pdev: ARef<platform::Device>,
 
     /// Iomem need to access registers.
@@ -659,16 +659,15 @@ impl Firmware {
         let _ = self.vm.deactivate();
     }
 
-    /// Stops the firmware for a GPU reset.
+    /// Stops the firmware for a GPU reset or a cold reload.
     ///
-    /// The reset runs because the firmware stopped responding, so it
-    /// is force-stopped and the subsequent `post_reset` does a
-    /// full reload.
+    /// The MCU is stopped without a clean halt, and the stop is marked
+    /// unclean so `needs_reload` returns true until `post_reset` succeeds.
     ///
-    /// The firmware VM is left resident so page-table updates on it keep
-    /// issuing cache and TLB maintenance up to the soft reset. It is released
-    /// after a completed reset by `mmu::post_reset`, together with the user
-    /// VMs.
+    /// On a GPU reset, the firmware VM is left resident so page-table
+    /// updates on it keep issuing cache and TLB maintenance up to the soft
+    /// reset. It is released after a completed reset by `mmu::post_reset`,
+    /// together with the user VMs.
     pub(crate) fn pre_reset(&self, tdev: &TyrDrmDevice) {
         self.unclean_stop.store(true, Release);
         tdev.job_irq
@@ -678,9 +677,9 @@ impl Firmware {
         self.global_iface.suspend();
     }
 
-    /// Reboots the MCU after a GPU reset.
+    /// Reboots the MCU after `pre_reset`, for a GPU reset or a cold reload.
     ///
-    /// The hang may have corrupted firmware memory, so every section is
+    /// Firmware memory is not assumed intact, so every section is
     /// rewritten from the data retained at load time before the MCU
     /// restarts. The reload also clears the halt request in the global
     /// input block, so no explicit `set_mcu_active` is needed.

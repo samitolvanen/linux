@@ -160,8 +160,8 @@ pub(crate) struct CsgSlotData {
 /// CSG slot operations need to coalesce multiple per-slot writes into a
 /// single CSG_REQ word, ring the per-CSG doorbell once, then wait for
 /// the firmware to acknowledge the resulting state transitions. The
-/// activate / evict callbacks of `CsgSlotOps` update this accumulator
-/// while the slot-manager mutex is held; `Scheduler::apply_csg_updates`
+/// tick and the `CsgSlotOps::activate` callback update this accumulator
+/// while the slot-manager mutex is held. `Scheduler::apply_csg_updates`
 /// then drives the firmware-visible side of the transaction. The
 /// slot-manager mutex is dropped around the firmware ack wait so other
 /// slot accessors can run; the scheduler mutex stays held.
@@ -285,15 +285,12 @@ impl CsgUpdateContext {
 /// CSG slot operations.
 ///
 /// `activate` programs the static CSG_INPUT registers and stages a
-/// `CSG_REQ.state = Start`. The firmware-visible `CSG_REQ` write,
+/// `CSG_REQ.state = Start` or `Resume`. The firmware-visible `CSG_REQ` write,
 /// doorbell ring and ack wait are driven by
 /// `Scheduler::apply_csg_updates`.
 ///
-/// Eviction releases the AS slot; the firmware-visible
-/// `CSG_REQ.state = Terminate` is staged by the tick worker (see
-/// `Tick::halt_and_unbind_evicted_groups`) and applied with the
-/// scheduler mutex dropped before this callback runs, so the
-/// callback itself just tears the binding down.
+/// The tick stages and applies a `Suspend` or `Terminate` before `evict`
+/// runs, so the callback itself just tears the binding down.
 pub(crate) struct CsgSlotOps {
     fw: Arc<fw::Firmware>,
 }
@@ -419,9 +416,7 @@ impl crate::slot::SlotOperations for CsgSlotOps {
         slot_data: &Self::SlotData,
         _ctx: &mut Self::Context,
     ) -> Result {
-        // The firmware ack for this slot's state transition landed before
-        // this callback runs, so it only tears the binding down. The VM
-        // keeps its AS slot, flagged idle for reuse on the next bind.
+        // The VM keeps its AS slot, flagged idle for reuse on the next bind.
         slot_data.group.with_locked_inner(|inner| {
             for queue in slot_data.group.queues.iter() {
                 queue.set_doorbell_id(None);

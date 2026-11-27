@@ -1305,7 +1305,7 @@ impl StageOps<TyrQueueOps> for QueueCompletionStage {
         // Wake at the remaining deadline. The submit fence's
         // progress callback (registered by the framework's
         // `process_exec`) will wake the pipeline earlier when
-        // `Scheduler::sync_upd_step` signals the fence in response
+        // `Scheduler::process_fw_events` signals the fence in response
         // to a sync-update IRQ; this `WaitFor` is just the
         // worst-case bound for actually faulting the job.
         StageAdvance::WaitFor(self.timeout - adjusted_elapsed)

@@ -64,7 +64,7 @@ const RETRACT_TIMEOUT: Delta = Delta::from_millis(2);
 /// Timeout for a reset command to complete.
 const RESET_TIMEOUT: Delta = Delta::from_millis(500);
 
-/// Returns the bitmask for the PWR interrupts the driver actively handles.
+/// Returns the bitmask for the PWR interrupts the driver unmasks.
 pub(crate) fn pwr_interrupts_mask() -> u32 {
     PWR_IRQ_MASK::zeroed()
         .with_power_changed_single(true)
