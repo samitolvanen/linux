@@ -1129,6 +1129,19 @@ impl<'a> Tick<'a> {
 
         if data.mmu.flush_caches().is_err() {
             pr_err!("cache clean on suspend failed, terminating suspended groups\n");
+            let lists = Iterator::chain(self.sched.runnable_groups.iter(), &self.sched.idle_groups);
+            for group in lists.flatten() {
+                let suspended = group.with_locked_inner(|inner| {
+                    let suspended = inner.state == State::Suspended;
+                    if suspended {
+                        inner.state = State::Terminated;
+                    }
+                    suspended
+                });
+                if suspended {
+                    Arc::from(group).schedule_term();
+                }
+            }
             let csg_slot_manager = data.csg_slot_manager.lock();
             for i in 0..MAX_CSGS {
                 let Some(slot_data) = csg_slot_manager.slot_data(i) else {
